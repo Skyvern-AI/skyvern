@@ -84,7 +84,11 @@ import {
   nodeAdderNode,
   startNode,
 } from "./workflowEditorUtils";
-import { parameterIsBitwardenCredential, ParametersState } from "./types";
+import {
+  parameterIsBitwardenCredential,
+  parameterIsOnePasswordCredential,
+  ParametersState,
+} from "./types";
 import { useAutoPan } from "./useAutoPan";
 
 function convertToParametersYAML(
@@ -149,14 +153,21 @@ function convertToParametersYAML(
           BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
       };
     } else {
-      if (parameterIsBitwardenCredential(parameter)) {
+      if (
+        parameterIsBitwardenCredential(parameter) ||
+        parameterIsOnePasswordCredential(parameter)
+      ) {
         return {
           parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
           key: parameter.key,
           description: parameter.description || null,
-          bitwarden_collection_id: parameter.collectionId,
+          bitwarden_collection_id: parameterIsBitwardenCredential(parameter)
+            ? parameter.collectionId
+            : null,
           bitwarden_item_id: parameter.itemId,
-          url_parameter_key: parameter.urlParameterKey,
+          url_parameter_key: parameterIsBitwardenCredential(parameter)
+            ? parameter.urlParameterKey
+            : null,
           bitwarden_client_id_aws_secret_key:
             BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
           bitwarden_client_secret_aws_secret_key:

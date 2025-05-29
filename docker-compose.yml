@@ -120,6 +120,10 @@ services:
       # - BITWARDEN_CLIENT_ID=FILL_ME_IN_PLEASE
       # - BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
       # - BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
+      # 1Password Settings
+      # - PASSWORD_MANAGER=onepassword
+      # - ONEPASSWORD_TOKEN=FILL_ME_IN_PLEASE
+      # - ONEPASSWORD_VAULT=FILL_ME_IN_PLEASE
       
     depends_on:
       postgres:

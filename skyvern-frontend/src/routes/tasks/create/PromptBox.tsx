@@ -12,6 +12,7 @@ import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
 import { MessageIcon } from "@/components/icons/MessageIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
+import { BrainIcon } from "@/components/icons/BrainIcon";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Input } from "@/components/ui/input";
 import {
@@ -232,6 +233,26 @@ function PromptBox() {
     },
   });
 
+  const enhancePromptMutation = useMutation({
+    mutationFn: async () => {
+      const client = await getClient(credentialGetter);
+      return client.post<{ output: string }>("/suggest/enhance_prompt", {
+        input: prompt,
+        context: {},
+      });
+    },
+    onSuccess: (response) => {
+      setPrompt(response.data.output);
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Error enhancing prompt",
+        description: error.message,
+      });
+    },
+  });
+
   const saveTaskMutation = useMutation({
     mutationFn: async (params: TaskGenerationApiResponse) => {
       const client = await getClient(credentialGetter);
@@ -278,6 +299,19 @@ function PromptBox() {
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Enter your prompt..."
               />
+              <div className="flex items-center">
+                {enhancePromptMutation.isPending ? (
+                  <ReloadIcon className="size-6 animate-spin" />
+                ) : (
+                  <div 
+                    onClick={() => {
+                      enhancePromptMutation.mutate();
+                    }}
+                  >
+                    <BrainIcon className="size-6 cursor-pointer" />
+                  </div>
+                )}
+              </div>
               <Select
                 value={selectValue}
                 onValueChange={(value: "v1" | "v2") => {

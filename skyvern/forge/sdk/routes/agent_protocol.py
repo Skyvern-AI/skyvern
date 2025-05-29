@@ -95,6 +95,7 @@ LOG = structlog.get_logger()
 
 class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
+    ENHANCE_PROMPT = "enhance_prompt"
 
 
 ################# /v1 Endpoints #################
@@ -1555,9 +1556,14 @@ async def suggest(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> AISuggestionBase:
     llm_prompt = ""
+    prompt_name = ""
 
     if ai_suggestion_type == AISuggestionType.DATA_SCHEMA:
         llm_prompt = prompt_engine.load_prompt("suggest-data-schema", input=data.input, additional_context=data.context)
+        prompt_name = "suggest-data-schema"
+    elif ai_suggestion_type == AISuggestionType.ENHANCE_PROMPT:
+        llm_prompt = prompt_engine.load_prompt("enhance-prompt", input=data.input, additional_context=data.context)
+        prompt_name = "enhance-prompt"
 
     try:
         new_ai_suggestion = await app.DATABASE.create_ai_suggestion(
@@ -1566,7 +1572,7 @@ async def suggest(
         )
 
         llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt, ai_suggestion=new_ai_suggestion, prompt_name="suggest-data-schema"
+            prompt=llm_prompt, ai_suggestion=new_ai_suggestion, prompt_name=prompt_name
         )
         parsed_ai_suggestion = AISuggestionBase.model_validate(llm_response)
 

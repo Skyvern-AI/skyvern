@@ -97,6 +97,13 @@ class Settings(BaseSettings):
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     BITWARDEN_MAX_RETRIES: int = 2
 
+    #########################
+    # 1Password Integration #
+    #########################
+    PASSWORD_MANAGER: str = "bitwarden"
+    ONEPASSWORD_TOKEN: str | None = None
+    ONEPASSWORD_VAULT: str | None = None
+
     # task generation settings
     PROMPT_CACHE_WINDOW_HOURS: int = 24
 
