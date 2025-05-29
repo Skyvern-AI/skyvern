@@ -230,6 +230,7 @@ initialize_env_file() {
 
     echo "Initializing .env file..."
     cp .env.example .env
+    echo "" >> .env
     setup_llm_providers
 
     # Ask for email or generate UUID
