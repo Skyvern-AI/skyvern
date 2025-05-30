@@ -8,7 +8,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflows import Workflow
 from skyvern.forge.sdk.workflow.scheduler import workflow_scheduler
-from skyvern.forge.utils.auth import get_organization
+from skyvern.forge.sdk.services import org_auth_service
 
 # Create router for workflow scheduler endpoints
 router = APIRouter(prefix="/workflows/scheduler", tags=["workflow_scheduler"])
@@ -31,7 +31,7 @@ class CronScheduleResponse(BaseModel):
 
 
 @router.get("/{workflow_id}", response_model=CronScheduleResponse)
-async def get_workflow_schedule(workflow_id: str, organization: Organization = Depends(get_organization)):
+async def get_workflow_schedule(workflow_id: str, organization: Organization = Depends(org_auth_service.get_current_org)):
     """Get the cron schedule for a workflow."""
     workflow = await app.DATABASE.get_workflow(workflow_id)
     if not workflow:
@@ -60,7 +60,7 @@ async def get_workflow_schedule(workflow_id: str, organization: Organization = D
 async def update_workflow_schedule(
     workflow_id: str, 
     schedule: CronScheduleRequest, 
-    organization: Organization = Depends(get_organization)
+    organization: Organization = Depends(org_auth_service.get_current_org)
 ):
     """Update the cron schedule for a workflow."""
     workflow = await app.DATABASE.get_workflow(workflow_id)
@@ -101,7 +101,7 @@ async def update_workflow_schedule(
 @router.post("/{workflow_id}/trigger", response_model=dict)
 async def trigger_workflow(
     workflow_id: str, 
-    organization: Organization = Depends(get_organization)
+    organization: Organization = Depends(org_auth_service.get_current_org)
 ):
     """Manually trigger a workflow run."""
     workflow = await app.DATABASE.get_workflow(workflow_id)
