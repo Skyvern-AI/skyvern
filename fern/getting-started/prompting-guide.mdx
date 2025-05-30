@@ -4,87 +4,63 @@ slug: getting-started/prompting-guide
 ---
 
 
-## TL;DR
+# Workflow Prompting Guide
 
-* Use key words “complete” or “terminate” to let Skyvern know when the task is done or should be ended, respectively
-    * Be specific when prompting; write as if you are speaking to a seven‑year‑old; verbosity is your friend.
-* Ensure your problem is formatted as a single clearly defined goal with guardrails
-    * For instance, “generate an insurance quote” will be more successful than a sequence like “generate multiple insurance quotes and compare them to find the best option”
-* Add guardrails like “close cookie dialogs” to instruct Skyvern when it encounters unexpected obstacles
-    * Some foreseeable obstacles include pop-ups, confirmations, cookie pop-ups, ad-banners, and more
-* Give Skyvern concrete examples of what to do and not to do to. For example, asking it to navigate to the home page if it can't find it's looking for can be a good idea.
+## Choose the Best Block Type
 
-## Step by Step
-
-A good 95% of the time, you can prevent a task failure before it even begins. Here are the steps to help optimize your run.
-
-### 1. Do you know what you’re trying to accomplish?
-
-Have a very clear idea of the problem you’re trying to have Skyvern solve. Ask yourself:
-
-What is my goal? Can I describe it very clearly so Skyvern knows I've accomplished my goal?
-
-Does the site have anything that might derail Skyvern, like captchas, cookie dialogs, or pop-ups? 
-
-Do you need to pre-load information or configure specific outputs or error messages?
-
-While some of these, like specifying how to act when encountering obstacles, are optional, goals and pre-loaded information are more critical.
-
-* Goal(s): if your task has multiple goals, Skyvern will not be able to complete it.
-* Input(s): be clear about your inputs and give Skyvern instruction on what to do if it encounters required inputs it doesn’t have the answer to. If Skyvern sees inputs, it will try its best to accomplish its goal, which could mean it might make up information or make reasonable assumptions.
-    * You can ask Skyvern to make up information or terminate if asked anything it doesn’t have the answer to
-    * If you want to add concrete information about yourself, you have to provide that in advance in JSON (Navigation Payload) or natural language (Navigation Goal) formats
+- Most deterministic: Action block
+    - single action like click, input text, etc.
+- Happy medium: Navigation block
+    - single goal, like your goal is to fill out the form
+- Most flexible: Navigation V2 block
+    - multi-goal, like your goal is to login, then fill the form, etc.
     
 
-### 2. Can Skyvern accomplish your goal?
+## Crafting a Prompt
 
-Skyvern does some tasks very well, so part of this is knowing if your task fits within what Skyvern can do. 
+### Anatomy
 
-What Skyvern does well:
+1. **[Required] Main goal** 
+2. Guardrails/details
+3. Payload, or information that Skyvern uses in input fields
+4. **[Required] Completion**/Termination criteria 
 
-* Filling out long, monotonous forms
-* Automating applications
-* E-commerce procurement or analysis
-* Downloading files
+### Dos
 
-What Skyvern doesn’t reliably execute: 
+- **Be very clear about your main goal and completion criteria.** A good rule of thumb is if someone were to read it with no visual context, would they be able to understand?
+    - Use key words like “complete” or “terminate” to let Skyvern know when the task is done or should be ended, respectively
+- **Start general and get more specific with testing.**
+    - Making the workflow more general first means there’s a higher chance of it being generalizable across different websites
+    - Use parameters in goal fields to add strings of texts that can make the workflow adjustable across different unique sites + their quirks
+- **Use clear visual indicators and phrases to capture the main goal and completion criteria.**
+    - For instance, if you goal is to navigate to a certain page, you can say “using the sales dropdown at the top of the page” or “to navigate to invoices, the button has a receipt icon”
 
-* Recursively scrape or iterate over multiple items
-* Completing multiple goals in a sequence
-    * However, our newest Workflows feature will allow you to accommodate that. Please reach out to us (https://meetings.hubspot.com/skyvern/demo) if you'd like to learn more!
+### Don’ts
 
-### 3. Is your prompt well-written?
+- **Be unclear.** Make sure your goals are clear, that details are rooted in visuals. If you’re confused or a random person would be confused, the LLM will definitely be confused
+- **Provide too little information.** If you’re logging in, you need to provide login credentials, a URL to go to, etc. Think, “what would I need if I were starting this task from scratch?” You can always overprovide information and Skyvern will use what it needs
+- **Make an action list unless absolutely necessary.** If needed as extra details, make sure it’s accompanied by a main goal
+- **Name the HTML element for items.** Some HTML element items are accessible, but not all. Wouldn’t recommend this as a first course of action!
 
-Skyvern needs specific direction. The difference between a task completing and failing could be one word adding a little bit of clarity. Here is detailed information about each input type and what it requires.
+### Examples
 
-**What makes for a good prompt?**
+**Example Navigation/Task Block prompt:**
 
-1. *(required) URL:*  Skyvern's starting point 
-1. *(often required) Navigation Goal:* details where Skyvern is going and what Skyvern is doing. Clear Navigation Goals will be a single goal, broken down into steps. You need to specify when the goal is complete, using “COMPLETE”, or when to abandon that goal, using “TERMINATE”
-    * The navigation goal is not used to load the URL. Asking Skyvern to "go to website A" in this field will not have the intended effect
-    * Terminations result in Skyvern explaining why it stopped navigating
-    * This field can be omitted if you only want Skyvern to extract data
-1. *(optional) Data Extraction Goal:* aside from where Skyvern is going and what Skyvern is doing, is there anything that Skyvern is extracting and returning back? A good data extraction goal is specific about what Skyvern is returning to the user
-    * Note that data extractions only happen AFTER Skyvern is finished navigating
-1. *(optional) Navigation Payload:* if you need any content inputted during your task flow, that content goes here in JSON format
-    * If you want to run the same task for different users (i.e. filling out the same form multiple times), you should keep everything else the same and update the Navigation Payload
-1. *(optional) Extracted Information Schema:* if you have a data extraction goal, some users need it formatted in a certain way for internal purposes. Navigation payload accepts JSON formatted specifications for how the data should be returned
-1. *(optional) Webhook Callback URL:* This URL can be specified if you would like Skyvern to notify you when it's finished executing
-1. *(optional) Max Steps:* some users want to cap cost through the number of steps the task can take
+Your goal is to fill out the form. Only fill out required fields that you have information for. To add address information, you will need to select the Add button and input the information in a popup modal. 
 
-## Prompt Examples
+Here is the information you need to get through the form:
+{{complete_payload}}
 
-**Good Navigation Goals**
+Your goal is complete when you have filled out the form and submitted. You will know your goal is complete when you are viewing a confirmation message that it was submitted.
 
-* Search for 'black waterproof mascara' in the search bar. Sort the results by popularity. Identify the first product in the sorted list. COMPLETE when the name and details of the most popular waterproof mascara are identified.
-* Navigate to this YouTube channel and watch ChannelNameHere’s latest videos. Summarize the content of these videos. COMPLETE when summaries of the latest 5 videos are obtained. Guardrails: Do not interact with any other content or profiles.
-* Fill out the job application form with the provided details. COMPLETE when the application form is successfully submitted. TERMINATE if the job form requires a cover letter. TERMINATE if there are any required questions that ask me to write a personalized paragraph. Guardrails: Do not apply to jobs that require relocation outside of Austin, TX. Do not respond to any optional questions.
+**Example Navigation V2 Block prompt:** 
 
-**Poor Navigation Goals**
+Your first goal is to search for an image using Google Lens. To do so, select the Google Lens camera icon. You will know you're looking at google lens when you see the option to drag and drop an image. Then search using the provided image link: {{image_URL}}
 
-* Visit every URL on this page, analyze its content, and return a summary. COMPLETE when every summary is returned. TERMINATE if you are unable to access a link.
-    * “Do this, then this, then this” requires iterations, which is not supported by Skyvern tasks
-* Download meeting transcripts and then generate a meeting summary for each. Then send out each summary to the attendees that were at each meeting. Make sure the summary goes to the right recipients. COMPLETE when you have sent the emails. TERMINATE if you are unable to download any transcripts.
-    * This is another iteration example, and we do not offer sending emails in our tasks feature right now
-* Generate a home insurance quote. Do not generate an auto insurance quote.
-    * This example does not have completion parameters to tell Skyvern when it has achieved its goal
+Now that you've searched google for the image, your goal is to identify the location. If you're unsure about the location, default to the location that is most represented in the search results.
+
+Now that you have the location, your goal is to go to google maps and extract the address. Provide the address in the following format: {{schema}}
+
+**Example Action Block prompt:**
+
+Click the continue button
