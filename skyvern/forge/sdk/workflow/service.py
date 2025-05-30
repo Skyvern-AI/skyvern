@@ -557,6 +557,10 @@ class WorkflowService:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        cron_expression: str | None = None,
+        timezone: str | None = None,
+        cron_enabled: bool = False,
+        next_run_time: datetime | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -573,6 +577,10 @@ class WorkflowService:
             version=version,
             is_saved_task=is_saved_task,
             status=status,
+            cron_expression=cron_expression,
+            timezone=timezone,
+            cron_enabled=cron_enabled,
+            next_run_time=next_run_time,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -1413,6 +1421,9 @@ class WorkflowService:
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    cron_expression=request.cron_expression,
+                    timezone=request.timezone,
+                    cron_enabled=request.cron_enabled,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1428,6 +1439,9 @@ class WorkflowService:
                     model=request.model,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    cron_expression=request.cron_expression,
+                    timezone=request.timezone,
+                    cron_enabled=request.cron_enabled,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id

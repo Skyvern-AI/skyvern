@@ -1186,6 +1186,10 @@ class AgentDB:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        cron_expression: str | None = None,
+        timezone: str | None = None,
+        cron_enabled: bool = False,
+        next_run_time: datetime | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1201,6 +1205,10 @@ class AgentDB:
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
+                cron_expression=cron_expression,
+                timezone=timezone,
+                cron_enabled=cron_enabled,
+                next_run_time=next_run_time,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
