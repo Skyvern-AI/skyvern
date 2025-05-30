@@ -14,17 +14,11 @@ import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
-import {
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-} from "@/components/ui/select";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { ModelsResponse } from "@/api/types";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const credentialGetter = useCredentialGetter();
@@ -83,27 +77,13 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                 <AccordionContent className="pl-6 pr-1 pt-1">
                   <div className="space-y-4">
                     <div className="space-y-2">
-                      <div className="flex gap-2">
-                        <Label>Model</Label>
-                        <HelpTooltip content="The LLM model to use for this workflow" />
-                      </div>
-                      <Select
-                        value={inputs.model?.model ?? "Skyvern Optimized"}
-                        onValueChange={(value) => {
-                          handleChange("model", { model: value });
+                      <ModelSelector
+                        className="nopan w-52 text-xs"
+                        value={inputs.model}
+                        onChange={(value) => {
+                          handleChange("model", value);
                         }}
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select model" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {models.map((m) => (
-                            <SelectItem key={m} value={m}>
-                              {m}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      />
                     </div>
                     <div className="space-y-2">
                       <div className="flex gap-2">
