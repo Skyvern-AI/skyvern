@@ -421,4 +421,4 @@ class WorkflowCreateYAMLRequest(BaseModel):
     # Cron job related fields
     cron_expression: str | None = None
     timezone: str | None = None
-    cron_enabled: bool = False
+    cron_enabled: bool = True

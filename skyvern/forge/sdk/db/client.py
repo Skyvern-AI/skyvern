@@ -1188,7 +1188,7 @@ class AgentDB:
         status: WorkflowStatus = WorkflowStatus.published,
         cron_expression: str | None = None,
         timezone: str | None = None,
-        cron_enabled: bool = False,
+        cron_enabled: bool = True,
         next_run_time: datetime | None = None,
     ) -> Workflow:
         async with self.Session() as session:

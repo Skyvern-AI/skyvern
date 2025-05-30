@@ -12,7 +12,7 @@ class WorkflowBase(BaseModel):
     organization_id: Optional[str] = None
     cron_expression: Optional[str] = None
     timezone: Optional[str] = None
-    cron_enabled: Optional[bool] = False
+    cron_enabled: Optional[bool] = True
     next_run_time: Optional[datetime] = None
 
 

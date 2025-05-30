@@ -223,7 +223,7 @@ class WorkflowModel(Base):
     # Cron job scheduling fields
     cron_expression = Column(String, nullable=True)
     timezone = Column(String, nullable=True, default="UTC")
-    cron_enabled = Column(Boolean, nullable=False, default=False)
+    cron_enabled = Column(Boolean, nullable=False, default=True)
     next_run_time = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
