@@ -8,7 +8,7 @@ export type WorkflowStartNodeData = {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
-  model: WorkflowModel;
+  model: WorkflowModel | null;
   editable: boolean;
 };
 

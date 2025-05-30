@@ -100,7 +100,6 @@ import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
 export const NEW_NODE_LABEL_PREFIX = "block_";
-const DEFAULT_MODEL = { model: "Skyvern Optimized" };
 
 function layoutUtil(
   nodes: Array<AppNode>,
@@ -662,7 +661,7 @@ function getElements(
       persistBrowserSession: settings.persistBrowserSession,
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
-      model: settings.model ?? DEFAULT_MODEL,
+      model: settings.model,
       editable,
     }),
   );
@@ -1322,7 +1321,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     persistBrowserSession: false,
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
-    model: DEFAULT_MODEL,
+    model: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
