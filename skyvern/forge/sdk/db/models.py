@@ -204,6 +204,7 @@ class WorkflowModel(Base):
         Index("permanent_id_version_idx", "workflow_permanent_id", "version"),
         Index("organization_id_title_idx", "organization_id", "title"),
         Index("workflow_oid_status_idx", "organization_id", "status"),
+        Index("workflow_next_run_time_idx", "next_run_time"),
     )
 
     workflow_id = Column(String, primary_key=True, index=True, default=generate_workflow_id)
@@ -218,6 +219,12 @@ class WorkflowModel(Base):
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
+    
+    # Cron job scheduling fields
+    cron_expression = Column(String, nullable=True)
+    timezone = Column(String, nullable=True, default="UTC")
+    cron_enabled = Column(Boolean, nullable=False, default=False)
+    next_run_time = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -249,6 +256,8 @@ class WorkflowRunModel(Base):
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
+    # Track if this run was triggered by a cron job
+    triggered_by_cron = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

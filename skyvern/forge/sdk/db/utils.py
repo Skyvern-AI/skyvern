@@ -191,6 +191,11 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         is_saved_task=workflow_model.is_saved_task,
         description=workflow_model.description,
         workflow_definition=WorkflowDefinition.model_validate(workflow_model.workflow_definition),
+        # Cron job scheduling fields
+        cron_expression=workflow_model.cron_expression,
+        timezone=workflow_model.timezone,
+        cron_enabled=workflow_model.cron_enabled,
+        next_run_time=workflow_model.next_run_time,
         created_at=workflow_model.created_at,
         modified_at=workflow_model.modified_at,
         deleted_at=workflow_model.deleted_at,
@@ -221,6 +226,8 @@ def convert_to_workflow_run(
         webhook_callback_url=workflow_run_model.webhook_callback_url,
         totp_verification_url=workflow_run_model.totp_verification_url,
         totp_identifier=workflow_run_model.totp_identifier,
+        # Flag to indicate if this run was triggered by a cron job
+        triggered_by_cron=workflow_run_model.triggered_by_cron,
         created_at=workflow_run_model.created_at,
         modified_at=workflow_run_model.modified_at,
         workflow_title=workflow_title,

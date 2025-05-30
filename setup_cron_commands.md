@@ -1,4 +1,4 @@
-# Complete Setup Commands for Cron Functionality
+# Skyvern – Cron Functionality Setup Guide
 
 This document walks you through **every shell command** required to pull the new branch, install dependencies, run database migrations, and start both backend and frontend so that the workflow-cron feature is live.
 
@@ -28,6 +28,8 @@ python -m venv .venv
 source .venv/bin/activate
 ```
 
+*(Alternatively use `pyenv`, `conda`, or Poetry’s built-in venv.)*
+
 ---
 
 ## 3  Install Backend Dependencies
@@ -40,6 +42,8 @@ pip install --upgrade poetry
 poetry install --no-interaction --with dev
 ```
 
+*(If you prefer pip: `pip install -r requirements.txt`)*
+
 ---
 
 ## 4  Configure Environment Variables
@@ -49,23 +53,45 @@ cp .env.example .env
 # Edit .env → set DATABASE_URL, OPENAI_API_KEY, etc.
 ```
 
+Make sure the DB user has permission to create/alter tables.
+
 ---
 
-## 5  Run Database Migrations (CRITICAL!)
+## 5  Run Database Migrations
 
 ```bash
 # 5.1 Upgrade schema to latest (adds cron columns & indexes)
 alembic upgrade head
 ```
 
-This applies `2025_05_29_1511_bf4a8c7d1e9a_add_cron_job_support.py` migration.
+This applies `2025_05_29_1511_bf4a8c7d1e9a_add_cron_job_support.py` along with any newer migrations.
 
 ---
 
-## 6  Start Backend Server
+## 6  (Optional) Seed / Create Superuser
 
 ```bash
-# 6.1 Launch Forge API with auto-reload
+# creates an organization & API key for testing
+python scripts/create_organization.py --name "My Org"
+python scripts/create_api_key.py --org-id <ORG_ID>
+```
+
+---
+
+## 7  Run Tests (sanity check)
+
+```bash
+pytest tests/test_workflow_scheduler.py
+```
+
+All tests should pass.
+
+---
+
+## 8  Start Backend Server
+
+```bash
+# 8.1 Launch Forge API with auto-reload
 poetry run uvicorn skyvern.forge.api_app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -77,7 +103,7 @@ INFO  Loaded <N> scheduled workflows
 
 ---
 
-## 7  Start Frontend (optional)
+## 9  Start Frontend (optional)
 
 ```bash
 cd skyvern-frontend
@@ -88,20 +114,23 @@ npm run dev          # localhost:5173
 
 ---
 
-## 8  Verify Cron Scheduler
+## 10  Verify Cron Scheduler
 
-1. Log in to UI → **Workflows** → pick a workflow → **Schedule Workflow** card
-2. Enable scheduling, e.g. `*/5 * * * *` in `UTC`
-3. Observe `next scheduled run` timestamp
-4. Watch backend logs when time passes → workflow run appears with `triggered_by_cron=true`
+1. Log in to UI → **Workflows** → pick a workflow → **Schedule Workflow** card.  
+2. Enable scheduling, e.g. `*/5 * * * *` in `UTC`.  
+3. Observe `next scheduled run` timestamp.  
+4. Watch backend logs when time passes → workflow run appears with `triggered_by_cron=true`.
 
 ---
 
-## 9  Run Tests
+### Common Troubleshooting
 
-```bash
-pytest tests/test_workflow_scheduler.py -v
-```
+| Issue | Command / Fix |
+|-------|---------------|
+| Migration failure | `alembic history` then `alembic downgrade -1` to rollback & inspect |
+| APScheduler jobs not firing | Ensure only **one** backend instance starts the scheduler (disable in workers) |
+| Invalid cron | Validate with `croniter.is_valid('expr')` in Python REPL |
 
-You're now fully set up to use automated, cron-driven workflows in Skyvern 🎉
+---
 
+You’re now fully set up to use automated, cron-driven workflows in Skyvern 🎉

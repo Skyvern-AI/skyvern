@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.forge.sdk.workflow.scheduler import workflow_scheduler
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
@@ -65,6 +66,26 @@ AGENT_FUNCTION = AgentFunction()
 PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=DATABASE)
 scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
+# Define the setup_api_app variable first as None, then assign the function to it later
 setup_api_app: Callable[[FastAPI], None] | None = None
 
 agent = ForgeAgent()
+
+
+async def _setup_api_app(app: FastAPI):
+    """
+    Set up the FastAPI application with additional components and event handlers.
+    """
+    @app.on_event("startup")
+    async def startup_event():
+        # Initialize the workflow scheduler
+        await workflow_scheduler.initialize()
+
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        # Shut down the workflow scheduler
+        if workflow_scheduler.scheduler.running:
+            workflow_scheduler.scheduler.shutdown()
+
+# Assign the function to the variable
+setup_api_app = _setup_api_app

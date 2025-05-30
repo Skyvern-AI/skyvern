@@ -1243,6 +1243,29 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflows_with_cron_enabled(self) -> list[Workflow]:
+        """Get all workflows with cron_enabled=True.
+        
+        Returns:
+            A list of workflows with cron_enabled=True
+        """
+        try:
+            async with self.Session() as session:
+                workflows = (
+                    await session.scalars(
+                        select(WorkflowModel)
+                        .filter(WorkflowModel.cron_enabled == True)
+                        .filter(WorkflowModel.deleted_at.is_(None))
+                    )
+                ).all()
+                return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+            
     async def get_workflow_by_permanent_id(
         self,
         workflow_permanent_id: str,
@@ -1371,6 +1394,33 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def update_workflow_cron(
+        self,
+        workflow_id: str,
+        cron_expression: str | None = None,
+        timezone: str | None = None,
+        cron_enabled: bool | None = None,
+    ) -> Workflow:
+        """Update a workflow's cron schedule.
+        
+        This is a specialized version of update_workflow that only updates cron-related fields.
+        
+        Args:
+            workflow_id: The ID of the workflow to update
+            cron_expression: The cron expression for the workflow
+            timezone: The timezone for the cron expression
+            cron_enabled: Whether the cron job is enabled
+            
+        Returns:
+            The updated workflow
+        """
+        return await self.update_workflow(
+            workflow_id=workflow_id,
+            cron_expression=cron_expression,
+            timezone=timezone,
+            cron_enabled=cron_enabled,
+        )
+    
     async def update_workflow(
         self,
         workflow_id: str,
@@ -1379,6 +1429,10 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
+        cron_expression: str | None = None,
+        timezone: str | None = None,
+        cron_enabled: bool | None = None,
+        next_run_time: datetime | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1396,6 +1450,14 @@ class AgentDB:
                         workflow.workflow_definition = workflow_definition
                     if version:
                         workflow.version = version
+                    if cron_expression is not None:
+                        workflow.cron_expression = cron_expression
+                    if timezone is not None:
+                        workflow.timezone = timezone
+                    if cron_enabled is not None:
+                        workflow.cron_enabled = cron_enabled
+                    if next_run_time is not None:
+                        workflow.next_run_time = next_run_time
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -1440,6 +1502,7 @@ class AgentDB:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         parent_workflow_run_id: str | None = None,
+        triggered_by_cron: bool = False,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1453,6 +1516,7 @@ class AgentDB:
                     totp_verification_url=totp_verification_url,
                     totp_identifier=totp_identifier,
                     parent_workflow_run_id=parent_workflow_run_id,
+                    triggered_by_cron=triggered_by_cron,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1462,6 +1526,45 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def create_workflow_run_from_cron(
+        self,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        organization_id: str,
+        status: WorkflowRunStatus = "created",
+        proxy_location: ProxyLocation | None = None,
+        webhook_callback_url: str | None = None,
+        totp_verification_url: str | None = None,
+        totp_identifier: str | None = None,
+    ) -> WorkflowRun:
+        """Create a workflow run that is triggered by a cron job.
+        
+        This is a specialized version of create_workflow_run that sets triggered_by_cron=True.
+        
+        Args:
+            workflow_id: The ID of the workflow
+            workflow_permanent_id: The permanent ID of the workflow
+            organization_id: The ID of the organization
+            status: The initial status of the workflow run
+            proxy_location: The proxy location for the workflow run
+            webhook_callback_url: The webhook callback URL for the workflow run
+            totp_verification_url: The TOTP verification URL for the workflow run
+            totp_identifier: The TOTP identifier for the workflow run
+            
+        Returns:
+            The created workflow run
+        """
+        return await self.create_workflow_run(
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            proxy_location=proxy_location,
+            webhook_callback_url=webhook_callback_url,
+            totp_verification_url=totp_verification_url,
+            totp_identifier=totp_identifier,
+            triggered_by_cron=True,
+        )
+        
     async def update_workflow_run(
         self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
     ) -> WorkflowRun:

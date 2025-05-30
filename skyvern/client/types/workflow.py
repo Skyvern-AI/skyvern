@@ -27,6 +27,11 @@ class Workflow(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     persist_browser_session: typing.Optional[bool] = None
     status: typing.Optional[WorkflowStatus] = None
+    # Cron job scheduling fields
+    cron_expression: typing.Optional[str] = None
+    timezone: typing.Optional[str] = None
+    cron_enabled: typing.Optional[bool] = None
+    next_run_time: typing.Optional[dt.datetime] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

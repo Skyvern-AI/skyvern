@@ -439,7 +439,7 @@ export type WorkflowDefinition = {
   blocks: Array<WorkflowBlock>;
 };
 
-export type WorkflowApiResponse = {
+export interface WorkflowApiResponse {
   workflow_id: string;
   organization_id: string;
   is_saved_task: boolean;
@@ -454,10 +454,14 @@ export type WorkflowApiResponse = {
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
+  cron_expression: string | null;
+  timezone: string | null;
+  cron_enabled: boolean;
+  next_run_time: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-};
+}
 
 export type WorkflowSettings = {
   proxyLocation: ProxyLocation | null;

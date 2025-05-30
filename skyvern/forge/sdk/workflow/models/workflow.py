@@ -144,6 +144,8 @@ class WorkflowRun(BaseModel):
     failure_reason: str | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
+    # Flag to indicate if this run was triggered by a cron job
+    triggered_by_cron: bool = False
 
     created_at: datetime
     modified_at: datetime
@@ -172,6 +174,8 @@ class WorkflowRunResponseBase(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    # Flag to indicate if this run was triggered by a cron job
+    triggered_by_cron: bool = False
     created_at: datetime
     modified_at: datetime
     parameters: dict[str, Any]
