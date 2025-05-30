@@ -92,6 +92,15 @@ class Settings(BaseSettings):
     BROWSER_SESSION_BASE_PATH: str = f"{constants.REPO_ROOT_DIR}/browser_sessions"
 
     #####################
+    # 1Password Configs #
+    #####################
+    ONEPASSWORD_ACCOUNT: str | None = None
+    ONEPASSWORD_EMAIL: str | None = None
+    ONEPASSWORD_SECRET_KEY: str | None = None
+    ONEPASSWORD_MASTER_PASSWORD: str | None = None
+    ONEPASSWORD_TIMEOUT_SECONDS: int = 60
+
+    #####################
     # Bitwarden Configs #
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
