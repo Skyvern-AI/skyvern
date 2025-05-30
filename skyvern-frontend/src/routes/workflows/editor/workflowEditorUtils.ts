@@ -663,6 +663,7 @@ function getElements(
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model ?? DEFAULT_MODEL,
+      cronExpression: settings.cronExpression ?? null,
       editable,
     }),
   );
@@ -1323,6 +1324,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
     model: DEFAULT_MODEL,
+    cronExpression: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1338,6 +1340,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       proxyLocation: data.proxyLocation,
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
+      cronExpression: data.cronExpression || null,
     };
   }
   return defaultSettings;

@@ -52,6 +52,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       ? data.persistBrowserSession
       : false,
     model: data.withWorkflowSettings ? data.model : { model: models[0] || "" },
+    cronExpression: data.withWorkflowSettings ? data.cronExpression : "",
   });
 
   function handleChange(key: string, value: unknown) {
@@ -144,6 +145,19 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <Label>Cron Schedule</Label>
+                        <HelpTooltip content="Set a cron expression to schedule this workflow (e.g. '0 9 * * 1-5' for weekdays at 9 AM)" />
+                      </div>
+                      <Input
+                        value={inputs.cronExpression || ""}
+                        placeholder="0 9 * * 1-5"
+                        onChange={(event) => {
+                          handleChange("cronExpression", event.target.value);
+                        }}
+                      />
                     </div>
                   </div>
                 </AccordionContent>

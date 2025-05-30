@@ -468,6 +468,7 @@ export type WorkflowSettings = {
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
+  cronExpression?: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model: string }>;

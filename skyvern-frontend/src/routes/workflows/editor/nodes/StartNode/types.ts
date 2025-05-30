@@ -9,6 +9,7 @@ export type WorkflowStartNodeData = {
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
   model: WorkflowModel;
+  cronExpression?: string | null;
   editable: boolean;
 };
 
