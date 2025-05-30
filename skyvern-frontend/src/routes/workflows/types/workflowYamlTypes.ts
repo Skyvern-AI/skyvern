@@ -10,6 +10,7 @@ export type WorkflowCreateYAMLRequest = {
   persist_browser_session?: boolean;
   model?: WorkflowModel | null;
   cron_expression?: string | null;
+  cron_enabled?: boolean;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
