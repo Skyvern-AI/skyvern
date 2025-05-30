@@ -44,18 +44,30 @@ class WorkflowScheduler:
 
     async def load_scheduled_workflows(self):
         """Load and schedule all workflows with cron_enabled=True from the database."""
+        logger.info("Loading scheduled workflows...")
+        
         # Get all workflows with cron_enabled=True
         workflows = await app.DATABASE.get_workflows_with_cron_enabled()
+        logger.info(f"Found {len(workflows)} workflows with cron_enabled=True")
         
+        scheduled_count = 0
         for workflow in workflows:
+            logger.info(f"Processing workflow {workflow.workflow_id} with cron_expression: {workflow.cron_expression}")
+            
             # Skip workflows without cron expression
             if not workflow.cron_expression:
+                logger.warning(f"Skipping workflow {workflow.workflow_id}: No cron expression")
                 continue
                 
-            # Schedule the workflow
-            await self.schedule_workflow(workflow.workflow_id)
+            try:
+                # Schedule the workflow
+                await self.schedule_workflow(workflow.workflow_id)
+                scheduled_count += 1
+                logger.info(f"Successfully scheduled workflow {workflow.workflow_id}")
+            except Exception as e:
+                logger.error(f"Error scheduling workflow {workflow.workflow_id}: {e}", exc_info=True)
             
-        logger.info(f"Loaded {len(workflows)} scheduled workflows")
+        logger.info(f"Successfully loaded {scheduled_count} out of {len(workflows)} scheduled workflows")
 
     async def schedule_workflow(self, workflow_id: str):
         """Schedule a workflow to run based on its cron expression.
@@ -140,17 +152,22 @@ class WorkflowScheduler:
             logger.error(f"Cannot update schedule for workflow {workflow_id}: not found")
             return
         
+        logger.info(f"Updating schedule for workflow {workflow_id}: cron_enabled={workflow.cron_enabled}, cron_expression={workflow.cron_expression}")
+        
         # If cron is enabled and expression is set, schedule the workflow
         if workflow.cron_enabled and workflow.cron_expression:
+            logger.info(f"Scheduling workflow {workflow_id} with cron expression: {workflow.cron_expression}")
             await self.schedule_workflow(workflow_id)
         else:
             # Otherwise, unschedule it
+            logger.info(f"Unscheduling workflow {workflow_id} (cron_enabled={workflow.cron_enabled}, cron_expression={workflow.cron_expression})")
             await self.unschedule_workflow(workflow_id)
             
             # Clear the next_run_time in the database
             await app.DATABASE.update_workflow(
                 workflow_id=workflow_id,
-                next_run_time=None
+                next_run_time=None,
+                cron_enabled=workflow.cron_enabled  # Ensure cron_enabled is properly set
             )
 
     async def _execute_workflow(self, workflow_id: str, organization_id: str):
@@ -162,27 +179,51 @@ class WorkflowScheduler:
             workflow_id: The ID of the workflow to execute
             organization_id: The ID of the organization that owns the workflow
         """
+        logger.info(f"Starting execution of scheduled workflow {workflow_id} for organization {organization_id}")
+        
         try:
+            # Get the workflow to verify it exists and get its details
+            workflow = await app.DATABASE.get_workflow(workflow_id)
+            if not workflow:
+                logger.error(f"Cannot execute workflow {workflow_id}: workflow not found")
+                return
+                
+            logger.info(f"Workflow details - ID: {workflow_id}, Title: {workflow.title}, Cron: {workflow.cron_expression}, Enabled: {workflow.cron_enabled}")
+            
             # Get the organization
             organization = await app.DATABASE.get_organization(organization_id)
             if not organization:
                 logger.error(f"Cannot execute workflow {workflow_id}: organization {organization_id} not found")
                 return
             
+            logger.info(f"Organization details - ID: {organization.organization_id}, Name: {organization.name}")
+            
             # Create a workflow run
+            logger.info(f"Creating workflow run for workflow {workflow_id}")
             workflow_run = await self._create_workflow_run(workflow_id, organization, triggered_by_cron=True)
             if not workflow_run:
+                logger.error(f"Failed to create workflow run for workflow {workflow_id}")
                 return
                 
+            logger.info(f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow_id}")
+                
             # Execute the workflow
+            logger.info(f"Executing workflow run {workflow_run.workflow_run_id}")
             await self._run_workflow(organization, workflow_id, workflow_run.workflow_run_id)
             
             # Update the next run time in the database
+            logger.info(f"Updating next run time for workflow {workflow_id}")
             await self._update_next_run_time(workflow_id)
             
             logger.info(f"Successfully executed scheduled workflow {workflow_id}, run ID: {workflow_run.workflow_run_id}")
         except Exception as e:
             logger.error(f"Error executing scheduled workflow {workflow_id}: {e}", exc_info=True)
+            # Try to log more context about the error
+            try:
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+            except:
+                pass
 
     async def _create_workflow_run(self, workflow_id: str, organization: Organization, triggered_by_cron: bool = False):
         """Create a workflow run for a scheduled execution.

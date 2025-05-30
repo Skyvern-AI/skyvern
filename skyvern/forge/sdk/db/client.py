@@ -1459,12 +1459,16 @@ class AgentDB:
                     if version:
                         workflow.version = version
                     if cron_expression is not None:
+                        LOG.debug(f"Updating cron_expression from {workflow.cron_expression} to {cron_expression}")
                         workflow.cron_expression = cron_expression
                     if timezone is not None:
+                        LOG.debug(f"Updating timezone from {workflow.timezone} to {timezone}")
                         workflow.timezone = timezone
                     if cron_enabled is not None:
+                        LOG.debug(f"Updating cron_enabled from {workflow.cron_enabled} to {cron_enabled}")
                         workflow.cron_enabled = cron_enabled
                     if next_run_time is not None:
+                        LOG.debug(f"Updating next_run_time from {workflow.next_run_time} to {next_run_time}")
                         workflow.next_run_time = next_run_time
                     await session.commit()
                     await session.refresh(workflow)
