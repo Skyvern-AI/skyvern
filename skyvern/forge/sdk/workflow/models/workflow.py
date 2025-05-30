@@ -77,6 +77,11 @@ class Workflow(BaseModel):
     persist_browser_session: bool = False
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
+    # Cron job related fields
+    cron_expression: str | None = None
+    timezone: str | None = None
+    cron_enabled: bool = False
+    next_run_time: datetime | None = None
 
     created_at: datetime
     modified_at: datetime

@@ -418,3 +418,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
     status: WorkflowStatus = WorkflowStatus.published
+    # Cron job related fields
+    cron_expression: str | None = None
+    timezone: str | None = None
+    cron_enabled: bool = False
