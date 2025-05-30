@@ -1978,6 +1978,10 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
   const userParameters = workflow.workflow_definition.parameters.filter(
     (parameter) => parameter.parameter_type !== WorkflowParameterTypes.Output,
   );
+  console.log(
+    "Converting workflow for export, cron_expression:",
+    workflow.cron_expression,
+  );
   return {
     title: workflow.title,
     description: workflow.description,
@@ -1985,6 +1989,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
     model: workflow.model,
+    cron_expression: workflow.cron_expression,
     totp_verification_url: workflow.totp_verification_url,
     workflow_definition: {
       parameters: convertParametersToParameterYAML(userParameters),

@@ -227,6 +227,7 @@ function FlowRenderer({
         return;
       }
       const client = await getClient(credentialGetter);
+      console.log("Cron expression in request:", data.settings.cronExpression);
       const requestBody: WorkflowCreateYAMLRequest = {
         title: data.title,
         description: workflow.description,
@@ -234,6 +235,7 @@ function FlowRenderer({
         webhook_callback_url: data.settings.webhookCallbackUrl,
         persist_browser_session: data.settings.persistBrowserSession,
         model: data.settings.model,
+        cron_expression: data.settings.cronExpression,
         totp_verification_url: workflow.totp_verification_url,
         workflow_definition: {
           parameters: data.parameters,
@@ -292,6 +294,7 @@ function FlowRenderer({
   async function handleSave() {
     const blocks = getWorkflowBlocks(nodes, edges);
     const settings = getWorkflowSettings(nodes);
+    console.log("Settings when saving:", settings);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
     const filteredParameters = workflow.workflow_definition.parameters.filter(
       (parameter) => {
