@@ -1,4 +1,5 @@
-FROM python:3.11 AS requirements-stage
+FROM python:3.11 as requirements-stage
+# Run `skyvern init llm` before building to generate the .env file
 
 WORKDIR /tmp
 RUN pip install poetry
@@ -32,7 +33,7 @@ RUN bw --version
 
 COPY . /app
 
-ENV PYTHONPATH="/app:$PYTHONPATH"
+ENV PYTHONPATH="/app"
 ENV VIDEO_PATH=/data/videos
 ENV HAR_PATH=/data/har
 ENV LOG_PATH=/data/log

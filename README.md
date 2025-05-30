@@ -80,6 +80,7 @@ print(task)
 
 Or your local Skyvern service from step 2:
 ```python
+# Find your API KEY in .env
 skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API KEY")
 task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
@@ -193,6 +194,7 @@ skyvern status
 1. Make sure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running on your machine
 1. Make sure you don't have postgres running locally (Run `docker ps` to check)
 1. Clone the repository and navigate to the root directory
+1. Run `skyvern init llm` to generate a `.env` file. This will be copied into the Docker image.
 1. Fill in the LLM provider key on the [docker-compose.yml](./docker-compose.yml). *If you want to run Skyvern on a remote server, make sure you set the correct server ip for the UI container in [docker-compose.yml](./docker-compose.yml).*
 2. Run the following command via the commandline:
    ```bash
@@ -369,7 +371,10 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 </p>
 
 # Contributor Setup
-
+For a complete local environment CLI Installation
+```bash
+pip install -e .
+```
 The following command sets up your development environment to use pre-commit (our commit hook handler)
 ```
 skyvern quickstart contributors

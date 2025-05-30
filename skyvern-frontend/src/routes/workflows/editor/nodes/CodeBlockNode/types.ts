@@ -25,4 +25,5 @@ export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   code: codeLead,
   continueOnFailure: false,
   parameterKeys: null,
+  model: null,
 } as const;

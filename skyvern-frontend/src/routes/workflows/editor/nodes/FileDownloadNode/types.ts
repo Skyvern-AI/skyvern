@@ -33,6 +33,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   continueOnFailure: false,
   cacheActions: false,
   engine: RunEngine.SkyvernV1,
+  model: null,
 } as const;
 
 export function isFileDownloadNode(node: Node): node is FileDownloadNode {

@@ -795,6 +795,18 @@ class SkyvernElement:
             LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
             raise
 
+    async def refresh_select_options(self) -> tuple[list, str] | None:
+        if self.get_tag_name() != InteractiveElement.SELECT:
+            return None
+
+        frame = await SkyvernFrame.create_instance(self.get_frame())
+        options, selected_value = await frame.get_select_options(await self.get_element_handler())
+        self.__static_element["options"] = options
+        if "attributes" in self.__static_element:
+            self.__static_element["attributes"]["selected"] = selected_value
+            self._attributes = self.__static_element["attributes"]
+        return options, selected_value
+
 
 class DomUtil:
     """

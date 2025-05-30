@@ -119,6 +119,11 @@ jobs:
           ENABLE_BEDROCK: "true"
         with:
           args: "run --hook-stage manual alembic-check"
+      - name: trigger tests
+        env:
+          ENABLE_OPENAI: "true"
+          OPENAI_API_KEY: "sk-dummy"
+        run: poetry run pytest tests
 
   fe-lint-build:
     runs-on: ubuntu-latest

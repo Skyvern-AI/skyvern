@@ -1,5 +1,6 @@
 import { RunEngine } from "@/api/types";
 import { WorkflowBlockType } from "./workflowTypes";
+import { WorkflowModel } from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
@@ -7,6 +8,7 @@ export type WorkflowCreateYAMLRequest = {
   proxy_location?: string | null;
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
+  model?: WorkflowModel | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
@@ -189,6 +191,7 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
+  model: WorkflowModel | null;
   include_action_history_in_verification: boolean;
 };
 

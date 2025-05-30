@@ -33,6 +33,7 @@ export const actionNodeDefaultData: ActionNodeData = {
   continueOnFailure: false,
   cacheActions: false,
   engine: RunEngine.SkyvernV1,
+  model: null,
 } as const;
 
 export function isActionNode(node: Node): node is ActionNode {

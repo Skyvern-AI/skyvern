@@ -22,6 +22,7 @@ export const taskv2NodeDefaultData: Taskv2NodeData = {
   totpIdentifier: null,
   totpVerificationUrl: null,
   maxSteps: MAX_STEPS_DEFAULT,
+  model: null,
 };
 
 export function isTaskV2Node(node: Node): node is Taskv2Node {

@@ -291,3 +291,7 @@ class SkyvernFrame:
     async def remove_target_attr(self, element: ElementHandle) -> None:
         js_script = "(element) => element.removeAttribute('target')"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
+
+    async def get_select_options(self, element: ElementHandle) -> tuple[list, str]:
+        js_script = "([element]) => getSelectOptions(element)"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])

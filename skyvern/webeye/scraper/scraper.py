@@ -725,7 +725,7 @@ class IncrementalScrapePage:
         return self.element_tree_trimmed
 
     async def start_listen_dom_increment(self, element: ElementHandle | None = None) -> None:
-        js_script = "(element) => startGlobalIncrementalObserver(element)"
+        js_script = "async (element) => await startGlobalIncrementalObserver(element)"
         await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script, arg=element)
 
     async def stop_listen_dom_increment(self) -> None:
