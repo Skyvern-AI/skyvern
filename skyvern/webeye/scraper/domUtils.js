@@ -1432,7 +1432,7 @@ async function buildElementTree(
 ) {
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
-    hoverStylesMap = getHoverStylesMap();
+    hoverStylesMap = await getHoverStylesMap();
   }
 
   var elements = [];
@@ -2163,72 +2163,114 @@ function scrollToElementTop(element) {
  * https://stackoverflow.com/questions/7013559/is-there-a-way-to-get-element-hover-style-while-the-element-not-in-hover-state
  * https://stackoverflow.com/questions/17226676/how-to-simulate-a-mouseover-in-pure-javascript-that-activates-the-css-hover
  */
-function getHoverStylesMap() {
+async function getHoverStylesMap() {
   const hoverMap = new Map();
-  const sheets = document.styleSheets;
+  const sheets = [...document.styleSheets];
+
+  const parseCssSheet = (sheet) => {
+    const rules = sheet.cssRules || sheet.rules;
+    for (const rule of rules) {
+      if (rule.type === 1 && rule.selectorText) {
+        // Split multiple selectors (e.g., "a:hover, button:hover")
+        const selectors = rule.selectorText.split(",").map((s) => s.trim());
+
+        for (const selector of selectors) {
+          // Check if this is a hover rule
+          if (selector.includes(":hover")) {
+            // Get all parts of the selector
+            const parts = selector.split(/\s*[>+~]\s*/);
+
+            // Get the main hoverable element (the one with :hover)
+            const hoverPart = parts.find((part) => part.includes(":hover"));
+            if (!hoverPart) continue;
+
+            // Get base selector without :hover
+            const baseSelector = hoverPart.replace(/:hover/g, "").trim();
+
+            // Skip invalid selectors
+            if (!isValidCSSSelector(baseSelector)) {
+              continue;
+            }
+
+            // Get or create styles object for this selector
+            let styles = hoverMap.get(baseSelector) || {};
+
+            // Add all style properties
+            for (const prop of rule.style) {
+              styles[prop] = rule.style[prop];
+            }
+
+            // If this is a nested selector (like :hover > .something)
+            // store it in a special format
+            if (parts.length > 1) {
+              const fullSelector = selector;
+              styles["__nested__"] = styles["__nested__"] || [];
+              styles["__nested__"].push({
+                selector: fullSelector,
+                styles: Object.fromEntries(
+                  [...rule.style].map((prop) => [prop, rule.style[prop]]),
+                ),
+              });
+            }
+
+            // only need the style which includes the cursor attribute.
+            if (!("cursor" in styles)) {
+              continue;
+            }
+            hoverMap.set(baseSelector, styles);
+          }
+        }
+      }
+    }
+  };
 
   try {
-    for (const sheet of sheets) {
-      try {
-        const rules = sheet.cssRules || sheet.rules;
-        for (const rule of rules) {
-          if (rule.type === 1 && rule.selectorText) {
-            // Split multiple selectors (e.g., "a:hover, button:hover")
-            const selectors = rule.selectorText.split(",").map((s) => s.trim());
+    await Promise.all(
+      sheets.map(async (sheet) => {
+        try {
+          parseCssSheet(sheet);
+        } catch (e) {
+          _jsConsoleWarn("Could not access stylesheet:", e);
 
-            for (const selector of selectors) {
-              // Check if this is a hover rule
-              if (selector.includes(":hover")) {
-                // Get all parts of the selector
-                const parts = selector.split(/\s*[>+~]\s*/);
+          if ((e.name !== "SecurityError" && e.code !== 18) || !sheet.href) {
+            return;
+          }
 
-                // Get the main hoverable element (the one with :hover)
-                const hoverPart = parts.find((part) => part.includes(":hover"));
-                if (!hoverPart) continue;
+          let newLink = null;
+          try {
+            _jsConsoleLog("recreating the link element: ", sheet.href);
+            const oldLink = document.querySelector(
+              `link[href="${sheet.href}"]`,
+            );
+            newLink = document.createElement("link");
+            newLink.rel = "stylesheet";
+            newLink.href = oldLink.href + "?v=" + Date.now(); // to void cache
+            newLink.crossOrigin = "anonymous";
+            // until the new link loaded, removing the old one
+            document.head.append(newLink);
 
-                // Get base selector without :hover
-                const baseSelector = hoverPart.replace(/:hover/g, "").trim();
-
-                // Skip invalid selectors
-                if (!isValidCSSSelector(baseSelector)) {
-                  continue;
-                }
-
-                // Get or create styles object for this selector
-                let styles = hoverMap.get(baseSelector) || {};
-
-                // Add all style properties
-                for (const prop of rule.style) {
-                  styles[prop] = rule.style[prop];
-                }
-
-                // If this is a nested selector (like :hover > .something)
-                // store it in a special format
-                if (parts.length > 1) {
-                  const fullSelector = selector;
-                  styles["__nested__"] = styles["__nested__"] || [];
-                  styles["__nested__"].push({
-                    selector: fullSelector,
-                    styles: Object.fromEntries(
-                      [...rule.style].map((prop) => [prop, rule.style[prop]]),
-                    ),
-                  });
-                }
-
-                // only need the style which includes the cursor attribute.
-                if (!("cursor" in styles)) {
-                  continue;
-                }
-                hoverMap.set(baseSelector, styles);
-              }
+            // wait for a while until the sheet is fully loaded
+            await asyncSleepFor(1500);
+            const newSheets = [...document.styleSheets];
+            const refreshedSheet = newSheets.find(
+              (s) => s.href === newLink.href,
+            );
+            if (!refreshedSheet) {
+              newLink.remove();
+              return;
+            }
+            _jsConsoleLog("parsing recreated the link element: ", newLink.href);
+            parseCssSheet(refreshedSheet);
+            oldLink.remove();
+          } catch (e) {
+            _jsConsoleWarn("Error recreating the link element:", e);
+            if (newLink) {
+              newLink.remove();
             }
           }
         }
-      } catch (e) {
-        _jsConsoleWarn("Could not access stylesheet:", e);
-        continue;
-      }
-    }
+      }),
+    );
   } catch (e) {
     _jsConsoleError("Error processing stylesheets:", e);
   }
@@ -2468,11 +2510,11 @@ if (window.globalObserverForDOMIncrement === undefined) {
   });
 }
 
-function startGlobalIncrementalObserver(element = null) {
+async function startGlobalIncrementalObserver(element = null) {
   window.globalListnerFlag = true;
   window.globalDomDepthMap = new Map();
   window.globalOneTimeIncrementElements = [];
-  window.globalHoverStylesMap = getHoverStylesMap();
+  window.globalHoverStylesMap = await getHoverStylesMap();
   window.globalParsedElementCounter = new SafeCounter();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   window.globalObserverForDOMIncrement.observe(document.body, {
