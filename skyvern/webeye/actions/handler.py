@@ -3193,6 +3193,7 @@ async def normal_select(
         step_id=step.step_id,
     )
 
+    await skyvern_element.refresh_select_options()
     options_html = skyvern_element.build_HTML()
     field_information = (
         input_or_select_context.field if not input_or_select_context.intention else input_or_select_context.intention
