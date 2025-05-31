@@ -18,7 +18,6 @@ def stop_server(
     port = settings.PORT
     with console.status(f"[bold green]Checking for process on port {port}...") as status:
         pids = get_pids_on_port(port)
-        status.stop()
     if not pids:
         console.print(f"[yellow]No process found running on port {port}.[/yellow]")
         return
