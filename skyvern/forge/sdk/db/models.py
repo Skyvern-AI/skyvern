@@ -92,6 +92,7 @@ class TaskModel(Base):
         nullable=False,
         index=True,
     )
+    model = Column(JSON, nullable=True)
 
 
 class StepModel(Base):
@@ -595,6 +596,7 @@ class TaskV2Model(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    model = Column(JSON, nullable=True)
 
 
 class ThoughtModel(Base):

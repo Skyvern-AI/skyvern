@@ -168,6 +168,7 @@ async def run_task(
             totp_verification_url=run_request.totp_url,
             totp_identifier=run_request.totp_identifier,
             include_action_history_in_verification=run_request.include_action_history_in_verification,
+            model=run_request.model,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -222,6 +223,7 @@ async def run_task(
                 extracted_information_schema=run_request.data_extraction_schema,
                 error_code_mapping=run_request.error_code_mapping,
                 create_task_run=True,
+                model=run_request.model,
             )
         except LLMProviderError:
             LOG.error("LLM failure to initialize task v2", exc_info=True)

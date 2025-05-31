@@ -5,6 +5,7 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -105,6 +106,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.organization_id = organization_id
         context.max_steps_override = max_steps_override
 
+        llm_key = task.llm_key
+        llm_caller = LLMCaller(llm_key) if llm_key else None
+
         if background_tasks:
             background_tasks.add_task(
                 app.agent.execute_step,
@@ -115,6 +119,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
                 engine=engine,
+                llm_caller=llm_caller,
             )
 
     async def execute_workflow(

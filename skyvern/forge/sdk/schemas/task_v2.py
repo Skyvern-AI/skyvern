@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from skyvern.config import settings
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.utils.url_validators import validate_url
 
@@ -43,9 +44,27 @@ class TaskV2(BaseModel):
     webhook_callback_url: str | None = None
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict | None = None
-
+    model: dict[str, Any] | None = None
     created_at: datetime
     modified_at: datetime
+
+    @property
+    def llm_key(self) -> str | None:
+        """
+        If the `TaskV2` has a `model` defined, then return the mapped llm_key for it.
+
+        Otherwise return `None`.
+        """
+
+        if self.model:
+            model_name = self.model.get("model_name")
+            if model_name:
+                mapping = settings.get_model_name_to_llm_key()
+                llm_key = mapping.get(model_name)
+                if llm_key:
+                    return llm_key
+
+        return None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

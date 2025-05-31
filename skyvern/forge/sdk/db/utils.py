@@ -91,6 +91,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         error_code_mapping=task_obj.error_code_mapping,
         errors=task_obj.errors,
         application=task_obj.application,
+        model=task_obj.model,
     )
     return task
 
