@@ -20,6 +20,21 @@ import { Separator } from "@/components/ui/separator";
 import { ModelsResponse } from "@/api/types";
 import { ModelSelector } from "@/components/ModelSelector";
 
+function isValidCronExpression(value: string): boolean {
+  const part = '(?:\\*|\\d+|\\d+-\\d+)(?:/\\d+)?';
+  const regex = new RegExp(`^${part}\\s+${part}\\s+${part}\\s+${part}\\s+${part}$`);
+  return regex.test(value.trim());
+}
+
+function isValidTimezone(tz: string): boolean {
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const credentialGetter = useCredentialGetter();
   const { updateNodeData } = useReactFlow();
@@ -46,7 +61,12 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       ? data.persistBrowserSession
       : false,
     model: data.withWorkflowSettings ? data.model : { model: models[0] || "" },
+    cronSchedule: data.withWorkflowSettings ? data.cronSchedule ?? "" : "",
+    cronTimezone: data.withWorkflowSettings ? data.cronTimezone ?? "" : "",
   });
+
+  const [cronError, setCronError] = useState<string | null>(null);
+  const [timezoneError, setTimezoneError] = useState<string | null>(null);
 
   function handleChange(key: string, value: unknown) {
     if (!data.editable) {
@@ -54,6 +74,20 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     }
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
+    if (key === "cronSchedule") {
+      if (value && typeof value === "string" && !isValidCronExpression(value)) {
+        setCronError("Invalid cron expression");
+      } else {
+        setCronError(null);
+      }
+    }
+    if (key === "cronTimezone") {
+      if (value && typeof value === "string" && !isValidTimezone(value)) {
+        setTimezoneError("Invalid timezone");
+      } else {
+        setTimezoneError(null);
+      }
+    }
   }
 
   if (data.withWorkflowSettings) {
@@ -124,6 +158,40 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <Label>Cron Schedule</Label>
+                        <HelpTooltip content="CRON expression for scheduling runs" />
+                      </div>
+                      <Input
+                        value={inputs.cronSchedule}
+                        placeholder="* * * * *"
+                        onChange={(event) => {
+                          handleChange("cronSchedule", event.target.value);
+                        }}
+                        className={cronError ? "border-red-500" : undefined}
+                      />
+                      {cronError && (
+                        <p className="text-xs text-red-500">{cronError}</p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex gap-2">
+                        <Label>Timezone</Label>
+                        <HelpTooltip content="IANA timezone identifier" />
+                      </div>
+                      <Input
+                        value={inputs.cronTimezone}
+                        placeholder="UTC"
+                        onChange={(event) => {
+                          handleChange("cronTimezone", event.target.value);
+                        }}
+                        className={timezoneError ? "border-red-500" : undefined}
+                      />
+                      {timezoneError && (
+                        <p className="text-xs text-red-500">{timezoneError}</p>
+                      )}
                     </div>
                   </div>
                 </AccordionContent>

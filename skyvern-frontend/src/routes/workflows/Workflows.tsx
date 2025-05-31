@@ -49,6 +49,8 @@ import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
+  cron_schedule: null,
+  cron_timezone: null,
   workflow_definition: {
     blocks: [],
     parameters: [],
