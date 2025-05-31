@@ -174,6 +174,7 @@ class ForgeAgent:
             max_steps_per_run=task_block.max_steps_per_run,
             error_code_mapping=task_block.error_code_mapping,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
+            model=task_block.model,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -387,7 +388,10 @@ class ForgeAgent:
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
                 if not llm_caller:
                     # if not, create a new llm_caller
-                    llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True)
+                    llm_key = task.llm_key
+                    llm_caller = LLMCaller(
+                        llm_key=llm_key or settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True
+                    )
 
             # TODO: remove the code after migrating everything to llm callers
             # currently, only anthropic cua tasks use llm_caller
