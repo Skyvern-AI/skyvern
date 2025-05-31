@@ -125,22 +125,22 @@ def run_ui() -> None:
         )
         return
 
-    if not (frontend_dir / ".env").exists():
+    frontend_env_path = frontend_dir / ".env"
+    if not frontend_env_path.exists():
         console.print("[bold blue]Setting up frontend .env file...[/bold blue]")
-        shutil.copy(frontend_dir / ".env.example", frontend_dir / ".env")
-        main_env_path = current_dir / ".env"
-        if main_env_path.exists():
-            load_dotenv(main_env_path)
-            skyvern_api_key = os.getenv("SKYVERN_API_KEY")
-            if skyvern_api_key:
-                frontend_env_path = frontend_dir / ".env"
-                set_key(str(frontend_env_path), "VITE_SKYVERN_API_KEY", skyvern_api_key)
-            else:
-                console.print("[red]ERROR: SKYVERN_API_KEY not found in .env file[/red]")
-        else:
-            console.print("[red]ERROR: .env file not found[/red]")
-
+        shutil.copy(frontend_dir / ".env.example", frontend_env_path)
         console.print("✅ [green]Successfully set up frontend .env file[/green]")
+
+    main_env_path = current_dir / ".env"
+    if main_env_path.exists():
+        load_dotenv(main_env_path)
+        skyvern_api_key = os.getenv("SKYVERN_API_KEY")
+        if skyvern_api_key:
+            set_key(str(frontend_env_path), "VITE_SKYVERN_API_KEY", skyvern_api_key)
+        else:
+            console.print("[red]ERROR: SKYVERN_API_KEY not found in .env file[/red]")
+    else:
+        console.print("[red]ERROR: .env file not found[/red]")
 
     os.chdir(frontend_dir)
 
