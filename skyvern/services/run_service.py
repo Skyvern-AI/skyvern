@@ -38,6 +38,13 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         elif run.task_run_type == RunType.anthropic_cua:
             run_engine = RunEngine.anthropic_cua
 
+        first_step = await app.DATABASE.get_first_step(
+            task_id=run.run_id, organization_id=organization_id
+        )
+        queue_time_seconds = None
+        if first_step:
+            queue_time_seconds = (first_step.created_at - run.created_at).total_seconds()
+
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
@@ -50,6 +57,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             recording_url=task_v1_response.recording_url,
             screenshot_urls=task_v1_response.action_screenshot_urls,
             downloaded_files=task_v1_response.downloaded_files,
+            queue_time_seconds=queue_time_seconds,
             run_request=TaskRunRequest(
                 engine=run_engine,
                 prompt=task_v1_response.request.navigation_goal,
@@ -67,7 +75,13 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             return None
-        return await task_v2_service.build_task_v2_run_response(task_v2)
+        thoughts = await app.DATABASE.get_thoughts(
+            task_v2_id=task_v2.observer_cruise_id, organization_id=organization_id
+        )
+        queue_time_seconds = None
+        if thoughts:
+            queue_time_seconds = (thoughts[0].created_at - task_v2.created_at).total_seconds()
+        return await task_v2_service.build_task_v2_run_response(task_v2, queue_time_seconds)
     elif run.task_run_type == RunType.workflow_run:
         return await workflow_service.get_workflow_run_response(run.run_id, organization_id=organization_id)
     raise ValueError(f"Invalid task run type: {run.task_run_type}")
