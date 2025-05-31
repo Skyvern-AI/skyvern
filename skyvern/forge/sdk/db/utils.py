@@ -170,32 +170,37 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
 
 
 def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = False) -> Workflow:
+    wm = workflow_model  # local variable for faster attribute lookups
+
     if debug_enabled:
         LOG.debug(
             "Converting WorkflowModel to Workflow",
-            workflow_id=workflow_model.workflow_id,
+            workflow_id=wm.workflow_id,
         )
 
+    proxy_location = ProxyLocation(wm.proxy_location) if wm.proxy_location else None
+    workflow_status = WorkflowStatus(wm.status)
+
     return Workflow(
-        workflow_id=workflow_model.workflow_id,
-        organization_id=workflow_model.organization_id,
-        title=workflow_model.title,
-        workflow_permanent_id=workflow_model.workflow_permanent_id,
-        webhook_callback_url=workflow_model.webhook_callback_url,
-        totp_verification_url=workflow_model.totp_verification_url,
-        totp_identifier=workflow_model.totp_identifier,
-        cron=workflow_model.cron,
-        persist_browser_session=workflow_model.persist_browser_session,
-        model=workflow_model.model,
-        proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),
-        version=workflow_model.version,
-        is_saved_task=workflow_model.is_saved_task,
-        description=workflow_model.description,
-        workflow_definition=WorkflowDefinition.model_validate(workflow_model.workflow_definition),
-        created_at=workflow_model.created_at,
-        modified_at=workflow_model.modified_at,
-        deleted_at=workflow_model.deleted_at,
-        status=WorkflowStatus(workflow_model.status),
+        workflow_id=wm.workflow_id,
+        organization_id=wm.organization_id,
+        title=wm.title,
+        workflow_permanent_id=wm.workflow_permanent_id,
+        webhook_callback_url=wm.webhook_callback_url,
+        totp_verification_url=wm.totp_verification_url,
+        totp_identifier=wm.totp_identifier,
+        cron=wm.cron,
+        persist_browser_session=wm.persist_browser_session,
+        model=wm.model,
+        proxy_location=proxy_location,
+        version=wm.version,
+        is_saved_task=wm.is_saved_task,
+        description=wm.description,
+        workflow_definition=WorkflowDefinition.model_validate(wm.workflow_definition),
+        created_at=wm.created_at,
+        modified_at=wm.modified_at,
+        deleted_at=wm.deleted_at,
+        status=workflow_status,
     )
 
 
