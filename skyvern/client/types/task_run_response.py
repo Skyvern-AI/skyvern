@@ -57,6 +57,11 @@ class TaskRunResponse(UniversalBaseModel):
     Timestamp when this run was last modified
     """
 
+    run_time_seconds: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    Total run time in seconds
+    """
+
     app_url: typing.Optional[str] = pydantic.Field(default=None)
     """
     URL to the application UI where the run can be viewed

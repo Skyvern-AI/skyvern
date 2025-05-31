@@ -46,6 +46,11 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             failure_reason=task_v1_response.failure_reason,
             created_at=task_v1_response.created_at,
             modified_at=task_v1_response.modified_at,
+            run_time_seconds=int(
+                (
+                    task_v1_response.modified_at - task_v1_response.created_at
+                ).total_seconds()
+            ),
             app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
             recording_url=task_v1_response.recording_url,
             screenshot_urls=task_v1_response.action_screenshot_urls,

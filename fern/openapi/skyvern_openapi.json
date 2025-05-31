@@ -7094,6 +7094,15 @@
               "2025-01-01T00:05:00Z"
             ]
           },
+          "run_time_seconds": {
+            "type": "integer",
+            "title": "Run Time Seconds",
+            "description": "Total run time in seconds",
+            "examples": [
+              60,
+              120
+            ]
+          },
           "app_url": {
             "anyOf": [
               {
@@ -9177,6 +9186,15 @@
             "description": "Timestamp when this run was last modified",
             "examples": [
               "2025-01-01T00:05:00Z"
+            ]
+          },
+          "run_time_seconds": {
+            "type": "integer",
+            "title": "Run Time Seconds",
+            "description": "Total run time in seconds",
+            "examples": [
+              60,
+              120
             ]
           },
           "app_url": {

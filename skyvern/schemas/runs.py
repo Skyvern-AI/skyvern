@@ -357,6 +357,11 @@ class BaseRunResponse(BaseModel):
     modified_at: datetime = Field(
         description="Timestamp when this run was last modified", examples=["2025-01-01T00:05:00Z"]
     )
+    run_time_seconds: int | None = Field(
+        default=None,
+        description="Total run time in seconds",
+        examples=[60, 120],
+    )
     app_url: str | None = Field(
         default=None,
         description="URL to the application UI where the run can be viewed",

@@ -86,6 +86,9 @@ async def get_workflow_run_response(
         app_url=app_url,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
+        run_time_seconds=int(
+            (workflow_run.modified_at - workflow_run.created_at).total_seconds()
+        ),
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_permanent_id,
             title=workflow_run_resp.workflow_title,

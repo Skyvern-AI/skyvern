@@ -25,6 +25,7 @@ class GetRunResponse_TaskV1(UniversalBaseModel):
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    run_time_seconds: typing.Optional[int] = None
     app_url: typing.Optional[str] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
@@ -49,6 +50,7 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    run_time_seconds: typing.Optional[int] = None
     app_url: typing.Optional[str] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
@@ -73,6 +75,7 @@ class GetRunResponse_OpenaiCua(UniversalBaseModel):
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    run_time_seconds: typing.Optional[int] = None
     app_url: typing.Optional[str] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
@@ -97,6 +100,7 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    run_time_seconds: typing.Optional[int] = None
     app_url: typing.Optional[str] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
@@ -121,6 +125,7 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
+    run_time_seconds: typing.Optional[int] = None
     app_url: typing.Optional[str] = None
     run_request: typing.Optional[WorkflowRunRequest] = None
 
