@@ -210,6 +210,24 @@ skyvern status
 If you encounter any database related errors while using Docker to run Skyvern, check which Postgres container is running with `docker ps`.
 
 
+## Cron Workflows
+
+Skyvern can run workflows on a recurring schedule. Enable this feature by adding the following variables to your `.env` file:
+
+```bash
+ENABLE_CRON_WORKFLOWS=true
+DEFAULT_CRON_TIMEZONE=UTC
+```
+
+`DEFAULT_CRON_TIMEZONE` sets the timezone used when cron expressions omit one. Use any valid IANA timezone string such as `UTC` or `America/Los_Angeles`.
+
+Start the scheduler alongside the API server with:
+
+```bash
+skyvern run scheduler
+```
+
+
 # How it works
 Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
 

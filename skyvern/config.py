@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
 
+    # cron workflow settings
+    ENABLE_CRON_WORKFLOWS: bool = False
+    DEFAULT_CRON_TIMEZONE: str = "UTC"
+
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
     EXTENSIONS: list[str] = []
