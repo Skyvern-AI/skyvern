@@ -1,11 +1,12 @@
-from .bitwarden import BitwardenService
-from .onepassword import OnePasswordService
+from skyvern.config import settings
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
     PasswordCredential,
 )
-from skyvern.config import settings
+
+from .bitwarden import BitwardenService
+from .onepassword import OnePasswordService
 
 
 class PasswordManagerService:

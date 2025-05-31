@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from enum import StrEnum
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 import structlog
 from pydantic import BaseModel
