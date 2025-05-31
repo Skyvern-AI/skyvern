@@ -52,17 +52,17 @@ You can also run browser tasks locally with Python code, with a little bit of se
 2. **Run Task In Python Code**
         ```python
         from skyvern import SkyvernAgent
-		import asyncio
+        import asyncio
         
         skyvern = SkyvernAgent()
-
-		async def run_task():
-	        task = await skyvern.run_task(
-    	        prompt="Find the top post on hackernews today",
-        	)
-	        print(task.model_dump())
-		
-		asyncio.run(run_task())
+        
+        async def run_task():
+            task = await skyvern.run_task(
+                prompt="Find the top post on hackernews today",
+            )
+            print(task.model_dump())
+        
+        asyncio.run(run_task())
 	    ```
         A local browser will pop up. Skyvern will start executing the task in the browser and close the browser when the task is done.
 
