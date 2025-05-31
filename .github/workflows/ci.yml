@@ -105,7 +105,8 @@ jobs:
           AWS_REGION: "us-east-1"
           ENABLE_BEDROCK: "true"
 
-      - name: Run alembic check
+      - name: Run the alembic-check pre-commit hook
+        uses: pre-commit/action@v3.0.0
         env:
           ENABLE_OPENAI: "true"
           OPENAI_API_KEY: "sk-dummy"
@@ -116,7 +117,8 @@ jobs:
           AZURE_GPT4O_MINI_API_VERSION: "dummy"
           AWS_REGION: "us-east-1"
           ENABLE_BEDROCK: "true"
-        run: poetry run ./run_alembic_check.sh
+        with:
+          args: "run --hook-stage manual alembic-check"
       - name: trigger tests
         env:
           ENABLE_OPENAI: "true"

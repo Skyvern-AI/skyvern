@@ -3368,7 +3368,6 @@ async def extract_information_for_navigation_goal(
         step=step,
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
-        llm_key_override=task.llm_key,
     )
 
     return ScrapeResult(

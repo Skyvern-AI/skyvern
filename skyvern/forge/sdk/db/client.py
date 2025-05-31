@@ -140,7 +140,6 @@ class AgentDB:
         task_type: str = TaskType.general,
         application: str | None = None,
         include_action_history_in_verification: bool | None = None,
-        model: dict[str, Any] | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -167,7 +166,6 @@ class AgentDB:
                     error_code_mapping=error_code_mapping,
                     application=application,
                     include_action_history_in_verification=include_action_history_in_verification,
-                    model=model,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -2365,7 +2363,6 @@ class AgentDB:
         webhook_callback_url: str | None = None,
         extracted_information_schema: dict | list | str | None = None,
         error_code_mapping: dict | None = None,
-        model: dict[str, Any] | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2381,7 +2378,6 @@ class AgentDB:
                 extracted_information_schema=extracted_information_schema,
                 error_code_mapping=error_code_mapping,
                 organization_id=organization_id,
-                model=model,
             )
             session.add(new_task_v2)
             await session.commit()

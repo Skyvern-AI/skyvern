@@ -229,7 +229,6 @@ class ForgeAgent:
             error_code_mapping=task_request.error_code_mapping,
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
-            model=task_request.model,
         )
         LOG.info(
             "Created new task",

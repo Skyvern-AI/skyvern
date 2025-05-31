@@ -61,7 +61,3 @@ URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. R
 BROWSER_SESSION_ID_DOC_STRING = """
 Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 """
-
-MODEL_CONFIG = """
-Optional model configuration.
-"""
