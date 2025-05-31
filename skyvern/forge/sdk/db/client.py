@@ -1251,28 +1251,16 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_workflows_with_cron_enabled(self) -> list[Workflow]:
-        """Get all workflows with cron_enabled=True.
-        
-        Returns:
-            A list of workflows with cron_enabled=True
-        """
-        try:
-            async with self.Session() as session:
-                workflows = (
-                    await session.scalars(
-                        select(WorkflowModel)
-                        .filter(WorkflowModel.cron_enabled == True)
-                        .filter(WorkflowModel.deleted_at.is_(None))
-                    )
-                ).all()
-                return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
+    async def get_workflows_with_cron(self) -> list[Workflow]:
+        """Return all workflows that have a cron schedule defined."""
+        async with self.Session() as session:
+            query = (
+                select(WorkflowModel)
+                .where(WorkflowModel.cron.is_not(None))
+                .where(WorkflowModel.deleted_at.is_(None))
+            )
+            workflows = (await session.scalars(query)).all()
+            return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
             
     async def get_workflow_by_permanent_id(
         self,

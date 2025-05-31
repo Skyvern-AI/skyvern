@@ -218,6 +218,7 @@ class WorkflowModel(Base):
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     model = Column(JSON, nullable=True)
+    cron = Column(String, nullable=True)
     status = Column(String, nullable=False, default="published")
     
     # Cron job scheduling fields

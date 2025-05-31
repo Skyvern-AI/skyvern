@@ -76,6 +76,7 @@ class Workflow(BaseModel):
     totp_identifier: str | None = None
     persist_browser_session: bool = False
     model: dict[str, Any] | None = None
+    cron: str | None = None
     status: WorkflowStatus = WorkflowStatus.published
     # Cron job related fields
     cron_expression: str | None = None
