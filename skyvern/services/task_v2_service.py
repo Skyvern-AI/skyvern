@@ -1595,7 +1595,6 @@ async def _summarize_task_v2(
         output=summarized_output,
     )
 
-
 async def build_task_v2_run_response(task_v2: TaskV2, queue_time_seconds: float | None = None) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
     from skyvern.services import workflow_service
