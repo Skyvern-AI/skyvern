@@ -118,7 +118,7 @@ jobs:
           AWS_REGION: "us-east-1"
           ENABLE_BEDROCK: "true"
         with:
-          args: "run --hook-stage manual alembic-check"
+          args: "--hook-stage manual alembic-check"
       - name: trigger tests
         env:
           ENABLE_OPENAI: "true"
