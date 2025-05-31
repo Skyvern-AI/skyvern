@@ -355,6 +355,10 @@ class BaseRunResponse(BaseModel):
         description="URL to the application UI where the run can be viewed",
         examples=["https://app.skyvern.com/tasks/tsk_123", "https://app.skyvern.com/workflows/wpid_123/wr_123"],
     )
+    queue_time_seconds: float | None = Field(
+        default=None,
+        description="Time in seconds the run spent in the task queue before execution",
+    )
 
 
 class TaskRunResponse(BaseRunResponse):
