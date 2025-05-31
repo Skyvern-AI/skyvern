@@ -7,6 +7,8 @@ import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
+  cron_schedule: null,
+  cron_timezone: null,
   workflow_definition: {
     blocks: [],
     parameters: [],

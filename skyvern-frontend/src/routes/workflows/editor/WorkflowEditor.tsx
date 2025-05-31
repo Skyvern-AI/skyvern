@@ -59,6 +59,8 @@ function WorkflowEditor() {
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
+    cronSchedule: (workflow as any).cron_schedule ?? null,
+    cronTimezone: (workflow as any).cron_timezone ?? null,
   };
 
   const elements = getElements(

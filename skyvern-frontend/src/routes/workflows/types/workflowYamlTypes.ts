@@ -9,6 +9,8 @@ export type WorkflowCreateYAMLRequest = {
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
   model?: WorkflowModel | null;
+  cron_schedule?: string | null;
+  cron_timezone?: string | null;
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;

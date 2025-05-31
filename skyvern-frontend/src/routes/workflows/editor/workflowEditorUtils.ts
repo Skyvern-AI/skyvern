@@ -662,6 +662,8 @@ function getElements(
       proxyLocation: settings.proxyLocation ?? ProxyLocation.Residential,
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
+      cronSchedule: settings.cronSchedule ?? null,
+      cronTimezone: settings.cronTimezone ?? null,
       editable,
     }),
   );
@@ -1322,6 +1324,8 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: null,
     model: null,
+    cronSchedule: null,
+    cronTimezone: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1337,6 +1341,8 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       proxyLocation: data.proxyLocation,
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
+      cronSchedule: data.cronSchedule,
+      cronTimezone: data.cronTimezone,
     };
   }
   return defaultSettings;
@@ -1981,6 +1987,8 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
     model: workflow.model,
+    cron_schedule: (workflow as any).cron_schedule ?? null,
+    cron_timezone: (workflow as any).cron_timezone ?? null,
     totp_verification_url: workflow.totp_verification_url,
     workflow_definition: {
       parameters: convertParametersToParameterYAML(userParameters),
