@@ -41,7 +41,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         first_step = await app.DATABASE.get_first_step(task_id=run.run_id, organization_id=organization_id)
         queue_time_seconds = None
         if first_step:
-            queue_time_seconds = (first_step.created_at - run.created_at).total_seconds()
+            queue_time_seconds = max(0, (first_step.created_at - run.created_at).total_seconds())
 
         return TaskRunResponse(
             run_id=run.run_id,
