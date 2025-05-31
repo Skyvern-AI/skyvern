@@ -16,8 +16,8 @@ def stop_server(
 ) -> None:
     """Stop the Skyvern API server running on the configured port."""
     port = settings.PORT
-    with console.status(f"[bold green]Checking for process on port {port}...") as status:
-        pids = get_pids_on_port(port)
+    console.print(f"[bold green]Checking for process on port {port}...[/bold green]")
+    pids = get_pids_on_port(port)
     if not pids:
         console.print(f"[yellow]No process found running on port {port}.[/yellow]")
         return
