@@ -5,7 +5,6 @@ from fastapi import BackgroundTasks, Request
 
 from skyvern.exceptions import OrganizationNotFound
 from skyvern.forge import app
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -96,20 +95,15 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
         run_obj = await app.DATABASE.get_run(run_id=task_id, organization_id=organization_id)
         engine = RunEngine.skyvern_v1
-        screenshot_scaling_enabled = False
         if run_obj and run_obj.task_run_type == RunType.openai_cua:
             engine = RunEngine.openai_cua
         elif run_obj and run_obj.task_run_type == RunType.anthropic_cua:
             engine = RunEngine.anthropic_cua
-            screenshot_scaling_enabled = True
 
         context: SkyvernContext = skyvern_context.ensure_context()
         context.task_id = task.task_id
         context.organization_id = organization_id
         context.max_steps_override = max_steps_override
-
-        llm_key = task.llm_key
-        llm_caller = LLMCaller(llm_key, screenshot_scaling_enabled=screenshot_scaling_enabled) if llm_key else None
 
         if background_tasks:
             background_tasks.add_task(
@@ -121,7 +115,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
                 engine=engine,
-                llm_caller=llm_caller,
             )
 
     async def execute_workflow(
