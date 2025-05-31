@@ -1596,7 +1596,7 @@ async def _summarize_task_v2(
     )
 
 
-async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
+async def build_task_v2_run_response(task_v2: TaskV2, queue_time_seconds: float | None = None) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
     from skyvern.services import workflow_service
 
@@ -1632,6 +1632,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         screenshot_urls=workflow_run_resp.screenshot_urls if workflow_run_resp else None,
         downloaded_files=workflow_run_resp.downloaded_files if workflow_run_resp else None,
         app_url=app_url,
+        queue_time_seconds=queue_time_seconds,
         run_request=TaskRunRequest(
             engine=RunEngine.skyvern_v2,
             prompt=task_v2.prompt or "",
@@ -1664,7 +1665,13 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         return
     try:
         # build the task v2 response with backward compatible data
-        task_run_response = await build_task_v2_run_response(task_v2)
+        thoughts = await app.DATABASE.get_thoughts(
+            task_v2_id=task_v2.observer_cruise_id, organization_id=organization_id
+        )
+        queue_time_seconds = None
+        if thoughts:
+            queue_time_seconds = (thoughts[0].created_at - task_v2.created_at).total_seconds()
+        task_run_response = await build_task_v2_run_response(task_v2, queue_time_seconds)
         task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
         payload_json = task_v2.model_dump_json(by_alias=True)
         payload_dict = json.loads(payload_json)
