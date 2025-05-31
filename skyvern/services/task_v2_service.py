@@ -163,6 +163,7 @@ async def initialize_task_v2(
     extracted_information_schema: dict | list | str | None = None,
     error_code_mapping: dict | None = None,
     create_task_run: bool = False,
+    model: dict[str, Any] | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -173,6 +174,7 @@ async def initialize_task_v2(
         proxy_location=proxy_location,
         extracted_information_schema=extracted_information_schema,
         error_code_mapping=error_code_mapping,
+        model=model,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -620,6 +622,7 @@ async def run_task_v2_helper(
                 screenshots=scraped_page.screenshots,
                 thought=thought,
                 prompt_name="task_v2",
+                llm_key_override=task_v2.llm_key,
             )
             LOG.info(
                 "Task v2 response",

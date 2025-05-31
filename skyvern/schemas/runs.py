@@ -21,6 +21,7 @@ from skyvern.schemas.docs.doc_strings import (
     DATA_EXTRACTION_SCHEMA_DOC_STRING,
     ERROR_CODE_MAPPING_DOC_STRING,
     MAX_STEPS_DOC_STRING,
+    MODEL_CONFIG,
     PROXY_LOCATION_DOC_STRING,
     TASK_ENGINE_DOC_STRING,
     TASK_PROMPT_DOC_STRING,
@@ -263,6 +264,12 @@ class TaskRunRequest(BaseModel):
         description=BROWSER_SESSION_ID_DOC_STRING,
         examples=BROWSER_SESSION_ID_EXAMPLES,
     )
+    model: dict[str, Any] | None = Field(
+        default=None,
+        description=MODEL_CONFIG,
+        examples=None,
+    )
+
     publish_workflow: bool = Field(
         default=False,
         description="Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",

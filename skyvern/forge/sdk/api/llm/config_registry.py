@@ -253,7 +253,7 @@ if settings.ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE4_OPUS",
         LLMConfig(
-            "anthropic/claude-opus-4-20250514",
+            "anthropic/claude-opus-4-latest",
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
@@ -263,7 +263,7 @@ if settings.ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
         "ANTHROPIC_CLAUDE4_SONNET",
         LLMConfig(
-            "anthropic/claude-sonnet-4-20250514",
+            "anthropic/claude-sonnet-4-latest",
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
