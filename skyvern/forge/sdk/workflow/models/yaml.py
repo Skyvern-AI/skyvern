@@ -415,6 +415,8 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_identifier: str | None = None
     persist_browser_session: bool = False
     model: dict[str, Any] | None = None
+    cron_schedule: str | None = None
+    cron_timezone: str | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
     status: WorkflowStatus = WorkflowStatus.published
