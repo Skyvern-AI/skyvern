@@ -70,6 +70,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.schemas.runs import CUA_RUN_TYPES
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions
 from skyvern.webeye.actions.actions import (
@@ -3363,12 +3364,18 @@ async def extract_information_for_navigation_goal(
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
 
+    task_run = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
+    llm_key_override = task.llm_key
+    if task_run and task_run.task_run_type in CUA_RUN_TYPES:
+        # CUA tasks should use the default data extraction llm key
+        llm_key_override = None
+
     json_response = await app.LLM_API_HANDLER(
         prompt=extract_information_prompt,
         step=step,
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
-        llm_key_override=task.llm_key,
+        llm_key_override=llm_key_override,
     )
 
     return ScrapeResult(

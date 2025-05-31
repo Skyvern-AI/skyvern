@@ -382,14 +382,17 @@ class ForgeAgent:
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
 
-            if not llm_caller:
+            if engine == RunEngine.anthropic_cua and not llm_caller:
+                # see if the llm_caller is already set in memory
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                if engine == RunEngine.anthropic_cua and not llm_caller:
-                    # llm_caller = LLMCaller(llm_key="BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_INFERENCE_PROFILE")
-                    llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                    if not llm_caller:
-                        llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True)
-                        LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
+                if not llm_caller:
+                    # if not, create a new llm_caller
+                    llm_caller = LLMCaller(llm_key=settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True)
+
+            # TODO: remove the code after migrating everything to llm callers
+            # currently, only anthropic cua tasks use llm_caller
+            if engine == RunEngine.anthropic_cua and llm_caller:
+                LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
 
             step, detailed_output = await self.agent_step(
                 task,

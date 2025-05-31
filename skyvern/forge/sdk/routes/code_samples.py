@@ -37,7 +37,7 @@ webhook_callback_url: https://example.com/webhook
 totp_verification_url: https://example.com/totp
 persist_browser_session: false
 model:
-  model: gpt-3.5-turbo
+  name: gpt-4.1
 workflow_definition:
   parameters:
     - key: website_url
@@ -121,7 +121,7 @@ workflow_definition = {
     "webhook_callback_url": "https://example.com/webhook",
     "totp_verification_url": "https://example.com/totp",
     "totp_identifier": "4155555555",
-    "model": {"model": "gpt-3.5-turbo"},
+    "model": {"name": "gpt-4.1"},
     "workflow_definition": {
         "parameters": [
             {
@@ -204,7 +204,8 @@ proxy_location: RESIDENTIAL
 webhook_callback_url: https://example.com/webhook
 totp_verification_url: https://example.com/totp
 persist_browser_session: false
-model: {model: gpt-3.5-turbo}
+model:
+  name: gpt-4.1
 workflow_definition:
   parameters:
     - key: website_url
@@ -287,7 +288,7 @@ updated_workflow_definition = {
     "webhook_callback_url": "https://example.com/webhook",
     "totp_verification_url": "https://example.com/totp",
     "totp_identifier": "4155555555",
-    "model": {"model": "gpt-3.5-turbo"},
+    "model": {"name": "gpt-4.1"},
     "workflow_definition": {
         "parameters": [
             {

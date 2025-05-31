@@ -629,7 +629,14 @@ class BaseTaskBlock(Block):
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
                 llm_key = workflow.determine_llm_key(block=self)
-                llm_caller = None if not llm_key else LLMCaller(llm_key=llm_key)
+                screenshot_scaling_enabled = False
+                if self.engine == RunEngine.anthropic_cua:
+                    screenshot_scaling_enabled = True
+                llm_caller = (
+                    None
+                    if not llm_key
+                    else LLMCaller(llm_key=llm_key, screenshot_scaling_enabled=screenshot_scaling_enabled)
+                )
 
                 await app.agent.execute_step(
                     organization=organization,
