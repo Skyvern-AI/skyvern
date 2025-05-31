@@ -1182,6 +1182,8 @@ class AgentDB:
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         model: dict[str, Any] | None = None,
+        cron_schedule: str | None = None,
+        cron_timezone: str | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -1199,6 +1201,8 @@ class AgentDB:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 model=model,
+                cron_schedule=cron_schedule,
+                cron_timezone=cron_timezone,
                 is_saved_task=is_saved_task,
                 status=status,
             )
