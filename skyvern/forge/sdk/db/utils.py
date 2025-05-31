@@ -184,6 +184,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         webhook_callback_url=workflow_model.webhook_callback_url,
         totp_verification_url=workflow_model.totp_verification_url,
         totp_identifier=workflow_model.totp_identifier,
+        cron=workflow_model.cron,
         persist_browser_session=workflow_model.persist_browser_session,
         model=workflow_model.model,
         proxy_location=(ProxyLocation(workflow_model.proxy_location) if workflow_model.proxy_location else None),

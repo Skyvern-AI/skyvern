@@ -1182,6 +1182,7 @@ class AgentDB:
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         model: dict[str, Any] | None = None,
+        cron: str | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -1197,6 +1198,7 @@ class AgentDB:
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
+                cron=cron,
                 persist_browser_session=persist_browser_session,
                 model=model,
                 is_saved_task=is_saved_task,
@@ -1379,6 +1381,7 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
+        cron: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1396,6 +1399,8 @@ class AgentDB:
                         workflow.workflow_definition = workflow_definition
                     if version:
                         workflow.version = version
+                    if cron is not None:
+                        workflow.cron = cron
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)

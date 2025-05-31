@@ -74,6 +74,7 @@ class Workflow(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    cron: str | None = None
     persist_browser_session: bool = False
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published

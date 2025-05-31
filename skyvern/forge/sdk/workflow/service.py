@@ -553,6 +553,7 @@ class WorkflowService:
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         model: dict[str, Any] | None = None,
+        cron: str | None = None,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -569,6 +570,7 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
             model=model,
+            cron=cron,
             workflow_permanent_id=workflow_permanent_id,
             version=version,
             is_saved_task=is_saved_task,
@@ -647,6 +649,7 @@ class WorkflowService:
         title: str | None = None,
         description: str | None = None,
         workflow_definition: WorkflowDefinition | None = None,
+        cron: str | None = None,
     ) -> Workflow:
         if workflow_definition:
             workflow_definition.validate()
@@ -657,6 +660,7 @@ class WorkflowService:
             organization_id=organization_id,
             description=description,
             workflow_definition=(workflow_definition.model_dump() if workflow_definition else None),
+            cron=cron,
         )
 
     async def delete_workflow_by_permanent_id(
@@ -1409,6 +1413,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    cron=request.cron,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -1426,6 +1431,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    cron=request.cron,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                 )
@@ -1595,6 +1601,7 @@ class WorkflowService:
                 workflow_id=workflow.workflow_id,
                 organization_id=organization_id,
                 workflow_definition=workflow_definition,
+                cron=request.cron,
             )
             LOG.info(
                 f"Created workflow from request, title: {request.title}",
