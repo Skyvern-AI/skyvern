@@ -30,4 +30,3 @@ def stop_server(
             return
     kill_pids(pids)
     console.print(Panel(f"Stopped server on port {port}", border_style="red"))
-
