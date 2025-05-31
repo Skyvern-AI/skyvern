@@ -6,9 +6,9 @@ from .init_command import init, init_browser
 from .quickstart import quickstart_app
 from .run_commands import run_app
 from .status import status_app
+from .stop_commands import stop_app
 from .tasks import tasks_app
 from .workflow import workflow_app
-from .stop_commands import stop_app
 
 cli_app = typer.Typer(
     help=("""[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment."""),

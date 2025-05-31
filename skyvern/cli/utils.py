@@ -4,9 +4,8 @@ import subprocess
 import sys
 from typing import List
 
-import typer
-
 import psutil
+import typer
 
 from skyvern.cli.console import console
 from skyvern.utils import detect_os
