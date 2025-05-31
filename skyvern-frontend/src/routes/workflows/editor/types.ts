@@ -16,21 +16,39 @@ export type SkyvernCredential = {
   credentialId: string;
 };
 
+export type OnePasswordCredential = {
+  key: string;
+  description?: string | null;
+  parameterType: "credential";
+  itemId: string | null;
+};
+
 export function parameterIsBitwardenCredential(
-  parameter: CredentialParameterState,
+  parameter: ParametersState[number],
 ): parameter is BitwardenLoginCredential {
   return "collectionId" in parameter;
 }
 
 export function parameterIsSkyvernCredential(
-  parameter: CredentialParameterState,
+  parameter: ParametersState[number],
 ): parameter is SkyvernCredential {
   return "credentialId" in parameter;
 }
 
+export function parameterIsOnePasswordCredential(
+  parameter: ParametersState[number],
+): parameter is OnePasswordCredential {
+  return (
+    "itemId" in parameter &&
+    !("collectionId" in parameter) &&
+    !("credentialId" in parameter)
+  );
+}
+
 export type CredentialParameterState =
   | BitwardenLoginCredential
-  | SkyvernCredential;
+  | SkyvernCredential
+  | OnePasswordCredential;
 
 export type ParametersState = Array<
   | {

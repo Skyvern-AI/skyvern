@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from skyvern.forge.sdk.services import PasswordManagerService
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -199,9 +200,9 @@ class WorkflowRunContext:
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
 
-        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
-
-        credential_item = bitwarden_credential.credential
+        credential_item = (
+            await PasswordManagerService.get_credential_item(db_credential.item_id)
+        ).credential
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {}
@@ -242,9 +243,9 @@ class WorkflowRunContext:
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
 
-        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
-
-        credential_item = bitwarden_credential.credential
+        credential_item = (
+            await PasswordManagerService.get_credential_item(db_credential.item_id)
+        ).credential
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {}
