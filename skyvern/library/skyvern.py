@@ -292,6 +292,7 @@ class Skyvern(AsyncSkyvern):
         self,
         prompt: str,
         engine: RunEngine = RunEngine.skyvern_v2,
+        model: dict[str, Any] | None = None,
         url: str | None = None,
         webhook_url: str | None = None,
         totp_identifier: str | None = None,
@@ -325,6 +326,7 @@ class Skyvern(AsyncSkyvern):
                 task_request = TaskRequest(
                     title=title or task_generation.suggested_title,
                     url=url,
+                    model=model,
                     navigation_goal=navigation_goal,
                     navigation_payload=navigation_payload,
                     data_extraction_goal=data_extraction_goal,
@@ -371,6 +373,7 @@ class Skyvern(AsyncSkyvern):
                     extracted_information_schema=data_extraction_schema,
                     error_code_mapping=error_code_mapping,
                     create_task_run=True,
+                    model=model,
                 )
 
                 await self._run_task_v2(organization, task_v2)

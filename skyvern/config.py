@@ -276,6 +276,8 @@ class Settings(BaseSettings):
                 "Gemini 2.5 Flash": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
                 "GPT 4.1": "OPENAI_GPT4_1",
                 "GPT o3-mini": "OPENAI_O3_MINI",
+                "bedrock/us.anthropic.claude-opus-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
+                "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
             }
         else:
             # TODO: apparently the list for OSS is to be much larger
@@ -284,6 +286,8 @@ class Settings(BaseSettings):
                 "Gemini 2.5 Flash": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
                 "GPT 4.1": "OPENAI_GPT4_1",
                 "GPT o3-mini": "OPENAI_O3_MINI",
+                "bedrock/us.anthropic.claude-opus-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
+                "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
             }
 
     def is_cloud_environment(self) -> bool:

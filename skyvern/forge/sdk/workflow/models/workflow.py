@@ -94,14 +94,14 @@ class Workflow(BaseModel):
         mapping = settings.get_model_name_to_llm_key()
 
         if block:
-            model_name = (block.model or {}).get("model")
+            model_name = (block.model or {}).get("name")
 
             if model_name:
                 llm_key = mapping.get(model_name)
                 if llm_key:
                     return llm_key
 
-        workflow_model_name = (self.model or {}).get("model")
+        workflow_model_name = (self.model or {}).get("name")
 
         if workflow_model_name:
             llm_key = mapping.get(workflow_model_name)
