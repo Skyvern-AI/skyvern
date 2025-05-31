@@ -35,5 +35,7 @@ xvfb=$!
 DISPLAY=:99 xterm 2>/dev/null &
 python run_streaming.py > /dev/null &
 
+python -m skyvern.cron &
+
 # Run the command and pass in all three arguments
 python -m skyvern.forge
