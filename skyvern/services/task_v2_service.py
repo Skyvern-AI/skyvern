@@ -1628,9 +1628,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
         created_at=task_v2.created_at,
         modified_at=task_v2.modified_at,
-        run_time_seconds=int(
-            (task_v2.modified_at - task_v2.created_at).total_seconds()
-        ),
+        run_time_seconds=int((task_v2.modified_at - task_v2.created_at).total_seconds()),
         recording_url=workflow_run_resp.recording_url if workflow_run_resp else None,
         screenshot_urls=workflow_run_resp.screenshot_urls if workflow_run_resp else None,
         downloaded_files=workflow_run_resp.downloaded_files if workflow_run_resp else None,
