@@ -8,6 +8,7 @@ from .run_commands import run_app
 from .status import status_app
 from .tasks import tasks_app
 from .workflow import workflow_app
+from .stop_commands import stop_app
 
 cli_app = typer.Typer(
     help=("""[bold]Skyvern CLI[/bold]\nManage and run your local Skyvern environment."""),
@@ -22,6 +23,7 @@ cli_app.add_typer(
 cli_app.add_typer(workflow_app, name="workflow", help="Workflow management commands.")
 cli_app.add_typer(tasks_app, name="tasks", help="Task management commands.")
 cli_app.add_typer(docs_app, name="docs", help="Open Skyvern documentation.")
+cli_app.add_typer(stop_app, name="stop", help="Stop Skyvern services.")
 cli_app.add_typer(status_app, name="status", help="Check if Skyvern services are running.")
 init_app = typer.Typer(
     invoke_without_command=True,
