@@ -21,6 +21,10 @@ type Props = {
   onChange: (value: WorkflowModel | null) => void;
 };
 
+const constants = {
+  SkyvernOptimized: "Skyvern Optimized",
+} as const;
+
 function ModelSelector({
   clearable = true,
   value,
@@ -38,6 +42,7 @@ function ModelSelector({
   });
 
   const models = availableModels?.models ?? [];
+  const choices = [constants.SkyvernOptimized, ...models];
 
   return (
     <div className="flex items-center justify-between">
@@ -49,18 +54,23 @@ function ModelSelector({
         <Select
           value={value?.model ?? ""}
           onValueChange={(v) => {
-            onChange({ model: v });
+            const newValue = v === constants.SkyvernOptimized ? null : v;
+            onChange(newValue ? { model: newValue } : null);
           }}
         >
           <SelectTrigger
             className={(className || "") + (value && clearable ? " pr-10" : "")}
           >
-            <SelectValue placeholder="Skyvern Optimized" />
+            <SelectValue placeholder={constants.SkyvernOptimized} />
           </SelectTrigger>
           <SelectContent>
-            {models.map((m) => (
+            {choices.map((m) => (
               <SelectItem key={m} value={m}>
-                {m}
+                {m === constants.SkyvernOptimized ? (
+                  <span>Skyvern Optimized ✨</span>
+                ) : (
+                  m
+                )}
               </SelectItem>
             ))}
           </SelectContent>
