@@ -393,7 +393,7 @@ export type CreditCardCredential = {
 };
 
 export type ModelsResponse = {
-  models: string[];
+  models: Record<string, string>;
 };
 
 export const RunEngine = {
