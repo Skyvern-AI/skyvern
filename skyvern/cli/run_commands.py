@@ -179,9 +179,6 @@ def run_workflow(
     param: Optional[List[str]] = typer.Option(
         None, "--param", help="Workflow parameters in key=value format (can be used multiple times)"
     ),
-    proxy_location: Optional[str] = typer.Option(
-        None, "--proxy-location", help="Proxy location for the workflow execution"
-    ),
     watch: bool = typer.Option(False, "--watch", help="Stream run logs until completion"),
     output: bool = typer.Option(False, "--output", help="Output the workflow run ID"),
     api_key: Optional[str] = typer.Option(
@@ -269,7 +266,7 @@ def run_workflow(
         payload: Dict[str, Any] = {"parameters": workflow_params}
         if title:
             payload["title"] = title
-        if max_steps:
+        if max_steps is not None:
             payload["max_steps_override"] = max_steps
 
         try:
