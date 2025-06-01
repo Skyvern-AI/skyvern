@@ -867,13 +867,12 @@ class ForgeAgent:
                 else:
                     if engine in CUA_ENGINES:
                         self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
-
                     json_response = await app.LLM_API_HANDLER(
                         prompt=extract_action_prompt,
                         prompt_name="extract-actions",
                         step=step,
                         screenshots=scraped_page.screenshots,
-                        llm_key_override=task.llm_key,
+                        llm_key_override=llm_caller.llm_key if llm_caller else None,
                     )
                     try:
                         json_response = await self.handle_potential_verification_code(
