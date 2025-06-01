@@ -109,6 +109,13 @@ function WorkflowRun() {
           description: "A copy of the workflow has been created.",
         });
       },
+      onError: (error) => {
+        toast({
+          variant: "destructive",
+          title: "Failed to Clone Workflow",
+          description: error.message,
+        });
+      },
     });
   }
 
