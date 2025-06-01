@@ -1489,8 +1489,10 @@ class ForgeAgent:
         )
         run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
         scroll = True
+        llm_key_override = task.llm_key
         if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
             scroll = False
+            llm_key_override = None
 
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
 
@@ -1510,11 +1512,13 @@ class ForgeAgent:
         )
 
         # this prompt is critical to our agent so let's use the primary LLM API handler
+
         verification_result = await app.LLM_API_HANDLER(
             prompt=verification_prompt,
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
             prompt_name="check-user-goal",
+            llm_key_override=llm_key_override,
         )
         return CompleteVerifyResult.model_validate(verification_result)
 
@@ -2683,11 +2687,16 @@ class ForgeAgent:
                 verification_code_check=False,
                 expire_verification_code=True,
             )
+            llm_key_override = task.llm_key
+            run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
+            if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
+                llm_key_override = None
             return await app.LLM_API_HANDLER(
                 prompt=extract_action_prompt,
                 step=step,
                 screenshots=scraped_page.screenshots,
                 prompt_name="extract-actions",
+                llm_key_override=llm_key_override,
             )
         return json_response
 
