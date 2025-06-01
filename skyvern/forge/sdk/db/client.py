@@ -1184,6 +1184,8 @@ class AgentDB:
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         model: dict[str, Any] | None = None,
+        cron_expression: str | None = None,
+        cron_enabled: bool = False,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
@@ -1201,6 +1203,8 @@ class AgentDB:
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 model=model,
+                cron_expression=cron_expression,
+                cron_enabled=cron_enabled,
                 is_saved_task=is_saved_task,
                 status=status,
             )
@@ -1373,6 +1377,19 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_enabled_cron_workflows(self) -> list[Workflow]:
+        try:
+            async with self.Session() as session:
+                workflows = (
+                    await session.scalars(
+                        select(WorkflowModel).filter_by(cron_enabled=True).filter(WorkflowModel.deleted_at.is_(None))
+                    )
+                ).all()
+                return [convert_to_workflow(workflow, self.debug_enabled) for workflow in workflows]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def update_workflow(
         self,
         workflow_id: str,
@@ -1381,6 +1398,8 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
+        cron_expression: str | None = None,
+        cron_enabled: bool | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1398,6 +1417,10 @@ class AgentDB:
                         workflow.workflow_definition = workflow_definition
                     if version:
                         workflow.version = version
+                    if cron_expression is not None:
+                        workflow.cron_expression = cron_expression
+                    if cron_enabled is not None:
+                        workflow.cron_enabled = cron_enabled
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
