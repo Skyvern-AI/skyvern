@@ -272,22 +272,22 @@ class Settings(BaseSettings):
 
         if self.is_cloud_environment():
             return {
-                "Gemini 2.5": "GEMINI_2.5_PRO_PREVIEW",
-                "Gemini 2.5 Flash": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
-                "GPT 4.1": "OPENAI_GPT4_1",
-                "GPT o3-mini": "OPENAI_O3_MINI",
-                "bedrock/us.anthropic.claude-opus-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
-                "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
+                "gemini-2.5-pro-preview-05-06": "VERTEX_GEMINI_2.5_PRO_PREVIEW",
+                "gemini-2.5-flash-preview-05-20": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                "azure/gpt-4.1": "AZURE_OPENAI_GPT4_1",
+                "azure/o3-mini": "AZURE_OPENAI_O3_MINI",
+                "us.anthropic.claude-opus-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
+                "us.anthropic.claude-sonnet-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
             }
         else:
             # TODO: apparently the list for OSS is to be much larger
             return {
-                "Gemini 2.5": "GEMINI_2.5_PRO_PREVIEW",
-                "Gemini 2.5 Flash": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
-                "GPT 4.1": "OPENAI_GPT4_1",
-                "GPT o3-mini": "OPENAI_O3_MINI",
-                "bedrock/us.anthropic.claude-opus-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
-                "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
+                "gemini-2.5-pro-preview-05-06": "VERTEX_GEMINI_2.5_PRO_PREVIEW",
+                "gemini-2.5-flash-preview-05-20": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                "azure/gpt-4.1": "AZURE_OPENAI_GPT4_1",
+                "azure/o3-mini": "AZURE_OPENAI_O3_MINI",
+                "us.anthropic.claude-opus-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
+                "us.anthropic.claude-sonnet-4-20250514-v1:0": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
             }
 
     def is_cloud_environment(self) -> bool:
