@@ -8,23 +8,33 @@ LOG = structlog.get_logger()
 def _parse_field(field: str, minimum: int, maximum: int) -> set[int]:
     """Parse a cron field into a set of integers."""
     values: set[int] = set()
+    rng_all = range(minimum, maximum + 1)
     for part in field.split(","):
         if part == "*":
-            values.update(range(minimum, maximum + 1))
-        elif part.startswith("*/"):
-            step = int(part[2:])
-            values.update(range(minimum, maximum + 1, step))
-        elif "-" in part:
-            if "/" in part:
-                rng, step_str = part.split("/")
-                start, end = map(int, rng.split("-"))
-                step = int(step_str)
+            values.update(rng_all)
+            continue
+        # Handle step values, e.g., "*/5" or "2-10/3"
+        if "/" in part:
+            base, step_str = part.split("/")
+            step = int(step_str)
+            if base == "*":
+                values.update(range(minimum, maximum + 1, step))
+            elif "-" in base:
+                start, end = map(int, base.split("-"))
                 values.update(range(start, end + 1, step))
             else:
-                start, end = map(int, part.split("-"))
-                values.update(range(start, end + 1))
-        else:
-            values.add(int(part))
+                # Unlikely for a cron field, treat as single value with step
+                start = int(base)
+                if minimum <= start <= maximum and (start - minimum) % step == 0:
+                    values.add(start)
+            continue
+        # Handle ranges, e.g. "2-10"
+        if "-" in part:
+            start, end = map(int, part.split("-"))
+            values.update(range(start, end + 1))
+            continue
+        # Handle single integer value; fast-path without using `set.add` for each part
+        values.add(int(part))
     return values
 
 
