@@ -810,9 +810,9 @@ async def models() -> ModelsResponse:
     Get a list of available models.
     """
     mapping = settings.get_model_name_to_llm_key()
-    models = list(mapping.keys())
+    just_labels = {k: v["label"] for k, v in mapping.items() if "anthropic" not in k.lower()}
 
-    return ModelsResponse(models=models)
+    return ModelsResponse(models=just_labels)
 
 
 @legacy_base_router.post(

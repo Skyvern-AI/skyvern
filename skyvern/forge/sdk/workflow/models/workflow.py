@@ -5,11 +5,10 @@ from typing import Any, List
 from pydantic import BaseModel, field_validator
 from typing_extensions import deprecated
 
-from skyvern.config import settings
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
-from skyvern.forge.sdk.workflow.models.block import Block, BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.utils.url_validators import validate_url
@@ -81,34 +80,6 @@ class Workflow(BaseModel):
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
-
-    def determine_llm_key(self, *, block: Block | None = None) -> str | None:
-        """
-        Determine the LLM key override to use for a block, if it has one.
-
-        It has one if:
-            - it defines one, or
-            - the workflow it is a part of (if applicable) defines one
-        """
-
-        mapping = settings.get_model_name_to_llm_key()
-
-        if block:
-            model_name = (block.model or {}).get("name")
-
-            if model_name:
-                llm_key = mapping.get(model_name)
-                if llm_key:
-                    return llm_key
-
-        workflow_model_name = (self.model or {}).get("name")
-
-        if workflow_model_name:
-            llm_key = mapping.get(workflow_model_name)
-            if llm_key:
-                return llm_key
-
-        return None
 
 
 class WorkflowRunStatus(StrEnum):
