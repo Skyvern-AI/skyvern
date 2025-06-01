@@ -29,7 +29,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   completeCriterion: "",
   terminateCriterion: "",
   errorCodeMapping: "null",
-  model: { model: "" },
+  model: { model_name: "" },
   engine: RunEngine.SkyvernV1,
   maxRetries: null,
   maxStepsOverride: null,

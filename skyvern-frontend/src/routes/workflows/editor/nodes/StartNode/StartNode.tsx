@@ -19,6 +19,7 @@ import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { ModelsResponse } from "@/api/types";
 import { ModelSelector } from "@/components/ModelSelector";
+import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const credentialGetter = useCredentialGetter();
@@ -33,7 +34,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     },
   });
 
-  const models = availableModels?.models ?? [];
+  const modelNames = availableModels?.models ?? {};
+  const firstKey = Object.keys(modelNames)[0];
+  const workflowModel: WorkflowModel | null = firstKey
+    ? { model_name: modelNames[firstKey] || "" }
+    : null;
 
   const [inputs, setInputs] = useState({
     webhookCallbackUrl: data.withWorkflowSettings
@@ -45,7 +50,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     persistBrowserSession: data.withWorkflowSettings
       ? data.persistBrowserSession
       : false,
-    model: data.withWorkflowSettings ? data.model : { model: models[0] || "" },
+    model: data.withWorkflowSettings ? data.model : workflowModel,
   });
 
   function handleChange(key: string, value: unknown) {

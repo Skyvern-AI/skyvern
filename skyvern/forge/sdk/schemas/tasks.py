@@ -248,10 +248,10 @@ class Task(TaskBase):
         Otherwise return `None`.
         """
         if self.model:
-            model_name = self.model.get("name")
+            model_name = self.model.get("model_name")
             if model_name:
                 mapping = settings.get_model_name_to_llm_key()
-                return mapping.get(model_name)
+                return mapping.get(model_name, {}).get("llm_key")
 
         return None
 
@@ -370,4 +370,4 @@ class SortDirection(StrEnum):
 
 
 class ModelsResponse(BaseModel):
-    models: list[str]
+    models: dict[str, str]

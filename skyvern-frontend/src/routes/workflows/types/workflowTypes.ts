@@ -466,7 +466,7 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
 };
 
-export type WorkflowModel = JsonObjectExtendable<{ model: string }>;
+export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;
 
 export function isOutputParameter(
   parameter: Parameter,

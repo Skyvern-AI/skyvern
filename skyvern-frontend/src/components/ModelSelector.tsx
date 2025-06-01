@@ -41,8 +41,17 @@ function ModelSelector({
     },
   });
 
-  const models = availableModels?.models ?? [];
-  const choices = [constants.SkyvernOptimized, ...models];
+  const models = availableModels?.models ?? {};
+  const reverseMap = Object.entries(models).reduce(
+    (acc, [key, value]) => {
+      acc[value] = key;
+      return acc;
+    },
+    {} as Record<string, string>,
+  );
+  const labels = Object.keys(reverseMap);
+  const chosen = value ? models[value.model_name] : constants.SkyvernOptimized;
+  const choices = [constants.SkyvernOptimized, ...labels];
 
   return (
     <div className="flex items-center justify-between">
@@ -52,10 +61,13 @@ function ModelSelector({
       </div>
       <div className="relative flex items-center">
         <Select
-          value={value?.model ?? ""}
+          value={chosen}
           onValueChange={(v) => {
             const newValue = v === constants.SkyvernOptimized ? null : v;
-            onChange(newValue ? { model: newValue } : null);
+            const modelName = newValue ? reverseMap[newValue] : null;
+            const value = modelName ? { model_name: modelName } : null;
+            console.log({ v, newValue, modelName, value });
+            onChange(value);
           }}
         >
           <SelectTrigger
