@@ -248,7 +248,7 @@ class Task(TaskBase):
         Otherwise return `None`.
         """
         if self.model:
-            model_name = self.model.get("name")
+            model_name = self.model.get("model_name")
             if model_name:
                 mapping = settings.get_model_name_to_llm_key()
                 return mapping.get(model_name)
