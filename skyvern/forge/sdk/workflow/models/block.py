@@ -99,6 +99,7 @@ class BlockType(StrEnum):
     FILE_DOWNLOAD = "file_download"
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
+    BROWSER_CHECK = "browser_check"
 
 
 class BlockStatus(StrEnum):
@@ -2339,6 +2340,80 @@ class WaitBlock(Block):
         )
 
 
+class BrowserCheckBlock(Block):
+    block_type: Literal[BlockType.BROWSER_CHECK] = BlockType.BROWSER_CHECK
+
+    prompt: str | None = None
+    if_blocks: list[BlockTypeVar] = []
+    else_blocks: list[BlockTypeVar] = []
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        parameters: set[PARAMETER_TYPE] = set()
+        for block in self.if_blocks + self.else_blocks:
+            for parameter in block.get_all_parameters(workflow_run_id):
+                parameters.add(parameter)
+        return list(parameters)
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+        has_browser = False
+        if browser_state:
+            page = await browser_state.get_working_page()
+            has_browser = page is not None and page.url != "about:blank"
+
+        selected_blocks = self.if_blocks if has_browser else self.else_blocks
+        last_result: BlockResult | None = None
+        for block in selected_blocks:
+            last_result = await block.execute_safe(
+                workflow_run_id=workflow_run_id,
+                parent_workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+            if last_result.status in {
+                BlockStatus.canceled,
+                BlockStatus.failed,
+                BlockStatus.terminated,
+                BlockStatus.timed_out,
+            } and not block.continue_on_failure:
+                break
+
+        output_value = {"browser_active": has_browser}
+        await self.record_output_parameter_value(
+            workflow_run_context, workflow_run_id, output_value
+        )
+
+        if last_result and not last_result.success and not last_result.status == BlockStatus.completed:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=last_result.failure_reason,
+                output_parameter_value=output_value,
+                status=last_result.status,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=output_value,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 class ValidationBlock(BaseTaskBlock):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION
 
@@ -2552,6 +2627,7 @@ BlockSubclasses = Union[
     WaitBlock,
     FileDownloadBlock,
     UrlBlock,
+    BrowserCheckBlock,
     TaskV2Block,
     FileUploadBlock,
 ]

@@ -333,6 +333,13 @@ class WaitBlockYAML(BlockYAML):
     wait_sec: int = 0
 
 
+class BrowserCheckBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.BROWSER_CHECK] = BlockType.BROWSER_CHECK  # type: ignore
+    prompt: str | None = None
+    if_blocks: list["BLOCK_YAML_SUBCLASSES"] | None = None
+    else_blocks: list["BLOCK_YAML_SUBCLASSES"] | None = None
+
+
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
@@ -393,6 +400,7 @@ BLOCK_YAML_SUBCLASSES = (
     | ExtractionBlockYAML
     | LoginBlockYAML
     | WaitBlockYAML
+    | BrowserCheckBlockYAML
     | FileDownloadBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
