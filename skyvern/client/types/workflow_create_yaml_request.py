@@ -18,6 +18,7 @@ class WorkflowCreateYamlRequest(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     persist_browser_session: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     workflow_definition: WorkflowDefinitionYaml
     is_saved_task: typing.Optional[bool] = None
     status: typing.Optional[WorkflowStatus] = None

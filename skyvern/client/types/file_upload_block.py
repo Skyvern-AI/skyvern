@@ -14,6 +14,7 @@ class FileUploadBlock(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None

@@ -11,6 +11,7 @@ class TaskV2Block(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     prompt: str
     url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
