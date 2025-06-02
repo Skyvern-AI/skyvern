@@ -84,6 +84,9 @@ class TaskModel(Base):
     max_steps_per_run = Column(Integer, nullable=True)
     application = Column(String, nullable=True)
     include_action_history_in_verification = Column(Boolean, default=False, nullable=True)
+    queued_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
         DateTime,
@@ -250,6 +253,10 @@ class WorkflowRunModel(Base):
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
+
+    queued_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -591,6 +598,10 @@ class TaskV2Model(Base):
     extracted_information_schema = Column(JSON, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
     max_steps = Column(Integer, nullable=True)
+
+    queued_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

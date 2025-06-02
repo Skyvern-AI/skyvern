@@ -92,6 +92,9 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         errors=task_obj.errors,
         application=task_obj.application,
         model=task_obj.model,
+        queued_at=task_obj.queued_at,
+        started_at=task_obj.started_at,
+        finished_at=task_obj.finished_at,
     )
     return task
 
@@ -222,6 +225,9 @@ def convert_to_workflow_run(
         webhook_callback_url=workflow_run_model.webhook_callback_url,
         totp_verification_url=workflow_run_model.totp_verification_url,
         totp_identifier=workflow_run_model.totp_identifier,
+        queued_at=workflow_run_model.queued_at,
+        started_at=workflow_run_model.started_at,
+        finished_at=workflow_run_model.finished_at,
         created_at=workflow_run_model.created_at,
         modified_at=workflow_run_model.modified_at,
         workflow_title=workflow_title,

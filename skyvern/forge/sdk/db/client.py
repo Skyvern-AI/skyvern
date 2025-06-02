@@ -600,6 +600,12 @@ class AgentDB:
                 ).first():
                     if status is not None:
                         task.status = status
+                        if status == TaskStatus.queued and task.queued_at is None:
+                            task.queued_at = datetime.utcnow()
+                        if status == TaskStatus.running and task.started_at is None:
+                            task.started_at = datetime.utcnow()
+                        if status.is_final() and task.finished_at is None:
+                            task.finished_at = datetime.utcnow()
                     if extracted_information is not None:
                         task.extracted_information = extracted_information
                     if failure_reason is not None:
@@ -1474,6 +1480,12 @@ class AgentDB:
             if workflow_run:
                 workflow_run.status = status
                 workflow_run.failure_reason = failure_reason
+                if status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
+                    workflow_run.queued_at = datetime.utcnow()
+                if status == WorkflowRunStatus.running and workflow_run.started_at is None:
+                    workflow_run.started_at = datetime.utcnow()
+                if status.is_final() and workflow_run.finished_at is None:
+                    workflow_run.finished_at = datetime.utcnow()
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -2517,6 +2529,12 @@ class AgentDB:
             if task_v2:
                 if status:
                     task_v2.status = status
+                    if status == TaskV2Status.queued and task_v2.queued_at is None:
+                        task_v2.queued_at = datetime.utcnow()
+                    if status == TaskV2Status.running and task_v2.started_at is None:
+                        task_v2.started_at = datetime.utcnow()
+                    if status.is_final() and task_v2.finished_at is None:
+                        task_v2.finished_at = datetime.utcnow()
                 if workflow_run_id:
                     task_v2.workflow_run_id = workflow_run_id
                 if workflow_id:
