@@ -141,6 +141,8 @@ services:
       - ./videos:/data/videos
       - ./har:/data/har
       - ./.streamlit:/app/.streamlit
+    env_file:
+      - skyvern-frontend/.env
     environment:
       - VITE_ENABLE_CODE_BLOCK=true
     # if you want to run skyvern on a remote server,
