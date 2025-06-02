@@ -151,6 +151,22 @@ navigation:
       - api: API Reference
         snippets:
           python: skyvern
+        layout: 
+          - section: Agents
+            contents:
+            - POST /v1/run/tasks
+          - section: Workflows
+            contents:
+            - GET /v1/workflows
+            - POST /v1/workflows
+          - section: Artifacts
+            contents: []
+          - section: Browser Session
+            contents: []
+          - section: Credentials
+            contents:
+            - GET /v1/credentials
+            - POST /v1/credentials        
   - tab: blog
   - tab: community
   - tab: github
