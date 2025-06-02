@@ -58,6 +58,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
+    BrowserCheckBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -87,6 +88,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.models.yaml import (
     BLOCK_YAML_TYPES,
+    BrowserCheckBlockYAML,
     ForLoopBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
@@ -1642,6 +1644,19 @@ class WorkflowService:
                         workflow_id=workflow_id, block_yamls=block_yaml.loop_blocks
                     )
                 )
+            if isinstance(block_yaml, BrowserCheckBlockYAML):
+                if block_yaml.if_blocks:
+                    output_parameters.update(
+                        await WorkflowService._create_all_output_parameters_for_workflow(
+                            workflow_id=workflow_id, block_yamls=block_yaml.if_blocks
+                        )
+                    )
+                if block_yaml.else_blocks:
+                    output_parameters.update(
+                        await WorkflowService._create_all_output_parameters_for_workflow(
+                            workflow_id=workflow_id, block_yamls=block_yaml.else_blocks
+                        )
+                    )
         return output_parameters
 
     @staticmethod
@@ -1944,6 +1959,23 @@ class WorkflowService:
                 wait_sec=block_yaml.wait_sec,
                 continue_on_failure=block_yaml.continue_on_failure,
                 output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.BROWSER_CHECK:
+            if_blocks = [
+                await WorkflowService.block_yaml_to_block(workflow, b, parameters)
+                for b in (block_yaml.if_blocks or [])
+            ]
+            else_blocks = [
+                await WorkflowService.block_yaml_to_block(workflow, b, parameters)
+                for b in (block_yaml.else_blocks or [])
+            ]
+            return BrowserCheckBlock(
+                label=block_yaml.label,
+                prompt=block_yaml.prompt,
+                if_blocks=if_blocks,
+                else_blocks=else_blocks,
+                output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
 
         elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
