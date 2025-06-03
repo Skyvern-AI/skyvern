@@ -112,6 +112,7 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
 
     organization = await db.get_organization(organization_id=api_key_data.sub)
     if not organization:
+        LOG.warning("Organization not found", organization_id=api_key_data.sub, **payload)
         raise HTTPException(status_code=404, detail="Organization not found")
 
     # check if the token exists in the database

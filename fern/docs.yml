@@ -2,7 +2,7 @@ instances:
   - url: https://skyvern.docs.buildwithfern.com
     custom-domain: https://docs.skyvern.com
 title: Skyvern
-favicon: images/skyvern_favicon.png
+favicon: images/skyvern_favicon_small.png
 logo:
   light: images/skyvern_logo_blackbg.png
   dark: images/skyvern_logo.png
@@ -36,7 +36,7 @@ tabs:
   home:
     display-name: Home
     icon: home
-  api: 
+  api:
     display-name: API Reference
     icon: code
   blog:
@@ -44,7 +44,7 @@ tabs:
     icon: newspaper
     href: https://blog.skyvern.com
   community:
-    display-name: Community 
+    display-name: Community
     icon: fa-brands fa-discord
     href: https://discord.gg/m6FmQV7nU3
   github:
@@ -151,11 +151,40 @@ navigation:
       - api: API Reference
         snippets:
           python: skyvern
+        layout:
+          - section: Agents
+            contents:
+            - POST /v1/run/tasks
+            - GET /v1/runs/{run_id}
+            - POST /v1/runs/{run_id}/cancel
+            - POST /v1/runs/{run_id}/retry_webhook
+          - section: Workflows
+            contents:
+            - POST /v1/run/workflows
+            - GET /v1/workflows
+            - POST /v1/workflows
+            - POST /v1/workflows/{workflow_id}
+            - POST /v1/workflows/{workflow_id}/delete
+          - section: Artifacts
+            contents:
+            - GET /v1/artifacts/{artifact_id}
+          - section: Browser Session
+            contents:
+            - GET /v1/browser_sessions
+            - POST /v1/browser_sessions
+            - POST /v1/browser_sessions/{browser_session_id}/close
+            - GET /v1/browser_sessions/{browser_session_id}
+          - section: Credentials
+            contents:
+            - POST /v1/credentials/totp
+            - GET /v1/credentials
+            - POST /v1/credentials
+            - POST /v1/credentials/{credential_id}/delete
+            - GET /v1/credentials/{credential_id}
   - tab: blog
   - tab: community
   - tab: github
   - tab: cloud
   - tab: demo
-
-experimental: 
+experimental:
   openapi-parser-v3: true
