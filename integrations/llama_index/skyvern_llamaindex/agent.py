@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from llama_index.core.tools import FunctionTool
 from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSpec
@@ -49,7 +49,13 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         self.engine = engine
         self.run_task_timeout_seconds = run_task_timeout_seconds
 
-    async def run_task(self, user_prompt: str, url: Optional[str] = None) -> TaskRunResponse:
+    async def run_task(
+        self,
+        user_prompt: str | None = None,
+        url: Optional[str] = None,
+        *_: Any,
+        **kw: Any,
+    ) -> TaskRunResponse:
         """
         Use Skyvern agent to run a task. This function won't return until the task is finished.
 
@@ -57,6 +63,15 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             user_prompt[str]: The user's prompt describing the task.
             url (Optional[str]): The URL of the target website for the task.
         """
+        if user_prompt is None and kw.get("args"):
+            user_prompt = kw["args"][0]
+
+        if url is None:
+            if kw.get("args") and len(kw["args"]) > 1:
+                url = kw["args"][1]
+            elif kw.get("kwargs"):
+                url = kw["kwargs"].get("url")
+
         return await self.agent.run_task(
             prompt=user_prompt,
             url=url,
@@ -65,7 +80,13 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             wait_for_completion=True,
         )
 
-    async def dispatch_task(self, user_prompt: str, url: Optional[str] = None) -> TaskRunResponse:
+    async def dispatch_task(
+        self,
+        user_prompt: str | None = None,
+        url: Optional[str] = None,
+        *_: Any,
+        **kw: Any,
+    ) -> TaskRunResponse:
         """
         Use Skyvern agent to dispatch a task. This function will return immediately and the task will be running in the background.
 
@@ -73,6 +94,14 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             user_prompt[str]: The user's prompt describing the task.
             url (Optional[str]): The URL of the target website for the task.
         """
+        if user_prompt is None and kw.get("args"):
+            user_prompt = kw["args"][0]
+
+        if url is None:
+            if kw.get("args") and len(kw["args"]) > 1:
+                url = kw["args"][1]
+            elif kw.get("kwargs"):
+                url = kw["kwargs"].get("url")
         return await self.agent.run_task(
             prompt=user_prompt,
             url=url,
@@ -81,11 +110,13 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             wait_for_completion=False,
         )
 
-    async def get_task(self, task_id: str) -> GetRunResponse | None:
+    async def get_task(self, task_id: str | None = None, *_: Any, **kwargs: Any) -> GetRunResponse | None:
         """
         Use Skyvern agent to get a task.
 
         Args:
             task_id[str]: The id of the task.
         """
+        if task_id is None and "args" in kwargs:
+            task_id = kwargs["args"][0]
         return await self.agent.get_run(run_id=task_id)
