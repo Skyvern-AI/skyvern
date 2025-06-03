@@ -13,6 +13,7 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunType
 from skyvern.services import task_v2_service
+from skyvern.utils.files import initialize_skyvern_state_file
 
 LOG = structlog.get_logger()
 
@@ -106,6 +107,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.max_steps_override = max_steps_override
 
         if background_tasks:
+            await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
             background_tasks.add_task(
                 app.agent.execute_step,
                 organization,
@@ -135,6 +137,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
 
         if background_tasks:
+            await initialize_skyvern_state_file(
+                workflow_run_id=workflow_run_id, organization_id=organization.organization_id
+            )
             background_tasks.add_task(
                 app.WORKFLOW_SERVICE.execute_workflow,
                 workflow_run_id=workflow_run_id,
@@ -178,6 +183,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
         )
 
         if background_tasks:
+            await initialize_skyvern_state_file(
+                workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id
+            )
             background_tasks.add_task(
                 task_v2_service.run_task_v2,
                 organization=organization,
