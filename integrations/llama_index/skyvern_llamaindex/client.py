@@ -1,4 +1,4 @@
-from typing import Any, List, Optional
+from typing import Any, List
 
 from llama_index.core.tools import FunctionTool
 from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSpec
@@ -62,7 +62,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
     async def run_task(
         self,
         user_prompt: str | None = None,
-        url: Optional[str] = None,
+        url: str | None = None,
         *_: Any,
         **kw: Any,
     ) -> TaskRunResponse:
@@ -82,6 +82,8 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             elif kw.get("kwargs"):
                 url = kw["kwargs"].get("url")
 
+        assert user_prompt is not None, "user_prompt is required"
+
         return await self.client.run_task(
             prompt=user_prompt,
             url=url,
@@ -93,7 +95,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
     async def dispatch_task(
         self,
         user_prompt: str | None = None,
-        url: Optional[str] = None,
+        url: str | None = None,
         *_: Any,
         **kw: Any,
     ) -> TaskRunResponse:
@@ -112,6 +114,8 @@ class SkyvernTaskToolSpec(BaseToolSpec):
                 url = kw["args"][1]
             elif kw.get("kwargs"):
                 url = kw["kwargs"].get("url")
+
+        assert user_prompt is not None, "user_prompt is required"
         return await self.client.run_task(
             prompt=user_prompt,
             url=url,
@@ -129,4 +133,6 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         """
         if task_id is None and "args" in kwargs:
             task_id = kwargs["args"][0]
+
+        assert task_id is not None, "task_id is required"
         return await self.client.get_run(run_id=task_id)
