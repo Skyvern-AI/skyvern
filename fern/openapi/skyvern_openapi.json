@@ -85,7 +85,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task",
         "x-fern-examples": [
           {
@@ -204,7 +203,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
           {
@@ -306,7 +304,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
         "x-fern-examples": [
           {
@@ -382,7 +379,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [
           {
@@ -449,18 +445,17 @@
             "description": "Invalid workflow definition"
           }
         },
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
               }
             ]
           }
@@ -581,7 +576,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "get_workflows",
         "x-fern-examples": [
           {
@@ -662,18 +656,17 @@
             "description": "Invalid workflow definition"
           }
         },
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
               }
             ]
           }
@@ -744,7 +737,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [
           {
@@ -820,7 +812,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "artifacts",
         "x-fern-sdk-method-name": "get_artifact"
       }
     },
@@ -889,7 +880,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [
           {
@@ -966,7 +956,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "create_browser_session",
         "x-fern-examples": [
           {
@@ -1035,7 +1024,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_sessions",
         "x-fern-examples": [
           {
@@ -1116,7 +1104,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "close_browser_session",
         "x-fern-examples": [
           {
@@ -1200,7 +1187,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_session",
         "x-fern-examples": [
           {
@@ -1274,7 +1260,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "send_totp_code"
       }
     },
@@ -1351,7 +1336,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "create_credential",
         "x-fern-examples": [
           {
@@ -1455,7 +1439,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credentials",
         "x-fern-examples": [
           {
@@ -1527,7 +1510,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "delete_credential",
         "x-fern-examples": [
           {
@@ -1606,7 +1588,6 @@
             }
           }
         },
-        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credential",
         "x-fern-examples": [
           {
@@ -1746,6 +1727,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "task_type": {
             "type": "string",
@@ -1987,6 +1980,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "url": {
             "anyOf": [
@@ -2908,6 +2913,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "code": {
             "type": "string",
             "title": "Code"
@@ -2983,6 +3000,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "code": {
             "type": "string",
@@ -3403,6 +3432,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "url": {
             "type": "string",
             "title": "Url"
@@ -3432,6 +3473,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "url": {
             "type": "string",
@@ -3464,6 +3517,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "task_type": {
             "type": "string",
@@ -3700,6 +3765,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "data_extraction_goal": {
             "type": "string",
             "title": "Data Extraction Goal"
@@ -3804,6 +3881,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "task_type": {
             "type": "string",
@@ -4046,6 +4135,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "navigation_goal": {
             "type": "string",
             "title": "Navigation Goal"
@@ -4219,6 +4320,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "file_url": {
             "type": "string",
             "title": "File Url"
@@ -4252,6 +4365,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "file_url": {
             "type": "string",
@@ -4302,6 +4427,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
@@ -4386,6 +4523,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
@@ -4472,6 +4621,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "loop_blocks": {
             "items": {
@@ -4653,6 +4814,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "loop_blocks": {
             "items": {
               "anyOf": [
@@ -4779,6 +4952,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "task_type": {
             "type": "string",
@@ -5021,6 +5206,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "url": {
             "anyOf": [
               {
@@ -5176,6 +5373,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "task_type": {
             "type": "string",
@@ -5411,6 +5620,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "navigation_goal": {
             "type": "string",
@@ -5790,6 +6011,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "file_url": {
             "type": "string",
             "title": "File Url"
@@ -5831,6 +6064,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "file_url": {
             "type": "string",
@@ -5942,6 +6187,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "smtp_host": {
             "$ref": "#/components/schemas/AWSSecretParameter"
           },
@@ -6013,6 +6270,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "smtp_host_secret_parameter_key": {
             "type": "string",
@@ -6342,6 +6611,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -6582,6 +6863,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "url": {
             "anyOf": [
@@ -6948,6 +7241,19 @@
               "pbs_123"
             ]
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "\nOptional model configuration.\n"
+          },
           "publish_workflow": {
             "type": "boolean",
             "title": "Publish Workflow",
@@ -7163,6 +7469,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "prompt": {
             "type": "string",
             "title": "Prompt"
@@ -7235,6 +7553,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "prompt": {
             "type": "string",
@@ -7310,6 +7640,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "llm_key": {
             "type": "string",
@@ -7404,6 +7746,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "llm_key": {
             "type": "string",
             "title": "Llm Key",
@@ -7467,6 +7821,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "path": {
             "anyOf": [
               {
@@ -7502,6 +7868,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "path": {
             "anyOf": [
@@ -7540,6 +7918,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "task_type": {
             "type": "string",
@@ -7776,6 +8166,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "url": {
             "type": "string",
             "title": "Url"
@@ -7807,6 +8209,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "task_type": {
             "type": "string",
@@ -8049,6 +8463,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -8159,6 +8585,18 @@
             "title": "Continue On Failure",
             "default": false
           },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "wait_sec": {
             "type": "integer",
             "title": "Wait Sec"
@@ -8234,6 +8672,18 @@
             "type": "boolean",
             "title": "Continue On Failure",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "wait_sec": {
             "type": "integer",
@@ -8334,6 +8784,18 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "status": {
             "$ref": "#/components/schemas/WorkflowStatus",
@@ -8440,6 +8902,18 @@
             "type": "boolean",
             "title": "Persist Browser Session",
             "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "workflow_definition": {
             "$ref": "#/components/schemas/WorkflowDefinitionYAML"
