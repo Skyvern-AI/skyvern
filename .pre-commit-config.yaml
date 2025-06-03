@@ -97,3 +97,8 @@ repos:
         entry: ./run_alembic_check.sh
         language: script
         stages: [ manual ]
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+
