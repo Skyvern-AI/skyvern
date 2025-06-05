@@ -463,7 +463,7 @@ class AgentFunction:
         return
 
     async def validate_task_execution(
-        self, organization_id: str | None = None, task_id: str | None = None, task_version: str | None = None
+        self, organization_id: str, task_id: str | None = None, task_version: str | None = None
     ) -> None:
         return
 
