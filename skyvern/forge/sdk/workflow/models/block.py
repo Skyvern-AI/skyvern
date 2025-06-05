@@ -2521,15 +2521,43 @@ class TaskV2Block(Block):
                     browser_session_id=browser_session_id,
                 )
             )
-        result_dict = None
-        if task_v2:
-            result_dict = task_v2.output
+        result_dict = task_v2.output if task_v2 else None
+
+        block_status_mapping = {
+            TaskV2Status.completed: BlockStatus.completed,
+            TaskV2Status.terminated: BlockStatus.terminated,
+            TaskV2Status.failed: BlockStatus.failed,
+            TaskV2Status.canceled: BlockStatus.canceled,
+            TaskV2Status.timed_out: BlockStatus.timed_out,
+        }
+
+        status = block_status_mapping.get(task_v2.status, BlockStatus.failed)
+        success = task_v2.status == TaskV2Status.completed
+
+        failure_reason = None
+        if not success:
+            workflow_run_id_to_check = task_v2.workflow_run_id or workflow_run_id
+            if workflow_run_id_to_check:
+                try:
+                    refreshed_workflow_run = await app.DATABASE.get_workflow_run(
+                        workflow_run_id=workflow_run_id_to_check,
+                        organization_id=organization_id,
+                    )
+                    if refreshed_workflow_run:
+                        failure_reason = refreshed_workflow_run.failure_reason
+                except Exception:
+                    LOG.warning(
+                        "Failed to get failure reason for task_v2",
+                        task_v2_id=task_v2.observer_cruise_id,
+                        workflow_run_id=workflow_run_id_to_check,
+                        exc_info=True,
+                    )
 
         return await self.build_block_result(
-            success=True,
-            failure_reason=None,
+            success=success,
+            failure_reason=failure_reason,
             output_parameter_value=result_dict,
-            status=BlockStatus.completed,
+            status=status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
