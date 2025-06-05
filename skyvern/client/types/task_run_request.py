@@ -80,7 +80,7 @@ class TaskRunRequest(UniversalBaseModel):
     webhook_url: typing.Optional[str] = pydantic.Field(default=None)
     """
     
-    URL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
+    After a run is finished, send an update to this URL. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
     """
 
     totp_identifier: typing.Optional[str] = pydantic.Field(default=None)
