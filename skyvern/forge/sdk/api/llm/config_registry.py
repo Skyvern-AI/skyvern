@@ -40,6 +40,22 @@ class LLMConfigRegistry:
             # If the key is not found in registered configs, treat it as a general model
             if not llm_key:
                 raise InvalidLLMConfigError(f"LLM_KEY not set for {llm_key}")
+
+            if llm_key.startswith("openrouter/"):
+                return LLMConfig(
+                    llm_key,
+                    ["OPENROUTER_API_KEY"],
+                    supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                    add_assistant_prefix=settings.LLM_CONFIG_ADD_ASSISTANT_PREFIX,
+                    max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                    litellm_params=LiteLLMParams(
+                        api_key=settings.OPENROUTER_API_KEY,
+                        api_base=settings.OPENROUTER_API_BASE,
+                        api_version=None,
+                        model_info={"model_name": llm_key},
+                    ),
+                )
+
             return LLMConfig(
                 llm_key,  # Use the LLM_KEY as the model name
                 ["LLM_API_KEY"],
