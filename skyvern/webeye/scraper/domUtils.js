@@ -818,6 +818,13 @@ function isInteractable(element, hoverStylesMap) {
     return true;
   }
 
+  if (window.jQuery && window.jQuery._data) {
+    const events = window.jQuery._data(element, "events");
+    if (events && "click" in events) {
+      return true;
+    }
+  }
+
   return false;
 }
 
