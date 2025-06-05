@@ -20,12 +20,14 @@ import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
+import fetchToCurl from "fetch-to-curl";
 import { useState } from "react";
 import { useForm, useFormState } from "react-hook-form";
 import { Link } from "react-router-dom";
@@ -37,7 +39,6 @@ import {
 } from "./taskFormTypes";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Switch } from "@/components/ui/switch";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
@@ -621,17 +622,30 @@ function CreateNewTaskForm({ initialValues }: Props) {
         </TaskFormSection>
 
         <div className="flex justify-end gap-3">
-          <CopyApiCommandDropdown
-            getRequest={() => ({
-              method: "POST",
-              url: `${apiBaseUrl}/tasks`,
-              body: createTaskRequestObject(form.getValues()),
-              headers: {
-                "Content-Type": "application/json",
-                "x-api-key": apiCredential ?? "<your-api-key>",
-              },
-            })}
-          />
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={async () => {
+              const curl = fetchToCurl({
+                method: "POST",
+                url: `${apiBaseUrl}/tasks`,
+                body: createTaskRequestObject(form.getValues()),
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                },
+              });
+              copyText(curl).then(() => {
+                toast({
+                  title: "Copied cURL",
+                  description: "cURL copied to clipboard",
+                });
+              });
+            }}
+          >
+            <CopyIcon className="mr-2 h-4 w-4" />
+            cURL
+          </Button>
           <Button type="submit" disabled={mutation.isPending}>
             {mutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
