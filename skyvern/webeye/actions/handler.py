@@ -96,11 +96,10 @@ from skyvern.webeye.scraper.scraper import (
     json_to_html,
     trim_element_tree,
 )
-from skyvern.webeye.utils.dom import DomUtil, InteractiveElement, SkyvernElement
+from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElement, SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
-COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
 class CustomSingleSelectResult:
@@ -822,6 +821,9 @@ async def handle_input_text_action(
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
+    is_totp_value = text == BitwardenConstants.TOTP
+    is_secret_value = text != action.text
+
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if await skyvern_element.is_disabled(dynamic=True):
         LOG.warning(
@@ -984,7 +986,7 @@ async def handle_input_text_action(
     await skyvern_element.get_locator().focus(timeout=timeout)
 
     # check the phone number format when type=tel and the text is not a secret value
-    if await skyvern_element.get_attr("type") == "tel" and text == action.text:
+    if not is_secret_value and await skyvern_element.get_attr("type") == "tel":
         try:
             text = await check_phone_number_format(
                 value=text,
@@ -1017,6 +1019,8 @@ async def handle_input_text_action(
             if not class_name or "blinking-cursor" not in class_name:
                 return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
+            if is_totp_value:
+                text = generate_totp_value(task=task, parameter=action.text)
             await skyvern_element.press_fill(text=text)
             return [ActionSuccess()]
 
@@ -1038,6 +1042,12 @@ async def handle_input_text_action(
             task_id=task.task_id,
             step_id=step.step_id,
         )
+
+    if is_totp_value:
+        LOG.info("Skipping the auto completion logic since it's a TOTP input")
+        text = generate_totp_value(task=task, parameter=action.text)
+        await skyvern_element.input(text)
+        return [ActionSuccess()]
 
     try:
         # TODO: not sure if this case will trigger auto-completion
@@ -1840,13 +1850,18 @@ async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) ->
 
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
-
-    if secret_value == BitwardenConstants.TOTP:
-        totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
-        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-        totp_secret_no_whitespace = "".join(totp_secret.split())
-        secret_value = pyotp.TOTP(totp_secret_no_whitespace).now()
     return secret_value if secret_value is not None else parameter
+
+
+def generate_totp_value(task: Task, parameter: str) -> str:
+    if task.workflow_run_id is None:
+        return parameter
+
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+    totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
+    totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+    totp_secret_no_whitespace = "".join(totp_secret.split())
+    return pyotp.TOTP(totp_secret_no_whitespace).now()
 
 
 async def chain_click(
