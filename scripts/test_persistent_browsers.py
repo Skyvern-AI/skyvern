@@ -2,6 +2,10 @@ import json
 import os
 from typing import Any, Optional, cast
 
+import pytest
+
+pytest.skip("requires network access", allow_module_level=True)
+
 import requests
 from dotenv import load_dotenv
 
