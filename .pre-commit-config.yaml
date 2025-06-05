@@ -1,5 +1,5 @@
 default_language_version:
-  python: python3.11
+  python: python3
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -13,9 +13,11 @@ repos:
       - id: check-symlinks
       - id: debug-statements
       - id: detect-private-key
+      - id: check-python-version
+        args: ['--min-version=3.11', '--max-version=3.13']
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.9.1
+    rev: v0.11.12
     hooks:
       # Run the linter.
       - id: ruff
@@ -30,7 +32,7 @@ repos:
     rev: 6.0.1
     hooks:
       - id: isort
-        language_version: python3.11
+        language_version: python3
         exclude: |
           (?x)(
             ^skyvern/client/.*|
@@ -49,7 +51,7 @@ repos:
     rev: v1.14.1
     hooks:
       - id: mypy
-        args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs, --python-version=3.11]
+        args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs]
         additional_dependencies:
           - requests
           - types-requests
