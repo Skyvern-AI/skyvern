@@ -9,6 +9,7 @@ on:
     branches: [main]
 jobs:
   test:
+    name: Run tests and pre-commit hooks
     runs-on: ubuntu-latest
     # Service containers to run with `container-job`
     services:
@@ -108,6 +109,7 @@ jobs:
           OPENAI_API_KEY: "sk-dummy"
         run: poetry run pytest tests
   fe-lint-build:
+    name: Frontend Lint and Build
     runs-on: ubuntu-latest
     defaults:
       run:
