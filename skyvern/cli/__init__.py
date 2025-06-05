@@ -8,7 +8,6 @@ __all__ = [
     "tasks_app",
     "docs_app",
     "status_app",
-    "stop_app",
     "init_app",
 ]
 
@@ -17,6 +16,5 @@ from .docs import docs_app
 from .quickstart import quickstart_app
 from .run_commands import run_app
 from .status import status_app
-from .stop_commands import stop_app
 from .tasks import tasks_app
 from .workflow import workflow_app
