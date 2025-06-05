@@ -13,7 +13,7 @@ repos:
       - id: check-symlinks
       - id: debug-statements
       - id: detect-private-key
-      - id: check-python-version
+      - id: check-python-versions
         args: ['--min-version=3.11', '--max-version=3.13']
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
