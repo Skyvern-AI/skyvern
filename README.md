@@ -187,7 +187,22 @@ skyvern run ui
 ```bash
 skyvern status
 ```
+**Stop the Skyvern service**
 
+```bash
+skyvern stop all
+```
+**Stop the Skyvern UI**
+
+```bash
+skyvern stop ui
+```
+
+**Stop the Skyvern Server Separately**
+
+```bash
+skyvern stop server
+```
 
 ## Docker Compose setup
 
