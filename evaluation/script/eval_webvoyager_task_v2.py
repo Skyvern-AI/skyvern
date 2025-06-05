@@ -79,7 +79,7 @@ async def run_eval(
 ) -> None:
     client = SkyvernClient(base_url=base_url, credentials=cred)
 
-    with open(record_json_path, "r", encoding="utf-8") as file:
+    with open(record_json_path, encoding="utf-8") as file:
         with open(output_csv_path, newline="", mode="w", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
             writer.writeheader()

@@ -12,7 +12,7 @@ from .workflow_parameter_yaml_default_value import WorkflowParameterYamlDefaultV
 class WorkflowDefinitionYamlParametersItem_AwsSecret(UniversalBaseModel):
     parameter_type: typing.Literal["aws_secret"] = "aws_secret"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     aws_key: str
 
     if IS_PYDANTIC_V2:
@@ -28,7 +28,7 @@ class WorkflowDefinitionYamlParametersItem_AwsSecret(UniversalBaseModel):
 class WorkflowDefinitionYamlParametersItem_BitwardenCreditCardData(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_credit_card_data"] = "bitwarden_credit_card_data"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     bitwarden_client_id_aws_secret_key: str
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
@@ -48,13 +48,13 @@ class WorkflowDefinitionYamlParametersItem_BitwardenCreditCardData(UniversalBase
 class WorkflowDefinitionYamlParametersItem_BitwardenLoginCredential(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_login_credential"] = "bitwarden_login_credential"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     bitwarden_client_id_aws_secret_key: str
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
-    url_parameter_key: typing.Optional[str] = None
-    bitwarden_collection_id: typing.Optional[str] = None
-    bitwarden_item_id: typing.Optional[str] = None
+    url_parameter_key: str | None = None
+    bitwarden_collection_id: str | None = None
+    bitwarden_item_id: str | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -69,13 +69,13 @@ class WorkflowDefinitionYamlParametersItem_BitwardenLoginCredential(UniversalBas
 class WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_sensitive_information"] = "bitwarden_sensitive_information"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     bitwarden_client_id_aws_secret_key: str
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
     bitwarden_collection_id: str
     bitwarden_identity_key: str
-    bitwarden_identity_fields: typing.List[str]
+    bitwarden_identity_fields: list[str]
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -90,7 +90,7 @@ class WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation(Univers
 class WorkflowDefinitionYamlParametersItem_Context(UniversalBaseModel):
     parameter_type: typing.Literal["context"] = "context"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     source_parameter_key: str
 
     if IS_PYDANTIC_V2:
@@ -106,7 +106,7 @@ class WorkflowDefinitionYamlParametersItem_Context(UniversalBaseModel):
 class WorkflowDefinitionYamlParametersItem_Credential(UniversalBaseModel):
     parameter_type: typing.Literal["credential"] = "credential"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     credential_id: str
 
     if IS_PYDANTIC_V2:
@@ -122,7 +122,7 @@ class WorkflowDefinitionYamlParametersItem_Credential(UniversalBaseModel):
 class WorkflowDefinitionYamlParametersItem_Output(UniversalBaseModel):
     parameter_type: typing.Literal["output"] = "output"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -137,9 +137,9 @@ class WorkflowDefinitionYamlParametersItem_Output(UniversalBaseModel):
 class WorkflowDefinitionYamlParametersItem_Workflow(UniversalBaseModel):
     parameter_type: typing.Literal["workflow"] = "workflow"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     workflow_parameter_type: WorkflowParameterType
-    default_value: typing.Optional[WorkflowParameterYamlDefaultValue] = None
+    default_value: WorkflowParameterYamlDefaultValue | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

@@ -40,27 +40,27 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     block_type: typing.Literal["action"] = "action"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
-    url: typing.Optional[str] = None
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
-    navigation_goal: typing.Optional[str] = None
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[ActionBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[ActionBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    navigation_goal: str | None = None
+    data_extraction_goal: str | None = None
+    data_schema: ActionBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[ActionBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -76,9 +76,9 @@ class ForLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
     block_type: typing.Literal["code"] = "code"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
     code: str
-    parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
+    parameters: list[CodeBlockParametersItem] | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -94,7 +94,7 @@ class ForLoopBlockLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     block_type: typing.Literal["download_to_s3"] = "download_to_s3"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -111,27 +111,27 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     block_type: typing.Literal["extraction"] = "extraction"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
-    url: typing.Optional[str] = None
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
-    navigation_goal: typing.Optional[str] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    navigation_goal: str | None = None
     data_extraction_goal: str
-    data_schema: typing.Optional[ExtractionBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[ExtractionBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    data_schema: ExtractionBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[ExtractionBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -147,27 +147,27 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     block_type: typing.Literal["file_download"] = "file_download"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
-    url: typing.Optional[str] = None
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
-    navigation_goal: typing.Optional[str] = None
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[FileDownloadBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[FileDownloadBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    navigation_goal: str | None = None
+    data_extraction_goal: str | None = None
+    data_schema: FileDownloadBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[FileDownloadBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -183,13 +183,13 @@ class ForLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
     block_type: typing.Literal["file_upload"] = "file_upload"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    storage_type: typing.Optional[FileStorageType] = None
-    s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
-    aws_access_key_id: typing.Optional[str] = None
-    aws_secret_access_key: typing.Optional[str] = None
-    region_name: typing.Optional[str] = None
-    path: typing.Optional[str] = None
+    continue_on_failure: bool | None = None
+    storage_type: FileStorageType | None = None
+    s3bucket: typing_extensions.Annotated[str | None, FieldMetadata(alias="s3_bucket")] = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
+    path: str | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -205,7 +205,7 @@ class ForLoopBlockLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     block_type: typing.Literal["file_url_parser"] = "file_url_parser"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
     file_url: str
     file_type: FileType = "csv"
 
@@ -223,11 +223,11 @@ class ForLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
     block_type: typing.Literal["for_loop"] = "for_loop"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
-    loop_over: typing.Optional[ForLoopBlockLoopOver] = None
-    loop_variable_reference: typing.Optional[str] = None
-    complete_if_empty: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
+    loop_blocks: list[ForLoopBlockLoopBlocksItem]
+    loop_over: ForLoopBlockLoopOver | None = None
+    loop_variable_reference: str | None = None
+    complete_if_empty: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -246,27 +246,27 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     block_type: typing.Literal["goto_url"] = "goto_url"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
     url: str
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
-    navigation_goal: typing.Optional[str] = None
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[UrlBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[UrlBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    navigation_goal: str | None = None
+    data_extraction_goal: str | None = None
+    data_schema: UrlBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[UrlBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -282,27 +282,27 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     block_type: typing.Literal["login"] = "login"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
-    url: typing.Optional[str] = None
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
-    navigation_goal: typing.Optional[str] = None
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[LoginBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[LoginBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    navigation_goal: str | None = None
+    data_extraction_goal: str | None = None
+    data_schema: LoginBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[LoginBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -318,27 +318,27 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     block_type: typing.Literal["navigation"] = "navigation"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
-    url: typing.Optional[str] = None
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
     navigation_goal: str
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[NavigationBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[NavigationBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    data_extraction_goal: str | None = None
+    data_schema: NavigationBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[NavigationBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -354,9 +354,9 @@ class ForLoopBlockLoopBlocksItem_PdfParser(UniversalBaseModel):
     block_type: typing.Literal["pdf_parser"] = "pdf_parser"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
     file_url: str
-    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    json_schema: dict[str, typing.Any | None] | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -372,16 +372,16 @@ class ForLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
     block_type: typing.Literal["send_email"] = "send_email"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
     smtp_host: AwsSecretParameter
     smtp_port: AwsSecretParameter
     smtp_username: AwsSecretParameter
     smtp_password: AwsSecretParameter
     sender: str
-    recipients: typing.List[str]
+    recipients: list[str]
     subject: str
     body: str
-    file_attachments: typing.Optional[typing.List[str]] = None
+    file_attachments: list[str] | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -397,27 +397,27 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     block_type: typing.Literal["task"] = "task"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
-    url: typing.Optional[str] = None
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
-    navigation_goal: typing.Optional[str] = None
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[TaskBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[TaskBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    navigation_goal: str | None = None
+    data_extraction_goal: str | None = None
+    data_schema: TaskBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[TaskBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -433,13 +433,13 @@ class ForLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
     block_type: typing.Literal["task_v2"] = "task_v2"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
     prompt: str
-    url: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    max_iterations: typing.Optional[int] = None
-    max_steps: typing.Optional[int] = None
+    url: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    max_iterations: int | None = None
+    max_steps: int | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -455,11 +455,11 @@ class ForLoopBlockLoopBlocksItem_TextPrompt(UniversalBaseModel):
     block_type: typing.Literal["text_prompt"] = "text_prompt"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    llm_key: typing.Optional[str] = None
+    continue_on_failure: bool | None = None
+    llm_key: str | None = None
     prompt: str
-    parameters: typing.Optional[typing.List[TextPromptBlockParametersItem]] = None
-    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    parameters: list[TextPromptBlockParametersItem] | None = None
+    json_schema: dict[str, typing.Any | None] | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -475,8 +475,8 @@ class ForLoopBlockLoopBlocksItem_UploadToS3(UniversalBaseModel):
     block_type: typing.Literal["upload_to_s3"] = "upload_to_s3"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    path: typing.Optional[str] = None
+    continue_on_failure: bool | None = None
+    path: str | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -492,27 +492,27 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     block_type: typing.Literal["validation"] = "validation"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    task_type: typing.Optional[str] = None
-    url: typing.Optional[str] = None
-    title: typing.Optional[str] = None
-    engine: typing.Optional[RunEngine] = None
-    complete_criterion: typing.Optional[str] = None
-    terminate_criterion: typing.Optional[str] = None
-    navigation_goal: typing.Optional[str] = None
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[ValidationBlockDataSchema] = None
-    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    max_retries: typing.Optional[int] = None
-    max_steps_per_run: typing.Optional[int] = None
-    parameters: typing.Optional[typing.List[ValidationBlockParametersItem]] = None
-    complete_on_download: typing.Optional[bool] = None
-    download_suffix: typing.Optional[str] = None
-    totp_verification_url: typing.Optional[str] = None
-    totp_identifier: typing.Optional[str] = None
-    cache_actions: typing.Optional[bool] = None
-    complete_verification: typing.Optional[bool] = None
-    include_action_history_in_verification: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
+    task_type: str | None = None
+    url: str | None = None
+    title: str | None = None
+    engine: RunEngine | None = None
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    navigation_goal: str | None = None
+    data_extraction_goal: str | None = None
+    data_schema: ValidationBlockDataSchema | None = None
+    error_code_mapping: dict[str, str | None] | None = None
+    max_retries: int | None = None
+    max_steps_per_run: int | None = None
+    parameters: list[ValidationBlockParametersItem] | None = None
+    complete_on_download: bool | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool | None = None
+    complete_verification: bool | None = None
+    include_action_history_in_verification: bool | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -528,9 +528,9 @@ class ForLoopBlockLoopBlocksItem_Wait(UniversalBaseModel):
     block_type: typing.Literal["wait"] = "wait"
     label: str
     output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
+    continue_on_failure: bool | None = None
     wait_sec: int
-    parameters: typing.Optional[typing.List[WaitBlockParametersItem]] = None
+    parameters: list[WaitBlockParametersItem] | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

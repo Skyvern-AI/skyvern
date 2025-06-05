@@ -211,7 +211,7 @@ class Block(BaseModel, abc.ABC):
         return template.render(template_data)
 
     @classmethod
-    def get_subclasses(cls) -> tuple[type["Block"], ...]:
+    def get_subclasses(cls) -> tuple[type[Block], ...]:
         return tuple(cls.__subclasses__())
 
     @staticmethod
@@ -2123,7 +2123,7 @@ class FileParserBlock(Block):
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
         if self.file_type == FileType.CSV:
             try:
-                with open(file_path, "r") as file:
+                with open(file_path) as file:
                     csv.Sniffer().sniff(file.read(1024))
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
@@ -2172,7 +2172,7 @@ class FileParserBlock(Block):
         self.validate_file_type(self.file_url, file_path)
         # Parse the file into a list of dictionaries where each dictionary represents a row in the file
         parsed_data = []
-        with open(file_path, "r") as file:
+        with open(file_path) as file:
             if self.file_type == FileType.CSV:
                 reader = csv.DictReader(file)
                 for row in reader:

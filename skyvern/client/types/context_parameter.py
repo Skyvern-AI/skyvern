@@ -11,9 +11,9 @@ from ..core.pydantic_utilities import update_forward_refs
 
 class ContextParameter(UniversalBaseModel):
     key: str
-    description: typing.Optional[str] = None
-    source: "ContextParameterSource"
-    value: typing.Optional[ContextParameterValue] = None
+    description: str | None = None
+    source: ContextParameterSource
+    value: ContextParameterValue | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

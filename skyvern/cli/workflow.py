@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
 
 import typer
 from dotenv import load_dotenv
@@ -22,7 +21,7 @@ workflow_app = typer.Typer(help="Manage Skyvern workflows.")
 @workflow_app.callback()
 def workflow_callback(
     ctx: typer.Context,
-    api_key: Optional[str] = typer.Option(
+    api_key: str | None = typer.Option(
         None,
         "--api-key",
         help="Skyvern API key",
@@ -33,7 +32,7 @@ def workflow_callback(
     ctx.obj = {"api_key": api_key}
 
 
-def _get_client(api_key: Optional[str] = None) -> Skyvern:
+def _get_client(api_key: str | None = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
     load_dotenv()
     load_dotenv(".env")
@@ -46,8 +45,8 @@ def start_workflow(
     ctx: typer.Context,
     workflow_id: str = typer.Argument(..., help="Workflow permanent ID"),
     parameters: str = typer.Option("{}", "--parameters", "-p", help="JSON parameters for the workflow"),
-    title: Optional[str] = typer.Option(None, "--title", help="Title for the workflow run"),
-    max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override the workflow max steps"),
+    title: str | None = typer.Option(None, "--title", help="Title for the workflow run"),
+    max_steps: int | None = typer.Option(None, "--max-steps", help="Override the workflow max steps"),
 ) -> None:
     """Dispatch a workflow run."""
     try:

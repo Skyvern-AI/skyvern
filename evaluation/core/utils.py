@@ -21,13 +21,13 @@ class WorkflowRunResultRequest(BaseModel):
 
 
 def load_webvoyager_case_from_json(file_path: str, group_id: str = "") -> Iterator[WebVoyagerTestCase]:
-    with open("evaluation/datasets/webvoyager_reference_answer.json", "r") as answer_file:
+    with open("evaluation/datasets/webvoyager_reference_answer.json") as answer_file:
         webvoyager_answers: dict = json.load(answer_file)
 
     if not group_id:
         group_id = str(uuid4())
 
-    with open(file_path, "r", encoding="utf-8") as file:
+    with open(file_path, encoding="utf-8") as file:
         for line in file:
             test_case: dict[str, str] = json.loads(line)
             web_name, id = test_case["id"].split("--")
@@ -47,7 +47,7 @@ def load_webvoyager_case_from_json(file_path: str, group_id: str = "") -> Iterat
 
 
 def load_records_from_json(file_path: str) -> Iterator[WorkflowRunResultRequest]:
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, encoding="utf-8") as f:
         for line in f:
             item: dict[str, str] = json.loads(line)
             id = item["id"]
