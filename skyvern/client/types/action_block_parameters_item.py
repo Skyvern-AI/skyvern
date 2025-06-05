@@ -15,13 +15,13 @@ from ..core.pydantic_utilities import update_forward_refs
 class ActionBlockParametersItem_AwsSecret(UniversalBaseModel):
     parameter_type: typing.Literal["aws_secret"] = "aws_secret"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     aws_secret_parameter_id: str
     workflow_id: str
     aws_key: str
     created_at: dt.datetime
     modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    deleted_at: dt.datetime | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -36,7 +36,7 @@ class ActionBlockParametersItem_AwsSecret(UniversalBaseModel):
 class ActionBlockParametersItem_BitwardenCreditCardData(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_credit_card_data"] = "bitwarden_credit_card_data"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     bitwarden_credit_card_data_parameter_id: str
     workflow_id: str
     bitwarden_client_id_aws_secret_key: str
@@ -46,7 +46,7 @@ class ActionBlockParametersItem_BitwardenCreditCardData(UniversalBaseModel):
     bitwarden_item_id: str
     created_at: dt.datetime
     modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    deleted_at: dt.datetime | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -61,18 +61,18 @@ class ActionBlockParametersItem_BitwardenCreditCardData(UniversalBaseModel):
 class ActionBlockParametersItem_BitwardenLoginCredential(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_login_credential"] = "bitwarden_login_credential"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     bitwarden_login_credential_parameter_id: str
     workflow_id: str
     bitwarden_client_id_aws_secret_key: str
     bitwarden_client_secret_aws_secret_key: str
     bitwarden_master_password_aws_secret_key: str
-    url_parameter_key: typing.Optional[str] = None
-    bitwarden_collection_id: typing.Optional[str] = None
-    bitwarden_item_id: typing.Optional[str] = None
+    url_parameter_key: str | None = None
+    bitwarden_collection_id: str | None = None
+    bitwarden_item_id: str | None = None
     created_at: dt.datetime
     modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    deleted_at: dt.datetime | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -87,7 +87,7 @@ class ActionBlockParametersItem_BitwardenLoginCredential(UniversalBaseModel):
 class ActionBlockParametersItem_BitwardenSensitiveInformation(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_sensitive_information"] = "bitwarden_sensitive_information"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     bitwarden_sensitive_information_parameter_id: str
     workflow_id: str
     bitwarden_client_id_aws_secret_key: str
@@ -95,10 +95,10 @@ class ActionBlockParametersItem_BitwardenSensitiveInformation(UniversalBaseModel
     bitwarden_master_password_aws_secret_key: str
     bitwarden_collection_id: str
     bitwarden_identity_key: str
-    bitwarden_identity_fields: typing.List[str]
+    bitwarden_identity_fields: list[str]
     created_at: dt.datetime
     modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    deleted_at: dt.datetime | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -113,9 +113,9 @@ class ActionBlockParametersItem_BitwardenSensitiveInformation(UniversalBaseModel
 class ActionBlockParametersItem_Context(UniversalBaseModel):
     parameter_type: typing.Literal["context"] = "context"
     key: str
-    description: typing.Optional[str] = None
-    source: "ContextParameterSource"
-    value: typing.Optional[ContextParameterValue] = None
+    description: str | None = None
+    source: ContextParameterSource
+    value: ContextParameterValue | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -134,13 +134,13 @@ from .context_parameter_source import ContextParameterSource  # noqa: E402
 class ActionBlockParametersItem_Credential(UniversalBaseModel):
     parameter_type: typing.Literal["credential"] = "credential"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     credential_parameter_id: str
     workflow_id: str
     credential_id: str
     created_at: dt.datetime
     modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    deleted_at: dt.datetime | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -155,12 +155,12 @@ class ActionBlockParametersItem_Credential(UniversalBaseModel):
 class ActionBlockParametersItem_Output(UniversalBaseModel):
     parameter_type: typing.Literal["output"] = "output"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     output_parameter_id: str
     workflow_id: str
     created_at: dt.datetime
     modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    deleted_at: dt.datetime | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -175,14 +175,14 @@ class ActionBlockParametersItem_Output(UniversalBaseModel):
 class ActionBlockParametersItem_Workflow(UniversalBaseModel):
     parameter_type: typing.Literal["workflow"] = "workflow"
     key: str
-    description: typing.Optional[str] = None
+    description: str | None = None
     workflow_parameter_id: str
     workflow_parameter_type: WorkflowParameterType
     workflow_id: str
-    default_value: typing.Optional[WorkflowParameterDefaultValue] = None
+    default_value: WorkflowParameterDefaultValue | None = None
     created_at: dt.datetime
     modified_at: dt.datetime
-    deleted_at: typing.Optional[dt.datetime] = None
+    deleted_at: dt.datetime | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

@@ -255,7 +255,7 @@ class AsyncAWSClient:
             return await client.deregister_task_definition(taskDefinition=task_definition)
 
 
-class S3Uri(object):
+class S3Uri:
     # From: https://stackoverflow.com/questions/42641315/s3-urls-get-bucket-name-and-path
     """
     >>> s = S3Uri("s3://bucket/hello/world")

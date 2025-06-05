@@ -18,15 +18,15 @@ class GetRunResponse_TaskV1(UniversalBaseModel):
     run_type: typing.Literal["task_v1"] = "task_v1"
     run_id: str
     status: RunStatus
-    output: typing.Optional[TaskRunResponseOutput] = None
-    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
-    recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
-    failure_reason: typing.Optional[str] = None
+    output: TaskRunResponseOutput | None = None
+    downloaded_files: list[FileInfo] | None = None
+    recording_url: str | None = None
+    screenshot_urls: list[str] | None = None
+    failure_reason: str | None = None
     created_at: dt.datetime
     modified_at: dt.datetime
-    app_url: typing.Optional[str] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    app_url: str | None = None
+    run_request: TaskRunRequest | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -42,15 +42,15 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
     run_type: typing.Literal["task_v2"] = "task_v2"
     run_id: str
     status: RunStatus
-    output: typing.Optional[TaskRunResponseOutput] = None
-    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
-    recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
-    failure_reason: typing.Optional[str] = None
+    output: TaskRunResponseOutput | None = None
+    downloaded_files: list[FileInfo] | None = None
+    recording_url: str | None = None
+    screenshot_urls: list[str] | None = None
+    failure_reason: str | None = None
     created_at: dt.datetime
     modified_at: dt.datetime
-    app_url: typing.Optional[str] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    app_url: str | None = None
+    run_request: TaskRunRequest | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -66,15 +66,15 @@ class GetRunResponse_OpenaiCua(UniversalBaseModel):
     run_type: typing.Literal["openai_cua"] = "openai_cua"
     run_id: str
     status: RunStatus
-    output: typing.Optional[TaskRunResponseOutput] = None
-    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
-    recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
-    failure_reason: typing.Optional[str] = None
+    output: TaskRunResponseOutput | None = None
+    downloaded_files: list[FileInfo] | None = None
+    recording_url: str | None = None
+    screenshot_urls: list[str] | None = None
+    failure_reason: str | None = None
     created_at: dt.datetime
     modified_at: dt.datetime
-    app_url: typing.Optional[str] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    app_url: str | None = None
+    run_request: TaskRunRequest | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -90,15 +90,15 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
     run_type: typing.Literal["anthropic_cua"] = "anthropic_cua"
     run_id: str
     status: RunStatus
-    output: typing.Optional[TaskRunResponseOutput] = None
-    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
-    recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
-    failure_reason: typing.Optional[str] = None
+    output: TaskRunResponseOutput | None = None
+    downloaded_files: list[FileInfo] | None = None
+    recording_url: str | None = None
+    screenshot_urls: list[str] | None = None
+    failure_reason: str | None = None
     created_at: dt.datetime
     modified_at: dt.datetime
-    app_url: typing.Optional[str] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    app_url: str | None = None
+    run_request: TaskRunRequest | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -114,15 +114,15 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     run_type: typing.Literal["workflow_run"] = "workflow_run"
     run_id: str
     status: RunStatus
-    output: typing.Optional[WorkflowRunResponseOutput] = None
-    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
-    recording_url: typing.Optional[str] = None
-    screenshot_urls: typing.Optional[typing.List[str]] = None
-    failure_reason: typing.Optional[str] = None
+    output: WorkflowRunResponseOutput | None = None
+    downloaded_files: list[FileInfo] | None = None
+    recording_url: str | None = None
+    screenshot_urls: list[str] | None = None
+    failure_reason: str | None = None
     created_at: dt.datetime
     modified_at: dt.datetime
-    app_url: typing.Optional[str] = None
-    run_request: typing.Optional[WorkflowRunRequest] = None
+    app_url: str | None = None
+    run_request: WorkflowRunRequest | None = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

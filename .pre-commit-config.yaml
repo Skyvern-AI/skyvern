@@ -51,6 +51,10 @@ repos:
       - id: python-check-mock-methods
       - id: python-no-log-warn
       - id: python-use-type-annotations
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.20.0
+    hooks:
+      - id: pyupgrade
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.16.0
     hooks:
@@ -61,7 +65,7 @@ repos:
           - types-requests
           - types-cachetools
           - alembic
-          - "sqlalchemy[mypy]"
+          - 'sqlalchemy[mypy]'
           - types-PyYAML
           - types-aiofiles
         exclude: |
@@ -91,7 +95,7 @@ repos:
         #   pass_filenames: false
         #   always_run: true
   - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: "v4.0.0-alpha.8" # Use the sha or tag you want to point at
+    rev: 'v4.0.0-alpha.8' # Use the sha or tag you want to point at
     hooks:
       - id: prettier
         types: [javascript]
