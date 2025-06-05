@@ -531,10 +531,7 @@ class ActionModel(Base):
 
 class WorkflowRunBlockModel(Base):
     __tablename__ = "workflow_run_blocks"
-    __table_args__ = (
-        Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),
-        Index("wfrb_url_idx", "url"),
-    )
+    __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
 
     workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
     workflow_run_id = Column(String, nullable=False)
@@ -567,13 +564,6 @@ class WorkflowRunBlockModel(Base):
 
     # wait block
     wait_sec = Column(Integer, nullable=True)
-
-    # http_request block
-    url = Column(String, nullable=True)
-    method = Column(String, nullable=True)
-    headers = Column(JSON, nullable=True)
-    body = Column(JSON, nullable=True)
-    timeout = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
