@@ -11,6 +11,7 @@ on:
 
 jobs:
   test:
+    name: Run tests and pre-commit hooks
     runs-on: ubuntu-latest
 
     # Service containers to run with `container-job`
@@ -124,6 +125,7 @@ jobs:
         run: poetry run pytest tests
 
   fe-lint-build:
+    name: Frontend Lint and Build
     runs-on: ubuntu-latest
     defaults:
       run:
