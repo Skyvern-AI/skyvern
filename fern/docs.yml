@@ -152,7 +152,7 @@ navigation:
         snippets:
           python: skyvern
         layout:
-          - section: Agents
+          - section: Agent
             contents:
             - POST /v1/run/tasks
             - GET /v1/runs/{run_id}
