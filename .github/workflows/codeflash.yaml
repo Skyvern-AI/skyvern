@@ -1,17 +1,14 @@
 name: Codeflash
-
 on:
   pull_request:
     paths:
       # So that this workflow only runs when code within the target module is modified
       - "skyvern/**"
   workflow_dispatch:
-
 concurrency:
   # Any new push to the PR will cancel the previous run, so that only the latest code is optimized
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   optimize:
     name: Optimize new Python code in this PR
@@ -21,7 +18,6 @@ jobs:
     env:
       CODEFLASH_API_KEY: ${{ secrets.CODEFLASH_API_KEY }}
       CODEFLASH_PR_NUMBER: ${{ github.event.number }}
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,5 +40,5 @@ jobs:
           poetry env use python
           poetry run codeflash
       - name: remove test dir
-        run: |
+        run: |-
           rm -rf codeflash-tests

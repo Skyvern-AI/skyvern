@@ -1,8 +1,6 @@
 name: Close inactive issues
 on:
-   workflow_dispatch:
-
-
+  workflow_dispatch:
 jobs:
   close-issues:
     runs-on: ubuntu-latest
