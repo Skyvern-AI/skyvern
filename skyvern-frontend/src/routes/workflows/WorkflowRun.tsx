@@ -17,15 +17,17 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import {
+  CopyIcon,
   FileIcon,
   Pencil2Icon,
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import fetchToCurl from "fetch-to-curl";
 import { Link, Outlet, useParams, useSearchParams } from "react-router-dom";
 import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
@@ -181,20 +183,37 @@ function WorkflowRun() {
         </div>
 
         <div className="flex gap-2">
-          <CopyApiCommandDropdown
-            getRequest={() => ({
-              method: "POST",
-              url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-              body: {
-                data: workflowRun?.parameters,
-                proxy_location: "RESIDENTIAL",
-              },
-              headers: {
-                "Content-Type": "application/json",
-                "x-api-key": apiCredential ?? "<your-api-key>",
-              },
-            })}
-          />
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (!workflowRun) {
+                return;
+              }
+              const curl = fetchToCurl({
+                method: "POST",
+                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
+                body: {
+                  data: workflowRun?.parameters,
+                  proxy_location: "RESIDENTIAL",
+                },
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                },
+              });
+              copyText(curl).then(() => {
+                toast({
+                  variant: "success",
+                  title: "Copied to Clipboard",
+                  description:
+                    "The cURL command has been copied to your clipboard.",
+                });
+              });
+            }}
+          >
+            <CopyIcon className="mr-2 h-4 w-4" />
+            cURL
+          </Button>
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>
               <Pencil2Icon className="mr-2 h-4 w-4" />

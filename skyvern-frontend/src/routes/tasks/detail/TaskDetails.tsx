@@ -24,10 +24,11 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
-import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import fetchToCurl from "fetch-to-curl";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { statusIsFinalized } from "../types";
 import { useTaskQuery } from "./hooks/useTaskQuery";
@@ -179,17 +180,34 @@ function TaskDetails() {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <CopyApiCommandDropdown
-              getRequest={() => ({
-                method: "POST",
-                url: `${apiBaseUrl}/tasks`,
-                body: task ? createTaskRequestObject(task) : undefined,
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
-              })}
-            />
+            <Button
+              variant="secondary"
+              onClick={() => {
+                if (!task) {
+                  return;
+                }
+                const curl = fetchToCurl({
+                  method: "POST",
+                  url: `${apiBaseUrl}/tasks`,
+                  body: createTaskRequestObject(task),
+                  headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": apiCredential ?? "<your-api-key>",
+                  },
+                });
+                copyText(curl).then(() => {
+                  toast({
+                    variant: "success",
+                    title: "Copied to Clipboard",
+                    description:
+                      "The cURL command has been copied to your clipboard.",
+                  });
+                });
+              }}
+            >
+              <CopyIcon className="mr-2 h-4 w-4" />
+              cURL
+            </Button>
             {taskIsRunningOrQueued && (
               <Dialog>
                 <DialogTrigger asChild>
