@@ -818,6 +818,17 @@ function isInteractable(element, hoverStylesMap) {
     return true;
   }
 
+  try {
+    if (window.jQuery && window.jQuery._data) {
+      const events = window.jQuery._data(element, "events");
+      if (events && "click" in events) {
+        return true;
+      }
+    }
+  } catch (e) {
+    _jsConsoleError("Error getting jQuery click events:", e);
+  }
+
   return false;
 }
 
