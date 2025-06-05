@@ -6,6 +6,7 @@ from .init_command import init, init_browser
 from .quickstart import quickstart_app
 from .run_commands import run_app
 from .status import status_app
+from .stop_commands import stop_app
 from .tasks import tasks_app
 from .workflow import workflow_app
 
@@ -23,6 +24,7 @@ cli_app.add_typer(workflow_app, name="workflow", help="Workflow management comma
 cli_app.add_typer(tasks_app, name="tasks", help="Task management commands.")
 cli_app.add_typer(docs_app, name="docs", help="Open Skyvern documentation.")
 cli_app.add_typer(status_app, name="status", help="Check if Skyvern services are running.")
+cli_app.add_typer(stop_app, name="stop", help="Stop Skyvern services like the API server.")
 init_app = typer.Typer(
     invoke_without_command=True,
     help="Interactively configure Skyvern and its dependencies.",
