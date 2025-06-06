@@ -23,11 +23,11 @@ def upgrade() -> None:
     op.add_column("workflow_run_blocks", sa.Column("headers", sa.JSON(), nullable=True))
     op.add_column("workflow_run_blocks", sa.Column("body", sa.JSON(), nullable=True))
     op.add_column("workflow_run_blocks", sa.Column("timeout", sa.Integer(), nullable=True))
-    op.create_index(op.f("ix_workflow_run_blocks_url"), "workflow_run_blocks", ["url"], unique=False)
+    op.create_index("wfrb_url_idx", "workflow_run_blocks", ["url"], unique=False)
 
 
 def downgrade() -> None:
-    op.drop_index(op.f("ix_workflow_run_blocks_url"), table_name="workflow_run_blocks")
+    op.drop_index("wfrb_url_idx", table_name="workflow_run_blocks")
     op.drop_column("workflow_run_blocks", "timeout")
     op.drop_column("workflow_run_blocks", "body")
     op.drop_column("workflow_run_blocks", "headers")
