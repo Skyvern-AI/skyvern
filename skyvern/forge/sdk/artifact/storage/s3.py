@@ -6,7 +6,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import DOWNLOAD_FILE_PREFIX
-from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -67,7 +67,18 @@ class S3Storage(BaseStorage):
         return f"s3://{self.bucket}/{settings.ENV}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
-        await self.async_client.upload_file(artifact.uri, data)
+        sc = await self._get_storage_class_for_org(artifact.organization_id)
+        LOG.info(
+            "Storing artifact",
+            artifact_id=artifact.id,
+            organization_id=artifact.organization_id,
+            uri=artifact.uri,
+            storage_class=sc,
+        )
+        await self.async_client.upload_file(artifact.uri, data, storage_class=sc)
+
+    async def _get_storage_class_for_org(self, organization_id: str | None) -> S3StorageClass:
+        return S3StorageClass.STANDARD
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await self.async_client.download_file(artifact.uri)
@@ -80,12 +91,30 @@ class S3Storage(BaseStorage):
         return await self.async_client.create_presigned_urls([artifact.uri for artifact in artifacts])
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
-        await self.async_client.upload_file_from_path(artifact.uri, path)
+        sc = await self._get_storage_class_for_org(artifact.organization_id)
+        LOG.info(
+            "Storing artifact from path",
+            artifact_id=artifact.id,
+            organization_id=artifact.organization_id,
+            uri=artifact.uri,
+            storage_class=sc,
+            path=path,
+        )
+        await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=sc)
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
-        await self.async_client.upload_file_from_path(to_path, from_path)
+        sc = await self._get_storage_class_for_org(organization_id)
+        LOG.info(
+            "Saving streaming file",
+            organization_id=organization_id,
+            file_name=file_name,
+            from_path=from_path,
+            to_path=to_path,
+            storage_class=sc,
+        )
+        await self.async_client.upload_file_from_path(to_path, from_path, storage_class=sc)
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
@@ -96,7 +125,16 @@ class S3Storage(BaseStorage):
         temp_zip_file = create_named_temporary_file()
         zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
-        await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path)
+        sc = await self._get_storage_class_for_org(organization_id)
+        LOG.info(
+            "Storing browser session",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            zip_file_path=zip_file_path,
+            browser_session_uri=browser_session_uri,
+            storage_class=sc,
+        )
+        await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path, storage_class=sc)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
@@ -117,6 +155,7 @@ class S3Storage(BaseStorage):
     ) -> None:
         download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
         files = os.listdir(download_dir)
+        sc = await self._get_storage_class_for_org(organization_id)
         for file in files:
             fpath = os.path.join(download_dir, file)
             if os.path.isfile(fpath):
@@ -124,11 +163,19 @@ class S3Storage(BaseStorage):
 
                 # Calculate SHA-256 checksum
                 checksum = calculate_sha256_for_file(fpath)
-                LOG.info("Calculated checksum for file", file=file, checksum=checksum)
-
+                LOG.info(
+                    "Calculated checksum for file",
+                    file=file,
+                    checksum=checksum,
+                    organization_id=organization_id,
+                    storage_class=sc,
+                )
                 # Upload file with checksum metadata
                 await self.async_client.upload_file_from_path(
-                    uri=uri, file_path=fpath, metadata={"sha256_checksum": checksum, "original_filename": file}
+                    uri=uri,
+                    file_path=fpath,
+                    metadata={"sha256_checksum": checksum, "original_filename": file},
+                    storage_class=sc,
                 )
 
     async def get_downloaded_files(
