@@ -234,6 +234,16 @@ class S3Storage(BaseStorage):
             s3_uri = f"s3://{bucket}/{settings.ENV}/{organization_id}/{todays_date}/{uuid_prefixed_filename}"
             fileObj.seek(0)  # Reset file pointer
             uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj, storage_class=sc)
+
+        if not uploaded_s3_uri:
+            LOG.error(
+                "Failed to upload file to S3 after retrying with UUID prefix",
+                organization_id=organization_id,
+                storage_class=sc,
+                filename=filename,
+                exc_info=True,
+            )
+            return None
         LOG.debug(
             "Legacy file upload",
             organization_id=organization_id,
@@ -241,13 +251,16 @@ class S3Storage(BaseStorage):
             filename=filename,
             uploaded_s3_uri=uploaded_s3_uri,
         )
-        if not uploaded_s3_uri:
-            LOG.error("Failed to upload file to S3 after retrying with UUID prefix", exc_info=True)
-            return None
-
         # Generate a presigned URL for the uploaded file
         presigned_urls = await self.async_client.create_presigned_urls([uploaded_s3_uri])
         if not presigned_urls:
-            LOG.error("Failed to create presigned URL for uploaded file", exc_info=True)
+            LOG.error(
+                "Failed to create presigned URL for uploaded file",
+                organization_id=organization_id,
+                storage_class=sc,
+                uploaded_s3_uri=uploaded_s3_uri,
+                filename=filename,
+                exc_info=True,
+            )
             return None
         return presigned_urls[0], uploaded_s3_uri
