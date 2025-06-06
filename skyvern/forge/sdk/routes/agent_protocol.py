@@ -1128,13 +1128,10 @@ async def get_artifacts(
         )
 
     analytics.capture("skyvern-oss-agent-entity-artifacts-get")
-
     params = {
-        "organization_id": current_org.organization_id,
         entity_type_to_param[entity_type]: entity_id,
     }
-
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)

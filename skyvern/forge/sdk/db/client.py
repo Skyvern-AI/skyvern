@@ -358,8 +358,9 @@ class AgentDB:
 
     async def get_total_unique_step_order_count_by_task_ids(
         self,
+        *,
         task_ids: list[str],
-        organization_id: str | None = None,
+        organization_id: str,
     ) -> int:
         """
         Get the total count of unique (step.task_id, step.order) pairs of StepModel for the given task ids
@@ -1008,6 +1009,8 @@ class AgentDB:
 
     async def get_artifacts_by_entity_id(
         self,
+        *,
+        organization_id: str,
         artifact_type: ArtifactType | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
@@ -1015,7 +1018,6 @@ class AgentDB:
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
-        organization_id: str | None = None,
     ) -> list[Artifact]:
         try:
             async with self.Session() as session:
@@ -1052,16 +1054,18 @@ class AgentDB:
 
     async def get_artifact_by_entity_id(
         self,
+        *,
         artifact_type: ArtifactType,
+        organization_id: str,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
-        organization_id: str | None = None,
     ) -> Artifact | None:
         artifacts = await self.get_artifacts_by_entity_id(
+            organization_id=organization_id,
             artifact_type=artifact_type,
             task_id=task_id,
             step_id=step_id,
@@ -1069,7 +1073,6 @@ class AgentDB:
             workflow_run_block_id=workflow_run_block_id,
             thought_id=thought_id,
             task_v2_id=task_v2_id,
-            organization_id=organization_id,
         )
         return artifacts[0] if artifacts else None
 
@@ -2400,9 +2403,10 @@ class AgentDB:
 
     async def get_thoughts(
         self,
+        *,
         task_v2_id: str,
-        thought_types: list[ThoughtType] | None = None,
-        organization_id: str | None = None,
+        thought_types: list[ThoughtType],
+        organization_id: str,
     ) -> list[Thought]:
         async with self.Session() as session:
             query = (
