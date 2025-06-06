@@ -55,6 +55,10 @@ repos:
     rev: v3.20.0
     hooks:
       - id: pyupgrade
+        exclude: |
+          (?x)(
+            ^skyvern/client/.*
+          )
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.16.0
     hooks:
