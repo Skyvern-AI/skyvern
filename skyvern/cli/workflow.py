@@ -71,15 +71,15 @@ def start_workflow(
     )
 
 
-@workflow_app.command("stop")
-def stop_workflow(
+@workflow_app.command("cancel")
+def cancel_workflow(
     ctx: typer.Context,
     run_id: str = typer.Argument(..., help="ID of the workflow run"),
 ) -> None:
     """Cancel a running workflow."""
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
     client.agent.cancel_run(run_id=run_id)
-    console.print(Panel(f"Stop signal sent for run {run_id}", border_style="red"))
+    console.print(Panel(f"Cancel signal sent for run {run_id}", border_style="red"))
 
 
 @workflow_app.command("status")
