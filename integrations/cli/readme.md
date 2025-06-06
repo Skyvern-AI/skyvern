@@ -1,26 +1,17 @@
-<!-- START doctoc generated TOC please keep comment here to allow auto update -->
-<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+# Skyvern CLI
 
-- [Skyvern CLI](#skyvern-cli)
-  - [Quickstart](#quickstart)
-  - [Initialization](#initialization)
-    - [Init Browser](#init-browser)
-  - [Run](#run)
-    - [server](#server)
-    - [ui](#ui)
-    - [all](#all)
-    - [mcp](#mcp)
-  - [Workflow](#workflow)
-    - [start](#start)
-    - [stop](#stop)
-    - [status](#status)
-    - [list](#list)
-  - [Tasks](#tasks)
-    - [list](#list-1)
-  - [Status](#status-1)
-  - [Docs](#docs)
+Skyvern ships with a comprehensive command line interface built using `typer`. The
+main entry point is the `skyvern` command which exposes subcommands for common
+operations.
 
-<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+## Table of Contents
+- [Quickstart](#quickstart)
+- [Initialization](#initialization)
+- [Run](#run)
+- [Workflow](#workflow)
+- [Tasks](#tasks)
+- [Status](#status)
+- [Docs](#docs)
 
 # Skyvern CLI
 
@@ -96,19 +87,19 @@ Run the Model Context Protocol (MCP) server.
 
 Commands for managing workflows through the Skyvern API.
 
-### start
+### run
 
 ```
-skyvern workflow start WORKFLOW_ID [--parameters JSON] [--title TEXT] [--max-steps INTEGER]
+skyvern workflow run WORKFLOW_ID [--parameters JSON] [--title TEXT] [--max-steps INTEGER]
 ```
 
 Dispatch a workflow run using the provided permanent identifier. Parameters are
-supplied as a JSON string.
+applied as a JSON string.
 
-### stop
+### cancel
 
 ```
-skyvern workflow stop RUN_ID
+skyvern workflow cancel RUN_ID
 ```
 
 Cancel a running workflow.
