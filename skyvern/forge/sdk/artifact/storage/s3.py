@@ -77,7 +77,7 @@ class S3Storage(BaseStorage):
         )
         await self.async_client.upload_file(artifact.uri, data, storage_class=sc)
 
-    async def _get_storage_class_for_org(self, organization_id: str | None) -> S3StorageClass:
+    async def _get_storage_class_for_org(self, organization_id: str) -> S3StorageClass:
         return S3StorageClass.STANDARD
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
