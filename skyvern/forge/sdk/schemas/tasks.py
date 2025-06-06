@@ -231,7 +231,7 @@ class Task(TaskBase):
         None,
         description="The reason for the task failure.",
     )
-    organization_id: str | None = None
+    organization_id: str
     workflow_run_id: str | None = None
     workflow_permanent_id: str | None = None
     order: int | None = None

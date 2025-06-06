@@ -10,6 +10,18 @@ from skyvern.config import settings
 LOG = structlog.get_logger()
 
 
+# We only include the storage classes that we want to use in our application.
+class S3StorageClass(StrEnum):
+    STANDARD = "STANDARD"
+    # REDUCED_REDUNDANCY = "REDUCED_REDUNDANCY"
+    # INTELLIGENT_TIERING = "INTELLIGENT_TIERING"
+    ONEZONE_IA = "ONEZONE_IA"
+    GLACIER = "GLACIER"
+    # DEEP_ARCHIVE = "DEEP_ARCHIVE"
+    # OUTPOSTS = "OUTPOSTS"
+    # STANDARD_IA = "STANDARD_IA"
+
+
 class AWSClientType(StrEnum):
     S3 = "s3"
     SECRETS_MANAGER = "secretsmanager"
@@ -68,21 +80,33 @@ class AsyncAWSClient:
             LOG.exception("Failed to delete secret.", secret_name=secret_name)
             raise e
 
-    async def upload_file(self, uri: str, data: bytes) -> str | None:
+    async def upload_file(
+        self, uri: str, data: bytes, storage_class: S3StorageClass = S3StorageClass.STANDARD
+    ) -> str | None:
+        if storage_class not in S3StorageClass:
+            raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
         try:
             async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
                 parsed_uri = S3Uri(uri)
-                await client.put_object(Body=data, Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+                await client.put_object(
+                    Body=data, Bucket=parsed_uri.bucket, Key=parsed_uri.key, StorageClass=str(storage_class)
+                )
                 return uri
         except Exception:
             LOG.exception("S3 upload failed.", uri=uri)
             return None
 
-    async def upload_file_stream(self, uri: str, file_obj: IO[bytes]) -> str | None:
+    async def upload_file_stream(
+        self, uri: str, file_obj: IO[bytes], storage_class: S3StorageClass = S3StorageClass.STANDARD
+    ) -> str | None:
+        if storage_class not in S3StorageClass:
+            raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
         try:
             async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
                 parsed_uri = S3Uri(uri)
-                await client.upload_fileobj(file_obj, parsed_uri.bucket, parsed_uri.key)
+                await client.upload_fileobj(
+                    file_obj, parsed_uri.bucket, parsed_uri.key, StorageClass=str(storage_class)
+                )
                 LOG.debug("Upload file stream success", uri=uri)
                 return uri
         except Exception:
@@ -93,22 +117,21 @@ class AsyncAWSClient:
         self,
         uri: str,
         file_path: str,
+        storage_class: S3StorageClass = S3StorageClass.STANDARD,
         metadata: dict | None = None,
         raise_exception: bool = False,
     ) -> None:
         try:
             async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
                 parsed_uri = S3Uri(uri)
-                params: dict[str, Any] = {
-                    "Filename": file_path,
-                    "Bucket": parsed_uri.bucket,
-                    "Key": parsed_uri.key,
-                }
-
-                if metadata:
-                    params["ExtraArgs"] = {"Metadata": metadata}
-
-                await client.upload_file(**params)
+                extra_args: dict[str, Any] = {"ExtraArgs": {"Metadata": metadata}} if metadata else {}
+                await client.upload_file(
+                    Filename=file_path,
+                    Bucket=parsed_uri.bucket,
+                    Key=parsed_uri.key,
+                    StorageClass=str(storage_class),
+                    **extra_args,
+                )
         except Exception as e:
             LOG.exception("S3 upload failed.", uri=uri)
             if raise_exception:

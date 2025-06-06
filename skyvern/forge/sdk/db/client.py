@@ -312,7 +312,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_task_steps(self, task_id: str, organization_id: str | None = None) -> list[Step]:
+    async def get_task_steps(self, task_id: str, organization_id: str) -> list[Step]:
         try:
             async with self.Session() as session:
                 if steps := (
