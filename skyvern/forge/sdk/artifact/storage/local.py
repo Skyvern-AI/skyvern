@@ -2,6 +2,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import BinaryIO
 
 import structlog
 
@@ -178,3 +179,10 @@ class LocalStorage(BaseStorage):
     def _create_directories_if_not_exists(path_including_file_name: Path) -> None:
         path = path_including_file_name.parent
         path.mkdir(parents=True, exist_ok=True)
+
+    async def save_legacy_file(
+        self, *, organization_id: str, filename: str, fileObj: BinaryIO
+    ) -> tuple[str, str] | None:
+        raise NotImplementedError(
+            "Legacy file storage is not implemented for LocalStorage. Please use a different storage backend."
+        )

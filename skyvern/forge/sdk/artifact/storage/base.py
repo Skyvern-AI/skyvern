@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import BinaryIO
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.models import Step
@@ -115,4 +116,10 @@ class BaseStorage(ABC):
     async def get_downloaded_files(
         self, organization_id: str, task_id: str | None, workflow_run_id: str | None
     ) -> list[FileInfo]:
+        pass
+
+    @abstractmethod
+    async def save_legacy_file(
+        self, *, organization_id: str, filename: str, fileObj: BinaryIO
+    ) -> tuple[str, str] | None:
         pass

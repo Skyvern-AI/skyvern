@@ -1,6 +1,3 @@
-import datetime
-import os
-import uuid
 from enum import Enum
 from typing import Annotated, Any
 
@@ -14,7 +11,6 @@ from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.core import skyvern_context
@@ -1696,36 +1692,12 @@ async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
-    bucket = app.SETTINGS_MANAGER.AWS_S3_BUCKET_UPLOADS
-    todays_date = datetime.datetime.now().strftime("%Y-%m-%d")
-
-    # First try uploading with original filename
-    try:
-        sanitized_filename = os.path.basename(file.filename)  # Remove any path components
-        s3_uri = (
-            f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{sanitized_filename}"
-        )
-        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
-    except Exception:
-        LOG.error("Failed to upload file to S3", exc_info=True)
-        uploaded_s3_uri = None
-
-    # If upload fails, try again with UUID prefix
-    if not uploaded_s3_uri:
-        uuid_prefixed_filename = f"{str(uuid.uuid4())}_{file.filename}"
-        s3_uri = f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{uuid_prefixed_filename}"
-        file.file.seek(0)  # Reset file pointer
-        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
-
-    if not uploaded_s3_uri:
+    uris = await app.STORAGE.save_legacy_file(
+        organization_id=current_org.organization_id, filename=file.filename, fileObj=file.file
+    )
+    if not uris:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
-
-    # Generate a presigned URL for the uploaded file
-    presigned_urls = await aws_client.create_presigned_urls([uploaded_s3_uri])
-    if not presigned_urls:
-        raise HTTPException(status_code=500, detail="Failed to generate presigned URL.")
-
-    presigned_url = presigned_urls[0]
+    presigned_url, uploaded_s3_uri = uris
     return ORJSONResponse(
         content={"s3_uri": uploaded_s3_uri, "presigned_url": presigned_url},
         status_code=200,
