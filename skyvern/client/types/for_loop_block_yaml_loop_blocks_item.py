@@ -18,26 +18,26 @@ from ..core.pydantic_utilities import update_forward_refs
 class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
     block_type: typing.Literal["task"] = "task"
     label: str
-    continue_on_failure: bool | None = None
-    url: str | None = None
-    title: str | None = None
-    engine: RunEngine | None = None
-    navigation_goal: str | None = None
-    data_extraction_goal: str | None = None
-    data_schema: TaskBlockYamlDataSchema | None = None
-    error_code_mapping: dict[str, str | None] | None = None
-    max_retries: int | None = None
-    max_steps_per_run: int | None = None
-    parameter_keys: list[str] | None = None
-    complete_on_download: bool | None = None
-    download_suffix: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
-    cache_actions: bool | None = None
-    complete_criterion: str | None = None
-    terminate_criterion: str | None = None
-    complete_verification: bool | None = None
-    include_action_history_in_verification: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    url: typing.Optional[str] = None
+    title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
+    navigation_goal: typing.Optional[str] = None
+    data_extraction_goal: typing.Optional[str] = None
+    data_schema: typing.Optional[TaskBlockYamlDataSchema] = None
+    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    max_retries: typing.Optional[int] = None
+    max_steps_per_run: typing.Optional[int] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+    complete_on_download: typing.Optional[bool] = None
+    download_suffix: typing.Optional[str] = None
+    totp_verification_url: typing.Optional[str] = None
+    totp_identifier: typing.Optional[str] = None
+    cache_actions: typing.Optional[bool] = None
+    complete_criterion: typing.Optional[str] = None
+    terminate_criterion: typing.Optional[str] = None
+    complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -52,11 +52,11 @@ class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_ForLoop(UniversalBaseModel):
     block_type: typing.Literal["for_loop"] = "for_loop"
     label: str
-    continue_on_failure: bool | None = None
-    loop_blocks: list[ForLoopBlockYamlLoopBlocksItem]
-    loop_over_parameter_key: str | None = None
-    loop_variable_reference: str | None = None
-    complete_if_empty: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    loop_blocks: typing.List["ForLoopBlockYamlLoopBlocksItem"]
+    loop_over_parameter_key: typing.Optional[str] = None
+    loop_variable_reference: typing.Optional[str] = None
+    complete_if_empty: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -74,9 +74,9 @@ from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402
 class ForLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
     block_type: typing.Literal["code"] = "code"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     code: str
-    parameter_keys: list[str] | None = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -91,11 +91,11 @@ class ForLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_TextPrompt(UniversalBaseModel):
     block_type: typing.Literal["text_prompt"] = "text_prompt"
     label: str
-    continue_on_failure: bool | None = None
-    llm_key: str | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    llm_key: typing.Optional[str] = None
     prompt: str
-    parameter_keys: list[str] | None = None
-    json_schema: dict[str, typing.Any | None] | None = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -110,7 +110,7 @@ class ForLoopBlockYamlLoopBlocksItem_TextPrompt(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     block_type: typing.Literal["download_to_s3"] = "download_to_s3"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -126,8 +126,8 @@ class ForLoopBlockYamlLoopBlocksItem_DownloadToS3(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_UploadToS3(UniversalBaseModel):
     block_type: typing.Literal["upload_to_s3"] = "upload_to_s3"
     label: str
-    continue_on_failure: bool | None = None
-    path: str | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -142,13 +142,13 @@ class ForLoopBlockYamlLoopBlocksItem_UploadToS3(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_FileUpload(UniversalBaseModel):
     block_type: typing.Literal["file_upload"] = "file_upload"
     label: str
-    continue_on_failure: bool | None = None
-    storage_type: FileStorageType | None = None
-    s3bucket: typing_extensions.Annotated[str | None, FieldMetadata(alias="s3_bucket")] = None
-    aws_access_key_id: str | None = None
-    aws_secret_access_key: str | None = None
-    region_name: str | None = None
-    path: str | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    storage_type: typing.Optional[FileStorageType] = None
+    s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
+    aws_access_key_id: typing.Optional[str] = None
+    aws_secret_access_key: typing.Optional[str] = None
+    region_name: typing.Optional[str] = None
+    path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -163,16 +163,16 @@ class ForLoopBlockYamlLoopBlocksItem_FileUpload(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_SendEmail(UniversalBaseModel):
     block_type: typing.Literal["send_email"] = "send_email"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     smtp_host_secret_parameter_key: str
     smtp_port_secret_parameter_key: str
     smtp_username_secret_parameter_key: str
     smtp_password_secret_parameter_key: str
     sender: str
-    recipients: list[str]
+    recipients: typing.List[str]
     subject: str
     body: str
-    file_attachments: list[str] | None = None
+    file_attachments: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -187,7 +187,7 @@ class ForLoopBlockYamlLoopBlocksItem_SendEmail(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     block_type: typing.Literal["file_url_parser"] = "file_url_parser"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     file_url: str
     file_type: FileType = "csv"
 
@@ -204,11 +204,11 @@ class ForLoopBlockYamlLoopBlocksItem_FileUrlParser(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
     block_type: typing.Literal["validation"] = "validation"
     label: str
-    continue_on_failure: bool | None = None
-    complete_criterion: str | None = None
-    terminate_criterion: str | None = None
-    error_code_mapping: dict[str, str | None] | None = None
-    parameter_keys: list[str] | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    complete_criterion: typing.Optional[str] = None
+    terminate_criterion: typing.Optional[str] = None
+    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -223,19 +223,19 @@ class ForLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
     block_type: typing.Literal["action"] = "action"
     label: str
-    continue_on_failure: bool | None = None
-    url: str | None = None
-    title: str | None = None
-    engine: RunEngine | None = None
-    navigation_goal: str | None = None
-    error_code_mapping: dict[str, str | None] | None = None
-    max_retries: int | None = None
-    parameter_keys: list[str] | None = None
-    complete_on_download: bool | None = None
-    download_suffix: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
-    cache_actions: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    url: typing.Optional[str] = None
+    title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
+    navigation_goal: typing.Optional[str] = None
+    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    max_retries: typing.Optional[int] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+    complete_on_download: typing.Optional[bool] = None
+    download_suffix: typing.Optional[str] = None
+    totp_verification_url: typing.Optional[str] = None
+    totp_identifier: typing.Optional[str] = None
+    cache_actions: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -250,24 +250,24 @@ class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Navigation(UniversalBaseModel):
     block_type: typing.Literal["navigation"] = "navigation"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     navigation_goal: str
-    url: str | None = None
-    title: str | None = None
-    engine: RunEngine | None = None
-    error_code_mapping: dict[str, str | None] | None = None
-    max_retries: int | None = None
-    max_steps_per_run: int | None = None
-    parameter_keys: list[str] | None = None
-    complete_on_download: bool | None = None
-    download_suffix: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
-    cache_actions: bool | None = None
-    complete_criterion: str | None = None
-    terminate_criterion: str | None = None
-    complete_verification: bool | None = None
-    include_action_history_in_verification: bool | None = None
+    url: typing.Optional[str] = None
+    title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
+    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    max_retries: typing.Optional[int] = None
+    max_steps_per_run: typing.Optional[int] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+    complete_on_download: typing.Optional[bool] = None
+    download_suffix: typing.Optional[str] = None
+    totp_verification_url: typing.Optional[str] = None
+    totp_identifier: typing.Optional[str] = None
+    cache_actions: typing.Optional[bool] = None
+    complete_criterion: typing.Optional[str] = None
+    terminate_criterion: typing.Optional[str] = None
+    complete_verification: typing.Optional[bool] = None
+    include_action_history_in_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -282,16 +282,16 @@ class ForLoopBlockYamlLoopBlocksItem_Navigation(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
     block_type: typing.Literal["extraction"] = "extraction"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     data_extraction_goal: str
-    url: str | None = None
-    title: str | None = None
-    engine: RunEngine | None = None
-    data_schema: ExtractionBlockYamlDataSchema | None = None
-    max_retries: int | None = None
-    max_steps_per_run: int | None = None
-    parameter_keys: list[str] | None = None
-    cache_actions: bool | None = None
+    url: typing.Optional[str] = None
+    title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
+    data_schema: typing.Optional[ExtractionBlockYamlDataSchema] = None
+    max_retries: typing.Optional[int] = None
+    max_steps_per_run: typing.Optional[int] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+    cache_actions: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -306,21 +306,21 @@ class ForLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
     block_type: typing.Literal["login"] = "login"
     label: str
-    continue_on_failure: bool | None = None
-    url: str | None = None
-    title: str | None = None
-    engine: RunEngine | None = None
-    navigation_goal: str | None = None
-    error_code_mapping: dict[str, str | None] | None = None
-    max_retries: int | None = None
-    max_steps_per_run: int | None = None
-    parameter_keys: list[str] | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
-    cache_actions: bool | None = None
-    complete_criterion: str | None = None
-    terminate_criterion: str | None = None
-    complete_verification: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    url: typing.Optional[str] = None
+    title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
+    navigation_goal: typing.Optional[str] = None
+    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    max_retries: typing.Optional[int] = None
+    max_steps_per_run: typing.Optional[int] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+    totp_verification_url: typing.Optional[str] = None
+    totp_identifier: typing.Optional[str] = None
+    cache_actions: typing.Optional[bool] = None
+    complete_criterion: typing.Optional[str] = None
+    terminate_criterion: typing.Optional[str] = None
+    complete_verification: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -335,8 +335,8 @@ class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_Wait(UniversalBaseModel):
     block_type: typing.Literal["wait"] = "wait"
     label: str
-    continue_on_failure: bool | None = None
-    wait_sec: int | None = None
+    continue_on_failure: typing.Optional[bool] = None
+    wait_sec: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -351,19 +351,19 @@ class ForLoopBlockYamlLoopBlocksItem_Wait(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
     block_type: typing.Literal["file_download"] = "file_download"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     navigation_goal: str
-    url: str | None = None
-    title: str | None = None
-    engine: RunEngine | None = None
-    error_code_mapping: dict[str, str | None] | None = None
-    max_retries: int | None = None
-    max_steps_per_run: int | None = None
-    parameter_keys: list[str] | None = None
-    download_suffix: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
-    cache_actions: bool | None = None
+    url: typing.Optional[str] = None
+    title: typing.Optional[str] = None
+    engine: typing.Optional[RunEngine] = None
+    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    max_retries: typing.Optional[int] = None
+    max_steps_per_run: typing.Optional[int] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+    download_suffix: typing.Optional[str] = None
+    totp_verification_url: typing.Optional[str] = None
+    totp_identifier: typing.Optional[str] = None
+    cache_actions: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -378,7 +378,7 @@ class ForLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_GotoUrl(UniversalBaseModel):
     block_type: typing.Literal["goto_url"] = "goto_url"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -394,9 +394,9 @@ class ForLoopBlockYamlLoopBlocksItem_GotoUrl(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_PdfParser(UniversalBaseModel):
     block_type: typing.Literal["pdf_parser"] = "pdf_parser"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     file_url: str
-    json_schema: dict[str, typing.Any | None] | None = None
+    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -411,13 +411,13 @@ class ForLoopBlockYamlLoopBlocksItem_PdfParser(UniversalBaseModel):
 class ForLoopBlockYamlLoopBlocksItem_TaskV2(UniversalBaseModel):
     block_type: typing.Literal["task_v2"] = "task_v2"
     label: str
-    continue_on_failure: bool | None = None
+    continue_on_failure: typing.Optional[bool] = None
     prompt: str
-    url: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
-    max_iterations: int | None = None
-    max_steps: int | None = None
+    url: typing.Optional[str] = None
+    totp_verification_url: typing.Optional[str] = None
+    totp_identifier: typing.Optional[str] = None
+    max_iterations: typing.Optional[int] = None
+    max_steps: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
