@@ -1,6 +1,8 @@
 import os
 import shutil
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
+from typing import BinaryIO
 
 import structlog
 
@@ -210,3 +212,36 @@ class S3Storage(BaseStorage):
             file_infos.append(file_info)
 
         return file_infos
+
+    async def save_legacy_file(
+        self, *, organization_id: str, filename: str, fileObj: BinaryIO
+    ) -> tuple[str, str] | None:
+        todays_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        bucket = settings.AWS_S3_BUCKET_UPLOADS
+        # First try uploading with original filename
+        try:
+            sanitized_filename = os.path.basename(filename)  # Remove any path components
+            s3_uri = f"s3://{bucket}/{settings.ENV}/{organization_id}/{todays_date}/{sanitized_filename}"
+            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj)
+        except Exception:
+            LOG.error("Failed to upload file to S3", exc_info=True)
+            uploaded_s3_uri = None
+
+        # If upload fails, try again with UUID prefix
+        if not uploaded_s3_uri:
+            uuid_prefixed_filename = f"{str(uuid.uuid4())}_{filename}"
+            s3_uri = f"s3://{bucket}/{settings.ENV}/{organization_id}/{todays_date}/{uuid_prefixed_filename}"
+            fileObj.seek(0)  # Reset file pointer
+            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj)
+
+        if not uploaded_s3_uri:
+            LOG.error("Failed to upload file to S3 after retrying with UUID prefix", exc_info=True)
+            return None
+
+        # Generate a presigned URL for the uploaded file
+        presigned_urls = await self.async_client.create_presigned_urls([uploaded_s3_uri])
+        if not presigned_urls:
+            LOG.error("Failed to create presigned URL for uploaded file", exc_info=True)
+            return None
+
+        return presigned_urls[0], uploaded_s3_uri
