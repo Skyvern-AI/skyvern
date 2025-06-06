@@ -218,6 +218,8 @@ class WorkflowModel(Base):
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     model = Column(JSON, nullable=True)
+    cron_expression = Column(String, nullable=True)
+    cron_enabled = Column(Boolean, default=False, nullable=False)
     status = Column(String, nullable=False, default="published")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

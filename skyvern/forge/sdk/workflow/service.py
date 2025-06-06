@@ -29,6 +29,7 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
+    InvalidCronExpression,
     InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateParameterKeys,
@@ -92,6 +93,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     WorkflowDefinitionYAML,
 )
 from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.utils.cron import validate_cron_expression
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -553,11 +555,15 @@ class WorkflowService:
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
         model: dict[str, Any] | None = None,
+        cron_expression: str | None = None,
+        cron_enabled: bool = False,
         workflow_permanent_id: str | None = None,
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
+        if cron_expression is not None and not validate_cron_expression(cron_expression):
+            raise InvalidCronExpression(cron_expression)
         return await app.DATABASE.create_workflow(
             title=title,
             workflow_definition=workflow_definition.model_dump(),
@@ -569,6 +575,8 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
             model=model,
+            cron_expression=cron_expression,
+            cron_enabled=cron_enabled,
             workflow_permanent_id=workflow_permanent_id,
             version=version,
             is_saved_task=is_saved_task,
@@ -647,9 +655,13 @@ class WorkflowService:
         title: str | None = None,
         description: str | None = None,
         workflow_definition: WorkflowDefinition | None = None,
+        cron_expression: str | None = None,
+        cron_enabled: bool | None = None,
     ) -> Workflow:
         if workflow_definition:
             workflow_definition.validate()
+        if cron_expression is not None and not validate_cron_expression(cron_expression):
+            raise InvalidCronExpression(cron_expression)
 
         return await app.DATABASE.update_workflow(
             workflow_id=workflow_id,
@@ -657,6 +669,8 @@ class WorkflowService:
             organization_id=organization_id,
             description=description,
             workflow_definition=(workflow_definition.model_dump() if workflow_definition else None),
+            cron_expression=cron_expression,
+            cron_enabled=cron_enabled,
         )
 
     async def delete_workflow_by_permanent_id(
@@ -1409,6 +1423,8 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    cron_expression=request.cron_expression,
+                    cron_enabled=request.cron_enabled,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -1426,6 +1442,8 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    cron_expression=request.cron_expression,
+                    cron_enabled=request.cron_enabled,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                 )

@@ -114,6 +114,14 @@ class InvalidWaitBlockTime(SkyvernException):
         super().__init__(f"Invalid wait time for wait block, it should be a number between 0 and {max_sec}.")
 
 
+class InvalidCronExpression(BaseWorkflowHTTPException):
+    def __init__(self, expression: str) -> None:
+        super().__init__(
+            f"Invalid cron expression: {expression}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class FailedToFormatJinjaStyleParameter(SkyvernException):
     def __init__(self, template: str, msg: str) -> None:
         super().__init__(
