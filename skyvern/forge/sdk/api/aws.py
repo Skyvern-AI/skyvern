@@ -105,7 +105,10 @@ class AsyncAWSClient:
             async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
                 parsed_uri = S3Uri(uri)
                 await client.upload_fileobj(
-                    file_obj, parsed_uri.bucket, parsed_uri.key, StorageClass=str(storage_class)
+                    file_obj,
+                    parsed_uri.bucket,
+                    parsed_uri.key,
+                    ExtraArgs={"StorageClass": str(storage_class)},
                 )
                 LOG.debug("Upload file stream success", uri=uri)
                 return uri
@@ -124,13 +127,14 @@ class AsyncAWSClient:
         try:
             async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
                 parsed_uri = S3Uri(uri)
-                extra_args: dict[str, Any] = {"ExtraArgs": {"Metadata": metadata}} if metadata else {}
+                extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
+                if metadata:
+                    extra_args["Metadata"] = metadata
                 await client.upload_file(
                     Filename=file_path,
                     Bucket=parsed_uri.bucket,
                     Key=parsed_uri.key,
-                    StorageClass=str(storage_class),
-                    **extra_args,
+                    ExtraArgs=extra_args,
                 )
         except Exception as e:
             LOG.exception("S3 upload failed.", uri=uri)
