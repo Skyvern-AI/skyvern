@@ -10,6 +10,41 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@master
+      - name: Determine Git credentials
+        id: git-creds
+        run: |
+          case "${{ github.event.comment.user.login }}" in
+            wintonzheng)
+              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=shu@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=Shuchang Zheng" >> $GITHUB_OUTPUT
+              ;;
+            LawyZheng)
+              echo "GH_PAT=${{ secrets.LAWY_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=lawy@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=Lawy Zheng" >> $GITHUB_OUTPUT
+              ;;
+            suchintan)
+              echo "GH_PAT=${{ secrets.SUCHINTAN_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=suchintan@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=Suchintan Singh" >> $GITHUB_OUTPUT
+              ;;
+            jomido)
+              echo "GH_PAT=${{ secrets.JON_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=jon@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=Jonathan Dobson" >> $GITHUB_OUTPUT
+              ;;
+            Prakashmaheshwaran)
+              echo "GH_PAT=${{ secrets.KASH_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=kash@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=Prakash Maheshwaran" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=shu@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_USERNAME=Shuchang Zheng" >> $GITHUB_OUTPUT
+              ;;
+          esac
       - name: Fetch PR details
         id: pr_details
         run: |
@@ -27,9 +62,9 @@ jobs:
       - name: Run GitHub File Sync
         uses: Skyvern-AI/repo-file-sync-action@main
         with:
-          GH_PAT: ${{ secrets.SKYVERN_CLOUD_GH_PAT }}
-          GIT_EMAIL: shu@skyvern.com
-          GIT_USERNAME: Shuchang Zheng
+          GH_PAT: ${{ steps.git-creds.outputs.GH_PAT }}
+          GIT_EMAIL: ${{ steps.git-creds.outputs.GIT_EMAIL }}
+          GIT_USERNAME: ${{ steps.git-creds.outputs.GIT_USERNAME }}
           BRANCH_NAME: repo-sync/${{ steps.pr_details.outputs.BRANCH_NAME }}
           PR_BODY: ${{ steps.pr_details.outputs.PR_BODY }}
           PR_TITLE: ${{ steps.pr_details.outputs.PR_TITLE }}
