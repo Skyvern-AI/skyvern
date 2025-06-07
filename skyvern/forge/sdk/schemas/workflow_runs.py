@@ -15,7 +15,7 @@ class WorkflowRunBlock(BaseModel):
     workflow_run_block_id: str
     block_workflow_run_id: str | None = None
     workflow_run_id: str
-    organization_id: str | None = None
+    organization_id: str
     description: str | None = None
     parent_workflow_run_block_id: str | None = None
     block_type: BlockType
