@@ -101,6 +101,12 @@ class TaskRunRequest(UniversalBaseModel):
     Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
     """
 
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
+    """
+    
+    Optional model configuration.
+    """
+
     publish_workflow: typing.Optional[bool] = pydantic.Field(default=None)
     """
     Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.

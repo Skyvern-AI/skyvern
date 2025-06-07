@@ -45,6 +45,7 @@ class Skyvern(AsyncSkyvern):
         super().__init__(
             base_url=base_url,
             api_key=api_key,
+            x_api_key=api_key,
             environment=environment,
             timeout=timeout,
             follow_redirects=follow_redirects,

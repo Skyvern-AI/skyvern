@@ -9,6 +9,7 @@ import pydantic
 class CodeBlockYaml(UniversalBaseModel):
     label: str
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     code: str
     parameter_keys: typing.Optional[typing.List[str]] = None
 
