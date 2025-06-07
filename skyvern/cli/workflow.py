@@ -41,15 +41,15 @@ def _get_client(api_key: Optional[str] = None) -> Skyvern:
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
 
 
-@workflow_app.command("start")
-def start_workflow(
+@workflow_app.command("run")
+def run_workflow(
     ctx: typer.Context,
     workflow_id: str = typer.Argument(..., help="Workflow permanent ID"),
     parameters: str = typer.Option("{}", "--parameters", "-p", help="JSON parameters for the workflow"),
     title: Optional[str] = typer.Option(None, "--title", help="Title for the workflow run"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override the workflow max steps"),
 ) -> None:
-    """Dispatch a workflow run."""
+    """Run a workflow."""
     try:
         params_dict = json.loads(parameters) if parameters else {}
     except json.JSONDecodeError:
