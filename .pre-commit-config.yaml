@@ -13,11 +13,9 @@ repos:
       - id: check-symlinks
       - id: debug-statements
       - id: detect-private-key
-      - id: check-python-version
-        args: ['--min-version=3.11', '--max-version=3.13']
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.11.12
+    rev: v0.11.13
     hooks:
       # Run the linter.
       - id: ruff
@@ -46,7 +44,7 @@ repos:
       - id: python-no-log-warn
       - id: python-use-type-annotations
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.14.1
+    rev: v1.16.0
     hooks:
       - id: mypy
         args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs]
