@@ -500,6 +500,66 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
 
+  useEffect(() => {
+    const element = editorElementRef.current;
+    if (!element) {
+      return;
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const target = event.target as HTMLElement;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target.isContentEditable
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+
+      const selectedNode = nodes.find((n) => n.selected);
+
+      let previous: string | null = null;
+      let next: string | null = null;
+      let parent: string | undefined;
+      let connectingEdgeType = "edgeWithAddButton";
+
+      if (selectedNode) {
+        previous = selectedNode.id;
+        parent = selectedNode.parentId;
+        const outgoingEdge = edges.find((e) => e.source === selectedNode.id);
+        if (outgoingEdge) {
+          next = outgoingEdge.target;
+          connectingEdgeType = outgoingEdge.type ?? connectingEdgeType;
+        }
+      } else {
+        const adder = nodes.find((n) => n.type === "nodeAdder" && !n.parentId);
+        if (adder) {
+          previous = edges.find((e) => e.target === adder.id)?.source ?? null;
+          next = adder.id;
+          parent = adder.parentId;
+          connectingEdgeType = "default";
+        }
+      }
+
+      setWorkflowPanelState({
+        active: true,
+        content: "nodeLibrary",
+        data: { previous, next, parent, connectingEdgeType },
+      });
+    }
+
+    element.addEventListener("keydown", handleKeyDown);
+    return () => {
+      element.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [edges, nodes, setWorkflowPanelState]);
+
   return (
     <>
       <Dialog
