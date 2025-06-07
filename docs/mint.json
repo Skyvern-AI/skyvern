@@ -1,0 +1,105 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "Skyvern",
+  "logo": {
+    "dark": "/images/skyvern_logo.png",
+    "light": "/images/skyvern_logo_blackbg.png"
+  },
+  "favicon": "/images/skyvern_favicon.png",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#07C983",
+    "dark": "#0D9373",
+    "anchors": {
+      "from": "#0D9373",
+      "to": "#07C983"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "Discord",
+      "url": "https://discord.gg/fG2XXEuQX3"
+    }, {
+      "name": "Github",
+      "url": "https://github.com/Skyvern-AI/Skyvern/"
+    }
+  ],
+  "topbarCtaButton": {
+    "name": "Try Skyvern Cloud",
+    "url": "https://app.skyvern.com"
+  },
+  "anchors": [
+    {
+      "name": "Blog",
+      "icon": "newspaper",
+      "url": "https://blog.skyvern.com"
+    },
+    {
+      "name": "Community",
+      "icon": "discord",
+      "url": "https://discord.gg/fG2XXEuQX3"
+    },
+    {
+      "name": "Github",
+      "icon": "github",
+      "url": "https://github.com/Skyvern-AI/Skyvern/"
+    },
+    {
+      "name": "Skyvern Cloud",
+      "icon": "cloud",
+      "url": "https://app.skyvern.com"
+    },
+    {
+      "name": "Book a demo",
+      "icon": "calendar",
+      "url": "https://meetings.hubspot.com/skyvern/demo"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": [
+        "introduction",
+        "getting-started/skyvern-in-action",
+        "getting-started/prompting-guide"
+      ]
+    },
+    {
+      "group": "Tasks",
+      "pages": [
+        "running-tasks/introduction",
+        "running-tasks/api-spec",
+        "running-tasks/api-v2-spec",
+        "running-tasks/webhooks-faq",
+        "running-tasks/visualizing-results",
+        "running-tasks/advanced-features"
+      ]
+    },
+    {
+      "group": "Workflows (Beta)",
+      "pages": [
+        "workflows/introduction",
+        "workflows/creating-workflows",
+        "workflows/getting-workflows",
+        "workflows/running-workflows",
+        "workflows/workflow-blocks",
+        "workflows/what-is-a-parameter"
+      ]
+    },
+    {
+      "group": "Integrations",
+      "pages": [
+        "integrations/api",
+        "integrations/zapier",
+        "integrations/make.com",
+        "integrations/workato"
+      ]
+    }
+  ],
+  "feedback.thumbsRating": true,
+  "footerSocials": {
+    "twitter": "https://twitter.com/skyvernai",
+    "github": "https://github.com/skyvern-ai/skyvern/",
+    "linkedin": "https://www.linkedin.com/company/skyvern"
+  }
+}
