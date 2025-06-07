@@ -15,17 +15,22 @@ RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 RUN playwright install-deps
 RUN playwright install
-RUN apt-get install -y xauth x11-apps netpbm curl && apt-get clean
+RUN apt-get install -y xauth x11-apps netpbm curl gpg ca-certificates && apt-get clean
 
 COPY .nvmrc /app/.nvmrc
-# Install Node.js based on .nvmrc version (without nvm)
-RUN NODE_MAJOR=$(cut -d. -f1 < /app/.nvmrc) && \
-    curl --fail --silent --show-error --location https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - && \
+COPY nodesource-repo.gpg.key /tmp/nodesource-repo.gpg.key
+RUN cat /tmp/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    NODE_MAJOR=$(cut -d. -f1 < /app/.nvmrc) && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" >> /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
     apt-get install -y nodejs && \
-    apt-get clean
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm /tmp/nodesource-repo.gpg.key && \
+    # confirm installation
+    npm -v && node -v
 
-# confirm installation
-RUN npm -v && node -v
+
 # install bitwarden cli
 RUN npm install -g @bitwarden/cli@2024.9.0
 # checking bw version also initializes the bw config
