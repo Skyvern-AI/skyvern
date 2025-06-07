@@ -87,14 +87,15 @@ class ArtifactManager:
 
     async def create_log_artifact(
         self,
+        *,
         log_entity_type: LogEntityType,
         log_entity_id: str,
         artifact_type: ArtifactType,
+        organization_id: str,
         step_id: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
-        organization_id: str | None = None,
         data: bytes | None = None,
         path: str | None = None,
     ) -> str:
