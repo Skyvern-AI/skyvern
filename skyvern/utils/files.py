@@ -25,5 +25,5 @@ def get_json_from_file(file_path: str) -> dict[str, str]:
     if not os.path.exists(file_path):
         return {}
 
-    with open(file_path, "r") as json_file:
+    with open(file_path) as json_file:
         return json.load(json_file)

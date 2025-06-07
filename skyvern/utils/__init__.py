@@ -28,7 +28,7 @@ def detect_os() -> str:
     system = platform.system()
     if system == "Linux":
         try:
-            with open("/proc/version", "r") as f:
+            with open("/proc/version") as f:
                 version_info = f.read().lower()
                 if "microsoft" in version_info:
                     return "wsl"

@@ -75,7 +75,7 @@ def load_js_script() -> str:
     try:
         # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
         # This will allow our code to be type safe.
-        with open(path, "r") as f:
+        with open(path) as f:
             return f.read()
     except FileNotFoundError as e:
         LOG.exception("Failed to load the JS script", path=path)
