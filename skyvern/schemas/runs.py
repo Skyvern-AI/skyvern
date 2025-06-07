@@ -357,6 +357,9 @@ class BaseRunResponse(BaseModel):
     modified_at: datetime = Field(
         description="Timestamp when this run was last modified", examples=["2025-01-01T00:05:00Z"]
     )
+    queued_at: datetime | None = Field(default=None, description="Timestamp when this run was queued")
+    started_at: datetime | None = Field(default=None, description="Timestamp when this run started execution")
+    finished_at: datetime | None = Field(default=None, description="Timestamp when this run finished")
     app_url: str | None = Field(
         default=None,
         description="URL to the application UI where the run can be viewed",
