@@ -1,7 +1,9 @@
-from datetime import datetime
 import sys
-from pathlib import Path
 import types
+from datetime import datetime
+from importlib import import_module
+from pathlib import Path
+
 import pytest
 
 pytest.skip("Dependencies missing", allow_module_level=True)
@@ -10,8 +12,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 ddtrace_stub = types.SimpleNamespace(tracer=None, filters=types.SimpleNamespace(FilterRequestsOnUrl=lambda x: None))
 sys.modules.setdefault("ddtrace", ddtrace_stub)
 sys.modules.setdefault("ddtrace.filters", ddtrace_stub.filters)
-
-from importlib import import_module
 
 Task = import_module("skyvern.forge.sdk.schemas.tasks").Task
 TaskBase = import_module("skyvern.forge.sdk.schemas.tasks").TaskBase

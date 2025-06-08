@@ -7,8 +7,9 @@ Create Date: 2025-06-02 00:50:00+00:00
 
 from typing import Sequence, Union
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision: str = "add_run_timestamps"
 down_revision: Union[str, None] = "babaa7307e8a"

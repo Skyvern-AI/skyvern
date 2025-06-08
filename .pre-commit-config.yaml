@@ -1,5 +1,5 @@
 default_language_version:
-  python: python3.11
+  python: python3
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -30,7 +30,7 @@ repos:
     rev: 6.0.1
     hooks:
       - id: isort
-        language_version: python3.11
+        language_version: python3
         exclude: |
           (?x)(
             ^skyvern/client/.*|
