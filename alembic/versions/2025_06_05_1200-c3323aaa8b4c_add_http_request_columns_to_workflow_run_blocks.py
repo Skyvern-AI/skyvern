@@ -9,6 +9,7 @@ Create Date: 2025-06-05 12:00:00.000000+00:00
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "c3323aaa8b4c"
@@ -23,7 +24,6 @@ def upgrade() -> None:
     op.add_column("workflow_run_blocks", sa.Column("headers", sa.JSON(), nullable=True))
     op.add_column("workflow_run_blocks", sa.Column("body", sa.JSON(), nullable=True))
     op.add_column("workflow_run_blocks", sa.Column("timeout", sa.Integer(), nullable=True))
-
 
 
 def downgrade() -> None:
