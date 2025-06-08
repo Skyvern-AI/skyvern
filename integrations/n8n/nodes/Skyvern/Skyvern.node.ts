@@ -21,7 +21,7 @@ async function skyvernApiRequest(
 ): Promise<any> {
     const credentials = await this.getCredentials('skyvernApi');
     const options: IHttpRequestOptions = {
-        baseURL: credentials.baseUrl,
+        baseURL: credentials.baseUrl as string,
         method,
         url: endpoint,
         body,
