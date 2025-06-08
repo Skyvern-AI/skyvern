@@ -9,6 +9,7 @@ import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import {
   isDisplayedInWorkflowEditor,
+  OnePasswordLoginCredentialParameterUI, // Added import
   WorkflowEditorParameterTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
@@ -139,13 +140,25 @@ function WorkflowEditor() {
                   credentialId: parameter.credential_id,
                   description: parameter.description,
                 };
-              } else {
+              } else if ( // Added block for OnePasswordLoginCredentialParameterUI
+                parameter.parameter_type === WorkflowParameterTypes.ONEPASSWORD_LOGIN_CREDENTIAL
+              ) {
+                const opParam = parameter as OnePasswordLoginCredentialParameterUI;
+                return {
+                  key: opParam.key,
+                  parameterType: WorkflowEditorParameterTypes.OnePasswordLogin,
+                  description: opParam.description,
+                  accessTokenAwsSecretKey: opParam.onepassword_access_token_aws_secret_key,
+                  itemId: opParam.onepassword_item_id,
+                  vaultId: opParam.onepassword_vault_id,
+                };
+              } else { // This else handles BitwardenLoginCredentialParameter implicitly now
                 return {
                   key: parameter.key,
-                  parameterType: WorkflowEditorParameterTypes.Credential,
-                  collectionId: parameter.bitwarden_collection_id,
-                  itemId: parameter.bitwarden_item_id,
-                  urlParameterKey: parameter.url_parameter_key,
+                  parameterType: WorkflowEditorParameterTypes.Credential, // This might need to be more specific if it's only Bitwarden Login
+                  collectionId: (parameter as any).bitwarden_collection_id, // Cast needed as type is not fully narrowed
+                  itemId: (parameter as any).bitwarden_item_id,
+                  urlParameterKey: (parameter as any).url_parameter_key,
                   description: parameter.description,
                 };
               }

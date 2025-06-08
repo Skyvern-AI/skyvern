@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    OnePasswordLoginCredentialParameterModel, # Added
     CredentialModel,
     CredentialParameterModel,
     OrganizationAuthTokenModel,
@@ -47,6 +48,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_aws_secret_parameter,
     convert_to_bitwarden_login_credential_parameter,
     convert_to_bitwarden_sensitive_information_parameter,
+    # Placeholder for a potential converter if SDK model is different from client model
+    # convert_to_onepassword_login_credential_parameter,
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
@@ -78,6 +81,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
+    OnePasswordLoginCredentialParameter as OnePasswordLoginCredentialParameterClient, # Added client type
     CredentialParameter,
     OutputParameter,
     WorkflowParameter,
@@ -3136,3 +3140,42 @@ class AgentDB:
                 query = query.filter_by(organization_id=organization_id)
             task_run = (await session.scalars(query)).first()
             return Run.model_validate(task_run) if task_run else None
+
+    async def create_onepassword_login_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        onepassword_access_token_aws_secret_key: str,
+        onepassword_item_id: str,
+        onepassword_vault_id: str,
+        description: str | None = None,
+    ) -> OnePasswordLoginCredentialParameterClient:
+        async with self.Session() as session:
+            # Assuming OnePasswordLoginCredentialParameterModel is the SQLAlchemy DB model
+            # and OnePasswordLoginCredentialParameterClient is the Pydantic client model
+            db_parameter = OnePasswordLoginCredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                onepassword_access_token_aws_secret_key=onepassword_access_token_aws_secret_key,
+                onepassword_item_id=onepassword_item_id,
+                onepassword_vault_id=onepassword_vault_id,
+            )
+            session.add(db_parameter)
+            await session.commit()
+            await session.refresh(db_parameter)
+            # Convert DB model to Pydantic model before returning
+            # This assumes a direct mapping or a converter function might be needed if structures differ.
+            # For now, direct attribute access for conversion.
+            return OnePasswordLoginCredentialParameterClient(
+                onepassword_login_credential_parameter_id=db_parameter.onepassword_login_credential_parameter_id,
+                workflow_id=db_parameter.workflow_id,
+                key=db_parameter.key,
+                description=db_parameter.description,
+                onepassword_access_token_aws_secret_key=db_parameter.onepassword_access_token_aws_secret_key,
+                onepassword_item_id=db_parameter.onepassword_item_id,
+                onepassword_vault_id=db_parameter.onepassword_vault_id,
+                created_at=db_parameter.created_at,
+                modified_at=db_parameter.modified_at,
+                deleted_at=db_parameter.deleted_at,
+            )

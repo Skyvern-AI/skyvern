@@ -350,12 +350,19 @@ from .workflow_definition_yaml_parameters_item import (
     WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation,
     WorkflowDefinitionYamlParametersItem_Context,
     WorkflowDefinitionYamlParametersItem_Credential,
+    OnePasswordLoginCredentialParameterYaml, # Added
     WorkflowDefinitionYamlParametersItem_Output,
     WorkflowDefinitionYamlParametersItem_Workflow,
 )
+
+# This assumes PARAMETER_YAML_TYPES is an alias or direct usage of WorkflowDefinitionYamlParametersItem
+# If PARAMETER_YAML_TYPES is a separate union, that would need a similar modification.
+# Based on the subtask, this is the primary identified union for parameter YAML types.
+PARAMETER_YAML_TYPES = WorkflowDefinitionYamlParametersItem
 from .workflow_parameter import WorkflowParameter
 from .workflow_parameter_default_value import WorkflowParameterDefaultValue
 from .workflow_parameter_type import WorkflowParameterType
+from .onepassword_login_credential_parameter_yaml import OnePasswordLoginCredentialParameterYaml # Added
 from .workflow_parameter_yaml import WorkflowParameterYaml
 from .workflow_parameter_yaml_default_value import WorkflowParameterYamlDefaultValue
 from .workflow_request import WorkflowRequest
@@ -673,6 +680,7 @@ __all__ = [
     "WorkflowDefinitionYamlParametersItem_AwsSecret",
     "WorkflowDefinitionYamlParametersItem_BitwardenCreditCardData",
     "WorkflowDefinitionYamlParametersItem_BitwardenLoginCredential",
+    "OnePasswordLoginCredentialParameterYaml", # Added
     "WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation",
     "WorkflowDefinitionYamlParametersItem_Context",
     "WorkflowDefinitionYamlParametersItem_Credential",

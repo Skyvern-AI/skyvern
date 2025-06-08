@@ -66,6 +66,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
+    OnePasswordLoginCredentialParameter as SDKOnePasswordLoginCredentialParameter, # Added SDK model
     ContextParameter,
     CredentialParameter,
     OutputParameter,
@@ -239,6 +240,7 @@ class WorkflowService:
                     BitwardenLoginCredentialParameter,
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
+                    SDKOnePasswordLoginCredentialParameter, # Added SDK model
                     CredentialParameter,
                 ),
             )
@@ -1552,6 +1554,27 @@ class WorkflowService:
                     )
                 elif parameter.parameter_type == ParameterType.CONTEXT:
                     context_parameter_yamls.append(parameter)
+                elif parameter.parameter_type == ParameterType.ONEPASSWORD_LOGIN_CREDENTIAL: # Added block
+                    # Ensure fields exist on 'parameter' (which is ParameterYAML)
+                    # This assumes OnePasswordLoginCredentialParameterYAML will have these attributes.
+                    if not all(hasattr(parameter, attr) for attr in [
+                        'onepassword_access_token_aws_secret_key',
+                        'onepassword_item_id',
+                        'onepassword_vault_id'
+                    ]):
+                        raise WorkflowParameterMissingRequiredValue(
+                            workflow_parameter_type=ParameterType.ONEPASSWORD_LOGIN_CREDENTIAL,
+                            workflow_parameter_key=parameter.key,
+                            required_value="onepassword_access_token_aws_secret_key, onepassword_item_id, onepassword_vault_id",
+                        )
+                    parameters[parameter.key] = await app.DATABASE.create_onepassword_login_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        onepassword_access_token_aws_secret_key=parameter.onepassword_access_token_aws_secret_key,
+                        onepassword_item_id=parameter.onepassword_item_id,
+                        onepassword_vault_id=parameter.onepassword_vault_id,
+                    )
                 else:
                     LOG.error(f"Invalid parameter type {parameter.parameter_type}")
 

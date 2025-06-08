@@ -18,6 +18,7 @@ class ParameterType(StrEnum):
     BITWARDEN_LOGIN_CREDENTIAL = "bitwarden_login_credential"
     BITWARDEN_SENSITIVE_INFORMATION = "bitwarden_sensitive_information"
     BITWARDEN_CREDIT_CARD_DATA = "bitwarden_credit_card_data"
+    ONEPASSWORD_LOGIN_CREDENTIAL = "onepassword_login_credential" # Added
     OUTPUT = "output"
     CREDENTIAL = "credential"
 
@@ -42,6 +43,21 @@ class AWSSecretParameter(Parameter):
     aws_secret_parameter_id: str
     workflow_id: str
     aws_key: str
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
+class OnePasswordLoginCredentialParameter(Parameter):
+    parameter_type: Literal[ParameterType.ONEPASSWORD_LOGIN_CREDENTIAL] = ParameterType.ONEPASSWORD_LOGIN_CREDENTIAL
+    # parameter fields
+    onepassword_login_credential_parameter_id: str # Matches DB model primary key
+    workflow_id: str
+    # 1Password specific fields
+    onepassword_access_token_aws_secret_key: str
+    onepassword_item_id: str # The item's UUID or name/title
+    onepassword_vault_id: str # The vault's UUID or name
 
     created_at: datetime
     modified_at: datetime
@@ -203,6 +219,7 @@ ParameterSubclasses = Union[
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     BitwardenCreditCardDataParameter,
+    OnePasswordLoginCredentialParameter, # Added
     OutputParameter,
     CredentialParameter,
 ]

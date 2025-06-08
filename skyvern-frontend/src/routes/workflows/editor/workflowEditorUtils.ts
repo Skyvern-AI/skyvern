@@ -5,13 +5,21 @@ import { nanoid } from "nanoid";
 import {
   WorkflowBlockType,
   WorkflowBlockTypes,
+  WorkflowEditorParameterTypes, // This was added in a previous step
   WorkflowParameterTypes,
   WorkflowParameterValueType,
   type AWSSecretParameter,
+  type BitwardenLoginCredentialParameter, // For casting
+  type BitwardenSensitiveInformationParameter, // For casting
+  type BitwardenCreditCardDataParameter, // For casting
+  type ContextParameter, // For casting
+  type CredentialParameter, // For casting
+  type OnePasswordLoginCredentialParameterUI, // Added import
   type OutputParameter,
   type Parameter,
   type WorkflowApiResponse,
   type WorkflowBlock,
+  type WorkflowParameter, // For casting
   type WorkflowSettings,
 } from "../types/workflowTypes";
 import {
@@ -50,7 +58,7 @@ import {
   SMTP_USERNAME_AWS_KEY,
   SMTP_USERNAME_PARAMETER_KEY,
 } from "./constants";
-import { ParametersState } from "./types";
+import { OnePasswordLoginParameterState, ParametersState } from "./types"; // Added OnePasswordLoginParameterState
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
@@ -1618,82 +1626,95 @@ function convertParametersToParameterYAML(
     const base = {
       key: parameter.key,
       description: parameter.description,
-      parameter_type: parameter.parameter_type,
+      parameter_type: parameter.parameter_type, // This is the backend-style snake_case type
     };
-    switch (parameter.parameter_type) {
+    switch (parameter.parameter_type) { // Ensure this switch uses backend-style types
       case WorkflowParameterTypes.AWS_Secret: {
         return {
           ...base,
-          parameter_type: WorkflowParameterTypes.AWS_Secret,
-          aws_key: parameter.aws_key,
+          // parameter_type is already in base
+          aws_key: (parameter as AWSSecretParameter).aws_key,
         };
       }
       case WorkflowParameterTypes.Bitwarden_Login_Credential: {
+        const bwLoginParam = parameter as BitwardenLoginCredentialParameter;
         return {
           ...base,
-          parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
-          bitwarden_collection_id: parameter.bitwarden_collection_id,
-          bitwarden_item_id: parameter.bitwarden_item_id,
-          url_parameter_key: parameter.url_parameter_key,
+          bitwarden_collection_id: bwLoginParam.bitwarden_collection_id,
+          bitwarden_item_id: bwLoginParam.bitwarden_item_id,
+          url_parameter_key: bwLoginParam.url_parameter_key,
           bitwarden_client_id_aws_secret_key:
-            parameter.bitwarden_client_id_aws_secret_key,
+            bwLoginParam.bitwarden_client_id_aws_secret_key,
           bitwarden_client_secret_aws_secret_key:
-            parameter.bitwarden_client_secret_aws_secret_key,
+            bwLoginParam.bitwarden_client_secret_aws_secret_key,
           bitwarden_master_password_aws_secret_key:
-            parameter.bitwarden_master_password_aws_secret_key,
+            bwLoginParam.bitwarden_master_password_aws_secret_key,
         };
       }
       case WorkflowParameterTypes.Bitwarden_Sensitive_Information: {
+        const bwSensParam = parameter as BitwardenSensitiveInformationParameter;
         return {
           ...base,
-          parameter_type:
-            WorkflowParameterTypes.Bitwarden_Sensitive_Information,
-          bitwarden_collection_id: parameter.bitwarden_collection_id,
-          bitwarden_identity_key: parameter.bitwarden_identity_key,
-          bitwarden_identity_fields: parameter.bitwarden_identity_fields,
+          bitwarden_collection_id: bwSensParam.bitwarden_collection_id,
+          bitwarden_identity_key: bwSensParam.bitwarden_identity_key,
+          bitwarden_identity_fields: bwSensParam.bitwarden_identity_fields,
           bitwarden_client_id_aws_secret_key:
-            parameter.bitwarden_client_id_aws_secret_key,
+            bwSensParam.bitwarden_client_id_aws_secret_key,
           bitwarden_client_secret_aws_secret_key:
-            parameter.bitwarden_client_secret_aws_secret_key,
+            bwSensParam.bitwarden_client_secret_aws_secret_key,
           bitwarden_master_password_aws_secret_key:
-            parameter.bitwarden_master_password_aws_secret_key,
+            bwSensParam.bitwarden_master_password_aws_secret_key,
         };
       }
       case WorkflowParameterTypes.Bitwarden_Credit_Card_Data: {
+        const bwCCParam = parameter as BitwardenCreditCardDataParameter;
         return {
           ...base,
-          parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
-          bitwarden_collection_id: parameter.bitwarden_collection_id,
-          bitwarden_item_id: parameter.bitwarden_item_id,
+          bitwarden_collection_id: bwCCParam.bitwarden_collection_id,
+          bitwarden_item_id: bwCCParam.bitwarden_item_id,
           bitwarden_client_id_aws_secret_key:
-            parameter.bitwarden_client_id_aws_secret_key,
+            bwCCParam.bitwarden_client_id_aws_secret_key,
           bitwarden_client_secret_aws_secret_key:
-            parameter.bitwarden_client_secret_aws_secret_key,
+            bwCCParam.bitwarden_client_secret_aws_secret_key,
           bitwarden_master_password_aws_secret_key:
-            parameter.bitwarden_master_password_aws_secret_key,
+            bwCCParam.bitwarden_master_password_aws_secret_key,
         };
       }
       case WorkflowParameterTypes.Context: {
+        const contextParam = parameter as ContextParameter;
         return {
           ...base,
-          parameter_type: WorkflowParameterTypes.Context,
-          source_parameter_key: parameter.source.key,
+          source_parameter_key: contextParam.source.key,
         };
       }
       case WorkflowParameterTypes.Workflow: {
+        const wfParam = parameter as WorkflowParameter;
         return {
           ...base,
-          parameter_type: WorkflowParameterTypes.Workflow,
-          workflow_parameter_type: parameter.workflow_parameter_type,
-          default_value: parameter.default_value,
+          workflow_parameter_type: wfParam.workflow_parameter_type,
+          default_value: wfParam.default_value,
         };
       }
       case WorkflowParameterTypes.Credential: {
+        const credParam = parameter as CredentialParameter;
         return {
           ...base,
-          parameter_type: WorkflowParameterTypes.Credential,
-          credential_id: parameter.credential_id,
+          credential_id: credParam.credential_id,
         };
+      }
+      case WorkflowParameterTypes.ONEPASSWORD_LOGIN_CREDENTIAL: {
+        const opParam = parameter as OnePasswordLoginCredentialParameterUI;
+        return {
+          ...base,
+          onepassword_access_token_aws_secret_key: opParam.onepassword_access_token_aws_secret_key,
+          onepassword_item_id: opParam.onepassword_item_id,
+          onepassword_vault_id: opParam.onepassword_vault_id,
+        };
+      }
+      default: {
+        // Ensures all cases of Parameter (excluding OutputParameter) are handled
+        const _exhaustiveCheck: never = parameter;
+        throw new Error (`Unhandled parameter type: ${(_exhaustiveCheck as Parameter).parameter_type}`);
       }
     }
   });
@@ -2161,3 +2182,4 @@ export {
   isOutputParameterKey,
   layout,
 };
+```

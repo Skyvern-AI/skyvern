@@ -20,6 +20,7 @@ import { CredentialParameterSourceSelector } from "../../components/CredentialPa
 import { SourceParameterKeySelector } from "../../components/SourceParameterKeySelector";
 import {
   WorkflowEditorParameterType,
+  WorkflowEditorParameterTypes, // Added import
   WorkflowParameterValueType,
 } from "../../types/workflowTypes";
 import { WorkflowParameterInput } from "../../WorkflowParameterInput";
@@ -90,6 +91,11 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
     useState("");
 
   const [credentialId, setCredentialId] = useState("");
+
+  // States for OnePasswordLogin
+  const [onePasswordAccessTokenKey, setOnePasswordAccessTokenKey] = useState("");
+  const [onePasswordItemId, setOnePasswordItemId] = useState("");
+  const [onePasswordVaultId, setOnePasswordVaultId] = useState("");
 
   return (
     <ScrollArea>
@@ -307,6 +313,32 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                 </div>
               )
           }
+          {/* Added block for OnePasswordLogin */}
+          {type === WorkflowEditorParameterTypes.OnePasswordLogin && (
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Access Token AWS Secret Key</Label>
+                <Input
+                  value={onePasswordAccessTokenKey}
+                  onChange={(e) => setOnePasswordAccessTokenKey(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">1Password Item ID</Label>
+                <Input
+                  value={onePasswordItemId}
+                  onChange={(e) => setOnePasswordItemId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">1Password Vault ID</Label>
+                <Input
+                  value={onePasswordVaultId}
+                  onChange={(e) => setOnePasswordVaultId(e.target.value)}
+                />
+              </div>
+            </>
+          )}
           <div className="flex justify-end">
             <Button
               onClick={() => {
@@ -326,7 +358,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   });
                   return;
                 }
-                if (type === "workflow") {
+                if (type === WorkflowEditorParameterTypes.Workflow) { // Changed to use enum
                   if (
                     parameterType === "json" &&
                     typeof defaultValueState.defaultValue === "string"
@@ -349,7 +381,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                       : defaultValueState.defaultValue;
                   onSave({
                     key,
-                    parameterType: "workflow",
+                    parameterType: WorkflowEditorParameterTypes.Workflow, // Changed to use enum
                     dataType: parameterType,
                     description,
                     defaultValue: defaultValueState.hasDefaultValue
@@ -357,7 +389,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                       : null,
                   });
                 }
-                if (type === "credential" && credentialType === "bitwarden") {
+                if (type === WorkflowEditorParameterTypes.Credential && credentialType === "bitwarden") { // Changed to use enum
                   const errorMessage = validateBitwardenLoginCredential(
                     bitwardenCollectionId,
                     bitwardenLoginCredentialItemId,
@@ -373,7 +405,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   }
                   onSave({
                     key,
-                    parameterType: "credential",
+                    parameterType: WorkflowEditorParameterTypes.Credential, // Changed to use enum
                     collectionId:
                       bitwardenCollectionId === ""
                         ? null
@@ -387,7 +419,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     description,
                   });
                 }
-                if (type === "secret" || type === "creditCardData") {
+                if (type === WorkflowEditorParameterTypes.Secret || type === WorkflowEditorParameterTypes.CreditCardData) { // Changed to use enum
                   if (!bitwardenCollectionId) {
                     toast({
                       variant: "destructive",
@@ -397,10 +429,10 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     return;
                   }
                 }
-                if (type === "secret") {
+                if (type === WorkflowEditorParameterTypes.Secret) { // Changed to use enum
                   onSave({
                     key,
-                    parameterType: "secret",
+                    parameterType: WorkflowEditorParameterTypes.Secret, // Changed to use enum
                     collectionId: bitwardenCollectionId,
                     identityFields: identityFields
                       .split(",")
@@ -410,16 +442,16 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     description,
                   });
                 }
-                if (type === "creditCardData") {
+                if (type === WorkflowEditorParameterTypes.CreditCardData) { // Changed to use enum
                   onSave({
                     key,
-                    parameterType: "creditCardData",
+                    parameterType: WorkflowEditorParameterTypes.CreditCardData, // Changed to use enum
                     collectionId: bitwardenCollectionId,
                     itemId: sensitiveInformationItemId,
                     description,
                   });
                 }
-                if (type === "context") {
+                if (type === WorkflowEditorParameterTypes.Context) { // Changed to use enum
                   if (!sourceParameterKey) {
                     toast({
                       variant: "destructive",
@@ -430,12 +462,12 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   }
                   onSave({
                     key,
-                    parameterType: "context",
+                    parameterType: WorkflowEditorParameterTypes.Context, // Changed to use enum
                     sourceParameterKey,
                     description,
                   });
                 }
-                if (type === "credential" && credentialType === "skyvern") {
+                if (type === WorkflowEditorParameterTypes.Credential && credentialType === "skyvern") { // Changed to use enum
                   if (!credentialId) {
                     toast({
                       variant: "destructive",
@@ -446,9 +478,28 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   }
                   onSave({
                     key,
-                    parameterType: "credential",
+                    parameterType: WorkflowEditorParameterTypes.Credential, // Changed to use enum
                     credentialId,
                     description,
+                  });
+                }
+                // Added save logic for OnePasswordLogin
+                if (type === WorkflowEditorParameterTypes.OnePasswordLogin) {
+                  if (!onePasswordAccessTokenKey || !onePasswordItemId || !onePasswordVaultId) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description: "Access Token Key, Item ID, and Vault ID are required for 1Password Login.",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: WorkflowEditorParameterTypes.OnePasswordLogin,
+                    description,
+                    accessTokenAwsSecretKey: onePasswordAccessTokenKey,
+                    itemId: onePasswordItemId,
+                    vaultId: onePasswordVaultId,
                   });
                 }
               }}

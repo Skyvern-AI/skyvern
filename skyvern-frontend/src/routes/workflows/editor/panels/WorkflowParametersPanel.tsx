@@ -119,6 +119,17 @@ function WorkflowParametersPanel() {
             >
               Credit Card Data Parameter
             </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => {
+                setOperationPanelState({
+                  active: true,
+                  operation: "add",
+                  type: WorkflowEditorParameterTypes.OnePasswordLogin, // Use the new editor type
+                });
+              }}
+            >
+              1Password Login Parameter
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
 

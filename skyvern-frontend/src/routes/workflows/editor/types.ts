@@ -62,4 +62,15 @@ export type ParametersState = Array<
       description?: string | null;
     }
   | CredentialParameterState
+  | OnePasswordLoginParameterState // Added
 >;
+
+// Added new state type definition
+export type OnePasswordLoginParameterState = {
+  parameterType: "onePasswordLogin"; // Matches WorkflowEditorParameterTypes.OnePasswordLogin
+  key: string;
+  description: string | null;
+  accessTokenAwsSecretKey: string;
+  itemId: string;
+  vaultId: string;
+};

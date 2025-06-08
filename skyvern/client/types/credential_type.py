@@ -2,4 +2,4 @@
 
 import typing
 
-CredentialType = typing.Union[typing.Literal["password", "credit_card"], typing.Any]
+CredentialType = typing.Union[typing.Literal["password", "credit_card", "onepassword_login"], typing.Any]

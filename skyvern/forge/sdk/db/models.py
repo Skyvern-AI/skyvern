@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_credential_id,
+    generate_onepassword_login_credential_parameter_id, # Placeholder for now
     generate_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -159,6 +160,31 @@ class OrganizationAuthTokenModel(Base):
     token = Column(String, index=True, nullable=False)
     valid = Column(Boolean, nullable=False, default=True)
 
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OnePasswordLoginCredentialParameterModel(Base):
+    __tablename__ = "onepassword_login_credential_parameters"
+
+    onepassword_login_credential_parameter_id = Column(
+        String,
+        primary_key=True,
+        index=True,
+        default=generate_onepassword_login_credential_parameter_id,
+    )
+    workflow_id = Column(String, index=True, nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    onepassword_access_token_aws_secret_key = Column(String, nullable=False)
+    onepassword_item_id = Column(String, nullable=False)
+    onepassword_vault_id = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
