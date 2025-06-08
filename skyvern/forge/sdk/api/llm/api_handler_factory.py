@@ -149,24 +149,33 @@ class LLMAPIHandlerFactory:
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(local_llm_key) from e
             except litellm.exceptions.ContextWindowExceededError as e:
+                duration_seconds = time.time() - start_time
                 LOG.exception(
                     "Context window exceeded",
                     llm_key=local_llm_key,
                     model=main_model_group,
+                    prompt_name=prompt_name,
+                    duration_seconds=duration_seconds,
                 )
                 raise SkyvernContextWindowExceededError() from e
             except ValueError as e:
+                duration_seconds = time.time() - start_time
                 LOG.exception(
                     "LLM token limit exceeded",
                     llm_key=local_llm_key,
                     model=main_model_group,
+                    prompt_name=prompt_name,
+                    duration_seconds=duration_seconds,
                 )
                 raise LLMProviderErrorRetryableTask(local_llm_key) from e
             except Exception as e:
+                duration_seconds = time.time() - start_time
                 LOG.exception(
                     "LLM request failed unexpectedly",
                     llm_key=local_llm_key,
                     model=main_model_group,
+                    prompt_name=prompt_name,
+                    duration_seconds=duration_seconds,
                 )
                 raise LLMProviderError(local_llm_key) from e
 
@@ -352,10 +361,13 @@ class LLMAPIHandlerFactory:
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(local_llm_key) from e
             except litellm.exceptions.ContextWindowExceededError as e:
+                duration_seconds = time.time() - start_time
                 LOG.exception(
                     "Context window exceeded",
                     llm_key=local_llm_key,
                     model=model_name,
+                    prompt_name=prompt_name,
+                    duration_seconds=duration_seconds,
                 )
                 raise SkyvernContextWindowExceededError() from e
             except CancelledError:
@@ -364,11 +376,19 @@ class LLMAPIHandlerFactory:
                     "LLM request got cancelled",
                     llm_key=local_llm_key,
                     model=model_name,
+                    prompt_name=prompt_name,
                     duration=t_llm_cancelled - t_llm_request,
                 )
                 raise LLMProviderError(local_llm_key)
             except Exception as e:
-                LOG.exception("LLM request failed unexpectedly", llm_key=local_llm_key)
+                duration_seconds = time.time() - start_time
+                LOG.exception(
+                    "LLM request failed unexpectedly",
+                    llm_key=local_llm_key,
+                    model=model_name,
+                    prompt_name=prompt_name,
+                    duration_seconds=duration_seconds,
+                )
                 raise LLMProviderError(local_llm_key) from e
 
             await app.ARTIFACT_MANAGER.create_llm_artifact(

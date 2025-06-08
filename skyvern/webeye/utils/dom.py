@@ -28,6 +28,7 @@ from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, j
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
 TEXT_PRESS_MAX_LENGTH = 20
@@ -589,6 +590,12 @@ class SkyvernElement:
 
     async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=timeout)
+
+    async def input(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        if self.get_tag_name().lower() not in COMMON_INPUT_TAGS:
+            await self.input_fill(text, timeout=timeout)
+            return
+        await self.input_sequentially(text=text, default_timeout=timeout)
 
     async def input_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().fill(text, timeout=timeout)

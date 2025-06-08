@@ -6,6 +6,7 @@ log.txt
 log-ingestion.txt
 logs
 *.log
+current.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -161,6 +162,7 @@ ig_*
 # Skyvern ignores
 videos/
 skyvern/artifacts/
+artifacts/
 traces/
 *.pkl
 har/
