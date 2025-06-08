@@ -8,7 +8,6 @@ import {
     INodePropertyOptions,
     INodeType,
     INodeTypeDescription,
-    NodeConnectionType,
     ResourceMapperField,
     ResourceMapperFields,
 } from 'n8n-workflow';
@@ -34,14 +33,14 @@ export class Skyvern implements INodeType {
     description: INodeTypeDescription = {
         displayName: 'Skyvern',
         name: 'skyvern',
-        icon: 'file:skyvern.png',
+        icon: 'file:skyvern.svg',
         group: ['transform'],
         description: 'Node to interact with Skyvern',
         defaults: {
             name: 'Skyvern',
         },
-        inputs: [NodeConnectionType.Main],
-        outputs: [NodeConnectionType.Main],
+        inputs: ['main'],
+        outputs: ['main'],
         credentials: [
             {
                 name: 'skyvernApi',
@@ -70,12 +69,14 @@ export class Skyvern implements INodeType {
                 displayName: 'Operation',
                 name: 'operation',
                 type: 'options',
+                noDataExpression: true,
                 required: true,
                 default: 'dispatchTask',
                 options: [
                     {
                         name: 'Dispatch a Task',
                         value: 'dispatchTask',
+                        action: 'Dispatch a task to execute asynchronously',
                         description: 'Dispatch a task to execute asynchronously',
                         displayOptions: {
                             show: {
@@ -110,6 +111,7 @@ export class Skyvern implements INodeType {
                     {
                         name: 'Get a Task',
                         value: 'getTask',
+                        action: 'Get a task by ID',
                         description: 'Get a task by ID',
                         displayOptions: {
                             show: {
@@ -127,6 +129,7 @@ export class Skyvern implements INodeType {
                     {
                         name: 'Get a Workflow Run',
                         value: 'getWorkflow',
+                        action: 'Get a workflow run by ID',
                         description: 'Get a workflow run by ID',
                         displayOptions: {
                             show: {
@@ -143,6 +146,7 @@ export class Skyvern implements INodeType {
                     {
                         name: 'Dispatch a Workflow Run',
                         value: 'dispatchWorkflow',
+                        action: 'Dispatch a workflow run to execute asynchronously',
                         description: 'Dispatch a workflow run to execute asynchronously',
                         displayOptions: {
                             show: {
@@ -311,7 +315,7 @@ export class Skyvern implements INodeType {
                 },
             },
             {
-                displayName: 'Workflow Title or ID',
+                displayName: 'Workflow Name or ID',
                 description: 'The title of the workflow. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code-examples/expressions/">expression</a>.',
                 name: 'workflowId',
                 type: 'options',
