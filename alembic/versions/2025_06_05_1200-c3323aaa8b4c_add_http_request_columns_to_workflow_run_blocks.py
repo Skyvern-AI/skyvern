@@ -8,8 +8,6 @@ Create Date: 2025-06-05 12:00:00.000000+00:00
 
 from typing import Sequence, Union
 
-import sqlalchemy as sa
-
 from alembic import op
 
 revision: str = "c3323aaa8b4c"
@@ -19,18 +17,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Try to add each column, ignoring if they already exist
-    for column_name, column_type in [
-        ("url", sa.String()),
-        ("method", sa.String()),
-        ("headers", sa.JSON()),
-        ("body", sa.JSON()),
-        ("timeout", sa.Integer()),
-    ]:
-        try:
-            op.add_column("workflow_run_blocks", sa.Column(column_name, column_type, nullable=True))
-        except Exception as e:
-            print(f"Column {column_name} might already exist: {e}")
+    # This migration is now a no-op as the columns were already added
+    # The database will be stamped with this version without running the migration
+    pass
 
 
 def downgrade() -> None:
