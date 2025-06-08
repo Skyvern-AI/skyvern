@@ -151,6 +151,9 @@ class WorkflowDefinitionYamlParametersItem_Workflow(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+# Import the OnePassword parameter type
+from .onepassword_login_credential_parameter_yaml import OnePasswordLoginCredentialParameterYaml
+
 WorkflowDefinitionYamlParametersItem = typing.Union[
     WorkflowDefinitionYamlParametersItem_AwsSecret,
     WorkflowDefinitionYamlParametersItem_BitwardenCreditCardData,
@@ -160,4 +163,5 @@ WorkflowDefinitionYamlParametersItem = typing.Union[
     WorkflowDefinitionYamlParametersItem_Credential,
     WorkflowDefinitionYamlParametersItem_Output,
     WorkflowDefinitionYamlParametersItem_Workflow,
+    OnePasswordLoginCredentialParameterYaml,
 ]

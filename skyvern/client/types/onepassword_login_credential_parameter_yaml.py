@@ -35,4 +35,3 @@ class OnePasswordLoginCredentialParameterYaml(UniversalBaseModel):
             # populate_by_name = True # Typically not needed unless aliases are used.
             # For YAML, direct field names are common.
             # Let's stick to what AwsSecretParameterYaml has.
-```

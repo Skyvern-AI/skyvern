@@ -355,7 +355,7 @@ export type CreditCardCredentialApiResponse = {
 export type CredentialApiResponse = {
   credential_id: string;
   credential: PasswordCredentialApiResponse | CreditCardCredentialApiResponse;
-  credential_type: "password" | "credit_card";
+  credential_type: "password" | "credit_card" | "onepassword_login";
   name: string;
 };
 
@@ -373,7 +373,7 @@ export function isCreditCardCredential(
 
 export type CreateCredentialRequest = {
   name: string;
-  credential_type: "password" | "credit_card";
+  credential_type: "password" | "credit_card" | "onepassword_login";
   credential: PasswordCredential | CreditCardCredential;
 };
 

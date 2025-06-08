@@ -24,6 +24,7 @@ from .bitwarden_login_credential_parameter import BitwardenLoginCredentialParame
 from .bitwarden_login_credential_parameter_yaml import BitwardenLoginCredentialParameterYaml
 from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
 from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
+from .onepassword_login_credential_parameter_yaml import OnePasswordLoginCredentialParameterYaml
 from .browser_session_response import BrowserSessionResponse
 from .code_block import CodeBlock
 from .code_block_parameters_item import (
@@ -394,6 +395,7 @@ __all__ = [
     "BitwardenLoginCredentialParameterYaml",
     "BitwardenSensitiveInformationParameter",
     "BitwardenSensitiveInformationParameterYaml",
+    "OnePasswordLoginCredentialParameterYaml",
     "BrowserSessionResponse",
     "CodeBlock",
     "CodeBlockParametersItem",

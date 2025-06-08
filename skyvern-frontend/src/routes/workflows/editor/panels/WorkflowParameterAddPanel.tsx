@@ -80,9 +80,9 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
     string | undefined
   >(undefined);
 
-  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
-    "skyvern",
-  );
+  const [credentialType, setCredentialType] = useState<
+    "bitwarden" | "skyvern" | "onepassword"
+  >("skyvern");
 
   const [identityKey, setIdentityKey] = useState("");
   const [identityFields, setIdentityFields] = useState("");
@@ -200,11 +200,14 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
             <SwitchBar
               value={credentialType}
               onChange={(value) => {
-                setCredentialType(value as "bitwarden" | "skyvern");
+                setCredentialType(
+                  value as "bitwarden" | "skyvern" | "onepassword",
+                );
               }}
               options={[
                 { label: "Skyvern", value: "skyvern" },
                 { label: "Bitwarden", value: "bitwarden" },
+                { label: "1Password", value: "onepassword" },
               ]}
             />
           )}
@@ -296,7 +299,8 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
           {
             // temporarily cloud only
             type === "credential" &&
-              credentialType === "skyvern" &&
+              (credentialType === "skyvern" ||
+                credentialType === "onepassword") &&
               isCloud && (
                 <div className="space-y-1">
                   <Label className="text-xs text-slate-300">Credential</Label>
@@ -435,7 +439,11 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     description,
                   });
                 }
-                if (type === "credential" && credentialType === "skyvern") {
+                if (
+                  type === "credential" &&
+                  (credentialType === "skyvern" ||
+                    credentialType === "onepassword")
+                ) {
                   if (!credentialId) {
                     toast({
                       variant: "destructive",

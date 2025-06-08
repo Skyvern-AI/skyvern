@@ -28,6 +28,7 @@ import {
   parameterIsSkyvernCredential,
   ParametersState,
 } from "../types";
+import { useCredentialsQuery } from "../../hooks/useCredentialsQuery";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 
@@ -78,9 +79,20 @@ function WorkflowParameterEditPanel({
   const isSkyvernCredential =
     initialValues.parameterType === "credential" &&
     parameterIsSkyvernCredential(initialValues);
-  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
-    isBitwardenCredential ? "bitwarden" : "skyvern",
-  );
+  const { data: credentials } = useCredentialsQuery();
+  const initialCredentialType: "bitwarden" | "skyvern" | "onepassword" =
+    isBitwardenCredential
+      ? "bitwarden"
+      : credentials?.find(
+            (c) =>
+              isSkyvernCredential &&
+              c.credential_id === initialValues.credentialId,
+          )?.credential_type === "onepassword_login"
+        ? "onepassword"
+        : "skyvern";
+  const [credentialType, setCredentialType] = useState<
+    "bitwarden" | "skyvern" | "onepassword"
+  >(initialCredentialType);
   const [urlParameterKey, setUrlParameterKey] = useState(
     isBitwardenCredential ? initialValues.urlParameterKey ?? "" : "",
   );
@@ -256,11 +268,14 @@ function WorkflowParameterEditPanel({
             <SwitchBar
               value={credentialType}
               onChange={(value) => {
-                setCredentialType(value as "bitwarden" | "skyvern");
+                setCredentialType(
+                  value as "bitwarden" | "skyvern" | "onepassword",
+                );
               }}
               options={[
                 { label: "Skyvern", value: "skyvern" },
                 { label: "Bitwarden", value: "bitwarden" },
+                { label: "1Password", value: "onepassword" },
               ]}
             />
           )}
@@ -350,7 +365,8 @@ function WorkflowParameterEditPanel({
           {
             // temporarily cloud only
             type === "credential" &&
-              credentialType === "skyvern" &&
+              (credentialType === "skyvern" ||
+                credentialType === "onepassword") &&
               isCloud && (
                 <div className="space-y-1">
                   <Label className="text-xs text-slate-300">Credential</Label>
@@ -478,7 +494,11 @@ function WorkflowParameterEditPanel({
                     description,
                   });
                 }
-                if (type === "credential" && credentialType === "skyvern") {
+                if (
+                  type === "credential" &&
+                  (credentialType === "skyvern" ||
+                    credentialType === "onepassword")
+                ) {
                   if (!credentialId) {
                     toast({
                       variant: "destructive",
