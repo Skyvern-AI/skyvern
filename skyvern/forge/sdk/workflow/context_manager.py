@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from skyvern.forge.sdk.services.onepassword import OnePasswordService # Added
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
+    OnePasswordLoginCredentialParameter, # Added
     ContextParameter,
     CredentialParameter,
     OutputParameter,
@@ -55,6 +57,7 @@ class WorkflowRunContext:
             | BitwardenLoginCredentialParameter
             | BitwardenCreditCardDataParameter
             | BitwardenSensitiveInformationParameter
+            | OnePasswordLoginCredentialParameter # Added
             | CredentialParameter
         ],
     ) -> Self:
@@ -96,6 +99,10 @@ class WorkflowRunContext:
                 )
             elif isinstance(secrete_parameter, BitwardenSensitiveInformationParameter):
                 await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
+                    aws_client, secrete_parameter, organization
+                )
+            elif isinstance(secrete_parameter, OnePasswordLoginCredentialParameter): # Added block
+                await workflow_run_context.register_onepassword_login_credential_parameter_value(
                     aws_client, secrete_parameter, organization
                 )
 
@@ -535,6 +542,83 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get credit card data from Bitwarden. Error: {e}")
             raise e
 
+    async def register_onepassword_login_credential_parameter_value(
+        self,
+        aws_client: AsyncAWSClient,
+        parameter: OnePasswordLoginCredentialParameter,
+        organization: Organization, # organization might not be strictly needed if vault_id is absolute
+    ) -> None:
+        try:
+            # Get the 1Password service account token from AWS secrets
+            op_service_account_token = await aws_client.get_secret(
+                parameter.onepassword_access_token_aws_secret_key
+            )
+        except Exception as e:
+            LOG.error(f"Failed to get 1Password service account token from AWS secrets. Error: {e}", exc_info=True)
+            raise SkyvernException(f"Failed to retrieve 1Password token: {e}")
+
+        if not op_service_account_token:
+            raise ValueError(f"1Password service account token not found for secret key: {parameter.onepassword_access_token_aws_secret_key}")
+
+        additional_env = {"OP_SERVICE_ACCOUNT_TOKEN": op_service_account_token}
+        onepassword_service = OnePasswordService()
+
+        try:
+            LOG.info(
+                f"Fetching 1Password credentials for item '{parameter.onepassword_item_id}' in vault '{parameter.onepassword_vault_id}'."
+            )
+            credentials = await onepassword_service.get_login_credentials(
+                item_id_or_name=parameter.onepassword_item_id,
+                vault_id_or_name=parameter.onepassword_vault_id,
+                additional_env=additional_env,
+            )
+
+            if credentials:
+                self.parameters[parameter.key] = parameter
+                self.values[parameter.key] = {} # Initialize the dict for this parameter's values
+
+                username = credentials.get("username")
+                password = credentials.get("password")
+                totp = credentials.get("totp")
+
+                if username is not None:
+                    username_secret_id = self.generate_random_secret_id() + "_username"
+                    self.secrets[username_secret_id] = username
+                    self.values[parameter.key]["username"] = username_secret_id
+
+                if password is not None:
+                    password_secret_id = self.generate_random_secret_id() + "_password"
+                    self.secrets[password_secret_id] = password
+                    self.values[parameter.key]["password"] = password_secret_id
+
+                if totp is not None:
+                    # Storing the actual TOTP code, assuming `get_login_credentials` returns the current code
+                    totp_secret_id = self.generate_random_secret_id() + "_totp_code"
+                    self.secrets[totp_secret_id] = totp
+                    self.values[parameter.key]["totp_code"] = totp_secret_id
+                    # Note: Unlike Bitwarden's TOTP handling which stores the TOTP secret key (seed)
+                    # and a placeholder `BitwardenConstants.TOTP`, here we are storing the resolved code.
+                    # If the requirement was to store the TOTP seed, OnePasswordService would need a method
+                    # to fetch the seed specifically, and this logic would be different.
+            else:
+                LOG.warning(
+                    f"No credentials returned from 1Password for item '{parameter.onepassword_item_id}' in vault '{parameter.onepassword_vault_id}'."
+                )
+                # Store empty or indicate failure, depending on desired behavior
+                self.parameters[parameter.key] = parameter
+                self.values[parameter.key] = {}
+
+
+        except SkyvernException as e: # Includes OnePasswordServiceError, OnePasswordCLIError, etc.
+            LOG.error(f"Failed to get credentials from 1Password for item '{parameter.onepassword_item_id}'. Error: {e}", exc_info=True)
+            # Optionally re-raise or handle by setting empty values
+            # For now, let's re-raise to make the failure visible
+            raise
+        except Exception as e:
+            LOG.error(f"An unexpected error occurred while processing 1Password parameter '{parameter.key}'. Error: {e}", exc_info=True)
+            raise SkyvernException(f"Unexpected error with 1Password parameter: {e}")
+
+
     async def register_parameter_value(
         self,
         aws_client: AsyncAWSClient,
@@ -760,6 +844,7 @@ class WorkflowContextManager:
             | BitwardenLoginCredentialParameter
             | BitwardenCreditCardDataParameter
             | BitwardenSensitiveInformationParameter
+            | OnePasswordLoginCredentialParameter # Added
         ],
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(

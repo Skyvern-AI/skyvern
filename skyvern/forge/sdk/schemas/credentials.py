@@ -9,6 +9,7 @@ class CredentialType(StrEnum):
 
     PASSWORD = "password"
     CREDIT_CARD = "credit_card"
+    ONEPASSWORD_LOGIN = "onepassword_login"
 
 
 class PasswordCredentialResponse(BaseModel):
