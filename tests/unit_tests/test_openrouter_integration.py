@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from skyvern.config import Settings
-from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.api.llm import api_handler_factory, config_registry
 from skyvern.forge import app
+from skyvern.forge.sdk.api.llm import api_handler_factory, config_registry
+from skyvern.forge.sdk.settings_manager import SettingsManager
 
 
 class DummyResponse(dict):
@@ -17,6 +17,7 @@ class DummyResponse(dict):
 
     def model_dump_json(self, indent: int = 2):
         import json
+
         return json.dumps(self, indent=indent)
 
 
@@ -38,7 +39,7 @@ async def test_openrouter_basic_completion(monkeypatch):
 
     monkeypatch.setattr(app, "ARTIFACT_MANAGER", DummyArtifactManager())
 
-    async_mock = AsyncMock(return_value=DummyResponse("{\"result\": \"ok\"}"))
+    async_mock = AsyncMock(return_value=DummyResponse('{"result": "ok"}'))
     monkeypatch.setattr(api_handler_factory.litellm, "acompletion", async_mock)
 
     handler = api_handler_factory.LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER")
@@ -59,7 +60,7 @@ async def test_openrouter_dynamic_model(monkeypatch):
     importlib.reload(config_registry)
 
     monkeypatch.setattr(app, "ARTIFACT_MANAGER", DummyArtifactManager())
-    async_mock = AsyncMock(return_value=DummyResponse("{\"status\": \"ok\"}"))
+    async_mock = AsyncMock(return_value=DummyResponse('{"status": "ok"}'))
     monkeypatch.setattr(api_handler_factory.litellm, "acompletion", async_mock)
 
     handler = api_handler_factory.LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER")
