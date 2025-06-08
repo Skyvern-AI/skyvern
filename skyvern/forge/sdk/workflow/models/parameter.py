@@ -4,9 +4,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.exceptions import InvalidWorkflowParameter
+from skyvern.forge.sdk.workflow.exceptions import InvalidParameterKey
 
 RESERVED_PARAMETER_KEYS = ["current_item", "current_value", "current_index"]
 
@@ -34,6 +35,13 @@ class Parameter(BaseModel, abc.ABC):
     @classmethod
     def get_subclasses(cls) -> tuple[type["Parameter"], ...]:
         return tuple(cls.__subclasses__())
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, key: str) -> str:
+        if key and key[0].isdigit():
+            raise InvalidParameterKey(key)
+        return key
 
 
 class AWSSecretParameter(Parameter):
