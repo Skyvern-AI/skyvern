@@ -1,10 +1,8 @@
 name: Update OpenAPI Specification
-
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
-
 jobs:
   update-openapi:
     runs-on: ubuntu-latest
