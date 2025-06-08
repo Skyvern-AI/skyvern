@@ -19,11 +19,18 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column("workflow_run_blocks", sa.Column("url", sa.String(), nullable=True))
-    op.add_column("workflow_run_blocks", sa.Column("method", sa.String(), nullable=True))
-    op.add_column("workflow_run_blocks", sa.Column("headers", sa.JSON(), nullable=True))
-    op.add_column("workflow_run_blocks", sa.Column("body", sa.JSON(), nullable=True))
-    op.add_column("workflow_run_blocks", sa.Column("timeout", sa.Integer(), nullable=True))
+    # Try to add each column, ignoring if they already exist
+    for column_name, column_type in [
+        ("url", sa.String()),
+        ("method", sa.String()),
+        ("headers", sa.JSON()),
+        ("body", sa.JSON()),
+        ("timeout", sa.Integer()),
+    ]:
+        try:
+            op.add_column("workflow_run_blocks", sa.Column(column_name, column_type, nullable=True))
+        except Exception as e:
+            print(f"Column {column_name} might already exist: {e}")
 
 
 def downgrade() -> None:
