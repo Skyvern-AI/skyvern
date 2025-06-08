@@ -27,7 +27,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("wfrb_url_idx", table_name="workflow_run_blocks")
     op.drop_column("workflow_run_blocks", "timeout")
     op.drop_column("workflow_run_blocks", "body")
     op.drop_column("workflow_run_blocks", "headers")
