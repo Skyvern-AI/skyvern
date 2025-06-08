@@ -2445,10 +2445,17 @@ class ForgeAgent:
                 step_retry=step.retry_index,
                 max_retries=settings.MAX_RETRIES_PER_STEP,
             )
+            failure_reason = (
+                f"\u2757 This step was retried {max_retries_per_step} times but failed each time.\n\n"
+                "Skyvern stopped execution to prevent getting stuck.\n\n"
+                "You can:\n"
+                "- Check the reasoning and screenshot for this step to see why it failed.\n"
+                "- Adjust the `max_retries_per_step` setting in your task if needed."
+            )
             await self.update_task(
                 task,
                 TaskStatus.failed,
-                failure_reason=f"Max retries per step ({max_retries_per_step}) exceeded",
+                failure_reason=failure_reason,
             )
             return None
         else:
