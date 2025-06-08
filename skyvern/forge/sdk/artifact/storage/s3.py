@@ -68,9 +68,9 @@ class S3Storage(BaseStorage):
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)
-        LOG.info(
+        LOG.debug(
             "Storing artifact",
-            artifact_id=artifact.id,
+            artifact_id=artifact.artifact_id,
             organization_id=artifact.organization_id,
             uri=artifact.uri,
             storage_class=sc,
@@ -92,9 +92,9 @@ class S3Storage(BaseStorage):
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)
-        LOG.info(
+        LOG.debug(
             "Storing artifact from path",
-            artifact_id=artifact.id,
+            artifact_id=artifact.artifact_id,
             organization_id=artifact.organization_id,
             uri=artifact.uri,
             storage_class=sc,
@@ -106,7 +106,7 @@ class S3Storage(BaseStorage):
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         sc = await self._get_storage_class_for_org(organization_id)
-        LOG.info(
+        LOG.debug(
             "Saving streaming file",
             organization_id=organization_id,
             file_name=file_name,
@@ -126,7 +126,7 @@ class S3Storage(BaseStorage):
         zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
         sc = await self._get_storage_class_for_org(organization_id)
-        LOG.info(
+        LOG.debug(
             "Storing browser session",
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
