@@ -1,16 +1,10 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import { useState } from "react";
-import {
-  Cross2Icon,
-  PlusIcon,
-  MagnifyingGlassIcon,
-} from "@radix-ui/react-icons";
+import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
 import { WorkflowBlockTypes } from "../../types/workflowTypes";
 import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
-import { Input } from "@/components/ui/input";
 
 const enableCodeBlock =
   import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
@@ -235,26 +229,6 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
   const closeWorkflowPanel = useWorkflowPanelStore(
     (state) => state.closeWorkflowPanel,
   );
-  const [search, setSearch] = useState("");
-
-  const filteredItems = nodeLibraryItems.filter((item) => {
-    if (workflowPanelData?.disableLoop && item.nodeType === "loop") {
-      return false;
-    }
-    if (!enableCodeBlock && item.nodeType === "codeBlock") {
-      return false;
-    }
-
-    const term = search.toLowerCase();
-    if (!term) {
-      return true;
-    }
-
-    return (
-      item.nodeType.toLowerCase().includes(term) ||
-      item.title.toLowerCase().includes(term)
-    );
-  });
 
   return (
     <div className="w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
@@ -277,24 +251,20 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
               : "Click on the node type you want to add"}
           </span>
         </header>
-        <div className="relative">
-          <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
-            <MagnifyingGlassIcon className="size-5" />
-          </div>
-          <Input
-            value={search}
-            onChange={(event) => {
-              setSearch(event.target.value);
-            }}
-            placeholder="Search blocks..."
-            className="pl-9"
-          />
-        </div>
         <ScrollArea>
           <ScrollAreaViewport className="max-h-[28rem]">
             <div className="space-y-2">
-              {filteredItems.length > 0 ? (
-                filteredItems.map((item) => (
+              {nodeLibraryItems.map((item) => {
+                if (
+                  workflowPanelData?.disableLoop &&
+                  item.nodeType === "loop"
+                ) {
+                  return null;
+                }
+                if (!enableCodeBlock && item.nodeType === "codeBlock") {
+                  return null;
+                }
+                return (
                   <div
                     key={item.nodeType}
                     className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
@@ -326,12 +296,8 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                     </div>
                     <PlusIcon className="size-6 shrink-0" />
                   </div>
-                ))
-              ) : (
-                <div className="p-4 text-center text-sm text-slate-400">
-                  No results found
-                </div>
-              )}
+                );
+              })}
             </div>
           </ScrollAreaViewport>
         </ScrollArea>
