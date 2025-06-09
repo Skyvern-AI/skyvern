@@ -743,7 +743,7 @@ async def get_run_artifacts(
                 artifact.signed_url = signed_urls[i]
         else:
             LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
-    return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
+    return artifacts
 
 
 @base_router.post(
