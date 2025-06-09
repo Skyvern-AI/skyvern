@@ -27,7 +27,8 @@ export type ParameterYAML =
   | ContextParameterYAML
   | OutputParameterYAML
   | BitwardenSensitiveInformationParameterYAML
-  | BitwardenCreditCardDataParameterYAML;
+  | BitwardenCreditCardDataParameterYAML
+  | OnePasswordCredentialParameterYAML;
 
 export type ParameterYAMLBase = {
   parameter_type: string;
@@ -76,6 +77,11 @@ export type BitwardenCreditCardDataParameterYAML = ParameterYAMLBase & {
   bitwarden_client_id_aws_secret_key: string;
   bitwarden_client_secret_aws_secret_key: string;
   bitwarden_master_password_aws_secret_key: string;
+};
+
+export type OnePasswordCredentialParameterYAML = ParameterYAMLBase & {
+  parameter_type: "onepassword";
+  secret_reference: string;
 };
 
 export type ContextParameterYAML = ParameterYAMLBase & {

@@ -68,6 +68,12 @@ import {
 } from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
+import {
+  ParametersState,
+  parameterIsSkyvernCredential,
+  parameterIsOnePasswordCredential,
+  parameterIsBitwardenCredential,
+} from "./types";
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
@@ -84,7 +90,7 @@ import {
   nodeAdderNode,
   startNode,
 } from "./workflowEditorUtils";
-import { parameterIsBitwardenCredential, ParametersState } from "./types";
+
 import { useAutoPan } from "./useAutoPan";
 
 function convertToParametersYAML(
@@ -97,84 +103,127 @@ function convertToParametersYAML(
   | BitwardenCreditCardDataParameterYAML
   | CredentialParameterYAML
 > {
-  return parameters.map((parameter) => {
-    if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
-      return {
-        parameter_type: WorkflowParameterTypes.Workflow,
-        key: parameter.key,
-        description: parameter.description || null,
-        workflow_parameter_type: parameter.dataType,
-        ...(parameter.defaultValue === null
-          ? {}
-          : { default_value: parameter.defaultValue }),
-      };
-    } else if (
-      parameter.parameterType === WorkflowEditorParameterTypes.Context
-    ) {
-      return {
-        parameter_type: WorkflowParameterTypes.Context,
-        key: parameter.key,
-        description: parameter.description || null,
-        source_parameter_key: parameter.sourceParameterKey,
-      };
-    } else if (
-      parameter.parameterType === WorkflowEditorParameterTypes.Secret
-    ) {
-      return {
-        parameter_type: WorkflowParameterTypes.Bitwarden_Sensitive_Information,
-        key: parameter.key,
-        bitwarden_identity_key: parameter.identityKey,
-        bitwarden_identity_fields: parameter.identityFields,
-        description: parameter.description || null,
-        bitwarden_collection_id: parameter.collectionId,
-        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
-        bitwarden_client_secret_aws_secret_key:
-          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
-        bitwarden_master_password_aws_secret_key:
-          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
-      };
-    } else if (
-      parameter.parameterType === WorkflowEditorParameterTypes.CreditCardData
-    ) {
-      return {
-        parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
-        key: parameter.key,
-        description: parameter.description || null,
-        bitwarden_item_id: parameter.itemId,
-        bitwarden_collection_id: parameter.collectionId,
-        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
-        bitwarden_client_secret_aws_secret_key:
-          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
-        bitwarden_master_password_aws_secret_key:
-          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
-      };
-    } else {
-      if (parameterIsBitwardenCredential(parameter)) {
-        return {
-          parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
-          key: parameter.key,
-          description: parameter.description || null,
-          bitwarden_collection_id: parameter.collectionId,
-          bitwarden_item_id: parameter.itemId,
-          url_parameter_key: parameter.urlParameterKey,
-          bitwarden_client_id_aws_secret_key:
-            BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
-          bitwarden_client_secret_aws_secret_key:
-            BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
-          bitwarden_master_password_aws_secret_key:
-            BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
-        };
-      } else {
-        return {
-          parameter_type: WorkflowParameterTypes.Workflow,
-          workflow_parameter_type: WorkflowParameterValueType.CredentialId,
-          default_value: parameter.credentialId,
-          key: parameter.key,
-          description: parameter.description || null,
-        };
-      }
-    }
-  });
+  return parameters
+    .map(
+      (
+        parameter: ParametersState[number],
+      ):
+        | WorkflowParameterYAML
+        | BitwardenLoginCredentialParameterYAML
+        | ContextParameterYAML
+        | BitwardenSensitiveInformationParameterYAML
+        | BitwardenCreditCardDataParameterYAML
+        | CredentialParameterYAML
+        | undefined => {
+        if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
+          return {
+            parameter_type: WorkflowParameterTypes.Workflow,
+            key: parameter.key,
+            description: parameter.description || null,
+            workflow_parameter_type: parameter.dataType,
+            ...(parameter.defaultValue === null
+              ? {}
+              : { default_value: parameter.defaultValue }),
+          };
+        } else if (
+          parameter.parameterType === WorkflowEditorParameterTypes.Context
+        ) {
+          return {
+            parameter_type: WorkflowParameterTypes.Context,
+            key: parameter.key,
+            description: parameter.description || null,
+            source_parameter_key: parameter.sourceParameterKey,
+          };
+        } else if (
+          parameter.parameterType === WorkflowEditorParameterTypes.Secret
+        ) {
+          return {
+            parameter_type:
+              WorkflowParameterTypes.Bitwarden_Sensitive_Information,
+            key: parameter.key,
+            bitwarden_identity_key: parameter.identityKey,
+            bitwarden_identity_fields: parameter.identityFields,
+            description: parameter.description || null,
+            bitwarden_collection_id: parameter.collectionId,
+            bitwarden_client_id_aws_secret_key:
+              BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+            bitwarden_client_secret_aws_secret_key:
+              BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+            bitwarden_master_password_aws_secret_key:
+              BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+          };
+        } else if (
+          parameter.parameterType ===
+          WorkflowEditorParameterTypes.CreditCardData
+        ) {
+          return {
+            parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
+            key: parameter.key,
+            description: parameter.description || null,
+            bitwarden_item_id: parameter.itemId,
+            bitwarden_collection_id: parameter.collectionId,
+            bitwarden_client_id_aws_secret_key:
+              BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+            bitwarden_client_secret_aws_secret_key:
+              BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+            bitwarden_master_password_aws_secret_key:
+              BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+          };
+        } else {
+          if (parameterIsBitwardenCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
+              key: parameter.key,
+              description: parameter.description || null,
+              bitwarden_collection_id: parameter.collectionId,
+              bitwarden_item_id: parameter.itemId,
+              url_parameter_key: parameter.urlParameterKey,
+              bitwarden_client_id_aws_secret_key:
+                BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+              bitwarden_client_secret_aws_secret_key:
+                BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+              bitwarden_master_password_aws_secret_key:
+                BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+            };
+          } else if (parameterIsSkyvernCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Workflow,
+              workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+              default_value: parameter.credentialId,
+              key: parameter.key,
+              description: parameter.description || null,
+            };
+          } else if (parameterIsOnePasswordCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Workflow,
+              workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+              default_value: parameter.secretReference,
+              key: parameter.key,
+              description: parameter.description || null,
+            };
+          }
+        }
+        return undefined;
+      },
+    )
+    .filter(
+      (
+        param:
+          | WorkflowParameterYAML
+          | BitwardenLoginCredentialParameterYAML
+          | ContextParameterYAML
+          | BitwardenSensitiveInformationParameterYAML
+          | BitwardenCreditCardDataParameterYAML
+          | CredentialParameterYAML
+          | undefined,
+      ): param is
+        | WorkflowParameterYAML
+        | BitwardenLoginCredentialParameterYAML
+        | ContextParameterYAML
+        | BitwardenSensitiveInformationParameterYAML
+        | BitwardenCreditCardDataParameterYAML
+        | CredentialParameterYAML => param !== undefined,
+    );
 }
 
 type Props = {
@@ -207,7 +256,8 @@ function FlowRenderer({
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const [parameters, setParameters] = useState(initialParameters);
+  const [parameters, setParameters] =
+    useState<ParametersState>(initialParameters);
   const [title, setTitle] = useState(initialTitle);
   const nodesInitialized = useNodesInitialized();
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();

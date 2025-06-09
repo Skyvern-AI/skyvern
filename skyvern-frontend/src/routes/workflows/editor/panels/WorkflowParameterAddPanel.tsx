@@ -80,9 +80,10 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
     string | undefined
   >(undefined);
 
-  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
-    "skyvern",
-  );
+  const [credentialType, setCredentialType] = useState<
+    "bitwarden" | "skyvern" | "onepassword"
+  >("skyvern");
+  const [secretReference, setSecretReference] = useState("");
 
   const [identityKey, setIdentityKey] = useState("");
   const [identityFields, setIdentityFields] = useState("");
@@ -200,11 +201,14 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
             <SwitchBar
               value={credentialType}
               onChange={(value) => {
-                setCredentialType(value as "bitwarden" | "skyvern");
+                setCredentialType(
+                  value as "bitwarden" | "skyvern" | "onepassword",
+                );
               }}
               options={[
                 { label: "Skyvern", value: "skyvern" },
                 { label: "Bitwarden", value: "bitwarden" },
+                { label: "1Password", value: "onepassword" },
               ]}
             />
           )}
@@ -236,6 +240,15 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                 />
               </div>
             </>
+          )}
+          {type === "credential" && credentialType === "onepassword" && (
+            <div className="space-y-1">
+              <Label className="text-xs text-slate-300">Secret Reference</Label>
+              <Input
+                value={secretReference}
+                onChange={(e) => setSecretReference(e.target.value)}
+              />
+            </div>
           )}
           {type === "context" && (
             <div className="space-y-1">
@@ -384,6 +397,22 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                         : bitwardenLoginCredentialItemId,
                     urlParameterKey:
                       urlParameterKey === "" ? null : urlParameterKey,
+                    description,
+                  });
+                }
+                if (type === "credential" && credentialType === "onepassword") {
+                  if (secretReference.trim() === "") {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description: "Secret reference is required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "onepassword",
+                    secretReference,
                     description,
                   });
                 }

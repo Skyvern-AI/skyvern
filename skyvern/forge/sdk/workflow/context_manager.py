@@ -17,6 +17,7 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from skyvern.forge.sdk.services.credentials import resolve_secret
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenSensitiveInformationParameter,
     ContextParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -86,6 +88,8 @@ class WorkflowRunContext:
                 await workflow_run_context.register_aws_secret_parameter_value(aws_client, secrete_parameter)
             elif isinstance(secrete_parameter, CredentialParameter):
                 await workflow_run_context.register_credential_parameter_value(secrete_parameter, organization)
+            elif isinstance(secrete_parameter, OnePasswordCredentialParameter):
+                await workflow_run_context.register_onepassword_credential_parameter_value(secrete_parameter)
             elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
                     aws_client, secrete_parameter, organization
@@ -195,30 +199,51 @@ class WorkflowRunContext:
 
         LOG.info(f"Fetching credential parameter value for credential: {credential_id}")
 
-        db_credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
-        if db_credential is None:
-            raise CredentialParameterNotFoundError(credential_id)
+        # Handle 1Password references directly (op://vault_id/item_id/field)
+        if credential_id.startswith("op://"):
+            try:
+                # Use the 1Password SDK to resolve the reference directly
+                secret_value = await resolve_secret(credential_id)
+                random_secret_id = self.generate_random_secret_id()
+                self.secrets[random_secret_id] = secret_value
+                self.values[parameter.key] = random_secret_id
+                self.parameters[parameter.key] = parameter
+                return
+            except Exception as e:
+                LOG.error(f"Failed to resolve 1Password reference: {credential_id}. Error: {e}")
+                raise e
 
-        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
+        # Handle regular credentials from the database
+        try:
+            db_credential = await app.DATABASE.get_credential(
+                credential_id, organization_id=organization.organization_id
+            )
+            if db_credential is None:
+                raise CredentialParameterNotFoundError(credential_id)
 
-        credential_item = bitwarden_credential.credential
+            bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
 
-        self.parameters[parameter.key] = parameter
-        self.values[parameter.key] = {}
-        credential_dict = credential_item.model_dump()
-        for key, value in credential_dict.items():
-            random_secret_id = self.generate_random_secret_id()
-            secret_id = f"{random_secret_id}_{key}"
-            self.secrets[secret_id] = value
-            self.values[parameter.key][key] = secret_id
+            credential_item = bitwarden_credential.credential
 
-        if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
-            random_secret_id = self.generate_random_secret_id()
-            totp_secret_id = f"{random_secret_id}_totp"
-            self.secrets[totp_secret_id] = BitwardenConstants.TOTP
-            totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-            self.secrets[totp_secret_value] = credential_item.totp
-            self.values[parameter.key]["totp"] = totp_secret_id
+            self.parameters[parameter.key] = parameter
+            self.values[parameter.key] = {}
+            credential_dict = credential_item.model_dump()
+            for key, value in credential_dict.items():
+                random_secret_id = self.generate_random_secret_id()
+                secret_id = f"{random_secret_id}_{key}"
+                self.secrets[secret_id] = value
+                self.values[parameter.key][key] = secret_id
+
+            if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+                random_secret_id = self.generate_random_secret_id()
+                totp_secret_id = f"{random_secret_id}_totp"
+                self.secrets[totp_secret_id] = BitwardenConstants.TOTP
+                totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+                self.secrets[totp_secret_value] = credential_item.totp
+                self.values[parameter.key]["totp"] = totp_secret_id
+        except Exception as e:
+            LOG.error(f"Failed to get credential from database: {credential_id}. Error: {e}")
+            raise e
 
     async def register_credential_parameter_value(
         self,
@@ -277,6 +302,13 @@ class WorkflowRunContext:
             self.secrets[random_secret_id] = secret_value
             self.values[parameter.key] = random_secret_id
             self.parameters[parameter.key] = parameter
+
+    async def register_onepassword_credential_parameter_value(self, parameter: OnePasswordCredentialParameter) -> None:
+        secret_value = await resolve_secret(parameter.secret_reference)
+        random_secret_id = self.generate_random_secret_id()
+        self.secrets[random_secret_id] = secret_value
+        self.values[parameter.key] = random_secret_id
+        self.parameters[parameter.key] = parameter
 
     async def register_bitwarden_login_credential_parameter_value(
         self,
