@@ -16,7 +16,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -711,6 +711,39 @@ async def get_artifact(
                 artifact_id=artifact_id,
             )
     return artifact
+
+
+@base_router.get(
+    "/runs/{run_id}/artifacts",
+    tags=["Artifacts"],
+    response_model=list[Artifact],
+    openapi_extra={
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_run_artifacts",
+    },
+    description="Get artifacts for a run",
+    summary="Get artifacts for a run",
+)
+@base_router.get("/runs/{run_id}/artifacts/", response_model=list[Artifact], include_in_schema=False)
+async def get_run_artifacts(
+    run_id: str = Path(..., description="The id of the task run or the workflow run."),
+    artifact_type: Annotated[list[ArtifactType] | None, Query()] = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    analytics.capture("skyvern-oss-run-artifacts-get")
+    artifacts = await app.DATABASE.get_artifacts_for_run(
+        run_id=run_id,
+        organization_id=current_org.organization_id,
+        artifact_types=artifact_type,
+    )
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
+        if signed_urls:
+            for i, artifact in enumerate(artifacts):
+                artifact.signed_url = signed_urls[i]
+        else:
+            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+    return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 
 @base_router.post(

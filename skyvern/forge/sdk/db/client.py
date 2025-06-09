@@ -949,6 +949,40 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_artifacts_for_run(
+        self,
+        run_id: str,
+        organization_id: str | None = None,
+        artifact_types: list[ArtifactType] | None = None,
+    ) -> list[Artifact]:
+        """Return artifacts associated with a run."""
+        run = await self.get_run(run_id, organization_id=organization_id)
+        if not run:
+            return []
+
+        async with self.Session() as session:
+            query = select(ArtifactModel).filter_by(organization_id=organization_id)
+
+            if run.task_run_type in [
+                RunType.task_v1,
+                RunType.openai_cua,
+                RunType.anthropic_cua,
+            ]:
+                query = query.filter_by(task_id=run.run_id)
+            elif run.task_run_type == RunType.task_v2:
+                query = query.filter_by(observer_cruise_id=run.run_id)
+            elif run.task_run_type == RunType.workflow_run:
+                query = query.filter_by(workflow_run_id=run.run_id)
+            else:
+                return []
+
+            if artifact_types:
+                query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
+
+            query = query.order_by(ArtifactModel.created_at)
+            artifacts = (await session.scalars(query)).all()
+            return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+
     async def get_artifact_by_id(
         self,
         artifact_id: str,
