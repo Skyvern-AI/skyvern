@@ -81,7 +81,8 @@ export type BitwardenCreditCardDataParameterYAML = ParameterYAMLBase & {
 
 export type OnePasswordCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "onepassword";
-  secret_reference: string;
+  vault_id: string;
+  item_id: string;
 };
 
 export type ContextParameterYAML = ParameterYAMLBase & {

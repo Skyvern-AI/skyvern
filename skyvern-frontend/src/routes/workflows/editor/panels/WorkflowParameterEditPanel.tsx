@@ -153,8 +153,11 @@ function WorkflowParameterEditPanel({
   const [credentialId, setCredentialId] = useState(
     isSkyvernCredential ? initialValues.credentialId : "",
   );
-  const [secretReference, setSecretReference] = useState(
-    isOnePasswordCredential ? initialValues.secretReference : "",
+  const [vaultId, setVaultId] = useState(
+    isOnePasswordCredential ? initialValues.vaultId : "",
+  );
+  const [opItemId, setOpItemId] = useState(
+    isOnePasswordCredential ? initialValues.itemId : "",
   );
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
@@ -310,13 +313,22 @@ function WorkflowParameterEditPanel({
             </>
           )}
           {type === "credential" && credentialType === "onepassword" && (
-            <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Secret Reference</Label>
-              <Input
-                value={secretReference}
-                onChange={(e) => setSecretReference(e.target.value)}
-              />
-            </div>
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Vault ID</Label>
+                <Input
+                  value={vaultId}
+                  onChange={(e) => setVaultId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Item ID</Label>
+                <Input
+                  value={opItemId}
+                  onChange={(e) => setOpItemId(e.target.value)}
+                />
+              </div>
+            </>
           )}
           {type === "context" && (
             <div className="space-y-1">
@@ -456,18 +468,19 @@ function WorkflowParameterEditPanel({
                   });
                 }
                 if (type === "credential" && credentialType === "onepassword") {
-                  if (secretReference.trim() === "") {
+                  if (vaultId.trim() === "" || opItemId.trim() === "") {
                     toast({
                       variant: "destructive",
                       title: "Failed to save parameter",
-                      description: "Secret reference is required",
+                      description: "Vault ID and Item ID are required",
                     });
                     return;
                   }
                   onSave({
                     key,
                     parameterType: "onepassword",
-                    secretReference,
+                    vaultId,
+                    itemId: opItemId,
                     description,
                   });
                 }

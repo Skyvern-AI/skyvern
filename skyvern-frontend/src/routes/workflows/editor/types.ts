@@ -20,7 +20,8 @@ export type OnePasswordCredential = {
   key: string;
   description?: string | null;
   parameterType: "onepassword";
-  secretReference: string;
+  vaultId: string;
+  itemId: string;
 };
 
 export function parameterIsBitwardenCredential(
@@ -38,7 +39,7 @@ export function parameterIsSkyvernCredential(
 export function parameterIsOnePasswordCredential(
   parameter: CredentialParameterState,
 ): parameter is OnePasswordCredential {
-  return "secretReference" in parameter;
+  return "vaultId" in parameter && "itemId" in parameter;
 }
 
 export type CredentialParameterState =

@@ -1700,7 +1700,8 @@ function convertParametersToParameterYAML(
           return {
             ...base,
             parameter_type: WorkflowParameterTypes.OnePassword,
-            secret_reference: parameter.secret_reference,
+            vault_id: parameter.vault_id,
+            item_id: parameter.item_id,
           };
         }
       }

@@ -1,4 +1,5 @@
 import copy
+import os
 import uuid
 from typing import TYPE_CHECKING, Any, Self
 
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from onepassword.client import Client
 from skyvern.forge.sdk.services.credentials import resolve_secret
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -304,11 +306,26 @@ class WorkflowRunContext:
             self.parameters[parameter.key] = parameter
 
     async def register_onepassword_credential_parameter_value(self, parameter: OnePasswordCredentialParameter) -> None:
-        secret_value = await resolve_secret(parameter.secret_reference)
-        random_secret_id = self.generate_random_secret_id()
-        self.secrets[random_secret_id] = secret_value
-        self.values[parameter.key] = random_secret_id
+        token = os.getenv("OP_SERVICE_ACCOUNT_TOKEN")
+        client = await Client.authenticate(
+            auth=token,
+            integration_name="Skyvern",
+            integration_version="v1.0.0",
+        )
+
+        item = await client.items.get(parameter.vault_id, parameter.item_id)
+
         self.parameters[parameter.key] = parameter
+        self.values[parameter.key] = {}
+
+        for field in item.fields:
+            if field.value is None:
+                continue
+            random_secret_id = self.generate_random_secret_id()
+            secret_id = f"{random_secret_id}_{field.id}"
+            self.secrets[secret_id] = field.value
+            key = (field.label or field.id).lower().replace(" ", "_")
+            self.values[parameter.key][key] = secret_id
 
     async def register_bitwarden_login_credential_parameter_value(
         self,

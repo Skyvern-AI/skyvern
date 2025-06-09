@@ -133,7 +133,8 @@ class OnePasswordCredentialParameter(Parameter):
 
     onepassword_credential_parameter_id: str
     workflow_id: str
-    secret_reference: str
+    vault_id: str
+    item_id: str
 
     created_at: datetime
     modified_at: datetime

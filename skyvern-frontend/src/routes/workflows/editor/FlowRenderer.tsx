@@ -197,7 +197,7 @@ function convertToParametersYAML(
             return {
               parameter_type: WorkflowParameterTypes.Workflow,
               workflow_parameter_type: WorkflowParameterValueType.CredentialId,
-              default_value: parameter.secretReference,
+              default_value: `${parameter.vaultId}:${parameter.itemId}`,
               key: parameter.key,
               description: parameter.description || null,
             };

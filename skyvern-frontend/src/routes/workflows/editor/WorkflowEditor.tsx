@@ -148,7 +148,8 @@ function WorkflowEditor() {
                   return {
                     key: parameter.key,
                     parameterType: WorkflowEditorParameterTypes.OnePassword,
-                    secretReference: parameter.secret_reference,
+                    vaultId: parameter.vault_id,
+                    itemId: parameter.item_id,
                     description: parameter.description,
                   };
                 } else if (

@@ -83,7 +83,8 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
   const [credentialType, setCredentialType] = useState<
     "bitwarden" | "skyvern" | "onepassword"
   >("skyvern");
-  const [secretReference, setSecretReference] = useState("");
+  const [vaultId, setVaultId] = useState("");
+  const [itemId, setItemId] = useState("");
 
   const [identityKey, setIdentityKey] = useState("");
   const [identityFields, setIdentityFields] = useState("");
@@ -242,13 +243,22 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
             </>
           )}
           {type === "credential" && credentialType === "onepassword" && (
-            <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Secret Reference</Label>
-              <Input
-                value={secretReference}
-                onChange={(e) => setSecretReference(e.target.value)}
-              />
-            </div>
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Vault ID</Label>
+                <Input
+                  value={vaultId}
+                  onChange={(e) => setVaultId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Item ID</Label>
+                <Input
+                  value={itemId}
+                  onChange={(e) => setItemId(e.target.value)}
+                />
+              </div>
+            </>
           )}
           {type === "context" && (
             <div className="space-y-1">
@@ -401,18 +411,19 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   });
                 }
                 if (type === "credential" && credentialType === "onepassword") {
-                  if (secretReference.trim() === "") {
+                  if (vaultId.trim() === "" || itemId.trim() === "") {
                     toast({
                       variant: "destructive",
                       title: "Failed to add parameter",
-                      description: "Secret reference is required",
+                      description: "Vault ID and Item ID are required",
                     });
                     return;
                   }
                   onSave({
                     key,
                     parameterType: "onepassword",
-                    secretReference,
+                    vaultId,
+                    itemId,
                     description,
                   });
                 }

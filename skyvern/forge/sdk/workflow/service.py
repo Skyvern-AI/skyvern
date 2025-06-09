@@ -889,13 +889,15 @@ class WorkflowService:
         self,
         workflow_id: str,
         key: str,
-        secret_reference: str,
+        vault_id: str,
+        item_id: str,
         description: str | None = None,
     ) -> OnePasswordCredentialParameter:
         return await app.DATABASE.create_onepassword_credential_parameter(
             workflow_id=workflow_id,
             key=key,
-            secret_reference=secret_reference,
+            vault_id=vault_id,
+            item_id=item_id,
             description=description,
         )
 
@@ -1508,7 +1510,8 @@ class WorkflowService:
                         workflow_id=workflow.workflow_id,
                         key=parameter.key,
                         description=parameter.description,
-                        secret_reference=parameter.secret_reference,
+                        vault_id=parameter.vault_id,
+                        item_id=parameter.item_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:

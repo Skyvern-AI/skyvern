@@ -1870,14 +1870,15 @@ class AgentDB:
             )
 
     async def create_onepassword_credential_parameter(
-        self, workflow_id: str, key: str, secret_reference: str, description: str | None = None
+        self, workflow_id: str, key: str, vault_id: str, item_id: str, description: str | None = None
     ) -> OnePasswordCredentialParameter:
         async with self.Session() as session:
             parameter = OnePasswordCredentialParameterModel(
                 workflow_id=workflow_id,
                 key=key,
                 description=description,
-                secret_reference=secret_reference,
+                vault_id=vault_id,
+                item_id=item_id,
             )
             session.add(parameter)
             await session.commit()
@@ -1887,7 +1888,8 @@ class AgentDB:
                 workflow_id=parameter.workflow_id,
                 key=parameter.key,
                 description=parameter.description,
-                secret_reference=parameter.secret_reference,
+                vault_id=parameter.vault_id,
+                item_id=parameter.item_id,
                 created_at=parameter.created_at,
                 modified_at=parameter.modified_at,
                 deleted_at=parameter.deleted_at,

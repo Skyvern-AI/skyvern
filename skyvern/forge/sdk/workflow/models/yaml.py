@@ -88,7 +88,8 @@ class BitwardenCreditCardDataParameterYAML(ParameterYAML):
 
 class OnePasswordCredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.ONEPASSWORD] = ParameterType.ONEPASSWORD  # type: ignore
-    secret_reference: str
+    vault_id: str
+    item_id: str
 
 
 class WorkflowParameterYAML(ParameterYAML):

@@ -419,7 +419,8 @@ class OnePasswordCredentialParameterModel(Base):
     workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
-    secret_reference = Column(String, nullable=False)
+    vault_id = Column(String, nullable=False)
+    item_id = Column(String, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
