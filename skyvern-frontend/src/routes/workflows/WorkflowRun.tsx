@@ -39,6 +39,9 @@ import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
 import { cn } from "@/util/utils";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
+import { convert } from "./editor/workflowEditorUtils";
+import { SaveIcon } from "@/components/icons/SaveIcon";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -88,6 +91,33 @@ function WorkflowRun() {
       });
     },
   });
+
+  const createWorkflowMutation = useCreateWorkflowMutation();
+
+  function handleSaveAsWorkflow() {
+    if (!workflow) return;
+
+    const clonedWorkflow = convert({
+      ...workflow,
+      title: `Copy of ${workflow.title}`,
+    });
+    createWorkflowMutation.mutate(clonedWorkflow, {
+      onSuccess: () => {
+        toast({
+          variant: "success",
+          title: "Workflow Cloned",
+          description: "A copy of the workflow has been created.",
+        });
+      },
+      onError: (error) => {
+        toast({
+          variant: "destructive",
+          title: "Failed to Clone Workflow",
+          description: error.message,
+        });
+      },
+    });
+  }
 
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -214,6 +244,20 @@ function WorkflowRun() {
             <CopyIcon className="mr-2 h-4 w-4" />
             cURL
           </Button>
+          {workflowRunIsFinalized && (
+            <Button
+              variant="secondary"
+              onClick={handleSaveAsWorkflow}
+              disabled={createWorkflowMutation.isPending}
+            >
+              {createWorkflowMutation.isPending ? (
+                <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <SaveIcon className="mr-2 h-4 w-4" />
+              )}
+              Save as Workflow
+            </Button>
+          )}
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/edit`}>
               <Pencil2Icon className="mr-2 h-4 w-4" />
