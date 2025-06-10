@@ -213,7 +213,7 @@ async def _convert_svg_to_string(
 
         for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
             try:
-                async with asyncio.Timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
                     json_response = await app.SECONDARY_LLM_API_HANDLER(
                         prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
                     )
@@ -240,11 +240,12 @@ async def _convert_svg_to_string(
                 await asyncio.sleep(3)
             except asyncio.TimeoutError:
                 LOG.warning(
-                    "Timeout to call LLM to parse SVG. Going to stop retrying",
+                    "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
                     element_id=element_id,
                     key=svg_key,
                 )
-                break
+                _mark_element_as_dropped(element)
+                return
             except Exception:
                 LOG.info(
                     "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
@@ -367,7 +368,7 @@ async def _convert_css_shape_to_string(
             # TODO: we don't retry the css shape conversion today
             for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
-                    async with asyncio.Timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                    async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
                         json_response = await app.SECONDARY_LLM_API_HANDLER(
                             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
                         )
@@ -394,11 +395,11 @@ async def _convert_css_shape_to_string(
                     await asyncio.sleep(3)
                 except asyncio.TimeoutError:
                     LOG.warning(
-                        "Timeout to call LLM to parse css shape. Going to stop retrying",
+                        "Timeout to call LLM to parse css shape. Going to abort the convertion directly.",
                         element_id=element_id,
                         key=shape_key,
                     )
-                    break
+                    return None
                 except Exception:
                     LOG.info(
                         "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
