@@ -4,6 +4,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Self
 
 import structlog
+from onepassword.client import Client
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -18,7 +19,6 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from onepassword.client import Client
 from skyvern.forge.sdk.services.credentials import resolve_secret
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -214,6 +214,47 @@ class WorkflowRunContext:
             except Exception as e:
                 LOG.error(f"Failed to resolve 1Password reference: {credential_id}. Error: {e}")
                 raise e
+
+        # Handle 1Password credentials in vault_id:item_id format
+        if ":" in credential_id and not credential_id.startswith("op://"):
+            try:
+                LOG.info(f"Processing 1Password credential in vault_id:item_id format: {credential_id}")
+                # Use the 1Password SDK to resolve the reference
+                import json
+
+                secret_value_json = await resolve_secret(credential_id)
+
+                # Validate the JSON response
+                if not secret_value_json:
+                    LOG.error(f"Empty response from 1Password for credential: {credential_id}")
+                    raise ValueError(f"Empty response from 1Password for credential: {credential_id}")
+
+                try:
+                    secret_values = json.loads(secret_value_json)
+                except json.JSONDecodeError as json_err:
+                    LOG.error(f"Invalid JSON response from 1Password: {secret_value_json[:100]}... Error: {json_err}")
+                    raise ValueError(f"Invalid JSON response from 1Password: {json_err}")
+
+                if not secret_values:
+                    LOG.warning(f"No values found in 1Password item: {credential_id}")
+                    # Still continue with empty values
+
+                self.parameters[parameter.key] = parameter
+                self.values[parameter.key] = {}
+
+                # Process each field in the 1Password item
+                for key, value in secret_values.items():
+                    random_secret_id = self.generate_random_secret_id()
+                    secret_id = f"{random_secret_id}_{key}"
+                    self.secrets[secret_id] = value
+                    self.values[parameter.key][key] = secret_id
+
+                LOG.info(f"Successfully processed 1Password credential with {len(secret_values)} fields")
+                return
+            except Exception as e:
+                LOG.error(f"Failed to resolve 1Password reference in custom format: {credential_id}. Error: {str(e)}")
+                # Add more context to the error
+                raise ValueError(f"Failed to process 1Password credential {credential_id}: {str(e)}") from e
 
         # Handle regular credentials from the database
         try:
