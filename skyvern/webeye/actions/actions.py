@@ -168,6 +168,13 @@ class Action(BaseModel):
         else:
             raise ValueError("Invalid action data")
 
+    def get_xpath(self) -> str | None:
+        if not self.skyvern_element_data:
+            return None
+        if "xpath" in self.skyvern_element_data:
+            return self.skyvern_element_data["xpath"]
+        return None
+
 
 class WebAction(Action):
     element_id: Annotated[str, Field(coerce_numbers_to_str=True)]
