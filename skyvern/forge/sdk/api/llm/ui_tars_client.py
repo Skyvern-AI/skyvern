@@ -1,6 +1,12 @@
 """
 UI-TARS Client for Seed1.5-VL model via ByteDance Doubao API.
 Implements history-5 conversation approach and action parsing.
+
+NOTE FROM BYTEDANCE TEAM:
+"Our agent is a native model-based agent instead of being implemented with a framework. Our context management is just "reserve all texts and most recent 5 images", which you can find in the cookbook. Good practice for implementing our model in any environment is listed below:
+Step 1: Getting prediction from our model using the same setting as cookbook. (system prompt, inference params)
+Step 2: Using the parse_action_to_structure_output function in cookbook to get the parsed action name and action input parameters
+Step 3: Implement your own adapter function for mapping our model action space to your environment's action space (like pyautogui in OSWorld, or playwright action space in WebVoyager), remember that our model does not need a set-of-mark screenshot or operate on an element id in html ally tree. We directly operate and work best based solely on visual coordinates."
 """
 
 import base64

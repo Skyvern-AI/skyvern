@@ -1491,7 +1491,6 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
     ) -> list[Action]:
         """Generate actions using UI-TARS (Seed1.5-VL) model."""
-        from skyvern.config import settings
         from skyvern.forge.sdk.api.llm.ui_tars_client import ui_tars_manager
         
         LOG.info(
