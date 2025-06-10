@@ -26,7 +26,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
-_LLM_CALL_TIMEOUT_SECONDS = 60  # 1m
+_LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
