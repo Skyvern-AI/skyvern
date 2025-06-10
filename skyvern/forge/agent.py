@@ -75,10 +75,10 @@ from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine
 from skyvern.services import run_service
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
-    ActionType,
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
