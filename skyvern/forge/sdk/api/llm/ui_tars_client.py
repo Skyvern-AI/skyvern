@@ -201,8 +201,8 @@ class UITarsClient:
                 error=str(e),
                 exc_info=True,
             )
-            # Return fallback wait action
-            return [self._create_fallback_action(task, step, str(e))]
+            # Return empty actions to trigger retry mechanism
+            return []
 
     async def _call_api(self) -> str:
         """Call the UI-TARS API and return response content."""
@@ -385,16 +385,30 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                         action_order=len(actions),
                     )
                 elif action_type == "scroll":
-                    direction = action_inputs.get("direction", "down")
+                    direction = action_inputs.get("direction", "down").lower()
                     x, y = self._extract_coordinates_from_box(action_inputs.get("start_box", ""), image_width, image_height)
+                    
+                    # Convert direction to scroll amounts
+                    scroll_amount = 300  # Default scroll amount in pixels
+                    if direction == "down":
+                        scroll_x, scroll_y = 0, scroll_amount
+                    elif direction == "up":
+                        scroll_x, scroll_y = 0, -scroll_amount
+                    elif direction == "right":
+                        scroll_x, scroll_y = scroll_amount, 0
+                    elif direction == "left":
+                        scroll_x, scroll_y = -scroll_amount, 0
+                    else:
+                        scroll_x, scroll_y = 0, scroll_amount  # Default to down
+                    
                     action = ScrollAction(
                         x=x,
                         y=y,
-                        direction=direction,
-                        clicks=3,  # Default scroll amount
+                        scroll_x=scroll_x,  # Required field
+                        scroll_y=scroll_y,  # Required field
                         reasoning=thought,
                         intention=thought,
-                        response=f"Scroll {direction} at ({x}, {y})",
+                        response=f"Scroll {direction} by ({scroll_x}, {scroll_y}) at ({x}, {y})",
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
                         task_id=task.task_id,
@@ -426,15 +440,17 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                     )
                 else:
                     # Create fallback action for unrecognized types
-                    action = self._create_fallback_action(task, step, f"Unrecognized action type: {action_type}")
+                    LOG.error(f"Unrecognized action type: {action_type}")
+                    continue
                 
                 actions.append(action)
                 
             except Exception as e:
                 LOG.error(f"Failed to convert action: {parsed_action}", error=str(e), exc_info=True)
-                actions.append(self._create_fallback_action(task, step, f"Failed to parse action: {str(e)}"))
+                # Skip failed actions instead of adding fallback wait actions
+                continue
         
-        return actions if actions else [self._create_fallback_action(task, step, "No valid actions found")]
+        return actions
 
     def _extract_coordinates_from_box(self, box_str: str, image_width: int, image_height: int) -> Tuple[int, int]:
         """Extract coordinates from UI-TARS box format."""
@@ -483,7 +499,7 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
             
             if not action_text:
                 LOG.warning("No action found in UI-TARS response", response=response_content)
-                return [self._create_fallback_action(task, step, "No clear action identified")]
+                return []
             
             # Parse different action types from UI-TARS
             action = self._parse_single_action(action_text, thought, task, step)
@@ -491,9 +507,9 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
             
         except Exception as e:
             LOG.error("Failed to parse UI-TARS response", error=str(e), response=response_content, exc_info=True)
-            actions.append(self._create_fallback_action(task, step, f"Failed to parse action: {str(e)}"))
+            return []
         
-        return actions if actions else [self._create_fallback_action(task, step, "No valid actions found")]
+        return actions
 
     def _parse_single_action(self, action_text: str, thought: str, task: Task, step: Step) -> Action:
         """Parse a single action from action text."""
@@ -536,8 +552,8 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                 action_order=0,
             )
         else:
-            # Default to wait action if action type not recognized
-            return self._create_fallback_action(task, step, f"{thought}. Unrecognized action: {action_text}")
+            # Raise exception for unrecognized action types
+            raise ValueError(f"Unrecognized action: {action_text}")
 
     def _parse_click_action(self, action_text: str, thought: str, task: Task, step: Step) -> ClickAction:
         """Parse click action from UI-TARS response."""
@@ -721,19 +737,6 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
             return int(coord_match.group(1)), int(coord_match.group(2))
         
         raise ValueError(f"Could not parse coordinates from: {action_text}")
-
-    def _create_fallback_action(self, task: Task, step: Step, reason: str) -> WaitAction:
-        """Create a fallback wait action when parsing fails."""
-        return WaitAction(
-            reasoning=reason,
-            seconds=2,
-            organization_id=task.organization_id,
-            workflow_run_id=task.workflow_run_id,
-            task_id=task.task_id,
-            step_id=step.step_id,
-            step_order=step.order,
-            action_order=0,
-        )
 
     def reset_conversation(self) -> None:
         """Reset the conversation history."""
