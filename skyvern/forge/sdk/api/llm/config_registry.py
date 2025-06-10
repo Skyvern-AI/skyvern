@@ -1034,23 +1034,3 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
             f"Registered OpenAI-compatible model with key {openai_compatible_model_key}",
             model_name=openai_compatible_model_name,
         )
-
-# UI-TARS configuration disabled - handled by custom client
-# if settings.ENABLE_UI_TARS:
-#     # UI-TARS (Seed1.5-VL via Doubao API) - Use openai/ prefix for LiteLLM compatibility
-#     LLMConfigRegistry.register_config(
-#         "UI_TARS_SEED1_5_VL",
-#         LLMConfig(
-#             f"openai/{settings.UI_TARS_MODEL}",
-#             ["UI_TARS_API_KEY"],
-#             supports_vision=True,
-#             add_assistant_prefix=False,
-#             max_completion_tokens=4096,
-#             litellm_params=LiteLLMParams(
-#                 api_base=settings.UI_TARS_API_BASE,
-#                 api_key=settings.UI_TARS_API_KEY,
-#                 api_version=None,
-#                 model_info={"model_name": f"openai/{settings.UI_TARS_MODEL}"},
-#             ),
-#         ),
-#     )
