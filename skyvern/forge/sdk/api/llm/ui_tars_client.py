@@ -369,8 +369,11 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                     )
                 elif action_type == "hotkey":
                     key = action_inputs.get("key", action_inputs.get("hotkey", ""))
+                    # Parse space-separated hotkey string into individual keys
+                    # UI-TARS format: "ctrl shift y" -> ["ctrl", "shift", "y"]
+                    keys = key.split() if key else []
                     action = KeypressAction(
-                        keys=[key],
+                        keys=keys,
                         reasoning=thought,
                         intention=thought,
                         response=f"Hotkey: {key}",
