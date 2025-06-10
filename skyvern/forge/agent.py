@@ -1533,18 +1533,8 @@ class ForgeAgent:
                 error=str(e),
                 exc_info=True,
             )
-            # Return a wait action as fallback
-            from skyvern.webeye.actions.actions import WaitAction
-            return [WaitAction(
-                reasoning=f"UI-TARS action generation failed: {str(e)}",
-                seconds=5,
-                organization_id=task.organization_id,
-                workflow_run_id=task.workflow_run_id,
-                task_id=task.task_id,
-                step_id=step.step_id,
-                step_order=step.order,
-                action_order=0,
-            )]
+            # Return empty actions to trigger retry mechanism
+            return []
     
     async def complete_verify(
         self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
