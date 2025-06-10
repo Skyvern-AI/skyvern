@@ -29,16 +29,18 @@ LOG = structlog.get_logger()
 
 
 class S3Storage(BaseStorage):
+    _PATH_VERSION = "v1"
+
     def __init__(self, bucket: str | None = None) -> None:
         self.async_client = AsyncAWSClient()
         self.bucket = bucket or settings.AWS_S3_BUCKET_ARTIFACTS
 
     def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
-        uri = f"s3://{self.bucket}/{settings.ENV}/global_workflows.txt"
+        uri = f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/global_workflows.txt"
         data = await self.async_client.download_file(uri, log_exception=False)
         if not data:
             return []
@@ -48,19 +50,19 @@ class S3Storage(BaseStorage):
         self, *, organization_id: str, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/{organization_id}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
 
     def build_thought_uri(
         self, *, organization_id: str, artifact_id: str, thought: Thought, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/{organization_id}/observers/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/observers/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_task_v2_uri(
         self, *, organization_id: str, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
         self,
@@ -71,13 +73,13 @@ class S3Storage(BaseStorage):
         artifact_type: ArtifactType,
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_ai_suggestion_uri(
         self, *, organization_id: str, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)

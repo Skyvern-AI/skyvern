@@ -34,7 +34,7 @@ class TestS3StorageBuildURIs:
         uri = s3_storage.build_uri("artifact123", step, ArtifactType.LLM_PROMPT)
         assert (
             uri
-            == f"s3://{TEST_BUCKET}/{settings.ENV}/{TEST_TASK_ID}/01_0_{TEST_STEP_ID}/2025-06-09T12:00:00_artifact123_llm_prompt.txt"
+            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_TASK_ID}/01_0_{TEST_STEP_ID}/2025-06-09T12:00:00_artifact123_llm_prompt.txt"
         )
 
     def test_build_log_uri(self, s3_storage: S3Storage) -> None:
@@ -46,7 +46,7 @@ class TestS3StorageBuildURIs:
         )
         assert (
             uri
-            == f"s3://{TEST_BUCKET}/{settings.ENV}/{TEST_ORGANIZATION_ID}/logs/workflow_run_block/log_id/2025-06-09T12:00:00_skyvern_log.log"
+            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/logs/workflow_run_block/log_id/2025-06-09T12:00:00_skyvern_log.log"
         )
 
     def test_build_thought_uri(self, s3_storage: S3Storage) -> None:
@@ -59,7 +59,7 @@ class TestS3StorageBuildURIs:
         )
         assert (
             uri
-            == f"s3://{TEST_BUCKET}/{settings.ENV}/{TEST_ORGANIZATION_ID}/observers/cruise123/thought123/2025-06-09T12:00:00_artifact123_visible_elements_tree.json"
+            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/observers/cruise123/thought123/2025-06-09T12:00:00_artifact123_visible_elements_tree.json"
         )
 
     def test_build_task_v2_uri(self, s3_storage: S3Storage) -> None:
@@ -72,7 +72,7 @@ class TestS3StorageBuildURIs:
         )
         assert (
             uri
-            == f"s3://{TEST_BUCKET}/{settings.ENV}/{TEST_ORGANIZATION_ID}/observers/cruise123/2025-06-09T12:00:00_artifact123_html_action.html"
+            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/observers/cruise123/2025-06-09T12:00:00_artifact123_html_action.html"
         )
 
     def test_build_workflow_run_block_uri(self, s3_storage: S3Storage) -> None:
@@ -85,7 +85,7 @@ class TestS3StorageBuildURIs:
         )
         assert (
             uri
-            == f"s3://{TEST_BUCKET}/{settings.ENV}/{TEST_ORGANIZATION_ID}/workflow_runs/{TEST_WORKFLOW_RUN_ID}/{TEST_BLOCK_ID}/2025-06-09T12:00:00_artifact123_har.har"
+            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/workflow_runs/{TEST_WORKFLOW_RUN_ID}/{TEST_BLOCK_ID}/2025-06-09T12:00:00_artifact123_har.har"
         )
 
     def test_build_ai_suggestion_uri(self, s3_storage: S3Storage) -> None:
@@ -98,5 +98,5 @@ class TestS3StorageBuildURIs:
         )
         assert (
             uri
-            == f"s3://{TEST_BUCKET}/{settings.ENV}/{TEST_ORGANIZATION_ID}/ai_suggestions/{TEST_AI_SUGGESTION_ID}/2025-06-09T12:00:00_artifact123_screenshot_llm.png"
+            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/ai_suggestions/{TEST_AI_SUGGESTION_ID}/2025-06-09T12:00:00_artifact123_screenshot_llm.png"
         )
