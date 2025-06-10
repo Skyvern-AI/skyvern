@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import importlib.metadata
 import platform
 from typing import Any, Dict

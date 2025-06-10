@@ -38,34 +38,45 @@ class LocalStorage(BaseStorage):
         if not file_path.exists():
             return []
         try:
-            with open(file_path, "r") as f:
+            with open(file_path) as f:
                 return [line.strip() for line in f.readlines() if line.strip()]
         except Exception:
             return []
 
-    def build_log_uri(self, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType) -> str:
+    def build_log_uri(
+        self, *, organization_id: str, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType
+    ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"file://{self.artifact_path}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
 
-    def build_thought_uri(self, artifact_id: str, thought: Thought, artifact_type: ArtifactType) -> str:
+    def build_thought_uri(
+        self, *, organization_id: str, artifact_id: str, thought: Thought, artifact_type: ArtifactType
+    ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/tasks/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/tasks/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
-    def build_task_v2_uri(self, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType) -> str:
+    def build_task_v2_uri(
+        self, *, organization_id: str, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType
+    ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
-        self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType
+        self,
+        *,
+        organization_id: str,
+        artifact_id: str,
+        workflow_run_block: WorkflowRunBlock,
+        artifact_type: ArtifactType,
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_ai_suggestion_uri(
-        self, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
+        self, *, organization_id: str, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None
