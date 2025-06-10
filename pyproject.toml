@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern"
-version = "0.2.0"
+version = "0.2.1"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
@@ -99,6 +99,7 @@ build = "^1.2.2.post1"
 pandas = "^2.2.3"
 pre-commit = "^4.2.0"
 ruff = "^0.11.12"
+aiosqlite = "^0.21.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

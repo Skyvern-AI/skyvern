@@ -75,10 +75,10 @@ from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine
 from skyvern.services import run_service
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
-    ActionType,
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
@@ -2445,10 +2445,25 @@ class ForgeAgent:
                 step_retry=step.retry_index,
                 max_retries=settings.MAX_RETRIES_PER_STEP,
             )
+            browser_state = app.BROWSER_MANAGER.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
+            page = None
+            if browser_state is not None:
+                page = await browser_state.get_working_page()
+
+            failure_reason = await self.summary_failure_reason_for_max_retries(
+                organization=organization,
+                task=task,
+                step=step,
+                page=page,
+                max_retries=max_retries_per_step,
+            )
+
             await self.update_task(
                 task,
                 TaskStatus.failed,
-                failure_reason=f"Max retries per step ({max_retries_per_step}) exceeded",
+                failure_reason=(
+                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
+                ),
             )
             return None
         else:
@@ -2528,6 +2543,72 @@ class ForgeAgent:
             if steps_results:
                 last_step_result = steps_results[-1]
                 return f"Step {last_step_result['order']}: {last_step_result['actions_result']}"
+            return ""
+
+    async def summary_failure_reason_for_max_retries(
+        self,
+        organization: Organization,
+        task: Task,
+        step: Step,
+        page: Page | None,
+        max_retries: int,
+    ) -> str:
+        html = ""
+        screenshots: list[bytes] = []
+        steps_results = []
+        try:
+            steps = await app.DATABASE.get_task_steps(
+                task_id=task.task_id, organization_id=organization.organization_id
+            )
+            for step_cnt, cur_step in enumerate(steps[-max_retries:]):
+                if cur_step.output and cur_step.output.actions_and_results:
+                    action_result_summary: list[str] = []
+                    step_result: dict[str, Any] = {
+                        "order": step_cnt,
+                    }
+                    for action, action_results in cur_step.output.actions_and_results:
+                        if len(action_results) == 0:
+                            continue
+                        last_result = action_results[-1]
+                        if last_result.success:
+                            continue
+                        reason = last_result.exception_message or ""
+                        action_result_summary.append(
+                            f"{action.reasoning}(action_type={action.action_type}, result=failed, reason={reason})"
+                        )
+                    step_result["actions_result"] = action_result_summary
+                    steps_results.append(step_result)
+
+            if page is not None:
+                skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+                html = await skyvern_frame.get_content()
+                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url)
+
+            prompt = prompt_engine.load_prompt(
+                "summarize-max-retries-reason",
+                navigation_goal=task.navigation_goal,
+                navigation_payload=task.navigation_payload,
+                steps=steps_results,
+                page_html=html,
+                max_retries=max_retries,
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            )
+            json_response = await app.LLM_API_HANDLER(
+                prompt=prompt,
+                screenshots=screenshots,
+                step=step,
+                prompt_name="summarize-max-retries-reason",
+            )
+            return json_response.get("reasoning", "")
+        except Exception:
+            LOG.warning(
+                "Failed to summarize the failure reason for max retries",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            if steps_results:
+                last_step_result = steps_results[-1]
+                return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
             return ""
 
     async def handle_completed_step(
