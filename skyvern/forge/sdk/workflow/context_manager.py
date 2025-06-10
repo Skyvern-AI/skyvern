@@ -348,6 +348,9 @@ class WorkflowRunContext:
 
     async def register_onepassword_credential_parameter_value(self, parameter: OnePasswordCredentialParameter) -> None:
         token = os.getenv("OP_SERVICE_ACCOUNT_TOKEN")
+        if not token:
+            raise ValueError("OP_SERVICE_ACCOUNT_TOKEN environment variable not set")
+            
         client = await Client.authenticate(
             auth=token,
             integration_name="Skyvern",
