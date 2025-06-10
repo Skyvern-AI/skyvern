@@ -4,7 +4,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Self
 
 import structlog
-from onepassword.client import Client
+from onepassword.client import Client as OnePasswordClient
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -351,7 +351,7 @@ class WorkflowRunContext:
         if not token:
             raise ValueError("OP_SERVICE_ACCOUNT_TOKEN environment variable not set")
 
-        client = await Client.authenticate(
+        client = await OnePasswordClient.authenticate(
             auth=token,
             integration_name="Skyvern",
             integration_version="v1.0.0",

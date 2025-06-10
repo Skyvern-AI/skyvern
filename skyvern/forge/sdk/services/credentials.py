@@ -1,8 +1,9 @@
 import logging
-import os
 from typing import Optional
 
-from onepassword.client import Client
+from onepassword.client import Client as OnePasswordClient
+
+from skyvern.config import settings
 
 LOG = logging.getLogger(__name__)
 
@@ -18,11 +19,11 @@ async def resolve_secret(reference: str) -> str:
     Returns:
         The resolved secret value
     """
-    token = os.getenv("OP_SERVICE_ACCOUNT_TOKEN")
+    token = settings.OP_SERVICE_ACCOUNT_TOKEN
     if not token:
-        raise ValueError("OP_SERVICE_ACCOUNT_TOKEN environment variable not set")
+        raise ValueError("OP_SERVICE_ACCOUNT_TOKEN not configured in settings")
 
-    client = await Client.authenticate(
+    client = await OnePasswordClient.authenticate(
         auth=token,
         integration_name="Skyvern 1Password",
         integration_version="v1.0.0",
@@ -41,7 +42,7 @@ async def resolve_secret(reference: str) -> str:
     raise ValueError(f"Invalid 1Password reference format: {reference}")
 
 
-async def get_1password_item_details(client: Client, vault_id: str, item_id: str) -> str:
+async def get_1password_item_details(client: OnePasswordClient, vault_id: str, item_id: str) -> str:
     """
     Get details of a 1Password item.
 
@@ -60,9 +61,9 @@ async def get_1password_item_details(client: Client, vault_id: str, item_id: str
         result = {}
 
         # Debug: Log the structure of the item and fields
-        LOG.info(f"1Password item structure: {dir(item)}")
+        LOG.info(f"1Password item structure: {dir(item)}" + 
+                (f"\nFirst field structure: {dir(item.fields[0])}" if hasattr(item, "fields") and item.fields else ""))
         if hasattr(item, "fields") and item.fields:
-            LOG.info(f"First field structure: {dir(item.fields[0])}")
             LOG.info(
                 f"Field value example: {item.fields[0].value if hasattr(item.fields[0], 'value') else 'No value attribute'}"
             )
@@ -169,7 +170,7 @@ async def get_1password_item_details(client: Client, vault_id: str, item_id: str
         raise
 
 
-async def get_totp_for_item(client: Client, vault_id: str, item_id: str) -> Optional[str]:
+async def get_totp_for_item(client: OnePasswordClient, vault_id: str, item_id: str) -> Optional[str]:
     """
     Get the TOTP code for a 1Password item if available.
 
