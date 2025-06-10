@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern-langchain"
-version = "0.2.0"
+version = "0.2.1"
 description = ""
 authors = ["lawyzheng <lawy@skyvern.com>"]
 packages = [{ include = "skyvern_langchain" }]
