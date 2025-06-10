@@ -22,20 +22,15 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             PR_NUMBER=${{ inputs.pr_number }}
-            PR_INFO=$(gh pr view $PR_NUMBER --json number,headRefName,body,title,url,author)
-            BRANCH_NAME=$(echo "$PR_INFO" | jq -r .headRefName)
-            PR_BODY=$(echo "$PR_INFO" | jq -r .body)
-            PR_TITLE=$(echo "$PR_INFO" | jq -r .title)
-            PR_URL=$(echo "$PR_INFO" | jq -r .url)
-            PR_AUTHOR=$(echo "$PR_INFO" | jq -r .author.login)
           else
             PR_NUMBER=${{ github.event.pull_request.number }}
-            BRANCH_NAME=${{ github.event.pull_request.head.ref }}
-            PR_BODY=${{ github.event.pull_request.body }}
-            PR_TITLE=${{ github.event.pull_request.title }}
-            PR_URL=${{ github.event.pull_request.html_url }}
-            PR_AUTHOR=${{ github.event.pull_request.user.login }}
           fi
+          PR_INFO=$(gh pr view $PR_NUMBER --json number,headRefName,body,title,url,author)
+          BRANCH_NAME=$(echo "$PR_INFO" | jq -r .headRefName)
+          PR_BODY=$(echo "$PR_INFO" | jq -r .body)
+          PR_TITLE=$(echo "$PR_INFO" | jq -r .title)
+          PR_URL=$(echo "$PR_INFO" | jq -r .url)
+          PR_AUTHOR=$(echo "$PR_INFO" | jq -r .author.login)
           echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_OUTPUT
           PR_BODY_ESCAPED=$(echo "$PR_BODY" | jq -aRs .)
