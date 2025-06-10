@@ -5,9 +5,11 @@ Revises: d9ce23f5729c
 Create Date: 2025-06-10 03:48:07.456369+00:00
 
 """
+
 from typing import Sequence, Union
 
 import sqlalchemy as sa  # noqa: F401
+
 from alembic import op  # noqa: F401
 
 # revision identifiers, used by Alembic.
