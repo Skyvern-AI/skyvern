@@ -33,12 +33,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("onepassword_credential_parameter_id"),
     )
     op.create_index(
-        op.f("ix_onepassword_credential_parameters_onepassword_credential_parameter_id"),
-        "onepassword_credential_parameters",
-        ["onepassword_credential_parameter_id"],
-        unique=False,
-    )
-    op.create_index(
         op.f("ix_onepassword_credential_parameters_workflow_id"),
         "onepassword_credential_parameters",
         ["workflow_id"],
@@ -49,9 +43,5 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index(
         op.f("ix_onepassword_credential_parameters_workflow_id"), table_name="onepassword_credential_parameters"
-    )
-    op.drop_index(
-        op.f("ix_onepassword_credential_parameters_onepassword_credential_parameter_id"),
-        table_name="onepassword_credential_parameters",
     )
     op.drop_table("onepassword_credential_parameters")
