@@ -35,12 +35,10 @@ class AsyncAWSClient:
         aws_secret_access_key: str | None = None,
         region_name: str | None = None,
     ) -> None:
-        self.aws_access_key_id = aws_access_key_id
-        self.aws_secret_access_key = aws_secret_access_key
         self.region_name = region_name or settings.AWS_REGION
         self.session = aioboto3.Session(
-            aws_access_key_id=self.aws_access_key_id,
-            aws_secret_access_key=self.aws_secret_access_key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
         )
 
     async def get_secret(self, secret_name: str) -> str | None:
@@ -255,7 +253,7 @@ class AsyncAWSClient:
             return await client.deregister_task_definition(taskDefinition=task_definition)
 
 
-class S3Uri(object):
+class S3Uri:
     # From: https://stackoverflow.com/questions/42641315/s3-urls-get-bucket-name-and-path
     """
     >>> s = S3Uri("s3://bucket/hello/world")

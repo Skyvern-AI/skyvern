@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
 
 import structlog
 from playwright._impl._errors import TargetClosedError
@@ -22,7 +21,7 @@ class BrowserSession:
 
 class PersistentSessionsManager:
     instance: PersistentSessionsManager | None = None
-    _browser_sessions: Dict[str, BrowserSession] = dict()
+    _browser_sessions: dict[str, BrowserSession] = dict()
     database: AgentDB
 
     def __new__(cls, database: AgentDB) -> PersistentSessionsManager:
@@ -82,7 +81,7 @@ class PersistentSessionsManager:
             organization_id=organization_id,
         )
 
-    async def get_network_info(self, session_id: str) -> Tuple[Optional[int], Optional[str]]:
+    async def get_network_info(self, session_id: str) -> tuple[int | None, str | None]:
         """Returns cdp port and ip address of the browser session"""
         browser_session = self._browser_sessions.get(session_id)
         if browser_session:

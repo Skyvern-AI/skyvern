@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from openai.types.responses.response import Response as OpenAIResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from skyvern.config import settings
 from skyvern.webeye.actions.actions import Action, DecisiveAction, UserDefinedError
@@ -43,8 +43,7 @@ class DetailedAgentStepOutput(BaseModel):
     step_exception: str | None = None
     cua_response: OpenAIResponse | None = None
 
-    class Config:
-        exclude = ["scraped_page", "extract_action_prompt"]
+    model_config = ConfigDict(exclude=["scraped_page", "extract_action_prompt"])
 
     def __repr__(self) -> str:
         if settings.DEBUG_MODE:
