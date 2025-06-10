@@ -35,9 +35,9 @@ class S3Storage(BaseStorage):
         self.async_client = AsyncAWSClient()
         self.bucket = bucket or settings.AWS_S3_BUCKET_ARTIFACTS
 
-    def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
+    def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
         uri = f"s3://{self.bucket}/{settings.ENV}/global_workflows.txt"
