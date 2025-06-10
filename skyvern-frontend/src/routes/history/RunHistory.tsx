@@ -21,7 +21,7 @@ import {
 import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 function isTask(run: Task | WorkflowRunApiResponse): run is Task {
@@ -33,7 +33,17 @@ function RunHistory() {
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const { data: runs, isFetching } = useRunsQuery({ page, statusFilters });
+  const PAGE_SIZE = 10;
+  const isLastPage = !isFetching && !!runs && runs.length < PAGE_SIZE;
   const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!isFetching && page > 1 && runs?.length === 0) {
+      const params = new URLSearchParams();
+      params.set("page", String(Math.max(1, page - 1)));
+      setSearchParams(params, { replace: true });
+    }
+  }, [page, runs, isFetching, setSearchParams]);
 
   function handleNavigate(event: React.MouseEvent, path: string) {
     if (event.ctrlKey || event.metaKey) {
@@ -171,7 +181,11 @@ function RunHistory() {
             </PaginationItem>
             <PaginationItem>
               <PaginationNext
+                className={cn({ "cursor-not-allowed": isLastPage })}
                 onClick={() => {
+                  if (isLastPage) {
+                    return;
+                  }
                   const params = new URLSearchParams();
                   params.set("page", String(page + 1));
                   setSearchParams(params, { replace: true });
