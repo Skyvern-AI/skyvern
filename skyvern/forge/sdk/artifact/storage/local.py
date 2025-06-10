@@ -123,7 +123,7 @@ class LocalStorage(BaseStorage):
         base_dir = Path(get_skyvern_temp_dir()) / organization_id
         file_path = base_dir / file_name
         normalized_path = file_path.resolve()
-        if not str(normalized_path).startswith(str(base_dir.resolve())):
+        if not normalized_path.is_relative_to(base_dir.resolve()):
             LOG.warning("Attempted access to an invalid file path", file_path=file_path)
             return None
         try:
