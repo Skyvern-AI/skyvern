@@ -854,6 +854,12 @@ class ForgeAgent:
                     scraped_page=scraped_page,
                     llm_caller=llm_caller,
                 )
+            elif engine == RunEngine.ui_tars:
+                actions = await self._generate_ui_tars_actions(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                )
             else:
                 using_cached_action_plan = False
                 if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
@@ -1478,6 +1484,69 @@ class ForgeAgent:
         )
         return actions
 
+    async def _generate_ui_tars_actions(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+    ) -> list[Action]:
+        """Generate actions using UI-TARS (Seed1.5-VL) model."""
+        from skyvern.config import settings
+        from skyvern.forge.sdk.api.llm.ui_tars_client import ui_tars_manager
+        
+        LOG.info(
+            "UI-TARS action generation starts",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            step_order=step.order,
+        )
+        
+        try:
+            # Check if UI-TARS is enabled and configured
+            if not settings.ENABLE_UI_TARS or not settings.UI_TARS_API_KEY:
+                raise ValueError("UI-TARS is not properly configured")
+            
+            # Get UI-TARS client for this task
+            ui_tars_client = ui_tars_manager.get_client(
+                task_id=task.task_id,
+                api_key=settings.UI_TARS_API_KEY,
+                api_base=settings.UI_TARS_API_BASE,
+                model=settings.UI_TARS_MODEL,
+            )
+            
+            # Generate actions using the consolidated client
+            actions = await ui_tars_client.generate_actions(task, step, scraped_page)
+            
+            LOG.info(
+                "UI-TARS action generation completed",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                actions_count=len(actions),
+            )
+            
+            return actions
+            
+        except Exception as e:
+            LOG.error(
+                "UI-TARS action generation failed",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                error=str(e),
+                exc_info=True,
+            )
+            # Return a wait action as fallback
+            from skyvern.webeye.actions.actions import WaitAction
+            return [WaitAction(
+                reasoning=f"UI-TARS action generation failed: {str(e)}",
+                seconds=5,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                action_order=0,
+            )]
+    
     async def complete_verify(
         self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteVerifyResult:
@@ -2095,6 +2164,15 @@ class ForgeAgent:
             return
 
         await self.async_operation_pool.remove_task(task.task_id)
+        
+        # Clean up UI-TARS client if used
+        try:
+            from skyvern.forge.sdk.api.llm.ui_tars_client import ui_tars_manager
+            ui_tars_manager.remove_client(task.task_id)
+        except Exception:
+            # UI-TARS cleanup is optional
+            pass
+        
         await self.cleanup_browser_and_create_artifacts(
             close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
         )

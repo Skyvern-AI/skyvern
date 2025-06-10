@@ -100,6 +100,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
             engine = RunEngine.openai_cua
         elif run_obj and run_obj.task_run_type == RunType.anthropic_cua:
             engine = RunEngine.anthropic_cua
+        elif run_obj and run_obj.task_run_type == RunType.ui_tars:
+            engine = RunEngine.ui_tars
 
         context: SkyvernContext = skyvern_context.ensure_context()
         context.task_id = task.task_id
