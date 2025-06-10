@@ -151,6 +151,7 @@ class UITarsClient:
             
             # Generate response using OpenAI API
             response_content = await self._call_api()
+            print(f"Response content: {response_content}")
             
             # Add response to history
             self.add_assistant_response(response_content)
@@ -158,36 +159,24 @@ class UITarsClient:
             image = Image.open(BytesIO(scraped_page.screenshots[0]))
             original_image_width, original_image_height = image.size
             model_type = "doubao"  # Use doubao model type for UI-TARS
-            # Use the official UI-TARS parser to get structured actions
-            try:
-                parsed_actions = self.parse_action_to_structure_output(
-                    response_content, 
-                    factor=1000,
-                    origin_resized_height=original_image_height,
-                    origin_resized_width=original_image_width,
-                    model_type=model_type
-                )
-                
-                LOG.info(f"UI-TARS parsed actions: {parsed_actions}")
-                
-                # Convert parsed actions to Skyvern action objects
-                actions = self._convert_parsed_actions_to_skyvern_actions(parsed_actions, task, step, original_image_width, original_image_height)
-                
-            except Exception as parse_error:
-                LOG.error(f"UI-TARS parser failed, falling back to basic parsing", error=str(parse_error), response=response_content)
-                # Fallback to basic response parsing if UI-TARS parser fails
-                actions = self._parse_response_to_actions(response_content, task, step)
             
-            LOG.info(
-                "UI-TARS action generation completed",
-                task_id=self.task_id,
-                step_id=step.step_id,
-                actions_count=len(actions),
-                response_content=response_content[:200],  # First 200 chars for logging
+            # Use the official UI-TARS parser to get structured actions
+            parsed_actions = self.parse_action_to_structure_output(
+                response_content, 
+                factor=1000,
+                origin_resized_height=original_image_height,
+                origin_resized_width=original_image_width,
+                model_type=model_type
             )
             
-            return actions
+            # LOG.info(f"UI-TARS parsed actions: {parsed_actions}")
+            print(f"UI-TARS parsed actions: {parsed_actions}")
             
+            # Convert parsed actions to Skyvern action objects
+            actions = self._convert_parsed_actions_to_skyvern_actions(parsed_actions, task, step, original_image_width, original_image_height)
+            print(f"Skyvern actions: {actions}")
+            return actions
+
         except Exception as e:
             LOG.error(
                 "UI-TARS action generation failed",
