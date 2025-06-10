@@ -95,7 +95,7 @@ function WorkflowParametersPanel() {
                 });
               }}
             >
-              Credential Parameter
+              Login Credential Parameter
             </DropdownMenuItem>
             <DropdownMenuItem
               onClick={() => {
