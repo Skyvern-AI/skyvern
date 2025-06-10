@@ -73,10 +73,10 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.schemas.runs import CUA_RUN_TYPES
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
-    ActionType,
     CheckboxAction,
     ClickAction,
     InputOrSelectContext,

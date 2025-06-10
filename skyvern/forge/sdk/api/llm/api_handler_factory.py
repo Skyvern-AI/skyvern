@@ -145,7 +145,9 @@ class LLMAPIHandlerFactory:
                 ai_suggestion=ai_suggestion,
             )
             try:
-                response = await router.acompletion(model=main_model_group, messages=messages, **parameters)
+                response = await router.acompletion(
+                    model=main_model_group, messages=messages, timeout=settings.LLM_CONFIG_TIMEOUT, **parameters
+                )
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(local_llm_key) from e
             except litellm.exceptions.ContextWindowExceededError as e:
