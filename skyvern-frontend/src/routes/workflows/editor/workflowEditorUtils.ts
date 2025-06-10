@@ -1614,89 +1614,99 @@ function getAvailableOutputParameterKeys(
 function convertParametersToParameterYAML(
   parameters: Array<Exclude<Parameter, OutputParameter>>,
 ): Array<ParameterYAML> {
-  return parameters.map((parameter) => {
-    const base = {
-      key: parameter.key,
-      description: parameter.description,
-      parameter_type: parameter.parameter_type,
-    };
-    switch (parameter.parameter_type) {
-      case WorkflowParameterTypes.AWS_Secret: {
-        return {
-          ...base,
-          parameter_type: WorkflowParameterTypes.AWS_Secret,
-          aws_key: parameter.aws_key,
-        };
+  return parameters
+    .map((parameter) => {
+      const base = {
+        key: parameter.key,
+        description: parameter.description,
+        parameter_type: parameter.parameter_type,
+      };
+      switch (parameter.parameter_type) {
+        case WorkflowParameterTypes.AWS_Secret: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.AWS_Secret,
+            aws_key: parameter.aws_key,
+          };
+        }
+        case WorkflowParameterTypes.Bitwarden_Login_Credential: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
+            bitwarden_collection_id: parameter.bitwarden_collection_id,
+            bitwarden_item_id: parameter.bitwarden_item_id,
+            url_parameter_key: parameter.url_parameter_key,
+            bitwarden_client_id_aws_secret_key:
+              parameter.bitwarden_client_id_aws_secret_key,
+            bitwarden_client_secret_aws_secret_key:
+              parameter.bitwarden_client_secret_aws_secret_key,
+            bitwarden_master_password_aws_secret_key:
+              parameter.bitwarden_master_password_aws_secret_key,
+          };
+        }
+        case WorkflowParameterTypes.Bitwarden_Sensitive_Information: {
+          return {
+            ...base,
+            parameter_type:
+              WorkflowParameterTypes.Bitwarden_Sensitive_Information,
+            bitwarden_collection_id: parameter.bitwarden_collection_id,
+            bitwarden_identity_key: parameter.bitwarden_identity_key,
+            bitwarden_identity_fields: parameter.bitwarden_identity_fields,
+            bitwarden_client_id_aws_secret_key:
+              parameter.bitwarden_client_id_aws_secret_key,
+            bitwarden_client_secret_aws_secret_key:
+              parameter.bitwarden_client_secret_aws_secret_key,
+            bitwarden_master_password_aws_secret_key:
+              parameter.bitwarden_master_password_aws_secret_key,
+          };
+        }
+        case WorkflowParameterTypes.Bitwarden_Credit_Card_Data: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
+            bitwarden_collection_id: parameter.bitwarden_collection_id,
+            bitwarden_item_id: parameter.bitwarden_item_id,
+            bitwarden_client_id_aws_secret_key:
+              parameter.bitwarden_client_id_aws_secret_key,
+            bitwarden_client_secret_aws_secret_key:
+              parameter.bitwarden_client_secret_aws_secret_key,
+            bitwarden_master_password_aws_secret_key:
+              parameter.bitwarden_master_password_aws_secret_key,
+          };
+        }
+        case WorkflowParameterTypes.Context: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Context,
+            source_parameter_key: parameter.source.key,
+          };
+        }
+        case WorkflowParameterTypes.Workflow: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Workflow,
+            workflow_parameter_type: parameter.workflow_parameter_type,
+            default_value: parameter.default_value,
+          };
+        }
+        case WorkflowParameterTypes.Credential: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Credential,
+            credential_id: parameter.credential_id,
+          };
+        }
+        case WorkflowParameterTypes.OnePassword: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.OnePassword,
+            vault_id: parameter.vault_id,
+            item_id: parameter.item_id,
+          };
+        }
       }
-      case WorkflowParameterTypes.Bitwarden_Login_Credential: {
-        return {
-          ...base,
-          parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
-          bitwarden_collection_id: parameter.bitwarden_collection_id,
-          bitwarden_item_id: parameter.bitwarden_item_id,
-          url_parameter_key: parameter.url_parameter_key,
-          bitwarden_client_id_aws_secret_key:
-            parameter.bitwarden_client_id_aws_secret_key,
-          bitwarden_client_secret_aws_secret_key:
-            parameter.bitwarden_client_secret_aws_secret_key,
-          bitwarden_master_password_aws_secret_key:
-            parameter.bitwarden_master_password_aws_secret_key,
-        };
-      }
-      case WorkflowParameterTypes.Bitwarden_Sensitive_Information: {
-        return {
-          ...base,
-          parameter_type:
-            WorkflowParameterTypes.Bitwarden_Sensitive_Information,
-          bitwarden_collection_id: parameter.bitwarden_collection_id,
-          bitwarden_identity_key: parameter.bitwarden_identity_key,
-          bitwarden_identity_fields: parameter.bitwarden_identity_fields,
-          bitwarden_client_id_aws_secret_key:
-            parameter.bitwarden_client_id_aws_secret_key,
-          bitwarden_client_secret_aws_secret_key:
-            parameter.bitwarden_client_secret_aws_secret_key,
-          bitwarden_master_password_aws_secret_key:
-            parameter.bitwarden_master_password_aws_secret_key,
-        };
-      }
-      case WorkflowParameterTypes.Bitwarden_Credit_Card_Data: {
-        return {
-          ...base,
-          parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
-          bitwarden_collection_id: parameter.bitwarden_collection_id,
-          bitwarden_item_id: parameter.bitwarden_item_id,
-          bitwarden_client_id_aws_secret_key:
-            parameter.bitwarden_client_id_aws_secret_key,
-          bitwarden_client_secret_aws_secret_key:
-            parameter.bitwarden_client_secret_aws_secret_key,
-          bitwarden_master_password_aws_secret_key:
-            parameter.bitwarden_master_password_aws_secret_key,
-        };
-      }
-      case WorkflowParameterTypes.Context: {
-        return {
-          ...base,
-          parameter_type: WorkflowParameterTypes.Context,
-          source_parameter_key: parameter.source.key,
-        };
-      }
-      case WorkflowParameterTypes.Workflow: {
-        return {
-          ...base,
-          parameter_type: WorkflowParameterTypes.Workflow,
-          workflow_parameter_type: parameter.workflow_parameter_type,
-          default_value: parameter.default_value,
-        };
-      }
-      case WorkflowParameterTypes.Credential: {
-        return {
-          ...base,
-          parameter_type: WorkflowParameterTypes.Credential,
-          credential_id: parameter.credential_id,
-        };
-      }
-    }
-  });
+    })
+    .filter(Boolean);
 }
 
 function convertBlocksToBlockYAML(
