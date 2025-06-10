@@ -40,7 +40,7 @@ class S3Storage(BaseStorage):
         return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
-        uri = f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/global_workflows.txt"
+        uri = f"s3://{self.bucket}/{settings.ENV}/global_workflows.txt"
         data = await self.async_client.download_file(uri, log_exception=False)
         if not data:
             return []
