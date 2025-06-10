@@ -99,6 +99,7 @@ build = "^1.2.2.post1"
 pandas = "^2.2.3"
 pre-commit = "^4.2.0"
 ruff = "^0.11.12"
+aiosqlite = "^0.21.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
