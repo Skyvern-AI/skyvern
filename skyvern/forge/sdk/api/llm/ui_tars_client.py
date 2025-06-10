@@ -146,8 +146,12 @@ class UITarsClient:
             if not scraped_page.screenshots:
                 raise ValueError("No screenshots available for UI-TARS")
             
-            screenshot_b64 = base64.b64encode(scraped_page.screenshots[0]).decode()
-            self.add_screenshot_to_history(screenshot_b64)
+            current_screenshot = scraped_page.screenshots[0]
+            image = Image.open(BytesIO(current_screenshot))
+            image_format = image.format.lower() if image.format else "png"
+            
+            screenshot_b64 = base64.b64encode(current_screenshot).decode()
+            self.add_screenshot_to_history(screenshot_b64, image_format)
             
             # Generate response using OpenAI API
             response_content = await self._call_api()
@@ -156,8 +160,9 @@ class UITarsClient:
             # Add response to history
             self.add_assistant_response(response_content)
             
-            image = Image.open(BytesIO(scraped_page.screenshots[0]))
+            # Get image dimensions for coordinate conversion
             original_image_width, original_image_height = image.size
+            print(f"Original image size: {original_image_width}x{original_image_height}")
             model_type = "doubao"  # Use doubao model type for UI-TARS
             
             # Use the official UI-TARS parser to get structured actions
@@ -592,6 +597,7 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
 
         if "<point>" in text:
             text = self.convert_point_to_coordinates(text)
+            print(f"Converted text: {text}")
         if "start_point=" in text:
             text = text.replace("start_point=", "start_box=")
         if "end_point=" in text:
