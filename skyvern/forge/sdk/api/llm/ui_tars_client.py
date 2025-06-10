@@ -155,15 +155,21 @@ class UITarsClient:
             
             # Generate response using OpenAI API
             response_content = await self._call_api()
-            print(f"Response content: {response_content}")
+            LOG.debug("UI-TARS response received", task_id=self.task_id, response_length=len(response_content))
+            
+            # Validate response format
+            if not response_content or not response_content.strip():
+                raise ValueError("Empty response from UI-TARS API")
+            
+            if "Action:" not in response_content:
+                raise ValueError(f"Invalid UI-TARS response format - missing 'Action:' section: {response_content[:200]}...")
             
             # Add response to history
             self.add_assistant_response(response_content)
             
             # Get image dimensions for coordinate conversion
             original_image_width, original_image_height = image.size
-            print(f"Original image size: {original_image_width}x{original_image_height}")
-            model_type = "doubao"  # Use doubao model type for UI-TARS
+            LOG.debug("Image dimensions", width=original_image_width, height=original_image_height)
             
             # Use the official UI-TARS parser to get structured actions
             parsed_actions = self.parse_action_to_structure_output(
@@ -171,15 +177,19 @@ class UITarsClient:
                 factor=1000,
                 origin_resized_height=original_image_height,
                 origin_resized_width=original_image_width,
-                model_type=model_type
+                model_type="doubao"
             )
             
-            # LOG.info(f"UI-TARS parsed actions: {parsed_actions}")
-            print(f"UI-TARS parsed actions: {parsed_actions}")
+            LOG.info("UI-TARS parsed actions", task_id=self.task_id, parsed_actions=parsed_actions)
             
             # Convert parsed actions to Skyvern action objects
             actions = self._convert_parsed_actions_to_skyvern_actions(parsed_actions, task, step, original_image_width, original_image_height)
-            print(f"Skyvern actions: {actions}")
+            LOG.info("Converted to Skyvern actions", task_id=self.task_id, actions=actions)
+            
+            if not actions:
+                LOG.warning("No valid actions generated from UI-TARS response", 
+                           task_id=self.task_id, response_preview=response_content[:200])
+            
             return actions
 
         except Exception as e:
@@ -274,7 +284,11 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                 thought = parsed_action.get("thought", "")
                 
                 if action_type == "click":
-                    x, y = self._extract_coordinates_from_box(action_inputs.get("start_box", ""), image_width, image_height)
+                    start_box = action_inputs.get("start_box", "")
+                    if not start_box:
+                        LOG.warning("Click action missing start_box coordinates", task_id=self.task_id)
+                        continue
+                    x, y = self._extract_coordinates_from_box(start_box, image_width, image_height)
                     action = ClickAction(
                         element_id="",
                         x=x,
@@ -290,7 +304,11 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                         action_order=len(actions),
                     )
                 elif action_type == "left_double":
-                    x, y = self._extract_coordinates_from_box(action_inputs.get("start_box", ""), image_width, image_height)
+                    start_box = action_inputs.get("start_box", "")
+                    if not start_box:
+                        LOG.warning("Left double click action missing start_box coordinates", task_id=self.task_id)
+                        continue
+                    x, y = self._extract_coordinates_from_box(start_box, image_width, image_height)
                     action = ClickAction(
                         element_id="",
                         x=x,
@@ -308,7 +326,11 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                         action_order=len(actions),
                     )
                 elif action_type == "right_single":
-                    x, y = self._extract_coordinates_from_box(action_inputs.get("start_box", ""), image_width, image_height)
+                    start_box = action_inputs.get("start_box", "")
+                    if not start_box:
+                        LOG.warning("Right click action missing start_box coordinates", task_id=self.task_id)
+                        continue
+                    x, y = self._extract_coordinates_from_box(start_box, image_width, image_height)
                     action = ClickAction(
                         element_id="",
                         x=x,
@@ -326,12 +348,17 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                     )
                 elif action_type == "type":
                     content = action_inputs.get("content", "")
+                    if not content:
+                        LOG.warning("Type action missing content", task_id=self.task_id)
+                        continue
+                    # Truncate long content for response message
+                    display_content = content[:50] + "..." if len(content) > 50 else content
                     action = InputTextAction(
                         element_id="",
                         text=content,
                         reasoning=thought,
                         intention=thought,
-                        response=f"Type: {content}",
+                        response=f"Type: {display_content}",
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
                         task_id=task.task_id,
@@ -340,8 +367,14 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                         action_order=len(actions),
                     )
                 elif action_type == "drag" or action_type == "select":
-                    start_x, start_y = self._extract_coordinates_from_box(action_inputs.get("start_box", ""), image_width, image_height)
-                    end_x, end_y = self._extract_coordinates_from_box(action_inputs.get("end_box", ""), image_width, image_height)
+                    start_box = action_inputs.get("start_box", "")
+                    end_box = action_inputs.get("end_box", "")
+                    if not start_box or not end_box:
+                        LOG.warning("Drag action missing start_box or end_box coordinates", 
+                                   task_id=self.task_id, start_box=start_box, end_box=end_box)
+                        continue
+                    start_x, start_y = self._extract_coordinates_from_box(start_box, image_width, image_height)
+                    end_x, end_y = self._extract_coordinates_from_box(end_box, image_width, image_height)
                     action = DragAction(
                         start_x=start_x,
                         start_y=start_y,
@@ -358,9 +391,15 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                     )
                 elif action_type == "hotkey":
                     key = action_inputs.get("key", action_inputs.get("hotkey", ""))
+                    if not key:
+                        LOG.warning("Hotkey action missing key combination", task_id=self.task_id)
+                        continue
                     # Parse space-separated hotkey string into individual keys
                     # UI-TARS format: "ctrl shift y" -> ["ctrl", "shift", "y"]
                     keys = key.split() if key else []
+                    if not keys:
+                        LOG.warning("Hotkey action has empty key list", task_id=self.task_id, key=key)
+                        continue
                     action = KeypressAction(
                         keys=keys,
                         reasoning=thought,
@@ -375,7 +414,14 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                     )
                 elif action_type == "scroll":
                     direction = action_inputs.get("direction", "down").lower()
-                    x, y = self._extract_coordinates_from_box(action_inputs.get("start_box", ""), image_width, image_height)
+                    start_box = action_inputs.get("start_box", "")
+                    if not start_box:
+                        LOG.warning("Scroll action missing start_box coordinates", task_id=self.task_id)
+                        continue
+                    if direction not in ["down", "up", "left", "right"]:
+                        LOG.warning("Invalid scroll direction", task_id=self.task_id, direction=direction)
+                        direction = "down"  # Default fallback
+                    x, y = self._extract_coordinates_from_box(start_box, image_width, image_height)
                     
                     # Convert direction to scroll amounts
                     scroll_amount = 300  # Default scroll amount in pixels
@@ -417,6 +463,8 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                         action_order=len(actions),
                     )
                 elif action_type == "finished":
+                    # Extract content from finished action if available
+                    finished_content = action_inputs.get("content", "")
                     action = CompleteAction(
                         reasoning=thought,
                         data_extraction_goal=task.data_extraction_goal,
@@ -445,11 +493,15 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
         """Extract coordinates from UI-TARS box format."""
         try:
             if not box_str:
-                return 0, 0
+                LOG.warning("Empty box string provided", task_id=self.task_id)
+                return image_width // 2, image_height // 2
             
             # Parse the box coordinates from the string format like "[0.5, 0.3, 0.5, 0.3]"
-            # The UI-TARS parser should return string representation of list of floats
-            coords = ast.literal_eval(box_str)  # This should be a list of float values (relative coordinates)
+            # The UI-TARS parser should return string representation of list of floats (relative coordinates)
+            coords = ast.literal_eval(box_str)
+            
+            if not isinstance(coords, (list, tuple)):
+                raise ValueError(f"Expected list/tuple, got {type(coords)}: {box_str}")
             
             if len(coords) == 4:
                 x1, y1, x2, y2 = coords
@@ -461,7 +513,17 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
                 x = int(x1 * image_width)
                 y = int(y1 * image_height)
             else:
-                raise ValueError(f"Invalid coordinate format: {box_str}")
+                raise ValueError(f"Expected 2 or 4 coordinates, got {len(coords)}: {box_str}")
+            
+            # Validate coordinate ranges for relative coordinates
+            if len(coords) == 4:
+                if not all(0 <= coord <= 1 for coord in coords):
+                    LOG.warning("Relative coordinates outside expected range [0,1]", 
+                               task_id=self.task_id, coords=coords)
+            elif len(coords) == 2:
+                if not (0 <= x1 <= 1 and 0 <= y1 <= 1):
+                    LOG.warning("Relative coordinates outside expected range [0,1]", 
+                               task_id=self.task_id, coords=coords)
             
             # Ensure coordinates are within image bounds
             x = max(0, min(x, image_width - 1))
@@ -470,7 +532,8 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
             return x, y
             
         except Exception as e:
-            LOG.error(f"Failed to extract coordinates from box: {box_str}", error=str(e))
+            LOG.error("Failed to extract coordinates from box", 
+                     task_id=self.task_id, box_str=box_str, error=str(e), exc_info=True)
             # Return center of image as fallback
             return image_width // 2, image_height // 2
                 
@@ -529,7 +592,7 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
             return {'function': func_name, 'args': kwargs}
 
         except Exception as e:
-            print(f"Failed to parse action '{action_str}': {e}")
+            LOG.error(f"Failed to parse action '{action_str}': {e}")
             return None
 
 
@@ -597,7 +660,7 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
 
         if "<point>" in text:
             text = self.convert_point_to_coordinates(text)
-            print(f"Converted text: {text}")
+            LOG.debug("Converted point coordinates in text", task_id=self.task_id)
         if "start_point=" in text:
             text = text.replace("start_point=", "start_box=")
         if "end_point=" in text:
@@ -669,7 +732,7 @@ finished(content='xxx') # Use escape characters \\', \\", and \\n in content par
         actions = []
         for action_instance, raw_str in zip(parsed_actions, all_action):
             if action_instance == None:
-                print(f"Action can't parse: {raw_str}")
+                LOG.error(f"Action can't parse: {raw_str}")
                 raise ValueError(f"Action can't parse: {raw_str}")
             action_type = action_instance["function"]
             params = action_instance["args"]
