@@ -18,6 +18,7 @@ class ParameterType(StrEnum):
     BITWARDEN_LOGIN_CREDENTIAL = "bitwarden_login_credential"
     BITWARDEN_SENSITIVE_INFORMATION = "bitwarden_sensitive_information"
     BITWARDEN_CREDIT_CARD_DATA = "bitwarden_credit_card_data"
+    ONEPASSWORD = "onepassword"
     OUTPUT = "output"
     CREDENTIAL = "credential"
 
@@ -127,6 +128,19 @@ class BitwardenCreditCardDataParameter(Parameter):
     deleted_at: datetime | None = None
 
 
+class OnePasswordCredentialParameter(Parameter):
+    parameter_type: Literal[ParameterType.ONEPASSWORD] = ParameterType.ONEPASSWORD
+
+    onepassword_credential_parameter_id: str
+    workflow_id: str
+    vault_id: str
+    item_id: str
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
 class WorkflowParameterType(StrEnum):
     STRING = "string"
     INTEGER = "integer"
@@ -203,6 +217,7 @@ ParameterSubclasses = Union[
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     BitwardenCreditCardDataParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     CredentialParameter,
 ]

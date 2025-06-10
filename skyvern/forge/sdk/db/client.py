@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenSensitiveInformationParameterModel,
     CredentialModel,
     CredentialParameterModel,
+    OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
     OrganizationModel,
@@ -79,6 +80,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -1865,6 +1867,32 @@ class AgentDB:
                 created_at=credential_parameter.created_at,
                 modified_at=credential_parameter.modified_at,
                 deleted_at=credential_parameter.deleted_at,
+            )
+
+    async def create_onepassword_credential_parameter(
+        self, workflow_id: str, key: str, vault_id: str, item_id: str, description: str | None = None
+    ) -> OnePasswordCredentialParameter:
+        async with self.Session() as session:
+            parameter = OnePasswordCredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                vault_id=vault_id,
+                item_id=item_id,
+            )
+            session.add(parameter)
+            await session.commit()
+            await session.refresh(parameter)
+            return OnePasswordCredentialParameter(
+                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_id=parameter.vault_id,
+                item_id=parameter.item_id,
+                created_at=parameter.created_at,
+                modified_at=parameter.modified_at,
+                deleted_at=parameter.deleted_at,
             )
 
     async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
