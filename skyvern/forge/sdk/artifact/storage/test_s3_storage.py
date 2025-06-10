@@ -31,10 +31,15 @@ def s3_storage() -> S3Storage:
 class TestS3StorageBuildURIs:
     def test_build_uri(self, s3_storage: S3Storage) -> None:
         step = create_fake_step(TEST_STEP_ID)
-        uri = s3_storage.build_uri("artifact123", step, ArtifactType.LLM_PROMPT)
+        uri = s3_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id="artifact123",
+            step=step,
+            artifact_type=ArtifactType.LLM_PROMPT,
+        )
         assert (
             uri
-            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_TASK_ID}/01_0_{TEST_STEP_ID}/2025-06-09T12:00:00_artifact123_llm_prompt.txt"
+            == f"s3://{TEST_BUCKET}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/{TEST_TASK_ID}/01_0_{TEST_STEP_ID}/2025-06-09T12:00:00_artifact123_llm_prompt.txt"
         )
 
     def test_build_log_uri(self, s3_storage: S3Storage) -> None:

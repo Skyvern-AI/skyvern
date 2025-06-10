@@ -39,7 +39,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
 
 class BaseStorage(ABC):
     @abstractmethod
-    def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
+    def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         pass
 
     @abstractmethod
