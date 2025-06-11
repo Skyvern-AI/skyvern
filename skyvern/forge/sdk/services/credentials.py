@@ -1,12 +1,21 @@
 import json
 import logging
-from typing import Optional
+import os
+from enum import Enum, auto
+from typing import Any, Dict, Optional
+
+from strenum import StrEnum
 
 from onepassword.client import Client as OnePasswordClient
 
 from skyvern.forge.sdk.config import settings
 
 LOG = logging.getLogger(__name__)
+
+
+class OnePasswordConstants(StrEnum):
+    """Constants for 1Password integration."""
+    TOTP = "OP_TOTP"  # Special value to indicate a TOTP code
 
 
 async def resolve_secret(vault_id: str, item_id: str) -> str:

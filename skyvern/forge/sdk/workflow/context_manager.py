@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Self, Tuple
 
 import structlog
 from onepassword.client import Client as OnePasswordClient
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -425,10 +426,17 @@ class WorkflowRunContext:
         try:
             totp = await client.items.get_totp(parameter.vault_id, parameter.item_id)
             if totp:
+                # Store the actual TOTP value in a separate secret for internal use
                 random_secret_id = self.generate_random_secret_id()
+                totp_value_id = f"{random_secret_id}_totp_value"
+                self.secrets[totp_value_id] = totp
+                
+                # Store the special TOTP constant that the agent will recognize
                 totp_secret_id = f"{random_secret_id}_totp"
-                self.secrets[totp_secret_id] = totp
+                self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 self.values[parameter.key]["totp"] = totp_secret_id
+                
+                LOG.info(f"TOTP code available for item {parameter.item_id}")
         except Exception as e:
             # TOTP might not be available for this item, just log and continue
             LOG.debug(f"TOTP not available for item {parameter.item_id}: {str(e)}")
