@@ -59,6 +59,7 @@ from skyvern.forge.sdk.api.files import (
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller, LLMCallerManager
+from skyvern.forge.sdk.api.llm.ui_tars_client import ui_tars_manager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
@@ -1491,7 +1492,6 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
     ) -> list[Action]:
         """Generate actions using UI-TARS (Seed1.5-VL) model."""
-        from skyvern.forge.sdk.api.llm.ui_tars_client import ui_tars_manager
         
         LOG.info(
             "UI-TARS action generation starts",
