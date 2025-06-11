@@ -31,8 +31,8 @@ LOG = structlog.get_logger()
 class S3Storage(BaseStorage):
     _PATH_VERSION = "v1"
 
-    def __init__(self, bucket: str | None = None) -> None:
-        self.async_client = AsyncAWSClient()
+    def __init__(self, bucket: str | None = None, endpoint_url: str | None = None) -> None:
+        self.async_client = AsyncAWSClient(endpoint_url=endpoint_url)
         self.bucket = bucket or settings.AWS_S3_BUCKET_ARTIFACTS
 
     def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
