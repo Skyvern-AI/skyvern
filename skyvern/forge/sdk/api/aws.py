@@ -37,21 +37,25 @@ class AsyncAWSClient:
         aws_access_key_id: str | None = None,
         aws_secret_access_key: str | None = None,
         region_name: str | None = None,
+        endpoint_url: str | None = None,
     ) -> None:
         self.region_name = region_name or settings.AWS_REGION
+        self._endpoint_url = endpoint_url
         self.session = aioboto3.Session(
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
         )
 
     def _ecs_client(self) -> ECSClient:
-        return self.session.client(AWSClientType.ECS, region_name=self.region_name)
+        return self.session.client(AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url)
 
     def _secrets_manager_client(self) -> SecretsManagerClient:
-        return self.session.client(AWSClientType.SECRETS_MANAGER, region_name=self.region_name)
+        return self.session.client(
+            AWSClientType.SECRETS_MANAGER, region_name=self.region_name, endpoint_url=self._endpoint_url
+        )
 
     def _s3_client(self) -> S3Client:
-        return self.session.client(AWSClientType.S3, region_name=self.region_name)
+        return self.session.client(AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url)
 
     async def get_secret(self, secret_name: str) -> str | None:
         try:
