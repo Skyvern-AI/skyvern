@@ -61,8 +61,10 @@ async def get_1password_item_details(client: OnePasswordClient, vault_id: str, i
         result = {}
 
         # Debug: Log the structure of the item and fields
-        LOG.info(f"1Password item structure: {dir(item)}" + 
-                (f"\nFirst field structure: {dir(item.fields[0])}" if hasattr(item, "fields") and item.fields else ""))
+        LOG.info(
+            f"1Password item structure: {dir(item)}"
+            + (f"\nFirst field structure: {dir(item.fields[0])}" if hasattr(item, "fields") and item.fields else "")
+        )
         if hasattr(item, "fields") and item.fields:
             LOG.info(
                 f"Field value example: {item.fields[0].value if hasattr(item.fields[0], 'value') else 'No value attribute'}"
