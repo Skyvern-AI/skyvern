@@ -1,11 +1,11 @@
 import json
 import logging
+from enum import StrEnum
 from typing import Optional
 
 from onepassword.client import Client as OnePasswordClient
-from strenum import StrEnum
 
-from skyvern.forge.sdk.config import settings
+from skyvern.config import settings
 
 LOG = logging.getLogger(__name__)
 
