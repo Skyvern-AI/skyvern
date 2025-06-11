@@ -100,6 +100,7 @@ pandas = "^2.2.3"
 pre-commit = "^4.2.0"
 ruff = "^0.11.12"
 aiosqlite = "^0.21.0"
+types-boto3 = {extras = ["full"], version = "^1.38.31"}
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
