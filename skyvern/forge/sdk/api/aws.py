@@ -4,6 +4,9 @@ from urllib.parse import urlparse
 
 import aioboto3
 import structlog
+from types_boto3_ecs.client import ECSClient
+from types_boto3_s3.client import S3Client
+from types_boto3_secretsmanager.client import SecretsManagerClient
 
 from skyvern.config import settings
 
@@ -34,16 +37,32 @@ class AsyncAWSClient:
         aws_access_key_id: str | None = None,
         aws_secret_access_key: str | None = None,
         region_name: str | None = None,
+        endpoint_url: str | None = None,
     ) -> None:
         self.region_name = region_name or settings.AWS_REGION
+        self._endpoint_url = endpoint_url
         self.session = aioboto3.Session(
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
         )
 
+    def _ecs_client(self) -> ECSClient:
+        return self.session.client(AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url)
+
+    def _secrets_manager_client(self) -> SecretsManagerClient:
+        return self.session.client(
+            AWSClientType.SECRETS_MANAGER, region_name=self.region_name, endpoint_url=self._endpoint_url
+        )
+
+    def _s3_client(self) -> S3Client:
+        return self.session.client(AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url)
+
+    def _create_tag_string(self, tags: dict[str, str]) -> str:
+        return "&".join([f"{k}={v}" for k, v in tags.items()])
+
     async def get_secret(self, secret_name: str) -> str | None:
         try:
-            async with self.session.client(AWSClientType.SECRETS_MANAGER, region_name=self.region_name) as client:
+            async with self._secrets_manager_client() as client:
                 response = await client.get_secret_value(SecretId=secret_name)
                 return response["SecretString"]
         except Exception as e:
@@ -56,7 +75,7 @@ class AsyncAWSClient:
 
     async def create_secret(self, secret_name: str, secret_value: str) -> None:
         try:
-            async with self.session.client(AWSClientType.SECRETS_MANAGER, region_name=self.region_name) as client:
+            async with self._secrets_manager_client() as client:
                 await client.create_secret(Name=secret_name, SecretString=secret_value)
         except Exception as e:
             LOG.exception("Failed to create secret.", secret_name=secret_name)
@@ -64,7 +83,7 @@ class AsyncAWSClient:
 
     async def set_secret(self, secret_name: str, secret_value: str) -> None:
         try:
-            async with self.session.client(AWSClientType.SECRETS_MANAGER, region_name=self.region_name) as client:
+            async with self._secrets_manager_client() as client:
                 await client.put_secret_value(SecretId=secret_name, SecretString=secret_value)
         except Exception as e:
             LOG.exception("Failed to set secret.", secret_name=secret_name)
@@ -72,22 +91,31 @@ class AsyncAWSClient:
 
     async def delete_secret(self, secret_name: str) -> None:
         try:
-            async with self.session.client(AWSClientType.SECRETS_MANAGER, region_name=self.region_name) as client:
+            async with self._secrets_manager_client() as client:
                 await client.delete_secret(SecretId=secret_name)
         except Exception as e:
             LOG.exception("Failed to delete secret.", secret_name=secret_name)
             raise e
 
     async def upload_file(
-        self, uri: str, data: bytes, storage_class: S3StorageClass = S3StorageClass.STANDARD
+        self,
+        uri: str,
+        data: bytes,
+        storage_class: S3StorageClass = S3StorageClass.STANDARD,
+        tags: dict[str, str] | None = None,
     ) -> str | None:
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
         try:
-            async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
+            async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
+                extra_args = {"Tagging": self._create_tag_string(tags)} if tags else {}
                 await client.put_object(
-                    Body=data, Bucket=parsed_uri.bucket, Key=parsed_uri.key, StorageClass=str(storage_class)
+                    Body=data,
+                    Bucket=parsed_uri.bucket,
+                    Key=parsed_uri.key,
+                    StorageClass=str(storage_class),
+                    **extra_args,
                 )
                 return uri
         except Exception:
@@ -95,18 +123,25 @@ class AsyncAWSClient:
             return None
 
     async def upload_file_stream(
-        self, uri: str, file_obj: IO[bytes], storage_class: S3StorageClass = S3StorageClass.STANDARD
+        self,
+        uri: str,
+        file_obj: IO[bytes],
+        storage_class: S3StorageClass = S3StorageClass.STANDARD,
+        tags: dict[str, str] | None = None,
     ) -> str | None:
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
         try:
-            async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
+            async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
+                extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
+                if tags:
+                    extra_args["Tagging"] = self._create_tag_string(tags)
                 await client.upload_fileobj(
                     file_obj,
                     parsed_uri.bucket,
                     parsed_uri.key,
-                    ExtraArgs={"StorageClass": str(storage_class)},
+                    ExtraArgs=extra_args,
                 )
                 LOG.debug("Upload file stream success", uri=uri)
                 return uri
@@ -121,13 +156,16 @@ class AsyncAWSClient:
         storage_class: S3StorageClass = S3StorageClass.STANDARD,
         metadata: dict | None = None,
         raise_exception: bool = False,
+        tags: dict[str, str] | None = None,
     ) -> None:
         try:
-            async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
+            async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
                 extra_args: dict[str, Any] = {"StorageClass": str(storage_class)}
                 if metadata:
                     extra_args["Metadata"] = metadata
+                if tags:
+                    extra_args["Tagging"] = self._create_tag_string(tags)
                 await client.upload_file(
                     Filename=file_path,
                     Bucket=parsed_uri.bucket,
@@ -141,7 +179,7 @@ class AsyncAWSClient:
 
     async def download_file(self, uri: str, log_exception: bool = True) -> bytes | None:
         try:
-            async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
+            async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
 
                 # Get full object including body
@@ -169,7 +207,7 @@ class AsyncAWSClient:
             The metadata dictionary or None if the request fails
         """
         try:
-            async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
+            async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
 
                 # Only get object metadata without the body
@@ -183,7 +221,7 @@ class AsyncAWSClient:
     async def create_presigned_urls(self, uris: list[str]) -> list[str] | None:
         presigned_urls = []
         try:
-            async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
+            async with self._s3_client() as client:
                 for uri in uris:
                     parsed_uri = S3Uri(uri)
                     url = await client.generate_presigned_url(
@@ -201,7 +239,7 @@ class AsyncAWSClient:
     async def list_files(self, uri: str) -> list[str]:
         object_keys: list[str] = []
         parsed_uri = S3Uri(uri)
-        async with self.session.client(AWSClientType.S3, region_name=self.region_name) as client:
+        async with self._s3_client() as client:
             async for page in client.get_paginator("list_objects_v2").paginate(
                 Bucket=parsed_uri.bucket, Prefix=parsed_uri.key
             ):
@@ -218,7 +256,7 @@ class AsyncAWSClient:
         subnets: list[str],
         security_groups: list[str],
     ) -> dict:
-        async with self.session.client(AWSClientType.ECS, region_name=self.region_name) as client:
+        async with self._ecs_client() as client:
             return await client.run_task(
                 cluster=cluster,
                 launchType=launch_type,
@@ -233,23 +271,23 @@ class AsyncAWSClient:
             )
 
     async def stop_task(self, cluster: str, task: str, reason: str | None = None) -> dict:
-        async with self.session.client(AWSClientType.ECS, region_name=self.region_name) as client:
+        async with self._ecs_client() as client:
             return await client.stop_task(cluster=cluster, task=task, reason=reason)
 
     async def describe_tasks(self, cluster: str, tasks: list[str]) -> dict:
-        async with self.session.client(AWSClientType.ECS, region_name=self.region_name) as client:
+        async with self._ecs_client() as client:
             return await client.describe_tasks(cluster=cluster, tasks=tasks)
 
     async def list_tasks(self, cluster: str) -> dict:
-        async with self.session.client(AWSClientType.ECS, region_name=self.region_name) as client:
+        async with self._ecs_client() as client:
             return await client.list_tasks(cluster=cluster)
 
     async def describe_task_definition(self, task_definition: str) -> dict:
-        async with self.session.client(AWSClientType.ECS, region_name=self.region_name) as client:
+        async with self._ecs_client() as client:
             return await client.describe_task_definition(taskDefinition=task_definition)
 
     async def deregister_task_definition(self, task_definition: str) -> dict:
-        async with self.session.client(AWSClientType.ECS, region_name=self.region_name) as client:
+        async with self._ecs_client() as client:
             return await client.deregister_task_definition(taskDefinition=task_definition)
 
 
