@@ -74,6 +74,7 @@ google-cloud-aiplatform = "^1.90.0"
 alive-progress = "^3.2.0"
 colorama = "^0.4.6"
 onepassword-sdk = "0.3.0"
+strenum = "^0.4.15"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
