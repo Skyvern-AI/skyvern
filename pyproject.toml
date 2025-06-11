@@ -38,7 +38,7 @@ psycopg = [
 alembic = "^1.12.1"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 cachetools = "^5.3.2"
-aioboto3 = "^12.0.0"
+aioboto3 = "^14.3.0"
 commentjson = "^0.9.0"
 asyncache = "^0.3.1"
 orjson = "^3.9.10"
@@ -101,6 +101,7 @@ pandas = "^2.2.3"
 pre-commit = "^4.2.0"
 ruff = "^0.11.12"
 aiosqlite = "^0.21.0"
+moto = {extras = ["s3", "server"], version = "^5.1.5"}
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
