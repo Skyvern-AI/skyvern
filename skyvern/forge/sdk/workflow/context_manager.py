@@ -1,7 +1,10 @@
+import json
 import copy
+import logging
 import os
 import uuid
-from typing import TYPE_CHECKING, Any, Self
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Self, Tuple
 
 import structlog
 from onepassword.client import Client as OnePasswordClient
@@ -186,6 +189,31 @@ class WorkflowRunContext:
     def generate_random_secret_id() -> str:
         return f"secret_{uuid.uuid4()}"
 
+    async def _get_credential_vault_and_item_ids(self, credential_id: str) -> Tuple[str, str]:
+        """
+        Extract vault_id and item_id from the credential_id.
+        This method handles the legacy format vault_id:item_id.
+        
+        Args:
+            credential_id: The credential identifier in the format vault_id:item_id
+            
+        Returns:
+            A tuple of (vault_id, item_id)
+            
+        Raises:
+            ValueError: If the credential format is invalid
+        """
+        # Check if it's in the format vault_id:item_id
+        if ":" in credential_id:
+            LOG.info(f"Processing credential in vault_id:item_id format: {credential_id}")
+            vault_id, item_id = credential_id.split(":", 1)
+            return vault_id, item_id
+            
+        # If we can't parse the credential_id, raise an error
+        raise ValueError(f"Invalid credential format: {credential_id}. Expected format: vault_id:item_id")
+
+
+
     async def register_secret_workflow_parameter_value(
         self,
         parameter: WorkflowParameter,
@@ -201,94 +229,76 @@ class WorkflowRunContext:
 
         LOG.info(f"Fetching credential parameter value for credential: {credential_id}")
 
-        # Handle 1Password references directly (op://vault_id/item_id/field)
-        if credential_id.startswith("op://"):
+        try:
+            # Extract vault_id and item_id from the database
+            vault_id, item_id = await self._get_credential_vault_and_item_ids(credential_id)
+            
+            # Use the 1Password SDK to resolve the reference using vault_id and item_id directly
+            secret_value_json = await resolve_secret(vault_id, item_id)
+            
+            # Validate the JSON response
+            if not secret_value_json:
+                LOG.error(f"Empty response from 1Password for credential: {credential_id}")
+                raise ValueError(f"Empty response from 1Password for credential: {credential_id}")
+            
             try:
-                # Use the 1Password SDK to resolve the reference directly
-                secret_value = await resolve_secret(credential_id)
-                random_secret_id = self.generate_random_secret_id()
-                self.secrets[random_secret_id] = secret_value
-                self.values[parameter.key] = random_secret_id
-                self.parameters[parameter.key] = parameter
-                return
-            except Exception as e:
-                LOG.error(f"Failed to resolve 1Password reference: {credential_id}. Error: {e}")
-                raise e
+                secret_values = json.loads(secret_value_json)
+            except json.JSONDecodeError as json_err:
+                LOG.error(f"Invalid JSON response from 1Password: {secret_value_json[:100]}... Error: {json_err}")
+                raise ValueError(f"Invalid JSON response from 1Password: {json_err}")
 
-        # Handle 1Password credentials in vault_id:item_id format
-        if ":" in credential_id and not credential_id.startswith("op://"):
-            try:
-                LOG.info(f"Processing 1Password credential in vault_id:item_id format: {credential_id}")
-                # Use the 1Password SDK to resolve the reference
-                import json
+            if not secret_values:
+                LOG.warning(f"No values found in 1Password item: {credential_id}")
+                # Still continue with empty values
 
-                secret_value_json = await resolve_secret(credential_id)
+            self.parameters[parameter.key] = parameter
+            self.values[parameter.key] = {}
 
-                # Validate the JSON response
-                if not secret_value_json:
-                    LOG.error(f"Empty response from 1Password for credential: {credential_id}")
-                    raise ValueError(f"Empty response from 1Password for credential: {credential_id}")
+            # Process fields from the 1Password item
+            if "fields" in secret_values and isinstance(secret_values["fields"], list):
+                for field in secret_values["fields"]:
+                    if not isinstance(field, dict) or "id" not in field or "value" not in field:
+                        continue
 
-                try:
-                    secret_values = json.loads(secret_value_json)
-                except json.JSONDecodeError as json_err:
-                    LOG.error(f"Invalid JSON response from 1Password: {secret_value_json[:100]}... Error: {json_err}")
-                    raise ValueError(f"Invalid JSON response from 1Password: {json_err}")
+                    field_id = field.get("id")
+                    field_type = field.get("field_type")
+                    field_value = field.get("value")
 
-                if not secret_values:
-                    LOG.warning(f"No values found in 1Password item: {credential_id}")
-                    # Still continue with empty values
+                    # Store the field value
+                    random_secret_id = self.generate_random_secret_id()
+                    secret_id = f"{random_secret_id}_{field_id}"
+                    self.secrets[secret_id] = field_value
+                    self.values[parameter.key][field_id] = secret_id
 
-                self.parameters[parameter.key] = parameter
-                self.values[parameter.key] = {}
-
-                # Process fields from the 1Password item
-                if "fields" in secret_values and isinstance(secret_values["fields"], list):
-                    for field in secret_values["fields"]:
-                        if not isinstance(field, dict) or "id" not in field or "value" not in field:
-                            continue
-
-                        field_id = field.get("id")
-                        field.get("title", field_id)
-                        field_type = field.get("field_type")
-                        field_value = field.get("value")
-
-                        # Store the field value
-                        random_secret_id = self.generate_random_secret_id()
-                        secret_id = f"{random_secret_id}_{field_id}"
-                        self.secrets[secret_id] = field_value
-                        self.values[parameter.key][field_id] = secret_id
-
-                        # For TOTP fields, also store the current code
-                        if field_type == "Totp" and isinstance(field.get("details"), dict):
-                            details = field.get("details")
-                            # Explicitly check that details is a dict before accessing get method
-                            if isinstance(details, dict):
-                                content = details.get("content")
-                                if isinstance(content, dict) and "code" in content:
-                                    totp_code = content["code"]
-                                    random_secret_id = self.generate_random_secret_id()
-                                    totp_secret_id = f"{random_secret_id}_totp"
-                                    self.secrets[totp_secret_id] = totp_code
-                                    totp_secret_value = self.totp_secret_value_key(
-                                        totp_secret_id
-                                    )  # same way we use for bitwarden
+                    # For TOTP fields, also store the current code
+                    if field_type == "Totp" and isinstance(field.get("details"), dict):
+                        details = field.get("details")
+                        # Explicitly check that details is a dict before accessing get method
+                        if isinstance(details, dict):
+                            content = details.get("content")
+                            if isinstance(content, dict) and "code" in content:
+                                totp_code = content["code"]
+                                random_secret_id = self.generate_random_secret_id()
+                                totp_secret_id = f"{random_secret_id}_totp"
+                                self.secrets[totp_secret_id] = totp_code
+                                totp_secret_value = self.totp_secret_value_key(totp_secret_id)
                                 self.secrets[totp_secret_value] = field_value  # Store the TOTP secret
                                 self.values[parameter.key]["totp"] = totp_secret_id
-                else:
-                    # Process each field in the 1Password item (old format or custom format)
-                    for key, value in secret_values.items():
-                        random_secret_id = self.generate_random_secret_id()
-                        secret_id = f"{random_secret_id}_{key}"
-                        self.secrets[secret_id] = value
-                        self.values[parameter.key][key] = secret_id
+            else:
+                # Process each field in the 1Password item (old format or custom format)
+                for key, value in secret_values.items():
+                    random_secret_id = self.generate_random_secret_id()
+                    secret_id = f"{random_secret_id}_{key}"
+                    self.secrets[secret_id] = value
+                    self.values[parameter.key][key] = secret_id
 
-                LOG.info("Successfully processed 1Password credential")
-                return
-            except Exception as e:
-                LOG.error(f"Failed to resolve 1Password reference in custom format: {credential_id}. Error: {str(e)}")
-                # Add more context to the error
-                raise ValueError(f"Failed to process 1Password credential {credential_id}: {str(e)}") from e
+            LOG.info("Successfully processed 1Password credential")
+            return
+            
+        except Exception as e:
+            LOG.error(f"Failed to process 1Password credential: {credential_id}. Error: {str(e)}")
+            # Add more context to the error
+            raise ValueError(f"Failed to process 1Password credential {credential_id}: {str(e)}") from e
 
         # Handle regular credentials from the database
         try:
@@ -392,10 +402,16 @@ class WorkflowRunContext:
         )
 
         item = await client.items.get(parameter.vault_id, parameter.item_id)
+        
+        # Check if item is None
+        if item is None:
+            LOG.error(f"No item found for vault_id:{parameter.vault_id}, item_id:{parameter.item_id}")
+            raise ValueError(f"1Password item not found: vault_id:{parameter.vault_id}, item_id:{parameter.item_id}")
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {}
 
+        # Process all fields
         for field in item.fields:
             if field.value is None:
                 continue
@@ -404,6 +420,19 @@ class WorkflowRunContext:
             self.secrets[secret_id] = field.value
             key = (field.label or field.id).lower().replace(" ", "_")
             self.values[parameter.key][key] = secret_id
+            
+        # Try to get TOTP if available
+        try:
+            totp = await client.items.get_totp(parameter.vault_id, parameter.item_id)
+            if totp:
+                random_secret_id = self.generate_random_secret_id()
+                totp_secret_id = f"{random_secret_id}_totp"
+                self.secrets[totp_secret_id] = totp
+                self.values[parameter.key]["totp"] = totp_secret_id
+        except Exception as e:
+            # TOTP might not be available for this item, just log and continue
+            LOG.debug(f"TOTP not available for item {parameter.item_id}: {str(e)}")
+            pass
 
     async def register_bitwarden_login_credential_parameter_value(
         self,

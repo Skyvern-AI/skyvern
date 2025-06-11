@@ -1,20 +1,21 @@
+import json
 import logging
 from typing import Optional
 
 from onepassword.client import Client as OnePasswordClient
 
-from skyvern.config import settings
+from skyvern.forge.sdk.config import settings
 
 LOG = logging.getLogger(__name__)
 
 
-async def resolve_secret(reference: str) -> str:
+async def resolve_secret(vault_id: str, item_id: str) -> str:
     """
-    Resolve a 1Password secret reference.
+    Resolve a 1Password secret using vault_id and item_id directly.
 
     Args:
-        reference: A 1Password reference in the format op://vault_id/item_id/field
-                  or a custom format vault_id:item_id
+        vault_id: The 1Password vault ID
+        item_id: The 1Password item ID
 
     Returns:
         The resolved secret value
@@ -29,17 +30,8 @@ async def resolve_secret(reference: str) -> str:
         integration_version="v1.0.0",
     )
 
-    # Handle standard op:// format
-    if reference.startswith("op://"):
-        return await client.secrets.resolve(reference)
-
-    # Handle custom format (vault_id:item_id)
-    if ":" in reference:
-        vault_id, item_id = reference.split(":", 1)
-        result = await get_1password_item_details(client, vault_id, item_id)
-        return result
-
-    raise ValueError(f"Invalid 1Password reference format: {reference}")
+    result = await get_1password_item_details(client, vault_id, item_id)
+    return result
 
 
 async def get_1password_item_details(client: OnePasswordClient, vault_id: str, item_id: str) -> str:
@@ -56,6 +48,11 @@ async def get_1password_item_details(client: OnePasswordClient, vault_id: str, i
     """
     try:
         item = await client.items.get(vault_id, item_id)
+        
+        # Check if item is None
+        if item is None:
+            LOG.error(f"No item found for vault_id:{vault_id}, item_id:{item_id}")
+            raise ValueError(f"1Password item not found: vault_id:{vault_id}, item_id:{item_id}")
 
         # Create a dictionary of all fields
         result = {}
@@ -65,10 +62,7 @@ async def get_1password_item_details(client: OnePasswordClient, vault_id: str, i
             f"1Password item structure: {dir(item)}"
             + (f"\nFirst field structure: {dir(item.fields[0])}" if hasattr(item, "fields") and item.fields else "")
         )
-        if hasattr(item, "fields") and item.fields:
-            LOG.info(
-                f"Field value example: {item.fields[0].value if hasattr(item.fields[0], 'value') else 'No value attribute'}"
-            )
+        # We don't log field values as they may contain sensitive credentials
 
         # Add all fields with proper attribute checking
         for i, field in enumerate(item.fields):
@@ -163,8 +157,6 @@ async def get_1password_item_details(client: OnePasswordClient, vault_id: str, i
                 result["totp"] = totp
         except Exception as totp_err:
             LOG.warning(f"Error getting TOTP: {totp_err}")
-
-        import json
 
         return json.dumps(result)
     except Exception as e:
