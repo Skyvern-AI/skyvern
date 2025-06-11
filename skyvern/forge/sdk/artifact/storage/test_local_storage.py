@@ -31,10 +31,15 @@ def local_storage() -> LocalStorage:
 class TestLocalStorageBuildURIs:
     def test_build_uri(self, local_storage: LocalStorage) -> None:
         step = create_fake_step(TEST_STEP_ID)
-        uri = local_storage.build_uri("artifact123", step, ArtifactType.LLM_PROMPT)
+        uri = local_storage.build_uri(
+            organization_id=TEST_ORGANIZATION_ID,
+            artifact_id="artifact123",
+            step=step,
+            artifact_type=ArtifactType.LLM_PROMPT,
+        )
         assert (
             uri
-            == f"file://{local_storage.artifact_path}/{TEST_TASK_ID}/01_0_{TEST_STEP_ID}/2025-06-09T12:00:00_artifact123_llm_prompt.txt"
+            == f"file://{local_storage.artifact_path}/{TEST_ORGANIZATION_ID}/{TEST_TASK_ID}/01_0_{TEST_STEP_ID}/2025-06-09T12:00:00_artifact123_llm_prompt.txt"
         )
 
     def test_build_log_uri(self, local_storage: LocalStorage) -> None:
