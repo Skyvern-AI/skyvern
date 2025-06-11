@@ -242,14 +242,43 @@ class WorkflowRunContext:
                 self.parameters[parameter.key] = parameter
                 self.values[parameter.key] = {}
 
-                # Process each field in the 1Password item
-                for key, value in secret_values.items():
-                    random_secret_id = self.generate_random_secret_id()
-                    secret_id = f"{random_secret_id}_{key}"
-                    self.secrets[secret_id] = value
-                    self.values[parameter.key][key] = secret_id
+                # Process fields from the 1Password item
+                if "fields" in secret_values and isinstance(secret_values["fields"], list):
+                    for field in secret_values["fields"]:
+                        if not isinstance(field, dict) or "id" not in field or "value" not in field:
+                            continue
+                            
+                        field_id = field.get("id")
+                        field_title = field.get("title", field_id)
+                        field_type = field.get("field_type")
+                        field_value = field.get("value")
+                        
+                        # Store the field value
+                        random_secret_id = self.generate_random_secret_id()
+                        secret_id = f"{random_secret_id}_{field_id}"
+                        self.secrets[secret_id] = field_value
+                        self.values[parameter.key][field_id] = secret_id
+                        
+                        # For TOTP fields, also store the current code
+                        if field_type == "Totp" and isinstance(field.get("details"), dict):
+                            details = field.get("details")
+                            if isinstance(details.get("content"), dict) and "code" in details["content"]:
+                                totp_code = details["content"]["code"]
+                                random_secret_id = self.generate_random_secret_id()
+                                totp_secret_id = f"{random_secret_id}_totp"
+                                self.secrets[totp_secret_id] = totp_code
+                                totp_secret_value = self.totp_secret_value_key(totp_secret_id) # same way we use for bitwarden
+                                self.secrets[totp_secret_value] = field_value  # Store the TOTP secret
+                                self.values[parameter.key]["totp"] = totp_secret_id
+                else:
+                    # Process each field in the 1Password item (old format or custom format)
+                    for key, value in secret_values.items():
+                        random_secret_id = self.generate_random_secret_id()
+                        secret_id = f"{random_secret_id}_{key}"
+                        self.secrets[secret_id] = value
+                        self.values[parameter.key][key] = secret_id
 
-                LOG.info(f"Successfully processed 1Password credential with {len(secret_values)} fields")
+                LOG.info(f"Successfully processed 1Password credential")
                 return
             except Exception as e:
                 LOG.error(f"Failed to resolve 1Password reference in custom format: {credential_id}. Error: {str(e)}")
