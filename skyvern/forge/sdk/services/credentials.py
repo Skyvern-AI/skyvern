@@ -1,12 +1,9 @@
 import json
 import logging
-import os
-from enum import Enum, auto
-from typing import Any, Dict, Optional
-
-from strenum import StrEnum
+from typing import Optional
 
 from onepassword.client import Client as OnePasswordClient
+from strenum import StrEnum
 
 from skyvern.forge.sdk.config import settings
 
@@ -15,6 +12,7 @@ LOG = logging.getLogger(__name__)
 
 class OnePasswordConstants(StrEnum):
     """Constants for 1Password integration."""
+
     TOTP = "OP_TOTP"  # Special value to indicate a TOTP code
 
 
@@ -57,7 +55,7 @@ async def get_1password_item_details(client: OnePasswordClient, vault_id: str, i
     """
     try:
         item = await client.items.get(vault_id, item_id)
-        
+
         # Check if item is None
         if item is None:
             LOG.error(f"No item found for vault_id:{vault_id}, item_id:{item_id}")

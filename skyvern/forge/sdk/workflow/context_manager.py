@@ -1,14 +1,11 @@
-import json
 import copy
-import logging
+import json
 import os
 import uuid
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, Self, Tuple
 
 import structlog
 from onepassword.client import Client as OnePasswordClient
-from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -23,7 +20,7 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import resolve_secret
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants, resolve_secret
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -194,13 +191,13 @@ class WorkflowRunContext:
         """
         Extract vault_id and item_id from the credential_id.
         This method handles the legacy format vault_id:item_id.
-        
+
         Args:
             credential_id: The credential identifier in the format vault_id:item_id
-            
+
         Returns:
             A tuple of (vault_id, item_id)
-            
+
         Raises:
             ValueError: If the credential format is invalid
         """
@@ -209,11 +206,9 @@ class WorkflowRunContext:
             LOG.info(f"Processing credential in vault_id:item_id format: {credential_id}")
             vault_id, item_id = credential_id.split(":", 1)
             return vault_id, item_id
-            
+
         # If we can't parse the credential_id, raise an error
         raise ValueError(f"Invalid credential format: {credential_id}. Expected format: vault_id:item_id")
-
-
 
     async def register_secret_workflow_parameter_value(
         self,
@@ -233,15 +228,15 @@ class WorkflowRunContext:
         try:
             # Extract vault_id and item_id from the database
             vault_id, item_id = await self._get_credential_vault_and_item_ids(credential_id)
-            
+
             # Use the 1Password SDK to resolve the reference using vault_id and item_id directly
             secret_value_json = await resolve_secret(vault_id, item_id)
-            
+
             # Validate the JSON response
             if not secret_value_json:
                 LOG.error(f"Empty response from 1Password for credential: {credential_id}")
                 raise ValueError(f"Empty response from 1Password for credential: {credential_id}")
-            
+
             try:
                 secret_values = json.loads(secret_value_json)
             except json.JSONDecodeError as json_err:
@@ -295,7 +290,7 @@ class WorkflowRunContext:
 
             LOG.info("Successfully processed 1Password credential")
             return
-            
+
         except Exception as e:
             LOG.error(f"Failed to process 1Password credential: {credential_id}. Error: {str(e)}")
             # Add more context to the error
@@ -403,7 +398,7 @@ class WorkflowRunContext:
         )
 
         item = await client.items.get(parameter.vault_id, parameter.item_id)
-        
+
         # Check if item is None
         if item is None:
             LOG.error(f"No item found for vault_id:{parameter.vault_id}, item_id:{parameter.item_id}")
@@ -421,7 +416,7 @@ class WorkflowRunContext:
             self.secrets[secret_id] = field.value
             key = (field.label or field.id).lower().replace(" ", "_")
             self.values[parameter.key][key] = secret_id
-            
+
         # Try to get TOTP if available
         try:
             totp = await client.items.get_totp(parameter.vault_id, parameter.item_id)
@@ -430,17 +425,16 @@ class WorkflowRunContext:
                 random_secret_id = self.generate_random_secret_id()
                 totp_value_id = f"{random_secret_id}_totp_value"
                 self.secrets[totp_value_id] = totp
-                
+
                 # Store the special TOTP constant that the agent will recognize
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 self.values[parameter.key]["totp"] = totp_secret_id
-                
+
                 LOG.info(f"TOTP code available for item {parameter.item_id}")
         except Exception as e:
             # TOTP might not be available for this item, just log and continue
             LOG.debug(f"TOTP not available for item {parameter.item_id}: {str(e)}")
-            pass
 
     async def register_bitwarden_login_credential_parameter_value(
         self,
