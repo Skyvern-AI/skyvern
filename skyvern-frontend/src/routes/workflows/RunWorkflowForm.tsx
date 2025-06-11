@@ -14,11 +14,11 @@ import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
-import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { type ApiCommandOptions } from "@/util/apiCommands";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import fetchToCurl from "fetch-to-curl";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { useForm } from "react-hook-form";
 import { useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
@@ -333,17 +333,14 @@ function RunWorkflowForm({
         </div>
 
         <div className="flex justify-end gap-2">
-          <Button
-            type="button"
-            variant="secondary"
-            onClick={() => {
+          <CopyApiCommandDropdown
+            getOptions={() => {
               const values = form.getValues();
               const body = getRunWorkflowRequestBody(
                 values,
                 workflowParameters,
               );
-
-              const curl = fetchToCurl({
+              return {
                 method: "POST",
                 url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
                 body,
@@ -351,21 +348,9 @@ function RunWorkflowForm({
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
-              });
-
-              copyText(curl).then(() => {
-                toast({
-                  variant: "success",
-                  title: "Copied to Clipboard",
-                  description:
-                    "The cURL command has been copied to your clipboard.",
-                });
-              });
+              } satisfies ApiCommandOptions;
             }}
-          >
-            <CopyIcon className="mr-2 h-4 w-4" />
-            cURL
-          </Button>
+          />
           <Button type="submit" disabled={runWorkflowMutation.isPending}>
             {runWorkflowMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />

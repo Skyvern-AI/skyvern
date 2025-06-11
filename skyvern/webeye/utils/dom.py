@@ -34,9 +34,7 @@ TEXT_INPUT_DELAY = 10  # 10ms between each character input
 TEXT_PRESS_MAX_LENGTH = 20
 
 
-async def resolve_locator(
-    scrape_page: ScrapedPage, page: Page, frame: str, css: str
-) -> typing.Tuple[Locator, Page | Frame]:
+async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> tuple[Locator, Page | Frame]:
     iframe_path: list[str] = []
 
     while frame != "main.frame":
@@ -335,10 +333,10 @@ class SkyvernElement:
     def get_frame_id(self) -> str:
         return self._frame_id
 
-    def get_attributes(self) -> typing.Dict:
+    def get_attributes(self) -> dict:
         return self._attributes
 
-    def get_options(self) -> typing.List[SkyvernOptionType]:
+    def get_options(self) -> list[SkyvernOptionType]:
         options = self.__static_element.get("options", None)
         if options is None:
             return []

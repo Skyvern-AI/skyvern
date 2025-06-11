@@ -5,7 +5,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
-from skyvern.webeye.actions.actions import ActionType
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.models import AgentStepOutput
 
 
@@ -49,7 +49,7 @@ class Step(BaseModel):
     order: int
     is_last: bool
     retry_index: int = 0
-    organization_id: str | None = None
+    organization_id: str
     input_token_count: int = 0
     output_token_count: int = 0
     reasoning_token_count: int | None = None

@@ -162,7 +162,7 @@ class BrowserContextFactory:
         preference_template = f"{SKYVERN_DIR}/webeye/chromium_preferences.json"
 
         preference_file_content = ""
-        with open(preference_template, "r") as f:
+        with open(preference_template) as f:
             preference_file_content = f.read()
             preference_file_content = preference_file_content.replace("MASK_SAVEFILE_DEFAULT_DIRECTORY", download_dir)
             preference_file_content = preference_file_content.replace("MASK_DOWNLOAD_DEFAULT_DIRECTORY", download_dir)
@@ -281,7 +281,7 @@ class BrowserContextFactory:
 class VideoArtifact(BaseModel):
     video_path: str | None = None
     video_artifact_id: str | None = None
-    video_data: bytes = bytes()
+    video_data: bytes = b""
 
 
 class BrowserArtifacts(BaseModel):
@@ -385,7 +385,7 @@ def _is_port_in_use(port: int) -> bool:
         try:
             s.bind(("localhost", port))
             return False
-        except socket.error:
+        except OSError:
             return True
 
 

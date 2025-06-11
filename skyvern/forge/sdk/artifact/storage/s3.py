@@ -1,6 +1,8 @@
 import os
 import shutil
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
+from typing import BinaryIO
 
 import structlog
 
@@ -27,13 +29,15 @@ LOG = structlog.get_logger()
 
 
 class S3Storage(BaseStorage):
+    _PATH_VERSION = "v1"
+
     def __init__(self, bucket: str | None = None) -> None:
         self.async_client = AsyncAWSClient()
         self.bucket = bucket or settings.AWS_S3_BUCKET_ARTIFACTS
 
-    def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
+    def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
         uri = f"s3://{self.bucket}/{settings.ENV}/global_workflows.txt"
@@ -42,42 +46,53 @@ class S3Storage(BaseStorage):
             return []
         return [line.strip() for line in data.decode("utf-8").split("\n") if line.strip()]
 
-    def build_log_uri(self, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType) -> str:
+    def build_log_uri(
+        self, *, organization_id: str, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType
+    ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
 
-    def build_thought_uri(self, artifact_id: str, thought: Thought, artifact_type: ArtifactType) -> str:
+    def build_thought_uri(
+        self, *, organization_id: str, artifact_id: str, thought: Thought, artifact_type: ArtifactType
+    ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/observers/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/observers/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
-    def build_task_v2_uri(self, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType) -> str:
+    def build_task_v2_uri(
+        self, *, organization_id: str, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType
+    ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
-        self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType
+        self,
+        *,
+        organization_id: str,
+        artifact_id: str,
+        workflow_run_block: WorkflowRunBlock,
+        artifact_type: ArtifactType,
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_ai_suggestion_uri(
-        self, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
+        self, *, organization_id: str, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"s3://{self.bucket}/{settings.ENV}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"s3://{self.bucket}/{self._PATH_VERSION}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)
-        LOG.info(
+        LOG.debug(
             "Storing artifact",
-            artifact_id=artifact.id,
+            artifact_id=artifact.artifact_id,
             organization_id=artifact.organization_id,
             uri=artifact.uri,
             storage_class=sc,
         )
         await self.async_client.upload_file(artifact.uri, data, storage_class=sc)
 
-    async def _get_storage_class_for_org(self, organization_id: str | None) -> S3StorageClass:
+    async def _get_storage_class_for_org(self, organization_id: str) -> S3StorageClass:
         return S3StorageClass.STANDARD
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
@@ -92,9 +107,9 @@ class S3Storage(BaseStorage):
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)
-        LOG.info(
+        LOG.debug(
             "Storing artifact from path",
-            artifact_id=artifact.id,
+            artifact_id=artifact.artifact_id,
             organization_id=artifact.organization_id,
             uri=artifact.uri,
             storage_class=sc,
@@ -106,7 +121,7 @@ class S3Storage(BaseStorage):
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         sc = await self._get_storage_class_for_org(organization_id)
-        LOG.info(
+        LOG.debug(
             "Saving streaming file",
             organization_id=organization_id,
             file_name=file_name,
@@ -126,7 +141,7 @@ class S3Storage(BaseStorage):
         zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
         sc = await self._get_storage_class_for_org(organization_id)
-        LOG.info(
+        LOG.debug(
             "Storing browser session",
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
@@ -210,3 +225,55 @@ class S3Storage(BaseStorage):
             file_infos.append(file_info)
 
         return file_infos
+
+    async def save_legacy_file(
+        self, *, organization_id: str, filename: str, fileObj: BinaryIO
+    ) -> tuple[str, str] | None:
+        todays_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        bucket = settings.AWS_S3_BUCKET_UPLOADS
+        sc = await self._get_storage_class_for_org(organization_id)
+        # First try uploading with original filename
+        try:
+            sanitized_filename = os.path.basename(filename)  # Remove any path components
+            s3_uri = f"s3://{bucket}/{settings.ENV}/{organization_id}/{todays_date}/{sanitized_filename}"
+            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj, storage_class=sc)
+        except Exception:
+            LOG.error("Failed to upload file to S3", exc_info=True)
+            uploaded_s3_uri = None
+
+        # If upload fails, try again with UUID prefix
+        if not uploaded_s3_uri:
+            uuid_prefixed_filename = f"{str(uuid.uuid4())}_{filename}"
+            s3_uri = f"s3://{bucket}/{settings.ENV}/{organization_id}/{todays_date}/{uuid_prefixed_filename}"
+            fileObj.seek(0)  # Reset file pointer
+            uploaded_s3_uri = await self.async_client.upload_file_stream(s3_uri, fileObj, storage_class=sc)
+
+        if not uploaded_s3_uri:
+            LOG.error(
+                "Failed to upload file to S3 after retrying with UUID prefix",
+                organization_id=organization_id,
+                storage_class=sc,
+                filename=filename,
+                exc_info=True,
+            )
+            return None
+        LOG.debug(
+            "Legacy file upload",
+            organization_id=organization_id,
+            storage_class=sc,
+            filename=filename,
+            uploaded_s3_uri=uploaded_s3_uri,
+        )
+        # Generate a presigned URL for the uploaded file
+        presigned_urls = await self.async_client.create_presigned_urls([uploaded_s3_uri])
+        if not presigned_urls:
+            LOG.error(
+                "Failed to create presigned URL for uploaded file",
+                organization_id=organization_id,
+                storage_class=sc,
+                uploaded_s3_uri=uploaded_s3_uri,
+                filename=filename,
+                exc_info=True,
+            )
+            return None
+        return presigned_urls[0], uploaded_s3_uri
