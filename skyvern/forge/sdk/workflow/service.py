@@ -68,6 +68,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenSensitiveInformationParameter,
     ContextParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -239,6 +240,7 @@ class WorkflowService:
                     BitwardenLoginCredentialParameter,
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
+                    OnePasswordCredentialParameter,
                     CredentialParameter,
                 ),
             )
@@ -883,6 +885,22 @@ class WorkflowService:
             description=description,
         )
 
+    async def create_onepassword_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        vault_id: str,
+        item_id: str,
+        description: str | None = None,
+    ) -> OnePasswordCredentialParameter:
+        return await app.DATABASE.create_onepassword_credential_parameter(
+            workflow_id=workflow_id,
+            key=key,
+            vault_id=vault_id,
+            item_id=item_id,
+            description=description,
+        )
+
     async def create_bitwarden_sensitive_information_parameter(
         self,
         workflow_id: str,
@@ -1489,6 +1507,14 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                         credential_id=parameter.credential_id,
+                    )
+                elif parameter.parameter_type == ParameterType.ONEPASSWORD:
+                    parameters[parameter.key] = await self.create_onepassword_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        vault_id=parameter.vault_id,
+                        item_id=parameter.item_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:
