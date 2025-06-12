@@ -1,8 +1,8 @@
-"""created 1password_credential_parameter
+"""db script for 1password integration
 
-Revision ID: 7bc030a082fa
-Revises: babaa7307e8a
-Create Date: 2025-06-10 04:54:45.079386+00:00
+Revision ID: 1517a4ba63fa
+Revises: add_run_timestamps
+Create Date: 2025-06-12 08:06:13.439802+00:00
 
 """
 
@@ -13,8 +13,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "7bc030a082fa"
-down_revision: Union[str, None] = "babaa7307e8a"
+revision: str = "1517a4ba63fa"
+down_revision: Union[str, None] = "add_run_timestamps"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
