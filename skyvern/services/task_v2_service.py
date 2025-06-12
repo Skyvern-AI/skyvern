@@ -20,6 +20,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
@@ -617,12 +618,14 @@ async def run_task_v2_helper(
                 thought_type=ThoughtType.plan,
                 thought_scenario=ThoughtScenario.generate_plan,
             )
-            task_v2_response = await app.LLM_API_HANDLER(
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                task_v2.llm_key, default=app.LLM_API_HANDLER
+            )
+            task_v2_response = await llm_api_handler(
                 prompt=task_v2_prompt,
                 screenshots=scraped_page.screenshots,
                 thought=thought,
                 prompt_name="task_v2",
-                llm_key_override=task_v2.llm_key,
             )
             LOG.info(
                 "Task v2 response",

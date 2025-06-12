@@ -58,6 +58,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_block,
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
+    hydrate_action,
 )
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -409,6 +410,26 @@ class AgentDB:
 
                 actions = (await session.scalars(query)).all()
                 return [Action.model_validate(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_task_actions_hydrated(self, task_id: str, organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id == task_id)
+                    .order_by(ActionModel.created_at)
+                )
+
+                actions = (await session.scalars(query)).all()
+                return [hydrate_action(action) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)

@@ -7,6 +7,7 @@ import structlog
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import (
+    ActionModel,
     ArtifactModel,
     AWSSecretParameterModel,
     BitwardenLoginCredentialParameterModel,
@@ -46,8 +47,54 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionType,
+    CheckboxAction,
+    ClickAction,
+    CompleteAction,
+    DownloadFileAction,
+    DragAction,
+    ExtractAction,
+    InputTextAction,
+    KeypressAction,
+    LeftMouseAction,
+    MoveAction,
+    NullAction,
+    ReloadPageAction,
+    ScrollAction,
+    SelectOptionAction,
+    SolveCaptchaAction,
+    TerminateAction,
+    UploadFileAction,
+    VerificationCodeAction,
+    WaitAction,
+)
 
 LOG = structlog.get_logger()
+
+# Mapping of action types to their corresponding action classes
+ACTION_TYPE_TO_CLASS = {
+    ActionType.CLICK: ClickAction,
+    ActionType.INPUT_TEXT: InputTextAction,
+    ActionType.UPLOAD_FILE: UploadFileAction,
+    ActionType.DOWNLOAD_FILE: DownloadFileAction,
+    ActionType.NULL_ACTION: NullAction,
+    ActionType.TERMINATE: TerminateAction,
+    ActionType.COMPLETE: CompleteAction,
+    ActionType.SELECT_OPTION: SelectOptionAction,
+    ActionType.CHECKBOX: CheckboxAction,
+    ActionType.WAIT: WaitAction,
+    ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
+    ActionType.RELOAD_PAGE: ReloadPageAction,
+    ActionType.EXTRACT: ExtractAction,
+    ActionType.SCROLL: ScrollAction,
+    ActionType.KEYPRESS: KeypressAction,
+    ActionType.MOVE: MoveAction,
+    ActionType.DRAG: DragAction,
+    ActionType.VERIFICATION_CODE: VerificationCodeAction,
+    ActionType.LEFT_MOUSE: LeftMouseAction,
+}
 
 
 @typing.no_type_check
@@ -432,3 +479,45 @@ def convert_to_workflow_run_block(
         block.include_action_history_in_verification = task.include_action_history_in_verification
 
     return block
+
+
+def hydrate_action(action_model: ActionModel) -> Action:
+    """
+    Convert ActionModel to the appropriate Action type based on action_type.
+    The action_json contains all the metadata of different types of actions.
+    """
+    # Create base action data from the model
+    action_data = {
+        "action_type": action_model.action_type,
+        "status": action_model.status,
+        "action_id": action_model.action_id,
+        "source_action_id": action_model.source_action_id,
+        "organization_id": action_model.organization_id,
+        "workflow_run_id": action_model.workflow_run_id,
+        "task_id": action_model.task_id,
+        "step_id": action_model.step_id,
+        "step_order": action_model.step_order,
+        "action_order": action_model.action_order,
+        "confidence_float": action_model.confidence_float,
+        "reasoning": action_model.reasoning,
+        "intention": action_model.intention,
+        "response": action_model.response,
+        "element_id": action_model.element_id,
+        "skyvern_element_hash": action_model.skyvern_element_hash,
+        "skyvern_element_data": action_model.skyvern_element_data,
+        "created_at": action_model.created_at,
+        "modified_at": action_model.modified_at,
+    }
+
+    # Merge with action_json data, skipping None values
+    if action_model.action_json:
+        for key, value in action_model.action_json.items():
+            if value is not None:
+                action_data[key] = value
+
+    # Get the appropriate action class and instantiate it
+    action_class = ACTION_TYPE_TO_CLASS.get(action_model.action_type)
+    if action_class is None:
+        raise ValueError(f"Unsupported action type: {action_model.action_type}")
+
+    return action_class(**action_data)
