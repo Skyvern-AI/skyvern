@@ -20,8 +20,9 @@ services:
   skyvern:
     image: public.ecr.aws/skyvern/skyvern:latest
     restart: on-failure
-    env_file:
-      - .env
+  #  Uncomment the follwoing two lines if you want to manage .env
+  #  env_file:
+  #   - .env
     # comment out if you want to externally call skyvern API
     ports:
       - 8001:8000
@@ -140,17 +141,14 @@ services:
     env_file:
       - skyvern-frontend/.env
     environment: {}
-    #  - VITE_ENABLE_CODE_BLOCK=true
-    # if you want to run skyvern on a remote server,
-    # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
-    # If you're self-hosting this behind a dns, you'll want to set:
-    #   A route for the API: api.yourdomain.com -> localhost:8000
-    #   A route for the UI: yourdomain.com -> localhost:8080
-    #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
-    # - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
-    #   - VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
-    #   - VITE_API_BASE_URL=http://localhost:8000/api/v1
-    #   - VITE_SKYVERN_API_KEY=<get this from "settings" in the Skyvern UI>
+environment:
+  # This tells Coolify to manage a domain for skyvern-ui itself
+  - SERVICE_FQDN_SKYVERN_UI_8080 
+  
+  # Templating to find the backend's URL
+  - VITE_API_BASE_URL=https://{{services.skyvern.fqdn}}/api/v1 
+  - VITE_WSS_BASE_URL=wss://{{services.skyvern.fqdn}}/api/v1
+  - 'VITE_ARTIFACT_API_BASE_URL=${SERVICE_FQDN_SKYVERN_UI}'
     depends_on:
       skyvern:
         condition: service_healthy
