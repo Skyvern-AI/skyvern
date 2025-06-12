@@ -804,17 +804,19 @@ class LLMCaller:
         """Custom UI-TARS API call using OpenAI client with VolcEngine endpoint."""
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 400
         model_name = self.llm_config.model_name
-        
+
         if not app.UI_TARS_CLIENT:
-            raise ValueError("UI_TARS_CLIENT not initialized. Please ensure ENABLE_UI_TARS=true and UI_TARS_API_KEY is set.")
-        
+            raise ValueError(
+                "UI_TARS_CLIENT not initialized. Please ensure ENABLE_UI_TARS=true and UI_TARS_API_KEY is set."
+            )
+
         LOG.info(
             "UI-TARS request",
             model_name=model_name,
             timeout=timeout,
             messages_length=len(messages),
         )
-        
+
         # Use the UI-TARS client (which is OpenAI-compatible with VolcEngine)
         chat_completion = await app.UI_TARS_CLIENT.chat.completions.create(
             model=model_name,
@@ -829,13 +831,13 @@ class LLMCaller:
             presence_penalty=None,
             timeout=timeout,
         )
-        
+
         # Aggregate streaming response like in ByteDance example
         response_content = ""
         async for message in chat_completion:
             if message.choices[0].delta.content:
                 response_content += message.choices[0].delta.content
-        
+
         # Create a response object that mimics the ModelResponse interface
         class UITarsResponse:
             def __init__(self, content: str, model: str):
@@ -843,50 +845,63 @@ class LLMCaller:
                 class Message:
                     def __init__(self, content: str):
                         self.content = content
-                        self.role = 'assistant'
-                
+                        self.role = "assistant"
+
                 class Choice:
                     def __init__(self, content: str):
                         self.message = Message(content)
-                
+
                 self.choices = [Choice(content)]
                 self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 self.model = model
                 self.object = "chat.completion"
-            
+
             def model_dump_json(self, indent: int = 2) -> str:
                 """Provide model_dump_json compatibility for artifact creation."""
                 import json
-                return json.dumps({
-                    "choices": [{"message": {"content": self.choices[0].message.content, "role": self.choices[0].message.role}}],
-                    "usage": self.usage,
-                    "model": self.model,
-                    "object": self.object,
-                }, indent=indent)
-            
+
+                return json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": self.choices[0].message.content,
+                                    "role": self.choices[0].message.role,
+                                }
+                            }
+                        ],
+                        "usage": self.usage,
+                        "model": self.model,
+                        "object": self.object,
+                    },
+                    indent=indent,
+                )
+
             def model_dump(self, exclude_none: bool = True) -> dict:
                 """Provide model_dump compatibility for raw_response."""
                 return {
-                    "choices": [{"message": {"content": self.choices[0].message.content, "role": self.choices[0].message.role}}],
+                    "choices": [
+                        {"message": {"content": self.choices[0].message.content, "role": self.choices[0].message.role}}
+                    ],
                     "usage": self.usage,
                     "model": self.model,
                     "object": self.object,
                 }
-            
-            def get(self, key: str, default=None):
+
+            def get(self, key: str, default: Any = None) -> Any:
                 """Provide dict-like access for compatibility."""
                 return getattr(self, key, default)
-            
-            def __getitem__(self, key):
+
+            def __getitem__(self, key: str) -> Any:
                 """Provide dict-like access for compatibility."""
                 return getattr(self, key)
-            
-            def __contains__(self, key):
+
+            def __contains__(self, key: str) -> bool:
                 """Provide dict-like access for compatibility."""
                 return hasattr(self, key)
-        
+
         response = UITarsResponse(response_content, model_name)
-        
+
         LOG.info(
             "UI-TARS response",
             model_name=model_name,
@@ -895,17 +910,19 @@ class LLMCaller:
         )
         return response
 
-    async def get_call_stats(self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | dict[str, Any] | Any) -> LLMCallStats:
+    async def get_call_stats(
+        self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | dict[str, Any] | Any
+    ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
-        
+
         # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
-        if hasattr(response, 'usage') and hasattr(response, 'choices') and hasattr(response, 'model'):
+        if hasattr(response, "usage") and hasattr(response, "choices") and hasattr(response, "model"):
             usage = response.usage
             # Use Doubao pricing: ¥0.8/1M input, ¥2/1M output (convert to USD: ~$0.11/$0.28)
             input_token_cost = (0.11 / 1000000) * usage.get("prompt_tokens", 0)
             output_token_cost = (0.28 / 1000000) * usage.get("completion_tokens", 0)
             llm_cost = input_token_cost + output_token_cost
-            
+
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=usage.get("prompt_tokens", 0),
@@ -913,7 +930,7 @@ class LLMCaller:
                 cached_tokens=0,  # UI-TARS doesn't have cached tokens
                 reasoning_tokens=0,
             )
-        
+
         # Handle UI-TARS response (dict format - fallback)
         if isinstance(response, dict) and "choices" in response and "usage" in response:
             usage = response["usage"]
@@ -921,7 +938,7 @@ class LLMCaller:
             input_token_cost = (0.11 / 1000000) * usage.get("prompt_tokens", 0)
             output_token_cost = (0.28 / 1000000) * usage.get("completion_tokens", 0)
             llm_cost = input_token_cost + output_token_cost
-            
+
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=usage.get("prompt_tokens", 0),
@@ -929,7 +946,7 @@ class LLMCaller:
                 cached_tokens=0,  # UI-TARS doesn't have cached tokens
                 reasoning_tokens=0,
             )
-        
+
         if isinstance(response, AnthropicMessage):
             usage = response.usage
             input_token_cost = (3.0 / 1000000) * usage.input_tokens

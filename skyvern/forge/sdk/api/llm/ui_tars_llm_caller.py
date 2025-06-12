@@ -20,7 +20,6 @@ from typing import Any, Dict
 import structlog
 from PIL import Image
 
-from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.models import Step
@@ -163,7 +162,7 @@ class UITarsLLMCaller(LLMCaller):
         **extra_parameters: Any,
     ) -> dict[str, Any]:
         """Override call method to use standard LLM routing instead of direct LiteLLM."""
-        
+
         # Use raw_response=True to bypass JSON parsing since UI-TARS returns plain text
         response = await super().call(
             prompt=prompt,
@@ -178,9 +177,9 @@ class UITarsLLMCaller(LLMCaller):
             use_message_history=True,  # Use message history for UI-TARS
             raw_response=True,  # Bypass JSON parsing - UI-TARS returns plain text
             window_dimension=window_dimension,
-            **extra_parameters
+            **extra_parameters,
         )
-        
+
         # Extract content from the raw response
         if isinstance(response, dict) and "choices" in response:
             content = response["choices"][0]["message"]["content"]
