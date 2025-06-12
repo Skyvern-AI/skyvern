@@ -99,25 +99,6 @@ LOG = structlog.get_logger()
 
 
 class WorkflowService:
-    @staticmethod
-    def _collect_extracted_information(value: Any) -> list[Any]:
-        """Recursively collect extracted_information values from nested outputs."""
-        results: list[Any] = []
-        if isinstance(value, dict):
-            if "extracted_information" in value and value["extracted_information"] is not None:
-                extracted = value["extracted_information"]
-                if isinstance(extracted, list):
-                    results.extend(extracted)
-                else:
-                    results.append(extracted)
-            else:
-                for v in value.values():
-                    results.extend(WorkflowService._collect_extracted_information(v))
-        elif isinstance(value, list):
-            for item in value:
-                results.extend(WorkflowService._collect_extracted_information(item))
-        return results
-
     async def setup_workflow_run(
         self,
         request_id: str | None,
@@ -1128,10 +1109,14 @@ class WorkflowService:
         EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
-            extracted_information: list[Any] = []
-            for _, output in output_parameter_tuples:
-                if output.value is not None:
-                    extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
+            extracted_information = {
+                output_parameter.key: output.value[EXTRACTED_INFORMATION_KEY]
+                for output_parameter, output in output_parameter_tuples
+                if output.value is not None
+                and isinstance(output.value, dict)
+                and EXTRACTED_INFORMATION_KEY in output.value
+                and output.value[EXTRACTED_INFORMATION_KEY] is not None
+            }
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
         total_steps = None
