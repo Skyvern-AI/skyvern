@@ -152,7 +152,7 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
         try:
             if not content:
                 raise EmptyLLMResponseError(str(response))
-            content = try_to_extract_json_from_markdown_format(content)
+            content = _try_to_extract_json_from_markdown_format(content)
             return commentjson.loads(content)
         except Exception as e:
             if content:
@@ -162,7 +162,7 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
                     content=content,
                 )
                 try:
-                    return fix_and_parse_json_string(content)
+                    return _fix_and_parse_json_string(content)
                 except Exception as e2:
                     LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
                     raise InvalidLLMResponseFormat(str(response)) from e2
@@ -170,7 +170,7 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
             raise InvalidLLMResponseFormat(str(response)) from e
 
 
-def fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
+def _fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
     """
     Fixes a cutoff JSON string by ignoring the last incomplete action and making it a valid JSON.
 
@@ -199,7 +199,7 @@ def fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
         raise InvalidLLMResponseFormat(json_string) from e
 
 
-def fix_unescaped_quotes_in_json(json_string: str) -> str:
+def _fix_unescaped_quotes_in_json(json_string: str) -> str:
     """
     Extracts the positions of quotation marks that define the JSON structure
     and the strings between them, handling unescaped quotation marks within strings.
@@ -251,7 +251,7 @@ def fix_unescaped_quotes_in_json(json_string: str) -> str:
     return "".join(result)
 
 
-def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
+def _fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
     """
     Auto-fixes a JSON string by escaping unescaped quotes and ignoring the last action if the JSON is cutoff.
 
@@ -264,7 +264,7 @@ def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
 
     LOG.info("Auto-fixing JSON string.")
     # Escape unescaped quotes in the JSON string
-    json_string = fix_unescaped_quotes_in_json(json_string)
+    json_string = _fix_unescaped_quotes_in_json(json_string)
     try:
         # Attempt to parse the JSON string
         return commentjson.loads(json_string)
@@ -276,10 +276,10 @@ def fix_and_parse_json_string(json_string: str) -> dict[str, Any]:
         except json.JSONDecodeError as e:
             error_position = e.pos
             # Try to fix the cutoff JSON string and see if it can be parsed
-            return fix_cutoff_json(json_string, error_position)
+            return _fix_cutoff_json(json_string, error_position)
 
 
-def try_to_extract_json_from_markdown_format(text: str) -> str:
+def _try_to_extract_json_from_markdown_format(text: str) -> str:
     pattern = r"```json\s*(.*?)\s*```"
     match = re.search(pattern, text, re.DOTALL)
     if match:

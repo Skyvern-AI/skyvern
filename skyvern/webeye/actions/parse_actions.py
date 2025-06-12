@@ -11,9 +11,9 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
-    ActionType,
     CheckboxAction,
     ClickAction,
     CompleteAction,
