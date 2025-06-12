@@ -336,4 +336,9 @@ class S3Uri:
         return self._parsed.geturl()
 
 
+def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
+    """Convert a list of tags to a dictionary."""
+    return {tag["Key"]: tag["Value"] for tag in tag_set}
+
+
 aws_client = AsyncAWSClient()
