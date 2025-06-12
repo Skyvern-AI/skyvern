@@ -23,7 +23,7 @@ services:
     restart: on-failure
     # env_file is removed to manage variables in the Coolify UI.
     ports:
-      - "${SKYVERN_HOST_PORT}:8000"
+      - "${SKYVERN_HOST_PORT}:8001"
       - "${CDP_HOST_PORT}:9222" # for cdp browser forwarding
     volumes:
       # Using named volumes for persistent artifact/log storage
