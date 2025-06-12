@@ -53,7 +53,7 @@ function header(type: WorkflowEditorParameterType) {
     return "Add Secret Parameter";
   }
   if (type === "creditCardData") {
-    return "Add Credit Card Data Parameter";
+    return "Add Credit Card Parameter";
   }
   return "Add Context Parameter";
 }
@@ -276,19 +276,19 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
           {type === "creditCardData" && (
             <>
               <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Collection ID</Label>
+                <Input
+                  value={bitwardenCollectionId}
+                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
                 <Label className="text-xs text-slate-300">Item ID</Label>
                 <Input
                   value={sensitiveInformationItemId}
                   onChange={(e) =>
                     setSensitiveInformationItemId(e.target.value)
                   }
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Collection ID</Label>
-                <Input
-                  value={bitwardenCollectionId}
-                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
             </>
