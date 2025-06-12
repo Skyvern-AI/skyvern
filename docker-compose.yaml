@@ -113,7 +113,7 @@ services:
     restart: on-failure
     ports:
       # Includes default values. Coolify UI variables will override these.
-      - "${UI_HOST_PORT:-8080}:8080"
+      - "${UI_HOST_PORT:-8081}:8081"
       - "${UI_ARTIFACT_PORT:-9090}:9090"
     volumes:
       # Using named volumes shared with the skyvern service
