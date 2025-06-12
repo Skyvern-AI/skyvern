@@ -821,13 +821,11 @@ async def parse_ui_tars_actions(
     try:
         # Parse the UI-TARS response text
         parsed_actions = _parse_ui_tars_response(response_content, browser_window_dimension)
-        
+
         actions: list[Action] = []
         for idx, parsed_action in enumerate(parsed_actions):
             try:
-                action = _create_ui_tars_action(
-                    parsed_action, task, step, browser_window_dimension, idx
-                )
+                action = _create_ui_tars_action(parsed_action, task, step, browser_window_dimension, idx)
                 if action:
                     actions.append(action)
             except Exception:
@@ -838,7 +836,7 @@ async def parse_ui_tars_actions(
                     parsed_action=parsed_action,
                 )
                 continue
-        
+
         if not actions:
             LOG.warning(
                 "No valid actions generated from UI-TARS response",
@@ -846,9 +844,9 @@ async def parse_ui_tars_actions(
                 step_id=step.step_id,
                 response_preview=response_content[:200],
             )
-        
+
         return actions
-        
+
     except Exception:
         LOG.exception(
             "Failed to parse UI-TARS actions",
@@ -861,23 +859,22 @@ async def parse_ui_tars_actions(
 
 def _parse_ui_tars_response(response_content: str, browser_window_dimension: Resolution) -> list[dict[str, Any]]:
     """Parse UI-TARS response text into structured action data.
-    
+
     Extracts essential parsing logic from action_parser.py without the complex coordinate transformations.
     """
-    import ast
     import re
-    
+
     text = response_content.strip()
-    
+
     # Convert point format to coordinates if needed
     if "<point>" in text:
         text = _convert_point_to_coordinates(text)
-    
+
     # Normalize parameter names
     text = text.replace("start_point=", "start_box=")
     text = text.replace("end_point=", "end_box=")
     text = text.replace("point=", "start_box=")
-    
+
     # Extract thought/reasoning
     thought = None
     thought_patterns = [
@@ -885,7 +882,7 @@ def _parse_ui_tars_response(response_content: str, browser_window_dimension: Res
         r"Reflection: (.+?)Action_Summary: (.+?)(?=\s*Action: |$)",
         r"Action_Summary: (.+?)(?=\s*Action: |$)",
     ]
-    
+
     for pattern in thought_patterns:
         thought_match = re.search(pattern, text, re.DOTALL)
         if thought_match:
@@ -894,22 +891,22 @@ def _parse_ui_tars_response(response_content: str, browser_window_dimension: Res
             elif len(thought_match.groups()) == 2:
                 thought = thought_match.group(2).strip()  # Use Action_Summary
             break
-    
+
     if "Action:" not in text:
         raise ValueError("No Action section found in UI-TARS response")
-    
+
     # Extract action string
     action_str = text.split("Action: ")[-1]
-    
+
     # Split multiple actions
     action_parts = action_str.split(")\n\n")
     all_actions = []
-    
+
     for action_part in action_parts:
         action_part = action_part.strip()
         if not action_part:
             continue
-            
+
         # Handle type action with content specially
         if "type(content" in action_part:
             if not action_part.endswith(")"):
@@ -922,12 +919,12 @@ def _parse_ui_tars_response(response_content: str, browser_window_dimension: Res
                 # Escape single quotes in content
                 content = content.replace("'", "\\'")
                 action_part = f"type(content='{content}')"
-        
+
         if not action_part.endswith(")"):
             action_part += ")"
-            
+
         all_actions.append(action_part)
-    
+
     # Parse each action
     parsed_actions = []
     for action_str in all_actions:
@@ -944,25 +941,25 @@ def _parse_ui_tars_response(response_content: str, browser_window_dimension: Res
                 exc_info=True,
             )
             continue
-    
+
     return parsed_actions
 
 
 def _parse_single_action(action_str: str) -> dict[str, Any] | None:
     """Parse a single action string into structured data."""
     import ast
-    
+
     try:
         # Clean up the action string
         action_str = action_str.replace("\n", "\\n").strip()
-        
+
         # Parse as Python expression
-        node = ast.parse(action_str, mode='eval')
+        node = ast.parse(action_str, mode="eval")
         if not isinstance(node, ast.Expression) or not isinstance(node.body, ast.Call):
             return None
-        
+
         call = node.body
-        
+
         # Get function name
         if isinstance(call.func, ast.Name):
             func_name = call.func.id
@@ -970,7 +967,7 @@ def _parse_single_action(action_str: str) -> dict[str, Any] | None:
             func_name = call.func.attr
         else:
             return None
-        
+
         # Get arguments
         action_inputs = {}
         for kw in call.keywords:
@@ -980,12 +977,12 @@ def _parse_single_action(action_str: str) -> dict[str, Any] | None:
                 else:  # ast.Str for older Python versions
                     value = kw.value.s
                 action_inputs[kw.arg] = value
-        
+
         return {
             "action_type": func_name,
             "action_inputs": action_inputs,
         }
-        
+
     except Exception:
         LOG.debug(f"Failed to parse action string: {action_str}", exc_info=True)
         return None
@@ -994,13 +991,14 @@ def _parse_single_action(action_str: str) -> dict[str, Any] | None:
 def _convert_point_to_coordinates(text: str) -> str:
     """Convert <point>x y</point> format to (x,y) format."""
     import re
-    
+    from typing import Match
+
     pattern = r"<point>(\d+)\s+(\d+)</point>"
-    
-    def replace_match(match):
+
+    def replace_match(match: Match[str]) -> str:
         x, y = map(int, match.groups())
         return f"({x},{y})"
-    
+
     return re.sub(pattern, replace_match, text)
 
 
@@ -1015,7 +1013,7 @@ def _create_ui_tars_action(
     action_type = parsed_action.get("action_type", "")
     action_inputs = parsed_action.get("action_inputs", {})
     thought = parsed_action.get("thought", "")
-    
+
     base_params = {
         "reasoning": thought,
         "intention": thought,
@@ -1026,11 +1024,9 @@ def _create_ui_tars_action(
         "step_order": step.order,
         "action_order": action_order,
     }
-    
+
     if action_type == "click":
-        x, y = _extract_ui_tars_coordinates(
-            action_inputs.get("start_box", ""), browser_window_dimension
-        )
+        x, y = _extract_ui_tars_coordinates(action_inputs.get("start_box", ""), browser_window_dimension)
         if x is None or y is None:
             return None
         return ClickAction(
@@ -1040,11 +1036,9 @@ def _create_ui_tars_action(
             response=f"Click at ({x}, {y})",
             **base_params,
         )
-    
+
     elif action_type == "left_double":
-        x, y = _extract_ui_tars_coordinates(
-            action_inputs.get("start_box", ""), browser_window_dimension
-        )
+        x, y = _extract_ui_tars_coordinates(action_inputs.get("start_box", ""), browser_window_dimension)
         if x is None or y is None:
             return None
         return ClickAction(
@@ -1056,11 +1050,9 @@ def _create_ui_tars_action(
             response=f"Double click at ({x}, {y})",
             **base_params,
         )
-    
+
     elif action_type == "right_single":
-        x, y = _extract_ui_tars_coordinates(
-            action_inputs.get("start_box", ""), browser_window_dimension
-        )
+        x, y = _extract_ui_tars_coordinates(action_inputs.get("start_box", ""), browser_window_dimension)
         if x is None or y is None:
             return None
         return ClickAction(
@@ -1071,7 +1063,7 @@ def _create_ui_tars_action(
             response=f"Right click at ({x}, {y})",
             **base_params,
         )
-    
+
     elif action_type == "type":
         content = action_inputs.get("content", "")
         if not content:
@@ -1082,14 +1074,10 @@ def _create_ui_tars_action(
             response=f"Type: {content[:50]}{'...' if len(content) > 50 else ''}",
             **base_params,
         )
-    
+
     elif action_type in ["drag", "select"]:
-        start_x, start_y = _extract_ui_tars_coordinates(
-            action_inputs.get("start_box", ""), browser_window_dimension
-        )
-        end_x, end_y = _extract_ui_tars_coordinates(
-            action_inputs.get("end_box", ""), browser_window_dimension
-        )
+        start_x, start_y = _extract_ui_tars_coordinates(action_inputs.get("start_box", ""), browser_window_dimension)
+        end_x, end_y = _extract_ui_tars_coordinates(action_inputs.get("end_box", ""), browser_window_dimension)
         if None in (start_x, start_y, end_x, end_y):
             return None
         return DragAction(
@@ -1099,7 +1087,7 @@ def _create_ui_tars_action(
             response=f"Drag from ({start_x}, {start_y}) to ({end_x}, {end_y})",
             **base_params,
         )
-    
+
     elif action_type == "hotkey":
         key_combo = action_inputs.get("key", action_inputs.get("hotkey", ""))
         if not key_combo:
@@ -1110,17 +1098,15 @@ def _create_ui_tars_action(
             response=f"Hotkey: {key_combo}",
             **base_params,
         )
-    
+
     elif action_type == "scroll":
         direction = action_inputs.get("direction", "down").lower()
-        x, y = _extract_ui_tars_coordinates(
-            action_inputs.get("start_box", ""), browser_window_dimension
-        )
+        x, y = _extract_ui_tars_coordinates(action_inputs.get("start_box", ""), browser_window_dimension)
         if x is None or y is None:
             # Use center of screen as fallback
             x = browser_window_dimension["width"] // 2
             y = browser_window_dimension["height"] // 2
-        
+
         scroll_amount = 300
         if direction == "down":
             scroll_x, scroll_y = 0, scroll_amount
@@ -1132,7 +1118,7 @@ def _create_ui_tars_action(
             scroll_x, scroll_y = -scroll_amount, 0
         else:
             scroll_x, scroll_y = 0, scroll_amount
-        
+
         return ScrollAction(
             element_id="",
             x=x,
@@ -1142,50 +1128,48 @@ def _create_ui_tars_action(
             response=f"Scroll {direction} at ({x}, {y})",
             **base_params,
         )
-    
+
     elif action_type == "wait":
         return WaitAction(
             seconds=5,
             **base_params,
         )
-    
+
     elif action_type == "finished":
         return CompleteAction(
             data_extraction_goal=task.data_extraction_goal,
             verified=True,  # UI-TARS has already determined completion, skip Skyvern validation
             **base_params,
         )
-    
+
     else:
         LOG.warning(f"Unsupported UI-TARS action type: {action_type}")
         return None
 
 
-def _extract_ui_tars_coordinates(
-    box_str: str, browser_window_dimension: Resolution
-) -> tuple[int | None, int | None]:
+def _extract_ui_tars_coordinates(box_str: str, browser_window_dimension: Resolution) -> tuple[int | None, int | None]:
     """Extract coordinates from UI-TARS box format with proper coordinate conversion.
-    
+
     UI-TARS coordinates need to be divided by 1000 to convert from the model's output
     format to relative coordinates (0-1 range), then multiplied by screen dimensions
     to get absolute pixel coordinates.
     """
     import ast
-    
+
     if not box_str:
         return None, None
-    
+
     try:
         # Parse coordinates from string format like "(450,320)" or "[0.5, 0.3, 0.5, 0.3]"
         coords = ast.literal_eval(box_str)
-        
+
         if not isinstance(coords, (list, tuple)):
             return None, None
-        
+
         if len(coords) == 2:
             # Direct coordinates like (450, 320) or (0.5, 0.3)
             x, y = coords
-            
+
             # UI-TARS specific coordinate conversion
             # UI-TARS outputs coordinates that need to be divided by 1000 first
             if x > 1 or y > 1:  # Likely UI-TARS format needing factor conversion
@@ -1193,41 +1177,47 @@ def _extract_ui_tars_coordinates(
                 x = x / 1000.0
                 y = y / 1000.0
                 LOG.debug(f"Applied UI-TARS factor conversion: ({original_x}, {original_y}) -> ({x}, {y})")
-            
+
             # Convert relative coordinates (0-1) to absolute screen coordinates
             if 0 <= x <= 1 and 0 <= y <= 1:
                 abs_x = int(x * browser_window_dimension["width"])
                 abs_y = int(y * browser_window_dimension["height"])
-                LOG.debug(f"Converted to absolute coordinates: ({abs_x}, {abs_y}) for screen {browser_window_dimension['width']}x{browser_window_dimension['height']}")
+                LOG.debug(
+                    f"Converted to absolute coordinates: ({abs_x}, {abs_y}) for screen {browser_window_dimension['width']}x{browser_window_dimension['height']}"
+                )
                 return abs_x, abs_y
-            
+
             return int(x), int(y)
-        
+
         elif len(coords) == 4:
             # Bounding box format [x1, y1, x2, y2] - take center point
             x1, y1, x2, y2 = coords
             x = (x1 + x2) / 2
             y = (y1 + y2) / 2
-            
+
             # UI-TARS specific coordinate conversion for bounding boxes
             if x > 1 or y > 1:  # Likely UI-TARS format needing factor conversion
                 original_x, original_y = x, y
                 x = x / 1000.0
                 y = y / 1000.0
-                LOG.debug(f"Applied UI-TARS factor conversion to bbox center: ({original_x}, {original_y}) -> ({x}, {y})")
-            
+                LOG.debug(
+                    f"Applied UI-TARS factor conversion to bbox center: ({original_x}, {original_y}) -> ({x}, {y})"
+                )
+
             # Convert relative coordinates (0-1) to absolute screen coordinates
             if 0 <= x <= 1 and 0 <= y <= 1:
                 abs_x = int(x * browser_window_dimension["width"])
                 abs_y = int(y * browser_window_dimension["height"])
-                LOG.debug(f"Converted bbox center to absolute coordinates: ({abs_x}, {abs_y}) for screen {browser_window_dimension['width']}x{browser_window_dimension['height']}")
+                LOG.debug(
+                    f"Converted bbox center to absolute coordinates: ({abs_x}, {abs_y}) for screen {browser_window_dimension['width']}x{browser_window_dimension['height']}"
+                )
                 return abs_x, abs_y
-            
+
             return int(x), int(y)
-        
+
         else:
             return None, None
-            
+
     except Exception:
         LOG.debug(f"Failed to parse UI-TARS coordinates: {box_str}", exc_info=True)
         return None, None

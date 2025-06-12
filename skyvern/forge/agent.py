@@ -7,7 +7,7 @@ import string
 from asyncio.exceptions import CancelledError
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, cast
+from typing import Any, Tuple, cast
 
 import httpx
 import structlog
@@ -1517,48 +1517,48 @@ class ForgeAgent:
         llm_caller: LLMCaller,
     ) -> list[Action]:
         """Generate actions using UI-TARS (Seed1.5-VL) model through the LLMCaller pattern."""
-        
+
         LOG.info(
             "UI-TARS action generation starts",
             task_id=task.task_id,
             step_id=step.step_id,
             step_order=step.order,
         )
-        
+
         # Ensure we have a UITarsLLMCaller instance
         if not isinstance(llm_caller, UITarsLLMCaller):
             raise ValueError(f"Expected UITarsLLMCaller, got {type(llm_caller)}")
-        
+
         # Add the current screenshot to conversation
         if scraped_page.screenshots:
             llm_caller.add_screenshot(scraped_page.screenshots[0])
         else:
             LOG.error("No screenshots found, skipping UI-TARS action generation")
             raise ValueError("No screenshots found, skipping UI-TARS action generation")
-        
+
         # Generate response using the LLMCaller
         response_content = await llm_caller.generate_ui_tars_response(step)
-        
+
         LOG.info(f"UI-TARS raw response: {response_content}")
 
-        
-        
-        window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else Resolution(width=1920, height=1080)
-        LOG.info(f"UI-TARS browser window dimension: {window_dimension}")
-        
-        actions = await parse_ui_tars_actions(
-            task, step, response_content, window_dimension
+        window_dimension = (
+            cast(Resolution, scraped_page.window_dimension)
+            if scraped_page.window_dimension
+            else Resolution(width=1920, height=1080)
         )
-        
+        LOG.info(f"UI-TARS browser window dimension: {window_dimension}")
+
+        actions = await parse_ui_tars_actions(task, step, response_content, window_dimension)
+
         LOG.info(
             "UI-TARS action generation completed",
             task_id=task.task_id,
             step_id=step.step_id,
             actions_count=len(actions),
         )
-        
+
         return actions
-    
+
     async def complete_verify(
         self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteVerifyResult:
@@ -2181,8 +2181,7 @@ class ForgeAgent:
             return
 
         await self.async_operation_pool.remove_task(task.task_id)
-        
-        
+
         await self.cleanup_browser_and_create_artifacts(
             close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
         )

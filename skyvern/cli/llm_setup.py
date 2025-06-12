@@ -170,14 +170,16 @@ def setup_llm_providers() -> None:
         else:
             update_or_add_env_var("UI_TARS_API_KEY", ui_tars_api_key)
             update_or_add_env_var("ENABLE_UI_TARS", "true")
-            
+
             # Optional: Allow customizing model endpoint
-            custom_model = Confirm.ask("Do you want to use a custom model endpoint? (default: doubao-1-5-thinking-vision-pro-250428)")
+            custom_model = Confirm.ask(
+                "Do you want to use a custom model endpoint? (default: doubao-1-5-thinking-vision-pro-250428)"
+            )
             if custom_model:
                 ui_tars_model = Prompt.ask("Enter your UI-TARS model endpoint ID")
                 if ui_tars_model:
                     update_or_add_env_var("UI_TARS_MODEL", ui_tars_model)
-            
+
             model_options.append("UI_TARS_SEED1_5_VL")
     else:
         update_or_add_env_var("ENABLE_UI_TARS", "false")
