@@ -53,7 +53,7 @@ function header(type: WorkflowEditorParameterType) {
     return "Add Secret Parameter";
   }
   if (type === "creditCardData") {
-    return "Add Credit Card Data Parameter";
+    return "Add Credit Card Parameter";
   }
   return "Add Context Parameter";
 }
