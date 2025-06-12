@@ -48,6 +48,7 @@ import {
   BlockYAML,
   ContextParameterYAML,
   CredentialParameterYAML,
+  OnePasswordCredentialParameterYAML,
   ParameterYAML,
   WorkflowCreateYAMLRequest,
   WorkflowParameterYAML,
@@ -101,6 +102,7 @@ function convertToParametersYAML(
   | ContextParameterYAML
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
+  | OnePasswordCredentialParameterYAML
   | CredentialParameterYAML
 > {
   return parameters
@@ -113,6 +115,7 @@ function convertToParametersYAML(
         | ContextParameterYAML
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
+        | OnePasswordCredentialParameterYAML
         | CredentialParameterYAML
         | undefined => {
         if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
@@ -214,6 +217,7 @@ function convertToParametersYAML(
           | ContextParameterYAML
           | BitwardenSensitiveInformationParameterYAML
           | BitwardenCreditCardDataParameterYAML
+          | OnePasswordCredentialParameterYAML
           | CredentialParameterYAML
           | undefined,
       ): param is
@@ -222,6 +226,7 @@ function convertToParametersYAML(
         | ContextParameterYAML
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
+        | OnePasswordCredentialParameterYAML
         | CredentialParameterYAML => param !== undefined,
     );
 }

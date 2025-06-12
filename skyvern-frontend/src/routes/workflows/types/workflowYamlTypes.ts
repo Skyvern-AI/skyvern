@@ -23,12 +23,12 @@ export type ParameterYAML =
   | WorkflowParameterYAML
   | BitwardenLoginCredentialParameterYAML
   | AWSSecretParameterYAML
-  | CredentialParameterYAML
-  | ContextParameterYAML
-  | OutputParameterYAML
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
-  | OnePasswordCredentialParameterYAML;
+  | OnePasswordCredentialParameterYAML
+  | ContextParameterYAML
+  | OutputParameterYAML
+  | CredentialParameterYAML;
 
 export type ParameterYAMLBase = {
   parameter_type: string;

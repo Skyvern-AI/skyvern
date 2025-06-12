@@ -77,4 +77,13 @@ export type ParametersState = Array<
       description?: string | null;
     }
   | CredentialParameterState
+  | {
+      key: string;
+      parameterType: "secret";
+      maybe: boolean;
+      identityKey: string;
+      identityFields: Array<string>;
+      collectionId: string;
+      description?: string | null;
+    }
 >;
