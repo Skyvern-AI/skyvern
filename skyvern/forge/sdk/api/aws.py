@@ -337,5 +337,8 @@ class S3Uri:
     def uri(self) -> str:
         return self._parsed.geturl()
 
+    def __str__(self) -> str:
+        return self.uri
+
 
 aws_client = AsyncAWSClient()
