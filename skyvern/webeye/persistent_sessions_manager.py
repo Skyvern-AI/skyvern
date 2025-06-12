@@ -6,6 +6,7 @@ import structlog
 from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge.sdk.db.client import AgentDB
+from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.webeye.browser_factory import BrowserState
 
@@ -29,6 +30,23 @@ class PersistentSessionsManager:
             cls.instance = super().__new__(cls)
         cls.instance.database = database
         return cls.instance
+
+    async def get_browser_address(self, session_id: str, organization_id: str) -> tuple[str, str, str]:
+        address = await wait_on_persistent_browser_address(self.database, session_id, organization_id)
+
+        if address is None:
+            raise Exception(f"Browser address not found for persistent browser session {session_id}")
+
+        protocol = "http"
+        host, cdp_port = address.split(":")
+
+        return protocol, host, cdp_port
+
+    async def get_session_by_runnable_id(
+        self, runnable_id: str, organization_id: str
+    ) -> PersistentBrowserSession | None:
+        """Get a specific browser session by runnable ID."""
+        return await self.database.get_persistent_browser_session_by_runnable_id(runnable_id, organization_id)
 
     async def get_active_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active sessions for an organization."""
