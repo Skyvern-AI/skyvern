@@ -51,7 +51,7 @@ services:
     # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
      - ENABLE_OPENAI=true
      - LLM_KEY=OPENAI_GPT4O
-     - OPENAI_API_KEY=${OPEN_AI_API_KEY}
+     - 'OPENAI_API_KEY=${OPEN_AI_API_KEY}'
     #  Gemini Support:
     # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
     # - LLM_KEY=GEMINI
