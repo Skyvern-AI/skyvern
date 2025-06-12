@@ -6,7 +6,8 @@ services:
     # ports:
     #   - 5432:5432
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      # Using a named volume for persistent database storage on the server
+      - postgres-data:/var/lib/postgresql/data
     environment:
       - PGDATA=/var/lib/postgresql/data/pgdata
       - POSTGRES_USER=skyvern
@@ -20,19 +21,17 @@ services:
   skyvern:
     image: public.ecr.aws/skyvern/skyvern:latest
     restart: on-failure
-  #  Uncomment the follwoing two lines if you want to manage .env
-  #  env_file:
-  #   - .env
-    # comment out if you want to externally call skyvern API
+    # env_file is removed to manage variables in the Coolify UI.
     ports:
       - 8001:8000
       - 9222:9222 # for cdp browser forwarding
     volumes:
-      - ./artifacts:/data/artifacts
-      - ./videos:/data/videos
-      - ./har:/data/har
-      - ./log:/data/log
-      - ./.streamlit:/app/.streamlit
+      # Using named volumes for persistent artifact/log storage
+      - artifacts-data:/data/artifacts
+      - videos-data:/data/videos
+      - har-data:/data/har
+      - log-data:/data/log
+      - streamlit-data:/app/.streamlit
       # Uncomment the following two lines if you want to connect to any local changes
       # - ./skyvern:/app/skyvern
       # - ./alembic:/app/alembic
@@ -45,80 +44,59 @@ services:
       # "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\chrome-cdp-profile" --no-first-run --no-default-browser-check
       # /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="/Users/yourusername/chrome-cdp-profile" --no-first-run --no-default-browser-check
       # - BROWSER_REMOTE_DEBUGGING_URL=http://host.docker.internal:9222/
-    # =========================
-    #       LLM Settings - Recommended to use skyvern CLI, `skyvern init llm` to setup your LLM's
-    # =========================
-    # OpenAI Support:
-    # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
-     - ENABLE_OPENAI=true
-     - LLM_KEY=OPENAI_GPT4O
-     - OPENAI_API_KEY=${OPENAI_API_KEY}
-    #  Gemini Support:
-    # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
-    # - LLM_KEY=GEMINI
-    # - ENABLE_GEMINI=true
-    # - GEMINI_API_KEY=YOUR_GEMINI_KEY
-    # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
-    # If you want to use other LLM provider, like azure and anthropic:
-    # - ENABLE_ANTHROPIC=true
-    # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
-    # - ANTHROPIC_API_KEY=<your_anthropic_key>
-    # Microsoft Azure OpenAI support:
-    # If you'd like to use Microsoft Azure OpenAI as your managed LLM service integration with Skyvern, use the environment variables below.
-    # In your Microsoft Azure subscription, you will need to provision the OpenAI service and deploy a model, in order to utilize it.
-    # 1. Login to the Azure Portal
-    # 2. Create an Azure Resource Group
-    # 3. Create an OpenAI resource in the Resource Group (choose a region and pricing tier)
-    # 4. From the OpenAI resource's Overview page, open the "Azure AI Foundry" portal (click the "Explore Azure AI Foundry Portal" button)
-    # 5. In Azure AI Foundry, click "Shared Resources" --> "Deployments"
-    # 6. Click "Deploy Model" --> "Deploy Base Model" --> select a model (specify this model "Deployment Name" value for the AZURE_DEPLOYMENT variable below)
-    # - ENABLE_AZURE=true
-    # - LLM_KEY=AZURE_OPENAI                          # Leave this value static, don't change it
-    # - AZURE_DEPLOYMENT=<your_azure_deployment>      # Use the OpenAI model "Deployment Name" that you deployed, using the steps above
-    # - AZURE_API_KEY=<your_azure_api_key>            # Copy and paste Key1 or Key2 from the OpenAI resource in Azure Portal
-    # - AZURE_API_BASE=<your_azure_api_base>          # Copy and paste the "Endpoint" from the OpenAI resource in Azure Portal (eg. https://xyzxyzxyz.openai.azure.com/)
-    # - AZURE_API_VERSION=<your_azure_api_version>    # Specify a valid Azure OpenAI data-plane API version (eg. 2024-08-01-preview) Docs: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
-    # Amazon Bedrock Support:
-    # Amazon Bedrock is a managed service that enables you to invoke LLMs and bill them through your AWS account.
-    # To use Amazon Bedrock as the LLM provider for Skyvern, specify the following environment variables.
-    # 1. In the AWS IAM console, create a new AWS IAM User (name it whatever you want)
-    # 2. Assign the "AmazonBedrockFullAccess" policy to the user
-    # 3. Generate an IAM Access Key under the IAM User's Security Credentials tab
-    # 4. In the Amazon Bedrock console, go to "Model Access"
-    # 5. Click Modify Model Access button
-    # 6. Enable "Claude 3.5 Sonnet v2" and save changes
-    # - ENABLE_BEDROCK=true
-    # - LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET   # This is the Claude 3.5 Sonnet "V2" model. Change to BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET_V1 for the non-v2 version.
-    # - AWS_REGION=us-west-2                         # Replace this with a different AWS region, if you desire
-    # - AWS_ACCESS_KEY_ID=FILL_ME_IN_PLEASE
-    # - AWS_SECRET_ACCESS_KEY=FILL_ME_IN_PLEASE
-    # Ollama Support:
-    # Ollama is a local LLM provider that can be used to run models locally on your machine.
-    # - LLM_KEY=OLLAMA
-    # - ENABLE_OLLAMA=true
-    # - OLLAMA_MODEL=qwen2.5:7b-instruct
-    # - OLLAMA_SERVER_URL=http://host.docker.internal:11434
-    # Open Router Support:
-    # - ENABLE_OPENROUTER=true
-    # - LLM_KEY=OPENROUTER
-    # - OPENROUTER_API_KEY=<your_openrouter_api_key>
-    # - OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
-    # Groq Support:
-    # - ENABLE_GROQ=true
-    # - LLM_KEY=GROQ
-    # - GROQ_API_KEY=<your_groq_api_key>
-    # - GROQ_MODEL=llama-3.1-8b-instant
-
-    # Maximum tokens to use: (only set for OpenRouter aand Ollama)
-    # - LLM_CONFIG_MAX_TOKENS=128000
-
-    # Bitwarden Settings
-    # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
-    # - BITWARDEN_SERVER=http://localhost  # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
-    # - BITWARDEN_SERVER_PORT=8002 # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
-    # - BITWARDEN_CLIENT_ID=FILL_ME_IN_PLEASE
-    # - BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
-    # - BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
+      # =========================
+      #       LLM Settings - Recommended to use skyvern CLI, `skyvern init llm` to setup your LLM's
+      # =========================
+      # OpenAI Support:
+      - ENABLE_OPENAI=true
+      - LLM_KEY=OPENAI_GPT4O
+      - OPENAI_API_KEY=${OPENAI_API_KEY} # Set this secret in the Coolify UI
+      # Gemini Support:
+      # To use, uncomment and set the GEMINI_API_KEY in the Coolify UI.
+      # - LLM_KEY=GEMINI
+      # - ENABLE_GEMINI=true
+      # - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
+      # Anthropic Support:
+      # - ENABLE_ANTHROPIC=true
+      # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Microsoft Azure OpenAI support:
+      # - ENABLE_AZURE=true
+      # - LLM_KEY=AZURE_OPENAI                          # Leave this value static, don't change it
+      # - AZURE_DEPLOYMENT=${AZURE_DEPLOYMENT}      # Use the OpenAI model "Deployment Name" that you deployed
+      # - AZURE_API_KEY=${AZURE_API_KEY}            # Copy and paste Key1 or Key2 from the OpenAI resource in Azure Portal
+      # - AZURE_API_BASE=${AZURE_API_BASE}          # Copy and paste the "Endpoint" from the OpenAI resource in Azure Portal
+      # - AZURE_API_VERSION=${AZURE_API_VERSION}    # Specify a valid Azure OpenAI data-plane API version (eg. 2024-08-01-preview)
+      # Amazon Bedrock Support:
+      # - ENABLE_BEDROCK=true
+      # - LLM_KEY=BEDROCK_ANTHROPIC_CLAUDE3.5_SONNET
+      # - AWS_REGION=us-west-2
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # Ollama Support:
+      # - LLM_KEY=OLLAMA
+      # - ENABLE_OLLAMA=true
+      # - OLLAMA_MODEL=qwen2.5:7b-instruct
+      # - OLLAMA_SERVER_URL=http://host.docker.internal:11434
+      # Open Router Support:
+      # - ENABLE_OPENROUTER=true
+      # - LLM_KEY=OPENROUTER
+      # - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # - OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct
+      # Groq Support:
+      # - ENABLE_GROQ=true
+      # - LLM_KEY=GROQ
+      # - GROQ_API_KEY=${GROQ_API_KEY}
+      # - GROQ_MODEL=llama-3.1-8b-instant
+      # Maximum tokens to use: (only set for OpenRouter and Ollama)
+      # - LLM_CONFIG_MAX_TOKENS=128000
+      # Bitwarden Settings
+      # - BITWARDEN_SERVER=http://localhost
+      # - BITWARDEN_SERVER_PORT=8002
+      # - BITWARDEN_CLIENT_ID=${BITWARDEN_CLIENT_ID}
+      # - BITWARDEN_CLIENT_SECRET=${BITWARDEN_CLIENT_SECRET}
+      # - BITWARDEN_MASTER_PASSWORD=${BITWARDEN_MASTER_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
@@ -127,6 +105,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
   skyvern-ui:
     image: public.ecr.aws/skyvern/skyvern-ui:latest
     restart: on-failure
@@ -134,21 +113,32 @@ services:
       - 8080:8080
       - 9090:9090
     volumes:
-      - ./artifacts:/data/artifacts
-      - ./videos:/data/videos
-      - ./har:/data/har
-      - ./.streamlit:/app/.streamlit
-    env_file:
-      - skyvern-frontend/.env
-    environment: {}
-environment:
-  # This tells Coolify to manage a domain for skyvern-ui itself
-  - SERVICE_FQDN_SKYVERN_UI_8080 
-  
-  # Templating to find the backend's URL
-  - VITE_API_BASE_URL=https://{{services.skyvern.fqdn}}/api/v1 
-  - VITE_WSS_BASE_URL=wss://{{services.skyvern.fqdn}}/api/v1
-  - 'VITE_ARTIFACT_API_BASE_URL=${SERVICE_FQDN_SKYVERN_UI}'
+      # Using named volumes shared with the skyvern service
+      - artifacts-data:/data/artifacts
+      - videos-data:/data/videos
+      - har-data:/data/har
+      - streamlit-data:/app/.streamlit
+    # The environment block is now correctly placed here and uses Coolify's templating.
+    environment:
+      # This tells Coolify to manage a domain for this service on port 8080
+      - SERVICE_FQDN_SKYVERN_UI_8080
+      # Templating to find the backend's URL. Coolify substitutes this before deployment.
+      - VITE_API_BASE_URL=https://{{services.skyvern.fqdn}}/api/v1
+      - VITE_WSS_BASE_URL=wss://{{services.skyvern.fqdn}}/api/v1
+      # This uses the variable created by the SERVICE_FQDN directive above.
+      - 'VITE_ARTIFACT_API_BASE_URL=${SERVICE_FQDN_SKYVERN_UI}'
+      # This will appear as an editable field in the UI. Get the value from the Skyvern UI's settings page after first deployment.
+      - VITE_SKYVERN_API_KEY=${VITE_SKYVERN_API_KEY}
     depends_on:
       skyvern:
         condition: service_healthy
+
+# Top-level declaration for all named volumes used by the services.
+# This is required for Docker to create them.
+volumes:
+  postgres-data: {}
+  artifacts-data: {}
+  videos-data: {}
+  har-data: {}
+  log-data: {}
+  streamlit-data: {}
