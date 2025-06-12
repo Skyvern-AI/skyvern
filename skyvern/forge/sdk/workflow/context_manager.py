@@ -1,7 +1,7 @@
 import copy
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Self, Tuple
+from typing import TYPE_CHECKING, Any, Self
 
 import structlog
 from onepassword.client import Client as OnePasswordClient
@@ -186,7 +186,7 @@ class WorkflowRunContext:
     def generate_random_secret_id() -> str:
         return f"secret_{uuid.uuid4()}"
 
-    async def _get_credential_vault_and_item_ids(self, credential_id: str) -> Tuple[str, str]:
+    async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
         Extract vault_id and item_id from the credential_id.
         This method handles the legacy format vault_id:item_id.
