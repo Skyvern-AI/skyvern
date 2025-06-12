@@ -22,7 +22,7 @@ import {
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Link,
   useNavigate,
@@ -40,12 +40,22 @@ function WorkflowPage() {
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const navigate = useNavigate();
 
+  const PAGE_SIZE = 10;
+
   const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
     workflowPermanentId,
     statusFilters,
     page,
     refetchOnMount: "always",
   });
+
+  useEffect(() => {
+    if (!isLoading && workflowRuns && workflowRuns.length === 0 && page > 1) {
+      const params = new URLSearchParams();
+      params.set("page", String(page - 1));
+      setSearchParams(params, { replace: true });
+    }
+  }, [workflowRuns, isLoading, page, setSearchParams]);
 
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -170,7 +180,15 @@ function WorkflowPage() {
               </PaginationItem>
               <PaginationItem>
                 <PaginationNext
+                  className={cn({
+                    "cursor-not-allowed":
+                      workflowRuns !== undefined &&
+                      workflowRuns.length < PAGE_SIZE,
+                  })}
                   onClick={() => {
+                    if (workflowRuns && workflowRuns.length < PAGE_SIZE) {
+                      return;
+                    }
                     const params = new URLSearchParams();
                     params.set("page", String(page + 1));
                     setSearchParams(params, { replace: true });

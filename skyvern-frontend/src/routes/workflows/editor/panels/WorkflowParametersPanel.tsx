@@ -117,7 +117,7 @@ function WorkflowParametersPanel() {
                 });
               }}
             >
-              Credit Card Data Parameter
+              Credit Card Parameter
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
