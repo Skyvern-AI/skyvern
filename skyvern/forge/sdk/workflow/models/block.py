@@ -939,7 +939,6 @@ class ForLoopBlock(Block):
         workflow_run_context: WorkflowRunContext,
         loop_over_values: list[Any],
         organization_id: str | None = None,
-        browser_session_id: str | None = None,
     ) -> LoopBlockExecutedResult:
         outputs_with_loop_values: list[list[dict[str, Any]]] = []
         block_outputs: list[BlockResult] = []
@@ -968,7 +967,6 @@ class ForLoopBlock(Block):
                     workflow_run_id=workflow_run_id,
                     parent_workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
-                    browser_session_id=browser_session_id,
                 )
 
                 output_value = (
@@ -1121,7 +1119,6 @@ class ForLoopBlock(Block):
             workflow_run_context=workflow_run_context,
             loop_over_values=loop_over_values,
             organization_id=organization_id,
-            browser_session_id=browser_session_id,
         )
         await self.record_output_parameter_value(
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
