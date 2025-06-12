@@ -25,7 +25,7 @@ services:
     # env_file is removed to manage variables in the Coolify UI.
     ports:
       # Includes default values. Coolify UI variables will override these.
-      - "${SKYVERN_HOST_PORT:-8001}:8000"
+      - "${SKYVERN_HOST_PORT:-8001}:8001"
       - "${CDP_HOST_PORT:-9222}:9222"
     volumes:
       # Using named volumes for persistent artifact/log storage
