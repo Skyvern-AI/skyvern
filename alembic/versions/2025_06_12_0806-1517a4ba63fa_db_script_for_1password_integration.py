@@ -1,7 +1,7 @@
 """db script for 1password integration
 
 Revision ID: 1517a4ba63fa
-Revises: 7bc030a082fa
+Revises: add_run_timestamps, 7bc030a082fa
 Create Date: 2025-06-12 08:06:13.439802+00:00
 
 """
