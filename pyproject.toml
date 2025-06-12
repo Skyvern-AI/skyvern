@@ -73,6 +73,7 @@ anthropic = "^0.50.0"
 google-cloud-aiplatform = "^1.90.0"
 alive-progress = "^3.2.0"
 colorama = "^0.4.6"
+onepassword-sdk = "0.3.0"
 types-boto3 = {extras = ["full"], version = "^1.38.31"}
 
 [tool.poetry.group.dev.dependencies]

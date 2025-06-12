@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenSensitiveInformationParameterModel,
     CredentialModel,
     CredentialParameterModel,
+    OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
     OrganizationModel,
@@ -80,6 +81,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -625,6 +627,12 @@ class AgentDB:
                 ).first():
                     if status is not None:
                         task.status = status
+                        if status == TaskStatus.queued and task.queued_at is None:
+                            task.queued_at = datetime.utcnow()
+                        if status == TaskStatus.running and task.started_at is None:
+                            task.started_at = datetime.utcnow()
+                        if status.is_final() and task.finished_at is None:
+                            task.finished_at = datetime.utcnow()
                     if extracted_information is not None:
                         task.extracted_information = extracted_information
                     if failure_reason is not None:
@@ -1499,6 +1507,12 @@ class AgentDB:
             if workflow_run:
                 workflow_run.status = status
                 workflow_run.failure_reason = failure_reason
+                if status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
+                    workflow_run.queued_at = datetime.utcnow()
+                if status == WorkflowRunStatus.running and workflow_run.started_at is None:
+                    workflow_run.started_at = datetime.utcnow()
+                if status.is_final() and workflow_run.finished_at is None:
+                    workflow_run.finished_at = datetime.utcnow()
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -1890,6 +1904,32 @@ class AgentDB:
                 created_at=credential_parameter.created_at,
                 modified_at=credential_parameter.modified_at,
                 deleted_at=credential_parameter.deleted_at,
+            )
+
+    async def create_onepassword_credential_parameter(
+        self, workflow_id: str, key: str, vault_id: str, item_id: str, description: str | None = None
+    ) -> OnePasswordCredentialParameter:
+        async with self.Session() as session:
+            parameter = OnePasswordCredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                vault_id=vault_id,
+                item_id=item_id,
+            )
+            session.add(parameter)
+            await session.commit()
+            await session.refresh(parameter)
+            return OnePasswordCredentialParameter(
+                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_id=parameter.vault_id,
+                item_id=parameter.item_id,
+                created_at=parameter.created_at,
+                modified_at=parameter.modified_at,
+                deleted_at=parameter.deleted_at,
             )
 
     async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
@@ -2542,6 +2582,12 @@ class AgentDB:
             if task_v2:
                 if status:
                     task_v2.status = status
+                    if status == TaskV2Status.queued and task_v2.queued_at is None:
+                        task_v2.queued_at = datetime.utcnow()
+                    if status == TaskV2Status.running and task_v2.started_at is None:
+                        task_v2.started_at = datetime.utcnow()
+                    if status.is_final() and task_v2.finished_at is None:
+                        task_v2.finished_at = datetime.utcnow()
                 if workflow_run_id:
                     task_v2.workflow_run_id = workflow_run_id
                 if workflow_id:
