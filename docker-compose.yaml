@@ -123,11 +123,13 @@ services:
       - streamlit-data:/app/.streamlit
     # The environment block is now correctly placed here and uses Coolify's templating.
     environment:
+      # Declare the Service FQDN in Coolify
+      - SERVICE_FQDN_UI_8081
       # Templating to find the backend's URL. Coolify substitutes this before deployment.
-      - VITE_API_BASE_URL=https://{{services.skyvern.fqdn}}/api/v1
-      - VITE_WSS_BASE_URL=wss://{{services.skyvern.fqdn}}/api/v1
+      - VITE_API_BASE_URL=${SERVICE_FQDN_API}/api/v1
+      - VITE_WSS_BASE_URL=${SERVICE_FQDN_API/https\:\/\//wss:\/\/}/api/v1
       # This uses Coolify templating to reference this service's own domain.
-      - VITE_ARTIFACT_API_BASE_URL=https://{{services.skyvern-ui.fqdn}}
+      - VITE_ARTIFACT_API_BASE_URL=${SERVICE_FQDN_UI}
       # This will appear as an editable field in the UI. Get the value from the Skyvern UI's settings page after first deployment.
       - VITE_SKYVERN_API_KEY=${VITE_SKYVERN_API_KEY}
     depends_on:
