@@ -1365,13 +1365,6 @@ async def get_workflow_run_with_workflow_id(
 
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
 
-    LOG.info(
-        "workflow-run.assign-browser-session-id",
-        runnable_id=workflow_run_id,
-        browser_session_id=browser_session_id,
-        organization_id=current_org.organization_id,
-    )
-
     return_dict["browser_session_id"] = browser_session_id
 
     task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
