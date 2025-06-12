@@ -265,6 +265,12 @@ class Settings(BaseSettings):
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"
     SKYVERN_API_KEY: str = "PLACEHOLDER"
 
+    PERSISTENT_BROWSER_VNC_PORT: int = 6080
+    """
+    The websockified port on which the VNC server of a persistent browser is 
+    listening.
+    """
+
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
