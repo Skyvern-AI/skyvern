@@ -7542,14 +7542,14 @@ files = [
 
 [[package]]
 name = "types-boto3"
-version = "1.38.35"
-description = "Type annotations for boto3 1.38.35 generated with mypy-boto3-builder 8.11.0"
+version = "1.38.31"
+description = "Type annotations for boto3 1.38.31 generated with mypy-boto3-builder 8.11.0"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "types_boto3-1.38.35-py3-none-any.whl", hash = "sha256:0fc49a17d450759a133c15eff61cc50c5b414a725865baff25ceb36d3bace276"},
-    {file = "types_boto3-1.38.35.tar.gz", hash = "sha256:cf6e83137166765859014260c67adc850563f701ca214387dacc3b8734858e52"},
+    {file = "types_boto3-1.38.31-py3-none-any.whl", hash = "sha256:f4a4ee4cf4bbad967b2c538f33197907e34dff2da6cc1df398203d73d7d734b3"},
+    {file = "types_boto3-1.38.31.tar.gz", hash = "sha256:dca7942fc84af05d3ebcc69122a519939b993d724d750d4a090b6e20cb8aabe6"},
 ]
 
 [package.dependencies]
@@ -7606,7 +7606,7 @@ bedrock-data-automation-runtime = ["types-boto3-bedrock-data-automation-runtime 
 bedrock-runtime = ["types-boto3-bedrock-runtime (>=1.38.0,<1.39.0)"]
 billing = ["types-boto3-billing (>=1.38.0,<1.39.0)"]
 billingconductor = ["types-boto3-billingconductor (>=1.38.0,<1.39.0)"]
-boto3 = ["boto3 (==1.38.35)"]
+boto3 = ["boto3 (==1.38.31)"]
 braket = ["types-boto3-braket (>=1.38.0,<1.39.0)"]
 budgets = ["types-boto3-budgets (>=1.38.0,<1.39.0)"]
 ce = ["types-boto3-ce (>=1.38.0,<1.39.0)"]
@@ -7970,14 +7970,14 @@ xray = ["types-boto3-xray (>=1.38.0,<1.39.0)"]
 
 [[package]]
 name = "types-boto3-full"
-version = "1.38.35"
-description = "All-in-one type annotations for boto3 1.38.35 generated with mypy-boto3-builder 8.11.0"
+version = "1.38.31"
+description = "All-in-one type annotations for boto3 1.38.31 generated with mypy-boto3-builder 8.11.0"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "types_boto3_full-1.38.35-py3-none-any.whl", hash = "sha256:408709e741a9b65ec66b42c2279802fcce4d98bc5fe0be8440194bff9a57143a"},
-    {file = "types_boto3_full-1.38.35.tar.gz", hash = "sha256:3dfe1e4b817de1863d80b61af7b396b519896675115b91eebe5d133f6c13a7f4"},
+    {file = "types_boto3_full-1.38.31-py3-none-any.whl", hash = "sha256:4ea2278141191f780881b69a043b0857634343db7b54f4109c71f1ba47afaeb5"},
+    {file = "types_boto3_full-1.38.31.tar.gz", hash = "sha256:e4e1f09a9f15a118417bf433f8bb562bf209f8fc18c77b29cd550b0326d14080"},
 ]
 
 [package.dependencies]
