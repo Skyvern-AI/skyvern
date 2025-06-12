@@ -23,8 +23,8 @@ services:
     restart: on-failure
     # env_file is removed to manage variables in the Coolify UI.
     ports:
-      - "${SKYVERN_HOST_PORT}:8001"
-      - "${CDP_HOST_PORT}:9222" # for cdp browser forwarding
+      - "${SKYVERN_HOST_PORT:-8000}:8000"
+      - "${CDP_HOST_PORT:-9222}:9222" # for cdp browser forwarding
     volumes:
       # Using named volumes for persistent artifact/log storage
       - artifacts-data:/data/artifacts
@@ -109,9 +109,8 @@ services:
   skyvern-ui:
     image: public.ecr.aws/skyvern/skyvern-ui:latest
     restart: on-failure
-    ports:
-      - "${UI_HOST_PORT}:8080"
-      - "${UI_ARTIFACT_PORT}:9090"
+      - "${UI_HOST_PORT:-8080}:8080"
+      - "${UI_ARTIFACT_PORT:-9090}:9090"
     volumes:
       # Using named volumes shared with the skyvern service
       - artifacts-data:/data/artifacts
