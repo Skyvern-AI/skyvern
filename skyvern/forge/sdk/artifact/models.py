@@ -77,7 +77,7 @@ class Artifact(BaseModel):
     observer_thought_id: str | None = None
     ai_suggestion_id: str | None = None
     signed_url: str | None = None
-    organization_id: str | None = None
+    organization_id: str
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)

@@ -26,6 +26,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
+_LLM_CALL_TIMEOUT_SECONDS = 30  # 30s
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
@@ -212,9 +213,10 @@ async def _convert_svg_to_string(
 
         for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
             try:
-                json_response = await app.SECONDARY_LLM_API_HANDLER(
-                    prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
-                )
+                async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                    json_response = await app.SECONDARY_LLM_API_HANDLER(
+                        prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
+                    )
                 svg_shape = json_response.get("shape", "")
                 recognized = json_response.get("recognized", False)
                 if not svg_shape or not recognized:
@@ -236,6 +238,14 @@ async def _convert_svg_to_string(
                     # set the invalid css shape to cache to avoid retry in the near future
                     await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(hours=1))
                 await asyncio.sleep(3)
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
+                    element_id=element_id,
+                    key=svg_key,
+                )
+                _mark_element_as_dropped(element)
+                return
             except Exception:
                 LOG.info(
                     "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
@@ -358,9 +368,10 @@ async def _convert_css_shape_to_string(
             # TODO: we don't retry the css shape conversion today
             for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
-                    json_response = await app.SECONDARY_LLM_API_HANDLER(
-                        prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
-                    )
+                    async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
+                        json_response = await app.SECONDARY_LLM_API_HANDLER(
+                            prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
+                        )
                     css_shape = json_response.get("shape", "")
                     recognized = json_response.get("recognized", False)
                     if not css_shape or not recognized:
@@ -382,6 +393,13 @@ async def _convert_css_shape_to_string(
                         # set the invalid css shape to cache to avoid retry in the near future
                         await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
                     await asyncio.sleep(3)
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "Timeout to call LLM to parse css shape. Going to abort the convertion directly.",
+                        element_id=element_id,
+                        key=shape_key,
+                    )
+                    return None
                 except Exception:
                     LOG.info(
                         "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
