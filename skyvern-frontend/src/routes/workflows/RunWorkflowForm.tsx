@@ -14,11 +14,13 @@ import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { copyText } from "@/util/copyText";
+import { useSyncFormFieldToStorage } from "@/hooks/useSyncFormFieldToStorage";
+import { useLocalStorageFormDefault } from "@/hooks/useLocalStorageFormDefault";
 import { apiBaseUrl } from "@/util/env";
-import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { type ApiCommandOptions } from "@/util/apiCommands";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import fetchToCurl from "fetch-to-curl";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { useForm } from "react-hook-form";
 import { useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
@@ -70,22 +72,27 @@ type RunWorkflowRequestBody = {
   data: Record<string, unknown>; // workflow parameters and values
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
+  browser_session_id: string | null;
 };
 
 function getRunWorkflowRequestBody(
   values: RunWorkflowFormType,
   workflowParameters: Array<WorkflowParameter>,
 ): RunWorkflowRequestBody {
-  const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+  const { webhookCallbackUrl, proxyLocation, browserSessionId, ...parameters } =
+    values;
 
   const parsedParameters = parseValuesForWorkflowRun(
     parameters,
     workflowParameters,
   );
 
+  const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
+
   const body: RunWorkflowRequestBody = {
     data: parsedParameters,
     proxy_location: proxyLocation,
+    browser_session_id: bsi,
   };
 
   if (webhookCallbackUrl) {
@@ -98,6 +105,7 @@ function getRunWorkflowRequestBody(
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
+  browserSessionId: string | null;
 };
 
 function RunWorkflowForm({
@@ -109,14 +117,25 @@ function RunWorkflowForm({
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const browserSessionIdDefault = useLocalStorageFormDefault(
+    "skyvern.browserSessionId",
+    (initialValues.browserSessionId as string | undefined) ?? null,
+  );
   const form = useForm<RunWorkflowFormType>({
     defaultValues: {
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation,
+      browserSessionId: browserSessionIdDefault,
     },
   });
   const apiCredential = useApiCredential();
+
+  useSyncFormFieldToStorage(
+    form,
+    "browserSessionId",
+    "skyvern.browserSessionId",
+  );
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
@@ -154,7 +173,13 @@ function RunWorkflowForm({
   });
 
   function onSubmit(values: RunWorkflowFormType) {
-    const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+    const {
+      webhookCallbackUrl,
+      proxyLocation,
+      browserSessionId,
+      ...parameters
+    } = values;
+
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
       workflowParameters,
@@ -163,6 +188,7 @@ function RunWorkflowForm({
       ...parsedParameters,
       webhookCallbackUrl,
       proxyLocation,
+      browserSessionId,
     });
   }
 
@@ -330,20 +356,52 @@ function RunWorkflowForm({
               );
             }}
           />
+          <FormField
+            key="browserSessionId"
+            control={form.control}
+            name="browserSessionId"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Browser Session ID
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          Use a persistent browser session to maintain state and
+                          enable browser interaction.
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <Input
+                          {...field}
+                          placeholder="pbs_xxx"
+                          value={
+                            field.value === null ? "" : (field.value as string)
+                          }
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
         </div>
-
         <div className="flex justify-end gap-2">
-          <Button
-            type="button"
-            variant="secondary"
-            onClick={() => {
+          <CopyApiCommandDropdown
+            getOptions={() => {
               const values = form.getValues();
               const body = getRunWorkflowRequestBody(
                 values,
                 workflowParameters,
               );
-
-              const curl = fetchToCurl({
+              return {
                 method: "POST",
                 url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
                 body,
@@ -351,21 +409,9 @@ function RunWorkflowForm({
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
-              });
-
-              copyText(curl).then(() => {
-                toast({
-                  variant: "success",
-                  title: "Copied to Clipboard",
-                  description:
-                    "The cURL command has been copied to your clipboard.",
-                });
-              });
+              } satisfies ApiCommandOptions;
             }}
-          >
-            <CopyIcon className="mr-2 h-4 w-4" />
-            cURL
-          </Button>
+          />
           <Button type="submit" disabled={runWorkflowMutation.isPending}>
             {runWorkflowMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />

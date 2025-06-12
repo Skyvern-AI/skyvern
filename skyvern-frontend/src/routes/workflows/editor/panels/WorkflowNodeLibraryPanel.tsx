@@ -273,8 +273,8 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
           </div>
           <span className="text-sm text-slate-400">
             {first
-              ? "Click on the node type to add your first block"
-              : "Click on the node type you want to add"}
+              ? "Click on the block type to add your first block"
+              : "Click on the block type you want to add"}
           </span>
         </header>
         <div className="relative">

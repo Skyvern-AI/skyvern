@@ -369,17 +369,17 @@ function WorkflowParameterEditPanel({
           {type === "creditCardData" && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID</Label>
-                <Input
-                  value={itemId}
-                  onChange={(e) => setItemId(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
                 <Label className="text-xs text-slate-300">Collection ID</Label>
                 <Input
                   value={collectionId}
                   onChange={(e) => setCollectionId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Item ID</Label>
+                <Input
+                  value={itemId}
+                  onChange={(e) => setItemId(e.target.value)}
                 />
               </div>
             </>
