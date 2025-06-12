@@ -7976,6 +7976,21 @@ workspaces-web = ["types-boto3-workspaces-web (>=1.38.0,<1.39.0)"]
 xray = ["types-boto3-xray (>=1.38.0,<1.39.0)"]
 
 [[package]]
+name = "types-boto3-ecs"
+version = "1.38.28"
+description = "Type annotations for boto3 ECS 1.38.28 service generated with mypy-boto3-builder 8.11.0"
+optional = false
+python-versions = ">=3.8"
+groups = ["dev"]
+files = [
+    {file = "types_boto3_ecs-1.38.28-py3-none-any.whl", hash = "sha256:7b3c317e710f80ea5b259f21c502823dd9b3da13c25fb4e16268373816b15a15"},
+    {file = "types_boto3_ecs-1.38.28.tar.gz", hash = "sha256:00f3afda03d2cf8c1b1938585ee716260d678aa932a8ffe4d703e4ea1ad0dfa3"},
+]
+
+[package.dependencies]
+typing-extensions = {version = "*", markers = "python_version < \"3.12\""}
+
+[[package]]
 name = "types-boto3-full"
 version = "1.38.31"
 description = "All-in-one type annotations for boto3 1.38.31 generated with mypy-boto3-builder 8.11.0"
@@ -8759,4 +8774,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.14"
-content-hash = "42bde1cb27d171911f966360781659a19ef5df896a220161c7d780c05a6a4758"
+content-hash = "0b2919c120ab29993139e23c57b863d0c41208d1177e69c2a10f8cf2144ef655"
