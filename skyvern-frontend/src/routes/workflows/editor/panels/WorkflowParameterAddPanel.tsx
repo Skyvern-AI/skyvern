@@ -80,9 +80,11 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
     string | undefined
   >(undefined);
 
-  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
-    "skyvern",
-  );
+  const [credentialType, setCredentialType] = useState<
+    "bitwarden" | "skyvern" | "onepassword"
+  >("skyvern");
+  const [vaultId, setVaultId] = useState("");
+  const [itemId, setItemId] = useState("");
 
   const [identityKey, setIdentityKey] = useState("");
   const [identityFields, setIdentityFields] = useState("");
@@ -200,11 +202,14 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
             <SwitchBar
               value={credentialType}
               onChange={(value) => {
-                setCredentialType(value as "bitwarden" | "skyvern");
+                setCredentialType(
+                  value as "bitwarden" | "skyvern" | "onepassword",
+                );
               }}
               options={[
                 { label: "Skyvern", value: "skyvern" },
                 { label: "Bitwarden", value: "bitwarden" },
+                { label: "1Password", value: "onepassword" },
               ]}
             />
           )}
@@ -233,6 +238,24 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   onChange={(e) =>
                     setBitwardenLoginCredentialItemId(e.target.value)
                   }
+                />
+              </div>
+            </>
+          )}
+          {type === "credential" && credentialType === "onepassword" && (
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Vault ID</Label>
+                <Input
+                  value={vaultId}
+                  onChange={(e) => setVaultId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Item ID</Label>
+                <Input
+                  value={itemId}
+                  onChange={(e) => setItemId(e.target.value)}
                 />
               </div>
             </>
@@ -384,6 +407,23 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                         : bitwardenLoginCredentialItemId,
                     urlParameterKey:
                       urlParameterKey === "" ? null : urlParameterKey,
+                    description,
+                  });
+                }
+                if (type === "credential" && credentialType === "onepassword") {
+                  if (vaultId.trim() === "" || itemId.trim() === "") {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description: "Vault ID and Item ID are required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "onepassword",
+                    vaultId,
+                    itemId,
                     description,
                   });
                 }
