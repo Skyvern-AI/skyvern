@@ -26,7 +26,6 @@ import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import {
   parameterIsBitwardenCredential,
   parameterIsSkyvernCredential,
-  parameterIsOnePasswordCredential,
   ParametersState,
 } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
@@ -79,17 +78,8 @@ function WorkflowParameterEditPanel({
   const isSkyvernCredential =
     initialValues.parameterType === "credential" &&
     parameterIsSkyvernCredential(initialValues);
-  const isOnePasswordCredential =
-    initialValues.parameterType === "onepassword" &&
-    parameterIsOnePasswordCredential(initialValues);
-  const [credentialType, setCredentialType] = useState<
-    "bitwarden" | "skyvern" | "onepassword"
-  >(
-    isBitwardenCredential
-      ? "bitwarden"
-      : isOnePasswordCredential
-        ? "onepassword"
-        : "skyvern",
+  const [credentialType, setCredentialType] = useState<"bitwarden" | "skyvern">(
+    isBitwardenCredential ? "bitwarden" : "skyvern",
   );
   const [urlParameterKey, setUrlParameterKey] = useState(
     isBitwardenCredential ? initialValues.urlParameterKey ?? "" : "",
@@ -152,12 +142,6 @@ function WorkflowParameterEditPanel({
 
   const [credentialId, setCredentialId] = useState(
     isSkyvernCredential ? initialValues.credentialId : "",
-  );
-  const [vaultId, setVaultId] = useState(
-    isOnePasswordCredential ? initialValues.vaultId : "",
-  );
-  const [opItemId, setOpItemId] = useState(
-    isOnePasswordCredential ? initialValues.itemId : "",
   );
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
@@ -272,14 +256,11 @@ function WorkflowParameterEditPanel({
             <SwitchBar
               value={credentialType}
               onChange={(value) => {
-                setCredentialType(
-                  value as "bitwarden" | "skyvern" | "onepassword",
-                );
+                setCredentialType(value as "bitwarden" | "skyvern");
               }}
               options={[
                 { label: "Skyvern", value: "skyvern" },
                 { label: "Bitwarden", value: "bitwarden" },
-                { label: "1Password", value: "onepassword" },
               ]}
             />
           )}
@@ -308,24 +289,6 @@ function WorkflowParameterEditPanel({
                   onChange={(e) =>
                     setBitwardenLoginCredentialItemId(e.target.value)
                   }
-                />
-              </div>
-            </>
-          )}
-          {type === "credential" && credentialType === "onepassword" && (
-            <>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Vault ID</Label>
-                <Input
-                  value={vaultId}
-                  onChange={(e) => setVaultId(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID</Label>
-                <Input
-                  value={opItemId}
-                  onChange={(e) => setOpItemId(e.target.value)}
                 />
               </div>
             </>
@@ -464,23 +427,6 @@ function WorkflowParameterEditPanel({
                     urlParameterKey:
                       urlParameterKey === "" ? null : urlParameterKey,
                     collectionId: collectionId === "" ? null : collectionId,
-                    description,
-                  });
-                }
-                if (type === "credential" && credentialType === "onepassword") {
-                  if (vaultId.trim() === "" || opItemId.trim() === "") {
-                    toast({
-                      variant: "destructive",
-                      title: "Failed to save parameter",
-                      description: "Vault ID and Item ID are required",
-                    });
-                    return;
-                  }
-                  onSave({
-                    key,
-                    parameterType: "onepassword",
-                    vaultId,
-                    itemId: opItemId,
                     description,
                   });
                 }
