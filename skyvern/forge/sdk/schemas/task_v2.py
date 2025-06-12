@@ -30,7 +30,7 @@ class TaskV2(BaseModel):
 
     observer_cruise_id: str = Field(alias="task_id")
     status: TaskV2Status
-    organization_id: str | None = None
+    organization_id: str
     workflow_run_id: str | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
@@ -99,7 +99,7 @@ class Thought(BaseModel):
 
     observer_thought_id: str = Field(alias="thought_id")
     observer_cruise_id: str = Field(alias="task_id")
-    organization_id: str | None = None
+    organization_id: str
     workflow_run_id: str | None = None
     workflow_run_block_id: str | None = None
     workflow_id: str | None = None
