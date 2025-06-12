@@ -190,6 +190,12 @@ class AsyncAWSClient:
                 LOG.exception("S3 download failed", uri=uri)
             return None
 
+    async def get_object_info(self, uri: str) -> dict:
+        async with self._s3_client() as client:
+            parsed_uri = S3Uri(uri)
+            # Only get object metadata without the body
+            return await client.head_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+
     async def get_file_metadata(
         self,
         uri: str,
@@ -207,12 +213,8 @@ class AsyncAWSClient:
             The metadata dictionary or None if the request fails
         """
         try:
-            async with self._s3_client() as client:
-                parsed_uri = S3Uri(uri)
-
-                # Only get object metadata without the body
-                response = await client.head_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
-                return response.get("Metadata", {})
+            response = await self.get_object_info(uri)
+            return response.get("Metadata", {})
         except Exception:
             if log_exception:
                 LOG.exception("S3 metadata retrieval failed", uri=uri)
