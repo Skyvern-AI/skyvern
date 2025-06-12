@@ -1,6 +1,5 @@
 import copy
 import json
-import os
 import uuid
 from typing import TYPE_CHECKING, Any, Self, Tuple
 
@@ -387,7 +386,7 @@ class WorkflowRunContext:
             self.parameters[parameter.key] = parameter
 
     async def register_onepassword_credential_parameter_value(self, parameter: OnePasswordCredentialParameter) -> None:
-        token = os.getenv("OP_SERVICE_ACCOUNT_TOKEN")
+        token = settings.OP_SERVICE_ACCOUNT_TOKEN
         if not token:
             raise ValueError("OP_SERVICE_ACCOUNT_TOKEN environment variable not set")
 
