@@ -109,6 +109,7 @@ services:
   skyvern-ui:
     image: public.ecr.aws/skyvern/skyvern-ui:latest
     restart: on-failure
+    ports:
       - "${UI_HOST_PORT:-8080}:8080"
       - "${UI_ARTIFACT_PORT:-9090}:9090"
     volumes:
