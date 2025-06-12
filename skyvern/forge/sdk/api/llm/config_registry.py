@@ -568,6 +568,23 @@ if settings.ENABLE_AZURE_O3:
             max_completion_tokens=100000,
         ),
     )
+if settings.ENABLE_UI_TARS:
+    LLMConfigRegistry.register_config(
+        "UI_TARS_SEED1_5_VL",
+        LLMConfig(
+            settings.UI_TARS_MODEL,
+            ["UI_TARS_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_tokens=400,
+            temperature=0.0,
+            litellm_params=LiteLLMParams(
+                api_base=settings.UI_TARS_API_BASE,
+                api_key=settings.UI_TARS_API_KEY,
+                model_info={"model_name": settings.UI_TARS_MODEL},
+            ),
+        ),
+    )
 
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(

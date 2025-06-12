@@ -7,7 +7,7 @@ import string
 from asyncio.exceptions import CancelledError
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Tuple, cast
+from typing import Any, Dict, List, Tuple, cast
 
 import httpx
 import structlog
@@ -59,7 +59,7 @@ from skyvern.forge.sdk.api.files import (
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller, LLMCallerManager
-from skyvern.forge.sdk.api.llm.ui_tars_client import ui_tars_manager
+from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
@@ -92,7 +92,12 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
 from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
-from skyvern.webeye.actions.parse_actions import parse_actions, parse_anthropic_actions, parse_cua_actions
+from skyvern.webeye.actions.parse_actions import (
+    parse_actions,
+    parse_anthropic_actions,
+    parse_cua_actions,
+    parse_ui_tars_actions,
+)
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrape_website
@@ -394,9 +399,18 @@ class ForgeAgent:
                         llm_key=llm_key or settings.ANTHROPIC_CUA_LLM_KEY, screenshot_scaling_enabled=True
                     )
 
+            if engine == RunEngine.ui_tars and not llm_caller:
+                # see if the llm_caller is already set in memory
+                llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
+                if not llm_caller:
+                    # create a new UI-TARS llm_caller
+                    llm_key = task.llm_key or settings.UI_TARS_LLM_KEY
+                    llm_caller = UITarsLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=True)
+                    llm_caller.initialize_conversation(task)
+
             # TODO: remove the code after migrating everything to llm callers
-            # currently, only anthropic cua tasks use llm_caller
-            if engine == RunEngine.anthropic_cua and llm_caller:
+            # currently, only anthropic cua and ui_tars tasks use llm_caller
+            if engine in [RunEngine.anthropic_cua, RunEngine.ui_tars] and llm_caller:
                 LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
 
             step, detailed_output = await self.agent_step(
@@ -551,6 +565,7 @@ class ForgeAgent:
                     complete_verification=complete_verification,
                     engine=engine,
                     cua_response=cua_response_param,
+                    llm_caller=llm_caller,
                 )
             elif settings.execute_all_steps() and next_step:
                 return await self.execute_step(
@@ -564,6 +579,7 @@ class ForgeAgent:
                     complete_verification=complete_verification,
                     engine=engine,
                     cua_response=cua_response_param,
+                    llm_caller=llm_caller,
                 )
             else:
                 LOG.info(
@@ -856,11 +872,14 @@ class ForgeAgent:
                     llm_caller=llm_caller,
                 )
             elif engine == RunEngine.ui_tars:
+                assert llm_caller is not None
                 actions = await self._generate_ui_tars_actions(
                     task=task,
                     step=step,
                     scraped_page=scraped_page,
+                    llm_caller=llm_caller,
                 )
+
             else:
                 using_cached_action_plan = False
                 if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
@@ -1490,8 +1509,9 @@ class ForgeAgent:
         task: Task,
         step: Step,
         scraped_page: ScrapedPage,
+        llm_caller: LLMCaller,
     ) -> list[Action]:
-        """Generate actions using UI-TARS (Seed1.5-VL) model."""
+        """Generate actions using UI-TARS (Seed1.5-VL) model through the LLMCaller pattern."""
         
         LOG.info(
             "UI-TARS action generation starts",
@@ -1500,41 +1520,39 @@ class ForgeAgent:
             step_order=step.order,
         )
         
-        try:
-            # Check if UI-TARS is enabled and configured
-            if not settings.ENABLE_UI_TARS or not settings.UI_TARS_API_KEY:
-                raise ValueError("UI-TARS is not properly configured")
-            
-            # Get UI-TARS client for this task
-            ui_tars_client = ui_tars_manager.get_client(
-                task_id=task.task_id,
-                api_key=settings.UI_TARS_API_KEY,
-                api_base=settings.UI_TARS_API_BASE,
-                model=settings.UI_TARS_MODEL,
-            )
-            
-            # Generate actions using the consolidated client
-            actions = await ui_tars_client.generate_actions(task, step, scraped_page)
-            
-            LOG.info(
-                "UI-TARS action generation completed",
-                task_id=task.task_id,
-                step_id=step.step_id,
-                actions_count=len(actions),
-            )
-            
-            return actions
-            
-        except Exception as e:
-            LOG.error(
-                "UI-TARS action generation failed",
-                task_id=task.task_id,
-                step_id=step.step_id,
-                error=str(e),
-                exc_info=True,
-            )
-            # Return empty actions to trigger retry mechanism
-            return []
+        # Ensure we have a UITarsLLMCaller instance
+        if not isinstance(llm_caller, UITarsLLMCaller):
+            raise ValueError(f"Expected UITarsLLMCaller, got {type(llm_caller)}")
+        
+        # Add the current screenshot to conversation
+        if scraped_page.screenshots:
+            llm_caller.add_screenshot(scraped_page.screenshots[0])
+        else:
+            LOG.error("No screenshots found, skipping UI-TARS action generation")
+            raise ValueError("No screenshots found, skipping UI-TARS action generation")
+        
+        # Generate response using the LLMCaller
+        response_content = await llm_caller.generate_ui_tars_response(step)
+        
+        LOG.info(f"UI-TARS raw response: {response_content}")
+
+        
+        
+        window_dimension = cast(Resolution, scraped_page.window_dimension) if scraped_page.window_dimension else Resolution(width=1920, height=1080)
+        LOG.info(f"UI-TARS browser window dimension: {window_dimension}")
+        
+        actions = await parse_ui_tars_actions(
+            task, step, response_content, window_dimension
+        )
+        
+        LOG.info(
+            "UI-TARS action generation completed",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            actions_count=len(actions),
+        )
+        
+        return actions
     
     async def complete_verify(
         self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
@@ -2154,13 +2172,6 @@ class ForgeAgent:
 
         await self.async_operation_pool.remove_task(task.task_id)
         
-        # Clean up UI-TARS client if used
-        try:
-            from skyvern.forge.sdk.api.llm.ui_tars_client import ui_tars_manager
-            ui_tars_manager.remove_client(task.task_id)
-        except Exception:
-            # UI-TARS cleanup is optional
-            pass
         
         await self.cleanup_browser_and_create_artifacts(
             close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
