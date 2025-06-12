@@ -4,12 +4,12 @@ import json
 import re
 from typing import Any
 
-import commentjson
 import json_repair
 import litellm
 import structlog
 
 from skyvern.constants import MAX_IMAGE_MESSAGES
+from skyvern.forge.sdk.api.llm import commentjson
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
 
 LOG = structlog.get_logger()
