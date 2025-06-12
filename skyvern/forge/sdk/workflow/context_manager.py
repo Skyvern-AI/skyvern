@@ -1,7 +1,7 @@
 import copy
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Self, Tuple
+from typing import TYPE_CHECKING, Any, Self
 
 import structlog
 from onepassword.client import Client as OnePasswordClient
