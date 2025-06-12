@@ -116,6 +116,9 @@ class WorkflowRun(BaseModel):
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
 
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -143,6 +146,9 @@ class WorkflowRunResponseBase(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     parameters: dict[str, Any]
