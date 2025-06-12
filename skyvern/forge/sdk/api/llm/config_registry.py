@@ -578,11 +578,6 @@ if settings.ENABLE_UI_TARS:
             add_assistant_prefix=False,
             max_tokens=400,
             temperature=0.0,
-            litellm_params=LiteLLMParams(
-                api_base=settings.UI_TARS_API_BASE,
-                api_key=settings.UI_TARS_API_KEY,
-                model_info={"model_name": settings.UI_TARS_MODEL},
-            ),
         ),
     )
 

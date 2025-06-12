@@ -17,7 +17,6 @@ import base64
 from io import BytesIO
 from typing import Any, Dict
 
-import litellm
 import structlog
 from PIL import Image
 
@@ -163,39 +162,37 @@ class UITarsLLMCaller(LLMCaller):
         window_dimension: Resolution | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any]:
-        """Override call method to use UI-TARS specific API format."""
-
-        # Get litellm_params safely depending on config type
-        litellm_params: dict[str, Any] = {}
-        if hasattr(self.llm_config, "litellm_params") and self.llm_config.litellm_params:
-            litellm_params = dict(self.llm_config.litellm_params)
-
-        # Use existing message history directly
-        chat_completion = await litellm.acompletion(
-            model=self.llm_config.model_name,
-            messages=self.message_history,
-            top_p=None,
-            temperature=0.0,
-            max_tokens=400,
-            stream=True,
-            seed=None,
-            stop=None,
-            frequency_penalty=None,
-            presence_penalty=None,
-            timeout=settings.LLM_CONFIG_TIMEOUT,
-            **litellm_params,
+        """Override call method to use standard LLM routing instead of direct LiteLLM."""
+        
+        # Use raw_response=True to bypass JSON parsing since UI-TARS returns plain text
+        response = await super().call(
+            prompt=prompt,
+            prompt_name=prompt_name,
+            step=step,
+            task_v2=task_v2,
+            thought=thought,
+            ai_suggestion=ai_suggestion,
+            screenshots=screenshots,
+            parameters=parameters,
+            tools=tools,
+            use_message_history=True,  # Use message history for UI-TARS
+            raw_response=True,  # Bypass JSON parsing - UI-TARS returns plain text
+            window_dimension=window_dimension,
+            **extra_parameters
         )
-        response = ""
-        async for message in chat_completion:
-            if message.choices[0].delta.content:
-                response += message.choices[0].delta.content
-        return {"content": response}
+        
+        # Extract content from the raw response
+        if isinstance(response, dict) and "choices" in response:
+            content = response["choices"][0]["message"]["content"]
+            return {"content": content}
+        else:
+            # Fallback for unexpected response format
+            return {"content": str(response)}
 
     async def generate_ui_tars_response(self, step: Step) -> str:
         """Generate UI-TARS response using the overridden call method."""
         response = await self.call(step=step)
 
-        # Extract the response content
         content = response.get("content", "").strip()
 
         # Add the response to conversation history

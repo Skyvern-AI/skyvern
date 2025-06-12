@@ -162,6 +162,7 @@ def setup_llm_providers() -> None:
 
     console.print("\n[bold blue]--- UI-TARS Configuration ---[/bold blue]")
     console.print("To enable UI-TARS (Seed1.5-VL), you must have a ByteDance Doubao API key.")
+    console.print("UI-TARS now uses direct VolcEngine API calls for improved compatibility.")
     enable_ui_tars = Confirm.ask("Do you want to enable UI-TARS?")
     if enable_ui_tars:
         ui_tars_api_key = Prompt.ask("Enter your ByteDance Doubao API key", password=True)
