@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern"
-version = "0.2.0"
+version = "0.2.1"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
@@ -38,7 +38,7 @@ psycopg = [
 alembic = "^1.12.1"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 cachetools = "^5.3.2"
-aioboto3 = "^12.0.0"
+aioboto3 = "^14.3.0"
 commentjson = "^0.9.0"
 asyncache = "^0.3.1"
 orjson = "^3.9.10"
@@ -75,6 +75,8 @@ alive-progress = "^3.2.0"
 colorama = "^0.4.6"
 onepassword-sdk = "0.3.0"
 strenum = "^0.4.15"
+types-boto3 = {extras = ["full"], version = "^1.38.31"}
+
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
@@ -101,6 +103,8 @@ build = "^1.2.2.post1"
 pandas = "^2.2.3"
 pre-commit = "^4.2.0"
 ruff = "^0.11.12"
+aiosqlite = "^0.21.0"
+moto = {extras = ["s3", "server"], version = "^5.1.5"}
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
