@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 import structlog
 from playwright._impl._errors import TimeoutError
@@ -21,7 +21,7 @@ def load_js_script() -> str:
     try:
         # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
         # This will allow our code to be type safe.
-        with open(path, "r") as f:
+        with open(path) as f:
             return f.read()
     except FileNotFoundError as e:
         LOG.exception("Failed to load the JS script", path=path)
@@ -43,7 +43,7 @@ async def _current_viewpoint_screenshot_helper(
         await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         LOG.debug("Page is fully loaded, agent is about to take screenshots")
         start_time = time.time()
-        screenshot: bytes = bytes()
+        screenshot: bytes = b""
         if file_path:
             screenshot = await page.screenshot(
                 path=file_path,
@@ -77,14 +77,14 @@ async def _scrolling_screenshots_helper(
     url: str | None = None,
     draw_boxes: bool = False,
     max_number: int = settings.MAX_NUM_SCREENSHOTS,
-) -> List[bytes]:
+) -> list[bytes]:
     skyvern_page = await SkyvernFrame.create_instance(frame=page)
     # page is the main frame and the index must be 0
     assert isinstance(skyvern_page.frame, Page)
     frame = "main.frame"
     frame_index = 0
 
-    screenshots: List[bytes] = []
+    screenshots: list[bytes] = []
     if await skyvern_page.is_window_scrollable():
         scroll_y_px_old = -30.0
         scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
@@ -161,7 +161,7 @@ class SkyvernFrame:
         draw_boxes: bool = False,
         max_number: int = settings.MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
-    ) -> List[bytes]:
+    ) -> list[bytes]:
         if not scroll:
             return [await _current_viewpoint_screenshot_helper(page=page)]
 
@@ -199,7 +199,7 @@ class SkyvernFrame:
         js_script = "(element) => scrollToElementTop(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=element)
 
-    async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> Dict:
+    async def parse_element_from_html(self, frame: str, element: ElementHandle, interactable: bool) -> dict:
         js_script = "async ([frame, element, interactable]) => await buildElementObject(frame, element, interactable)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[frame, element, interactable])
 

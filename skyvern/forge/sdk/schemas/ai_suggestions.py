@@ -12,7 +12,7 @@ class AISuggestion(AISuggestionBase):
     model_config = ConfigDict(from_attributes=True)
     ai_suggestion_type: str
     ai_suggestion_id: str
-    organization_id: str | None = None
+    organization_id: str
 
     created_at: datetime
     modified_at: datetime

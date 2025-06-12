@@ -5,7 +5,7 @@ from typing import Any, List, Sequence
 import structlog
 from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
@@ -58,6 +58,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_block,
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
+    hydrate_action,
 )
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -106,14 +107,18 @@ elif "postgresql+asyncpg" in settings.DATABASE_STRING:
 
 
 class AgentDB:
-    def __init__(self, database_string: str, debug_enabled: bool = False) -> None:
+    def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
         super().__init__()
         self.debug_enabled = debug_enabled
-        self.engine = create_async_engine(
-            database_string,
-            json_serializer=_custom_json_serializer,
-            connect_args=DB_CONNECT_ARGS,
-            poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
+        self.engine = (
+            create_async_engine(
+                database_string,
+                json_serializer=_custom_json_serializer,
+                connect_args=DB_CONNECT_ARGS,
+                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
+            )
+            if db_engine is None
+            else db_engine
         )
         self.Session = async_sessionmaker(bind=self.engine)
 
@@ -405,6 +410,26 @@ class AgentDB:
 
                 actions = (await session.scalars(query)).all()
                 return [Action.model_validate(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_task_actions_hydrated(self, task_id: str, organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id == task_id)
+                    .order_by(ActionModel.created_at)
+                )
+
+                actions = (await session.scalars(query)).all()
+                return [hydrate_action(action) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
