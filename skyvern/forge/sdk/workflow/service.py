@@ -68,6 +68,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenSensitiveInformationParameter,
     ContextParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -98,6 +99,25 @@ LOG = structlog.get_logger()
 
 
 class WorkflowService:
+    @staticmethod
+    def _collect_extracted_information(value: Any) -> list[Any]:
+        """Recursively collect extracted_information values from nested outputs."""
+        results: list[Any] = []
+        if isinstance(value, dict):
+            if "extracted_information" in value and value["extracted_information"] is not None:
+                extracted = value["extracted_information"]
+                if isinstance(extracted, list):
+                    results.extend(extracted)
+                else:
+                    results.append(extracted)
+            else:
+                for v in value.values():
+                    results.extend(WorkflowService._collect_extracted_information(v))
+        elif isinstance(value, list):
+            for item in value:
+                results.extend(WorkflowService._collect_extracted_information(item))
+        return results
+
     async def setup_workflow_run(
         self,
         request_id: str | None,
@@ -239,6 +259,7 @@ class WorkflowService:
                     BitwardenLoginCredentialParameter,
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
+                    OnePasswordCredentialParameter,
                     CredentialParameter,
                 ),
             )
@@ -883,6 +904,22 @@ class WorkflowService:
             description=description,
         )
 
+    async def create_onepassword_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        vault_id: str,
+        item_id: str,
+        description: str | None = None,
+    ) -> OnePasswordCredentialParameter:
+        return await app.DATABASE.create_onepassword_credential_parameter(
+            workflow_id=workflow_id,
+            key=key,
+            vault_id=vault_id,
+            item_id=item_id,
+            description=description,
+        )
+
     async def create_bitwarden_sensitive_information_parameter(
         self,
         workflow_id: str,
@@ -1091,14 +1128,10 @@ class WorkflowService:
         EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
-            extracted_information = {
-                output_parameter.key: output.value[EXTRACTED_INFORMATION_KEY]
-                for output_parameter, output in output_parameter_tuples
-                if output.value is not None
-                and isinstance(output.value, dict)
-                and EXTRACTED_INFORMATION_KEY in output.value
-                and output.value[EXTRACTED_INFORMATION_KEY] is not None
-            }
+            extracted_information: list[Any] = []
+            for _, output in output_parameter_tuples:
+                if output.value is not None:
+                    extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
         total_steps = None
@@ -1125,6 +1158,9 @@ class WorkflowService:
             webhook_callback_url=workflow_run.webhook_callback_url,
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
+            queued_at=workflow_run.queued_at,
+            started_at=workflow_run.started_at,
+            finished_at=workflow_run.finished_at,
             created_at=workflow_run.created_at,
             modified_at=workflow_run.modified_at,
             parameters=parameters_with_value,
@@ -1486,6 +1522,14 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                         credential_id=parameter.credential_id,
+                    )
+                elif parameter.parameter_type == ParameterType.ONEPASSWORD:
+                    parameters[parameter.key] = await self.create_onepassword_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        vault_id=parameter.vault_id,
+                        item_id=parameter.item_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:
