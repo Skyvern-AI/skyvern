@@ -195,11 +195,11 @@ function convertToParametersYAML(
             };
           } else if (parameterIsOnePasswordCredential(parameter)) {
             return {
-              parameter_type: WorkflowParameterTypes.Workflow,
-              workflow_parameter_type: WorkflowParameterValueType.CredentialId,
-              default_value: `${parameter.vaultId}:${parameter.itemId}`,
+              parameter_type: WorkflowParameterTypes.OnePassword,
               key: parameter.key,
               description: parameter.description || null,
+              vault_id: parameter.vaultId,
+              item_id: parameter.itemId,
             };
           }
         }
