@@ -5,12 +5,12 @@ from enum import IntEnum
 
 import structlog
 import websockets
+from cloud.config import settings
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from websockets import Data
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from cloud.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
