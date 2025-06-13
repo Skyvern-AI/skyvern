@@ -1097,16 +1097,14 @@ async def _generate_loop_task(
         output_parameter=loop_value_extraction_output_parameter,
         value=extraction_block_result.output_parameter_value,
     )
+    url: str | None = None
     task_parameters: list[PARAMETER_TYPE] = []
     if is_loop_value_link is True:
         LOG.info("Loop values are links", loop_values=loop_values)
         context_parameter_key = url = f"task_in_loop_url_{loop_random_string}"
     else:
         LOG.info("Loop values are not links", loop_values=loop_values)
-        page = await browser_state.get_working_page()
-        url = str(
-            await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else original_url
-        )
+        url = None
         context_parameter_key = "target"
 
     # create ContextParameter for the value
@@ -1629,6 +1627,9 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         status=task_v2.status,
         output=task_v2.output,
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
+        queued_at=task_v2.queued_at,
+        started_at=task_v2.started_at,
+        finished_at=task_v2.finished_at,
         created_at=task_v2.created_at,
         modified_at=task_v2.modified_at,
         recording_url=workflow_run_resp.recording_url if workflow_run_resp else None,
