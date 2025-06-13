@@ -568,6 +568,18 @@ if settings.ENABLE_AZURE_O3:
             max_completion_tokens=100000,
         ),
     )
+if settings.ENABLE_UI_TARS:
+    LLMConfigRegistry.register_config(
+        "UI_TARS_SEED1_5_VL",
+        LLMConfig(
+            settings.UI_TARS_MODEL,
+            ["UI_TARS_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_tokens=400,
+            temperature=0.0,
+        ),
+    )
 
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
@@ -624,6 +636,16 @@ if settings.ENABLE_GEMINI:
         "GEMINI_2.5_PRO_EXP_03_25",
         LLMConfig(
             "gemini/gemini-2.5-pro-exp-03-25",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_FLASH_PREVIEW",
+        LLMConfig(
+            "gemini/gemini-2.5-flash-preview-05-20",
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,

@@ -2,7 +2,7 @@ import dataclasses
 import json
 import time
 from asyncio import CancelledError
-from typing import Any
+from typing import Any, AsyncIterator
 
 import litellm
 import structlog
@@ -10,6 +10,7 @@ from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.utils import CustomStreamWrapper, ModelResponse
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig, dummy_llm_api_handler
+from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, llm_messages_builder_with_history, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -744,9 +746,13 @@ class LLMCaller:
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
-    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage:
+    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | Any:
         if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)
+
+        # Route UI-TARS models to custom handler instead of LiteLLM
+        if self.llm_key and "UI_TARS" in self.llm_key:
+            return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
         return await litellm.acompletion(
             model=self.llm_config.model_name, messages=messages, tools=tools, timeout=timeout, **active_parameters
@@ -790,8 +796,97 @@ class LLMCaller:
         )
         return response
 
-    async def get_call_stats(self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage) -> LLMCallStats:
+    async def _call_ui_tars(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list | None = None,
+        timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        **active_parameters: dict[str, Any],
+    ) -> Any:
+        """Custom UI-TARS API call using OpenAI client with VolcEngine endpoint."""
+        max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 400
+        model_name = self.llm_config.model_name
+
+        if not app.UI_TARS_CLIENT:
+            raise ValueError(
+                "UI_TARS_CLIENT not initialized. Please ensure ENABLE_UI_TARS=true and UI_TARS_API_KEY is set."
+            )
+
+        LOG.info(
+            "UI-TARS request",
+            model_name=model_name,
+            timeout=timeout,
+            messages_length=len(messages),
+        )
+
+        # Use the UI-TARS client (which is OpenAI-compatible with VolcEngine)
+        chat_completion: AsyncIterator[ChatCompletionChunk] = await app.UI_TARS_CLIENT.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            top_p=None,
+            temperature=active_parameters.get("temperature", 0.0),
+            max_tokens=max_tokens,
+            stream=True,
+            seed=None,
+            stop=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            timeout=timeout,
+        )
+
+        # Aggregate streaming response like in ByteDance example
+        response_content = ""
+        async for message in chat_completion:
+            if message.choices[0].delta.content:
+                response_content += message.choices[0].delta.content
+
+        response = UITarsResponse(response_content, model_name)
+
+        LOG.info(
+            "UI-TARS response",
+            model_name=model_name,
+            response_length=len(response_content),
+            timeout=timeout,
+        )
+        return response
+
+    async def get_call_stats(
+        self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | dict[str, Any] | Any
+    ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
+
+        # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
+        if hasattr(response, "usage") and hasattr(response, "choices") and hasattr(response, "model"):
+            usage = response.usage
+            # Use Doubao pricing: ¥0.8/1M input, ¥2/1M output (convert to USD: ~$0.11/$0.28)
+            input_token_cost = (0.11 / 1000000) * usage.get("prompt_tokens", 0)
+            output_token_cost = (0.28 / 1000000) * usage.get("completion_tokens", 0)
+            llm_cost = input_token_cost + output_token_cost
+
+            return LLMCallStats(
+                llm_cost=llm_cost,
+                input_tokens=usage.get("prompt_tokens", 0),
+                output_tokens=usage.get("completion_tokens", 0),
+                cached_tokens=0,  # UI-TARS doesn't have cached tokens
+                reasoning_tokens=0,
+            )
+
+        # Handle UI-TARS response (dict format - fallback)
+        if isinstance(response, dict) and "choices" in response and "usage" in response:
+            usage = response["usage"]
+            # Use Doubao pricing: ¥0.8/1M input, ¥2/1M output (convert to USD: ~$0.11/$0.28)
+            input_token_cost = (0.11 / 1000000) * usage.get("prompt_tokens", 0)
+            output_token_cost = (0.28 / 1000000) * usage.get("completion_tokens", 0)
+            llm_cost = input_token_cost + output_token_cost
+
+            return LLMCallStats(
+                llm_cost=llm_cost,
+                input_tokens=usage.get("prompt_tokens", 0),
+                output_tokens=usage.get("completion_tokens", 0),
+                cached_tokens=0,  # UI-TARS doesn't have cached tokens
+                reasoning_tokens=0,
+            )
+
         if isinstance(response, AnthropicMessage):
             usage = response.usage
             input_token_cost = (3.0 / 1000000) * usage.input_tokens
