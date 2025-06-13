@@ -1745,6 +1745,9 @@ async def handle_keypress_action(
             updated_keys.append("Escape")
         elif key_lower_case == "alt":
             updated_keys.append("Alt")
+        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
+            # Handle function keys: f1 -> F1, f5 -> F5, etc.
+            updated_keys.append(key_lower_case.upper())
         else:
             updated_keys.append(key)
     keypress_str = "+".join(updated_keys)

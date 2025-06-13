@@ -67,6 +67,11 @@ class WorkflowRunResponse(UniversalBaseModel):
     The original request parameters used to start this workflow run
     """
 
+    browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    ID of the Skyvern persistent browser session used for this run
+    """
+
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:

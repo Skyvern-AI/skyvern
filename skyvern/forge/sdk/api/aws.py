@@ -61,6 +61,7 @@ class AsyncAWSClient:
         return "&".join([f"{k}={v}" for k, v in tags.items()])
 
     async def get_secret(self, secret_name: str) -> str | None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/secretsmanager/client/get_secret_value.html
         try:
             async with self._secrets_manager_client() as client:
                 response = await client.get_secret_value(SecretId=secret_name)
@@ -74,6 +75,7 @@ class AsyncAWSClient:
             return None
 
     async def create_secret(self, secret_name: str, secret_value: str) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/secretsmanager/client/create_secret.html
         try:
             async with self._secrets_manager_client() as client:
                 await client.create_secret(Name=secret_name, SecretString=secret_value)
@@ -82,6 +84,7 @@ class AsyncAWSClient:
             raise e
 
     async def set_secret(self, secret_name: str, secret_value: str) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/secretsmanager/client/put_secret_value.html
         try:
             async with self._secrets_manager_client() as client:
                 await client.put_secret_value(SecretId=secret_name, SecretString=secret_value)
@@ -90,6 +93,7 @@ class AsyncAWSClient:
             raise e
 
     async def delete_secret(self, secret_name: str) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/secretsmanager/client/delete_secret.html
         try:
             async with self._secrets_manager_client() as client:
                 await client.delete_secret(SecretId=secret_name)
@@ -104,6 +108,7 @@ class AsyncAWSClient:
         storage_class: S3StorageClass = S3StorageClass.STANDARD,
         tags: dict[str, str] | None = None,
     ) -> str | None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/put_object.html
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
         try:
@@ -129,6 +134,7 @@ class AsyncAWSClient:
         storage_class: S3StorageClass = S3StorageClass.STANDARD,
         tags: dict[str, str] | None = None,
     ) -> str | None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/upload_fileobj.html#upload-fileobj
         if storage_class not in S3StorageClass:
             raise ValueError(f"Invalid storage class: {storage_class}. Must be one of {list(S3StorageClass)}")
         try:
@@ -158,6 +164,7 @@ class AsyncAWSClient:
         raise_exception: bool = False,
         tags: dict[str, str] | None = None,
     ) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/upload_file.html
         try:
             async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
@@ -178,6 +185,7 @@ class AsyncAWSClient:
                 raise e
 
     async def download_file(self, uri: str, log_exception: bool = True) -> bytes | None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/get_object.html
         try:
             async with self._s3_client() as client:
                 parsed_uri = S3Uri(uri)
@@ -201,6 +209,7 @@ class AsyncAWSClient:
         uri: str,
         log_exception: bool = True,
     ) -> dict | None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/head_object.html
         """
         Retrieves only the metadata of a file without downloading its content.
 
@@ -221,6 +230,7 @@ class AsyncAWSClient:
             return None
 
     async def create_presigned_urls(self, uris: list[str]) -> list[str] | None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
         presigned_urls = []
         try:
             async with self._s3_client() as client:
@@ -239,6 +249,7 @@ class AsyncAWSClient:
             return None
 
     async def list_files(self, uri: str) -> list[str]:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/paginator/ListObjectsV2.html
         object_keys: list[str] = []
         parsed_uri = S3Uri(uri)
         async with self._s3_client() as client:
@@ -258,6 +269,7 @@ class AsyncAWSClient:
         subnets: list[str],
         security_groups: list[str],
     ) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/run_task.html
         async with self._ecs_client() as client:
             return await client.run_task(
                 cluster=cluster,
@@ -273,22 +285,27 @@ class AsyncAWSClient:
             )
 
     async def stop_task(self, cluster: str, task: str, reason: str | None = None) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/stop_task.html
         async with self._ecs_client() as client:
             return await client.stop_task(cluster=cluster, task=task, reason=reason)
 
     async def describe_tasks(self, cluster: str, tasks: list[str]) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/describe_tasks.html
         async with self._ecs_client() as client:
             return await client.describe_tasks(cluster=cluster, tasks=tasks)
 
     async def list_tasks(self, cluster: str) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/list_tasks.html
         async with self._ecs_client() as client:
             return await client.list_tasks(cluster=cluster)
 
     async def describe_task_definition(self, task_definition: str) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/describe_task_definition.html
         async with self._ecs_client() as client:
             return await client.describe_task_definition(taskDefinition=task_definition)
 
     async def deregister_task_definition(self, task_definition: str) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/deregister_task_definition.html
         async with self._ecs_client() as client:
             return await client.deregister_task_definition(taskDefinition=task_definition)
 
@@ -339,6 +356,11 @@ class S3Uri:
 
     def __str__(self) -> str:
         return self.uri
+
+
+def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
+    """Convert a list of tags to a dictionary."""
+    return {tag["Key"]: tag["Value"] for tag in tag_set}
 
 
 aws_client = AsyncAWSClient()
