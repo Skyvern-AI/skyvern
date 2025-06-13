@@ -2,7 +2,7 @@ import dataclasses
 import json
 import time
 from asyncio import CancelledError
-from typing import Any
+from typing import Any, AsyncIterator
 
 import litellm
 import structlog
@@ -10,6 +10,7 @@ from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.utils import CustomStreamWrapper, ModelResponse
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -819,7 +820,7 @@ class LLMCaller:
         )
 
         # Use the UI-TARS client (which is OpenAI-compatible with VolcEngine)
-        chat_completion = await app.UI_TARS_CLIENT.chat.completions.create(
+        chat_completion: AsyncIterator[ChatCompletionChunk] = await app.UI_TARS_CLIENT.chat.completions.create(
             model=model_name,
             messages=messages,
             top_p=None,
