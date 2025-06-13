@@ -48,10 +48,10 @@ if SettingsManager.get_settings().ENABLE_BEDROCK_ANTHROPIC:
 
 # Add UI-TARS client setup
 UI_TARS_CLIENT = None
-if SettingsManager.get_settings().ENABLE_UI_TARS:
+if SettingsManager.get_settings().ENABLE_VOLCENGINE:
     UI_TARS_CLIENT = AsyncOpenAI(
-        api_key=SettingsManager.get_settings().UI_TARS_API_KEY,
-        base_url=SettingsManager.get_settings().UI_TARS_API_BASE,
+        api_key=SettingsManager.get_settings().VOLCENGINE_API_KEY,
+        base_url=SettingsManager.get_settings().VOLCENGINE_API_BASE,
     )
 
 SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(

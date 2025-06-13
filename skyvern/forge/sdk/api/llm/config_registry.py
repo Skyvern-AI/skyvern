@@ -568,16 +568,46 @@ if settings.ENABLE_AZURE_O3:
             max_completion_tokens=100000,
         ),
     )
-if settings.ENABLE_UI_TARS:
+if settings.ENABLE_VOLCENGINE:
     LLMConfigRegistry.register_config(
-        "UI_TARS_SEED1_5_VL",
+        "VOLCENGINE_DOUBAO_SEED_1_6",
         LLMConfig(
-            settings.UI_TARS_MODEL,
-            ["UI_TARS_API_KEY"],
+            "volcengine/doubao-seed-1.6-250615",
+            ["VOLCENGINE_API_KEY"],
+            litellm_params=LiteLLMParams(
+                api_base=settings.VOLCENGINE_API_BASE,
+                api_key=settings.VOLCENGINE_API_KEY,
+            ),
             supports_vision=True,
             add_assistant_prefix=False,
-            max_tokens=400,
-            temperature=0.0,
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
+        "VOLCENGINE_DOUBAO_SEED_1_6_FLASH",
+        LLMConfig(
+            "volcengine/doubao-seed-1.6-flash-250615",
+            ["VOLCENGINE_API_KEY"],
+            litellm_params=LiteLLMParams(
+                api_base=settings.VOLCENGINE_API_BASE,
+                api_key=settings.VOLCENGINE_API_KEY,
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
+        "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO",
+        LLMConfig(
+            "volcengine/doubao-1-5-thinking-vision-pro-250428",
+            ["VOLCENGINE_API_KEY"],
+            litellm_params=LiteLLMParams(
+                api_base=settings.VOLCENGINE_API_BASE,
+                api_key=settings.VOLCENGINE_API_KEY,
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
         ),
     )
 

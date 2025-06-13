@@ -404,7 +404,7 @@ class ForgeAgent:
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
                 if not llm_caller:
                     # create a new UI-TARS llm_caller
-                    llm_key = task.llm_key or settings.UI_TARS_LLM_KEY
+                    llm_key = task.llm_key or settings.VOLCENGINE_CUA_LLM_KEY
                     llm_caller = UITarsLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=True)
                     llm_caller.initialize_conversation(task)
 

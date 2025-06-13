@@ -62,7 +62,7 @@ class UITarsLLMCaller(LLMCaller):
             # Handle None case for navigation_goal
             instruction = task.navigation_goal or "Default navigation task"
             system_prompt = _build_system_prompt(instruction)
-            self.message_history = [{"role": "user", "content": system_prompt}]
+            self.message_history: list = [{"role": "user", "content": system_prompt}]
             self._conversation_initialized = True
             LOG.debug("Initialized UI-TARS conversation", task_id=task.task_id)
 

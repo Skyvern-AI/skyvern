@@ -134,12 +134,11 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
 
-    # UI-TARS (Seed1.5-VL via Doubao)
-    UI_TARS_API_KEY: str | None = None
-    UI_TARS_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
-    UI_TARS_MODEL: str = "doubao-1-5-thinking-vision-pro-250428"
-    UI_TARS_LLM_KEY: str = "UI_TARS_SEED1_5_VL"
-    ENABLE_UI_TARS: bool = False
+    # VOLCENGINE (Doubao)
+    ENABLE_VOLCENGINE: bool = False
+    VOLCENGINE_API_KEY: str | None = None
+    VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
+    VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
