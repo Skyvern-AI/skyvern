@@ -35,7 +35,7 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import { NarrativeCard } from "./components/header/NarrativeCard";
@@ -45,6 +45,7 @@ import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTemplates } from "../discover/WorkflowTemplates";
+import { PAGE_SIZE } from "./constants";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -70,6 +71,7 @@ function Workflows() {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       params.append("page", String(page));
+      params.append("page_size", String(PAGE_SIZE + 1));
       params.append("only_workflows", "true");
       params.append("title", debouncedSearch);
       return client
@@ -79,6 +81,26 @@ function Workflows() {
         .then((response) => response.data);
     },
   });
+
+  useEffect(() => {
+    if (page !== 1) {
+      const params = new URLSearchParams();
+      params.set("page", "1");
+      setSearchParams(params, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch]);
+
+  useEffect(() => {
+    if (!isLoading && workflows && workflows.length === 0 && page > 1) {
+      const params = new URLSearchParams();
+      params.set("page", String(page - 1));
+      setSearchParams(params, { replace: true });
+    }
+  }, [isLoading, workflows, page, setSearchParams]);
+
+  const visibleWorkflows = workflows?.slice(0, PAGE_SIZE);
+  const hasNextPage = workflows ? workflows.length > PAGE_SIZE : false;
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -192,12 +214,12 @@ function Workflows() {
                 <TableRow>
                   <TableCell colSpan={4}>Loading...</TableCell>
                 </TableRow>
-              ) : workflows?.length === 0 ? (
+              ) : visibleWorkflows?.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={4}>No workflows found</TableCell>
                 </TableRow>
               ) : (
-                workflows?.map((workflow) => {
+                visibleWorkflows?.map((workflow) => {
                   return (
                     <TableRow
                       key={workflow.workflow_permanent_id}
@@ -294,7 +316,11 @@ function Workflows() {
               </PaginationItem>
               <PaginationItem>
                 <PaginationNext
+                  className={cn({ "cursor-not-allowed": !hasNextPage })}
                   onClick={() => {
+                    if (!hasNextPage) {
+                      return;
+                    }
                     const params = new URLSearchParams();
                     params.set("page", String(page + 1));
                     setSearchParams(params, { replace: true });
