@@ -687,3 +687,18 @@ class SkyvernContextWindowExceededError(SkyvernException):
 class LLMCallerNotFoundError(SkyvernException):
     def __init__(self, uid: str) -> None:
         super().__init__(f"LLM caller for {uid} is not found")
+
+
+class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is already occupied")
+
+
+class MissingBrowserSessionError(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} does not exist.")
+
+
+class MissingBrowserAddressError(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} does not have an address.")

@@ -9,6 +9,7 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
+from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -221,6 +222,8 @@ async def run_task(
                 create_task_run=True,
                 model=run_request.model,
             )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except LLMProviderError:
             LOG.error("LLM failure to initialize task v2", exc_info=True)
             raise HTTPException(
@@ -316,18 +319,22 @@ async def run_workflow(
         totp_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
     )
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=legacy_workflow_request,
-        template=template,
-        version=None,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=legacy_workflow_request,
+            template=template,
+            version=None,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -1253,18 +1260,21 @@ async def run_workflow_legacy(
         browser_session_id=workflow_request.browser_session_id,
     )
 
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=workflow_request,
-        template=template,
-        version=version,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=workflow_request,
+            template=template,
+            version=version,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return RunWorkflowResponse(
         workflow_id=workflow_id,
@@ -1759,6 +1769,8 @@ async def run_task_v2(
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
         )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except LLMProviderError:
         LOG.error("LLM failure to initialize task v2", exc_info=True)
         raise HTTPException(
