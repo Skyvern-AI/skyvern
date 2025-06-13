@@ -41,6 +41,7 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -77,6 +78,7 @@ class ForLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     code: str
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
 
@@ -95,6 +97,7 @@ class ForLoopBlockLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -112,6 +115,7 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -148,6 +152,7 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -184,6 +189,7 @@ class ForLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None
@@ -206,6 +212,7 @@ class ForLoopBlockLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
     file_type: FileType = "csv"
 
@@ -224,6 +231,7 @@ class ForLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
     loop_variable_reference: typing.Optional[str] = None
@@ -247,6 +255,7 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: str
     title: typing.Optional[str] = None
@@ -283,6 +292,7 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -319,6 +329,7 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -355,6 +366,7 @@ class ForLoopBlockLoopBlocksItem_PdfParser(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
@@ -373,6 +385,7 @@ class ForLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     smtp_host: AwsSecretParameter
     smtp_port: AwsSecretParameter
     smtp_username: AwsSecretParameter
@@ -398,6 +411,7 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -434,6 +448,7 @@ class ForLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     prompt: str
     url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
@@ -456,6 +471,7 @@ class ForLoopBlockLoopBlocksItem_TextPrompt(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     llm_key: typing.Optional[str] = None
     prompt: str
     parameters: typing.Optional[typing.List[TextPromptBlockParametersItem]] = None
@@ -476,6 +492,7 @@ class ForLoopBlockLoopBlocksItem_UploadToS3(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -493,6 +510,7 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -529,6 +547,7 @@ class ForLoopBlockLoopBlocksItem_Wait(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     wait_sec: int
     parameters: typing.Optional[typing.List[WaitBlockParametersItem]] = None
 
