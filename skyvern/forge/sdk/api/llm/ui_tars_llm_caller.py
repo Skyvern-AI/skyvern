@@ -23,10 +23,7 @@ from PIL import Image
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.utils.image_resizer import Resolution
 
 LOG = structlog.get_logger()
 
@@ -150,10 +147,10 @@ class UITarsLLMCaller(LLMCaller):
         response = await self.call(
             step=step,
             use_message_history=True,  # Use conversation history
-            raw_response=True,         # Skip JSON parsing for plain text
+            raw_response=True,  # Skip JSON parsing for plain text
         )
 
-        content = response['choices'][0]['message']['content']
+        content = response["choices"][0]["message"]["content"]
 
         # Add the response to conversation history
         self.add_assistant_response(content)
