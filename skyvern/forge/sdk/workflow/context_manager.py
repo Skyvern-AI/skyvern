@@ -63,7 +63,7 @@ class WorkflowRunContext:
         ],
     ) -> Self:
         # key is label name
-        workflow_run_context = cls()
+        workflow_run_context = cls(aws_client=aws_client)
         for parameter, run_parameter in workflow_parameter_tuples:
             if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                 await workflow_run_context.register_secret_workflow_parameter_value(
@@ -87,22 +87,22 @@ class WorkflowRunContext:
 
         for secrete_parameter in secret_parameters:
             if isinstance(secrete_parameter, AWSSecretParameter):
-                await workflow_run_context.register_aws_secret_parameter_value(aws_client, secrete_parameter)
+                await workflow_run_context.register_aws_secret_parameter_value(secrete_parameter)
             elif isinstance(secrete_parameter, CredentialParameter):
                 await workflow_run_context.register_credential_parameter_value(secrete_parameter, organization)
             elif isinstance(secrete_parameter, OnePasswordCredentialParameter):
                 await workflow_run_context.register_onepassword_credential_parameter_value(secrete_parameter)
             elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
-                    aws_client, secrete_parameter, organization
+                    secrete_parameter, organization
                 )
             elif isinstance(secrete_parameter, BitwardenCreditCardDataParameter):
                 await workflow_run_context.register_bitwarden_credit_card_data_parameter_value(
-                    aws_client, secrete_parameter, organization
+                    secrete_parameter, organization
                 )
             elif isinstance(secrete_parameter, BitwardenSensitiveInformationParameter):
                 await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
-                    aws_client, secrete_parameter, organization
+                    secrete_parameter, organization
                 )
 
         for context_parameter in context_parameters:
@@ -113,11 +113,12 @@ class WorkflowRunContext:
 
         return workflow_run_context
 
-    def __init__(self) -> None:
+    def __init__(self, aws_client: AsyncAWSClient) -> None:
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
+        self._aws_client = aws_client
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -372,13 +373,12 @@ class WorkflowRunContext:
 
     async def register_aws_secret_parameter_value(
         self,
-        aws_client: AsyncAWSClient,
         parameter: AWSSecretParameter,
     ) -> None:
         # If the parameter is an AWS secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
-        secret_value = await aws_client.get_secret(parameter.aws_key)
+        secret_value = await self._aws_client.get_secret(parameter.aws_key)
         if secret_value is not None:
             random_secret_id = self.generate_random_secret_id()
             self.secrets[random_secret_id] = secret_value
@@ -427,19 +427,18 @@ class WorkflowRunContext:
 
     async def register_bitwarden_login_credential_parameter_value(
         self,
-        aws_client: AsyncAWSClient,
         parameter: BitwardenLoginCredentialParameter,
         organization: Organization,
     ) -> None:
         try:
             # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await aws_client.get_secret(
+            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
                 parameter.bitwarden_client_id_aws_secret_key
             )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await aws_client.get_secret(
+            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
                 parameter.bitwarden_client_secret_aws_secret_key
             )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await aws_client.get_secret(
+            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
                 parameter.bitwarden_master_password_aws_secret_key
             )
         except Exception as e:
@@ -531,19 +530,18 @@ class WorkflowRunContext:
 
     async def register_bitwarden_sensitive_information_parameter_value(
         self,
-        aws_client: AsyncAWSClient,
         parameter: BitwardenSensitiveInformationParameter,
         organization: Organization,
     ) -> None:
         try:
             # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await aws_client.get_secret(
+            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
                 parameter.bitwarden_client_id_aws_secret_key
             )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await aws_client.get_secret(
+            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
                 parameter.bitwarden_client_secret_aws_secret_key
             )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await aws_client.get_secret(
+            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
                 parameter.bitwarden_master_password_aws_secret_key
             )
         except Exception as e:
@@ -599,19 +597,18 @@ class WorkflowRunContext:
 
     async def register_bitwarden_credit_card_data_parameter_value(
         self,
-        aws_client: AsyncAWSClient,
         parameter: BitwardenCreditCardDataParameter,
         organization: Organization,
     ) -> None:
         try:
             # Get the Bitwarden login credentials from AWS secrets
-            client_id = settings.BITWARDEN_CLIENT_ID or await aws_client.get_secret(
+            client_id = settings.BITWARDEN_CLIENT_ID or await self._aws_client.get_secret(
                 parameter.bitwarden_client_id_aws_secret_key
             )
-            client_secret = settings.BITWARDEN_CLIENT_SECRET or await aws_client.get_secret(
+            client_secret = settings.BITWARDEN_CLIENT_SECRET or await self._aws_client.get_secret(
                 parameter.bitwarden_client_secret_aws_secret_key
             )
-            master_password = settings.BITWARDEN_MASTER_PASSWORD or await aws_client.get_secret(
+            master_password = settings.BITWARDEN_MASTER_PASSWORD or await self._aws_client.get_secret(
                 parameter.bitwarden_master_password_aws_secret_key
             )
         except Exception as e:
