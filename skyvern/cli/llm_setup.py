@@ -160,6 +160,27 @@ def setup_llm_providers() -> None:
     else:
         update_or_add_env_var("ENABLE_NOVITA", "false")
 
+    console.print("\n[bold blue]--- VolcEngine Configuration ---[/bold blue]")
+    console.print("To enable VolcEngine, you must have a ByteDance Doubao API key.")
+    enable_volcengine = Confirm.ask("Do you want to enable VolcEngine?")
+    if enable_volcengine:
+        volcengine_api_key = Prompt.ask("Enter your VolcEngine(ByteDance Doubao) API key", password=True)
+        if not volcengine_api_key:
+            console.print("[red]Error: VolcEngine key is required. VolcEngine will not be enabled.[/red]")
+        else:
+            update_or_add_env_var("VOLCENGINE_API_KEY", volcengine_api_key)
+            update_or_add_env_var("ENABLE_VOLCENGINE", "true")
+
+            model_options.extend(
+                [
+                    "VOLCENGINE_DOUBAO_SEED_1_6",
+                    "VOLCENGINE_DOUBAO_SEED_1_6_FLASH",
+                    "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO",
+                ]
+            )
+    else:
+        update_or_add_env_var("ENABLE_VOLCENGINE", "false")
+
     console.print("\n[bold blue]--- OpenAI-Compatible Provider Configuration ---[/bold blue]")
     console.print("To enable an OpenAI-compatible provider, you must have a model name, API key, and API base URL.")
     enable_openai_compatible = Confirm.ask("Do you want to enable an OpenAI-compatible provider?")

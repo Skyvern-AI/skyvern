@@ -60,7 +60,7 @@ from skyvern.forge.sdk.api.files import (
     list_files_in_directory,
     wait_for_download_finished,
 )
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCallerManager
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
@@ -70,6 +70,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 from skyvern.schemas.runs import CUA_RUN_TYPES
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions
@@ -821,7 +822,7 @@ async def handle_input_text_action(
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
-    is_totp_value = text == BitwardenConstants.TOTP
+    is_totp_value = text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP
     is_secret_value = text != action.text
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
@@ -1744,6 +1745,9 @@ async def handle_keypress_action(
             updated_keys.append("Escape")
         elif key_lower_case == "alt":
             updated_keys.append("Alt")
+        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
+            # Handle function keys: f1 -> F1, f5 -> F5, etc.
+            updated_keys.append(key_lower_case.upper())
         else:
             updated_keys.append(key)
     keypress_str = "+".join(updated_keys)
@@ -2557,7 +2561,8 @@ async def sequentially_select_from_dropdown(
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
         )
-        json_response = await app.LLM_API_HANDLER(
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER)
+        json_response = await llm_api_handler(
             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="confirm-multi-selection-finish"
         )
         if json_response.get("is_mini_goal_finished", False):
@@ -2641,7 +2646,8 @@ async def select_from_emerging_elements(
         task_id=task.task_id,
     )
 
-    json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER)
+    json_response = await llm_api_handler(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     LOG.info(
         "LLM response for the matched element",
@@ -3385,12 +3391,12 @@ async def extract_information_for_navigation_goal(
         # CUA tasks should use the default data extraction llm key
         llm_key_override = None
 
-    json_response = await app.LLM_API_HANDLER(
+    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key_override, default=app.LLM_API_HANDLER)
+    json_response = await llm_api_handler(
         prompt=extract_information_prompt,
         step=step,
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
-        llm_key_override=llm_key_override,
     )
 
     return ScrapeResult(

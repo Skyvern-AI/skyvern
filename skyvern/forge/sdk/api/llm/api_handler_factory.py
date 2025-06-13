@@ -2,7 +2,7 @@ import dataclasses
 import json
 import time
 from asyncio import CancelledError
-from typing import Any
+from typing import Any, AsyncIterator
 
 import litellm
 import structlog
@@ -10,6 +10,7 @@ from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.utils import CustomStreamWrapper, ModelResponse
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig, dummy_llm_api_handler
+from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, llm_messages_builder_with_history, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -44,6 +46,20 @@ class LLMCallStats(BaseModel):
 
 class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
+
+    @staticmethod
+    def get_override_llm_api_handler(override_llm_key: str | None, *, default: LLMAPIHandler) -> LLMAPIHandler:
+        if not override_llm_key:
+            return default
+        try:
+            return LLMAPIHandlerFactory.get_llm_api_handler(override_llm_key)
+        except Exception:
+            LOG.warning(
+                "Failed to get override LLM API handler, going to use the default.",
+                override_llm_key=override_llm_key,
+                exc_info=True,
+            )
+            return default
 
     @staticmethod
     def get_llm_api_handler_with_router(llm_key: str) -> LLMAPIHandler:
@@ -82,7 +98,6 @@ class LLMAPIHandlerFactory:
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
-            llm_key_override: str | None = None,
         ) -> dict[str, Any]:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
@@ -96,18 +111,10 @@ class LLMAPIHandlerFactory:
             Returns:
                 The response from the LLM router.
             """
-            nonlocal llm_config
-            nonlocal llm_key
-
-            local_llm_config: LLMConfig | LLMRouterConfig = llm_config
-            if llm_key_override:
-                local_llm_config = LLMConfigRegistry.get_config(llm_key_override)
-
-            local_llm_key = llm_key_override or llm_key
             start_time = time.time()
 
             if parameters is None:
-                parameters = LLMAPIHandlerFactory.get_api_parameters(local_llm_config)
+                parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
             context = skyvern_context.current()
             if context and len(context.hashed_href_map) > 0:
@@ -128,12 +135,12 @@ class LLMAPIHandlerFactory:
                 task_v2=task_v2,
                 thought=thought,
             )
-            messages = await llm_messages_builder(prompt, screenshots, local_llm_config.add_assistant_prefix)
+            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(
                     {
-                        "model": local_llm_key,
+                        "model": llm_key,
                         "messages": messages,
                         **parameters,
                     }
@@ -149,12 +156,12 @@ class LLMAPIHandlerFactory:
                     model=main_model_group, messages=messages, timeout=settings.LLM_CONFIG_TIMEOUT, **parameters
                 )
             except litellm.exceptions.APIError as e:
-                raise LLMProviderErrorRetryableTask(local_llm_key) from e
+                raise LLMProviderErrorRetryableTask(llm_key) from e
             except litellm.exceptions.ContextWindowExceededError as e:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
                     "Context window exceeded",
-                    llm_key=local_llm_key,
+                    llm_key=llm_key,
                     model=main_model_group,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
@@ -164,22 +171,22 @@ class LLMAPIHandlerFactory:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
                     "LLM token limit exceeded",
-                    llm_key=local_llm_key,
+                    llm_key=llm_key,
                     model=main_model_group,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
                 )
-                raise LLMProviderErrorRetryableTask(local_llm_key) from e
+                raise LLMProviderErrorRetryableTask(llm_key) from e
             except Exception as e:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
                     "LLM request failed unexpectedly",
-                    llm_key=local_llm_key,
+                    llm_key=llm_key,
                     model=main_model_group,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
                 )
-                raise LLMProviderError(local_llm_key) from e
+                raise LLMProviderError(llm_key) from e
 
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=response.model_dump_json(indent=2).encode("utf-8"),
@@ -191,6 +198,7 @@ class LLMAPIHandlerFactory:
             )
             if step or thought:
                 try:
+                    # FIXME: volcengine doesn't support litellm cost calculation.
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
                     LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
@@ -226,7 +234,7 @@ class LLMAPIHandlerFactory:
                         reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
                     )
-            parsed_response = parse_api_response(response, local_llm_config.add_assistant_prefix)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
@@ -253,7 +261,7 @@ class LLMAPIHandlerFactory:
             duration_seconds = time.time() - start_time
             LOG.info(
                 "LLM API handler duration metrics",
-                llm_key=local_llm_key,
+                llm_key=llm_key,
                 model=main_model_group,
                 prompt_name=prompt_name,
                 duration_seconds=duration_seconds,
@@ -287,25 +295,15 @@ class LLMAPIHandlerFactory:
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
-            llm_key_override: str | None = None,
         ) -> dict[str, Any]:
-            nonlocal llm_config
-            nonlocal llm_key
-
-            local_llm_config: LLMConfig | LLMRouterConfig = llm_config
-            if llm_key_override:
-                local_llm_config = LLMConfigRegistry.get_config(llm_key_override)
-
-            local_llm_key = llm_key_override or llm_key
-
             start_time = time.time()
             active_parameters = base_parameters or {}
             if parameters is None:
-                parameters = LLMAPIHandlerFactory.get_api_parameters(local_llm_config)
+                parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
             active_parameters.update(parameters)
-            if local_llm_config.litellm_params:  # type: ignore
-                active_parameters.update(local_llm_config.litellm_params)  # type: ignore
+            if llm_config.litellm_params:  # type: ignore
+                active_parameters.update(llm_config.litellm_params)  # type: ignore
 
             context = skyvern_context.current()
             if context and len(context.hashed_href_map) > 0:
@@ -328,12 +326,12 @@ class LLMAPIHandlerFactory:
                 ai_suggestion=ai_suggestion,
             )
 
-            if not local_llm_config.supports_vision:
+            if not llm_config.supports_vision:
                 screenshots = None
 
-            model_name = local_llm_config.model_name
+            model_name = llm_config.model_name
 
-            messages = await llm_messages_builder(prompt, screenshots, local_llm_config.add_assistant_prefix)
+            messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(
                     {
@@ -361,12 +359,12 @@ class LLMAPIHandlerFactory:
                     **active_parameters,
                 )
             except litellm.exceptions.APIError as e:
-                raise LLMProviderErrorRetryableTask(local_llm_key) from e
+                raise LLMProviderErrorRetryableTask(llm_key) from e
             except litellm.exceptions.ContextWindowExceededError as e:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
                     "Context window exceeded",
-                    llm_key=local_llm_key,
+                    llm_key=llm_key,
                     model=model_name,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
@@ -376,22 +374,22 @@ class LLMAPIHandlerFactory:
                 t_llm_cancelled = time.perf_counter()
                 LOG.error(
                     "LLM request got cancelled",
-                    llm_key=local_llm_key,
+                    llm_key=llm_key,
                     model=model_name,
                     prompt_name=prompt_name,
                     duration=t_llm_cancelled - t_llm_request,
                 )
-                raise LLMProviderError(local_llm_key)
+                raise LLMProviderError(llm_key)
             except Exception as e:
                 duration_seconds = time.time() - start_time
                 LOG.exception(
                     "LLM request failed unexpectedly",
-                    llm_key=local_llm_key,
+                    llm_key=llm_key,
                     model=model_name,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
                 )
-                raise LLMProviderError(local_llm_key) from e
+                raise LLMProviderError(llm_key) from e
 
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=response.model_dump_json(indent=2).encode("utf-8"),
@@ -404,6 +402,7 @@ class LLMAPIHandlerFactory:
 
             if step or thought:
                 try:
+                    # FIXME: volcengine doesn't support litellm cost calculation.
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
                     LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
@@ -439,7 +438,7 @@ class LLMAPIHandlerFactory:
                         cached_token_count=cached_tokens if cached_tokens > 0 else None,
                         thought_cost=llm_cost,
                     )
-            parsed_response = parse_api_response(response, local_llm_config.add_assistant_prefix)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
@@ -466,9 +465,9 @@ class LLMAPIHandlerFactory:
             duration_seconds = time.time() - start_time
             LOG.info(
                 "LLM API handler duration metrics",
-                llm_key=local_llm_key,
+                llm_key=llm_key,
                 prompt_name=prompt_name,
-                model=local_llm_config.model_name,
+                model=llm_config.model_name,
                 duration_seconds=duration_seconds,
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
@@ -749,9 +748,13 @@ class LLMCaller:
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
-    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage:
+    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)
+
+        # Route UI-TARS models to custom handler instead of LiteLLM
+        if self.llm_key and "UI_TARS" in self.llm_key:
+            return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
         return await litellm.acompletion(
             model=self.llm_config.model_name, messages=messages, tools=tools, timeout=timeout, **active_parameters
@@ -795,8 +798,76 @@ class LLMCaller:
         )
         return response
 
-    async def get_call_stats(self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage) -> LLMCallStats:
+    async def _call_ui_tars(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list | None = None,
+        timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        **active_parameters: dict[str, Any],
+    ) -> UITarsResponse:
+        """Custom UI-TARS API call using OpenAI client with VolcEngine endpoint."""
+        max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 400
+        model_name = self.llm_config.model_name.replace("volcengine/", "")
+
+        if not app.UI_TARS_CLIENT:
+            raise ValueError(
+                "UI_TARS_CLIENT not initialized. Please ensure ENABLE_VOLCENGINE=true and VOLCENGINE_API_KEY is set."
+            )
+
+        LOG.info(
+            "UI-TARS request",
+            model_name=model_name,
+            timeout=timeout,
+            messages_length=len(messages),
+        )
+
+        # Use the UI-TARS client (which is OpenAI-compatible with VolcEngine)
+        chat_completion: AsyncIterator[ChatCompletionChunk] = await app.UI_TARS_CLIENT.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            top_p=None,
+            temperature=active_parameters.get("temperature", 0.0),
+            max_tokens=max_tokens,
+            stream=True,
+            seed=None,
+            stop=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            timeout=timeout,
+        )
+
+        # Aggregate streaming response like in ByteDance example
+        response_content = ""
+        async for message in chat_completion:
+            if message.choices[0].delta.content:
+                response_content += message.choices[0].delta.content
+
+        response = UITarsResponse(response_content, model_name)
+
+        LOG.info(
+            "UI-TARS response",
+            model_name=model_name,
+            response_length=len(response_content),
+            timeout=timeout,
+        )
+        return response
+
+    async def get_call_stats(
+        self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
+    ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
+
+        # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
+        if isinstance(response, UITarsResponse):
+            ui_tars_usage = response.usage
+            return LLMCallStats(
+                llm_cost=0,  # TODO: calculate the cost according to the price: https://www.volcengine.com/docs/82379/1544106
+                input_tokens=ui_tars_usage.get("prompt_tokens", 0),
+                output_tokens=ui_tars_usage.get("completion_tokens", 0),
+                cached_tokens=0,  # only part of model support cached tokens
+                reasoning_tokens=0,
+            )
+
         if isinstance(response, AnthropicMessage):
             usage = response.usage
             input_token_cost = (3.0 / 1000000) * usage.input_tokens
