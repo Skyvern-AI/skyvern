@@ -23,6 +23,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig, dummy_llm_api_handler
+from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, llm_messages_builder_with_history, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -837,68 +838,6 @@ class LLMCaller:
         async for message in chat_completion:
             if message.choices[0].delta.content:
                 response_content += message.choices[0].delta.content
-
-        # Create a response object that mimics the ModelResponse interface
-        class UITarsResponse:
-            def __init__(self, content: str, model: str):
-                # Create choice objects with proper nested structure for parse_api_response
-                class Message:
-                    def __init__(self, content: str):
-                        self.content = content
-                        self.role = "assistant"
-
-                class Choice:
-                    def __init__(self, content: str):
-                        self.message = Message(content)
-
-                self.choices = [Choice(content)]
-                self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                self.model = model
-                self.object = "chat.completion"
-
-            def model_dump_json(self, indent: int = 2) -> str:
-                """Provide model_dump_json compatibility for artifact creation."""
-                import json
-
-                return json.dumps(
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": self.choices[0].message.content,
-                                    "role": self.choices[0].message.role,
-                                }
-                            }
-                        ],
-                        "usage": self.usage,
-                        "model": self.model,
-                        "object": self.object,
-                    },
-                    indent=indent,
-                )
-
-            def model_dump(self, exclude_none: bool = True) -> dict:
-                """Provide model_dump compatibility for raw_response."""
-                return {
-                    "choices": [
-                        {"message": {"content": self.choices[0].message.content, "role": self.choices[0].message.role}}
-                    ],
-                    "usage": self.usage,
-                    "model": self.model,
-                    "object": self.object,
-                }
-
-            def get(self, key: str, default: Any = None) -> Any:
-                """Provide dict-like access for compatibility."""
-                return getattr(self, key, default)
-
-            def __getitem__(self, key: str) -> Any:
-                """Provide dict-like access for compatibility."""
-                return getattr(self, key)
-
-            def __contains__(self, key: str) -> bool:
-                """Provide dict-like access for compatibility."""
-                return hasattr(self, key)
 
         response = UITarsResponse(response_content, model_name)
 
