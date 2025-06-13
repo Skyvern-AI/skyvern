@@ -1351,12 +1351,9 @@ def _generate_random_string(length: int = 5) -> str:
     return "".join(random.choices(RANDOM_STRING_POOL, k=length))
 
 
-async def get_thought_timelines(
-    task_v2_id: str,
-    organization_id: str | None = None,
-) -> list[WorkflowRunTimeline]:
+async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
     thoughts = await app.DATABASE.get_thoughts(
-        task_v2_id,
+        task_v2_id=task_v2_id,
         organization_id=organization_id,
         thought_types=[
             ThoughtType.plan,
