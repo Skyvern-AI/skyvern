@@ -161,3 +161,4 @@ class WorkflowRunResponseBase(BaseModel):
     total_cost: float | None = None
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
+    browser_session_id: str | None = None

@@ -219,6 +219,14 @@ class WorkflowService:
             )
             raise e
 
+        if workflow_request.browser_session_id:
+            await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                browser_session_id=workflow_request.browser_session_id,
+                runnable_type="workflow_run",
+                runnable_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+            )
+
         return workflow_run
 
     async def execute_workflow(

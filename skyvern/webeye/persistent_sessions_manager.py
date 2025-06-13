@@ -6,6 +6,7 @@ import structlog
 from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge.sdk.db.client import AgentDB
+from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.webeye.browser_factory import BrowserState
 
@@ -26,9 +27,63 @@ class PersistentSessionsManager:
 
     def __new__(cls, database: AgentDB) -> PersistentSessionsManager:
         if cls.instance is None:
-            cls.instance = super().__new__(cls)
+            new_instance = super().__new__(cls)
+            cls.instance = new_instance
+            cls.instance.database = database
+            return new_instance
+
         cls.instance.database = database
         return cls.instance
+
+    async def begin_session(
+        self,
+        *,
+        browser_session_id: str,
+        runnable_type: str,
+        runnable_id: str,
+        organization_id: str,
+    ) -> None:
+        """
+        Attempt to begin a session.
+
+        TODO: cloud-side, temporal and ECS fargate are used to effect the session. These tools are not presently
+        available OSS-side.
+        """
+
+        LOG.info("Begin browser session", browser_session_id=browser_session_id)
+
+        persistent_browser_session = await self.database.get_persistent_browser_session(
+            browser_session_id, organization_id
+        )
+
+        if persistent_browser_session is None:
+            raise Exception(f"Persistent browser session not found for {browser_session_id}")
+
+        await self.occupy_browser_session(
+            session_id=browser_session_id,
+            runnable_type=runnable_type,
+            runnable_id=runnable_id,
+            organization_id=organization_id,
+        )
+
+        LOG.info("Browser session begin", browser_session_id=browser_session_id)
+
+    async def get_browser_address(self, session_id: str, organization_id: str) -> tuple[str, str, str]:
+        address = await wait_on_persistent_browser_address(self.database, session_id, organization_id)
+
+        if address is None:
+            raise Exception(f"Browser address not found for persistent browser session {session_id}")
+
+        protocol = "http"
+        host, cdp_port = address.split(":")
+
+        return protocol, host, cdp_port
+
+    async def get_session_by_runnable_id(
+        self, runnable_id: str, organization_id: str
+    ) -> PersistentBrowserSession | None:
+        """Get a specific browser session by runnable ID."""
+        return await self.database.get_persistent_browser_session_by_runnable_id(runnable_id, organization_id)
 
     async def get_active_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active sessions for an organization."""
