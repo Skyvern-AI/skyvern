@@ -24,6 +24,13 @@ jobs:
             PR_NUMBER=${{ inputs.pr_number }}
           else
             PR_NUMBER=${{ github.event.pull_request.number }}
+            if [ -z "$PR_NUMBER" ]; then
+              PR_NUMBER=$(git log -1 --pretty=format:%s | grep -o '#[0-9]\\+' | tr -d '#')
+            fi
+          fi
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR number found. Exiting."
+            exit 1
           fi
           PR_INFO=$(gh pr view $PR_NUMBER --json number,headRefName,body,title,url,author)
           BRANCH_NAME=$(echo "$PR_INFO" | jq -r .headRefName)
