@@ -365,6 +365,11 @@ class BaseRunResponse(BaseModel):
         description="URL to the application UI where the run can be viewed",
         examples=["https://app.skyvern.com/tasks/tsk_123", "https://app.skyvern.com/workflows/wpid_123/wr_123"],
     )
+    browser_session_id: str | None = Field(
+        default=None,
+        description="ID of the Skyvern persistent browser session used for this run",
+        examples=["pbs_123"],
+    )
 
 
 class TaskRunResponse(BaseRunResponse):

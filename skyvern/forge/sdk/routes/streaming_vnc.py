@@ -5,12 +5,12 @@ from enum import IntEnum
 
 import structlog
 import websockets
-from cloud.config import settings
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from websockets import Data
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
@@ -184,9 +184,8 @@ async def get_streaming_for_task(
     streaming = Streaming(
         interactor="user",
         organization_id=organization_id,
-        vnc_port=settings.PERSISTENT_BROWSER_VNC_PORT,
+        vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
         websocket=websocket,
-        # --
         browser_session=browser_session,
         task=task,
     )
@@ -230,8 +229,7 @@ async def get_streaming_for_workflow_run(
     streaming = Streaming(
         interactor="user",
         organization_id=organization_id,
-        vnc_port=settings.PERSISTENT_BROWSER_VNC_PORT,
-        # --
+        vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
         browser_session=browser_session,
         workflow_run=workflow_run,
         websocket=websocket,
