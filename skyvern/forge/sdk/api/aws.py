@@ -354,6 +354,9 @@ class S3Uri:
     def uri(self) -> str:
         return self._parsed.geturl()
 
+    def __str__(self) -> str:
+        return self.uri
+
 
 def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
     """Convert a list of tags to a dictionary."""
