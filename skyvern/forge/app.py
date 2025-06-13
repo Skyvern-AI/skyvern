@@ -46,6 +46,14 @@ ANTHROPIC_CLIENT = AsyncAnthropic(api_key=SettingsManager.get_settings().ANTHROP
 if SettingsManager.get_settings().ENABLE_BEDROCK_ANTHROPIC:
     ANTHROPIC_CLIENT = AsyncAnthropicBedrock()
 
+# Add UI-TARS client setup
+UI_TARS_CLIENT = None
+if SettingsManager.get_settings().ENABLE_UI_TARS:
+    UI_TARS_CLIENT = AsyncOpenAI(
+        api_key=SettingsManager.get_settings().UI_TARS_API_KEY,
+        base_url=SettingsManager.get_settings().UI_TARS_API_BASE,
+    )
+
 SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
     SETTINGS_MANAGER.SECONDARY_LLM_KEY if SETTINGS_MANAGER.SECONDARY_LLM_KEY else SETTINGS_MANAGER.LLM_KEY
 )

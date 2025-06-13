@@ -70,6 +70,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 from skyvern.schemas.runs import CUA_RUN_TYPES
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions
@@ -821,7 +822,7 @@ async def handle_input_text_action(
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
-    is_totp_value = text == BitwardenConstants.TOTP
+    is_totp_value = text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP
     is_secret_value = text != action.text
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
@@ -1744,6 +1745,9 @@ async def handle_keypress_action(
             updated_keys.append("Escape")
         elif key_lower_case == "alt":
             updated_keys.append("Alt")
+        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
+            # Handle function keys: f1 -> F1, f5 -> F5, etc.
+            updated_keys.append(key_lower_case.upper())
         else:
             updated_keys.append(key)
     keypress_str = "+".join(updated_keys)
