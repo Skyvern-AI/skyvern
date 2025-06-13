@@ -63,4 +63,4 @@ class UITarsResponse:
 
     def __contains__(self, key: str) -> bool:
         """Provide dict-like access for compatibility."""
-        return hasattr(self, key) 
+        return hasattr(self, key)
