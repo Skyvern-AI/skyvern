@@ -93,12 +93,7 @@ class BrowserManager:
                 raise MissingBrowserState(task_id=task.task_id)
             else:
                 if task.organization_id:
-                    await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
-                        browser_session_id,
-                        organization_id=task.organization_id,
-                        runnable_type="task",
-                        runnable_id=task.task_id,
-                    )
+                    LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
                 else:
                     LOG.warning("Organization ID is not set for task", task_id=task.task_id)
                 page = await browser_state.get_working_page()
@@ -160,12 +155,7 @@ class BrowserManager:
                 )
                 raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
             else:
-                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
-                    browser_session_id,
-                    runnable_type="workflow_run",
-                    runnable_id=workflow_run.workflow_run_id,
-                    organization_id=workflow_run.organization_id,
-                )
+                LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
                 page = await browser_state.get_working_page()
                 if page:
                     if url:

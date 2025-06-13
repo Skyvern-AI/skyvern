@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timedelta
 from typing import Any, List, Sequence
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenSensitiveInformationParameterModel,
     CredentialModel,
     CredentialParameterModel,
+    OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
     OrganizationModel,
@@ -58,6 +60,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_block,
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
+    hydrate_action,
 )
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -79,6 +82,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -355,8 +359,9 @@ class AgentDB:
 
     async def get_total_unique_step_order_count_by_task_ids(
         self,
+        *,
         task_ids: list[str],
-        organization_id: str | None = None,
+        organization_id: str,
     ) -> int:
         """
         Get the total count of unique (step.task_id, step.order) pairs of StepModel for the given task ids
@@ -409,6 +414,26 @@ class AgentDB:
 
                 actions = (await session.scalars(query)).all()
                 return [Action.model_validate(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_task_actions_hydrated(self, task_id: str, organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id == task_id)
+                    .order_by(ActionModel.created_at)
+                )
+
+                actions = (await session.scalars(query)).all()
+                return [hydrate_action(action) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -604,6 +629,12 @@ class AgentDB:
                 ).first():
                     if status is not None:
                         task.status = status
+                        if status == TaskStatus.queued and task.queued_at is None:
+                            task.queued_at = datetime.utcnow()
+                        if status == TaskStatus.running and task.started_at is None:
+                            task.started_at = datetime.utcnow()
+                        if status.is_final() and task.finished_at is None:
+                            task.finished_at = datetime.utcnow()
                     if extracted_information is not None:
                         task.extracted_information = extracted_information
                     if failure_reason is not None:
@@ -979,6 +1010,8 @@ class AgentDB:
 
     async def get_artifacts_by_entity_id(
         self,
+        *,
+        organization_id: str,
         artifact_type: ArtifactType | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
@@ -986,7 +1019,6 @@ class AgentDB:
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
-        organization_id: str | None = None,
     ) -> list[Artifact]:
         try:
             async with self.Session() as session:
@@ -1023,16 +1055,18 @@ class AgentDB:
 
     async def get_artifact_by_entity_id(
         self,
+        *,
         artifact_type: ArtifactType,
+        organization_id: str,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
-        organization_id: str | None = None,
     ) -> Artifact | None:
         artifacts = await self.get_artifacts_by_entity_id(
+            organization_id=organization_id,
             artifact_type=artifact_type,
             task_id=task_id,
             step_id=step_id,
@@ -1040,7 +1074,6 @@ class AgentDB:
             workflow_run_block_id=workflow_run_block_id,
             thought_id=thought_id,
             task_v2_id=task_v2_id,
-            organization_id=organization_id,
         )
         return artifacts[0] if artifacts else None
 
@@ -1478,6 +1511,12 @@ class AgentDB:
             if workflow_run:
                 workflow_run.status = status
                 workflow_run.failure_reason = failure_reason
+                if status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
+                    workflow_run.queued_at = datetime.utcnow()
+                if status == WorkflowRunStatus.running and workflow_run.started_at is None:
+                    workflow_run.started_at = datetime.utcnow()
+                if status.is_final() and workflow_run.finished_at is None:
+                    workflow_run.finished_at = datetime.utcnow()
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -1869,6 +1908,32 @@ class AgentDB:
                 created_at=credential_parameter.created_at,
                 modified_at=credential_parameter.modified_at,
                 deleted_at=credential_parameter.deleted_at,
+            )
+
+    async def create_onepassword_credential_parameter(
+        self, workflow_id: str, key: str, vault_id: str, item_id: str, description: str | None = None
+    ) -> OnePasswordCredentialParameter:
+        async with self.Session() as session:
+            parameter = OnePasswordCredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                vault_id=vault_id,
+                item_id=item_id,
+            )
+            session.add(parameter)
+            await session.commit()
+            await session.refresh(parameter)
+            return OnePasswordCredentialParameter(
+                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_id=parameter.vault_id,
+                item_id=parameter.item_id,
+                created_at=parameter.created_at,
+                modified_at=parameter.modified_at,
+                deleted_at=parameter.deleted_at,
             )
 
     async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
@@ -2339,9 +2404,10 @@ class AgentDB:
 
     async def get_thoughts(
         self,
+        *,
         task_v2_id: str,
-        thought_types: list[ThoughtType] | None = None,
-        organization_id: str | None = None,
+        thought_types: list[ThoughtType],
+        organization_id: str,
     ) -> list[Thought]:
         async with self.Session() as session:
             query = (
@@ -2521,6 +2587,12 @@ class AgentDB:
             if task_v2:
                 if status:
                     task_v2.status = status
+                    if status == TaskV2Status.queued and task_v2.queued_at is None:
+                        task_v2.queued_at = datetime.utcnow()
+                    if status == TaskV2Status.running and task_v2.started_at is None:
+                        task_v2.started_at = datetime.utcnow()
+                    if status.is_final() and task_v2.finished_at is None:
+                        task_v2.finished_at = datetime.utcnow()
                 if workflow_run_id:
                     task_v2.workflow_run_id = workflow_run_id
                 if workflow_id:
@@ -3140,3 +3212,21 @@ class AgentDB:
                 query = query.filter_by(organization_id=organization_id)
             task_run = (await session.scalars(query)).first()
             return Run.model_validate(task_run) if task_run else None
+
+    async def wait_on_persistent_browser_address(self, session_id: str, organization_id: str) -> str:
+        async with asyncio.timeout(10 * 60):
+            while True:
+                persistent_browser_session = await self.get_persistent_browser_session(session_id, organization_id)
+                if persistent_browser_session is None:
+                    raise Exception(f"Persistent browser session not found for {session_id}")
+
+                LOG.info(
+                    "Checking browser address",
+                    session_id=session_id,
+                    address=persistent_browser_session.browser_address,
+                )
+
+                if persistent_browser_session.browser_address:
+                    return persistent_browser_session.browser_address
+
+                await asyncio.sleep(2)

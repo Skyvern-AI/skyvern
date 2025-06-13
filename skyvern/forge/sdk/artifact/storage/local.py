@@ -28,9 +28,9 @@ class LocalStorage(BaseStorage):
     def __init__(self, artifact_path: str = settings.ARTIFACT_STORAGE_PATH) -> None:
         self.artifact_path = artifact_path
 
-    def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
+    def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{organization_id}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
         file_path = Path(f"{self.artifact_path}/{settings.ENV}/global_workflows.txt")
@@ -38,7 +38,7 @@ class LocalStorage(BaseStorage):
         if not file_path.exists():
             return []
         try:
-            with open(file_path, "r") as f:
+            with open(file_path) as f:
                 return [line.strip() for line in f.readlines() if line.strip()]
         except Exception:
             return []

@@ -72,7 +72,9 @@ class ArtifactManager:
         path: str | None = None,
     ) -> str:
         artifact_id = generate_artifact_id()
-        uri = app.STORAGE.build_uri(artifact_id, step, artifact_type)
+        uri = app.STORAGE.build_uri(
+            organization_id=step.organization_id, artifact_id=artifact_id, step=step, artifact_type=artifact_type
+        )
         return await self._create_artifact(
             aio_task_primary_key=step.task_id,
             artifact_id=artifact_id,
