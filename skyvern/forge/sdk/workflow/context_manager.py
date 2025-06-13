@@ -1,5 +1,4 @@
 import copy
-import json
 import uuid
 from typing import TYPE_CHECKING, Any, Self
 
@@ -19,7 +18,7 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import OnePasswordConstants, resolve_secret
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -224,77 +223,6 @@ class WorkflowRunContext:
             )
 
         LOG.info(f"Fetching credential parameter value for credential: {credential_id}")
-
-        try:
-            # Extract vault_id and item_id from the database
-            vault_id, item_id = await self._get_credential_vault_and_item_ids(credential_id)
-
-            # Use the 1Password SDK to resolve the reference using vault_id and item_id directly
-            secret_value_json = await resolve_secret(vault_id, item_id)
-
-            # Validate the JSON response
-            if not secret_value_json:
-                LOG.error(f"Empty response from 1Password for credential: {credential_id}")
-                raise ValueError(f"Empty response from 1Password for credential: {credential_id}")
-
-            try:
-                secret_values = json.loads(secret_value_json)
-            except json.JSONDecodeError as json_err:
-                LOG.error(f"Invalid JSON response from 1Password: {secret_value_json[:100]}... Error: {json_err}")
-                raise ValueError(f"Invalid JSON response from 1Password: {json_err}")
-
-            if not secret_values:
-                LOG.warning(f"No values found in 1Password item: {credential_id}")
-                # Still continue with empty values
-
-            self.parameters[parameter.key] = parameter
-            self.values[parameter.key] = {}
-
-            # Process fields from the 1Password item
-            if "fields" in secret_values and isinstance(secret_values["fields"], list):
-                for field in secret_values["fields"]:
-                    if not isinstance(field, dict) or "id" not in field or "value" not in field:
-                        continue
-
-                    field_id = field.get("id")
-                    field_type = field.get("field_type")
-                    field_value = field.get("value")
-
-                    # Store the field value
-                    random_secret_id = self.generate_random_secret_id()
-                    secret_id = f"{random_secret_id}_{field_id}"
-                    self.secrets[secret_id] = field_value
-                    self.values[parameter.key][field_id] = secret_id
-
-                    # For TOTP fields, also store the current code
-                    if field_type == "Totp" and isinstance(field.get("details"), dict):
-                        details = field.get("details")
-                        # Explicitly check that details is a dict before accessing get method
-                        if isinstance(details, dict):
-                            content = details.get("content")
-                            if isinstance(content, dict) and "code" in content:
-                                totp_code = content["code"]
-                                random_secret_id = self.generate_random_secret_id()
-                                totp_secret_id = f"{random_secret_id}_totp"
-                                self.secrets[totp_secret_id] = totp_code
-                                totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                                self.secrets[totp_secret_value] = field_value  # Store the TOTP secret
-                                self.values[parameter.key]["totp"] = totp_secret_id
-            else:
-                # Process each field in the 1Password item (old format or custom format)
-                for key, value in secret_values.items():
-                    random_secret_id = self.generate_random_secret_id()
-                    secret_id = f"{random_secret_id}_{key}"
-                    self.secrets[secret_id] = value
-                    self.values[parameter.key][key] = secret_id
-
-            LOG.info("Successfully processed 1Password credential")
-            return
-
-        except Exception as e:
-            LOG.error(f"Failed to process 1Password credential: {credential_id}. Error: {str(e)}")
-            # Add more context to the error
-            raise ValueError(f"Failed to process 1Password credential {credential_id}: {str(e)}") from e
 
         # Handle regular credentials from the database
         try:
