@@ -145,6 +145,7 @@ class UITarsLLMCaller(LLMCaller):
     async def generate_ui_tars_response(self, step: Step) -> str:
         """Generate UI-TARS response using the parent LLMCaller directly."""
         response = await self.call(
+            step=step,
             use_message_history=True,  # Use conversation history
             raw_response=True,  # Skip JSON parsing for plain text
         )
