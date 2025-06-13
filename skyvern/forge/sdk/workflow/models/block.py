@@ -2523,11 +2523,22 @@ class TaskV2Block(Block):
         if task_v2:
             result_dict = task_v2.output
 
+        block_status_mapping = {
+            TaskV2Status.completed: BlockStatus.completed,
+            TaskV2Status.terminated: BlockStatus.terminated,
+            TaskV2Status.failed: BlockStatus.failed,
+            TaskV2Status.canceled: BlockStatus.canceled,
+            TaskV2Status.timed_out: BlockStatus.timed_out,
+        }
+        block_status = block_status_mapping.get(task_v2.status, BlockStatus.failed)
+        success = task_v2.status == TaskV2Status.completed
+        failure_reason = getattr(task_v2, "failure_reason", None)
+
         return await self.build_block_result(
-            success=True,
-            failure_reason=None,
+            success=success,
+            failure_reason=failure_reason,
             output_parameter_value=result_dict,
-            status=BlockStatus.completed,
+            status=block_status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
