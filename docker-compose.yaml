@@ -50,14 +50,14 @@ services:
       #       LLM Settings - Recommended to use skyvern CLI, `skyvern init llm` to setup your LLM's
       # =========================
       # OpenAI Support:
-      - ENABLE_OPENAI=true
-      - LLM_KEY=OPENAI_GPT4O
+      - ENABLE_OPENAI=${ENABLE_OPENAI:-false}
+      - LLM_KEY=${LLM_KEY:-OPENAI_GPT4O}
       - OPENAI_API_KEY=${OPENAI_API_KEY} # Set this secret in the Coolify UI
       # Gemini Support:
       # To use, uncomment and set the GEMINI_API_KEY in the Coolify UI.
       # - LLM_KEY=GEMINI
-      # - ENABLE_GEMINI=true
-      # - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ENABLE_GEMINI=true${ENABLE_GEIMINI:-false}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
       # Anthropic Support:
       # - ENABLE_ANTHROPIC=true
