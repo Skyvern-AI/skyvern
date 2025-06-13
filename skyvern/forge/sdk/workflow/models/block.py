@@ -939,6 +939,7 @@ class ForLoopBlock(Block):
         workflow_run_context: WorkflowRunContext,
         loop_over_values: list[Any],
         organization_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> LoopBlockExecutedResult:
         outputs_with_loop_values: list[list[dict[str, Any]]] = []
         block_outputs: list[BlockResult] = []
@@ -967,6 +968,7 @@ class ForLoopBlock(Block):
                     workflow_run_id=workflow_run_id,
                     parent_workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                 )
 
                 output_value = (
@@ -1119,6 +1121,7 @@ class ForLoopBlock(Block):
             workflow_run_context=workflow_run_context,
             loop_over_values=loop_over_values,
             organization_id=organization_id,
+            browser_session_id=browser_session_id,
         )
         await self.record_output_parameter_value(
             workflow_run_context, workflow_run_id, loop_executed_result.outputs_with_loop_values
@@ -1225,12 +1228,7 @@ async def wrapper():
             )
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
             if browser_state:
-                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
-                    browser_session_id,
-                    runnable_type="workflow_run",
-                    runnable_id=workflow_run_id,
-                    organization_id=organization_id,
-                )
+                LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 

@@ -2,7 +2,7 @@ import dataclasses
 import json
 import time
 from asyncio import CancelledError
-from typing import Any
+from typing import Any, AsyncIterator
 
 import litellm
 import structlog
@@ -10,6 +10,7 @@ from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.utils import CustomStreamWrapper, ModelResponse
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderErrorRetryableTask,
 )
 from skyvern.forge.sdk.api.llm.models import LLMAPIHandler, LLMConfig, LLMRouterConfig, dummy_llm_api_handler
+from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import llm_messages_builder, llm_messages_builder_with_history, parse_api_response
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -196,6 +198,7 @@ class LLMAPIHandlerFactory:
             )
             if step or thought:
                 try:
+                    # FIXME: volcengine doesn't support litellm cost calculation.
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
                     LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
@@ -399,6 +402,7 @@ class LLMAPIHandlerFactory:
 
             if step or thought:
                 try:
+                    # FIXME: volcengine doesn't support litellm cost calculation.
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
                     LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
@@ -744,9 +748,13 @@ class LLMCaller:
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
-    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage:
+    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)
+
+        # Route UI-TARS models to custom handler instead of LiteLLM
+        if self.llm_key and "UI_TARS" in self.llm_key:
+            return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
         return await litellm.acompletion(
             model=self.llm_config.model_name, messages=messages, tools=tools, timeout=timeout, **active_parameters
@@ -790,8 +798,76 @@ class LLMCaller:
         )
         return response
 
-    async def get_call_stats(self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage) -> LLMCallStats:
+    async def _call_ui_tars(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list | None = None,
+        timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        **active_parameters: dict[str, Any],
+    ) -> UITarsResponse:
+        """Custom UI-TARS API call using OpenAI client with VolcEngine endpoint."""
+        max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 400
+        model_name = self.llm_config.model_name.replace("volcengine/", "")
+
+        if not app.UI_TARS_CLIENT:
+            raise ValueError(
+                "UI_TARS_CLIENT not initialized. Please ensure ENABLE_VOLCENGINE=true and VOLCENGINE_API_KEY is set."
+            )
+
+        LOG.info(
+            "UI-TARS request",
+            model_name=model_name,
+            timeout=timeout,
+            messages_length=len(messages),
+        )
+
+        # Use the UI-TARS client (which is OpenAI-compatible with VolcEngine)
+        chat_completion: AsyncIterator[ChatCompletionChunk] = await app.UI_TARS_CLIENT.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            top_p=None,
+            temperature=active_parameters.get("temperature", 0.0),
+            max_tokens=max_tokens,
+            stream=True,
+            seed=None,
+            stop=None,
+            frequency_penalty=None,
+            presence_penalty=None,
+            timeout=timeout,
+        )
+
+        # Aggregate streaming response like in ByteDance example
+        response_content = ""
+        async for message in chat_completion:
+            if message.choices[0].delta.content:
+                response_content += message.choices[0].delta.content
+
+        response = UITarsResponse(response_content, model_name)
+
+        LOG.info(
+            "UI-TARS response",
+            model_name=model_name,
+            response_length=len(response_content),
+            timeout=timeout,
+        )
+        return response
+
+    async def get_call_stats(
+        self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
+    ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
+
+        # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
+        if isinstance(response, UITarsResponse):
+            ui_tars_usage = response.usage
+            return LLMCallStats(
+                llm_cost=0,  # TODO: calculate the cost according to the price: https://www.volcengine.com/docs/82379/1544106
+                input_tokens=ui_tars_usage.get("prompt_tokens", 0),
+                output_tokens=ui_tars_usage.get("completion_tokens", 0),
+                cached_tokens=0,  # only part of model support cached tokens
+                reasoning_tokens=0,
+            )
+
         if isinstance(response, AnthropicMessage):
             usage = response.usage
             input_token_cost = (3.0 / 1000000) * usage.input_tokens

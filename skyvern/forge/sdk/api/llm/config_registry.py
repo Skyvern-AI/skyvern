@@ -568,6 +568,48 @@ if settings.ENABLE_AZURE_O3:
             max_completion_tokens=100000,
         ),
     )
+if settings.ENABLE_VOLCENGINE:
+    LLMConfigRegistry.register_config(
+        "VOLCENGINE_DOUBAO_SEED_1_6",
+        LLMConfig(
+            "volcengine/doubao-seed-1.6-250615",
+            ["VOLCENGINE_API_KEY"],
+            litellm_params=LiteLLMParams(
+                api_base=settings.VOLCENGINE_API_BASE,
+                api_key=settings.VOLCENGINE_API_KEY,
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
+        "VOLCENGINE_DOUBAO_SEED_1_6_FLASH",
+        LLMConfig(
+            "volcengine/doubao-seed-1.6-flash-250615",
+            ["VOLCENGINE_API_KEY"],
+            litellm_params=LiteLLMParams(
+                api_base=settings.VOLCENGINE_API_BASE,
+                api_key=settings.VOLCENGINE_API_KEY,
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
+        "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO",
+        LLMConfig(
+            "volcengine/doubao-1-5-thinking-vision-pro-250428",
+            ["VOLCENGINE_API_KEY"],
+            litellm_params=LiteLLMParams(
+                api_base=settings.VOLCENGINE_API_BASE,
+                api_key=settings.VOLCENGINE_API_KEY,
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+        ),
+    )
 
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
@@ -624,6 +666,16 @@ if settings.ENABLE_GEMINI:
         "GEMINI_2.5_PRO_EXP_03_25",
         LLMConfig(
             "gemini/gemini-2.5-pro-exp-03-25",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_FLASH_PREVIEW",
+        LLMConfig(
+            "gemini/gemini-2.5-flash-preview-05-20",
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,

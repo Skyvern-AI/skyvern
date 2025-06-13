@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timedelta
 from typing import Any, List, Sequence
@@ -3211,3 +3212,21 @@ class AgentDB:
                 query = query.filter_by(organization_id=organization_id)
             task_run = (await session.scalars(query)).first()
             return Run.model_validate(task_run) if task_run else None
+
+    async def wait_on_persistent_browser_address(self, session_id: str, organization_id: str) -> str:
+        async with asyncio.timeout(10 * 60):
+            while True:
+                persistent_browser_session = await self.get_persistent_browser_session(session_id, organization_id)
+                if persistent_browser_session is None:
+                    raise Exception(f"Persistent browser session not found for {session_id}")
+
+                LOG.info(
+                    "Checking browser address",
+                    session_id=session_id,
+                    address=persistent_browser_session.browser_address,
+                )
+
+                if persistent_browser_session.browser_address:
+                    return persistent_browser_session.browser_address
+
+                await asyncio.sleep(2)

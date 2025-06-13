@@ -34,10 +34,10 @@ jobs:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v3
       - name: Build, tag, and push backend image to Amazon Public ECR and Docker Hub
         id: build-image
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v6
         env:
           ECR_REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
         with:
@@ -46,6 +46,8 @@ jobs:
             linux/amd64
             linux/arm64
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.event.release.tag_name }}
@@ -55,12 +57,14 @@ jobs:
             ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:latest
       - name: Build, tag, and push ui image to Amazon Public ECR and Docker Hub
         id: build-ui-image
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v6
         env:
           ECR_REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
         with:
           context: .
           file: Dockerfile.ui
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           platforms: |
             linux/amd64
             linux/arm64

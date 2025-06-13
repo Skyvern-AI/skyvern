@@ -153,7 +153,10 @@ function WorkflowParametersPanel() {
                             active: true,
                             operation: "edit",
                             parameter: parameter,
-                            type: parameter.parameterType,
+                            type:
+                              parameter.parameterType === "onepassword"
+                                ? WorkflowEditorParameterTypes.OnePassword
+                                : parameter.parameterType,
                           });
                         }}
                       />
