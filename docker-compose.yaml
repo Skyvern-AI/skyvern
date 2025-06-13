@@ -56,7 +56,7 @@ services:
       # Gemini Support:
       # To use, uncomment and set the GEMINI_API_KEY in the Coolify UI.
       # - LLM_KEY=GEMINI
-      - ENABLE_GEMINI=true${ENABLE_GEIMINI:-false}
+      - ENABLE_GEMINI=${ENABLE_GEMINI:-false}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
       # Anthropic Support:
