@@ -368,7 +368,7 @@ export class Skyvern implements INodeType {
                     },
                 },
                 typeOptions: {
-                    loadOptionsDependsOn: ['workflowId'],
+                    loadOptionsDependsOn: ['resource', 'workflowOperation', 'workflowId'],
                     resourceMapper: {
                         resourceMapperMethod: 'getWorkflowRunParameters',
                         mode: 'update',
