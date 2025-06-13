@@ -411,29 +411,19 @@ class WorkflowRunContext:
             if field.value is None:
                 continue
             random_secret_id = self.generate_random_secret_id()
-            secret_id = f"{random_secret_id}_{field.id}"
-            self.secrets[secret_id] = field.value
-            key = (field.label or field.id).lower().replace(" ", "_")
-            self.values[parameter.key][key] = secret_id
-
-        # Try to get TOTP if available
-        try:
-            totp = await client.items.get_totp(parameter.vault_id, parameter.item_id)
-            if totp:
-                # Store the actual TOTP value in a separate secret for internal use
-                random_secret_id = self.generate_random_secret_id()
-                totp_value_id = f"{random_secret_id}_totp_value"
-                self.secrets[totp_value_id] = totp
-
-                # Store the special TOTP constant that the agent will recognize
+            field_type = field.field_type.value.lower()
+            if field_type == "totp":
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
+                totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+                self.secrets[totp_secret_value] = field.value
                 self.values[parameter.key]["totp"] = totp_secret_id
-
-                LOG.info(f"TOTP code available for item {parameter.item_id}")
-        except Exception as e:
-            # TOTP might not be available for this item, just log and continue
-            LOG.debug(f"TOTP not available for item {parameter.item_id}: {str(e)}")
+            else:
+                # this will be the username or password or other field
+                key = field.id.replace(" ", "_")
+                secret_id = f"{random_secret_id}_{key}"
+                self.secrets[secret_id] = field.value
+                self.values[parameter.key][key] = secret_id
 
     async def register_bitwarden_login_credential_parameter_value(
         self,
