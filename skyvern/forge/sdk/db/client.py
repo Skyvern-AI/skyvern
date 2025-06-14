@@ -986,6 +986,82 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_artifacts_for_run(
+        self,
+        run_id: str,
+        organization_id: str,
+        artifact_types: list[ArtifactType] | None = None,
+        group_by_type: bool = False,
+        sort_by: str = "created_at",
+    ) -> dict[ArtifactType, list[Artifact]] | list[Artifact]:
+        """Return artifacts associated with a run.
+
+        Args:
+            run_id: The ID of the run to get artifacts for
+            organization_id: The ID of the organization that owns the run
+            artifact_types: Optional list of artifact types to filter by
+            group_by_type: If True, returns a dictionary mapping artifact types to lists of artifacts.
+                         If False, returns a flat list of artifacts. Defaults to False.
+            sort_by: Field to sort artifacts by. Must be one of: 'created_at', 'step_id', 'task_id'.
+                   Defaults to 'created_at'.
+
+        Returns:
+            If group_by_type is True, returns a dictionary mapping artifact types to lists of artifacts.
+            If group_by_type is False, returns a list of artifacts sorted by the specified field.
+
+        Raises:
+            ValueError: If sort_by is not one of the allowed values
+        """
+        allowed_sort_fields = {"created_at", "step_id", "task_id"}
+        if sort_by not in allowed_sort_fields:
+            raise ValueError(f"sort_by must be one of {allowed_sort_fields}")
+        run = await self.get_run(run_id, organization_id=organization_id)
+        if not run:
+            return []
+
+        async with self.Session() as session:
+            query = select(ArtifactModel).filter_by(organization_id=organization_id)
+
+            if run.task_run_type in [
+                RunType.task_v1,
+                RunType.openai_cua,
+                RunType.anthropic_cua,
+            ]:
+                query = query.filter_by(task_id=run.run_id)
+            elif run.task_run_type == RunType.task_v2:
+                query = query.filter_by(observer_cruise_id=run.run_id)
+            elif run.task_run_type == RunType.workflow_run:
+                query = query.filter_by(workflow_run_id=run.run_id)
+            else:
+                return []
+
+            if artifact_types:
+                query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
+
+            # Apply sorting
+            if sort_by == "created_at":
+                query = query.order_by(ArtifactModel.created_at)
+            elif sort_by == "step_id":
+                query = query.order_by(ArtifactModel.step_id, ArtifactModel.created_at)
+            elif sort_by == "task_id":
+                query = query.order_by(ArtifactModel.task_id, ArtifactModel.created_at)
+
+            # Execute query and convert to Artifact objects
+            artifacts = [
+                convert_to_artifact(artifact, self.debug_enabled) for artifact in (await session.scalars(query)).all()
+            ]
+
+            # Group artifacts by type if requested
+            if group_by_type:
+                result: dict[ArtifactType, list[Artifact]] = {}
+                for artifact in artifacts:
+                    if artifact.artifact_type not in result:
+                        result[artifact.artifact_type] = []
+                    result[artifact.artifact_type].append(artifact)
+                return result
+
+            return artifacts
+
     async def get_artifact_by_id(
         self,
         artifact_id: str,
