@@ -15,6 +15,7 @@ const createNewTaskFormSchemaBase = z.object({
   errorCodeMapping: z.string().or(z.null()),
   proxyLocation: z.nativeEnum(ProxyLocation).or(z.null()),
   includeActionHistoryInVerification: z.boolean().or(z.null()).default(false),
+  maxScreenshotScrollingTimes: z.number().or(z.null()).default(null),
 });
 
 const savedTaskFormSchemaBase = createNewTaskFormSchemaBase.extend({

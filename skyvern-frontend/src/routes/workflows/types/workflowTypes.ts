@@ -470,6 +470,7 @@ export type WorkflowApiResponse = {
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
+  max_screenshot_scrolling_times: number | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -480,6 +481,7 @@ export type WorkflowSettings = {
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
+  maxScreenshotScrollingTimes: number | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;
