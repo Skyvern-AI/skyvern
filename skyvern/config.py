@@ -134,6 +134,12 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
 
+    # VOLCENGINE (Doubao)
+    ENABLE_VOLCENGINE: bool = False
+    VOLCENGINE_API_KEY: str | None = None
+    VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
+    VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
+
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
     OPENAI_COMPATIBLE_API_KEY: str | None = None
@@ -242,6 +248,7 @@ class Settings(BaseSettings):
     BITWARDEN_CLIENT_ID: str | None = None
     BITWARDEN_CLIENT_SECRET: str | None = None
     BITWARDEN_MASTER_PASSWORD: str | None = None
+    OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
@@ -263,6 +270,12 @@ class Settings(BaseSettings):
     # SkyvernClient Settings
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"
     SKYVERN_API_KEY: str = "PLACEHOLDER"
+
+    SKYVERN_BROWSER_VNC_PORT: int = 6080
+    """
+    The websockified port on which the VNC server of a persistent browser is 
+    listening.
+    """
 
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """

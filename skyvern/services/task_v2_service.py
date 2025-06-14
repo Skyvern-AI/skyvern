@@ -20,6 +20,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
@@ -617,12 +618,14 @@ async def run_task_v2_helper(
                 thought_type=ThoughtType.plan,
                 thought_scenario=ThoughtScenario.generate_plan,
             )
-            task_v2_response = await app.LLM_API_HANDLER(
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                task_v2.llm_key, default=app.LLM_API_HANDLER
+            )
+            task_v2_response = await llm_api_handler(
                 prompt=task_v2_prompt,
                 screenshots=scraped_page.screenshots,
                 thought=thought,
                 prompt_name="task_v2",
-                llm_key_override=task_v2.llm_key,
             )
             LOG.info(
                 "Task v2 response",
@@ -1094,16 +1097,14 @@ async def _generate_loop_task(
         output_parameter=loop_value_extraction_output_parameter,
         value=extraction_block_result.output_parameter_value,
     )
+    url: str | None = None
     task_parameters: list[PARAMETER_TYPE] = []
     if is_loop_value_link is True:
         LOG.info("Loop values are links", loop_values=loop_values)
         context_parameter_key = url = f"task_in_loop_url_{loop_random_string}"
     else:
         LOG.info("Loop values are not links", loop_values=loop_values)
-        page = await browser_state.get_working_page()
-        url = str(
-            await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else original_url
-        )
+        url = None
         context_parameter_key = "target"
 
     # create ContextParameter for the value
@@ -1350,12 +1351,9 @@ def _generate_random_string(length: int = 5) -> str:
     return "".join(random.choices(RANDOM_STRING_POOL, k=length))
 
 
-async def get_thought_timelines(
-    task_v2_id: str,
-    organization_id: str | None = None,
-) -> list[WorkflowRunTimeline]:
+async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
     thoughts = await app.DATABASE.get_thoughts(
-        task_v2_id,
+        task_v2_id=task_v2_id,
         organization_id=organization_id,
         thought_types=[
             ThoughtType.plan,
@@ -1626,6 +1624,9 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         status=task_v2.status,
         output=task_v2.output,
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
+        queued_at=task_v2.queued_at,
+        started_at=task_v2.started_at,
+        finished_at=task_v2.finished_at,
         created_at=task_v2.created_at,
         modified_at=task_v2.modified_at,
         recording_url=workflow_run_resp.recording_url if workflow_run_resp else None,

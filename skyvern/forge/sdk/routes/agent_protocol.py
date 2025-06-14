@@ -1,6 +1,3 @@
-import datetime
-import os
-import uuid
 from enum import Enum
 from typing import Annotated, Any
 
@@ -12,9 +9,9 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
+from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -225,6 +222,8 @@ async def run_task(
                 create_task_run=True,
                 model=run_request.model,
             )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except LLMProviderError:
             LOG.error("LLM failure to initialize task v2", exc_info=True)
             raise HTTPException(
@@ -320,18 +319,22 @@ async def run_workflow(
         totp_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
     )
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=legacy_workflow_request,
-        template=template,
-        version=None,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=legacy_workflow_request,
+            template=template,
+            version=None,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -1165,13 +1168,10 @@ async def get_artifacts(
         )
 
     analytics.capture("skyvern-oss-agent-entity-artifacts-get")
-
     params = {
-        "organization_id": current_org.organization_id,
         entity_type_to_param[entity_type]: entity_id,
     }
-
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
@@ -1290,18 +1290,21 @@ async def run_workflow_legacy(
         browser_session_id=workflow_request.browser_session_id,
     )
 
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=workflow_request,
-        template=template,
-        version=version,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=workflow_request,
+            template=template,
+            version=version,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return RunWorkflowResponse(
         workflow_id=workflow_id,
@@ -1394,12 +1397,24 @@ async def get_workflow_run_with_workflow_id(
         include_cost=True,
     )
     return_dict = workflow_run_status_response.model_dump()
+
+    browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+
+    return_dict["browser_session_id"] = browser_session_id
+
     task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
+
     if task_v2:
         return_dict["task_v2"] = task_v2.model_dump(by_alias=True)
+
     return return_dict
 
 
@@ -1729,36 +1744,12 @@ async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
-    bucket = app.SETTINGS_MANAGER.AWS_S3_BUCKET_UPLOADS
-    todays_date = datetime.datetime.now().strftime("%Y-%m-%d")
-
-    # First try uploading with original filename
-    try:
-        sanitized_filename = os.path.basename(file.filename)  # Remove any path components
-        s3_uri = (
-            f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{sanitized_filename}"
-        )
-        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
-    except Exception:
-        LOG.error("Failed to upload file to S3", exc_info=True)
-        uploaded_s3_uri = None
-
-    # If upload fails, try again with UUID prefix
-    if not uploaded_s3_uri:
-        uuid_prefixed_filename = f"{str(uuid.uuid4())}_{file.filename}"
-        s3_uri = f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{uuid_prefixed_filename}"
-        file.file.seek(0)  # Reset file pointer
-        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
-
-    if not uploaded_s3_uri:
+    uris = await app.STORAGE.save_legacy_file(
+        organization_id=current_org.organization_id, filename=file.filename, fileObj=file.file
+    )
+    if not uris:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
-
-    # Generate a presigned URL for the uploaded file
-    presigned_urls = await aws_client.create_presigned_urls([uploaded_s3_uri])
-    if not presigned_urls:
-        raise HTTPException(status_code=500, detail="Failed to generate presigned URL.")
-
-    presigned_url = presigned_urls[0]
+    presigned_url, uploaded_s3_uri = uris
     return ORJSONResponse(
         content={"s3_uri": uploaded_s3_uri, "presigned_url": presigned_url},
         status_code=200,
@@ -1808,6 +1799,8 @@ async def run_task_v2(
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
         )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except LLMProviderError:
         LOG.error("LLM failure to initialize task v2", exc_info=True)
         raise HTTPException(
