@@ -734,18 +734,35 @@ async def get_run_artifacts(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
     analytics.capture("skyvern-oss-run-artifacts-get")
+    # Get artifacts as a list (not grouped by type)
     artifacts = await app.DATABASE.get_artifacts_for_run(
         run_id=run_id,
         organization_id=current_org.organization_id,
         artifact_types=artifact_type,
+        group_by_type=False,  # This ensures we get a list, not a dict
     )
+
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
-        if signed_urls:
-            for i, artifact in enumerate(artifacts):
-                artifact.signed_url = signed_urls[i]
+        # Ensure we have a list of artifacts
+        artifacts_list = artifacts if isinstance(artifacts, list) else []
+
+        # Get signed URLs for all artifacts
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
+
+        if signed_urls and len(signed_urls) == len(artifacts_list):
+            for i, artifact in enumerate(artifacts_list):
+                if hasattr(artifact, "signed_url"):
+                    artifact.signed_url = signed_urls[i]
+        elif signed_urls:
+            LOG.warning(
+                "Mismatch between artifacts and signed URLs count",
+                artifacts_count=len(artifacts_list),
+                urls_count=len(signed_urls),
+                run_id=run_id,
+            )
         else:
             LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+
     return artifacts
 
 
