@@ -73,7 +73,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 from skyvern.schemas.runs import CUA_RUN_TYPES
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
-from skyvern.webeye.actions import actions
+from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -88,7 +88,6 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
     WebAction,
 )
-from skyvern.webeye.actions.handler_utils import download_file_safe
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
@@ -1888,7 +1887,7 @@ async def chain_click(
     file: list[str] | str = []
     if action.file_url:
         file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
-        file = await download_file_safe(file_url, action.model_dump())
+        file = await handler_utils.download_file(file_url, action.model_dump())
 
     is_filechooser_trigger = False
 
