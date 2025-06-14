@@ -1,6 +1,6 @@
 # Skyvern Kubernetes Deployment
 
-## REMINDER: It is not recommended to deploy Skyvern on the Internet without using some form of authentication! It is recommended to se this deployment for network without exposure to the Internet. 
+## REMINDER: It is not recommended to deploy Skyvern on the Internet without using some form of authentication! It is recommended to use this deployment for network without exposure to the Internet. 
 
 ## General 
 This README has the purpose to explain the way Skyvern is deployed using Kubernetes.
@@ -13,6 +13,12 @@ This latter results in having the following endpoints:
 > BACKEND: http(s)://skyvern.example.com/api/
 
 There is also a simple deploy script called `k8s-deploy.sh`, which runs the necessary commands to create the namespace and apply the `yaml` files.
+
+If you look to redeploy from zero, make sure to delete the folders created on the hosts:
+
+```
+rm -rf /app/ /data/
+```
 
 ## Environment variables
 
