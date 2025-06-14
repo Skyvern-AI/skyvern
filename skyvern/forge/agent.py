@@ -871,7 +871,11 @@ class ForgeAgent:
                     scraped_page=scraped_page,
                     llm_caller=llm_caller,
                 )
-            elif engine == RunEngine.ui_tars:
+            elif engine == RunEngine.ui_tars and not app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "DISABLE_UI_TARS_CUA",
+                task.workflow_run_id or task.task_id,
+                properties={"organization_id": task.organization_id},
+            ):
                 assert llm_caller is not None
                 actions = await self._generate_ui_tars_actions(
                     task=task,
