@@ -88,6 +88,7 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
     WebAction,
 )
+from skyvern.webeye.actions.handler_utils import download_file_safe
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
@@ -1887,15 +1888,7 @@ async def chain_click(
     file: list[str] | str = []
     if action.file_url:
         file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
-        try:
-            file = await download_file(file_url)
-        except Exception:
-            LOG.exception(
-                "Failed to download file, continuing without it",
-                action=action,
-                file_url=file_url,
-            )
-            file = []
+        file = await download_file_safe(file_url, action.model_dump())
 
     is_filechooser_trigger = False
 
