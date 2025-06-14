@@ -424,4 +424,5 @@ class WorkflowCreateYAMLRequest(BaseModel):
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
+    max_screenshot_scrolling_times: int | None = None
     status: WorkflowStatus = WorkflowStatus.published
