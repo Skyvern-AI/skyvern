@@ -1666,7 +1666,8 @@ class ForgeAgent:
                 scrolling_number=scrolling_number,
                 use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                     "ENABLE_PLAYWRIGHT_FULLPAGE",
-                    str(task.organization_id),
+                    task.workflow_run_id or task.task_id,
+                    properties={"organization_id": task.organization_id},
                 ),
             )
             await app.ARTIFACT_MANAGER.create_artifact(
@@ -2151,7 +2152,8 @@ class ForgeAgent:
                     screenshot = await browser_state.take_fullpage_screenshot(
                         use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                             "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            str(task.organization_id),
+                            task.workflow_run_id or task.task_id,
+                            properties={"organization_id": task.organization_id},
                         )
                     )
                     await app.ARTIFACT_MANAGER.create_artifact(
