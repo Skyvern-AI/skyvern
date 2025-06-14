@@ -20,6 +20,7 @@ import { Separator } from "@/components/ui/separator";
 import { ModelsResponse } from "@/api/types";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
+import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "../Taskv2Node/types";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const credentialGetter = useCredentialGetter();
@@ -51,6 +52,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       ? data.persistBrowserSession
       : false,
     model: data.withWorkflowSettings ? data.model : workflowModel,
+    maxScreenshotScrollingTimes: data.withWorkflowSettings
+      ? data.maxScreenshotScrollingTimes
+      : null,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -129,6 +133,26 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Label>Max Scrolling Screenshots</Label>
+                        <HelpTooltip
+                          content={`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                        />
+                      </div>
+                      <Input
+                        value={inputs.maxScreenshotScrollingTimes ?? ""}
+                        placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                        onChange={(event) => {
+                          const value =
+                            event.target.value === ""
+                              ? null
+                              : Number(event.target.value);
+
+                          handleChange("maxScreenshotScrollingTimes", value);
+                        }}
+                      />
                     </div>
                   </div>
                 </AccordionContent>

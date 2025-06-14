@@ -149,6 +149,7 @@ class AgentDB:
         application: str | None = None,
         include_action_history_in_verification: bool | None = None,
         model: dict[str, Any] | None = None,
+        max_screenshot_scrolling_times: int | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -176,6 +177,7 @@ class AgentDB:
                     application=application,
                     include_action_history_in_verification=include_action_history_in_verification,
                     model=model,
+                    max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -1217,6 +1219,7 @@ class AgentDB:
         description: str | None = None,
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
+        max_screenshot_scrolling_times: int | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
@@ -1236,6 +1239,7 @@ class AgentDB:
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 persist_browser_session=persist_browser_session,
                 model=model,
                 is_saved_task=is_saved_task,
@@ -1479,6 +1483,7 @@ class AgentDB:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         parent_workflow_run_id: str | None = None,
+        max_screenshot_scrolling_times: int | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1492,6 +1497,7 @@ class AgentDB:
                     totp_verification_url=totp_verification_url,
                     totp_identifier=totp_identifier,
                     parent_workflow_run_id=parent_workflow_run_id,
+                    max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -2436,6 +2442,7 @@ class AgentDB:
         extracted_information_schema: dict | list | str | None = None,
         error_code_mapping: dict | None = None,
         model: dict[str, Any] | None = None,
+        max_screenshot_scrolling_times: int | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2452,6 +2459,7 @@ class AgentDB:
                 error_code_mapping=error_code_mapping,
                 organization_id=organization_id,
                 model=model,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             )
             session.add(new_task_v2)
             await session.commit()

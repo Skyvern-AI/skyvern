@@ -88,6 +88,7 @@ class TaskModel(Base):
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+    max_screenshot_scrolling_times = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
         DateTime,
@@ -218,6 +219,7 @@ class WorkflowModel(Base):
     workflow_definition = Column(JSON, nullable=False)
     proxy_location = Column(String)
     webhook_callback_url = Column(String)
+    max_screenshot_scrolling_times = Column(Integer, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
@@ -254,6 +256,7 @@ class WorkflowRunModel(Base):
     webhook_callback_url = Column(String)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
+    max_screenshot_scrolling_times = Column(Integer, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -621,6 +624,7 @@ class TaskV2Model(Base):
     extracted_information_schema = Column(JSON, nullable=True)
     error_code_mapping = Column(JSON, nullable=True)
     max_steps = Column(Integer, nullable=True)
+    max_screenshot_scrolling_times = Column(Integer, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)

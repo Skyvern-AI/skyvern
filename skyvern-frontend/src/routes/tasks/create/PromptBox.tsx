@@ -43,7 +43,10 @@ import {
   generateUniqueEmail,
 } from "../data/sampleTaskData";
 import { ExampleCasePill } from "./ExampleCasePill";
-import { MAX_STEPS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import {
+  MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT,
+  MAX_STEPS_DEFAULT,
+} from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -153,6 +156,8 @@ function PromptBox() {
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
+  const [maxScreenshotScrollingTimes, setMaxScreenshotScrollingTimes] =
+    useState<string | null>(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
 
@@ -167,6 +172,7 @@ function PromptBox() {
           proxy_location: proxyLocation,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
+          max_screenshot_scrolling_times: maxScreenshotScrollingTimes,
           extracted_information_schema: dataSchema
             ? (() => {
                 try {
@@ -437,6 +443,21 @@ function PromptBox() {
                         fontSize={8}
                       />
                     </div>
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Max Scrolling Screenshots</div>
+                      <div className="text-xs text-slate-400">
+                        {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                      </div>
+                    </div>
+                    <Input
+                      value={maxScreenshotScrollingTimes ?? ""}
+                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                      onChange={(event) => {
+                        setMaxScreenshotScrollingTimes(event.target.value);
+                      }}
+                    />
                   </div>
                 </div>
               </div>
