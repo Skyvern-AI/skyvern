@@ -1,0 +1,66 @@
+# .github/workflows/sync_upstream.yml
+
+name: Sync with Upstream
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+  # Runs the workflow automatically every day at 10:00 UTC
+  schedule:
+    - cron: "0 10 * * *"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out your fork's repository
+      # We use the Personal Access Token (PAT) here for authentication
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          # Fetch all history so we can do a proper merge
+          fetch-depth: 0
+
+      # Step 2: Configure Git with a user name and email
+      - name: Set Git config
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+
+      # Step 3: Add the original repository as the 'upstream' remote
+      - name: Add Upstream Remote
+        run: git remote add upstream https://github.com/skyvern-ai/skyvern.git
+
+      # Step 4: Fetch all branches and tags from the upstream
+      - name: Fetch from Upstream
+        run: git fetch upstream
+
+      # Step 5: Merge the main branch from upstream into your fork's main branch
+      - name: Merge Upstream
+        run: git merge upstream/main -m "Merge upstream changes" || true
+
+      # Step 6: This is the magic step.
+      # It ensures YOUR version of docker-compose.yml is kept, overwriting any
+      # upstream changes or merge conflicts for that specific file.
+      - name: Preserve a specific file from our fork
+        run: git checkout HEAD -- docker-compose.yaml
+      
+      # Step 7: Add the preserved file to the commit if there were changes
+      - name: Stage preserved file
+        run: git add docker-compose.yaml
+
+      # Step 8: Commit the changes if any were made
+      - name: Commit changes
+        run: |
+          # The 'git diff-index' command checks if there are any staged changes.
+          # We only want to commit and push if the merge actually resulted in an update.
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "chore: Sync with upstream and preserve docker-compose.yaml"
+          fi
+      
+      # Step 9: Push the updated code back to your fork on GitHub
+      - name: Push changes
+        run: git push origin main
