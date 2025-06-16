@@ -22,6 +22,7 @@ class WorkflowRequestBody(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     browser_session_id: str | None = None
+    max_screenshot_scrolling_times: int | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -76,6 +77,7 @@ class Workflow(BaseModel):
     persist_browser_session: bool = False
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
+    max_screenshot_scrolling_times: int | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -115,7 +117,11 @@ class WorkflowRun(BaseModel):
     failure_reason: str | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
+    max_screenshot_scrolling_times: int | None = None
 
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -143,6 +149,9 @@ class WorkflowRunResponseBase(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     parameters: dict[str, Any]
@@ -155,3 +164,5 @@ class WorkflowRunResponseBase(BaseModel):
     total_cost: float | None = None
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
+    browser_session_id: str | None = None
+    max_screenshot_scrolling_times: int | None = None

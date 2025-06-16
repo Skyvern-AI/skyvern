@@ -9,6 +9,7 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
+from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -165,6 +166,7 @@ async def run_task(
             totp_identifier=run_request.totp_identifier,
             include_action_history_in_verification=run_request.include_action_history_in_verification,
             model=run_request.model,
+            max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -202,6 +204,7 @@ async def run_task(
                 data_extraction_schema=task_v1_response.extracted_information_schema,
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
+                max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
             ),
         )
     if run_request.engine == RunEngine.skyvern_v2:
@@ -220,7 +223,10 @@ async def run_task(
                 error_code_mapping=run_request.error_code_mapping,
                 create_task_run=True,
                 model=run_request.model,
+                max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
             )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except LLMProviderError:
             LOG.error("LLM failure to initialize task v2", exc_info=True)
             raise HTTPException(
@@ -260,6 +266,7 @@ async def run_task(
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
+                max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
             ),
         )
     LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
@@ -315,19 +322,24 @@ async def run_workflow(
         totp_identifier=workflow_run_request.totp_identifier,
         totp_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
+        max_screenshot_scrolling_times=workflow_run_request.max_screenshot_scrolling_times,
     )
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=legacy_workflow_request,
-        template=template,
-        version=None,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=legacy_workflow_request,
+            template=template,
+            version=None,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -1128,13 +1140,10 @@ async def get_artifacts(
         )
 
     analytics.capture("skyvern-oss-agent-entity-artifacts-get")
-
     params = {
-        "organization_id": current_org.organization_id,
         entity_type_to_param[entity_type]: entity_id,
     }
-
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
@@ -1253,18 +1262,21 @@ async def run_workflow_legacy(
         browser_session_id=workflow_request.browser_session_id,
     )
 
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=workflow_request,
-        template=template,
-        version=version,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=workflow_request,
+            template=template,
+            version=version,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return RunWorkflowResponse(
         workflow_id=workflow_id,
@@ -1357,12 +1369,24 @@ async def get_workflow_run_with_workflow_id(
         include_cost=True,
     )
     return_dict = workflow_run_status_response.model_dump()
+
+    browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+
+    return_dict["browser_session_id"] = browser_session_id
+
     task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
+
     if task_v2:
         return_dict["task_v2"] = task_v2.model_dump(by_alias=True)
+
     return return_dict
 
 
@@ -1746,7 +1770,10 @@ async def run_task_v2(
             create_task_run=True,
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
+            max_screenshot_scrolling_times=data.max_screenshot_scrolling_times,
         )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except LLMProviderError:
         LOG.error("LLM failure to initialize task v2", exc_info=True)
         raise HTTPException(

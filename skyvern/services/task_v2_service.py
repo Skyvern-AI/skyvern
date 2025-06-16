@@ -165,6 +165,7 @@ async def initialize_task_v2(
     error_code_mapping: dict | None = None,
     create_task_run: bool = False,
     model: dict[str, Any] | None = None,
+    max_screenshot_scrolling_times: int | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -176,11 +177,13 @@ async def initialize_task_v2(
         extracted_information_schema=extracted_information_schema,
         error_code_mapping=error_code_mapping,
         model=model,
+        max_screenshot_scrolling_times=max_screenshot_scrolling_times,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
     if context:
         context.task_v2_id = task_v2.observer_cruise_id
+        context.max_screenshot_scrolling_times = max_screenshot_scrolling_times
 
     thought = await app.DATABASE.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -221,7 +224,9 @@ async def initialize_task_v2(
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
-            workflow_request=WorkflowRequestBody(),
+            workflow_request=WorkflowRequestBody(
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
             version=None,
@@ -454,6 +459,7 @@ async def run_task_v2_helper(
             request_id=request_id,
             task_v2_id=task_v2_id,
             browser_session_id=browser_session_id,
+            max_screenshot_scrolling_times=task_v2.max_screenshot_scrolling_times,
         )
     )
 
@@ -771,6 +777,7 @@ async def run_task_v2_helper(
             proxy_location=task_v2.proxy_location or ProxyLocation.RESIDENTIAL,
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
+            max_screenshot_scrolling_times=task_v2.max_screenshot_scrolling_times,
         )
         LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
@@ -1097,16 +1104,14 @@ async def _generate_loop_task(
         output_parameter=loop_value_extraction_output_parameter,
         value=extraction_block_result.output_parameter_value,
     )
+    url: str | None = None
     task_parameters: list[PARAMETER_TYPE] = []
     if is_loop_value_link is True:
         LOG.info("Loop values are links", loop_values=loop_values)
         context_parameter_key = url = f"task_in_loop_url_{loop_random_string}"
     else:
         LOG.info("Loop values are not links", loop_values=loop_values)
-        page = await browser_state.get_working_page()
-        url = str(
-            await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else original_url
-        )
+        url = None
         context_parameter_key = "target"
 
     # create ContextParameter for the value
@@ -1353,12 +1358,9 @@ def _generate_random_string(length: int = 5) -> str:
     return "".join(random.choices(RANDOM_STRING_POOL, k=length))
 
 
-async def get_thought_timelines(
-    task_v2_id: str,
-    organization_id: str | None = None,
-) -> list[WorkflowRunTimeline]:
+async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
     thoughts = await app.DATABASE.get_thoughts(
-        task_v2_id,
+        task_v2_id=task_v2_id,
         organization_id=organization_id,
         thought_types=[
             ThoughtType.plan,
@@ -1629,6 +1631,9 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         status=task_v2.status,
         output=task_v2.output,
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
+        queued_at=task_v2.queued_at,
+        started_at=task_v2.started_at,
+        finished_at=task_v2.finished_at,
         created_at=task_v2.created_at,
         modified_at=task_v2.modified_at,
         recording_url=workflow_run_resp.recording_url if workflow_run_resp else None,

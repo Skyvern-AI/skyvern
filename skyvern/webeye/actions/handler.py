@@ -70,9 +70,10 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 from skyvern.schemas.runs import CUA_RUN_TYPES
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
-from skyvern.webeye.actions import actions
+from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -821,7 +822,7 @@ async def handle_input_text_action(
     if text is None:
         return [ActionFailure(FailedToFetchSecret())]
 
-    is_totp_value = text == BitwardenConstants.TOTP
+    is_totp_value = text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP
     is_secret_value = text != action.text
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
@@ -1744,6 +1745,9 @@ async def handle_keypress_action(
             updated_keys.append("Escape")
         elif key_lower_case == "alt":
             updated_keys.append("Alt")
+        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
+            # Handle function keys: f1 -> F1, f5 -> F5, etc.
+            updated_keys.append(key_lower_case.upper())
         else:
             updated_keys.append(key)
     keypress_str = "+".join(updated_keys)
@@ -1883,15 +1887,7 @@ async def chain_click(
     file: list[str] | str = []
     if action.file_url:
         file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
-        try:
-            file = await download_file(file_url)
-        except Exception:
-            LOG.exception(
-                "Failed to download file, continuing without it",
-                action=action,
-                file_url=file_url,
-            )
-            file = []
+        file = await handler_utils.download_file(file_url, action.model_dump())
 
     is_filechooser_trigger = False
 

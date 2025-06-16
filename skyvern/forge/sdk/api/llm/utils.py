@@ -4,12 +4,12 @@ import json
 import re
 from typing import Any
 
-import commentjson
 import json_repair
 import litellm
 import structlog
 
 from skyvern.constants import MAX_IMAGE_MESSAGES
+from skyvern.forge.sdk.api.llm import commentjson
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
 
 LOG = structlog.get_logger()
@@ -97,7 +97,11 @@ async def llm_messages_builder_with_history(
                     },
                 }
             current_user_messages.append(message)
-    messages.append({"role": "user", "content": current_user_messages})
+
+    # Only append a user message if there's actually content to add
+    if current_user_messages:
+        messages.append({"role": "user", "content": current_user_messages})
+
     # anthropic has hard limit of image & document messages (20 as of Apr 2025)
     # limit the number of image type messages to 10 for anthropic
     # delete the oldest image type message if the number of image type messages is greater than 10
