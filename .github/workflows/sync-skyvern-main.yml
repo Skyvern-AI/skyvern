@@ -51,8 +51,14 @@ jobs:
       # Step 7: Add the preserved file to the commit if there were changes
       - name: Stage preserved file
         run: git add docker-compose.yaml
+        
+    # Step 8: Remove unwanted workflow files from upstream
+      - name: Remove unwanted upstream workflows
+        run: |
+          git rm -f .github/workflows/build-docker-image.yml || true
+          # Add more 'git rm -f' lines here for other workflows you want to ignore
 
-      # Step 8: Commit the changes if any were made
+    # Step 9: Commit the changes if any were made
       - name: Commit changes
         run: |
           # The 'git diff-index' command checks if there are any staged changes.
@@ -61,6 +67,6 @@ jobs:
             git commit -m "chore: Sync with upstream and preserve docker-compose.yaml"
           fi
       
-      # Step 9: Push the updated code back to your fork on GitHub
+      # Step 10: Push the updated code back to your fork on GitHub
       - name: Push changes
         run: git push origin main
