@@ -45,8 +45,8 @@ jobs:
       # Step 6: This is the magic step.
       # It ensures YOUR version of docker-compose.yml is kept, overwriting any
       # upstream changes or merge conflicts for that specific file.
-      - name: Preserve a specific file from our fork
-        run: git checkout HEAD -- docker-compose.yaml
+      - name: Remove docker-compose (reapaced with coolified version)
+        run: git rm -f docker-compose.yml || true
       
       # Step 7: Add the preserved file to the commit if there were changes
       - name: Stage preserved file
