@@ -1,6 +1,6 @@
 # .github/workflows/sync-skyvern-main.yml
 
-name: Sync with Upstream
+name: Sync with Main
 
 on:
   # Allows you to run this workflow manually from the Actions tab
