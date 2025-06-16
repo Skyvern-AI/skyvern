@@ -60,6 +60,7 @@ function WorkflowEditor() {
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
+    maxScreenshotScrollingTimes: workflow.max_screenshot_scrolling_times,
   };
 
   const elements = getElements(

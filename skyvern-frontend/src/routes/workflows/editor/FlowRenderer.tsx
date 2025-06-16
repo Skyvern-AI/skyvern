@@ -289,6 +289,8 @@ function FlowRenderer({
         webhook_callback_url: data.settings.webhookCallbackUrl,
         persist_browser_session: data.settings.persistBrowserSession,
         model: data.settings.model,
+        max_screenshot_scrolling_times:
+          data.settings.maxScreenshotScrollingTimes,
         totp_verification_url: workflow.totp_verification_url,
         workflow_definition: {
           parameters: data.parameters,

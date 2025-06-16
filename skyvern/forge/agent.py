@@ -19,6 +19,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
+    DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -181,6 +182,7 @@ class ForgeAgent:
             error_code_mapping=task_block.error_code_mapping,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
             model=task_block.model,
+            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -237,6 +239,7 @@ class ForgeAgent:
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
+            max_screenshot_scrolling_times=task_request.max_screenshot_scrolling_times,
         )
         LOG.info(
             "Created new task",
@@ -1650,12 +1653,23 @@ class ForgeAgent:
         if not working_page:
             raise BrowserStateMissingPage()
 
-        fullpage_screenshot = True
+        context = skyvern_context.ensure_context()
+        scrolling_number = context.max_screenshot_scrolling_times
+        if scrolling_number is None:
+            scrolling_number = DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES
+
         if engine in CUA_ENGINES:
-            fullpage_screenshot = False
+            scrolling_number = 0
 
         try:
-            screenshot = await browser_state.take_screenshot(full_page=fullpage_screenshot)
+            screenshot = await browser_state.take_post_action_screenshot(
+                scrolling_number=scrolling_number,
+                use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "ENABLE_PLAYWRIGHT_FULLPAGE",
+                    task.workflow_run_id or task.task_id,
+                    properties={"organization_id": task.organization_id},
+                ),
+            )
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SCREENSHOT_ACTION,
@@ -2135,7 +2149,13 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
-                    screenshot = await browser_state.take_screenshot(full_page=True)
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            task.workflow_run_id or task.task_id,
+                            properties={"organization_id": task.organization_id},
+                        )
+                    )
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=last_step,
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,

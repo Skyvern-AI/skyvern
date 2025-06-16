@@ -73,7 +73,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 from skyvern.schemas.runs import CUA_RUN_TYPES
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
-from skyvern.webeye.actions import actions
+from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -1887,15 +1887,7 @@ async def chain_click(
     file: list[str] | str = []
     if action.file_url:
         file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
-        try:
-            file = await download_file(file_url)
-        except Exception:
-            LOG.exception(
-                "Failed to download file, continuing without it",
-                action=action,
-                file_url=file_url,
-            )
-            file = []
+        file = await handler_utils.download_file(file_url, action.model_dump())
 
     is_filechooser_trigger = False
 

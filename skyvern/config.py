@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     BROWSER_TIMEZONE: str = "America/New_York"
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
+    BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
