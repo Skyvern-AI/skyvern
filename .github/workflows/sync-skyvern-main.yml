@@ -1,4 +1,4 @@
-# .github/workflows/sync_upstream.yml
+# .github/workflows/sync-skyvern-main.yml
 
 name: Sync with Upstream
 
