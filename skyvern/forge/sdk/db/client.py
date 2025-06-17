@@ -2875,6 +2875,28 @@ class AgentDB:
                 for workflow_run_block in workflow_run_blocks
             ]
 
+    async def get_workflow_run_blocks_count(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+    ) -> int:
+        """Return the number of blocks executed for a workflow run."""
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(WorkflowRunBlockModel)
+                    .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                    .where(WorkflowRunBlockModel.organization_id == organization_id)
+                )
+                return (await session.execute(query)).scalar_one()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_active_persistent_browser_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active persistent browser sessions for an organization."""
         try:

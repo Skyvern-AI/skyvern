@@ -1147,6 +1147,11 @@ class WorkflowService:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
+        steps_executed = await app.DATABASE.get_workflow_run_blocks_count(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+
         total_steps = None
         total_cost = None
         if include_cost:
@@ -1181,6 +1186,7 @@ class WorkflowService:
             recording_url=recording_url,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
+            steps_executed=steps_executed,
             outputs=outputs,
             total_steps=total_steps,
             total_cost=total_cost,
@@ -1288,6 +1294,7 @@ class WorkflowService:
             downloaded_files=workflow_run_status_response.downloaded_files,
             recording_url=workflow_run_status_response.recording_url,
             screenshot_urls=workflow_run_status_response.screenshot_urls,
+            steps_executed=workflow_run_status_response.steps_executed,
             failure_reason=workflow_run_status_response.failure_reason,
             app_url=app_url,
             created_at=workflow_run_status_response.created_at,
