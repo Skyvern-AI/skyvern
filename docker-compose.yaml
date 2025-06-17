@@ -129,13 +129,11 @@ services:
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
     # If you're self-hosting this behind a dns, you'll want to set:
     #   A route for the API: api.yourdomain.com -> localhost:8001
-      - SERVICE_FQDN_API_8001=/api/v1
     #   A route for the UI: yourdomain.com -> localhost:8080
     #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
-      - SERVICE_FQDN_ARTIFACT_9090=/
-      - VITE_WSS_BASE_URL=ws://${COOLIFY_FQDN}
-      - VITE_ARTIFACT_API_BASE_URL=${SERVICE_FQDN_ARTIFACT}
-      - VITE_API_BASE_URL=${SERVICE_FQDN_API}
+      - VITE_WSS_BASE_URL=wss://${COOLIFY_FQDN}
+      - VITE_ARTIFACT_API_BASE_URL=https://artifact.${COOLIFY_FQDN}
+      - VITE_API_BASE_URL=${SERVICE_FQDN_API}https://api.${COOLIFY_FQDN}/api/v1
     # This will appear as an editable field in the UI. Get the value from the Skyvern UI's settings page after first deployment.
       - VITE_SKYVERN_API_KEY=${VITE_SKYVERN_API_KEY}
     depends_on:
