@@ -125,16 +125,16 @@ services:
     environment:
     # Declare the Service FQDN in Coolify
       - VITE_ENABLE_CODE_BLOCK=true
-      - COOLIFY_FQDN
+      - COOLIFY_FQDN: ${COOLIFY_FQDN}
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
     # If you're self-hosting this behind a dns, you'll want to set:
     #   A route for the API: api.yourdomain.com -> localhost:8001
     #   A route for the UI: yourdomain.com -> localhost:8080
     #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
-      - VITE_WSS_BASE_URL=ws://${COOLIFY_FQDN}:8000/api/v1
-      - VITE_ARTIFACT_API_BASE_URL=http://artifact.${COOLIFY_FQDN}:9090
-      - VITE_API_BASE_URL=http://api.${COOLIFY_FQDN}:8001/api/v1
+      - VITE_WSS_BASE_URL: wss://${COOLIFY_FQDN}/api/v1
+      - VITE_ARTIFACT_API_BASE_URL: http://artifact.${COOLIFY_FQDN}
+      - VITE_API_BASE_URL: http://api.${COOLIFY_FQDN}/api/v1
     # old - VITE_WSS_BASE_URL=wss:${COOLIFY_FQDN}
     # old - VITE_ARTIFACT_API_BASE_URL=https://artifact.${COOLIFY_FQDN}
     # old - VITE_API_BASE_URL=https://api.${COOLIFY_FQDN}/api/v1
