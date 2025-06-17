@@ -3,21 +3,25 @@
 import json
 from typing import Any
 
+from anthropic import BaseModel
 
-class UITarsResponse:
+
+class Message:
+    def __init__(self, content: str):
+        self.content = content
+        self.role = "assistant"
+
+
+class Choice:
+    def __init__(self, content: str):
+        self.message = Message(content)
+
+
+class UITarsResponse(BaseModel):
     """A response object that mimics the ModelResponse interface for UI-TARS API responses."""
 
     def __init__(self, content: str, model: str):
         # Create choice objects with proper nested structure for parse_api_response
-        class Message:
-            def __init__(self, content: str):
-                self.content = content
-                self.role = "assistant"
-
-        class Choice:
-            def __init__(self, content: str):
-                self.message = Message(content)
-
         self.choices = [Choice(content)]
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.model = model

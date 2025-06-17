@@ -198,6 +198,7 @@ class LLMAPIHandlerFactory:
             )
             if step or thought:
                 try:
+                    # FIXME: volcengine doesn't support litellm cost calculation.
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
                     LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
@@ -401,6 +402,7 @@ class LLMAPIHandlerFactory:
 
             if step or thought:
                 try:
+                    # FIXME: volcengine doesn't support litellm cost calculation.
                     llm_cost = litellm.completion_cost(completion_response=response)
                 except Exception as e:
                     LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
@@ -746,7 +748,7 @@ class LLMCaller:
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
-    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | Any:
+    ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)
 
@@ -802,14 +804,14 @@ class LLMCaller:
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
-    ) -> Any:
+    ) -> UITarsResponse:
         """Custom UI-TARS API call using OpenAI client with VolcEngine endpoint."""
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 400
-        model_name = self.llm_config.model_name
+        model_name = self.llm_config.model_name.replace("volcengine/", "")
 
         if not app.UI_TARS_CLIENT:
             raise ValueError(
-                "UI_TARS_CLIENT not initialized. Please ensure ENABLE_UI_TARS=true and UI_TARS_API_KEY is set."
+                "UI_TARS_CLIENT not initialized. Please ensure ENABLE_VOLCENGINE=true and VOLCENGINE_API_KEY is set."
             )
 
         LOG.info(
@@ -851,39 +853,18 @@ class LLMCaller:
         return response
 
     async def get_call_stats(
-        self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | dict[str, Any] | Any
+        self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
 
         # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
-        if hasattr(response, "usage") and hasattr(response, "choices") and hasattr(response, "model"):
-            usage = response.usage
-            # Use Doubao pricing: ¥0.8/1M input, ¥2/1M output (convert to USD: ~$0.11/$0.28)
-            input_token_cost = (0.11 / 1000000) * usage.get("prompt_tokens", 0)
-            output_token_cost = (0.28 / 1000000) * usage.get("completion_tokens", 0)
-            llm_cost = input_token_cost + output_token_cost
-
+        if isinstance(response, UITarsResponse):
+            ui_tars_usage = response.usage
             return LLMCallStats(
-                llm_cost=llm_cost,
-                input_tokens=usage.get("prompt_tokens", 0),
-                output_tokens=usage.get("completion_tokens", 0),
-                cached_tokens=0,  # UI-TARS doesn't have cached tokens
-                reasoning_tokens=0,
-            )
-
-        # Handle UI-TARS response (dict format - fallback)
-        if isinstance(response, dict) and "choices" in response and "usage" in response:
-            usage = response["usage"]
-            # Use Doubao pricing: ¥0.8/1M input, ¥2/1M output (convert to USD: ~$0.11/$0.28)
-            input_token_cost = (0.11 / 1000000) * usage.get("prompt_tokens", 0)
-            output_token_cost = (0.28 / 1000000) * usage.get("completion_tokens", 0)
-            llm_cost = input_token_cost + output_token_cost
-
-            return LLMCallStats(
-                llm_cost=llm_cost,
-                input_tokens=usage.get("prompt_tokens", 0),
-                output_tokens=usage.get("completion_tokens", 0),
-                cached_tokens=0,  # UI-TARS doesn't have cached tokens
+                llm_cost=0,  # TODO: calculate the cost according to the price: https://www.volcengine.com/docs/82379/1544106
+                input_tokens=ui_tars_usage.get("prompt_tokens", 0),
+                output_tokens=ui_tars_usage.get("completion_tokens", 0),
+                cached_tokens=0,  # only part of model support cached tokens
                 reasoning_tokens=0,
             )
 

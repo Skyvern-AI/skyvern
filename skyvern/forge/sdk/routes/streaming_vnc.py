@@ -24,11 +24,57 @@ Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
 
 
 class MessageType(IntEnum):
-    keyboard = 4
-    mouse = 5
+    Keyboard = 4
+    Mouse = 5
+
+
+class Keys:
+    """
+    VNC RFB keycodes. There's likely a pithier repr (indexes 6-7). This is ok for now.
+    """
+
+    class Down:
+        Ctrl = b"\x04\x01\x00\x00\x00\x00\xff\xe3"
+        Cmd = b"\x04\x01\x00\x00\x00\x00\xff\xe9"
+        Alt = b"\x04\x01\x00\x00\x00\x00\xff~"  # option
+        OKey = b"\x04\x01\x00\x00\x00\x00\x00o"
+
+    class Up:
+        Ctrl = b"\x04\x00\x00\x00\x00\x00\xff\xe3"
+        Cmd = b"\x04\x00\x00\x00\x00\x00\xff\xe9"
+        Alt = b"\x04\x00\x00\x00\x00\x00\xff\x7e"  # option
+
+
+def is_rmb(data: bytes) -> bool:
+    return data[0:2] == b"\x05\x04"
+
+
+class Mouse:
+    class Up:
+        Right = is_rmb
 
 
 LOG = structlog.get_logger()
+
+
+@dataclasses.dataclass
+class KeyState:
+    ctrl_is_down: bool = False
+    alt_is_down: bool = False
+    cmd_is_down: bool = False
+    o_is_down: bool = False
+
+    def is_forbidden(self, data: bytes) -> bool:
+        """
+        :return: True if the key is forbidden, else False
+        """
+        return self.is_ctrl_o(data)
+
+    def is_ctrl_o(self, data: bytes) -> bool:
+        """
+        Do not allow the opening of files.
+        """
+        return self.ctrl_is_down and data == Keys.Down.OKey
 
 
 @dataclasses.dataclass
@@ -49,6 +95,7 @@ class Streaming:
     # --
 
     browser_session: AddressablePersistentBrowserSession | None = None
+    key_state: KeyState = dataclasses.field(default_factory=KeyState)
     task: Task | None = None
     workflow_run: WorkflowRun | None = None
 
@@ -75,6 +122,20 @@ class Streaming:
             pass
 
         return self
+
+    def update_key_state(self, data: bytes) -> None:
+        if data == Keys.Down.Ctrl:
+            self.key_state.ctrl_is_down = True
+        elif data == Keys.Up.Ctrl:
+            self.key_state.ctrl_is_down = False
+        elif data == Keys.Down.Alt:
+            self.key_state.alt_is_down = True
+        elif data == Keys.Up.Alt:
+            self.key_state.alt_is_down = False
+        elif data == Keys.Down.Cmd:
+            self.key_state.cmd_is_down = True
+        elif data == Keys.Up.Cmd:
+            self.key_state.cmd_is_down = False
 
 
 async def auth(apikey: str | None, token: str | None, websocket: WebSocket) -> str | None:
@@ -234,6 +295,8 @@ async def get_streaming_for_workflow_run(
         workflow_run=workflow_run,
         websocket=websocket,
     )
+
+    LOG.info("Got streaming context for workflow run.", streaming=streaming)
 
     loops = [
         asyncio.create_task(loop_verify_workflow_run(streaming)),
@@ -402,10 +465,19 @@ async def loop_stream_vnc(streaming: Streaming) -> None:
                     if data:
                         message_type = data[0]
 
-                        # TODO: verify 4,5 are keyboard/mouse; they seem to be
+                        if message_type == MessageType.Keyboard.value:
+                            streaming.update_key_state(data)
+
+                            if streaming.key_state.is_forbidden(data):
+                                continue
+
+                        if message_type == MessageType.Mouse.value:
+                            if Mouse.Up.Right(data):
+                                continue
+
                         if not streaming.interactor == "user" and message_type in (
-                            MessageType.keyboard.value,
-                            MessageType.mouse.value,
+                            MessageType.Keyboard.value,
+                            MessageType.Mouse.value,
                         ):
                             LOG.info(
                                 "Blocking user message.", task=streaming.task, organization_id=streaming.organization_id

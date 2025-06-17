@@ -288,7 +288,11 @@ class Block(BaseModel, abc.ABC):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
+        engine: RunEngine | None = None
         try:
+            if isinstance(self, BaseTaskBlock):
+                engine = self.engine
+
             workflow_run_block = await app.DATABASE.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -296,6 +300,7 @@ class Block(BaseModel, abc.ABC):
                 label=self.label,
                 block_type=self.block_type,
                 continue_on_failure=self.continue_on_failure,
+                engine=engine,
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
 
@@ -307,7 +312,13 @@ class Block(BaseModel, abc.ABC):
             if not browser_state:
                 LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
             else:
-                screenshot = await browser_state.take_screenshot(full_page=True)
+                screenshot = await browser_state.take_fullpage_screenshot(
+                    use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "ENABLE_PLAYWRIGHT_FULLPAGE",
+                        workflow_run_id,
+                        properties={"organization_id": str(organization_id)},
+                    )
+                )
                 if screenshot:
                     await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                         workflow_run_block=workflow_run_block,
@@ -569,8 +580,16 @@ class BaseTaskBlock(Block):
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
                     )
+                    # assert that the browser state is not None, otherwise we can't go through typing
+                    assert browser_state is not None
                     # add screenshot artifact for the first task
-                    screenshot = await browser_state.take_screenshot(full_page=True)
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            workflow_run_id,
+                            properties={"organization_id": str(organization_id)},
+                        )
+                    )
                     if screenshot:
                         await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                             workflow_run_block=workflow_run_block,
@@ -1228,12 +1247,7 @@ async def wrapper():
             )
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
             if browser_state:
-                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
-                    browser_session_id,
-                    runnable_type="workflow_run",
-                    runnable_id=workflow_run_id,
-                    organization_id=organization_id,
-                )
+                LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
@@ -2491,6 +2505,7 @@ class TaskV2Block(Block):
                 proxy_location=workflow_run.proxy_location,
                 totp_identifier=self.totp_identifier,
                 totp_verification_url=self.totp_verification_url,
+                max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
             )
             await app.DATABASE.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -2522,6 +2537,7 @@ class TaskV2Block(Block):
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
                     browser_session_id=browser_session_id,
+                    max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
                 )
             )
         result_dict = None

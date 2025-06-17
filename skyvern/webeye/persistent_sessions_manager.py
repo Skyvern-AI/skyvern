@@ -27,9 +27,46 @@ class PersistentSessionsManager:
 
     def __new__(cls, database: AgentDB) -> PersistentSessionsManager:
         if cls.instance is None:
-            cls.instance = super().__new__(cls)
+            new_instance = super().__new__(cls)
+            cls.instance = new_instance
+            cls.instance.database = database
+            return new_instance
+
         cls.instance.database = database
         return cls.instance
+
+    async def begin_session(
+        self,
+        *,
+        browser_session_id: str,
+        runnable_type: str,
+        runnable_id: str,
+        organization_id: str,
+    ) -> None:
+        """
+        Attempt to begin a session.
+
+        TODO: cloud-side, temporal and ECS fargate are used to effect the session. These tools are not presently
+        available OSS-side.
+        """
+
+        LOG.info("Begin browser session", browser_session_id=browser_session_id)
+
+        persistent_browser_session = await self.database.get_persistent_browser_session(
+            browser_session_id, organization_id
+        )
+
+        if persistent_browser_session is None:
+            raise Exception(f"Persistent browser session not found for {browser_session_id}")
+
+        await self.occupy_browser_session(
+            session_id=browser_session_id,
+            runnable_type=runnable_type,
+            runnable_id=runnable_id,
+            organization_id=organization_id,
+        )
+
+        LOG.info("Browser session begin", browser_session_id=browser_session_id)
 
     async def get_browser_address(self, session_id: str, organization_id: str) -> tuple[str, str, str]:
         address = await wait_on_persistent_browser_address(self.database, session_id, organization_id)

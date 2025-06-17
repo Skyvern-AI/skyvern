@@ -23,10 +23,7 @@ from PIL import Image
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.utils.image_resizer import Resolution
 
 LOG = structlog.get_logger()
 
@@ -62,7 +59,7 @@ class UITarsLLMCaller(LLMCaller):
             # Handle None case for navigation_goal
             instruction = task.navigation_goal or "Default navigation task"
             system_prompt = _build_system_prompt(instruction)
-            self.message_history = [{"role": "user", "content": system_prompt}]
+            self.message_history: list = [{"role": "user", "content": system_prompt}]
             self._conversation_initialized = True
             LOG.debug("Initialized UI-TARS conversation", task_id=task.task_id)
 
@@ -145,54 +142,15 @@ class UITarsLLMCaller(LLMCaller):
             return "png"  # Default to PNG for unsupported formats
         return format_str
 
-    async def call(
-        self,
-        prompt: str | None = None,
-        prompt_name: str | None = None,
-        step: Step | None = None,
-        task_v2: TaskV2 | None = None,
-        thought: Thought | None = None,
-        ai_suggestion: AISuggestion | None = None,
-        screenshots: list[bytes] | None = None,
-        parameters: dict[str, Any] | None = None,
-        tools: list[Any] | None = None,
-        use_message_history: bool = False,
-        raw_response: bool = False,
-        window_dimension: Resolution | None = None,
-        **extra_parameters: Any,
-    ) -> dict[str, Any]:
-        """Override call method to use standard LLM routing instead of direct LiteLLM."""
-
-        # Use raw_response=True to bypass JSON parsing since UI-TARS returns plain text
-        response = await super().call(
-            prompt=prompt,
-            prompt_name=prompt_name,
+    async def generate_ui_tars_response(self, step: Step) -> str:
+        """Generate UI-TARS response using the parent LLMCaller directly."""
+        response = await self.call(
             step=step,
-            task_v2=task_v2,
-            thought=thought,
-            ai_suggestion=ai_suggestion,
-            screenshots=screenshots,
-            parameters=parameters,
-            tools=tools,
-            use_message_history=True,  # Use message history for UI-TARS
-            raw_response=True,  # Bypass JSON parsing - UI-TARS returns plain text
-            window_dimension=window_dimension,
-            **extra_parameters,
+            use_message_history=True,  # Use conversation history
+            raw_response=True,  # Skip JSON parsing for plain text
         )
 
-        # Extract content from the raw response
-        if isinstance(response, dict) and "choices" in response:
-            content = response["choices"][0]["message"]["content"]
-            return {"content": content}
-        else:
-            # Fallback for unexpected response format
-            return {"content": str(response)}
-
-    async def generate_ui_tars_response(self, step: Step) -> str:
-        """Generate UI-TARS response using the overridden call method."""
-        response = await self.call(step=step)
-
-        content = response.get("content", "").strip()
+        content = response["choices"][0]["message"]["content"]
 
         # Add the response to conversation history
         self.add_assistant_response(content)

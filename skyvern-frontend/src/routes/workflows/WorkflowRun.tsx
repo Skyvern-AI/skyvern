@@ -100,6 +100,8 @@ function WorkflowRun() {
   const parameters = workflowRun?.parameters ?? {};
   const proxyLocation =
     workflowRun?.proxy_location ?? ProxyLocation.Residential;
+  const maxScreenshotScrollingTimes =
+    workflowRun?.max_screenshot_scrolling_times ?? null;
 
   const title = workflowIsLoading ? (
     <Skeleton className="h-9 w-48" />
@@ -244,6 +246,7 @@ function WorkflowRun() {
                   data: parameters,
                   proxyLocation,
                   webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
+                  maxScreenshotScrollingTimes,
                 }}
               >
                 <PlayIcon className="mr-2 h-4 w-4" />

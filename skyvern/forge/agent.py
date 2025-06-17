@@ -19,6 +19,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
+    DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -72,8 +73,9 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, Tas
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
-from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine
+from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.services import run_service
+from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -181,6 +183,7 @@ class ForgeAgent:
             error_code_mapping=task_block.error_code_mapping,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
             model=task_block.model,
+            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -237,6 +240,7 @@ class ForgeAgent:
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
+            max_screenshot_scrolling_times=task_request.max_screenshot_scrolling_times,
         )
         LOG.info(
             "Created new task",
@@ -265,6 +269,12 @@ class ForgeAgent:
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
+        # do not need to do complete verification when it's a CUA task
+        # 1. CUA executes only one action step by step -- it's pretty less likely to have a hallucination for completion or forget to return a complete
+        # 2. It will significantly slow down CUA tasks
+        if engine in CUA_ENGINES:
+            complete_verification = False
+
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
             workflow_run = await app.DATABASE.get_workflow_run(
@@ -404,7 +414,7 @@ class ForgeAgent:
                 llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
                 if not llm_caller:
                     # create a new UI-TARS llm_caller
-                    llm_key = task.llm_key or settings.UI_TARS_LLM_KEY
+                    llm_key = task.llm_key or settings.VOLCENGINE_CUA_LLM_KEY
                     llm_caller = UITarsLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=True)
                     llm_caller.initialize_conversation(task)
 
@@ -871,7 +881,11 @@ class ForgeAgent:
                     scraped_page=scraped_page,
                     llm_caller=llm_caller,
                 )
-            elif engine == RunEngine.ui_tars:
+            elif engine == RunEngine.ui_tars and not app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "DISABLE_UI_TARS_CUA",
+                task.workflow_run_id or task.task_id,
+                properties={"organization_id": task.organization_id},
+            ):
                 assert llm_caller is not None
                 actions = await self._generate_ui_tars_actions(
                     task=task,
@@ -1568,10 +1582,9 @@ class ForgeAgent:
             step_id=step.step_id,
             workflow_run_id=task.workflow_run_id,
         )
-        run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
         scroll = True
         llm_key_override = task.llm_key
-        if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
+        if await is_cua_task(task=task):
             scroll = False
             llm_key_override = None
 
@@ -1646,12 +1659,23 @@ class ForgeAgent:
         if not working_page:
             raise BrowserStateMissingPage()
 
-        fullpage_screenshot = True
+        context = skyvern_context.ensure_context()
+        scrolling_number = context.max_screenshot_scrolling_times
+        if scrolling_number is None:
+            scrolling_number = DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES
+
         if engine in CUA_ENGINES:
-            fullpage_screenshot = False
+            scrolling_number = 0
 
         try:
-            screenshot = await browser_state.take_screenshot(full_page=fullpage_screenshot)
+            screenshot = await browser_state.take_post_action_screenshot(
+                scrolling_number=scrolling_number,
+                use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "ENABLE_PLAYWRIGHT_FULLPAGE",
+                    task.workflow_run_id or task.task_id,
+                    properties={"organization_id": task.organization_id},
+                ),
+            )
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
                 artifact_type=ArtifactType.SCREENSHOT_ACTION,
@@ -2131,7 +2155,13 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
-                    screenshot = await browser_state.take_screenshot(full_page=True)
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            task.workflow_run_id or task.task_id,
+                            properties={"organization_id": task.organization_id},
+                        )
+                    )
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=last_step,
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -2604,9 +2634,8 @@ class ForgeAgent:
                 step_result["actions_result"] = action_result_summary
                 steps_results.append(step_result)
 
-            run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
             scroll = True
-            if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
+            if await is_cua_task(task=task):
                 scroll = False
 
             screenshots: list[bytes] = []
@@ -2856,8 +2885,7 @@ class ForgeAgent:
                 expire_verification_code=True,
             )
             llm_key_override = task.llm_key
-            run_obj = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
-            if run_obj and run_obj.task_run_type in CUA_RUN_TYPES:
+            if await is_cua_task(task=task):
                 llm_key_override = None
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 llm_key_override, default=app.LLM_API_HANDLER

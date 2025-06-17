@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.task_v2 import Thought
 from skyvern.forge.sdk.workflow.models.block import BlockType
+from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.actions import Action
 
 
@@ -24,6 +25,7 @@ class WorkflowRunBlock(BaseModel):
     output: dict | list | str | None = None
     continue_on_failure: bool = False
     failure_reason: str | None = None
+    engine: RunEngine | None = None
     task_id: str | None = None
     url: str | None = None
     navigation_goal: str | None = None
