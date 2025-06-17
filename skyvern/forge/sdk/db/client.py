@@ -95,7 +95,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunType
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 
@@ -2707,6 +2707,7 @@ class AgentDB:
         status: BlockStatus = BlockStatus.running,
         output: dict | list | str | None = None,
         continue_on_failure: bool = False,
+        engine: RunEngine | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
@@ -2719,6 +2720,7 @@ class AgentDB:
                 status=status,
                 output=output,
                 continue_on_failure=continue_on_failure,
+                engine=engine,
             )
             session.add(new_workflow_run_block)
             await session.commit()
@@ -2759,6 +2761,7 @@ class AgentDB:
         wait_sec: int | None = None,
         description: str | None = None,
         block_workflow_run_id: str | None = None,
+        engine: str | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2799,6 +2802,8 @@ class AgentDB:
                     workflow_run_block.description = description
                 if block_workflow_run_id:
                     workflow_run_block.block_workflow_run_id = block_workflow_run_id
+                if engine:
+                    workflow_run_block.engine = engine
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
@@ -2829,6 +2834,25 @@ class AgentDB:
                     task = await self.get_task(task_id, organization_id=organization_id)
                 return convert_to_workflow_run_block(workflow_run_block, task=task)
             raise NotFoundError(f"WorkflowRunBlock {workflow_run_block_id} not found")
+
+    async def get_workflow_run_block_by_task_id(
+        self,
+        task_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRunBlock:
+        async with self.Session() as session:
+            workflow_run_block = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run_block:
+                task = None
+                task_id = workflow_run_block.task_id
+                if task_id:
+                    task = await self.get_task(task_id, organization_id=organization_id)
+                return convert_to_workflow_run_block(workflow_run_block, task=task)
+            raise NotFoundError(f"WorkflowRunBlock not found by {task_id}")
 
     async def get_workflow_run_blocks(
         self,
