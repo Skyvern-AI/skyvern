@@ -71,7 +71,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import OnePasswordConstants
-from skyvern.schemas.runs import CUA_RUN_TYPES
+from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
@@ -3377,9 +3377,8 @@ async def extract_information_for_navigation_goal(
         local_datetime=datetime.now(context.tz_info).isoformat(),
     )
 
-    task_run = await app.DATABASE.get_run(run_id=task.task_id, organization_id=task.organization_id)
     llm_key_override = task.llm_key
-    if task_run and task_run.task_run_type in CUA_RUN_TYPES:
+    if await is_cua_task(task=task):
         # CUA tasks should use the default data extraction llm key
         llm_key_override = None
 

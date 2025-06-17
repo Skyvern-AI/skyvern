@@ -460,6 +460,7 @@ def convert_to_workflow_run_block(
         output=workflow_run_block_model.output,
         continue_on_failure=workflow_run_block_model.continue_on_failure,
         failure_reason=workflow_run_block_model.failure_reason,
+        engine=workflow_run_block_model.engine,
         task_id=workflow_run_block_model.task_id,
         loop_values=workflow_run_block_model.loop_values,
         current_value=workflow_run_block_model.current_value,

@@ -13,7 +13,7 @@ from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -719,6 +719,56 @@ async def get_artifact(
                 artifact_id=artifact_id,
             )
     return artifact
+
+
+@base_router.get(
+    "/runs/{run_id}/artifacts",
+    tags=["Artifacts"],
+    response_model=list[Artifact],
+    openapi_extra={
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_run_artifacts",
+    },
+    description="Get artifacts for a run",
+    summary="Get artifacts for a run",
+)
+@base_router.get("/runs/{run_id}/artifacts/", response_model=list[Artifact], include_in_schema=False)
+async def get_run_artifacts(
+    run_id: str = Path(..., description="The id of the task run or the workflow run."),
+    artifact_type: Annotated[list[ArtifactType] | None, Query()] = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    analytics.capture("skyvern-oss-run-artifacts-get")
+    # Get artifacts as a list (not grouped by type)
+    artifacts = await app.DATABASE.get_artifacts_for_run(
+        run_id=run_id,
+        organization_id=current_org.organization_id,
+        artifact_types=artifact_type,
+        group_by_type=False,  # This ensures we get a list, not a dict
+    )
+
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        # Ensure we have a list of artifacts
+        artifacts_list = artifacts if isinstance(artifacts, list) else []
+
+        # Get signed URLs for all artifacts
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
+
+        if signed_urls and len(signed_urls) == len(artifacts_list):
+            for i, artifact in enumerate(artifacts_list):
+                if hasattr(artifact, "signed_url"):
+                    artifact.signed_url = signed_urls[i]
+        elif signed_urls:
+            LOG.warning(
+                "Mismatch between artifacts and signed URLs count",
+                artifacts_count=len(artifacts_list),
+                urls_count=len(signed_urls),
+                run_id=run_id,
+            )
+        else:
+            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+
+    return artifacts
 
 
 @base_router.post(

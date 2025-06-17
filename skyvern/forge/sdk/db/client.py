@@ -95,7 +95,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunType
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 
@@ -985,6 +985,82 @@ class AgentDB:
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def get_artifacts_for_run(
+        self,
+        run_id: str,
+        organization_id: str,
+        artifact_types: list[ArtifactType] | None = None,
+        group_by_type: bool = False,
+        sort_by: str = "created_at",
+    ) -> dict[ArtifactType, list[Artifact]] | list[Artifact]:
+        """Return artifacts associated with a run.
+
+        Args:
+            run_id: The ID of the run to get artifacts for
+            organization_id: The ID of the organization that owns the run
+            artifact_types: Optional list of artifact types to filter by
+            group_by_type: If True, returns a dictionary mapping artifact types to lists of artifacts.
+                         If False, returns a flat list of artifacts. Defaults to False.
+            sort_by: Field to sort artifacts by. Must be one of: 'created_at', 'step_id', 'task_id'.
+                   Defaults to 'created_at'.
+
+        Returns:
+            If group_by_type is True, returns a dictionary mapping artifact types to lists of artifacts.
+            If group_by_type is False, returns a list of artifacts sorted by the specified field.
+
+        Raises:
+            ValueError: If sort_by is not one of the allowed values
+        """
+        allowed_sort_fields = {"created_at", "step_id", "task_id"}
+        if sort_by not in allowed_sort_fields:
+            raise ValueError(f"sort_by must be one of {allowed_sort_fields}")
+        run = await self.get_run(run_id, organization_id=organization_id)
+        if not run:
+            return []
+
+        async with self.Session() as session:
+            query = select(ArtifactModel).filter_by(organization_id=organization_id)
+
+            if run.task_run_type in [
+                RunType.task_v1,
+                RunType.openai_cua,
+                RunType.anthropic_cua,
+            ]:
+                query = query.filter_by(task_id=run.run_id)
+            elif run.task_run_type == RunType.task_v2:
+                query = query.filter_by(observer_cruise_id=run.run_id)
+            elif run.task_run_type == RunType.workflow_run:
+                query = query.filter_by(workflow_run_id=run.run_id)
+            else:
+                return []
+
+            if artifact_types:
+                query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
+
+            # Apply sorting
+            if sort_by == "created_at":
+                query = query.order_by(ArtifactModel.created_at)
+            elif sort_by == "step_id":
+                query = query.order_by(ArtifactModel.step_id, ArtifactModel.created_at)
+            elif sort_by == "task_id":
+                query = query.order_by(ArtifactModel.task_id, ArtifactModel.created_at)
+
+            # Execute query and convert to Artifact objects
+            artifacts = [
+                convert_to_artifact(artifact, self.debug_enabled) for artifact in (await session.scalars(query)).all()
+            ]
+
+            # Group artifacts by type if requested
+            if group_by_type:
+                result: dict[ArtifactType, list[Artifact]] = {}
+                for artifact in artifacts:
+                    if artifact.artifact_type not in result:
+                        result[artifact.artifact_type] = []
+                    result[artifact.artifact_type].append(artifact)
+                return result
+
+            return artifacts
 
     async def get_artifact_by_id(
         self,
@@ -2631,6 +2707,7 @@ class AgentDB:
         status: BlockStatus = BlockStatus.running,
         output: dict | list | str | None = None,
         continue_on_failure: bool = False,
+        engine: RunEngine | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
@@ -2643,6 +2720,7 @@ class AgentDB:
                 status=status,
                 output=output,
                 continue_on_failure=continue_on_failure,
+                engine=engine,
             )
             session.add(new_workflow_run_block)
             await session.commit()
@@ -2683,6 +2761,7 @@ class AgentDB:
         wait_sec: int | None = None,
         description: str | None = None,
         block_workflow_run_id: str | None = None,
+        engine: str | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2723,6 +2802,8 @@ class AgentDB:
                     workflow_run_block.description = description
                 if block_workflow_run_id:
                     workflow_run_block.block_workflow_run_id = block_workflow_run_id
+                if engine:
+                    workflow_run_block.engine = engine
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
@@ -2753,6 +2834,25 @@ class AgentDB:
                     task = await self.get_task(task_id, organization_id=organization_id)
                 return convert_to_workflow_run_block(workflow_run_block, task=task)
             raise NotFoundError(f"WorkflowRunBlock {workflow_run_block_id} not found")
+
+    async def get_workflow_run_block_by_task_id(
+        self,
+        task_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRunBlock:
+        async with self.Session() as session:
+            workflow_run_block = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run_block:
+                task = None
+                task_id = workflow_run_block.task_id
+                if task_id:
+                    task = await self.get_task(task_id, organization_id=organization_id)
+                return convert_to_workflow_run_block(workflow_run_block, task=task)
+            raise NotFoundError(f"WorkflowRunBlock not found by {task_id}")
 
     async def get_workflow_run_blocks(
         self,
