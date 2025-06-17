@@ -288,7 +288,11 @@ class Block(BaseModel, abc.ABC):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
+        engine: RunEngine | None = None
         try:
+            if isinstance(self, BaseTaskBlock):
+                engine = self.engine
+
             workflow_run_block = await app.DATABASE.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -296,6 +300,7 @@ class Block(BaseModel, abc.ABC):
                 label=self.label,
                 block_type=self.block_type,
                 continue_on_failure=self.continue_on_failure,
+                engine=engine,
             )
             workflow_run_block_id = workflow_run_block.workflow_run_block_id
 

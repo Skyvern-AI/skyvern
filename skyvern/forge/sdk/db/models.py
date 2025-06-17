@@ -573,13 +573,14 @@ class WorkflowRunBlockModel(Base):
     parent_workflow_run_block_id = Column(String, nullable=True)
     organization_id = Column(String, nullable=True)
     description = Column(String, nullable=True)
-    task_id = Column(String, nullable=True)
+    task_id = Column(String, index=True, nullable=True)
     label = Column(String, nullable=True)
     block_type = Column(String, nullable=False)
     status = Column(String, nullable=False)
     output = Column(JSON, nullable=True)
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
+    engine = Column(String, nullable=True)
 
     # for loop block
     loop_values = Column(JSON, nullable=True)
