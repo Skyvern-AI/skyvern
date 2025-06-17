@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to sync'
+        description: 'PR number to sync. Input JUST the number, no #'
         required: true
         type: string
 jobs:
