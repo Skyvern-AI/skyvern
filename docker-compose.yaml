@@ -125,7 +125,7 @@ services:
     environment:
     # Declare the Service FQDN in Coolify
       - SERVICE_FQDN_API_8001=/api/v1
-      - SERVICE_FQDN_ARTIFACTS_9090=${SERVICE_FQDN_ARTIFACTS}
+      - SERVICE_FQDN_ARTIFACTS_9090
       - SERVICE_URL_API=${SERVICE_URL_API}
       - VITE_ENABLE_CODE_BLOCK=true
     # if you want to run skyvern on a remote server,
@@ -134,7 +134,7 @@ services:
     #   A route for the API: api.yourdomain.com -> localhost:8000
     #   A route for the UI: yourdomain.com -> localhost:8080
     #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
-      - VITE_WSS_BASE_URL=ws://${SERVICE_FQDN}
+      - VITE_WSS_BASE_URL=ws://${COOLIFY_FQDN}
       - VITE_ARTIFACT_API_BASE_URL=${SERVICE_FQDN_ARTIFACTS}
       - VITE_API_BASE_URL=${SERVICE_FQDN_API}
     # This will appear as an editable field in the UI. Get the value from the Skyvern UI's settings page after first deployment.
