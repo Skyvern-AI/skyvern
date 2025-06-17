@@ -88,7 +88,7 @@ async def _scrolling_screenshots_helper(
     draw_boxes: bool = False,
     max_number: int = settings.MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
-) -> list[bytes]:
+) -> tuple[list[bytes], list[int]]:
     skyvern_page = await SkyvernFrame.create_instance(frame=page)
     # page is the main frame and the index must be 0
     assert isinstance(skyvern_page.frame, Page)
@@ -101,6 +101,7 @@ async def _scrolling_screenshots_helper(
         draw_boxes = False
 
     screenshots: list[bytes] = []
+    positions: list[int] = []
     if await skyvern_page.is_window_scrollable():
         scroll_y_px_old = -30.0
         scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
@@ -110,6 +111,7 @@ async def _scrolling_screenshots_helper(
         while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
             screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame, mode=mode)
             screenshots.append(screenshot)
+            positions.append(int(scroll_y_px))
             scroll_y_px_old = scroll_y_px
             LOG.debug("Scrolling to next page", url=url, num_screenshots=len(screenshots))
             scroll_y_px = await skyvern_page.scroll_to_next_page(
@@ -138,11 +140,48 @@ async def _scrolling_screenshots_helper(
         LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
         screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame, mode=mode)
         screenshots.append(screenshot)
+        positions.append(0)
 
         if draw_boxes:
             await skyvern_page.remove_bounding_boxes()
 
-    return screenshots
+    return screenshots, positions
+
+
+def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -> Image.Image:
+    """Merge screenshots vertically using scroll positions to remove overlaps."""
+    if not images:
+        raise ValueError("no images to merge")
+    if len(images) != len(positions):
+        raise ValueError("images and positions length mismatch")
+
+    if len(images) == 1:
+        return images[0]
+
+    max_width = max(img.width for img in images)
+
+    merged_height = images[0].height
+    for i in range(1, len(images)):
+        merged_height += positions[i] - positions[i - 1]
+
+    merged_img = Image.new("RGB", (max_width, merged_height), color=(255, 255, 255))
+
+    current_y = 0
+    merged_img.paste(images[0], (0, current_y))
+    current_y += images[0].height
+
+    for i in range(1, len(images)):
+        step = positions[i] - positions[i - 1]
+        overlap = images[i].height - step
+        if overlap > 0:
+            cropped = images[i].crop((0, overlap, images[i].width, images[i].height))
+        else:
+            cropped = images[i]
+
+        merged_img.paste(cropped, (0, current_y))
+        current_y += cropped.height
+
+    return merged_img
 
 
 class SkyvernFrame:
@@ -195,7 +234,9 @@ class SkyvernFrame:
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
         start_time = time.time()
         async with asyncio.timeout(timeout):
-            screenshots = await _scrolling_screenshots_helper(page=page, mode=mode, max_number=scrolling_number)
+            screenshots, positions = await _scrolling_screenshots_helper(
+                page=page, mode=mode, max_number=scrolling_number
+            )
             images = []
 
             for screenshot in screenshots:
@@ -203,15 +244,7 @@ class SkyvernFrame:
                     img.load()
                     images.append(img)
 
-            total_height = sum(img.height for img in images)
-            max_width = max(img.width for img in images)
-
-            merged_img = Image.new("RGB", (max_width, total_height), color=(255, 255, 255))
-
-            current_y = 0
-            for img in images:
-                merged_img.paste(img, (0, current_y))
-                current_y += img.height
+            merged_img = _merge_images_by_position(images, positions)
 
             buffer = BytesIO()
             merged_img.save(buffer, format="PNG")
@@ -241,9 +274,10 @@ class SkyvernFrame:
         if not scroll:
             return [await _current_viewpoint_screenshot_helper(page=page, mode=ScreenshotMode.DETAILED)]
 
-        return await _scrolling_screenshots_helper(
+        screenshots, _ = await _scrolling_screenshots_helper(
             page=page, url=url, max_number=max_number, draw_boxes=draw_boxes, mode=ScreenshotMode.DETAILED
         )
+        return screenshots
 
     @classmethod
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
