@@ -134,7 +134,7 @@ services:
     #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
       - VITE_WSS_BASE_URL=wss:${COOLIFY_FQDN}
       - VITE_ARTIFACT_API_BASE_URL=https://artifact.${COOLIFY_FQDN}
-      - VITE_API_BASE_URL=${SERVICE_FQDN_API}https://api.${COOLIFY_FQDN}/api/v1
+      - VITE_API_BASE_URL=https://api.${COOLIFY_FQDN}/api/v1
     # This will appear as an editable field in the UI. Get the value from the Skyvern UI's settings page after first deployment.
       - VITE_SKYVERN_API_KEY=${VITE_SKYVERN_API_KEY}
     depends_on:
