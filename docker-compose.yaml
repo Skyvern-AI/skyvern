@@ -111,7 +111,7 @@ services:
   artifact-server:
     build:
       context: ./skyvern-frontend
-      dockerfile: Dockerfile.artifact
+      dockerfile: dockerfile.artifact
     restart: on-failure
     ports:
       - "9090:9090"
