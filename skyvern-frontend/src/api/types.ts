@@ -343,6 +343,7 @@ export type Createv2TaskRequest = {
   user_prompt: string;
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
+  browser_session_id?: string | null;
 };
 
 export type PasswordCredentialApiResponse = {
