@@ -107,7 +107,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-
+  ## Begin New Artifact Service
+  artifact-server:
+    build:
+      context: ./skyvern-frontend
+      dockerfile: Dockerfile.artifact
+    restart: on-failure
+    ports:
+      - "9090:9090"
+    volumes:
+      - artifacts-data:/data/artifacts
+    environment:
+      - NODE_ENV=production
+ ## End New Artifact Service
   skyvern-ui:
     image: public.ecr.aws/skyvern/skyvern-ui:latest
     restart: on-failure
