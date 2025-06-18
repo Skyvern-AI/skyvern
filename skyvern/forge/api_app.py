@@ -12,6 +12,8 @@ from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
+from skyvern.forge.request_logging import log_raw_request_middleware
+
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
@@ -112,6 +114,10 @@ def get_agent_app() -> FastAPI:
             return await call_next(request)
         finally:
             skyvern_context.reset()
+
+    @app.middleware("http")
+    async def raw_request_logging(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        return await log_raw_request_middleware(request, call_next)
 
     if settings.ADDITIONAL_MODULES:
         for module in settings.ADDITIONAL_MODULES:
