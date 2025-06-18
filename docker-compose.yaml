@@ -126,7 +126,8 @@ services:
     ports:
       # Includes default values. Coolify UI variables will override these.
       - "${UI_HOST_PORT:-8081}:8080"
-      - "${UI_ARTIFACT_PORT:-9090}:9090"
+      # Port mapping below moved to artifact-server service
+      # - "${UI_ARTIFACT_PORT:-9090}:9090"
     volumes:
       # Using named volumes shared with the skyvern service
       - artifacts-data:/data/artifacts
