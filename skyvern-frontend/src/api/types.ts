@@ -294,6 +294,7 @@ export type WorkflowRunStatusApiResponse = {
   total_cost: number | null;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
+  browser_session_id: string | null;
   max_screenshot_scrolling_times: number | null;
 };
 
