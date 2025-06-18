@@ -39,6 +39,14 @@ import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 
+function formatDuration(duration?: number | null) {
+  if (duration === null || typeof duration === "undefined") {
+    return "N/A";
+  }
+  const seconds = duration > 1000 ? duration / 1000 : duration;
+  return `${seconds.toFixed(2)} sec`;
+}
+
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
   const active = searchParams.get("active");
@@ -256,6 +264,17 @@ function WorkflowRun() {
           )}
         </div>
       </header>
+      <div className="w-fit space-y-2 rounded bg-slate-elevation1 p-4">
+        <h2 className="text-lg font-bold">Run Info</h2>
+        <div className="flex justify-between gap-4 text-sm">
+          <span className="text-slate-400">Queue Time</span>
+          <span>{formatDuration(workflowRun?.queue_time)}</span>
+        </div>
+        <div className="flex justify-between gap-4 text-sm">
+          <span className="text-slate-400">Execution Time</span>
+          <span>{formatDuration(workflowRun?.execution_time)}</span>
+        </div>
+      </div>
       {showOutputSection && (
         <div
           className={cn("grid gap-4 rounded-lg bg-slate-elevation1 p-4", {

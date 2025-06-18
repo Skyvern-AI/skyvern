@@ -273,6 +273,8 @@ export type WorkflowRunApiResponse = {
   workflow_id: string;
   workflow_permanent_id: string;
   workflow_run_id: string;
+  queue_time: number | null;
+  execution_time: number | null;
   workflow_title: string | null;
 };
 
@@ -284,6 +286,8 @@ export type WorkflowRunStatusApiResponse = {
   webhook_callback_url: string | null;
   created_at: string;
   modified_at: string;
+  queue_time: number | null;
+  execution_time: number | null;
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
