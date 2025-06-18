@@ -1,13 +1,12 @@
 import asyncio
+import importlib.resources
+import importlib.util
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional
-
-import importlib.resources
-import importlib.util
 
 import psutil
 import typer
@@ -38,12 +37,12 @@ def find_frontend_dir() -> Optional[Path]:
             if candidate.exists():
                 return candidate
 
-
     for name in ("skyvern_frontend", "skyvern.frontend"):
         try:
-            candidate = importlib.resources.files(name)
+            # Convert the Traversable returned by importlib.resources.files to a Path via str for MyPy compatibility
+            candidate = Path(str(importlib.resources.files(name)))
             if candidate.exists():
-                return Path(candidate)
+                return candidate
         except ModuleNotFoundError:
             continue
 
@@ -53,6 +52,7 @@ def find_frontend_dir() -> Optional[Path]:
             return candidate
 
     return None
+
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 
