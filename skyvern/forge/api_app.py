@@ -12,11 +12,10 @@ from starlette.requests import HTTPConnection, Request
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
-from skyvern.forge.request_logging import log_raw_request_middleware
-
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
+from skyvern.forge.request_logging import log_raw_request_middleware
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError

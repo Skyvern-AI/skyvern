@@ -8,8 +8,9 @@ from skyvern.config import settings
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from typing import Awaitable, Callable
-    from starlette.requests import Request
+
     from fastapi import Response
+    from starlette.requests import Request
 
 LOG = structlog.get_logger()
 
@@ -41,9 +42,7 @@ def _sanitize_body(body: bytes, content_type: str | None) -> str:
     return text
 
 
-async def log_raw_request_middleware(
-    request: "Request", call_next: "Callable[[Request], Awaitable[Response]]"
-) -> "Response":
+async def log_raw_request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     if not settings.LOG_RAW_API_REQUESTS:
         return await call_next(request)
 
