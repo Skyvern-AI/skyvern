@@ -153,6 +153,7 @@ function PromptBox() {
   const [proxyLocation, setProxyLocation] = useState<ProxyLocation>(
     ProxyLocation.Residential,
   );
+  const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
@@ -170,6 +171,7 @@ function PromptBox() {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
+          browser_session_id: browserSessionId,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
           max_screenshot_scrolling_times: maxScreenshotScrollingTimes,
@@ -381,6 +383,21 @@ function PromptBox() {
                     <ProxySelector
                       value={proxyLocation}
                       onChange={setProxyLocation}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Browser Session ID</div>
+                      <div className="text-xs text-slate-400">
+                        The ID of a persistent browser session
+                      </div>
+                    </div>
+                    <Input
+                      value={browserSessionId ?? ""}
+                      placeholder="pbs_xxx"
+                      onChange={(event) => {
+                        setBrowserSessionId(event.target.value);
+                      }}
                     />
                   </div>
                   <div className="flex gap-16">
