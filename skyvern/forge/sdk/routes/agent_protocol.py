@@ -1821,6 +1821,7 @@ async def run_task_v2(
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
             max_screenshot_scrolling_times=data.max_screenshot_scrolling_times,
+            browser_session_id=data.browser_session_id,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
