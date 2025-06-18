@@ -1,0 +1,6 @@
+FROM node:18-alpine
+WORKDIR /app
+COPY artifactServer.js ./
+RUN npm install express cors
+EXPOSE 9090
+CMD ["node", "artifactServer.js"]
