@@ -166,6 +166,7 @@ async def initialize_task_v2(
     create_task_run: bool = False,
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
+    browser_session_id: str | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -226,6 +227,7 @@ async def initialize_task_v2(
             request_id=None,
             workflow_request=WorkflowRequestBody(
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                browser_session_id=browser_session_id,
             ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
