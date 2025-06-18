@@ -111,6 +111,16 @@ class BlockStatus(StrEnum):
     timed_out = "timed_out"
 
 
+# Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
+# import time so it is not recreated on each block execution.
+TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
+    TaskV2Status.completed: BlockStatus.completed,
+    TaskV2Status.terminated: BlockStatus.terminated,
+    TaskV2Status.failed: BlockStatus.failed,
+    TaskV2Status.canceled: BlockStatus.canceled,
+    TaskV2Status.timed_out: BlockStatus.timed_out,
+}
+
 @dataclass(frozen=True)
 class BlockResult:
     success: bool
@@ -2525,16 +2535,10 @@ class TaskV2Block(Block):
         if task_v2:
             result_dict = task_v2.output
 
-        block_status_mapping = {
-            TaskV2Status.completed: BlockStatus.completed,
-            TaskV2Status.terminated: BlockStatus.terminated,
-            TaskV2Status.failed: BlockStatus.failed,
-            TaskV2Status.canceled: BlockStatus.canceled,
-            TaskV2Status.timed_out: BlockStatus.timed_out,
-        }
-        block_status = block_status_mapping.get(task_v2.status, BlockStatus.failed)
+        # Determine block status from task status using module-level mapping
+        block_status = TASKV2_TO_BLOCK_STATUS.get(task_v2.status, BlockStatus.failed)
         success = task_v2.status == TaskV2Status.completed
-        failure_reason = getattr(task_v2, "failure_reason", None)
+        failure_reason = task_v2.failure_reason
 
         return await self.build_block_result(
             success=success,
