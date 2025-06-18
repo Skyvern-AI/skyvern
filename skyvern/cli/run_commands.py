@@ -2,8 +2,12 @@ import asyncio
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+import importlib.resources
+import importlib.util
 
 import psutil
 import typer
@@ -19,6 +23,36 @@ from skyvern.library.skyvern import Skyvern
 from skyvern.utils import detect_os
 
 from .console import console
+
+
+def find_frontend_dir() -> Optional[Path]:
+    """Locate the skyvern-frontend directory if present."""
+    repo_candidate = Path(__file__).resolve().parents[2] / "skyvern-frontend"
+    if repo_candidate.exists():
+        return repo_candidate
+
+    for name in ("skyvern_frontend", "skyvern-frontend", "skyvern.frontend"):
+        spec = importlib.util.find_spec(name)
+        if spec and spec.origin:
+            candidate = Path(spec.origin).parent
+            if candidate.exists():
+                return candidate
+
+
+    for name in ("skyvern_frontend", "skyvern.frontend"):
+        try:
+            candidate = importlib.resources.files(name)
+            if candidate.exists():
+                return Path(candidate)
+        except ModuleNotFoundError:
+            continue
+
+    for base in [Path(sys.argv[0]).resolve().parent, Path.cwd(), Path.cwd().parent]:
+        candidate = base / "skyvern-frontend"
+        if candidate.exists():
+            return candidate
+
+    return None
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 
@@ -117,13 +151,17 @@ def run_ui() -> None:
     except Exception as e:  # pragma: no cover - CLI safeguards
         console.print(f"[red]Error checking for process: {e}[/red]")
 
-    current_dir = Path(__file__).parent.parent.parent
-    frontend_dir = current_dir / "skyvern-frontend"
-    if not frontend_dir.exists():
+    frontend_dir = find_frontend_dir()
+    if not frontend_dir:
         console.print(
-            f"[bold red]ERROR: Skyvern Frontend directory not found at [path]{frontend_dir}[/path]. Are you in the right repo?[/bold red]"
+            "[bold red]ERROR: Skyvern Frontend directory not found.[/bold red]\n"
+            "The UI is not bundled with this installation.\n"
+            "Clone the repository or use the Docker image to run the UI.\n"
+            "As a workaround, run 'skyvern run server'."
         )
         return
+
+    current_dir = Path(__file__).parent.parent.parent
 
     frontend_env_path = frontend_dir / ".env"
     if not frontend_env_path.exists():
