@@ -145,7 +145,7 @@ services:
     #   A route for the API: api.yourdomain.com -> localhost:8001
     #   A route for the UI: yourdomain.com -> localhost:8080
     #   A route for the artifact API: artifact.yourdomain.com -> localhost:9090 (maybe not needed)
-      - VITE_WSS_BASE_URL: wss://${COOLIFY_FQDN}/api/v1
+      - VITE_WSS_BASE_URL: wss://api.${COOLIFY_FQDN}/api/v1
       - VITE_ARTIFACT_API_BASE_URL: http://artifact.${COOLIFY_FQDN}
       - VITE_API_BASE_URL: http://api.${COOLIFY_FQDN}/api/v1
     # old - VITE_WSS_BASE_URL=wss:${COOLIFY_FQDN}
