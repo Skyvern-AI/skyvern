@@ -120,9 +120,7 @@ class WorkflowService:
         return results
 
     async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
-        credential = await app.DATABASE.get_credential(
-            credential_id, organization_id=organization.organization_id
-        )
+        credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
         if credential is None:
             raise InvalidCredentialId(credential_id)
 
@@ -197,24 +195,16 @@ class WorkflowService:
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
-                    if (
-                        workflow_parameter.workflow_parameter_type
-                        == WorkflowParameterType.CREDENTIAL_ID
-                    ):
-                        await self._validate_credential_id(request_body_value, organization)
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                        await self._validate_credential_id(str(request_body_value), organization)
                     await self.create_workflow_run_parameter(
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_parameter=workflow_parameter,
                         value=request_body_value,
                     )
                 elif workflow_parameter.default_value is not None:
-                    if (
-                        workflow_parameter.workflow_parameter_type
-                        == WorkflowParameterType.CREDENTIAL_ID
-                    ):
-                        await self._validate_credential_id(
-                            workflow_parameter.default_value, organization
-                        )
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                        await self._validate_credential_id(str(workflow_parameter.default_value), organization)
                     await self.create_workflow_run_parameter(
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_parameter=workflow_parameter,
