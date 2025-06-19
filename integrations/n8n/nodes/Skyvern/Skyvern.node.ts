@@ -8,6 +8,7 @@ import {
     INodePropertyOptions,
     INodeType,
     INodeTypeDescription,
+    NodeConnectionType,
     ResourceMapperField,
     ResourceMapperFields,
 } from 'n8n-workflow';
@@ -39,8 +40,8 @@ export class Skyvern implements INodeType {
         defaults: {
             name: 'Skyvern',
         },
-        inputs: ['main'],
-        outputs: ['main'],
+        inputs: [NodeConnectionType.Main],
+        outputs: [NodeConnectionType.Main],
         credentials: [
             {
                 name: 'skyvernApi',
@@ -71,11 +72,11 @@ export class Skyvern implements INodeType {
                 type: 'options',
                 noDataExpression: true,
                 required: true,
-                default: 'dispatchTask',
+                default: 'dispatch',
                 options: [
                     {
                         name: 'Dispatch a Task',
-                        value: 'dispatchTask',
+                        value: 'dispatch',
                         action: 'Dispatch a task to execute asynchronously',
                         description: 'Dispatch a task to execute asynchronously',
                         displayOptions: {
@@ -110,7 +111,7 @@ export class Skyvern implements INodeType {
                     },
                     {
                         name: 'Get a Task',
-                        value: 'getTask',
+                        value: 'get',
                         action: 'Get a task by ID',
                         description: 'Get a task by ID',
                         displayOptions: {
@@ -128,7 +129,7 @@ export class Skyvern implements INodeType {
                     },
                     {
                         name: 'Get a Workflow Run',
-                        value: 'getWorkflow',
+                        value: 'get',
                         action: 'Get a workflow run by ID',
                         description: 'Get a workflow run by ID',
                         displayOptions: {
@@ -145,7 +146,7 @@ export class Skyvern implements INodeType {
                     },
                     {
                         name: 'Dispatch a Workflow Run',
-                        value: 'dispatchWorkflow',
+                        value: 'dispatch',
                         action: 'Dispatch a workflow run to execute asynchronously',
                         description: 'Dispatch a workflow run to execute asynchronously',
                         displayOptions: {
@@ -173,11 +174,13 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        operation: ['dispatch'],
                     },
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         body: {
                             prompt: '={{$value}}',
                         },
@@ -194,11 +197,13 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        operation: ['dispatch'],
                     },
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         body: {
                             url: '={{$value ? $value : null}}',
                         },
@@ -215,11 +220,13 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        operation: ['dispatch'],
                     },
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         body: {
                             webhook_url: '={{$value ? $value : null}}',
                         },
@@ -236,11 +243,12 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['getTask'],
+                        operation: ['get'],
                     },
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
                         method: 'GET',
                         url: '={{"/v1/runs/" + $value}}',
                     },
@@ -310,7 +318,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        operation: ['dispatch'],
                     },
                 },
             },
@@ -341,11 +349,13 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['getWorkflow'],
+                        operation: ['get'],
                     },
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'GET',
                         url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/runs/" + $value}}',
                     },
                 },
@@ -364,7 +374,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatchWorkflow'],
+                        operation: ['dispatch'],
                     },
                 },
                 typeOptions: {
@@ -382,6 +392,8 @@ export class Skyvern implements INodeType {
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
                         body: {
                             data: '={{$value["value"]}}',
@@ -399,7 +411,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatchWorkflow'],
+                        operation: ['dispatch'],
                     },
                 },
                 routing: {
@@ -438,7 +450,7 @@ export class Skyvern implements INodeType {
                 if (resource !== 'workflow') return { fields: [] };
 
                 const operation = this.getCurrentNodeParameter('operation') as string;
-                if (operation !== 'dispatchWorkflow') return { fields: [] };
+                if (operation !== 'dispatch') return { fields: [] };
 
                 const workflowId = this.getCurrentNodeParameter('workflowId') as string;
                 if (!workflowId) return { fields: [] };
