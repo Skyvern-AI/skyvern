@@ -129,7 +129,7 @@ export class Skyvern implements INodeType {
                     },
                     {
                         name: 'Get a Workflow Run',
-                        value: 'get',
+                        value: 'getWorkflow',
                         action: 'Get a workflow run by ID',
                         description: 'Get a workflow run by ID',
                         displayOptions: {
