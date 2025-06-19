@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update, or_
+from sqlalchemy import and_, delete, distinct, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -1098,7 +1098,6 @@ class AgentDB:
         thought_id: str | None = None,
         task_v2_id: str | None = None,
     ) -> list[Artifact]:
-
         try:
             async with self.Session() as session:
                 # Build base query
