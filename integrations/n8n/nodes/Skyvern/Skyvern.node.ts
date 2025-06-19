@@ -8,7 +8,6 @@ import {
     INodePropertyOptions,
     INodeType,
     INodeTypeDescription,
-    NodeConnectionType,
     ResourceMapperField,
     ResourceMapperFields,
 } from 'n8n-workflow';
@@ -40,8 +39,10 @@ export class Skyvern implements INodeType {
         defaults: {
             name: 'Skyvern',
         },
-        inputs: ['main' as NodeConnectionType[] & any],
-        outputs: ['main' as NodeConnectionType[] & any],
+        // @ts-ignore - ESLint requires string literal but TS wants a different type
+        inputs: ['main'],
+        // @ts-ignore - ESLint requires string literal but TS wants a different type
+        outputs: ['main'],
         credentials: [
             {
                 name: 'skyvernApi',
@@ -174,7 +175,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatch'],
+                        operation: ['dispatchTask'],
                     },
                 },
                 routing: {
@@ -197,7 +198,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatch'],
+                        operation: ['dispatchTask'],
                     },
                 },
                 routing: {
@@ -220,7 +221,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatch'],
+                        operation: ['dispatchTask'],
                     },
                 },
                 routing: {
@@ -318,7 +319,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatch'],
+                        operation: ['dispatchTask'],
                     },
                 },
             },
@@ -374,7 +375,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatch'],
+                        operation: ['dispatchTask'],
                     },
                 },
                 typeOptions: {
@@ -411,7 +412,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatch'],
+                        operation: ['dispatchTask'],
                     },
                 },
                 routing: {
@@ -450,7 +451,7 @@ export class Skyvern implements INodeType {
                 if (resource !== 'workflow') return { fields: [] };
 
                 const operation = this.getCurrentNodeParameter('operation') as string;
-                if (operation !== 'dispatch') return { fields: [] };
+                if (operation !== 'dispatchWorkflow') return { fields: [] };
 
                 const workflowId = this.getCurrentNodeParameter('workflowId') as string;
                 if (!workflowId) return { fields: [] };
