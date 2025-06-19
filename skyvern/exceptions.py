@@ -163,6 +163,14 @@ class MissingValueForParameter(SkyvernHTTPException):
         )
 
 
+class InvalidCredentialId(SkyvernHTTPException):
+    def __init__(self, credential_id: str) -> None:
+        super().__init__(
+            f"Invalid credential ID: {credential_id}. Failed to resolve to a valid credential.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class WorkflowParameterNotFound(SkyvernHTTPException):
     def __init__(self, workflow_parameter_id: str) -> None:
         super().__init__(

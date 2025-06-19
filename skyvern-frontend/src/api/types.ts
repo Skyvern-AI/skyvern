@@ -294,6 +294,7 @@ export type WorkflowRunStatusApiResponse = {
   total_cost: number | null;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
+  browser_session_id: string | null;
   max_screenshot_scrolling_times: number | null;
 };
 
@@ -343,6 +344,7 @@ export type Createv2TaskRequest = {
   user_prompt: string;
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
+  browser_session_id?: string | null;
 };
 
 export type PasswordCredentialApiResponse = {

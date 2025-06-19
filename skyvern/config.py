@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     ENV: str = "local"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
+    LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
