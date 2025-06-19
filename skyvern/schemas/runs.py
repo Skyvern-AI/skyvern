@@ -271,7 +271,10 @@ class TaskRunRequest(BaseModel):
         description=MODEL_CONFIG,
         examples=None,
     )
-
+    extra_http_headers: dict[str, str] | None = Field(
+        default=None,
+        description="The extra HTTP headers for the requests in browser.",
+    )
     publish_workflow: bool = Field(
         default=False,
         description="Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
@@ -333,6 +336,10 @@ class WorkflowRunRequest(BaseModel):
     max_screenshot_scrolling_times: int | None = Field(
         default=None,
         description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+    )
+    extra_http_headers: dict[str, str] | None = Field(
+        default=None,
+        description="The extra HTTP headers for the requests in browser.",
     )
 
     @field_validator("webhook_url", "totp_url")

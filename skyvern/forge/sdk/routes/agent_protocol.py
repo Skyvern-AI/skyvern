@@ -167,6 +167,7 @@ async def run_task(
             include_action_history_in_verification=run_request.include_action_history_in_verification,
             model=run_request.model,
             max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+            extra_http_headers=run_request.extra_http_headers,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -224,6 +225,7 @@ async def run_task(
                 create_task_run=True,
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+                extra_http_headers=run_request.extra_http_headers,
             )
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -320,9 +322,10 @@ async def run_workflow(
         proxy_location=workflow_run_request.proxy_location,
         webhook_callback_url=workflow_run_request.webhook_url,
         totp_identifier=workflow_run_request.totp_identifier,
-        totp_url=workflow_run_request.totp_url,
+        totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
         max_screenshot_scrolling_times=workflow_run_request.max_screenshot_scrolling_times,
+        extra_http_headers=workflow_run_request.extra_http_headers,
     )
 
     try:
@@ -1822,6 +1825,7 @@ async def run_task_v2(
             error_code_mapping=data.error_code_mapping,
             max_screenshot_scrolling_times=data.max_screenshot_scrolling_times,
             browser_session_id=data.browser_session_id,
+            extra_http_headers=data.extra_http_headers,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
