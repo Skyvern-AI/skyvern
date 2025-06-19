@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg width="32px" height="32px" viewBox="0 0 32 32" version="1.1" xmlns="http://www.w3.org/2000/svg">
-    <title>Skyvern Icon</title>
-    <g stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
-        <path d="M16,2 C23.732,2 30,8.268 30,16 C30,23.732 23.732,30 16,30 C8.268,30 2,23.732 2,16 C2,8.268 8.268,2 16,2 Z" fill="#2B5DE0" fill-rule="nonzero"></path>
-        <path d="M22,10 C22.552,10 23,10.448 23,11 L23,21 C23,21.552 22.552,22 22,22 L10,22 C9.448,22 9,21.552 9,21 L9,11 C9,10.448 9.448,10 10,10 L22,10 Z M21,12 L11,12 L11,20 L21,20 L21,12 Z" fill="#FFFFFF" fill-rule="nonzero"></path>
-        <path d="M16,14 L19,17 L13,17 L16,14 Z" fill="#FFFFFF" fill-rule="nonzero"></path>
-    </g>
-</svg>
