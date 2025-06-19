@@ -121,6 +121,7 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
 
+
 @dataclass(frozen=True)
 class BlockResult:
     success: bool
@@ -2540,8 +2541,10 @@ class TaskV2Block(Block):
         success = task_v2.status == TaskV2Status.completed
         failure_reason = task_v2.failure_reason
 
+        # If continue_on_failure is True, we treat the block as successful even if the task failed
+        # This allows the workflow to continue execution despite this block's failure
         return await self.build_block_result(
-            success=success,
+            success=success or self.continue_on_failure,
             failure_reason=failure_reason,
             output_parameter_value=result_dict,
             status=block_status,
