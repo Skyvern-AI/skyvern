@@ -33,9 +33,7 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
   const [workflowParameters, setWorkflowParameters] =
     useWorkflowParametersState();
   const credentialParameters = workflowParameters.filter(
-    (parameter) =>
-      parameter.parameterType === "credential" ||
-      parameter.parameterType === "onepassword",
+    (parameter) => parameter.parameterType === "credential",
   );
   const credentialInputParameters = workflowParameters.filter(
     (parameter) =>
