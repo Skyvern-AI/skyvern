@@ -30,8 +30,21 @@ jobs:
       - name: Fetch from Upstream
         run: git fetch upstream
 
+      # Backup local README.md before merge
+      - name: Backup local README.md
+        run: |
+          cp README.md README.local.backup.md || true
+
       - name: Merge Upstream
         run: git merge upstream/main -m "Merge upstream changes" || true
+
+      # Restore local README.md after merge
+      - name: Restore local README.md
+        run: |
+          if [ -f README.local.backup.md ]; then
+            mv README.local.backup.md README.md
+            git add README.md
+          fi
 
       # Ensure docker-compose.yml is deleted if it exists
       - name: Ensure docker-compose.yml is deleted
@@ -68,7 +81,7 @@ jobs:
       - name: Commit changes
         run: |
           if ! git diff-index --quiet HEAD; then
-            git commit -m "chore: Sync with upstream and preserve docker-compose.yaml, skyvern-frontend/dockerfile.artifact"
+            git commit -m "chore: Sync with upstream and preserve docker-compose.yaml, skyvern-frontend/dockerfile.artifact, README.md"
           fi
 
       - name: Push changes
