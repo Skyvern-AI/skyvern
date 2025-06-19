@@ -23,6 +23,7 @@ class SkyvernContext:
     hashed_href_map: dict[str, str] = field(default_factory=dict)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
+    max_screenshot_scrolling_times: int | None = None
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override})"

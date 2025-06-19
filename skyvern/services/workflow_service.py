@@ -83,6 +83,9 @@ async def get_workflow_run_response(
         recording_url=workflow_run_resp.recording_url,
         screenshot_urls=workflow_run_resp.screenshot_urls,
         failure_reason=workflow_run_resp.failure_reason,
+        queued_at=workflow_run.queued_at,
+        started_at=workflow_run.started_at,
+        finished_at=workflow_run.finished_at,
         app_url=app_url,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
@@ -94,6 +97,7 @@ async def get_workflow_run_response(
             webhook_url=workflow_run.webhook_callback_url or None,
             totp_url=workflow_run.totp_verification_url or None,
             totp_identifier=workflow_run.totp_identifier,
+            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
             # TODO: add browser session id
         ),
     )

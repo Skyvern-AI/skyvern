@@ -18,3 +18,7 @@ class PersistentBrowserSession(BaseModel):
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+
+
+class AddressablePersistentBrowserSession(PersistentBrowserSession):
+    browser_address: str

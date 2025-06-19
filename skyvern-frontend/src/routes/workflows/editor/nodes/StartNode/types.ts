@@ -9,6 +9,7 @@ export type WorkflowStartNodeData = {
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
+  maxScreenshotScrollingTimes: number | null;
   editable: boolean;
 };
 

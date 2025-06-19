@@ -30,7 +30,7 @@ class TaskV2(BaseModel):
 
     observer_cruise_id: str = Field(alias="task_id")
     status: TaskV2Status
-    organization_id: str | None = None
+    organization_id: str
     workflow_run_id: str | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
@@ -45,6 +45,11 @@ class TaskV2(BaseModel):
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict | None = None
     model: dict[str, Any] | None = None
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    max_screenshot_scrolling_times: int | None = None
+
     created_at: datetime
     modified_at: datetime
 
@@ -99,7 +104,7 @@ class Thought(BaseModel):
 
     observer_thought_id: str = Field(alias="thought_id")
     observer_cruise_id: str = Field(alias="task_id")
-    organization_id: str | None = None
+    organization_id: str
     workflow_run_id: str | None = None
     workflow_run_block_id: str | None = None
     workflow_id: str | None = None
@@ -144,6 +149,7 @@ class TaskV2Request(BaseModel):
     publish_workflow: bool = False
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
+    max_screenshot_scrolling_times: int | None = None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

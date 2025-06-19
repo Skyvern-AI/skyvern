@@ -20,14 +20,14 @@ import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { type ApiCommandOptions } from "@/util/apiCommands";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
-import fetchToCurl from "fetch-to-curl";
 import { useState } from "react";
 import { useForm, useFormState } from "react-hook-form";
 import { Link } from "react-router-dom";
@@ -39,6 +39,7 @@ import {
 } from "./taskFormTypes";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Switch } from "@/components/ui/switch";
+import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
@@ -80,6 +81,7 @@ function createTaskRequestObject(
     extracted_information_schema: extractedInformationSchema,
     totp_identifier: transform(formValues.totpIdentifier),
     error_code_mapping: errorCodeMapping,
+    max_screenshot_scrolling_times: formValues.maxScreenshotScrollingTimes,
     include_action_history_in_verification:
       formValues.includeActionHistoryInVerification,
   };
@@ -114,6 +116,8 @@ function CreateNewTaskForm({ initialValues }: Props) {
       ...initialValues,
       maxStepsOverride: initialValues.maxStepsOverride ?? null,
       proxyLocation: initialValues.proxyLocation ?? ProxyLocation.Residential,
+      maxScreenshotScrollingTimes:
+        initialValues.maxScreenshotScrollingTimes ?? null,
     },
   });
   const { errors } = useFormState({ control: form.control });
@@ -557,6 +561,45 @@ function CreateNewTaskForm({ initialValues }: Props) {
                     );
                   }}
                 />
+                <FormField
+                  control={form.control}
+                  name="maxScreenshotScrollingTimes"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-16">
+                        <FormLabel>
+                          <div className="w-72">
+                            <h1 className="text-lg">
+                              Max Scrolling Screenshots
+                            </h1>
+                            <h2 className="text-base text-slate-400">
+                              {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                            </h2>
+                          </div>
+                        </FormLabel>
+                        <div className="w-full">
+                          <FormControl>
+                            <Input
+                              {...field}
+                              type="number"
+                              min={0}
+                              value={field.value ?? ""}
+                              placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                              onChange={(event) => {
+                                const value =
+                                  event.target.value === ""
+                                    ? null
+                                    : Number(event.target.value);
+                                field.onChange(value);
+                              }}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </div>
+                      </div>
+                    </FormItem>
+                  )}
+                />
                 <Separator />
                 <FormField
                   control={form.control}
@@ -622,11 +665,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
         </TaskFormSection>
 
         <div className="flex justify-end gap-3">
-          <Button
-            type="button"
-            variant="secondary"
-            onClick={async () => {
-              const curl = fetchToCurl({
+          <CopyApiCommandDropdown
+            getOptions={() =>
+              ({
                 method: "POST",
                 url: `${apiBaseUrl}/tasks`,
                 body: createTaskRequestObject(form.getValues()),
@@ -634,18 +675,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
-              });
-              copyText(curl).then(() => {
-                toast({
-                  title: "Copied cURL",
-                  description: "cURL copied to clipboard",
-                });
-              });
-            }}
-          >
-            <CopyIcon className="mr-2 h-4 w-4" />
-            cURL
-          </Button>
+              }) satisfies ApiCommandOptions
+            }
+          />
           <Button type="submit" disabled={mutation.isPending}>
             {mutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />

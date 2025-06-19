@@ -14,6 +14,7 @@ import {
 import { ObserverThoughtScreenshot } from "./ObserverThoughtScreenshot";
 import { WorkflowRunBlockScreenshot } from "./WorkflowRunBlockScreenshot";
 import { WorkflowRunStream } from "./WorkflowRunStream";
+import { WorkflowRunStreamVnc } from "./WorkflowRunStreamVnc";
 import { useSearchParams } from "react-router-dom";
 import { findActiveItem } from "./workflowTimelineUtils";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -62,9 +63,15 @@ function WorkflowRunOverview() {
     workflowRunIsFinalized,
   );
 
+  const streamingComponent = workflowRun.browser_session_id ? (
+    <WorkflowRunStreamVnc />
+  ) : (
+    <WorkflowRunStream />
+  );
+
   return (
-    <AspectRatio ratio={16 / 9} className="overflow-y-hidden">
-      {selection === "stream" && <WorkflowRunStream />}
+    <AspectRatio ratio={16 / 9}>
+      {selection === "stream" && streamingComponent}
       {selection !== "stream" && isAction(selection) && (
         <ActionScreenshot
           index={selection.action_order ?? 0}

@@ -11,6 +11,7 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
     FailedToSendWebhook,
+    InvalidCredentialId,
     MissingValueForParameter,
     SkyvernException,
     WorkflowNotFound,
@@ -68,6 +69,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenSensitiveInformationParameter,
     ContextParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -98,6 +100,30 @@ LOG = structlog.get_logger()
 
 
 class WorkflowService:
+    @staticmethod
+    def _collect_extracted_information(value: Any) -> list[Any]:
+        """Recursively collect extracted_information values from nested outputs."""
+        results: list[Any] = []
+        if isinstance(value, dict):
+            if "extracted_information" in value and value["extracted_information"] is not None:
+                extracted = value["extracted_information"]
+                if isinstance(extracted, list):
+                    results.extend(extracted)
+                else:
+                    results.append(extracted)
+            else:
+                for v in value.values():
+                    results.extend(WorkflowService._collect_extracted_information(v))
+        elif isinstance(value, list):
+            for item in value:
+                results.extend(WorkflowService._collect_extracted_information(item))
+        return results
+
+    async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
+        credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        if credential is None:
+            raise InvalidCredentialId(credential_id)
+
     async def setup_workflow_run(
         self,
         request_id: str | None,
@@ -149,6 +175,7 @@ class WorkflowService:
             organization_id=workflow.organization_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
         )
         skyvern_context.set(
             SkyvernContext(
@@ -158,6 +185,7 @@ class WorkflowService:
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
                 max_steps_override=max_steps_override,
+                max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
             )
         )
 
@@ -167,12 +195,16 @@ class WorkflowService:
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                        await self._validate_credential_id(str(request_body_value), organization)
                     await self.create_workflow_run_parameter(
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_parameter=workflow_parameter,
                         value=request_body_value,
                     )
                 elif workflow_parameter.default_value is not None:
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                        await self._validate_credential_id(str(workflow_parameter.default_value), organization)
                     await self.create_workflow_run_parameter(
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_parameter=workflow_parameter,
@@ -198,6 +230,14 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
             )
             raise e
+
+        if workflow_request.browser_session_id:
+            await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                browser_session_id=workflow_request.browser_session_id,
+                runnable_type="workflow_run",
+                runnable_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+            )
 
         return workflow_run
 
@@ -239,6 +279,7 @@ class WorkflowService:
                     BitwardenLoginCredentialParameter,
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
+                    OnePasswordCredentialParameter,
                     CredentialParameter,
                 ),
             )
@@ -548,6 +589,7 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition,
         description: str | None = None,
         proxy_location: ProxyLocation | None = None,
+        max_screenshot_scrolling_times: int | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -565,6 +607,7 @@ class WorkflowService:
             description=description,
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
@@ -738,6 +781,7 @@ class WorkflowService:
             totp_verification_url=workflow_request.totp_verification_url,
             totp_identifier=workflow_request.totp_identifier,
             parent_workflow_run_id=parent_workflow_run_id,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
         )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str) -> WorkflowRun:
@@ -880,6 +924,22 @@ class WorkflowService:
             workflow_id=workflow_id,
             key=key,
             credential_id=credential_id,
+            description=description,
+        )
+
+    async def create_onepassword_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        vault_id: str,
+        item_id: str,
+        description: str | None = None,
+    ) -> OnePasswordCredentialParameter:
+        return await app.DATABASE.create_onepassword_credential_parameter(
+            workflow_id=workflow_id,
+            key=key,
+            vault_id=vault_id,
+            item_id=item_id,
             description=description,
         )
 
@@ -1091,14 +1151,10 @@ class WorkflowService:
         EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
-            extracted_information = {
-                output_parameter.key: output.value[EXTRACTED_INFORMATION_KEY]
-                for output_parameter, output in output_parameter_tuples
-                if output.value is not None
-                and isinstance(output.value, dict)
-                and EXTRACTED_INFORMATION_KEY in output.value
-                and output.value[EXTRACTED_INFORMATION_KEY] is not None
-            }
+            extracted_information: list[Any] = []
+            for _, output in output_parameter_tuples:
+                if output.value is not None:
+                    extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
         total_steps = None
@@ -1125,6 +1181,9 @@ class WorkflowService:
             webhook_callback_url=workflow_run.webhook_callback_url,
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
+            queued_at=workflow_run.queued_at,
+            started_at=workflow_run.started_at,
+            finished_at=workflow_run.finished_at,
             created_at=workflow_run.created_at,
             modified_at=workflow_run.modified_at,
             parameters=parameters_with_value,
@@ -1136,6 +1195,7 @@ class WorkflowService:
             total_steps=total_steps,
             total_cost=total_cost,
             workflow_title=workflow.title,
+            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
         )
 
     async def clean_up_workflow(
@@ -1409,6 +1469,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -1426,6 +1487,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                 )
@@ -1486,6 +1548,14 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                         credential_id=parameter.credential_id,
+                    )
+                elif parameter.parameter_type == ParameterType.ONEPASSWORD:
+                    parameters[parameter.key] = await self.create_onepassword_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        vault_id=parameter.vault_id,
+                        item_id=parameter.item_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:

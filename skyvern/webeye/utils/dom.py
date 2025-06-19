@@ -11,7 +11,7 @@ import structlog
 from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_ID_ATTR
+from skyvern.constants import SKYVERN_ID_ATTR, TEXT_INPUT_DELAY
 from skyvern.exceptions import (
     ElementIsNotLabel,
     InteractWithDisabledElement,
@@ -24,19 +24,15 @@ from skyvern.exceptions import (
     NoneFrameError,
     SkyvernException,
 )
+from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
-TEXT_INPUT_DELAY = 10  # 10ms between each character input
-TEXT_PRESS_MAX_LENGTH = 20
 
-
-async def resolve_locator(
-    scrape_page: ScrapedPage, page: Page, frame: str, css: str
-) -> typing.Tuple[Locator, Page | Frame]:
+async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> tuple[Locator, Page | Frame]:
     iframe_path: list[str] = []
 
     while frame != "main.frame":
@@ -335,10 +331,10 @@ class SkyvernElement:
     def get_frame_id(self) -> str:
         return self._frame_id
 
-    def get_attributes(self) -> typing.Dict:
+    def get_attributes(self) -> dict:
         return self._attributes
 
-    def get_options(self) -> typing.List[SkyvernOptionType]:
+    def get_options(self) -> list[SkyvernOptionType]:
         options = self.__static_element.get("options", None)
         if options is None:
             return []
@@ -576,14 +572,7 @@ class SkyvernElement:
         await self.get_locator().focus(timeout=timeout)
 
     async def input_sequentially(self, text: str, default_timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        length = len(text)
-        if length > TEXT_PRESS_MAX_LENGTH:
-            # if the text is longer than TEXT_PRESS_MAX_LENGTH characters, we will locator.fill in initial texts until the last TEXT_PRESS_MAX_LENGTH characters
-            # and then type the last TEXT_PRESS_MAX_LENGTH characters with locator.press_sequentially
-            await self.input_fill(text[: length - TEXT_PRESS_MAX_LENGTH])
-            text = text[length - TEXT_PRESS_MAX_LENGTH :]
-
-        await self.press_fill(text, timeout=default_timeout)
+        await handler_utils.input_sequentially(self.get_locator(), text, timeout=default_timeout)
 
     async def press_key(self, key: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().press(key=key, timeout=timeout)

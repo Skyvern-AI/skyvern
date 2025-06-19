@@ -141,6 +141,7 @@ export type CreateTaskRequest = {
   totp_identifier?: string | null;
   application?: string | null;
   include_action_history_in_verification?: boolean | null;
+  max_screenshot_scrolling_times?: number | null;
 };
 
 export type User = {
@@ -293,6 +294,8 @@ export type WorkflowRunStatusApiResponse = {
   total_cost: number | null;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
+  browser_session_id: string | null;
+  max_screenshot_scrolling_times: number | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -341,6 +344,7 @@ export type Createv2TaskRequest = {
   user_prompt: string;
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
+  browser_session_id?: string | null;
 };
 
 export type PasswordCredentialApiResponse = {
