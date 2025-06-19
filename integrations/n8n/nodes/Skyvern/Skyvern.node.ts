@@ -40,8 +40,8 @@ export class Skyvern implements INodeType {
         defaults: {
             name: 'Skyvern',
         },
-        inputs: [NodeConnectionType.Main],
-        outputs: [NodeConnectionType.Main],
+        inputs: ['main' as NodeConnectionType[] & any],
+        outputs: ['main' as NodeConnectionType[] & any],
         credentials: [
             {
                 name: 'skyvernApi',
@@ -72,11 +72,11 @@ export class Skyvern implements INodeType {
                 type: 'options',
                 noDataExpression: true,
                 required: true,
-                default: 'dispatch',
+                default: 'dispatchTask',
                 options: [
                     {
                         name: 'Dispatch a Task',
-                        value: 'dispatch',
+                        value: 'dispatchTask',
                         action: 'Dispatch a task to execute asynchronously',
                         description: 'Dispatch a task to execute asynchronously',
                         displayOptions: {
@@ -111,7 +111,7 @@ export class Skyvern implements INodeType {
                     },
                     {
                         name: 'Get a Task',
-                        value: 'get',
+                        value: 'getTask',
                         action: 'Get a task by ID',
                         description: 'Get a task by ID',
                         displayOptions: {
@@ -146,7 +146,7 @@ export class Skyvern implements INodeType {
                     },
                     {
                         name: 'Dispatch a Workflow Run',
-                        value: 'dispatch',
+                        value: 'dispatchWorkflow',
                         action: 'Dispatch a workflow run to execute asynchronously',
                         description: 'Dispatch a workflow run to execute asynchronously',
                         displayOptions: {
