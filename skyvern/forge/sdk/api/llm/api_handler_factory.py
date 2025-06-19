@@ -586,15 +586,16 @@ class LLMCaller:
                         tool["display_width_px"] = target_dimension["width"]
             screenshots = resize_screenshots(screenshots, target_dimension)
 
-        await app.ARTIFACT_MANAGER.create_llm_artifact(
-            data=prompt.encode("utf-8") if prompt else b"",
-            artifact_type=ArtifactType.LLM_PROMPT,
-            screenshots=screenshots,
-            step=step,
-            task_v2=task_v2,
-            thought=thought,
-            ai_suggestion=ai_suggestion,
-        )
+        if prompt:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=prompt.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_PROMPT,
+                screenshots=screenshots,
+                step=step,
+                task_v2=task_v2,
+                thought=thought,
+                ai_suggestion=ai_suggestion,
+            )
 
         if not self.llm_config.supports_vision:
             screenshots = None

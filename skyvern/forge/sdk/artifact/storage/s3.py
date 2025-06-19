@@ -186,13 +186,12 @@ class S3Storage(BaseStorage):
         files = os.listdir(download_dir)
         sc = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
+        base_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue
-            uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}/{file}"
-
-            # Calculate SHA-256 checksum
+            uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
             LOG.info(
                 "Calculated checksum for file",

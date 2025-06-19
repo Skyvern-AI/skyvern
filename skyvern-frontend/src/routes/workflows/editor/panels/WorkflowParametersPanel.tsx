@@ -155,7 +155,7 @@ function WorkflowParametersPanel() {
                             parameter: parameter,
                             type:
                               parameter.parameterType === "onepassword"
-                                ? WorkflowEditorParameterTypes.OnePassword
+                                ? WorkflowEditorParameterTypes.Credential
                                 : parameter.parameterType,
                           });
                         }}
