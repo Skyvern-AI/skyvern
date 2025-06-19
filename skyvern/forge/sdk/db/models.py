@@ -177,7 +177,10 @@ class OrganizationAuthTokenModel(Base):
 
 class ArtifactModel(Base):
     __tablename__ = "artifacts"
-    __table_args__ = (Index("org_task_step_index", "organization_id", "task_id", "step_id"),)
+    __table_args__ = (
+        Index("org_task_step_index", "organization_id", "task_id", "step_id"),
+        Index("artifacts_org_created_at_index", "organization_id", "created_at"),
+    )
 
     artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
