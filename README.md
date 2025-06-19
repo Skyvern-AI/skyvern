@@ -1,12 +1,12 @@
 # Skyvern-Coolify
 
-This repository is a **fork** of the upstream [Skyvern](https://github.com/skyvern-ai/skyvern) project, purpose-built for seamless deployment on [Coolify](https://coolify.io/). 
+This repository is a **fork** of the upstream [Skyvern](https://github.com/skyvern-ai/skyvern) project, for seamless(ish) deployment on [Coolify](https://coolify.io/). 
 
 ---
 
 ## 🚀 About This Fork
 
-While retaining all of the power of the original Skyvern, this fork introduces several key changes to optimize for Coolify deployments and advanced production use-cases:
+This fork introduces several key changes to optimize for Coolify deployments. It *should* sync unmodified files with the upstream repo nightly. Very much a work-in-progress.
 
 ### Core Differences with Upstream
 
@@ -75,7 +75,7 @@ For each service (`skyvern`, `artifact-server`, `skyvern-ui`):
 - In the Coolify UI, set the required environment variables:
   - `COOLIFY_FQDN` (e.g., `mydomain.com`)
   - All `VITE_*` variables as shown above
-  - Any required LLM API keys or toggles
+  - Any required LLM API keys or toggles -- see comments in docker-compose.yaml for environment variables and values correspsonding to your setup and add in the UI as needed. 
 - Ensure ports are mapped as needed (defaults: 8001 for `skyvern`, 8081 for `skyvern-ui`, 9090 for `artifact-server`).
 
 ### 5. **Deploy**
