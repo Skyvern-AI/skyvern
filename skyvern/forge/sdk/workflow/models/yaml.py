@@ -425,4 +425,5 @@ class WorkflowCreateYAMLRequest(BaseModel):
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
     max_screenshot_scrolling_times: int | None = None
+    extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published

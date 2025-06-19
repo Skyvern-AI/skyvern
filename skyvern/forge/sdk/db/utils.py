@@ -130,6 +130,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         organization_id=task_obj.organization_id,
         proxy_location=(ProxyLocation(task_obj.proxy_location) if task_obj.proxy_location else None),
         extracted_information_schema=task_obj.extracted_information_schema,
+        extra_http_headers=task_obj.extra_http_headers,
         workflow_run_id=task_obj.workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
@@ -248,6 +249,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         modified_at=workflow_model.modified_at,
         deleted_at=workflow_model.deleted_at,
         status=WorkflowStatus(workflow_model.status),
+        extra_http_headers=workflow_model.extra_http_headers,
     )
 
 
@@ -281,6 +283,7 @@ def convert_to_workflow_run(
         modified_at=workflow_run_model.modified_at,
         workflow_title=workflow_title,
         max_screenshot_scrolling_times=workflow_run_model.max_screenshot_scrolling_times,
+        extra_http_headers=workflow_run_model.extra_http_headers,
     )
 
 
