@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
+from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -1089,7 +1089,7 @@ class AgentDB:
     async def get_artifacts_by_entity_id(
         self,
         *,
-        organization_id: str,
+        organization_id: str | None,
         artifact_type: ArtifactType | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
@@ -1098,8 +1098,10 @@ class AgentDB:
         thought_id: str | None = None,
         task_v2_id: str | None = None,
     ) -> list[Artifact]:
+
         try:
             async with self.Session() as session:
+                # Build base query
                 query = select(ArtifactModel)
 
                 if artifact_type is not None:
@@ -1116,14 +1118,17 @@ class AgentDB:
                     query = query.filter_by(observer_thought_id=thought_id)
                 if task_v2_id is not None:
                     query = query.filter_by(observer_cruise_id=task_v2_id)
+                # Handle backward compatibility where old artifact rows were stored with organization_id NULL
                 if organization_id is not None:
-                    query = query.filter_by(organization_id=organization_id)
+                    query = query.filter(
+                        or_(ArtifactModel.organization_id == organization_id, ArtifactModel.organization_id.is_(None))
+                    )
 
                 query = query.order_by(ArtifactModel.created_at.desc())
-                if artifacts := (await session.scalars(query)).all():
-                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
-                else:
-                    return []
+
+                artifacts = (await session.scalars(query)).all()
+                LOG.debug("Artifacts fetched", count=len(artifacts))
+                return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
