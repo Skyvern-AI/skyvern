@@ -184,6 +184,7 @@ class ForgeAgent:
             include_action_history_in_verification=task_block.include_action_history_in_verification,
             model=task_block.model,
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
+            extra_http_headers=workflow_run.extra_http_headers,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -241,6 +242,7 @@ class ForgeAgent:
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolling_times,
+            extra_http_headers=task_request.extra_http_headers,
         )
         LOG.info(
             "Created new task",

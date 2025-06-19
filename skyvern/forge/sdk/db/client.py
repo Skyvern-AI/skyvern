@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -150,6 +150,7 @@ class AgentDB:
         include_action_history_in_verification: bool | None = None,
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -178,6 +179,7 @@ class AgentDB:
                     include_action_history_in_verification=include_action_history_in_verification,
                     model=model,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                    extra_http_headers=extra_http_headers,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -1089,7 +1091,7 @@ class AgentDB:
     async def get_artifacts_by_entity_id(
         self,
         *,
-        organization_id: str | None,
+        organization_id: str,
         artifact_type: ArtifactType | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
@@ -1100,7 +1102,6 @@ class AgentDB:
     ) -> list[Artifact]:
         try:
             async with self.Session() as session:
-                # Build base query
                 query = select(ArtifactModel)
 
                 if artifact_type is not None:
@@ -1117,17 +1118,14 @@ class AgentDB:
                     query = query.filter_by(observer_thought_id=thought_id)
                 if task_v2_id is not None:
                     query = query.filter_by(observer_cruise_id=task_v2_id)
-                # Handle backward compatibility where old artifact rows were stored with organization_id NULL
                 if organization_id is not None:
-                    query = query.filter(
-                        or_(ArtifactModel.organization_id == organization_id, ArtifactModel.organization_id.is_(None))
-                    )
+                    query = query.filter_by(organization_id=organization_id)
 
                 query = query.order_by(ArtifactModel.created_at.desc())
-
-                artifacts = (await session.scalars(query)).all()
-                LOG.debug("Artifacts fetched", count=len(artifacts))
-                return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
+                if artifacts := (await session.scalars(query)).all():
+                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
+                else:
+                    return []
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1300,6 +1298,7 @@ class AgentDB:
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
@@ -1320,6 +1319,7 @@ class AgentDB:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                extra_http_headers=extra_http_headers,
                 persist_browser_session=persist_browser_session,
                 model=model,
                 is_saved_task=is_saved_task,
@@ -1564,6 +1564,7 @@ class AgentDB:
         totp_identifier: str | None = None,
         parent_workflow_run_id: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1578,6 +1579,7 @@ class AgentDB:
                     totp_identifier=totp_identifier,
                     parent_workflow_run_id=parent_workflow_run_id,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                    extra_http_headers=extra_http_headers,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -2523,6 +2525,7 @@ class AgentDB:
         error_code_mapping: dict | None = None,
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2540,6 +2543,7 @@ class AgentDB:
                 organization_id=organization_id,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                extra_http_headers=extra_http_headers,
             )
             session.add(new_task_v2)
             await session.commit()

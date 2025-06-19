@@ -49,6 +49,7 @@ class TaskV2(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     max_screenshot_scrolling_times: int | None = None
+    extra_http_headers: dict[str, str] | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -150,6 +151,7 @@ class TaskV2Request(BaseModel):
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_screenshot_scrolling_times: int | None = None
+    extra_http_headers: dict[str, str] | None = None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
