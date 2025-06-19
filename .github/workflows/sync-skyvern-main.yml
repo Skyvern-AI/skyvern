@@ -1,5 +1,3 @@
-# .github/workflows/sync-skyvern-main.yml
-
 name: Sync with Main
 
 on:
@@ -59,19 +57,18 @@ jobs:
             git rm -f .github/workflows/sync-skyvern-cloud.yml
           fi
 
-      # (REMOVED) Restore local frontend/package.json step
-
-      # Restore frontend/dockerfile.artifact if missing
-      - name: Restore frontend/dockerfile.artifact if missing
+      # Restore skyvern-frontend/dockerfile.artifact if missing
+      - name: Restore skyvern-frontend/dockerfile.artifact if missing
         run: |
-          if [ ! -f frontend/dockerfile.artifact ]; then
-            git checkout origin/main -- frontend/dockerfile.artifact || touch frontend/dockerfile.artifact
+          mkdir -p skyvern-frontend
+          if [ ! -f skyvern-frontend/dockerfile.artifact ]; then
+            git checkout origin/main -- skyvern-frontend/dockerfile.artifact || touch skyvern-frontend/dockerfile.artifact
           fi
 
       - name: Commit changes
         run: |
           if ! git diff-index --quiet HEAD; then
-            git commit -m "chore: Sync with upstream and preserve docker-compose.yaml, frontend/package.json, and dockerfile.artifact"
+            git commit -m "chore: Sync with upstream and preserve docker-compose.yaml, skyvern-frontend/dockerfile.artifact"
           fi
 
       - name: Push changes
