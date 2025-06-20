@@ -37,6 +37,7 @@ import {
   Taskv2BlockYAML,
   URLBlockYAML,
   FileUploadBlockYAML,
+  HttpRequestBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -99,6 +100,7 @@ import {
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
+import { httpRequestNodeDefaultData } from "./nodes/HttpRequestNode/types";
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
@@ -505,12 +507,12 @@ function convertToNode(
         type: "fileUpload",
         data: {
           ...commonData,
-          path: block.path,
-          storageType: block.storage_type,
-          s3Bucket: block.s3_bucket,
-          awsAccessKeyId: block.aws_access_key_id,
-          awsSecretAccessKey: block.aws_secret_access_key,
-          regionName: block.region_name,
+          path: block.path ?? "",
+          storageType: block.storage_type ?? "s3",
+          s3Bucket: block.s3_bucket ?? "",
+          regionName: block.region_name ?? "",
+          awsAccessKeyId: block.aws_access_key_id ?? "",
+          awsSecretAccessKey: block.aws_secret_access_key ?? "",
         },
       };
     }
@@ -523,6 +525,26 @@ function convertToNode(
         data: {
           ...commonData,
           url: block.url,
+        },
+      };
+    }
+
+    case "http_request": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "httpRequest",
+        data: {
+          ...commonData,
+          curlCommand: block.curl_command,
+          method: block.method,
+          url: block.url,
+          headers: block.headers,
+          body: block.body,
+          timeout: block.timeout,
+          followRedirects: block.follow_redirects,
+          parameterKeys: block.parameters.map((p) => p.key),
+          inputMode: block.curl_command ? "curl" : "manual",
         },
       };
     }
@@ -947,6 +969,17 @@ function createNode(
         },
       };
     }
+    case "httpRequest": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "httpRequest",
+        data: {
+          ...httpRequestNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -969,8 +1002,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "task",
-        url: node.data.url,
         title: node.data.label,
+        url: node.data.url,
         navigation_goal: node.data.navigationGoal,
         data_extraction_goal: node.data.dataExtractionGoal,
         complete_criterion: node.data.completeCriterion,
@@ -1141,51 +1174,56 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         engine: node.data.engine,
       };
     }
-    case "sendEmail": {
-      return {
+    case "loop": {
+      // Note: loop blocks are handled separately by getOrderedChildrenBlocks
+      const blockYaml: ForLoopBlockYAML = {
         ...base,
-        block_type: "send_email",
-        body: node.data.body,
-        file_attachments: node.data.fileAttachments
-          .split(",")
-          .map((attachment) => attachment.trim()),
-        recipients: node.data.recipients
-          .split(",")
-          .map((recipient) => recipient.trim()),
-        subject: node.data.subject,
-        sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
-        smtp_host_secret_parameter_key: node.data.smtpHostSecretParameterKey,
-        smtp_port_secret_parameter_key: node.data.smtpPortSecretParameterKey,
-        smtp_username_secret_parameter_key:
-          node.data.smtpUsernameSecretParameterKey,
-        smtp_password_secret_parameter_key:
-          node.data.smtpPasswordSecretParameterKey,
+        block_type: "for_loop",
+        loop_over_parameter_key: node.data.loopValue,
+        loop_blocks: [], // This should be populated by getOrderedChildrenBlocks
+        loop_variable_reference: node.data.loopVariableReference,
+        complete_if_empty: node.data.completeIfEmpty,
       };
+      return blockYaml;
     }
     case "codeBlock": {
-      return {
+      const blockYaml: CodeBlockYAML = {
         ...base,
         block_type: "code",
-        parameter_keys: node.data.parameterKeys,
         code: node.data.code,
+        parameter_keys: node.data.parameterKeys,
       };
+      return blockYaml;
+    }
+    case "textPrompt": {
+      const blockYaml: TextPromptBlockYAML = {
+        ...base,
+        block_type: "text_prompt",
+        llm_key: "",
+        prompt: node.data.prompt,
+        json_schema: JSONParseSafe(node.data.jsonSchema),
+        parameter_keys: node.data.parameterKeys,
+      };
+      return blockYaml;
     }
     case "download": {
-      return {
+      const blockYaml: DownloadToS3BlockYAML = {
         ...base,
         block_type: "download_to_s3",
         url: node.data.url,
       };
+      return blockYaml;
     }
     case "upload": {
-      return {
+      const blockYaml: UploadToS3BlockYAML = {
         ...base,
         block_type: "upload_to_s3",
         path: node.data.path,
       };
+      return blockYaml;
     }
     case "fileUpload": {
-      return {
+      const blockYaml: FileUploadBlockYAML = {
         ...base,
         block_type: "file_upload",
         path: node.data.path,
@@ -1195,38 +1233,72 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         aws_secret_access_key: node.data.awsSecretAccessKey,
         region_name: node.data.regionName,
       };
+      return blockYaml;
     }
     case "fileParser": {
-      return {
+      const blockYaml: FileUrlParserBlockYAML = {
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
         file_type: "csv",
       };
-    }
-    case "textPrompt": {
-      return {
-        ...base,
-        block_type: "text_prompt",
-        llm_key: "",
-        prompt: node.data.prompt,
-        json_schema: JSONParseSafe(node.data.jsonSchema),
-        parameter_keys: node.data.parameterKeys,
-      };
+      return blockYaml;
     }
     case "pdfParser": {
-      return {
+      const blockYaml: PDFParserBlockYAML = {
         ...base,
         block_type: "pdf_parser",
         file_url: node.data.fileUrl,
         json_schema: JSONParseSafe(node.data.jsonSchema),
       };
+      return blockYaml;
+    }
+    case "sendEmail": {
+      const blockYaml: SendEmailBlockYAML = {
+        ...base,
+        block_type: "send_email",
+        body: node.data.body,
+        file_attachments: Array.isArray(node.data.fileAttachments)
+          ? node.data.fileAttachments
+          : node.data.fileAttachments
+              .split(",")
+              .map((attachment: string) => attachment.trim()),
+        recipients: Array.isArray(node.data.recipients)
+          ? node.data.recipients
+          : node.data.recipients
+              .split(",")
+              .map((recipient: string) => recipient.trim()),
+        subject: node.data.subject,
+        sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
+        smtp_host_secret_parameter_key: node.data.smtpHostSecretParameterKey,
+        smtp_port_secret_parameter_key: node.data.smtpPortSecretParameterKey,
+        smtp_username_secret_parameter_key:
+          node.data.smtpUsernameSecretParameterKey,
+        smtp_password_secret_parameter_key:
+          node.data.smtpPasswordSecretParameterKey,
+      };
+      return blockYaml;
     }
     case "url": {
-      return {
+      const blockYaml: URLBlockYAML = {
         ...base,
         block_type: "goto_url",
         url: node.data.url,
+      };
+      return blockYaml;
+    }
+    case "httpRequest": {
+      return {
+        ...base,
+        block_type: "http_request",
+        curl_command: node.data.curlCommand,
+        method: node.data.method,
+        url: node.data.url,
+        headers: node.data.headers,
+        body: node.data.body,
+        timeout: node.data.timeout,
+        follow_redirects: node.data.followRedirects,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     default: {
@@ -1842,8 +1914,8 @@ function convertBlocksToBlockYAML(
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: block.parameters.map((p) => p.key),
-          totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
+          totp_identifier: block.totp_identifier,
           cache_actions: block.cache_actions,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
@@ -1869,10 +1941,10 @@ function convertBlocksToBlockYAML(
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
-          download_suffix: block.download_suffix,
           parameter_keys: block.parameters.map((p) => p.key),
-          totp_identifier: block.totp_identifier,
+          download_suffix: block.download_suffix,
           totp_verification_url: block.totp_verification_url,
+          totp_identifier: block.totp_identifier,
           cache_actions: block.cache_actions,
           engine: block.engine,
         };
@@ -1893,8 +1965,8 @@ function convertBlocksToBlockYAML(
         const blockYaml: CodeBlockYAML = {
           ...base,
           block_type: "code",
-          code: block.code,
           parameter_keys: block.parameters.map((p) => p.key),
+          code: block.code,
         };
         return blockYaml;
       }
@@ -1957,18 +2029,41 @@ function convertBlocksToBlockYAML(
         return blockYaml;
       }
       case "send_email": {
+        // Handle file_attachments - ensure it's an array
+        let fileAttachments: string[] = [];
+        if (Array.isArray(block.file_attachments)) {
+          fileAttachments = block.file_attachments;
+        } else if (
+          typeof block.file_attachments === "string" &&
+          block.file_attachments
+        ) {
+          fileAttachments = (block.file_attachments as string)
+            .split(",")
+            .map((attachment: string) => attachment.trim());
+        }
+
+        // Handle recipients - ensure it's an array
+        let recipients: string[] = [];
+        if (Array.isArray(block.recipients)) {
+          recipients = block.recipients;
+        } else if (typeof block.recipients === "string" && block.recipients) {
+          recipients = (block.recipients as string)
+            .split(",")
+            .map((recipient: string) => recipient.trim());
+        }
+
         const blockYaml: SendEmailBlockYAML = {
           ...base,
           block_type: "send_email",
+          body: block.body,
+          file_attachments: fileAttachments,
+          recipients: recipients,
+          subject: block.subject,
+          sender: block.sender === "" ? EMAIL_BLOCK_SENDER : block.sender,
           smtp_host_secret_parameter_key: block.smtp_host?.key,
           smtp_port_secret_parameter_key: block.smtp_port?.key,
           smtp_username_secret_parameter_key: block.smtp_username?.key,
           smtp_password_secret_parameter_key: block.smtp_password?.key,
-          sender: block.sender,
-          recipients: block.recipients,
-          subject: block.subject,
-          body: block.body,
-          file_attachments: block.file_attachments,
         };
         return blockYaml;
       }
@@ -1979,6 +2074,26 @@ function convertBlocksToBlockYAML(
           url: block.url,
         };
         return blockYaml;
+      }
+      case "http_request": {
+        const blockYaml: HttpRequestBlockYAML = {
+          ...base,
+          block_type: "http_request",
+          curl_command: block.curl_command,
+          method: block.method,
+          url: block.url,
+          headers: block.headers,
+          body: block.body,
+          timeout: block.timeout,
+          follow_redirects: block.follow_redirects,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      default: {
+        throw new Error(
+          `Unhandled block type: ${(block as WorkflowBlock).block_type}`,
+        );
       }
     }
   });
