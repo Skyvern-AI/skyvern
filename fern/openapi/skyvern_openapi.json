@@ -815,6 +815,114 @@
         "x-fern-sdk-method-name": "get_artifact"
       }
     },
+    "/v1/runs/{run_id}/artifacts": {
+      "get": {
+        "tags": [
+          "Artifacts"
+        ],
+        "summary": "Get artifacts for a run",
+        "description": "Get artifacts for a run",
+        "operationId": "get_run_artifacts_v1_runs__run_id__artifacts_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the task run or the workflow run.",
+              "examples": [
+                "tsk_123",
+                "tsk_v2_123",
+                "wr_123"
+              ],
+              "title": "Run Id"
+            },
+            "description": "The id of the task run or the workflow run."
+          },
+          {
+            "name": "artifact_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/ArtifactType"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Artifact Type",
+              "description": "Optional list of artifact types to filter by"
+            },
+            "description": "Optional list of artifact types to filter by"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved artifacts for run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Artifact"
+                  },
+                  "title": "Response Get Run Artifacts V1 Runs  Run Id  Artifacts Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_run_artifacts",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nartifacts = await skyvern.artifacts.get_run_artifacts(run_id=\"tsk_v2_123\")\nprint(artifacts)\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/runs/{run_id}/retry_webhook": {
       "post": {
         "tags": [

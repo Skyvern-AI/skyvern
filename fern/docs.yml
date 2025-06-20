@@ -78,6 +78,8 @@ navigation:
             path: running-tasks/run-tasks.mdx
           - page: Visualizing Results
             path: running-tasks/visualizing-results.mdx
+          - page: Artifacts
+            path: running-tasks/artifacts.mdx
           - page: Cancel Task Runs
             path: running-tasks/cancel-runs.mdx
           - page: Webhooks FAQ
@@ -171,6 +173,7 @@ navigation:
           - section: Artifacts
             contents:
               - GET /v1/artifacts/{artifact_id}
+              - GET /v1/runs/{run_id}/artifacts
           - section: Browser Session
             contents:
               - GET /v1/browser_sessions

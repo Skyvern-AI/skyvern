@@ -1,0 +1,136 @@
+---
+title: Artifacts
+subtitle: Understanding and retrieving Skyvern artifacts through the API
+slug: running-tasks/artifacts
+---
+
+## What are Artifacts?
+
+Artifacts are files and data generated during the execution of Skyvern tasks and workflows. They provide valuable insights into what happened during a run and can be used for debugging, auditing, or extracting additional information from your automation runs.
+
+## Types of Artifacts
+
+Skyvern generates several types of artifacts during execution:
+
+### Visual Artifacts
+- **Screenshots**: Captures of the browser state at different points during execution
+  - `screenshot_llm`: Screenshots sent to the LLM for decision making
+  - `screenshot_action`: Screenshots taken before/after actions
+  - `screenshot_final`: Final screenshot of the completed task
+- **Recordings**: Video recordings of the entire task execution (`recording`)
+
+### Debug and Analysis Artifacts
+- **HTML Snapshots**: The raw HTML of pages during execution (`html_scrape`, `html_action`)
+- **Element Trees**: Structured representation of page elements (`visible_elements_tree`)
+- **Browser Logs**: Console logs from the browser (`browser_console_log`)
+- **HAR Files**: Network activity logs (`har`)
+
+### AI and LLM Artifacts
+- **LLM Requests**: The prompts sent to language models (`llm_request`)
+- **LLM Responses**: Raw responses from language models (`llm_response`)
+- **LLM Parsed Responses**: Structured data extracted from LLM responses (`llm_response_parsed`)
+
+### Debugging Artifacts
+- **Skyvern Logs**: Internal Skyvern execution logs (`skyvern_log`)
+- **Trace Data**: Detailed execution traces for debugging (`trace`)
+
+## Retrieving Artifacts
+
+### Get Artifacts for a Run
+
+Retrieve all artifacts associated with a specific task run or workflow run:
+
+```python
+from skyvern import Skyvern
+
+client = Skyvern(api_key="YOUR_API_KEY")
+
+# Get all artifacts for a run
+artifacts = await client.artifacts.get_run_artifacts(run_id="tsk_v2_123")
+
+# Filter by specific artifact types
+screenshot_artifacts = await client.artifacts.get_run_artifacts(
+    run_id="tsk_v2_123",
+    artifact_type=["screenshot_llm", "screenshot_action"]
+)
+```
+
+### Get a Specific Artifact
+
+Retrieve a specific artifact by its ID:
+
+```python
+# Get a specific artifact
+artifact = await client.artifacts.get_artifact(artifact_id="artifact_123")
+
+# The artifact object contains metadata and a signed URL for downloading
+print(f"Artifact Type: {artifact.artifact_type}")
+print(f"Download URL: {artifact.signed_url}")
+print(f"Created: {artifact.created_at}")
+```
+
+## Artifact Object Structure
+
+Each artifact contains the following information:
+
+```json
+{
+  "artifact_id": "art_123456",
+  "artifact_type": "screenshot_llm",
+  "uri": "s3://bucket/path/to/artifact",
+  "signed_url": "https://presigned-url-for-download",
+  "task_id": "tsk_123",
+  "step_id": "step_456", 
+  "workflow_run_id": "wr_789",
+  "created_at": "2023-01-01T00:00:00Z",
+  "modified_at": "2023-01-01T00:00:00Z",
+  "organization_id": "org_123"
+}
+```
+
+## Downloading Artifact Content
+
+Use the `signed_url` field to download the actual artifact content:
+
+```python
+import httpx
+
+# Get the artifact
+artifact = await client.artifacts.get_artifact(artifact_id="artifact_123")
+
+# Download the content using the signed URL
+async with httpx.AsyncClient() as http_client:
+    response = await http_client.get(artifact.signed_url)
+    content = response.content
+    
+    # Save to file
+    with open(f"artifact_{artifact.artifact_id}.{artifact.artifact_type}", "wb") as f:
+        f.write(content)
+```
+
+## Use Cases
+
+### Debugging Failed Tasks
+When a task fails, examine the artifacts to understand what went wrong:
+- Review the final screenshot to see the end state
+- Check LLM requests/responses to understand decision making
+- Examine browser console logs for JavaScript errors
+
+### Quality Assurance
+Use artifacts to verify task execution:
+- Screenshots show the visual state at each step
+- Recordings provide a complete visual audit trail
+- HTML snapshots preserve the exact page content
+
+### Data Extraction Verification
+For extraction tasks, artifacts help verify results:
+- Compare extracted data with actual page content from HTML artifacts
+- Review LLM responses to understand extraction reasoning
+- Use screenshots to visually confirm extracted information
+
+## Best Practices
+
+1. **Filter Artifacts**: Use the `artifact_type` parameter to retrieve only the artifacts you need
+2. **Handle Signed URLs**: Signed URLs are temporary - download content promptly if needed
+3. **Organize Downloads**: Use artifact metadata (type, timestamp) to organize downloaded files
+4. **Monitor Storage**: Be mindful of artifact storage costs in cloud deployments
