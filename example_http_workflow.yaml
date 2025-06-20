@@ -1,0 +1,38 @@
+title: "Example HTTP Request Workflow"
+description: "A workflow demonstrating HTTP request capabilities"
+proxy_location: "RESIDENTIAL"
+workflow_definition:
+  parameters:
+    - parameter_type: "workflow"
+      key: "api_token"
+      description: "API authentication token"
+      workflow_parameter_type: "string"
+      default_value: "your-api-token-here"
+    - parameter_type: "workflow"
+      key: "user_id"
+      description: "User ID to fetch data for"
+      workflow_parameter_type: "string"
+      default_value: "12345"
+  blocks:
+    - block_type: "http_request"
+      label: "fetch_user_data"
+      curl_command: 'curl -X GET "https://api.example.com/users/{{ user_id }}" -H "Authorization: Bearer {{ api_token }}"'
+      continue_on_failure: false
+    
+    - block_type: "http_request"
+      label: "post_data"
+      curl_command: |
+        curl -X POST "https://api.example.com/data" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer {{ api_token }}" \
+          -d '{"user": "{{ fetch_user_data_output.body.username }}", "action": "update"}'
+      continue_on_failure: false
+    
+    - block_type: "text_prompt"
+      label: "process_response"
+      prompt: |
+        Based on the API response from the previous step:
+        {{ post_data_output }}
+        
+        Please summarize the result and indicate if the operation was successful.
+      continue_on_failure: false

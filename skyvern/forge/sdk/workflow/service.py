@@ -38,6 +38,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
+    Block,
     BlockStatus,
     BlockType,
     BlockTypeVar,
@@ -48,6 +49,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     FileParserBlock,
     FileUploadBlock,
     ForLoopBlock,
+    HTTPBlock,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
@@ -2065,6 +2067,24 @@ class WorkflowService:
                 url=block_yaml.url,
                 output_parameter=output_parameter,
                 complete_verification=False,
+            )
+        elif block_yaml.block_type == BlockType.HTTP_REQUEST:
+            return HTTPBlock(
+                label=block_yaml.label,
+                curl_command=block_yaml.curl_command,
+                method=block_yaml.method,
+                url=block_yaml.url,
+                headers=block_yaml.headers,
+                body=block_yaml.body,
+                timeout=block_yaml.timeout,
+                parameters=(
+                    [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                    if block_yaml.parameter_keys
+                    else []
+                ),
+                output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
+                model=block_yaml.model,
             )
 
         raise ValueError(f"Invalid block type {block_yaml.block_type}")

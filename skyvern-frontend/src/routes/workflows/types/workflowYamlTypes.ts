@@ -119,7 +119,8 @@ export type BlockYAML =
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
   | Taskv2BlockYAML
-  | URLBlockYAML;
+  | URLBlockYAML
+  | HTTPBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -326,4 +327,16 @@ export type PDFParserBlockYAML = BlockYAMLBase & {
 export type URLBlockYAML = BlockYAMLBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type HTTPBlockYAML = BlockYAMLBase & {
+  block_type: "http_request";
+  curl_command: string;
+  method?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  timeout?: number;
+  parameter_keys?: Array<string> | null;
+  model?: WorkflowModel | null;
 };

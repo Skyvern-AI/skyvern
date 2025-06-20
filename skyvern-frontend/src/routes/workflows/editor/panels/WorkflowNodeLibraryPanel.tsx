@@ -221,6 +221,17 @@ const nodeLibraryItems: Array<{
     title: "Wait Block",
     description: "Wait for some time",
   },
+  {
+    nodeType: "http",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.HTTPRequest}
+        className="size-6"
+      />
+    ),
+    title: "HTTP Request Block",
+    description: "Make HTTP requests using cURL",
+  },
 ];
 
 type Props = {

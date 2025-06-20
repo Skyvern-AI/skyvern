@@ -16,7 +16,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, Union
 from urllib.parse import quote
+import re
+import shlex
 
+import aiohttp
 import filetype
 import structlog
 from email_validator import EmailNotValidError, validate_email
@@ -100,6 +103,7 @@ class BlockType(StrEnum):
     FILE_DOWNLOAD = "file_download"
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
+    HTTP_REQUEST = "http_request"
 
 
 class BlockStatus(StrEnum):
@@ -2434,6 +2438,273 @@ class UrlBlock(BaseTaskBlock):
     url: str
 
 
+class HTTPBlock(Block):
+    block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST
+    
+    # The cURL command string
+    curl_command: str
+    
+    # Optional: Individual fields for more control
+    method: str | None = None
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    body: str | None = None
+    timeout: int = 30
+    parameters: list[PARAMETER_TYPE] = []
+    
+    def parse_curl_command(self, curl_command: str) -> dict[str, Any]:
+        """Parse a cURL command into its components."""
+        # Remove 'curl' from the beginning if present
+        curl_command = curl_command.strip()
+        if curl_command.startswith('curl'):
+            curl_command = curl_command[4:].strip()
+        
+        # Parse the command using shlex
+        try:
+            parts = shlex.split(curl_command)
+        except ValueError as e:
+            raise ValueError(f"Invalid cURL command: {e}")
+        
+        # Initialize result
+        result = {
+            'method': 'GET',
+            'url': None,
+            'headers': {},
+            'data': None,
+        }
+        
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+            
+            if part in ['-X', '--request']:
+                if i + 1 < len(parts):
+                    result['method'] = parts[i + 1].upper()
+                    i += 2
+                else:
+                    i += 1
+            elif part in ['-H', '--header']:
+                if i + 1 < len(parts):
+                    header = parts[i + 1]
+                    if ':' in header:
+                        key, value = header.split(':', 1)
+                        result['headers'][key.strip()] = value.strip()
+                    i += 2
+                else:
+                    i += 1
+            elif part in ['-d', '--data', '--data-raw', '--data-binary']:
+                if i + 1 < len(parts):
+                    result['data'] = parts[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            elif part.startswith('-d') and len(part) > 2:
+                # Handle -d'data' format
+                result['data'] = part[2:]
+                i += 1
+            elif part.startswith('--data='):
+                result['data'] = part[7:]
+                i += 1
+            elif part.startswith('http://') or part.startswith('https://'):
+                result['url'] = part
+                i += 1
+            elif not part.startswith('-'):
+                # Assume it's the URL if it doesn't start with a flag
+                if not result['url']:
+                    result['url'] = part
+                i += 1
+            else:
+                # Skip unknown flags
+                i += 1
+        
+        return result
+    
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        parameters = self.parameters
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        
+        # Check if curl_command is a parameter reference
+        if self.curl_command and workflow_run_context.has_parameter(self.curl_command):
+            if self.curl_command not in [parameter.key for parameter in parameters]:
+                parameters.append(workflow_run_context.get_parameter(self.curl_command))
+        
+        # Check if URL is a parameter reference
+        if self.url and workflow_run_context.has_parameter(self.url):
+            if self.url not in [parameter.key for parameter in parameters]:
+                parameters.append(workflow_run_context.get_parameter(self.url))
+                
+        return parameters
+    
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        # Format curl command if it contains template variables
+        self.curl_command = self.format_block_parameter_template_from_workflow_run_context(
+            self.curl_command, workflow_run_context
+        )
+        
+        # Format individual fields if provided
+        if self.url:
+            self.url = self.format_block_parameter_template_from_workflow_run_context(
+                self.url, workflow_run_context
+            )
+            
+        if self.body:
+            self.body = self.format_block_parameter_template_from_workflow_run_context(
+                self.body, workflow_run_context
+            )
+    
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        # Get workflow run context
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        
+        # Format template parameters
+        self.format_potential_template_parameters(workflow_run_context)
+        
+        # Parse the cURL command
+        try:
+            parsed = self.parse_curl_command(self.curl_command)
+        except ValueError as e:
+            LOG.error(
+                "Failed to parse cURL command",
+                workflow_run_id=workflow_run_id,
+                curl_command=self.curl_command,
+                error=str(e),
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to parse cURL command: {str(e)}",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        # Use parsed values or override with explicit parameters
+        method = self.method or parsed['method']
+        url = self.url or parsed['url']
+        headers = self.headers or parsed['headers']
+        body = self.body or parsed['data']
+        
+        if not url:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No URL provided in cURL command or parameters",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        # Validate URL
+        try:
+            url = prepend_scheme_and_validate_url(url)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Invalid URL: {str(e)}",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        # Execute the HTTP request
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
+                request_kwargs: dict[str, Any] = {
+                    "headers": headers,
+                }
+                
+                # Handle different content types
+                if body:
+                    if headers.get('Content-Type', '').startswith('application/json'):
+                        try:
+                            request_kwargs['json'] = json.loads(body)
+                        except json.JSONDecodeError:
+                            request_kwargs['data'] = body
+                    else:
+                        request_kwargs['data'] = body
+                
+                LOG.info(
+                    "Executing HTTP request",
+                    workflow_run_id=workflow_run_id,
+                    method=method,
+                    url=url,
+                )
+                
+                async with session.request(method, url, **request_kwargs) as response:
+                    response_data = {
+                        "status_code": response.status,
+                        "headers": dict(response.headers),
+                        "url": str(response.url),
+                        "method": method,
+                    }
+                    
+                    # Try to parse response as JSON
+                    try:
+                        response_data["body"] = await response.json()
+                    except Exception:
+                        # If not JSON, get as text
+                        response_data["body"] = await response.text()
+                    
+                    # Record the output
+                    await self.record_output_parameter_value(
+                        workflow_run_context,
+                        workflow_run_id,
+                        response_data,
+                    )
+                    
+                    # Check if request was successful
+                    success = 200 <= response.status < 400
+                    
+                    return await self.build_block_result(
+                        success=success,
+                        failure_reason=None if success else f"HTTP {response.status}",
+                        output_parameter_value=response_data,
+                        status=BlockStatus.completed if success else BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                    
+        except asyncio.TimeoutError:
+            failure_reason = f"HTTP request timed out after {self.timeout} seconds"
+            LOG.error(
+                failure_reason,
+                workflow_run_id=workflow_run_id,
+                url=url,
+                method=method,
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                status=BlockStatus.timed_out,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except Exception as e:
+            failure_reason = f"HTTP request failed: {str(e)}"
+            LOG.error(
+                failure_reason,
+                workflow_run_id=workflow_run_id,
+                url=url,
+                method=method,
+                error=str(e),
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+
 class TaskV2Block(Block):
     block_type: Literal[BlockType.TaskV2] = BlockType.TaskV2
     prompt: str
@@ -2590,6 +2861,7 @@ BlockSubclasses = Union[
     WaitBlock,
     FileDownloadBlock,
     UrlBlock,
+    HTTPBlock,
     TaskV2Block,
     FileUploadBlock,
 ]

@@ -93,6 +93,9 @@ from .file_download_block_yaml import FileDownloadBlockYaml
 from .file_info import FileInfo
 from .file_parser_block import FileParserBlock
 from .file_parser_block_yaml import FileParserBlockYaml
+from .http_block import HttpBlock
+from .http_block_yaml import HttpBlockYaml
+from .http_block_parameters_item import HttpBlockParametersItem
 from .file_storage_type import FileStorageType
 from .file_type import FileType
 from .file_upload_block import FileUploadBlock
@@ -448,6 +451,9 @@ __all__ = [
     "FileInfo",
     "FileParserBlock",
     "FileParserBlockYaml",
+    "HttpBlock",
+    "HttpBlockYaml",
+    "HttpBlockParametersItem",
     "FileStorageType",
     "FileType",
     "FileUploadBlock",

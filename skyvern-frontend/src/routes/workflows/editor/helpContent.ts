@@ -3,7 +3,7 @@ export const baseHelpTooltipContent = {
   navigationGoal:
     "Give Skyvern an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails. Use {{ parameter_name }} to reference a parameter value",
   parameters:
-    "Define placeholder values using the “parameters” drop down that you predefine or redefine run-to-run.",
+    'Define placeholder values using the "parameters" drop down that you predefine or redefine run-to-run.',
   dataExtractionGoal:
     "Tell Skyvern what data you would like to scrape at the end of your run.",
   dataSchema: "Specify a format for extracted data in JSON.",
@@ -115,6 +115,7 @@ export const helpTooltips = {
     jsonSchema: "Specify a format for the extracted information from the file",
   },
   url: baseHelpTooltipContent,
+  httpCurl: "Paste a cURL command that will be parsed and executed. Supports GET, POST, PUT, DELETE, and custom headers.",
 };
 
 export const placeholders = {
@@ -158,5 +159,9 @@ export const placeholders = {
   url: {
     ...basePlaceholderContent,
     url: "(required) Navigate to this URL: https://...",
+  },
+  http: {
+    ...basePlaceholderContent,
+    curlCommand: 'curl -X GET "https://api.example.com/data" -H "Authorization: Bearer {{ token }}"',
   },
 };

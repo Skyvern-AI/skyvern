@@ -37,6 +37,7 @@ import {
   Taskv2BlockYAML,
   URLBlockYAML,
   FileUploadBlockYAML,
+  HTTPBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -99,6 +100,33 @@ import {
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
+import { httpNodeDefaultData } from "./nodes/HTTPNode/types";
+import type { TaskBlock } from "@/api/types";
+import type {
+  AWSSecretParameterYAML,
+  ActionBlockYAML,
+  BlockYAML,
+  CodeBlockYAML,
+  DownloadToS3BlockYAML,
+  ExtractionBlockYAML,
+  FileDownloadBlockYAML,
+  FileParserBlockYAML,
+  FileUploadBlockYAML,
+  ForLoopBlockYAML,
+  LoginBlockYAML,
+  NavigationBlockYAML,
+  PDFParserBlockYAML,
+  ParameterYAML,
+  SendEmailBlockYAML,
+  TaskBlockYAML,
+  TaskV2BlockYAML,
+  TextPromptBlockYAML,
+  UploadToS3BlockYAML,
+  UrlBlockYAML,
+  ValidationBlockYAML,
+  WaitBlockYAML,
+  WorkflowCreateYAMLRequest,
+} from "./workflowEditorTypes";
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
@@ -526,6 +554,23 @@ function convertToNode(
         },
       };
     }
+    case "http_request": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "http",
+        data: {
+          ...commonData,
+          curlCommand: block.curl_command,
+          method: block.method,
+          url: block.url,
+          headers: block.headers,
+          body: block.body,
+          timeout: block.timeout,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
   }
 }
 
@@ -947,6 +992,17 @@ function createNode(
         },
       };
     }
+    case "http": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "http",
+        data: {
+          ...httpNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -969,8 +1025,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "task",
-        url: node.data.url,
         title: node.data.label,
+        url: node.data.url,
         navigation_goal: node.data.navigationGoal,
         data_extraction_goal: node.data.dataExtractionGoal,
         complete_criterion: node.data.completeCriterion,
@@ -1208,7 +1264,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       return {
         ...base,
         block_type: "text_prompt",
-        llm_key: "",
+        llm_key: node.data.llm_key,
         prompt: node.data.prompt,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         parameter_keys: node.data.parameterKeys,
@@ -1227,6 +1283,19 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "goto_url",
         url: node.data.url,
+      };
+    }
+    case "http": {
+      return {
+        ...base,
+        block_type: "http_request",
+        curl_command: node.data.curlCommand,
+        method: node.data.method,
+        url: node.data.url,
+        headers: node.data.headers,
+        body: node.data.body,
+        timeout: node.data.timeout,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     default: {
@@ -1977,6 +2046,20 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "goto_url",
           url: block.url,
+        };
+        return blockYaml;
+      }
+      case "http_request": {
+        const blockYaml: HTTPBlockYAML = {
+          ...base,
+          block_type: "http_request",
+          curl_command: block.curl_command,
+          method: block.method,
+          url: block.url,
+          headers: block.headers,
+          body: block.body,
+          timeout: block.timeout,
+          parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
       }
