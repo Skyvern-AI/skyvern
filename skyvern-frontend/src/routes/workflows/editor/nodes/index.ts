@@ -41,6 +41,8 @@ import { Taskv2Node } from "./Taskv2Node/types";
 import { Taskv2Node as Taskv2NodeComponent } from "./Taskv2Node/Taskv2Node";
 import { URLNode } from "./URLNode/types";
 import { URLNode as URLNodeComponent } from "./URLNode/URLNode";
+import { HttpRequestNode } from "./HttpRequestNode/types";
+import { HttpRequestNode as HttpRequestNodeComponent } from "./HttpRequestNode/HttpRequestNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -63,7 +65,8 @@ export type WorkflowBlockNode =
   | FileDownloadNode
   | PDFParserNode
   | Taskv2Node
-  | URLNode;
+  | URLNode
+  | HttpRequestNode;
 
 export function isUtilityNode(node: AppNode): node is UtilityNode {
   return node.type === "nodeAdder" || node.type === "start";
@@ -97,4 +100,5 @@ export const nodeTypes = {
   pdfParser: memo(PDFParserNodeComponent),
   taskv2: memo(Taskv2NodeComponent),
   url: memo(URLNodeComponent),
+  httpRequest: memo(HttpRequestNodeComponent),
 } as const;
