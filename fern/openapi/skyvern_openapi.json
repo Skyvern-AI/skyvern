@@ -815,6 +815,105 @@
         "x-fern-sdk-method-name": "get_artifact"
       }
     },
+    "/v1/runs/{run_id}/artifacts": {
+      "get": {
+        "tags": [
+          "Artifacts"
+        ],
+        "summary": "Get artifacts for a run",
+        "description": "Get artifacts for a run",
+        "operationId": "get_run_artifacts_v1_runs__run_id__artifacts_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the task run or the workflow run.",
+              "examples": [
+                "tsk_123",
+                "tsk_v2_123",
+                "wr_123"
+              ],
+              "title": "Run Id"
+            },
+            "description": "The id of the task run or the workflow run."
+          },
+          {
+            "name": "artifact_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ArtifactType"
+              },
+              "title": "Artifact Type"
+            },
+            "description": "Optional list of artifact types to filter by"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved artifacts for run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Artifact"
+                  },
+                  "title": "Response Get Run Artifacts V1 Runs  Run Id  Artifacts Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_artifacts",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nartifacts = await skyvern.get_run_artifacts(run_id=\"tsk_v2_123\")\nprint(artifacts)\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/runs/{run_id}/retry_webhook": {
       "post": {
         "tags": [
@@ -8696,147 +8795,6 @@
           "label"
         ],
         "title": "WaitBlockYAML"
-      },
-      "Workflow": {
-        "properties": {
-          "workflow_id": {
-            "type": "string",
-            "title": "Workflow Id"
-          },
-          "organization_id": {
-            "type": "string",
-            "title": "Organization Id"
-          },
-          "title": {
-            "type": "string",
-            "title": "Title"
-          },
-          "workflow_permanent_id": {
-            "type": "string",
-            "title": "Workflow Permanent Id"
-          },
-          "version": {
-            "type": "integer",
-            "title": "Version"
-          },
-          "is_saved_task": {
-            "type": "boolean",
-            "title": "Is Saved Task"
-          },
-          "description": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Description"
-          },
-          "workflow_definition": {
-            "$ref": "#/components/schemas/WorkflowDefinition"
-          },
-          "proxy_location": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ProxyLocation"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "webhook_callback_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Webhook Callback Url"
-          },
-          "totp_verification_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Verification Url"
-          },
-          "totp_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Identifier"
-          },
-          "persist_browser_session": {
-            "type": "boolean",
-            "title": "Persist Browser Session",
-            "default": false
-          },
-          "model": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Model"
-          },
-          "status": {
-            "$ref": "#/components/schemas/WorkflowStatus",
-            "default": "published"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Created At"
-          },
-          "modified_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Modified At"
-          },
-          "deleted_at": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Deleted At"
-          }
-        },
-        "type": "object",
-        "required": [
-          "workflow_id",
-          "organization_id",
-          "title",
-          "workflow_permanent_id",
-          "version",
-          "is_saved_task",
-          "workflow_definition",
-          "created_at",
-          "modified_at"
-        ],
-        "title": "Workflow"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
