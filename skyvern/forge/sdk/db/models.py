@@ -59,7 +59,7 @@ class TaskModel(Base):
     __tablename__ = "tasks"
     __table_args__ = (Index("idx_tasks_org_created", "organization_id", "created_at"),)
 
-    task_id = Column(String, primary_key=True, index=True, default=generate_task_id)
+    task_id = Column(String, primary_key=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     status = Column(String, index=True)
     webhook_callback_url = Column(String)
@@ -108,7 +108,7 @@ class StepModel(Base):
         Index("created_at_org_index", "created_at", "organization_id"),
     )
 
-    step_id = Column(String, primary_key=True, index=True, default=generate_step_id)
+    step_id = Column(String, primary_key=True, default=generate_step_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"), index=True)
     status = Column(String)
@@ -133,7 +133,7 @@ class StepModel(Base):
 class OrganizationModel(Base):
     __tablename__ = "organizations"
 
-    organization_id = Column(String, primary_key=True, index=True, default=generate_org_id)
+    organization_id = Column(String, primary_key=True, default=generate_org_id)
     organization_name = Column(String, nullable=False)
     webhook_callback_url = Column(UnicodeText)
     max_steps_per_run = Column(Integer, nullable=True)
@@ -177,15 +177,18 @@ class OrganizationAuthTokenModel(Base):
 
 class ArtifactModel(Base):
     __tablename__ = "artifacts"
-    __table_args__ = (Index("org_task_step_index", "organization_id", "task_id", "step_id"),)
+    __table_args__ = (
+        Index("org_task_step_index", "organization_id", "task_id", "step_id"),
+        Index("artifacts_org_created_at_index", "organization_id", "created_at"),
+    )
 
-    artifact_id = Column(String, primary_key=True, index=True, default=generate_artifact_id)
+    artifact_id = Column(String, primary_key=True, default=generate_artifact_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     workflow_run_id = Column(String, index=True)
     workflow_run_block_id = Column(String, index=True)
     observer_cruise_id = Column(String, index=True)
     observer_thought_id = Column(String, index=True)
-    ai_suggestion_id = Column(String, index=True)
+    ai_suggestion_id = Column(String)
     task_id = Column(String)
     step_id = Column(String, index=True)
     artifact_type = Column(String)
@@ -213,7 +216,7 @@ class WorkflowModel(Base):
         Index("workflow_oid_status_idx", "organization_id", "status"),
     )
 
-    workflow_id = Column(String, primary_key=True, index=True, default=generate_workflow_id)
+    workflow_id = Column(String, primary_key=True, default=generate_workflow_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     title = Column(String, nullable=False)
     description = Column(String, nullable=True)
@@ -246,7 +249,7 @@ class WorkflowRunModel(Base):
     __tablename__ = "workflow_runs"
     __table_args__ = (Index("idx_workflow_runs_org_created", "organization_id", "created_at"),)
 
-    workflow_run_id = Column(String, primary_key=True, index=True, default=generate_workflow_run_id)
+    workflow_run_id = Column(String, primary_key=True, default=generate_workflow_run_id)
     workflow_id = Column(String, nullable=False)
     workflow_permanent_id = Column(String, nullable=False, index=True)
     # workfow runs with parent_workflow_run_id are nested workflow runs which won't show up in the workflow run history
@@ -278,7 +281,7 @@ class WorkflowRunModel(Base):
 class WorkflowParameterModel(Base):
     __tablename__ = "workflow_parameters"
 
-    workflow_parameter_id = Column(String, primary_key=True, index=True, default=generate_workflow_parameter_id)
+    workflow_parameter_id = Column(String, primary_key=True, default=generate_workflow_parameter_id)
     workflow_parameter_type = Column(String, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
@@ -297,7 +300,7 @@ class WorkflowParameterModel(Base):
 class OutputParameterModel(Base):
     __tablename__ = "output_parameters"
 
-    output_parameter_id = Column(String, primary_key=True, index=True, default=generate_output_parameter_id)
+    output_parameter_id = Column(String, primary_key=True, default=generate_output_parameter_id)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
     workflow_id = Column(String, index=True, nullable=False)
@@ -314,7 +317,7 @@ class OutputParameterModel(Base):
 class AWSSecretParameterModel(Base):
     __tablename__ = "aws_secret_parameters"
 
-    aws_secret_parameter_id = Column(String, primary_key=True, index=True, default=generate_aws_secret_parameter_id)
+    aws_secret_parameter_id = Column(String, primary_key=True, default=generate_aws_secret_parameter_id)
     workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
@@ -411,7 +414,7 @@ class BitwardenCreditCardDataParameterModel(Base):
 class CredentialParameterModel(Base):
     __tablename__ = "credential_parameters"
 
-    credential_parameter_id = Column(String, primary_key=True, index=True, default=generate_credential_parameter_id)
+    credential_parameter_id = Column(String, primary_key=True, default=generate_credential_parameter_id)
     workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
@@ -427,7 +430,7 @@ class OnePasswordCredentialParameterModel(Base):
     __tablename__ = "onepassword_credential_parameters"
 
     onepassword_credential_parameter_id = Column(
-        String, primary_key=True, index=True, default=generate_onepassword_credential_parameter_id
+        String, primary_key=True, default=generate_onepassword_credential_parameter_id
     )
     workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
@@ -542,7 +545,7 @@ class ActionModel(Base):
         Index("action_org_created_at_index", "organization_id", desc("created_at")),
     )
 
-    action_id = Column(String, primary_key=True, index=True, default=generate_action_id)
+    action_id = Column(String, primary_key=True, default=generate_action_id)
     action_type = Column(String, nullable=False)
     source_action_id = Column(String, nullable=True, index=True)
     organization_id = Column(String, nullable=True)
