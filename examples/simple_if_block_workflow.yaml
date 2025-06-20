@@ -1,0 +1,48 @@
+title: "Shopping Cart Conditional Workflow"
+description: "A simple workflow that checks if the shopping cart has items and proceeds accordingly"
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: shop_url
+      workflow_parameter_type: string
+      default_value: "https://shop.example.com"
+      description: "The URL of the shopping website"
+  
+  blocks:
+    # Navigate to the shopping cart
+    - block_type: navigation
+      label: go_to_cart
+      navigation_goal: "Navigate to the shopping cart page"
+      url: "{{ shop_url }}/cart"
+      
+    # Check if cart has items
+    - block_type: if
+      label: check_cart_items
+      condition: "The shopping cart contains at least one item"
+      
+      true_blocks:
+        # If cart has items, proceed to checkout
+        - block_type: extraction
+          label: extract_cart_details
+          data_extraction_goal: "Extract cart items and total price"
+          data_schema:
+            items:
+              - name: "string"
+                quantity: "number"
+                price: "number"
+            total_price: "number"
+            
+        - block_type: action
+          label: proceed_to_checkout
+          navigation_goal: "Click the 'Proceed to Checkout' button"
+          
+      false_blocks:
+        # If cart is empty, go shopping
+        - block_type: text_prompt
+          label: generate_message
+          prompt: "Generate a message indicating the cart is empty"
+          
+        - block_type: navigation
+          label: continue_shopping
+          navigation_goal: "Navigate to the shop's main page to browse products"
+          url: "{{ shop_url }}"

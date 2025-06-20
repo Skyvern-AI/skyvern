@@ -167,6 +167,15 @@ class ForLoopBlockYAML(BlockYAML):
     complete_if_empty: bool = False
 
 
+class IfBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.IF] = BlockType.IF  # type: ignore
+    
+    condition: str
+    true_blocks: list["BLOCK_YAML_SUBCLASSES"] = []
+    false_blocks: list["BLOCK_YAML_SUBCLASSES"] = []
+    parameter_keys: list[str] | None = None
+
+
 class CodeBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -423,6 +432,7 @@ BLOCK_YAML_SUBCLASSES = (
     | PDFParserBlockYAML
     | TaskV2BlockYAML
     | HttpRequestBlockYAML
+    | IfBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

@@ -101,6 +101,7 @@ class BlockType(StrEnum):
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
+    IF = "if"
 
 
 class BlockStatus(StrEnum):
@@ -2866,6 +2867,262 @@ class HttpRequestBlock(Block):
             )
 
 
+class IfBlock(Block):
+    block_type: Literal[BlockType.IF] = BlockType.IF
+    
+    condition: str  # The prompt/condition to evaluate based on browser content
+    true_blocks: list[BlockTypeVar] = []
+    false_blocks: list[BlockTypeVar] = []
+    parameters: list[PARAMETER_TYPE] = []
+    
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        parameters = set(self.parameters)
+        
+        # Add parameters from true blocks
+        for block in self.true_blocks:
+            for parameter in block.get_all_parameters(workflow_run_id):
+                parameters.add(parameter)
+        
+        # Add parameters from false blocks  
+        for block in self.false_blocks:
+            for parameter in block.get_all_parameters(workflow_run_id):
+                parameters.add(parameter)
+                
+        return list(parameters)
+    
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        self.condition = self.format_block_parameter_template_from_workflow_run_context(
+            self.condition, workflow_run_context
+        )
+    
+    async def evaluate_condition(
+        self, 
+        workflow_run_id: str,
+        organization_id: str | None = None
+    ) -> bool:
+        """
+        Evaluate the condition based on the current browser state.
+        Uses the LLM to analyze the browser content and determine if the condition is true or false.
+        """
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+        if not browser_state:
+            LOG.warning("No browser state found for condition evaluation", workflow_run_id=workflow_run_id)
+            return False
+            
+        try:
+            # Take a screenshot of the current page
+            screenshot = await browser_state.take_screenshot(full_page=True)
+            
+            # Get page HTML for additional context
+            page = await browser_state.get_or_create_page()
+            page_html = await get_interactable_element_tree(page)
+            
+            # Use LLM to evaluate the condition
+            prompt = prompt_engine.load_prompt(
+                "evaluate-if-condition",
+                condition=self.condition,
+                page_html=page_html,
+            )
+            
+            json_response = await app.LLM_API_HANDLER(
+                prompt=prompt,
+                screenshots=[screenshot] if screenshot else [],
+                prompt_name="evaluate-if-condition"
+            )
+            
+            # Extract the boolean result
+            result = json_response.get("result", False)
+            reasoning = json_response.get("reasoning", "")
+            
+            LOG.info(
+                "Evaluated if condition",
+                workflow_run_id=workflow_run_id,
+                condition=self.condition,
+                result=result,
+                reasoning=reasoning
+            )
+            
+            return bool(result)
+            
+        except Exception as e:
+            LOG.exception(
+                "Failed to evaluate if condition",
+                workflow_run_id=workflow_run_id,
+                condition=self.condition,
+                error=str(e)
+            )
+            return False
+    
+    async def execute_blocks_helper(
+        self,
+        blocks: list[BlockTypeVar],
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: WorkflowRunContext,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> tuple[list[BlockResult], BlockStatus, str | None]:
+        """
+        Execute a list of blocks sequentially and return their results.
+        Returns: (block_results, final_status, failure_reason)
+        """
+        block_results: list[BlockResult] = []
+        
+        for block_idx, block in enumerate(blocks):
+            original_block = block
+            block = block.copy()
+            
+            block_result = await block.execute_safe(
+                workflow_run_id=workflow_run_id,
+                parent_workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+            
+            block = original_block
+            block_results.append(block_result)
+            
+            # Handle cancellation
+            if block_result.status == BlockStatus.canceled:
+                LOG.info(
+                    f"IfBlock: Block at index {block_idx} was canceled",
+                    workflow_run_id=workflow_run_id,
+                    block_type=block.block_type,
+                )
+                return block_results, BlockStatus.canceled, f"Block {block.label} was canceled"
+            
+            # Handle failure
+            if not block_result.success and not block.continue_on_failure:
+                LOG.info(
+                    f"IfBlock: Block at index {block_idx} failed",
+                    workflow_run_id=workflow_run_id,
+                    block_type=block.block_type,
+                    failure_reason=block_result.failure_reason,
+                )
+                return block_results, BlockStatus.failed, block_result.failure_reason
+        
+        return block_results, BlockStatus.completed, None
+    
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        
+        # Format template parameters
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            failure_reason = f"Failed to format condition template: {str(e)}"
+            await self.record_output_parameter_value(
+                workflow_run_context, workflow_run_id, {"failure_reason": failure_reason}
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        # Evaluate the condition
+        try:
+            condition_result = await self.evaluate_condition(workflow_run_id, organization_id)
+        except Exception as e:
+            failure_reason = f"Failed to evaluate condition: {str(e)}"
+            await self.record_output_parameter_value(
+                workflow_run_context, workflow_run_id, {"failure_reason": failure_reason}
+            )
+            return await self.build_block_result(
+                success=False,
+                failure_reason=failure_reason,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        # Update the workflow run block with the condition result
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            output={"condition_result": condition_result, "condition": self.condition},
+        )
+        
+        # Execute the appropriate branch
+        blocks_to_execute = self.true_blocks if condition_result else self.false_blocks
+        branch_name = "true" if condition_result else "false"
+        
+        LOG.info(
+            f"IfBlock: Executing {branch_name} branch with {len(blocks_to_execute)} blocks",
+            workflow_run_id=workflow_run_id,
+            condition=self.condition,
+            condition_result=condition_result,
+            num_blocks=len(blocks_to_execute),
+        )
+        
+        if not blocks_to_execute:
+            # No blocks to execute in this branch
+            output_value = {
+                "condition": self.condition,
+                "condition_result": condition_result,
+                "branch_executed": branch_name,
+                "message": f"No blocks defined for {branch_name} branch"
+            }
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_value)
+            return await self.build_block_result(
+                success=True,
+                failure_reason=None,
+                output_parameter_value=output_value,
+                status=BlockStatus.completed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        
+        # Execute the blocks in the selected branch
+        block_results, final_status, failure_reason = await self.execute_blocks_helper(
+            blocks=blocks_to_execute,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_context=workflow_run_context,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+        
+        # Build output value
+        output_value = {
+            "condition": self.condition,
+            "condition_result": condition_result,
+            "branch_executed": branch_name,
+            "block_results": [
+                {
+                    "block_label": blocks_to_execute[i].label,
+                    "success": result.success,
+                    "status": result.status,
+                }
+                for i, result in enumerate(block_results)
+            ]
+        }
+        
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_value)
+        
+        success = final_status == BlockStatus.completed
+        return await self.build_block_result(
+            success=success,
+            failure_reason=failure_reason,
+            output_parameter_value=output_value,
+            status=final_status,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
@@ -2887,5 +3144,6 @@ BlockSubclasses = Union[
     TaskV2Block,
     FileUploadBlock,
     HttpRequestBlock,
+    IfBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]

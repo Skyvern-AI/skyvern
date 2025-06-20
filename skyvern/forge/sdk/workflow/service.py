@@ -60,6 +60,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
     WaitBlock,
     HttpRequestBlock,
+    IfBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -93,6 +94,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     ForLoopBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    IfBlockYAML,
 )
 from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.webeye.browser_factory import BrowserState
@@ -1718,6 +1720,22 @@ class WorkflowService:
                         workflow_id=workflow_id, block_yamls=block_yaml.loop_blocks
                     )
                 )
+            # Recursively create output parameters for if blocks
+            elif isinstance(block_yaml, IfBlockYAML):
+                # Create output parameters for true blocks
+                if block_yaml.true_blocks:
+                    output_parameters.update(
+                        await WorkflowService._create_all_output_parameters_for_workflow(
+                            workflow_id=workflow_id, block_yamls=block_yaml.true_blocks
+                        )
+                    )
+                # Create output parameters for false blocks
+                if block_yaml.false_blocks:
+                    output_parameters.update(
+                        await WorkflowService._create_all_output_parameters_for_workflow(
+                            workflow_id=workflow_id, block_yamls=block_yaml.false_blocks
+                        )
+                    )
         return output_parameters
 
     @staticmethod
@@ -1788,6 +1806,34 @@ class WorkflowService:
                 output_parameter=output_parameter,
                 continue_on_failure=block_yaml.continue_on_failure,
                 complete_if_empty=block_yaml.complete_if_empty,
+            )
+        elif block_yaml.block_type == BlockType.IF:
+            # Convert true and false blocks
+            true_blocks = [
+                await WorkflowService.block_yaml_to_block(workflow, block, parameters)
+                for block in block_yaml.true_blocks
+            ]
+            false_blocks = [
+                await WorkflowService.block_yaml_to_block(workflow, block, parameters)
+                for block in block_yaml.false_blocks
+            ]
+            
+            # Get parameters referenced in the if block
+            if_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            
+            return IfBlock(
+                label=block_yaml.label,
+                condition=block_yaml.condition,
+                true_blocks=true_blocks,
+                false_blocks=false_blocks,
+                parameters=if_block_parameters,
+                output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
+                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.CODE:
             return CodeBlock(

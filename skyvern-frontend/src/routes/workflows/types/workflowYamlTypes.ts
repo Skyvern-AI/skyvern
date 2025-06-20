@@ -119,7 +119,8 @@ export type BlockYAML =
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
   | Taskv2BlockYAML
-  | URLBlockYAML;
+  | URLBlockYAML
+  | IfBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -315,6 +316,14 @@ export type ForLoopBlockYAML = BlockYAMLBase & {
   loop_blocks: Array<BlockYAML>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+};
+
+export type IfBlockYAML = BlockYAMLBase & {
+  block_type: "if";
+  condition: string;
+  true_blocks: Array<BlockYAML>;
+  false_blocks: Array<BlockYAML>;
+  parameter_keys?: Array<string> | null;
 };
 
 export type PDFParserBlockYAML = BlockYAMLBase & {

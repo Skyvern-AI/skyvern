@@ -1,0 +1,78 @@
+title: "Login Workflow with Conditional Branching"
+description: "A workflow that demonstrates conditional branching based on page state"
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: website_url
+      workflow_parameter_type: string
+      default_value: "https://example.com"
+      description: "The URL of the website to navigate to"
+    
+    - parameter_type: workflow  
+      key: username
+      workflow_parameter_type: string
+      default_value: ""
+      description: "Username for login"
+      
+    - parameter_type: workflow
+      key: password
+      workflow_parameter_type: string
+      default_value: ""
+      description: "Password for login"
+  
+  blocks:
+    # Navigate to the website
+    - block_type: navigation
+      label: navigate_to_site
+      navigation_goal: "Navigate to the website"
+      url: "{{ website_url }}"
+      
+    # Check if user is already logged in
+    - block_type: if
+      label: check_login_status
+      condition: "The page shows that the user is already logged in (e.g., displays username, logout button, or account menu)"
+      true_blocks:
+        # If already logged in, just extract account info
+        - block_type: extraction
+          label: extract_account_info
+          data_extraction_goal: "Extract the user's account information"
+          data_schema:
+            username: "string"
+            email: "string"
+            
+      false_blocks:
+        # If not logged in, perform login
+        - block_type: action
+          label: click_login_button
+          navigation_goal: "Click on the login button or link"
+          
+        - block_type: login
+          label: perform_login
+          navigation_goal: "Enter username and password and submit the login form"
+          parameter_keys:
+            - username
+            - password
+            
+        # After login, check if there's an error
+        - block_type: if
+          label: check_login_error
+          condition: "The page displays a login error message (e.g., 'Invalid credentials', 'Login failed')"
+          true_blocks:
+            # If login failed, send notification
+            - block_type: text_prompt
+              label: generate_error_message
+              prompt: "Generate a user-friendly error message based on the login error: {{ check_login_status_output }}"
+              
+          false_blocks:
+            # If login succeeded, navigate to dashboard
+            - block_type: navigation
+              label: go_to_dashboard
+              navigation_goal: "Navigate to the user dashboard or home page"
+              
+            - block_type: extraction
+              label: extract_dashboard_data
+              data_extraction_goal: "Extract key information from the dashboard"
+              data_schema:
+                account_balance: "number"
+                recent_transactions: "array"
+                notifications_count: "number"

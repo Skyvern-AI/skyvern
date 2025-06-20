@@ -1,0 +1,30 @@
+Your task is to evaluate a condition based on the current state of the browser page. You need to analyze the page content, HTML elements, and screenshot to determine if the given condition is true or false.
+
+The condition to evaluate:
+```
+{{ condition }}
+```
+
+Page HTML structure:
+```
+{{ page_html }}
+```
+
+Make sure to ONLY return the JSON object in this format with no additional text before or after it:
+```json
+{
+  "page_info": str, // Describe the relevant information from the page that relates to the condition
+  "reasoning": str, // Explain step by step how you evaluated the condition based on what you see on the page
+  "result": bool // True if the condition is met, False otherwise
+}
+```
+
+Examples of conditions you might evaluate:
+- "The page contains a login form"
+- "The user is logged in"
+- "There is an error message displayed"
+- "The shopping cart has items"
+- "The page title contains 'Success'"
+- "A specific button with text 'Submit' exists"
+
+Evaluate the condition carefully based on the actual content of the page.

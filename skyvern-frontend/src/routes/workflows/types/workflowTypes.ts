@@ -190,7 +190,8 @@ export type WorkflowBlock =
   | FileDownloadBlock
   | PDFParserBlock
   | Taskv2Block
-  | URLBlock;
+  | URLBlock
+  | IfBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -212,6 +213,7 @@ export const WorkflowBlockTypes = {
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
   URL: "goto_url",
+  If: "if",
 } as const;
 
 export function isTaskVariantBlock(item: {
@@ -288,6 +290,14 @@ export type ForLoopBlock = WorkflowBlockBase & {
   loop_blocks: Array<WorkflowBlock>;
   loop_variable_reference: string | null;
   complete_if_empty: boolean;
+};
+
+export type IfBlock = WorkflowBlockBase & {
+  block_type: "if";
+  condition: string;
+  true_blocks: Array<WorkflowBlock>;
+  false_blocks: Array<WorkflowBlock>;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type CodeBlock = WorkflowBlockBase & {
