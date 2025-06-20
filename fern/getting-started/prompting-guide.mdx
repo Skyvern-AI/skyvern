@@ -1,5 +1,5 @@
 ---
-title: Task Prompting Guide
+title: Prompting and Troubleshooting Guide
 slug: getting-started/prompting-guide
 ---
 
@@ -8,11 +8,11 @@ slug: getting-started/prompting-guide
 
 ## Choose the Best Block Type
 
-- Most deterministic: Action block
-    - single action like click, input text, etc.
-- Happy medium: Navigation block
+- **Most deterministic:** Action block
+    - single action like click, input text, etc
+- **Happy medium:** Navigation block
     - single goal, like your goal is to fill out the form
-- Most flexible: Navigation V2 block
+- **Most flexible:** Navigation V2 block
     - multi-goal, like your goal is to login, then fill the form, etc.
     
 
@@ -42,6 +42,8 @@ slug: getting-started/prompting-guide
 - **Make an action list unless absolutely necessary.** If needed as extra details, make sure it’s accompanied by a main goal
 - **Name the HTML element for items.** Some HTML element items are accessible, but not all. Wouldn’t recommend this as a first course of action!
 
+<br>
+
 ### Examples
 
 **Example Navigation/Task Block prompt:**
@@ -64,3 +66,67 @@ Now that you have the location, your goal is to go to google maps and extract th
 **Example Action Block prompt:**
 
 Click the continue button
+
+<br>
+
+# Workflow Troubleshooting Guide
+
+## Process
+
+Sometimes we test things and they run perfectly. Huzzah! Other times, issues crop up. The process of overcoming these issues by identifying errors is **troubleshooting** 
+
+There are a two main reasons why a workflow might fail
+
+- prompt issues/configuration issues
+- bugs
+
+<br>
+
+## When you get a Failure or Termination
+
+### When you need to make a prompt change
+
+Common signs that indicate a prompt change
+
+- **Completed too soon:** the task wasn't finished, but the agent thought it was finished and moved on to the next block too early
+- **Didn't complete soon enough:** the task finished but the agent didn't realize it was finished and kept taking actions on that block
+- **Payload issue:** The information provided may be incorrectly structured or incomplete. This could mean:
+    - The format needs to change: JSON parameter, string parameter, breaking a parameter into smaller parameters
+    - Content is missing or invalid: check the payload to see if the parameter is missing or mislabeled
+    - Parameters might not be configured properly: does each parameter have a double bracket {{sample_parameter}}? Does the label in the bracket match the label in the parameters tab?
+
+### When you’re unsure
+
+What do you do when you’re unsure:
+
+1. Identify where the problem is happening
+    - **Check the screenshots with every step:** is everything happening as you expect it to?
+    - **Check the recording:** is there something missing in the screenshots that can explain why it failed?
+2. Identify the problem
+    - **Check the parameters of the problem task:** Are the inputs what you expected them to be? Do they match what’s in the workflow?
+    - **Check diagnostics for the problem task:** Is the navigation goal correct? Were elements mapped properly? Do they “exist” according to the bot? What actions in the action list did it say it took?
+
+### When you need to file a bug
+
+- Usually, you’ve tried making multiple prompt changes and the error persists
+- Sometimes it’s clear from the gate that there is a bug
+    - Issues with common bugs like dropdowns, like checkboxes, etc.
+    - Action lists referencing the wrong element or bounding boxes not mapped on properly
+
+<br>
+
+## When you get a Complete
+
+### If it ain’t broke don’t fix it…
+
+- First, celebrate
+- Check **reliability**: run again and again, are any errors popping up on subsequent runs? Add guardrails, change payloads, refine completion criteria
+- Check **accuracy**: is the content correct? Improve prompting and add validation blocks to check the content
+
+### …or maybe fix it
+
+- If you have a **content-sensitive workflow,** plan for edge cases ahead of time
+    - What happens if I end up on a different screen? Set termination criteria preemptively
+    - Add validation blocks to check a review page and make sure the content matches. Make sure to pass in the payload to check!
+- **In ForLoops,** it is especially important to add guardrails since each block builds on the last
+    - For instance, if you are clicking into each item in a table, consider passing in termination criteria that stops the task in the case you’re not looking at the correct page. Pro Tip: set continue on failure and a first block so it continues even if it messes up one!
