@@ -2,16 +2,19 @@ import type { Node } from "@xyflow/react";
 import type { NodeBaseData } from "../types";
 import type { WorkflowParameter } from "../../../types/workflowTypes";
 
-export type HttpRequestNodeData = NodeBaseData & {
-  curlCommand: string | null;
-  method: string;
-  url: string | null;
-  headers: Record<string, string> | null;
-  body: Record<string, unknown> | string | null;
-  timeout: number;
-  followRedirects: boolean;
-  parameterKeys: Array<string>;
-  inputMode: "curl" | "manual";
+export type HttpRequestNodeData = {
+  editable: boolean;
+  label: string;
+  inputMode?: "manual" | "curl";
+  curlCommand?: string;
+  method?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  body?: string | Record<string, unknown>;
+  timeout?: number;
+  followRedirects?: boolean;
+  parameterKeys?: Array<string>;
+  continueOnFailure?: boolean;
 };
 
 export type HttpRequestNode = Node<HttpRequestNodeData, "httpRequest">;
@@ -20,12 +23,11 @@ export const httpRequestNodeDefaultData: HttpRequestNodeData = {
   label: "",
   continueOnFailure: false,
   editable: true,
-  model: null,
-  curlCommand: null,
+  curlCommand: "",
   method: "GET",
-  url: null,
-  headers: null,
-  body: null,
+  url: "",
+  headers: {},
+  body: "",
   timeout: 30,
   followRedirects: true,
   parameterKeys: [],

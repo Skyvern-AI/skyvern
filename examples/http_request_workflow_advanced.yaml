@@ -1,0 +1,121 @@
+title: Advanced HTTP Request Workflow Example
+description: Demonstrates advanced features of the HTTP Request block including authentication, data transformation, and error handling
+
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: api_key
+      description: API key for authentication
+      value: "sk-example-key"
+    - parameter_type: workflow
+      key: user_id
+      description: User ID to fetch data for
+      value: "12345"
+
+  blocks:
+    # Example 1: Simple GET request with authentication header
+    - block_type: http_request
+      label: fetch_user_profile
+      method: GET
+      url: "https://api.example.com/users/{{ user_id }}"
+      headers:
+        Authorization: "Bearer {{ api_key }}"
+        Accept: "application/json"
+      timeout: 30
+      follow_redirects: true
+
+    # Example 2: POST request with JSON body
+    - block_type: http_request
+      label: create_notification
+      method: POST
+      url: "https://api.example.com/notifications"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer {{ api_key }}"
+      body:
+        user_id: "{{ user_id }}"
+        message: "Welcome {{ fetch_user_profile_output.body.name }}!"
+        type: "info"
+        timestamp: "{{ current_timestamp }}"
+      timeout: 15
+
+    # Example 3: Using curl command for complex request
+    - block_type: http_request
+      label: github_api_curl
+      curl_command: |
+        curl -X GET 'https://api.github.com/repos/Skyvern-AI/skyvern/releases/latest' \
+          -H 'Accept: application/vnd.github.v3+json' \
+          -H 'User-Agent: Skyvern-Workflow'
+
+    # Example 4: Chained requests - use output from previous request
+    - block_type: http_request
+      label: fetch_user_posts
+      method: GET
+      url: "{{ fetch_user_profile_output.body.posts_url }}"
+      headers:
+        Authorization: "Bearer {{ api_key }}"
+      parameters:
+        - key: github_api_curl_output
+        - key: fetch_user_profile_output
+
+    # Example 5: PUT request with form data
+    - block_type: http_request
+      label: update_user_status
+      method: PUT
+      url: "https://api.example.com/users/{{ user_id }}/status"
+      headers:
+        Content-Type: "application/x-www-form-urlencoded"
+        Authorization: "Bearer {{ api_key }}"
+      body: "status=active&last_seen={{ current_timestamp }}&post_count={{ fetch_user_posts_output.body.total }}"
+
+    # Example 6: DELETE request
+    - block_type: http_request
+      label: cleanup_old_session
+      method: DELETE
+      url: "https://api.example.com/sessions/{{ fetch_user_profile_output.body.session_id }}"
+      headers:
+        Authorization: "Bearer {{ api_key }}"
+      continue_on_failure: true
+
+    # Example 7: Using response data in subsequent blocks
+    - block_type: text_prompt
+      label: analyze_github_release
+      prompt: |
+        Analyze the latest Skyvern release information:
+        
+        Release Name: {{ github_api_curl_output.body.name }}
+        Published At: {{ github_api_curl_output.body.published_at }}
+        Body: {{ github_api_curl_output.body.body }}
+        
+        Provide a summary of the key features and improvements.
+
+    # Example 8: Error handling with validation
+    - block_type: validation
+      label: check_api_responses
+      complete_criterion: |
+        All API requests completed successfully with status codes in the 200-299 range.
+        User profile fetch status: {{ fetch_user_profile_output.status_code }}
+        Notification creation status: {{ create_notification_output.status_code }}
+      terminate_criterion: |
+        Any critical API request failed with status code >= 400
+
+    # Example 9: Webhook callback
+    - block_type: http_request
+      label: send_webhook_notification
+      method: POST
+      url: "https://webhook.site/your-webhook-url"
+      headers:
+        Content-Type: "application/json"
+      body:
+        workflow_id: "{{ workflow_id }}"
+        status: "completed"
+        results:
+          user_profile: "{{ fetch_user_profile_output.body }}"
+          github_release: "{{ github_api_curl_output.body.tag_name }}"
+          analysis: "{{ analyze_github_release_output }}"
+      timeout: 10
+
+# Workflow settings
+settings:
+  persist_browser_session: false
+  webhook_callback_url: "https://webhook.site/workflow-callback"
