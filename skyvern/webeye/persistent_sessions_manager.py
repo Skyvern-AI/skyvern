@@ -50,7 +50,7 @@ class PersistentSessionsManager:
         available OSS-side.
         """
 
-        LOG.info("Begin browser session", browser_session_id=browser_session_id)
+        LOG.info("Begin browser session", browser_session_id=browser_session_id, runnable_type=runnable_type, runnable_id=runnable_id, organization_id=organization_id)
 
         persistent_browser_session = await self.database.get_persistent_browser_session(
             browser_session_id, organization_id
@@ -59,12 +59,85 @@ class PersistentSessionsManager:
         if persistent_browser_session is None:
             raise Exception(f"Persistent browser session not found for {browser_session_id}")
 
+        LOG.info("Found persistent browser session, calling occupy_browser_session", browser_session_id=browser_session_id, runnable_type=runnable_type, runnable_id=runnable_id)
+
         await self.occupy_browser_session(
             session_id=browser_session_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
             organization_id=organization_id,
         )
+
+        LOG.info("Successfully occupied browser session", browser_session_id=browser_session_id, runnable_type=runnable_type, runnable_id=runnable_id)
+
+        # For OSS version, ensure the browser state is available for the workflow run
+        # In cloud version, this would be handled by temporal and ECS fargate
+        browser_session = self._browser_sessions.get(browser_session_id)
+        if browser_session and browser_session.browser_state:
+            # The browser state already exists, we just need to make sure it's associated with the runnable
+            LOG.info(
+                "Browser session already has browser state, ready for workflow run",
+                browser_session_id=browser_session_id,
+                runnable_id=runnable_id,
+                runnable_type=runnable_type,
+            )
+        else:
+            # Browser state doesn't exist, create it for OSS version
+            LOG.info(
+                "Creating browser state for workflow run in OSS version",
+                browser_session_id=browser_session_id,
+                runnable_id=runnable_id,
+                runnable_type=runnable_type,
+            )
+            
+            try:
+                from skyvern.webeye.browser_factory import BrowserState
+                from playwright.async_api import async_playwright
+                
+                # Create a new browser state
+                pw = await async_playwright().start()
+                from skyvern.webeye.browser_factory import BrowserContextFactory
+                
+                (
+                    browser_context,
+                    browser_artifacts,
+                    browser_cleanup,
+                ) = await BrowserContextFactory.create_browser_context(
+                    pw,
+                    organization_id=organization_id,
+                )
+                
+                browser_state = BrowserState(
+                    pw=pw,
+                    browser_context=browser_context,
+                    page=None,
+                    browser_artifacts=browser_artifacts,
+                    browser_cleanup=browser_cleanup,
+                )
+                
+                # Store the browser state in memory
+                browser_session = BrowserSession(
+                    browser_state=browser_state,
+                    cdp_port=0,  # Not used in OSS version
+                    cdp_host="localhost"
+                )
+                self._browser_sessions[browser_session_id] = browser_session
+                
+                LOG.info(
+                    "Created browser state for workflow run",
+                    browser_session_id=browser_session_id,
+                    runnable_id=runnable_id,
+                    runnable_type=runnable_type,
+                )
+                
+            except Exception as e:
+                LOG.warning(
+                    "Failed to create browser state for workflow run",
+                    browser_session_id=browser_session_id,
+                    runnable_id=runnable_id,
+                    runnable_type=runnable_type,
+                    error=str(e),
+                )
 
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
 
@@ -92,7 +165,71 @@ class PersistentSessionsManager:
     async def get_browser_state(self, session_id: str, organization_id: str | None = None) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)
-        return browser_session.browser_state if browser_session else None
+        if browser_session:
+            return browser_session.browser_state
+        
+        # For OSS version, if browser state doesn't exist in memory but session exists in database,
+        # create a new browser state
+        if organization_id:
+            try:
+                # Check if session exists in database
+                db_session = await self.database.get_persistent_browser_session(session_id, organization_id)
+                if db_session and db_session.deleted_at is None:
+                    LOG.info(
+                        "Browser state not found in memory but session exists in database, creating new browser state for OSS version",
+                        browser_session_id=session_id,
+                        organization_id=organization_id,
+                    )
+                    
+                    from skyvern.webeye.browser_factory import BrowserState
+                    from playwright.async_api import async_playwright
+                    
+                    # Create a new browser state
+                    pw = await async_playwright().start()
+                    from skyvern.webeye.browser_factory import BrowserContextFactory
+                    
+                    (
+                        browser_context,
+                        browser_artifacts,
+                        browser_cleanup,
+                    ) = await BrowserContextFactory.create_browser_context(
+                        pw,
+                        organization_id=organization_id,
+                    )
+                    
+                    browser_state = BrowserState(
+                        pw=pw,
+                        browser_context=browser_context,
+                        page=None,
+                        browser_artifacts=browser_artifacts,
+                        browser_cleanup=browser_cleanup,
+                    )
+                    
+                    # Store the browser state in memory
+                    browser_session = BrowserSession(
+                        browser_state=browser_state,
+                        cdp_port=0,  # Not used in OSS version
+                        cdp_host="localhost"
+                    )
+                    self._browser_sessions[session_id] = browser_session
+                    
+                    LOG.info(
+                        "Created new browser state for existing session",
+                        browser_session_id=session_id,
+                        organization_id=organization_id,
+                    )
+                    
+                    return browser_state
+                    
+            except Exception as e:
+                LOG.warning(
+                    "Failed to create browser state for existing session",
+                    browser_session_id=session_id,
+                    organization_id=organization_id,
+                    error=str(e),
+                )
+        
+        return None
 
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
@@ -118,6 +255,55 @@ class PersistentSessionsManager:
             runnable_id=runnable_id,
             timeout_minutes=timeout_minutes,
         )
+
+        # For OSS version, create an actual browser state since cloud infrastructure is not available
+        # In cloud version, this would be handled by temporal and ECS fargate
+        try:
+            from skyvern.webeye.browser_factory import BrowserState
+            from playwright.async_api import async_playwright
+            
+            # Create a new browser state
+            pw = await async_playwright().start()
+            from skyvern.webeye.browser_factory import BrowserContextFactory
+            
+            (
+                browser_context,
+                browser_artifacts,
+                browser_cleanup,
+            ) = await BrowserContextFactory.create_browser_context(
+                pw,
+                organization_id=organization_id,
+            )
+            
+            browser_state = BrowserState(
+                pw=pw,
+                browser_context=browser_context,
+                page=None,
+                browser_artifacts=browser_artifacts,
+                browser_cleanup=browser_cleanup,
+            )
+            
+            # Store the browser state in memory
+            browser_session = BrowserSession(
+                browser_state=browser_state,
+                cdp_port=0,  # Not used in OSS version
+                cdp_host="localhost"
+            )
+            self._browser_sessions[browser_session_db.persistent_browser_session_id] = browser_session
+            
+            LOG.info(
+                "Created browser state for OSS version",
+                browser_session_id=browser_session_db.persistent_browser_session_id,
+                organization_id=organization_id,
+            )
+            
+        except Exception as e:
+            LOG.warning(
+                "Failed to create browser state for OSS version, session will be created in database only",
+                browser_session_id=browser_session_db.persistent_browser_session_id,
+                organization_id=organization_id,
+                error=str(e),
+            )
 
         return browser_session_db
 

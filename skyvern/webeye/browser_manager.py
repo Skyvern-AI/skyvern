@@ -163,6 +163,10 @@ class BrowserManager:
                 raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                # Store the browser state in the browser manager's pages dictionary with the workflow run ID
+                self.pages[workflow_run_id] = browser_state
+                if parent_workflow_run_id:
+                    self.pages[parent_workflow_run_id] = browser_state
                 page = await browser_state.get_working_page()
                 if page:
                     if url:

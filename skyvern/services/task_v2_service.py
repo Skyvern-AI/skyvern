@@ -204,13 +204,33 @@ async def initialize_task_v2(
     # validate
     LOG.info(f"Initialized task v2 initial response: {metadata_response}")
     url: str = user_url or metadata_response.get("url", "")
+    
     if not url:
-        raise UrlGenerationFailure()
+        if browser_session_id:
+            try:
+                # Get the current URL from the browser session
+                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    browser_session_id, organization_id=organization.organization_id
+                )
+                if browser_state:
+                    page = await browser_state.get_working_page()
+                    if page:
+                        url = await SkyvernFrame.get_url(page)
+                        LOG.info(f"Extracted current URL from browser session: {url}")
+                    else:
+                        LOG.error("Could not get working page from browser session")
+                else:
+                    LOG.error("Could not get browser state for session")
+            except Exception as e:
+                LOG.error(f"Failed to extract URL from browser session: {e}")
+        if not url:
+            raise UrlGenerationFailure()
     title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
     metadata = TaskV2Metadata(
         url=url,
         workflow_title=title,
     )
+
     url = metadata.url
     if not url:
         raise UrlGenerationFailure()
@@ -240,6 +260,7 @@ async def initialize_task_v2(
             max_steps_override=max_steps_override,
             parent_workflow_run_id=parent_workflow_run_id,
         )
+        LOG.info("Created workflow run with browser session", workflow_run_id=workflow_run.workflow_run_id, browser_session_id=browser_session_id)
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
         # fail the workflow run
@@ -785,6 +806,7 @@ async def run_task_v2_helper(
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
             max_screenshot_scrolling_times=task_v2.max_screenshot_scrolling_times,
+            persist_browser_session=browser_session_id is not None,
         )
         LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
