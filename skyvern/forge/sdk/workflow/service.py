@@ -232,12 +232,15 @@ class WorkflowService:
             raise e
 
         if workflow_request.browser_session_id:
+            LOG.info("Calling begin_session for browser session", browser_session_id=workflow_request.browser_session_id, workflow_run_id=workflow_run.workflow_run_id, organization_id=organization.organization_id)
             await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
                 browser_session_id=workflow_request.browser_session_id,
                 runnable_type="workflow_run",
                 runnable_id=workflow_run.workflow_run_id,
                 organization_id=organization.organization_id,
             )
+        else:
+            LOG.info("No browser_session_id provided in workflow_request", workflow_run_id=workflow_run.workflow_run_id)
 
         return workflow_run
 

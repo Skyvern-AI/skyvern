@@ -1,11 +1,11 @@
-You're to assist the user to achieve the user goal in the browser. Given the user input, what is the url to type into the browser? Also come up with a proper title for this goal to achieve.
+You're to assist the user to achieve the user goal in the browser. Given the user input, determine if a specific URL is needed or if the task should work with the current page. Also come up with a proper title for this goal to achieve.
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in JSON format with the following keys:
 {
-  "thoughts": str, // Think step by step. Has the user specify a url to go? If yes, what is the complete url user specified? If not, to achieve what the user wants to do, what is most likely website url for achieving the goal?
-  "url": str, // The initial url to type into the browser. If the user specified one, use exactly that url.
+  "thoughts": str, // Think step by step. Has the user specified a url to go? If yes, what is the complete url user specified? If not, to achieve what the user wants to do, what is most likely website url for achieving the goal? If the user wants to work with the current page, leave url empty.
+  "url": str, // The initial url to type into the browser. If the user specified one, use exactly that url. If the user wants to work with the current page or no specific URL is needed, leave this empty or omit it.
   "title": str, // A descriptive and informative title for the goal. Use no more than 5 words
 }
 
