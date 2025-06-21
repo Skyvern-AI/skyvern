@@ -11,6 +11,7 @@ import pydantic
 class ExtractionBlockYaml(UniversalBaseModel):
     label: str
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     data_extraction_goal: str
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None

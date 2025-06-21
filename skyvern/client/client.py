@@ -54,6 +54,7 @@ class Skyvern:
 
 
     api_key : typing.Optional[str]
+    x_api_key : str
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -69,6 +70,7 @@ class Skyvern:
 
     client = Skyvern(
         api_key="YOUR_API_KEY",
+        x_api_key="YOUR_X_API_KEY",
     )
     """
 
@@ -78,6 +80,7 @@ class Skyvern:
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
         api_key: typing.Optional[str] = None,
+        x_api_key: str,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.Client] = None,
@@ -86,6 +89,7 @@ class Skyvern:
         self._client_wrapper = SyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
             api_key=api_key,
+            x_api_key=x_api_key,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.Client(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -110,6 +114,7 @@ class Skyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -188,6 +193,10 @@ class Skyvern:
 
             Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
+        model : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
+
+            Optional model configuration.
+
         publish_workflow : typing.Optional[bool]
             Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
 
@@ -208,6 +217,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.run_task(
             prompt="Find the top 3 posts on Hacker News.",
@@ -231,6 +241,7 @@ class Skyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "model": model,
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
             },
@@ -362,6 +373,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.run_workflow(
             workflow_id="wpid_123",
@@ -447,6 +459,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_run(
             run_id="tsk_123",
@@ -516,6 +529,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.cancel_run(
             run_id="run_id",
@@ -592,6 +606,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_workflows()
         """
@@ -664,6 +679,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.create_workflow()
         """
@@ -739,6 +755,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.update_workflow(
             workflow_id="wpid_123",
@@ -805,6 +822,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.delete_workflow(
             workflow_id="wpid_123",
@@ -861,6 +879,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_artifact(
             artifact_id="artifact_id",
@@ -930,6 +949,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.retry_run_webhook(
             run_id="tsk_123",
@@ -986,6 +1006,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_browser_sessions()
         """
@@ -1053,6 +1074,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.create_browser_session()
         """
@@ -1127,6 +1149,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.close_browser_session(
             browser_session_id="pbs_123456",
@@ -1196,6 +1219,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_browser_session(
             browser_session_id="pbs_123456",
@@ -1302,6 +1326,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.send_totp_code(
             totp_identifier="john.doe@example.com",
@@ -1382,6 +1407,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_credentials()
         """
@@ -1454,6 +1480,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.create_credential(
             name="My Credential",
@@ -1527,6 +1554,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.delete_credential(
             credential_id="cred_1234567890",
@@ -1580,6 +1608,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_credential(
             credential_id="cred_1234567890",
@@ -1634,6 +1663,7 @@ class AsyncSkyvern:
 
 
     api_key : typing.Optional[str]
+    x_api_key : str
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -1649,6 +1679,7 @@ class AsyncSkyvern:
 
     client = AsyncSkyvern(
         api_key="YOUR_API_KEY",
+        x_api_key="YOUR_X_API_KEY",
     )
     """
 
@@ -1658,6 +1689,7 @@ class AsyncSkyvern:
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
         api_key: typing.Optional[str] = None,
+        x_api_key: str,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.AsyncClient] = None,
@@ -1666,6 +1698,7 @@ class AsyncSkyvern:
         self._client_wrapper = AsyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
             api_key=api_key,
+            x_api_key=x_api_key,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.AsyncClient(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -1690,6 +1723,7 @@ class AsyncSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -1768,6 +1802,10 @@ class AsyncSkyvern:
 
             Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
+        model : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
+
+            Optional model configuration.
+
         publish_workflow : typing.Optional[bool]
             Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
 
@@ -1790,6 +1828,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -1819,6 +1858,7 @@ class AsyncSkyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "model": model,
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
             },
@@ -1952,6 +1992,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2045,6 +2086,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2122,6 +2164,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2206,6 +2249,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2286,6 +2330,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2369,6 +2414,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2443,6 +2489,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2509,6 +2556,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2586,6 +2634,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2650,6 +2699,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2725,6 +2775,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2807,6 +2858,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2884,6 +2936,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2998,6 +3051,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -3086,6 +3140,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -3166,6 +3221,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -3249,6 +3305,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -3310,6 +3367,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 

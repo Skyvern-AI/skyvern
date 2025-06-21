@@ -11,6 +11,7 @@ class UploadToS3Block(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:

@@ -13,6 +13,7 @@ class CodeBlock(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     code: str
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
 

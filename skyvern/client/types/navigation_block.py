@@ -15,6 +15,7 @@ class NavigationBlock(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
