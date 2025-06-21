@@ -121,7 +121,7 @@ function TaskParameters() {
         <div className="w-72">
           <h1 className="text-lg">Extra HTTP Headers</h1>
           <h2 className="text-base text-slate-400">
-            Specify some self defined HTTP requests headers in Dict format
+            Specify some self-defined HTTP requests headers
           </h2>
         </div>
         <div className="w-full">

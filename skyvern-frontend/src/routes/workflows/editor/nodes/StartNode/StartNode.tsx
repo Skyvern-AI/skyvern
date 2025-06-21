@@ -139,7 +139,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                     <div className="space-y-2">
                       <div className="flex items-center gap-2">
                         <Label>Extra HTTP Headers</Label>
-                        <HelpTooltip content="Specify some self defined HTTP requests headers in Dict format" />
+                        <HelpTooltip content="Specify some self-defined HTTP requests headers" />
                       </div>
                       <KeyValueInput
                         value={inputs.extraHttpHeaders ?? null}
