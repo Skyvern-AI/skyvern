@@ -61,6 +61,9 @@ function WorkflowEditor() {
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
     maxScreenshotScrollingTimes: workflow.max_screenshot_scrolling_times,
+    extraHttpHeaders: workflow.extra_http_headers
+      ? JSON.stringify(workflow.extra_http_headers)
+      : null,
   };
 
   const elements = getElements(
