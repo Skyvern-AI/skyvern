@@ -128,6 +128,7 @@ async def run_task(
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
+    LOG.info(f"[DEBUG] Handler received browser_session_id: {run_request.browser_session_id}")
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
 
@@ -226,6 +227,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
                 extra_http_headers=run_request.extra_http_headers,
+                browser_session_id=run_request.browser_session_id,
             )
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e

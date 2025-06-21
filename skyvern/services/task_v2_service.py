@@ -206,24 +206,44 @@ async def initialize_task_v2(
     url: str = user_url or metadata_response.get("url", "")
     
     if not url:
+        LOG.info(f"No URL from prompt/metadata, attempting to extract from browser session. browser_session_id={browser_session_id}, org_id={organization.organization_id}")
         if browser_session_id:
             try:
-                # Get the current URL from the browser session
                 browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                     browser_session_id, organization_id=organization.organization_id
                 )
                 if browser_state:
-                    page = await browser_state.get_working_page()
-                    if page:
-                        url = await SkyvernFrame.get_url(page)
-                        LOG.info(f"Extracted current URL from browser session: {url}")
+                    LOG.info(f"Got browser_state for session {browser_session_id}")
+                    
+                    # FYI: `browser_state.get_working_page()` will not work because it returns None
+                    # Get the current page directly from browser context to avoid stale references
+                    if browser_state.browser_context and browser_state.browser_context.pages:
+                        current_page = browser_state.browser_context.pages[-1]  # Get the most recent page
+                        LOG.info(f"Got current page from browser context for session {browser_session_id}")
+                        
+                        # Set the working page to the existing page to avoid creating a new blank page
+                        await browser_state.set_working_page(current_page, len(browser_state.browser_context.pages) - 1)
+                        LOG.info(f"Set working page for session {browser_session_id}")
+                        
+                        current_url = await SkyvernFrame.get_url(current_page)
+                        LOG.info(f"Current URL from browser session: {current_url}")
+                        if current_url and current_url != "about:blank":
+                            url = current_url
+                            LOG.info(f"Using current URL from browser session: {url}")
+                        else:
+                            LOG.info(f"Browser session has blank page ({current_url}), but allowing task to proceed since user will navigate manually")
+                            # Allow the task to proceed with empty URL when using browser session
+                            # The user will manually navigate to the desired page
                     else:
-                        LOG.error("Could not get working page from browser session")
+                        LOG.warning(f"No pages found in browser context for session {browser_session_id}")
                 else:
-                    LOG.error("Could not get browser state for session")
+                    LOG.error(f"Could not get browser state for session {browser_session_id}")
             except Exception as e:
-                LOG.error(f"Failed to extract URL from browser session: {e}")
+                LOG.error(f"Failed to extract URL from browser session {browser_session_id}: {e}")
+        
+        # Only raise error if no browser session is provided
         if not url:
+            LOG.error(f"UrlGenerationFailure: No URL could be determined for browser_session_id={browser_session_id}")
             raise UrlGenerationFailure()
     title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
     metadata = TaskV2Metadata(
