@@ -664,6 +664,7 @@ function getElements(
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
       maxScreenshotScrollingTimes: settings.maxScreenshotScrollingTimes,
+      extraHttpHeaders: settings.extraHttpHeaders,
       editable,
     }),
   );
@@ -1325,6 +1326,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     webhookCallbackUrl: null,
     model: null,
     maxScreenshotScrollingTimes: null,
+    extraHttpHeaders: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1341,6 +1343,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
       maxScreenshotScrollingTimes: data.maxScreenshotScrollingTimes,
+      extraHttpHeaders: data.extraHttpHeaders,
     };
   }
   return defaultSettings;
@@ -1997,6 +2000,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
     max_screenshot_scrolling_times: workflow.max_screenshot_scrolling_times,
+    extra_http_headers: workflow.extra_http_headers,
     workflow_definition: {
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),

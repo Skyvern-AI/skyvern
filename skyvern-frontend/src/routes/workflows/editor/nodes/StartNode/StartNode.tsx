@@ -21,6 +21,7 @@ import { ModelsResponse } from "@/api/types";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "../Taskv2Node/types";
+import { KeyValueInput } from "@/components/KeyValueInput";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const credentialGetter = useCredentialGetter();
@@ -55,6 +56,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     maxScreenshotScrollingTimes: data.withWorkflowSettings
       ? data.maxScreenshotScrollingTimes
       : null,
+    extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -133,6 +135,19 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Label>Extra HTTP Headers</Label>
+                        <HelpTooltip content="Specify some self-defined HTTP requests headers" />
+                      </div>
+                      <KeyValueInput
+                        value={inputs.extraHttpHeaders ?? null}
+                        onChange={(val) =>
+                          handleChange("extraHttpHeaders", val)
+                        }
+                        addButtonText="Add Header"
+                      />
                     </div>
                     <div className="space-y-2">
                       <div className="flex items-center gap-2">
