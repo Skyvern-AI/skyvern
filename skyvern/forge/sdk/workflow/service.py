@@ -1184,6 +1184,7 @@ class WorkflowService:
             webhook_callback_url=workflow_run.webhook_callback_url,
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
+            extra_http_headers=workflow_run.extra_http_headers,
             queued_at=workflow_run.queued_at,
             started_at=workflow_run.started_at,
             finished_at=workflow_run.finished_at,
