@@ -111,6 +111,33 @@ services:
     # Maximum tokens to use: (only set for OpenRouter aand Ollama)
     # - LLM_CONFIG_MAX_TOKENS=128000
 
+    # =========================
+    #   Storage Configuration - Choose between local, S3, or Azure Blob Storage
+    # =========================
+    # Default is local storage. To use cloud storage, uncomment one of the sections below:
+    
+    # AWS S3 Storage:
+    # - SKYVERN_STORAGE_TYPE=s3
+    # - AWS_REGION=us-east-1
+    # - AWS_S3_BUCKET_ARTIFACTS=skyvern-artifacts
+    # - AWS_S3_BUCKET_SCREENSHOTS=skyvern-screenshots
+    # - AWS_S3_BUCKET_BROWSER_SESSIONS=skyvern-browser-sessions
+    # - AWS_S3_BUCKET_UPLOADS=skyvern-uploads
+    # Also ensure your AWS credentials are configured (via IAM role, env vars, or ~/.aws/credentials)
+    
+    # Azure Blob Storage:
+    # - SKYVERN_STORAGE_TYPE=azure
+    # Option 1: Using Connection String (recommended)
+    # - AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=your_account;AccountKey=your_key;EndpointSuffix=core.windows.net
+    # Option 2: Using Account Name and Key
+    # - AZURE_STORAGE_ACCOUNT_NAME=your_storage_account_name
+    # - AZURE_STORAGE_ACCOUNT_KEY=your_storage_account_key
+    # Container names (optional - these are the defaults)
+    # - AZURE_STORAGE_CONTAINER_ARTIFACTS=skyvern-artifacts
+    # - AZURE_STORAGE_CONTAINER_SCREENSHOTS=skyvern-screenshots
+    # - AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS=skyvern-browser-sessions
+    # - AZURE_STORAGE_CONTAINER_UPLOADS=skyvern-uploads
+
     # Bitwarden Settings
     # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
     # - BITWARDEN_SERVER=http://localhost  # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN

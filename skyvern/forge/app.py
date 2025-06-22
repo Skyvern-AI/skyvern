@@ -10,6 +10,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.artifact.storage.azure_blob import AzureBlobStorage
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
@@ -28,6 +29,8 @@ DATABASE = AgentDB(
 )
 if SettingsManager.get_settings().SKYVERN_STORAGE_TYPE == "s3":
     StorageFactory.set_storage(S3Storage())
+elif SettingsManager.get_settings().SKYVERN_STORAGE_TYPE == "azure":
+    StorageFactory.set_storage(AzureBlobStorage())
 STORAGE = StorageFactory.get_storage()
 CACHE = CacheFactory.get_cache()
 ARTIFACT_MANAGER = ArtifactManager()
