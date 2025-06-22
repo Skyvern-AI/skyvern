@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: skyvern-backend
+  namespace: skyvern
+spec:
+  type: ClusterIP # Or LoadBalancer
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+    - name: cdp
+      port: 9222
+      targetPort: 9222
+  selector:
+    app: skyvern-backend
