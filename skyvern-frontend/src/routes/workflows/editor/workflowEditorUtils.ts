@@ -1,4 +1,4 @@
-import Dagre from "@dagrejs/dagre";
+import * as Dagre from "@dagrejs/dagre";
 import type { Node } from "@xyflow/react";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
@@ -525,6 +525,11 @@ function convertToNode(
           url: block.url,
         },
       };
+    }
+    default: {
+      throw new Error(
+        `Unknown block type: ${(block as WorkflowBlock).block_type}`,
+      );
     }
   }
 }
@@ -1982,6 +1987,11 @@ function convertBlocksToBlockYAML(
           url: block.url,
         };
         return blockYaml;
+      }
+      default: {
+        throw new Error(
+          `Unknown block type: ${(block as WorkflowBlock).block_type}`,
+        );
       }
     }
   });
