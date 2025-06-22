@@ -1033,7 +1033,11 @@ class AgentDB:
             elif run.task_run_type == RunType.task_v2:
                 query = query.filter_by(observer_cruise_id=run.run_id)
             elif run.task_run_type == RunType.workflow_run:
-                query = query.filter_by(workflow_run_id=run.run_id)
+                # For workflow runs, artifacts are linked through tasks, not directly by workflow_run_id
+                # Most artifacts have workflow_run_id as NULL, so we need to JOIN with tasks
+                query = query.join(TaskModel, TaskModel.task_id == ArtifactModel.task_id).filter(
+                    TaskModel.workflow_run_id == run.run_id
+                )
             else:
                 return []
 
