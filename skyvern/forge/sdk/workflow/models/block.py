@@ -2558,7 +2558,12 @@ class TaskV2Block(Block):
         # Determine block status from task status using module-level mapping
         block_status = TASKV2_TO_BLOCK_STATUS.get(task_v2.status, BlockStatus.failed)
         success = task_v2.status == TaskV2Status.completed
-        failure_reason = task_v2.failure_reason
+        failure_reason: str | None = None
+        task_v2_workflow_run_id = task_v2.workflow_run_id
+        if task_v2_workflow_run_id:
+            task_v2_workflow_run = await app.DATABASE.get_workflow_run(task_v2_workflow_run_id, organization_id)
+            if task_v2_workflow_run:
+                failure_reason = task_v2_workflow_run.failure_reason
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure

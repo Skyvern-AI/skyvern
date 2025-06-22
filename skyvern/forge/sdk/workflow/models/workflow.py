@@ -152,6 +152,7 @@ class WorkflowRunResponseBase(BaseModel):
     webhook_callback_url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
+    extra_http_headers: dict[str, str] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
