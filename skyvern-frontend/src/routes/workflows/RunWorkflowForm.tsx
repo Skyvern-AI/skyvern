@@ -11,6 +11,7 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { KeyValueInput } from "@/components/KeyValueInput";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -36,6 +37,7 @@ type Props = {
     proxyLocation: ProxyLocation;
     webhookCallbackUrl: string;
     maxScreenshotScrollingTimes: number | null;
+    extraHttpHeaders: Record<string, string> | null;
   };
 };
 
@@ -76,6 +78,7 @@ type RunWorkflowRequestBody = {
   webhook_callback_url?: string | null;
   browser_session_id: string | null;
   max_screenshot_scrolling_times?: number | null;
+  extra_http_headers?: Record<string, string> | null;
 };
 
 function getRunWorkflowRequestBody(
@@ -87,6 +90,7 @@ function getRunWorkflowRequestBody(
     proxyLocation,
     browserSessionId,
     maxScreenshotScrollingTimes,
+    extraHttpHeaders,
     ...parameters
   } = values;
 
@@ -111,6 +115,15 @@ function getRunWorkflowRequestBody(
     body.webhook_callback_url = webhookCallbackUrl;
   }
 
+  if (extraHttpHeaders) {
+    try {
+      body.extra_http_headers = JSON.parse(extraHttpHeaders);
+    } catch (e) {
+      console.error("Invalid extra Header JSON");
+      body.extra_http_headers = null;
+    }
+  }
+
   return body;
 }
 
@@ -119,6 +132,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   proxyLocation: ProxyLocation;
   browserSessionId: string | null;
   maxScreenshotScrollingTimes: number | null;
+  extraHttpHeaders: string | null;
 };
 
 function RunWorkflowForm({
@@ -141,6 +155,9 @@ function RunWorkflowForm({
       proxyLocation: initialSettings.proxyLocation,
       browserSessionId: browserSessionIdDefault,
       maxScreenshotScrollingTimes: initialSettings.maxScreenshotScrollingTimes,
+      extraHttpHeaders: initialSettings.extraHttpHeaders
+        ? JSON.stringify(initialSettings.extraHttpHeaders)
+        : null,
     },
   });
   const apiCredential = useApiCredential();
@@ -192,6 +209,7 @@ function RunWorkflowForm({
       proxyLocation,
       browserSessionId,
       maxScreenshotScrollingTimes,
+      extraHttpHeaders,
       ...parameters
     } = values;
 
@@ -205,6 +223,7 @@ function RunWorkflowForm({
       proxyLocation,
       browserSessionId,
       maxScreenshotScrollingTimes,
+      extraHttpHeaders,
     });
   }
 
@@ -399,6 +418,40 @@ function RunWorkflowForm({
                           value={
                             field.value === null ? "" : (field.value as string)
                           }
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
+          <FormField
+            key="extraHttpHeaders"
+            control={form.control}
+            name="extraHttpHeaders"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Extra HTTP Headers
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          Specify some self defined HTTP requests headers in
+                          Dict format
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <KeyValueInput
+                          value={field.value ?? ""}
+                          onChange={(val) => field.onChange(val)}
+                          addButtonText="Add Header"
                         />
                       </FormControl>
                       <FormMessage />

@@ -14,6 +14,7 @@ import { MessageIcon } from "@/components/icons/MessageIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Input } from "@/components/ui/input";
+import { KeyValueInput } from "@/components/KeyValueInput";
 import {
   CustomSelectItem,
   Select,
@@ -161,6 +162,7 @@ function PromptBox() {
     useState<string | null>(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
+  const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
@@ -181,6 +183,15 @@ function PromptBox() {
                   return JSON.parse(dataSchema);
                 } catch (e) {
                   return dataSchema;
+                }
+              })()
+            : null,
+          extra_http_headers: extraHttpHeaders
+            ? (() => {
+                try {
+                  return JSON.parse(extraHttpHeaders);
+                } catch (e) {
+                  return extraHttpHeaders;
                 }
               })()
             : null,
@@ -413,6 +424,30 @@ function PromptBox() {
                         setTotpIdentifier(event.target.value);
                       }}
                     />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Extra HTTP Headers</div>
+                      <div className="text-xs text-slate-400">
+                        Specify some self defined HTTP requests headers in Dict
+                        format
+                      </div>
+                    </div>
+                    <div className="flex-1">
+                      <KeyValueInput
+                        value={extraHttpHeaders ?? ""}
+                        onChange={(val) =>
+                          setExtraHttpHeaders(
+                            val === null
+                              ? null
+                              : typeof val === "string"
+                                ? val || null
+                                : JSON.stringify(val),
+                          )
+                        }
+                        addButtonText="Add Header"
+                      />
+                    </div>
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">

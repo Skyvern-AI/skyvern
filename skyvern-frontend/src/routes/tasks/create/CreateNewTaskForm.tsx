@@ -17,6 +17,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { toast } from "@/components/ui/use-toast";
+import { KeyValueInput } from "@/components/KeyValueInput";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -61,6 +62,14 @@ function createTaskRequestObject(
       extractedInformationSchema = formValues.extractedInformationSchema;
     }
   }
+  let extraHttpHeaders = null;
+  if (formValues.extraHttpHeaders) {
+    try {
+      extraHttpHeaders = JSON.parse(formValues.extraHttpHeaders);
+    } catch (e) {
+      extraHttpHeaders = formValues.extraHttpHeaders;
+    }
+  }
   let errorCodeMapping = null;
   if (formValues.errorCodeMapping) {
     try {
@@ -79,6 +88,7 @@ function createTaskRequestObject(
     proxy_location: formValues.proxyLocation ?? ProxyLocation.Residential,
     navigation_payload: transform(formValues.navigationPayload),
     extracted_information_schema: extractedInformationSchema,
+    extra_http_headers: extraHttpHeaders,
     totp_identifier: transform(formValues.totpIdentifier),
     error_code_mapping: errorCodeMapping,
     max_screenshot_scrolling_times: formValues.maxScreenshotScrollingTimes,
@@ -601,6 +611,35 @@ function CreateNewTaskForm({ initialValues }: Props) {
                   )}
                 />
                 <Separator />
+                <FormField
+                  control={form.control}
+                  name="extraHttpHeaders"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-16">
+                        <FormLabel>
+                          <div className="w-72">
+                            <h1 className="text-lg">Extra HTTP Headers</h1>
+                            <h2 className="text-base text-slate-400">
+                              Specify some self defined HTTP requests headers in
+                              Dict format
+                            </h2>
+                          </div>
+                        </FormLabel>
+                        <div className="w-full">
+                          <FormControl>
+                            <KeyValueInput
+                              value={field.value ?? ""}
+                              onChange={(val) => field.onChange(val)}
+                              addButtonText="Add Header"
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </div>
+                      </div>
+                    </FormItem>
+                  )}
+                />
                 <FormField
                   control={form.control}
                   name="errorCodeMapping"

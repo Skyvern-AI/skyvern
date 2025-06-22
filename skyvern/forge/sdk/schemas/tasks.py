@@ -73,6 +73,9 @@ class TaskBase(BaseModel):
         default=None,
         description="The requested schema of the extracted information.",
     )
+    extra_http_headers: dict[str, str] | None = Field(
+        None, description="The extra HTTP headers for the requests in browser."
+    )
     complete_criterion: str | None = Field(
         default=None, description="Criterion to complete", examples=["Complete if 'hello world' shows up on the page"]
     )

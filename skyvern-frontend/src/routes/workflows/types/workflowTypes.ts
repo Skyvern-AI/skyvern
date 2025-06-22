@@ -466,6 +466,7 @@ export type WorkflowApiResponse = {
   workflow_definition: WorkflowDefinition;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
+  extra_http_headers: Record<string, string> | null;
   persist_browser_session: boolean;
   model: WorkflowModel | null;
   totp_verification_url: string | null;
@@ -482,6 +483,7 @@ export type WorkflowSettings = {
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
+  extraHttpHeaders: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

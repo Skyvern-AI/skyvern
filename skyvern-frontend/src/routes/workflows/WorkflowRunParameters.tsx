@@ -37,6 +37,10 @@ function WorkflowRunParameters() {
     ? (location.state.webhookCallbackUrl as string)
     : null;
 
+  const extraHttpHeaders = location.state
+    ? (location.state.extraHttpHeaders as Record<string, string>)
+    : null;
+
   const initialValues = location.state?.data
     ? location.state.data
     : workflowParameters?.reduce(
@@ -115,6 +119,8 @@ function WorkflowRunParameters() {
             maxScreenshotScrollingTimes ??
             workflow.max_screenshot_scrolling_times ??
             null,
+          extraHttpHeaders:
+            extraHttpHeaders ?? workflow.extra_http_headers ?? null,
         }}
       />
     </div>

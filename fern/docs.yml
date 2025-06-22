@@ -70,7 +70,7 @@ navigation:
             path: getting-started/quickstart.mdx
           - page: Skyvern In Action
             path: getting-started/skyvern-in-action.mdx
-          - page: Task Prompting Guide
+          - page: Prompting and Troubleshooting Guide
             path: getting-started/prompting-guide.mdx
       - section: Tasks
         contents:
