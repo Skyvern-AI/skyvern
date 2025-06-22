@@ -607,7 +607,43 @@ function isDOMNodeRepresentDiv(element) {
   return false;
 }
 
-function isInteractableInput(element) {
+function isHoverPointerElement(element, hoverStylesMap) {
+  const tagName = element.tagName.toLowerCase();
+  const elementClassName = element.className.toString();
+  const elementCursor = getElementComputedStyle(element)?.cursor;
+  if (elementCursor === "pointer") {
+    return true;
+  }
+
+  // Check if element has hover styles that change cursor to pointer
+  // This is to handle the case where an element's cursor is "auto", but resolves to "pointer" on hover
+  if (elementCursor === "auto") {
+    // TODO: we need a better algorithm to match the selector with better performance
+    for (const [selector, styles] of hoverStylesMap) {
+      let shouldMatch = false;
+      for (const className of element.classList) {
+        if (selector.includes(className)) {
+          shouldMatch = true;
+          break;
+        }
+      }
+      if (shouldMatch || selector.includes(tagName)) {
+        if (element.matches(selector) && styles.cursor === "pointer") {
+          return true;
+        }
+      }
+    }
+  }
+
+  // FIXME: hardcode to fix the bug about hover style now
+  if (elementClassName.includes("hover:cursor-pointer")) {
+    return true;
+  }
+
+  return false;
+}
+
+function isInteractableInput(element, hoverStylesMap) {
   const tagName = element.tagName.toLowerCase();
   if (tagName !== "input") {
     // let other checks decide
@@ -619,7 +655,10 @@ function isInteractableInput(element) {
   // "city", "state", "zip", "country"
   // That's the reason I (Kerem) removed the valid input types check
   var type = element.getAttribute("type")?.toLowerCase().trim() ?? "text";
-  return !isReadonlyElement(element) && type !== "hidden";
+  return (
+    isHoverPointerElement(element, hoverStylesMap) ||
+    (!isReadonlyElement(element) && type !== "hidden")
+  );
 }
 
 function isValidCSSSelector(selector) {
@@ -656,7 +695,7 @@ function isInteractable(element, hoverStylesMap) {
     return false;
   }
 
-  if (isInteractableInput(element)) {
+  if (isInteractableInput(element, hoverStylesMap)) {
     return true;
   }
 
@@ -779,33 +818,7 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "svg" ||
     tagName === "strong"
   ) {
-    const elementCursor = getElementComputedStyle(element)?.cursor;
-    if (elementCursor === "pointer") {
-      return true;
-    }
-
-    // Check if element has hover styles that change cursor to pointer
-    // This is to handle the case where an element's cursor is "auto", but resolves to "pointer" on hover
-    if (elementCursor === "auto") {
-      // TODO: we need a better algorithm to match the selector with better performance
-      for (const [selector, styles] of hoverStylesMap) {
-        let shouldMatch = false;
-        for (const className of element.classList) {
-          if (selector.includes(className)) {
-            shouldMatch = true;
-            break;
-          }
-        }
-        if (shouldMatch || selector.includes(tagName)) {
-          if (element.matches(selector) && styles.cursor === "pointer") {
-            return true;
-          }
-        }
-      }
-    }
-
-    // FIXME: hardcode to fix the bug about hover style now
-    if (className.includes("hover:cursor-pointer")) {
+    if (isHoverPointerElement(element, hoverStylesMap)) {
       return true;
     }
   }
@@ -2102,13 +2115,14 @@ async function scrollToNextPage(
   draw_boxes,
   frame = "main.frame",
   frame_index = undefined,
+  need_overlap = true,
 ) {
   // remove bounding boxes, scroll to next page with 200px overlap, then draw bounding boxes again
   // return true if there is a next page, false otherwise
   removeBoundingBoxes();
   window.scrollBy({
     left: 0,
-    top: window.innerHeight - 200,
+    top: need_overlap ? window.innerHeight - 200 : window.innerHeight,
     behavior: "instant",
   });
   if (draw_boxes) {

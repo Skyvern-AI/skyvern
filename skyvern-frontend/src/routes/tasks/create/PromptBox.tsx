@@ -14,6 +14,7 @@ import { MessageIcon } from "@/components/icons/MessageIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Input } from "@/components/ui/input";
+import { KeyValueInput } from "@/components/KeyValueInput";
 import {
   CustomSelectItem,
   Select,
@@ -43,7 +44,10 @@ import {
   generateUniqueEmail,
 } from "../data/sampleTaskData";
 import { ExampleCasePill } from "./ExampleCasePill";
-import { MAX_STEPS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import {
+  MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT,
+  MAX_STEPS_DEFAULT,
+} from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -150,11 +154,15 @@ function PromptBox() {
   const [proxyLocation, setProxyLocation] = useState<ProxyLocation>(
     ProxyLocation.Residential,
   );
+  const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
+  const [maxScreenshotScrollingTimes, setMaxScreenshotScrollingTimes] =
+    useState<string | null>(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
+  const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
@@ -165,14 +173,25 @@ function PromptBox() {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
+          browser_session_id: browserSessionId,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
+          max_screenshot_scrolling_times: maxScreenshotScrollingTimes,
           extracted_information_schema: dataSchema
             ? (() => {
                 try {
                   return JSON.parse(dataSchema);
                 } catch (e) {
                   return dataSchema;
+                }
+              })()
+            : null,
+          extra_http_headers: extraHttpHeaders
+            ? (() => {
+                try {
+                  return JSON.parse(extraHttpHeaders);
+                } catch (e) {
+                  return extraHttpHeaders;
                 }
               })()
             : null,
@@ -379,6 +398,21 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
+                      <div className="text-sm">Browser Session ID</div>
+                      <div className="text-xs text-slate-400">
+                        The ID of a persistent browser session
+                      </div>
+                    </div>
+                    <Input
+                      value={browserSessionId ?? ""}
+                      placeholder="pbs_xxx"
+                      onChange={(event) => {
+                        setBrowserSessionId(event.target.value);
+                      }}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
                       <div className="text-sm">2FA Identifier</div>
                       <div className="text-xs text-slate-400">
                         The identifier for a 2FA code for this task.
@@ -390,6 +424,30 @@ function PromptBox() {
                         setTotpIdentifier(event.target.value);
                       }}
                     />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Extra HTTP Headers</div>
+                      <div className="text-xs text-slate-400">
+                        Specify some self defined HTTP requests headers in Dict
+                        format
+                      </div>
+                    </div>
+                    <div className="flex-1">
+                      <KeyValueInput
+                        value={extraHttpHeaders ?? ""}
+                        onChange={(val) =>
+                          setExtraHttpHeaders(
+                            val === null
+                              ? null
+                              : typeof val === "string"
+                                ? val || null
+                                : JSON.stringify(val),
+                          )
+                        }
+                        addButtonText="Add Header"
+                      />
+                    </div>
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
@@ -437,6 +495,21 @@ function PromptBox() {
                         fontSize={8}
                       />
                     </div>
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Max Scrolling Screenshots</div>
+                      <div className="text-xs text-slate-400">
+                        {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                      </div>
+                    </div>
+                    <Input
+                      value={maxScreenshotScrollingTimes ?? ""}
+                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                      onChange={(event) => {
+                        setMaxScreenshotScrollingTimes(event.target.value);
+                      }}
+                    />
                   </div>
                 </div>
               </div>

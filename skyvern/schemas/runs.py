@@ -182,6 +182,7 @@ class RunType(StrEnum):
     workflow_run = "workflow_run"
     openai_cua = "openai_cua"
     anthropic_cua = "anthropic_cua"
+    ui_tars = "ui_tars"
 
 
 class RunEngine(StrEnum):
@@ -189,10 +190,11 @@ class RunEngine(StrEnum):
     skyvern_v2 = "skyvern-2.0"
     openai_cua = "openai-cua"
     anthropic_cua = "anthropic-cua"
+    ui_tars = "ui-tars"
 
 
-CUA_ENGINES = [RunEngine.openai_cua, RunEngine.anthropic_cua]
-CUA_RUN_TYPES = [RunType.openai_cua, RunType.anthropic_cua]
+CUA_ENGINES = [RunEngine.openai_cua, RunEngine.anthropic_cua, RunEngine.ui_tars]
+CUA_RUN_TYPES = [RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]
 
 
 class RunStatus(StrEnum):
@@ -269,13 +271,20 @@ class TaskRunRequest(BaseModel):
         description=MODEL_CONFIG,
         examples=None,
     )
-
+    extra_http_headers: dict[str, str] | None = Field(
+        default=None,
+        description="The extra HTTP headers for the requests in browser.",
+    )
     publish_workflow: bool = Field(
         default=False,
         description="Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
     )
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
+    )
+    max_screenshot_scrolling_times: int | None = Field(
+        default=None,
+        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
     )
 
     @field_validator("url", "webhook_url", "totp_url")
@@ -324,6 +333,14 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
+    max_screenshot_scrolling_times: int | None = Field(
+        default=None,
+        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+    )
+    extra_http_headers: dict[str, str] | None = Field(
+        default=None,
+        description="The extra HTTP headers for the requests in browser.",
+    )
 
     @field_validator("webhook_url", "totp_url")
     @classmethod
@@ -357,16 +374,26 @@ class BaseRunResponse(BaseModel):
     modified_at: datetime = Field(
         description="Timestamp when this run was last modified", examples=["2025-01-01T00:05:00Z"]
     )
+    queued_at: datetime | None = Field(default=None, description="Timestamp when this run was queued")
+    started_at: datetime | None = Field(default=None, description="Timestamp when this run started execution")
+    finished_at: datetime | None = Field(default=None, description="Timestamp when this run finished")
     app_url: str | None = Field(
         default=None,
         description="URL to the application UI where the run can be viewed",
         examples=["https://app.skyvern.com/tasks/tsk_123", "https://app.skyvern.com/workflows/wpid_123/wr_123"],
     )
+    browser_session_id: str | None = Field(
+        default=None, description="ID of the Skyvern persistent browser session used for this run", examples=["pbs_123"]
+    )
+    max_screenshot_scrolling_times: int | None = Field(
+        default=None,
+        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's NONE or 0, it takes the current view point screenshot.",
+    )
 
 
 class TaskRunResponse(BaseRunResponse):
-    run_type: Literal[RunType.task_v1, RunType.task_v2, RunType.openai_cua, RunType.anthropic_cua] = Field(
-        description="Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua"
+    run_type: Literal[RunType.task_v1, RunType.task_v2, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars] = (
+        Field(description="Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars")
     )
     run_request: TaskRunRequest | None = Field(
         default=None, description="The original request parameters used to start this task run"

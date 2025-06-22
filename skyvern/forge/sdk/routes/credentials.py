@@ -213,7 +213,7 @@ async def delete_credential(
     credential_id: str = Path(
         ...,
         description="The unique identifier of the credential to delete",
-        example="cred_1234567890",
+        examples=["cred_1234567890"],
         openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -259,7 +259,7 @@ async def get_credential(
     credential_id: str = Path(
         ...,
         description="The unique identifier of the credential",
-        example="cred_1234567890",
+        examples=["cred_1234567890"],
         openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -329,14 +329,14 @@ async def get_credentials(
         1,
         ge=1,
         description="Page number for pagination",
-        example=1,
+        examples=[1],
         openapi_extra={"x-fern-sdk-parameter-name": "page"},
     ),
     page_size: int = Query(
         10,
         ge=1,
         description="Number of items per page",
-        example=10,
+        examples=[10],
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
 ) -> list[CredentialResponse]:

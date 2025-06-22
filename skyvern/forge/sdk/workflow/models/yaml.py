@@ -86,6 +86,12 @@ class BitwardenCreditCardDataParameterYAML(ParameterYAML):
     bitwarden_item_id: str
 
 
+class OnePasswordCredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.ONEPASSWORD] = ParameterType.ONEPASSWORD  # type: ignore
+    vault_id: str
+    item_id: str
+
+
 class WorkflowParameterYAML(ParameterYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -370,6 +376,7 @@ PARAMETER_YAML_SUBCLASSES = (
     | BitwardenLoginCredentialParameterYAML
     | BitwardenSensitiveInformationParameterYAML
     | BitwardenCreditCardDataParameterYAML
+    | OnePasswordCredentialParameterYAML
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
@@ -417,4 +424,6 @@ class WorkflowCreateYAMLRequest(BaseModel):
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
+    max_screenshot_scrolling_times: int | None = None
+    extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published

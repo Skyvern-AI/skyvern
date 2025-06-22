@@ -70,7 +70,7 @@ navigation:
             path: getting-started/quickstart.mdx
           - page: Skyvern In Action
             path: getting-started/skyvern-in-action.mdx
-          - page: Task Prompting Guide
+          - page: Prompting and Troubleshooting Guide
             path: getting-started/prompting-guide.mdx
       - section: Tasks
         contents:
@@ -161,6 +161,9 @@ navigation:
           - section: Workflows
             contents:
               - POST /v1/run/workflows
+              - GET /v1/runs/{run_id}
+              - POST /v1/runs/{run_id}/cancel
+              - POST /v1/runs/{run_id}/retry_webhook
               - GET /v1/workflows
               - POST /v1/workflows
               - POST /v1/workflows/{workflow_id}

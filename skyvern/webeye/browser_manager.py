@@ -31,6 +31,7 @@ class BrowserManager:
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -44,6 +45,7 @@ class BrowserManager:
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
+            extra_http_headers=extra_http_headers,
         )
         return BrowserState(
             pw=pw,
@@ -93,12 +95,7 @@ class BrowserManager:
                 raise MissingBrowserState(task_id=task.task_id)
             else:
                 if task.organization_id:
-                    await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
-                        browser_session_id,
-                        organization_id=task.organization_id,
-                        runnable_type="task",
-                        runnable_id=task.task_id,
-                    )
+                    LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
                 else:
                     LOG.warning("Organization ID is not set for task", task_id=task.task_id)
                 page = await browser_state.get_working_page()
@@ -114,6 +111,7 @@ class BrowserManager:
                 url=task.url,
                 task_id=task.task_id,
                 organization_id=task.organization_id,
+                extra_http_headers=task.extra_http_headers,
             )
 
         self.pages[task.task_id] = browser_state
@@ -123,7 +121,11 @@ class BrowserManager:
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
         await browser_state.get_or_create_page(
-            url=task.url, proxy_location=task.proxy_location, task_id=task.task_id, organization_id=task.organization_id
+            url=task.url,
+            proxy_location=task.proxy_location,
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            extra_http_headers=task.extra_http_headers,
         )
         return browser_state
 
@@ -160,12 +162,7 @@ class BrowserManager:
                 )
                 raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
             else:
-                await app.PERSISTENT_SESSIONS_MANAGER.occupy_browser_session(
-                    browser_session_id,
-                    runnable_type="workflow_run",
-                    runnable_id=workflow_run.workflow_run_id,
-                    organization_id=workflow_run.organization_id,
-                )
+                LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
                 page = await browser_state.get_working_page()
                 if page:
                     if url:
@@ -183,6 +180,7 @@ class BrowserManager:
                 url=url,
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
+                extra_http_headers=workflow_run.extra_http_headers,
             )
 
         self.pages[workflow_run_id] = browser_state
@@ -196,6 +194,7 @@ class BrowserManager:
             proxy_location=workflow_run.proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
+            extra_http_headers=workflow_run.extra_http_headers,
         )
         return browser_state
 

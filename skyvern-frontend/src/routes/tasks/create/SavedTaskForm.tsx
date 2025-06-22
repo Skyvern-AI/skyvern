@@ -16,14 +16,14 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { SubmitEvent } from "@/types";
-import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { type ApiCommandOptions } from "@/util/apiCommands";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
-import fetchToCurl from "fetch-to-curl";
 import { useState } from "react";
 import { useForm, useFormState } from "react-hook-form";
 import { Link, useParams } from "react-router-dom";
@@ -737,11 +737,9 @@ function SavedTaskForm({ initialValues }: Props) {
         </TaskFormSection>
 
         <div className="flex justify-end gap-3">
-          <Button
-            type="button"
-            variant="secondary"
-            onClick={async () => {
-              const curl = fetchToCurl({
+          <CopyApiCommandDropdown
+            getOptions={() =>
+              ({
                 method: "POST",
                 url: `${apiBaseUrl}/tasks`,
                 body: createTaskRequestObject(form.getValues()),
@@ -749,19 +747,9 @@ function SavedTaskForm({ initialValues }: Props) {
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
-              });
-              copyText(curl).then(() => {
-                toast({
-                  variant: "success",
-                  title: "Copied successfully",
-                  description: "cURL copied to clipboard",
-                });
-              });
-            }}
-          >
-            <CopyIcon className="mr-2 h-4 w-4" />
-            cURL
-          </Button>
+              }) satisfies ApiCommandOptions
+            }
+          />
           <Button
             type="submit"
             name="save"

@@ -30,9 +30,15 @@ function WorkflowRunParameters() {
   const proxyLocation = location.state
     ? (location.state.proxyLocation as ProxyLocation)
     : null;
+  const maxScreenshotScrollingTimes =
+    location.state?.maxScreenshotScrollingTimes ?? null;
 
   const webhookCallbackUrl = location.state
     ? (location.state.webhookCallbackUrl as string)
+    : null;
+
+  const extraHttpHeaders = location.state
+    ? (location.state.extraHttpHeaders as Record<string, string>)
     : null;
 
   const initialValues = location.state?.data
@@ -109,6 +115,12 @@ function WorkflowRunParameters() {
             ProxyLocation.Residential,
           webhookCallbackUrl:
             webhookCallbackUrl ?? workflow.webhook_callback_url ?? "",
+          maxScreenshotScrollingTimes:
+            maxScreenshotScrollingTimes ??
+            workflow.max_screenshot_scrolling_times ??
+            null,
+          extraHttpHeaders:
+            extraHttpHeaders ?? workflow.extra_http_headers ?? null,
         }}
       />
     </div>

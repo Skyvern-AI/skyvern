@@ -105,10 +105,11 @@ async def save_workflow_run_block_logs(workflow_run_block_id: str) -> None:
 
 
 async def _save_log_artifacts(
+    *,
     log: list[dict],
     log_entity_type: LogEntityType,
     log_entity_id: str,
-    organization_id: str | None,
+    organization_id: str | None = None,
     step_id: str | None = None,
     task_id: str | None = None,
     workflow_run_id: str | None = None,
@@ -117,7 +118,13 @@ async def _save_log_artifacts(
     try:
         if not settings.ENABLE_LOG_ARTIFACTS:
             return
-
+        if not organization_id:
+            LOG.error(
+                "Organization ID is required to save log artifacts",
+                log_entity_type=log_entity_type,
+                log_entity_id=log_entity_id,
+            )
+            return
         log_json = json.dumps(log, cls=SkyvernJSONLogEncoder, indent=2)
 
         log_artifact = await app.DATABASE.get_artifact_by_entity_id(
