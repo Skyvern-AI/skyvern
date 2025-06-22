@@ -23,6 +23,16 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "AZURE_API_KEY": "",
             "AZURE_API_BASE": "",
             "AZURE_API_VERSION": "",
+            "AZURE_AD_TOKEN": "",
+            "AZURE_TENANT_ID": "",
+            "AZURE_CLIENT_ID": "",
+            "AZURE_CLIENT_SECRET": "",
+            "AZURE_USERNAME": "",
+            "AZURE_PASSWORD": "",
+            "AZURE_SCOPE": "https://cognitiveservices.azure.com/.default",
+            "AZURE_BASE_MODEL": "",
+            "AZURE_O_SERIES_MODEL": "",
+            "AZURE_TTS_DEPLOYMENT": "",
             "ENABLE_AZURE_GPT4O_MINI": "false",
             "AZURE_GPT4O_MINI_DEPLOYMENT": "",
             "AZURE_GPT4O_MINI_API_KEY": "",
@@ -105,22 +115,68 @@ def setup_llm_providers() -> None:
         update_or_add_env_var("ENABLE_ANTHROPIC", "false")
 
     console.print("\n[bold blue]--- Azure Configuration ---[/bold blue]")
-    console.print("To enable Azure, you must have an Azure deployment name, API key, base URL, and API version.")
+    console.print("Azure OpenAI supports multiple authentication methods:")
+    console.print("1. API Key (simplest)")
+    console.print("2. Azure AD Token")
+    console.print("3. Tenant ID + Client ID + Client Secret")
+    console.print("4. Client ID + Username + Password")
+    
     enable_azure = Confirm.ask("Do you want to enable Azure?")
     if enable_azure:
         azure_deployment = Prompt.ask("Enter your Azure deployment name")
-        azure_api_key = Prompt.ask("Enter your Azure API key", password=True)
-        azure_api_base = Prompt.ask("Enter your Azure API base URL")
-        azure_api_version = Prompt.ask("Enter your Azure API version")
-        if not all([azure_deployment, azure_api_key, azure_api_base, azure_api_version]):
-            console.print("[red]Error: All Azure fields must be populated. Azure will not be enabled.[/red]")
+        azure_api_base = Prompt.ask("Enter your Azure API base URL (e.g., https://myresource.openai.azure.com/)")
+        azure_api_version = Prompt.ask("Enter your Azure API version", default="2024-02-01")
+        
+        if not all([azure_deployment, azure_api_base, azure_api_version]):
+            console.print("[red]Error: Deployment name, API base, and API version are required.[/red]")
         else:
             update_or_add_env_var("AZURE_DEPLOYMENT", azure_deployment)
-            update_or_add_env_var("AZURE_API_KEY", azure_api_key)
             update_or_add_env_var("AZURE_API_BASE", azure_api_base)
             update_or_add_env_var("AZURE_API_VERSION", azure_api_version)
             update_or_add_env_var("ENABLE_AZURE", "true")
-            model_options.append("AZURE_OPENAI_GPT4O")
+            
+            # Ask for authentication method
+            auth_method = Prompt.ask(
+                "Choose authentication method",
+                choices=["1", "2", "3", "4"],
+                default="1"
+            )
+            
+            if auth_method == "1":
+                # API Key authentication
+                azure_api_key = Prompt.ask("Enter your Azure API key", password=True)
+                if azure_api_key:
+                    update_or_add_env_var("AZURE_API_KEY", azure_api_key)
+            elif auth_method == "2":
+                # Azure AD Token
+                azure_ad_token = Prompt.ask("Enter your Azure AD token", password=True)
+                if azure_ad_token:
+                    update_or_add_env_var("AZURE_AD_TOKEN", azure_ad_token)
+            elif auth_method == "3":
+                # Tenant/Client/Secret
+                tenant_id = Prompt.ask("Enter your Azure Tenant ID")
+                client_id = Prompt.ask("Enter your Azure Client ID")
+                client_secret = Prompt.ask("Enter your Azure Client Secret", password=True)
+                if all([tenant_id, client_id, client_secret]):
+                    update_or_add_env_var("AZURE_TENANT_ID", tenant_id)
+                    update_or_add_env_var("AZURE_CLIENT_ID", client_id)
+                    update_or_add_env_var("AZURE_CLIENT_SECRET", client_secret)
+            elif auth_method == "4":
+                # Username/Password
+                client_id = Prompt.ask("Enter your Azure Client ID")
+                username = Prompt.ask("Enter your Azure username")
+                password = Prompt.ask("Enter your Azure password", password=True)
+                if all([client_id, username, password]):
+                    update_or_add_env_var("AZURE_CLIENT_ID", client_id)
+                    update_or_add_env_var("AZURE_USERNAME", username)
+                    update_or_add_env_var("AZURE_PASSWORD", password)
+            
+            # Optional: Base model for cost tracking
+            base_model = Prompt.ask("Enter base model name for cost tracking (optional, press Enter to skip)", default="")
+            if base_model:
+                update_or_add_env_var("AZURE_BASE_MODEL", base_model)
+            
+            model_options.append("AZURE_OPENAI")
     else:
         update_or_add_env_var("ENABLE_AZURE", "false")
 

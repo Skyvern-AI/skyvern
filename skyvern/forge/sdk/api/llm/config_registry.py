@@ -390,20 +390,90 @@ if settings.ENABLE_BEDROCK:
 
 
 if settings.ENABLE_AZURE:
+    # Build litellm_params based on available authentication method
+    azure_litellm_params = LiteLLMParams(
+        api_base=settings.AZURE_API_BASE,
+        api_version=settings.AZURE_API_VERSION,
+    )
+    
+    # Check which authentication method to use
+    if settings.AZURE_AD_TOKEN:
+        # Azure AD Token authentication
+        azure_litellm_params["azure_ad_token"] = settings.AZURE_AD_TOKEN
+    elif settings.AZURE_TENANT_ID and settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET:
+        # Tenant/Client/Secret authentication
+        azure_litellm_params["tenant_id"] = settings.AZURE_TENANT_ID
+        azure_litellm_params["client_id"] = settings.AZURE_CLIENT_ID
+        azure_litellm_params["client_secret"] = settings.AZURE_CLIENT_SECRET
+        azure_litellm_params["azure_scope"] = settings.AZURE_SCOPE
+    elif settings.AZURE_CLIENT_ID and settings.AZURE_USERNAME and settings.AZURE_PASSWORD:
+        # Username/Password authentication
+        azure_litellm_params["client_id"] = settings.AZURE_CLIENT_ID
+        azure_litellm_params["azure_username"] = settings.AZURE_USERNAME
+        azure_litellm_params["azure_password"] = settings.AZURE_PASSWORD
+        azure_litellm_params["azure_scope"] = settings.AZURE_SCOPE
+    else:
+        # Default to API key authentication
+        azure_litellm_params["api_key"] = settings.AZURE_API_KEY
+    
+    # Add base_model for cost tracking if specified
+    if settings.AZURE_BASE_MODEL:
+        azure_litellm_params["model_info"] = {"base_model": settings.AZURE_BASE_MODEL}
+    
     LLMConfigRegistry.register_config(
         "AZURE_OPENAI",
         LLMConfig(
             f"azure/{settings.AZURE_DEPLOYMENT}",
             [
                 "AZURE_DEPLOYMENT",
-                "AZURE_API_KEY",
                 "AZURE_API_BASE",
                 "AZURE_API_VERSION",
             ],
+            litellm_params=azure_litellm_params,
             supports_vision=True,
             add_assistant_prefix=False,
         ),
     )
+    
+    # Register Azure O-series model if configured
+    if settings.AZURE_O_SERIES_MODEL:
+        o_series_litellm_params = azure_litellm_params.copy()
+        # O-series models don't support temperature
+        LLMConfigRegistry.register_config(
+            "AZURE_O_SERIES",
+            LLMConfig(
+                f"azure/o_series/{settings.AZURE_O_SERIES_MODEL}",
+                [
+                    "AZURE_O_SERIES_MODEL",
+                    "AZURE_API_BASE",
+                    "AZURE_API_VERSION",
+                ],
+                litellm_params=o_series_litellm_params,
+                supports_vision=True,
+                add_assistant_prefix=False,
+                max_completion_tokens=100000,
+                temperature=None,  # Temperature isn't supported in the O-model series
+                reasoning_effort="high",
+            ),
+        )
+    
+    # Register Azure TTS model if configured
+    if settings.AZURE_TTS_DEPLOYMENT:
+        tts_litellm_params = azure_litellm_params.copy()
+        LLMConfigRegistry.register_config(
+            "AZURE_TTS",
+            LLMConfig(
+                f"azure/{settings.AZURE_TTS_DEPLOYMENT}",
+                [
+                    "AZURE_TTS_DEPLOYMENT",
+                    "AZURE_API_BASE",
+                    "AZURE_API_VERSION",
+                ],
+                litellm_params=tts_litellm_params,
+                supports_vision=False,
+                add_assistant_prefix=False,
+            ),
+        )
 
 if settings.ENABLE_AZURE_GPT4O_MINI:
     LLMConfigRegistry.register_config(

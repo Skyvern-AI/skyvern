@@ -163,18 +163,20 @@ class Settings(BaseSettings):
     AZURE_CUA_ENDPOINT: str | None = None
     AZURE_CUA_DEPLOYMENT: str | None = "computer-use-preview"
     AZURE_CUA_API_VERSION: str | None = "2025-03-01-preview"
-
-    # AZURE GPT-4o mini
-    AZURE_GPT4O_MINI_DEPLOYMENT: str | None = None
-    AZURE_GPT4O_MINI_API_KEY: str | None = None
-    AZURE_GPT4O_MINI_API_BASE: str | None = None
-    AZURE_GPT4O_MINI_API_VERSION: str | None = None
-
-    # AZURE o3 mini
-    AZURE_O3_MINI_DEPLOYMENT: str | None = None
-    AZURE_O3_MINI_API_KEY: str | None = None
-    AZURE_O3_MINI_API_BASE: str | None = None
-    AZURE_O3_MINI_API_VERSION: str | None = None
+    
+    # Azure AD Authentication
+    AZURE_AD_TOKEN: str | None = None
+    AZURE_TENANT_ID: str | None = None
+    AZURE_CLIENT_ID: str | None = None
+    AZURE_CLIENT_SECRET: str | None = None
+    AZURE_USERNAME: str | None = None
+    AZURE_PASSWORD: str | None = None
+    AZURE_SCOPE: str | None = "https://cognitiveservices.azure.com/.default"
+    
+    # Additional Azure model configurations
+    AZURE_BASE_MODEL: str | None = None  # For cost tracking
+    AZURE_O_SERIES_MODEL: str | None = None  # For O-series models
+    AZURE_TTS_DEPLOYMENT: str | None = None  # For TTS
 
     # AZURE gpt-4.1
     ENABLE_AZURE_GPT4_1: bool = False
@@ -210,6 +212,18 @@ class Settings(BaseSettings):
     AZURE_O3_API_KEY: str | None = None
     AZURE_O3_API_BASE: str | None = None
     AZURE_O3_API_VERSION: str = "2025-01-01-preview"
+
+    # AZURE GPT-4o mini
+    AZURE_GPT4O_MINI_DEPLOYMENT: str | None = None
+    AZURE_GPT4O_MINI_API_KEY: str | None = None
+    AZURE_GPT4O_MINI_API_BASE: str | None = None
+    AZURE_GPT4O_MINI_API_VERSION: str | None = None
+
+    # AZURE o3 mini
+    AZURE_O3_MINI_DEPLOYMENT: str | None = None
+    AZURE_O3_MINI_API_KEY: str | None = None
+    AZURE_O3_MINI_API_BASE: str | None = None
+    AZURE_O3_MINI_API_VERSION: str | None = None
 
     # GEMINI
     GEMINI_API_KEY: str | None = None

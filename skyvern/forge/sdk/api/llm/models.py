@@ -16,6 +16,17 @@ class LiteLLMParams(TypedDict, total=False):
     model_info: dict[str, Any] | None
     vertex_credentials: str | None
     vertex_location: str | None
+    # Azure AD authentication parameters
+    azure_ad_token: str | None
+    tenant_id: str | None
+    client_id: str | None
+    client_secret: str | None
+    azure_username: str | None
+    azure_password: str | None
+    azure_scope: str | None
+    azure_ad_token_provider: Any | None  # For DefaultAzureCredential
+    drop_params: bool | None
+    base_model: str | None  # For cost tracking
 
 
 @dataclass(frozen=True)

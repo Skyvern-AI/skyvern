@@ -74,9 +74,33 @@ services:
     # - ENABLE_AZURE=true
     # - LLM_KEY=AZURE_OPENAI                          # Leave this value static, don't change it
     # - AZURE_DEPLOYMENT=<your_azure_deployment>      # Use the OpenAI model "Deployment Name" that you deployed, using the steps above
-    # - AZURE_API_KEY=<your_azure_api_key>            # Copy and paste Key1 or Key2 from the OpenAI resource in Azure Portal
     # - AZURE_API_BASE=<your_azure_api_base>          # Copy and paste the "Endpoint" from the OpenAI resource in Azure Portal (eg. https://xyzxyzxyz.openai.azure.com/)
     # - AZURE_API_VERSION=<your_azure_api_version>    # Specify a valid Azure OpenAI data-plane API version (eg. 2024-08-01-preview) Docs: https://learn.microsoft.com/en-us/azure/ai-services/openai/reference
+    #
+    # Azure Authentication Methods (choose one):
+    # 
+    # Method 1: API Key (Simplest)
+    # - AZURE_API_KEY=<your_azure_api_key>            # Copy and paste Key1 or Key2 from the OpenAI resource in Azure Portal
+    #
+    # Method 2: Azure AD Token
+    # - AZURE_AD_TOKEN=<your_azure_ad_token>          # Use `az account get-access-token --resource https://cognitiveservices.azure.com` to get token
+    #
+    # Method 3: Service Principal (Tenant + Client + Secret)
+    # - AZURE_TENANT_ID=<your_tenant_id>
+    # - AZURE_CLIENT_ID=<your_client_id>
+    # - AZURE_CLIENT_SECRET=<your_client_secret>
+    # - AZURE_SCOPE=https://cognitiveservices.azure.com/.default  # Default scope for cognitive services
+    #
+    # Method 4: Username/Password
+    # - AZURE_CLIENT_ID=<your_client_id>
+    # - AZURE_USERNAME=<your_username>
+    # - AZURE_PASSWORD=<your_password>
+    # - AZURE_SCOPE=https://cognitiveservices.azure.com/.default  # Default scope for cognitive services
+    #
+    # Optional: Cost tracking and special models
+    # - AZURE_BASE_MODEL=gpt-4                        # Base model name for accurate cost tracking
+    # - AZURE_O_SERIES_MODEL=o1-preview               # For O-series models (o1, o3, etc.)
+    # - AZURE_TTS_DEPLOYMENT=tts-1                    # For Text-to-Speech
     # Amazon Bedrock Support:
     # Amazon Bedrock is a managed service that enables you to invoke LLMs and bill them through your AWS account.
     # To use Amazon Bedrock as the LLM provider for Skyvern, specify the following environment variables.

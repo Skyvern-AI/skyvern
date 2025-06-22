@@ -438,15 +438,52 @@ Supported LLM Keys: `OPENAI_GPT4_TURBO`, `OPENAI_GPT4V`, `OPENAI_GPT4O`, `OPENAI
 Supported LLM Keys: `ANTHROPIC_CLAUDE3`, `ANTHROPIC_CLAUDE3_OPUS`, `ANTHROPIC_CLAUDE3_SONNET`, `ANTHROPIC_CLAUDE3_HAIKU`, `ANTHROPIC_CLAUDE3.5_SONNET`
 
 ##### Azure OpenAI
+Azure OpenAI supports multiple authentication methods through litellm. Choose the method that best fits your security requirements.
+
+###### Basic Configuration
 | Variable | Description| Type | Sample Value|
 | -------- | ------- | ------- | ------- |
 | `ENABLE_AZURE` | Register Azure OpenAI models | Boolean | `true`, `false` |
-| `AZURE_API_KEY` | Azure deployment API key | String | `sk-1234567890` |
 | `AZURE_DEPLOYMENT` | Azure OpenAI Deployment Name | String | `skyvern-deployment`|
 | `AZURE_API_BASE` | Azure deployment api base url| String | `https://skyvern-deployment.openai.azure.com/`|
 | `AZURE_API_VERSION` | Azure API Version| String | `2024-02-01`|
 
-Supported LLM Key: `AZURE_OPENAI`
+###### Authentication Methods
+
+**Method 1: API Key (Simplest)**
+| Variable | Description| Type | Sample Value|
+| -------- | ------- | ------- | ------- |
+| `AZURE_API_KEY` | Azure deployment API key | String | `sk-1234567890` |
+
+**Method 2: Azure AD Token**
+| Variable | Description| Type | Sample Value|
+| -------- | ------- | ------- | ------- |
+| `AZURE_AD_TOKEN` | Azure Active Directory token | String | `eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1...` |
+
+**Method 3: Service Principal (Tenant + Client + Secret)**
+| Variable | Description| Type | Sample Value|
+| -------- | ------- | ------- | ------- |
+| `AZURE_TENANT_ID` | Azure Tenant ID | String | `bdfd79b3-8401-47...` |
+| `AZURE_CLIENT_ID` | Azure Client ID | String | `db38de1f-4bb3...` |
+| `AZURE_CLIENT_SECRET` | Azure Client Secret | String | `your-client-secret` |
+| `AZURE_SCOPE` | Azure OAuth scope | String | `https://cognitiveservices.azure.com/.default` |
+
+**Method 4: Username/Password**
+| Variable | Description| Type | Sample Value|
+| -------- | ------- | ------- | ------- |
+| `AZURE_CLIENT_ID` | Azure Client ID | String | `db38de1f-4bb3...` |
+| `AZURE_USERNAME` | Azure username | String | `user@contoso.com` |
+| `AZURE_PASSWORD` | Azure password | String | `your-password` |
+| `AZURE_SCOPE` | Azure OAuth scope | String | `https://cognitiveservices.azure.com/.default` |
+
+###### Optional Configuration
+| Variable | Description| Type | Sample Value|
+| -------- | ------- | ------- | ------- |
+| `AZURE_BASE_MODEL` | Base model name for cost tracking | String | `gpt-4`, `gpt-3.5-turbo` |
+| `AZURE_O_SERIES_MODEL` | O-series model deployment name | String | `o1-preview`, `o3-mini` |
+| `AZURE_TTS_DEPLOYMENT` | Text-to-Speech deployment name | String | `tts-1` |
+
+Supported LLM Keys: `AZURE_OPENAI`, `AZURE_O_SERIES` (if configured), `AZURE_TTS` (if configured)
 
 ##### AWS Bedrock
 | Variable | Description| Type | Sample Value|
