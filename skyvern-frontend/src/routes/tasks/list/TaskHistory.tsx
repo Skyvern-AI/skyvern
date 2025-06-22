@@ -157,7 +157,10 @@ function TaskHistory() {
                       className="w-1/6 cursor-pointer"
                       onClick={(event) => handleNavigate(event, task.task_id)}
                     >
-                      <StatusBadgeWithTiming status={task.status} timingData={task} />
+                      <StatusBadgeWithTiming
+                        status={task.status}
+                        timingData={task}
+                      />
                     </TableCell>
                     <TableCell
                       className="w-1/4 cursor-pointer"

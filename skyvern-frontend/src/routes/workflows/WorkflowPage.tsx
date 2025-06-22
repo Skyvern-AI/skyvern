@@ -150,7 +150,10 @@ function WorkflowPage() {
                   >
                     <TableCell>{workflowRun.workflow_run_id}</TableCell>
                     <TableCell>
-                      <StatusBadgeWithTiming status={workflowRun.status} timingData={workflowRun} />
+                      <StatusBadgeWithTiming
+                        status={workflowRun.status}
+                        timingData={workflowRun}
+                      />
                     </TableCell>
                     <TableCell title={basicTimeFormat(workflowRun.created_at)}>
                       {basicLocalTimeFormat(workflowRun.created_at)}

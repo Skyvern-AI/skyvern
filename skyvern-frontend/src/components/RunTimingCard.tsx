@@ -1,4 +1,3 @@
-import React from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { ClockIcon, PlayIcon, TimerIcon } from "@radix-ui/react-icons";
 import { formatDistanceStrict } from "date-fns";
@@ -56,7 +55,7 @@ function RunTimingCard({ data, className }: Props) {
       <CardContent className="p-4">
         <div className="space-y-3">
           <h3 className="text-sm font-semibold text-slate-300">Run Timing</h3>
-          
+
           {queueTime && (
             <div className="flex items-center gap-2 text-xs">
               <TimerIcon className="h-4 w-4 text-slate-400" />
@@ -64,7 +63,7 @@ function RunTimingCard({ data, className }: Props) {
               <span className="font-medium text-slate-200">{queueTime}</span>
             </div>
           )}
-          
+
           {runTime && (
             <div className="flex items-center gap-2 text-xs">
               <PlayIcon className="h-4 w-4 text-slate-400" />
@@ -72,7 +71,7 @@ function RunTimingCard({ data, className }: Props) {
               <span className="font-medium text-slate-200">{runTime}</span>
             </div>
           )}
-          
+
           {totalTime && (
             <div className="flex items-center gap-2 text-xs">
               <ClockIcon className="h-4 w-4 text-slate-400" />

@@ -177,7 +177,9 @@ function TaskDetails() {
             {taskIsLoading ? (
               <Skeleton className="h-8 w-32" />
             ) : (
-              task && <StatusBadgeWithTiming status={task.status} timingData={task} />
+              task && (
+                <StatusBadgeWithTiming status={task.status} timingData={task} />
+              )
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -266,7 +268,9 @@ function TaskDetails() {
         <Skeleton className="h-32 w-full" />
       ) : (
         <>
-          {task && <RunTimingCard data={task} className="bg-slate-elevation3" />}
+          {task && (
+            <RunTimingCard data={task} className="bg-slate-elevation3" />
+          )}
           {extractedInformation}
           {failureReason}
         </>
