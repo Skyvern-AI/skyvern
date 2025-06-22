@@ -34,7 +34,7 @@ spec:
                 name: skyvern-frontend
                 port:
                   number: 8080
-  #tls:
-  #  - hosts:
-  #      - skyvern.example.com
-  #    secretName: ""
+                  #tls:
+                  #  - hosts:
+                  #      - skyvern.example.com
+                  #    secretName: ""
