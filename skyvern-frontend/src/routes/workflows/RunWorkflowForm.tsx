@@ -256,6 +256,7 @@ function RunWorkflowForm({
                     if (value === null) {
                       return "This field is required";
                     }
+                    return true;
                   },
                 }}
                 render={({ field }) => {
@@ -314,7 +315,7 @@ function RunWorkflowForm({
             rules={{
               validate: (value) => {
                 if (value === null || value === "") {
-                  return;
+                  return true;
                 }
                 if (typeof value !== "string") {
                   return "Invalid URL";
@@ -324,6 +325,7 @@ function RunWorkflowForm({
                 if (!success) {
                   return "Invalid URL";
                 }
+                return true;
               },
             }}
             render={({ field }) => {

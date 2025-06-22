@@ -198,6 +198,7 @@ function WorkflowRunTimelineBlockItem({
             />
           );
         }
+        return null;
       })}
     </div>
   );

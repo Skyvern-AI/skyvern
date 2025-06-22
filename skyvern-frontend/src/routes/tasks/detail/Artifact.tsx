@@ -67,6 +67,7 @@ function Artifact({ type, artifacts }: Props) {
     if (artifact.uri.startsWith("s3://") && artifact.signed_url) {
       return axios.get(artifact.signed_url).then((response) => response.data);
     }
+    return Promise.reject(new Error("Unsupported artifact URI"));
   }
 
   const results = useQueries({

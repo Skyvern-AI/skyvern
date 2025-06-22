@@ -28,6 +28,7 @@ function StatusBadgeWithTiming({ status, timingData, className }: Props) {
 
       return () => clearInterval(interval);
     }
+    return undefined;
   }, [status]);
 
   const calculateDuration = () => {

@@ -31,7 +31,7 @@ function WorkflowPostRunParameters() {
 
   function getActiveBlock() {
     if (!workflowRunTimeline) {
-      return;
+      return undefined;
     }
     if (isWorkflowRunBlock(activeItem)) {
       return activeItem;
@@ -42,6 +42,7 @@ function WorkflowPostRunParameters() {
         activeItem.action_id,
       );
     }
+    return undefined;
   }
 
   const activeBlock = getActiveBlock();

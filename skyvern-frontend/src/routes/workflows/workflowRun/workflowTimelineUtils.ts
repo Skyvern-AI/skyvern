@@ -25,6 +25,7 @@ function findBlockSurroundingAction(
       stack.push(...current.children);
     }
   }
+  return undefined;
 }
 
 function findActiveItem(

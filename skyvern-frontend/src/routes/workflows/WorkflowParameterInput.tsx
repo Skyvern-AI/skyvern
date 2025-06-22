@@ -91,6 +91,9 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
       />
     );
   }
+
+  // Default case - should never happen, but TypeScript requires all paths to return
+  return null;
 }
 
 export { WorkflowParameterInput };

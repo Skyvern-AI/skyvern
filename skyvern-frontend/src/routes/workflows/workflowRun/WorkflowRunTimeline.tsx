@@ -122,6 +122,7 @@ function WorkflowRunTimeline({
                   />
                 );
               }
+              return null;
             })}
           </div>
         </ScrollAreaViewport>

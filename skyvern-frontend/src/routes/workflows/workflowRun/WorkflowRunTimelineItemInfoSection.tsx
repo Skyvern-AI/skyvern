@@ -230,6 +230,8 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
       </div>
     );
   }
+
+  return null;
 }
 
 export { WorkflowRunTimelineItemInfoSection };
