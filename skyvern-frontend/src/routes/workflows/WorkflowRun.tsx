@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
+import { StatusBadgeWithTiming } from "@/components/StatusBadgeWithTiming";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
 import {
@@ -175,9 +176,9 @@ function WorkflowRun() {
           <div className="flex items-center gap-5">
             {title}
             {workflowRunIsLoading ? (
-              <Skeleton className="h-8 w-28" />
+              <Skeleton className="h-8 w-24" />
             ) : workflowRun ? (
-              <StatusBadge status={workflowRun?.status} />
+              <StatusBadgeWithTiming status={workflowRun?.status} timingData={workflowRun} />
             ) : null}
           </div>
           <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>

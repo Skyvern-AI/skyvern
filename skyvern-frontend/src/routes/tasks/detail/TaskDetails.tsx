@@ -4,7 +4,7 @@ import {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
-import { StatusBadge } from "@/components/StatusBadge";
+import { StatusBadgeWithTiming } from "@/components/StatusBadgeWithTiming";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
 import {
@@ -32,6 +32,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { statusIsFinalized } from "../types";
 import { useTaskQuery } from "./hooks/useTaskQuery";
+import { RunTimingCard } from "@/components/RunTimingCard";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -176,7 +177,7 @@ function TaskDetails() {
             {taskIsLoading ? (
               <Skeleton className="h-8 w-32" />
             ) : (
-              task && <StatusBadge status={task.status} />
+              task && <StatusBadgeWithTiming status={task.status} timingData={task} />
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -265,6 +266,7 @@ function TaskDetails() {
         <Skeleton className="h-32 w-full" />
       ) : (
         <>
+          {task && <RunTimingCard data={task} className="bg-slate-elevation3" />}
           {extractedInformation}
           {failureReason}
         </>

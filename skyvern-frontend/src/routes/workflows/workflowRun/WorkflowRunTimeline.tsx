@@ -5,6 +5,7 @@ import { cn } from "@/util/utils";
 import { DotFilledIcon } from "@radix-ui/react-icons";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
+import { RunTimingCard } from "@/components/RunTimingCard";
 import {
   isBlockItem,
   isObserverThought,
@@ -70,6 +71,7 @@ function WorkflowRunTimeline({
           Steps: {workflowRun.total_steps ?? 0}
         </div>
       </div>
+      <RunTimingCard data={workflowRun} className="bg-slate-elevation3" />
       <ScrollArea>
         <ScrollAreaViewport className="h-[37rem] max-h-[37rem]">
           <div className="space-y-4">

@@ -117,6 +117,9 @@ export type TaskApiResponse = {
   status: Status;
   created_at: string; // ISO 8601
   modified_at: string; // ISO 8601
+  queued_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
@@ -267,6 +270,9 @@ export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
   modified_at: string;
+  queued_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
   proxy_location: ProxyLocation | null;
   status: Status;
   title?: string;
@@ -286,6 +292,9 @@ export type WorkflowRunStatusApiResponse = {
   extra_http_headers: Record<string, string> | null;
   created_at: string;
   modified_at: string;
+  queued_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
@@ -334,6 +343,9 @@ export type TaskV2 = {
   url: string | null;
   created_at: string;
   modified_at: string;
+  queued_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
   output: Record<string, unknown> | null;
   summary: string | null;
   webhook_callback_url: string | null;

@@ -50,6 +50,7 @@
     "clsx": "^2.1.0",
     "cmdk": "^1.0.0",
     "cors": "^2.8.5",
+    "date-fns": "^4.1.0",
     "embla-carousel-react": "^8.0.0",
     "express": "^4.19.2",
     "fetch-to-curl": "^0.6.0",

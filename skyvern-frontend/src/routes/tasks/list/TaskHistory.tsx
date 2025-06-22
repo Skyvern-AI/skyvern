@@ -1,6 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
-import { StatusBadge } from "@/components/StatusBadge";
+import { StatusBadgeWithTiming } from "@/components/StatusBadgeWithTiming";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import {
   Pagination,
@@ -157,7 +157,7 @@ function TaskHistory() {
                       className="w-1/6 cursor-pointer"
                       onClick={(event) => handleNavigate(event, task.task_id)}
                     >
-                      <StatusBadge status={task.status} />
+                      <StatusBadgeWithTiming status={task.status} timingData={task} />
                     </TableCell>
                     <TableCell
                       className="w-1/4 cursor-pointer"

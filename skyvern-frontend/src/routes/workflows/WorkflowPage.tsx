@@ -1,5 +1,5 @@
 import { Status } from "@/api/types";
-import { StatusBadge } from "@/components/StatusBadge";
+import { StatusBadgeWithTiming } from "@/components/StatusBadgeWithTiming";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
 import {
@@ -150,7 +150,7 @@ function WorkflowPage() {
                   >
                     <TableCell>{workflowRun.workflow_run_id}</TableCell>
                     <TableCell>
-                      <StatusBadge status={workflowRun.status} />
+                      <StatusBadgeWithTiming status={workflowRun.status} timingData={workflowRun} />
                     </TableCell>
                     <TableCell title={basicTimeFormat(workflowRun.created_at)}>
                       {basicLocalTimeFormat(workflowRun.created_at)}
