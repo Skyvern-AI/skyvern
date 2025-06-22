@@ -750,10 +750,10 @@ async def get_run_artifacts(
         group_by_type=False,  # This ensures we get a list, not a dict
     )
 
-    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
-        # Ensure we have a list of artifacts
-        artifacts_list = artifacts if isinstance(artifacts, list) else []
+    # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
+    artifacts_list = artifacts if isinstance(artifacts, list) else []
 
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         # Get signed URLs for all artifacts
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
 
@@ -771,7 +771,7 @@ async def get_run_artifacts(
         else:
             LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
 
-    return artifacts
+    return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
 
 
 @base_router.post(
