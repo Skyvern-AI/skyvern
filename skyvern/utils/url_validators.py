@@ -38,7 +38,7 @@ def is_blocked_host(host: str) -> bool:
     except ValueError:
         # If the host is not a valid IP address (e.g., it's a domain name like localhost), handle it here
         for blocked_host in settings.BLOCKED_HOSTS:
-            if blocked_host == host:
+            if blocked_host.lower() == host.lower():
                 return True
         return False
     except Exception:
