@@ -120,7 +120,7 @@ def setup_llm_providers() -> None:
             update_or_add_env_var("AZURE_API_BASE", azure_api_base)
             update_or_add_env_var("AZURE_API_VERSION", azure_api_version)
             update_or_add_env_var("ENABLE_AZURE", "true")
-            model_options.append("AZURE_OPENAI_GPT4O")
+            model_options.append("AZURE_OPENAI")
     else:
         update_or_add_env_var("ENABLE_AZURE", "false")
 
