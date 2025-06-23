@@ -1,7 +1,7 @@
 import copy
 import uuid
-from typing import TYPE_CHECKING, Any, Self
 from datetime import datetime
+from typing import TYPE_CHECKING, Any, Self
 
 import structlog
 from onepassword.client import Client as OnePasswordClient
@@ -36,7 +36,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter
@@ -902,7 +901,7 @@ class TaskRunContext:
         Initialize a TaskRunContext for a task with the provided credential IDs.
         """
         task_context = cls(aws_client=aws_client)
-        
+
         if credential_ids:
             for idx, credential_id in enumerate(credential_ids):
                 # Create a temporary CredentialParameter for each credential
@@ -916,7 +915,7 @@ class TaskRunContext:
                     modified_at=datetime.now(),
                 )
                 await task_context.register_credential_parameter_value(credential_param, organization)
-        
+
         return task_context
 
     def get_parameter(self, key: str) -> PARAMETER_TYPE:

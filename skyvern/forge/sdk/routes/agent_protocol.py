@@ -136,10 +136,7 @@ async def run_task(
         for credential_id in run_request.credential_ids:
             credential = await app.DATABASE.get_credential(credential_id, organization_id=current_org.organization_id)
             if credential is None:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Credential not found: {credential_id}"
-                )
+                raise HTTPException(status_code=400, detail=f"Credential not found: {credential_id}")
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1

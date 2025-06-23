@@ -175,7 +175,7 @@ async def initialize_task_v2(
         model = {}
     if credential_ids:
         model["credential_ids"] = credential_ids
-    
+
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -993,8 +993,8 @@ async def handle_block_result(
 
 
 async def _set_up_workflow_context(
-    workflow_id: str, 
-    workflow_run_id: str, 
+    workflow_id: str,
+    workflow_run_id: str,
     organization: Organization,
     credential_ids: list[str] | None = None,
 ) -> None:
@@ -1004,13 +1004,14 @@ async def _set_up_workflow_context(
     # Get all <workflow parameter, workflow run parameter> tuples
     wp_wps_tuples = await app.WORKFLOW_SERVICE.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
     workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(workflow_id=workflow_id)
-    
+
     # Create credential parameters if credential_ids are provided
     secret_parameters = []
     if credential_ids:
-        from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
         from datetime import datetime
-        
+
+        from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+
         for idx, credential_id in enumerate(credential_ids):
             credential_param = CredentialParameter(
                 parameter_type="credential",
@@ -1022,7 +1023,7 @@ async def _set_up_workflow_context(
                 modified_at=datetime.now(),
             )
             secret_parameters.append(credential_param)
-    
+
     await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
         organization,
         workflow_run_id,
