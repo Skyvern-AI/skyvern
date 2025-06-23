@@ -6,6 +6,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -25,6 +26,7 @@ class ArtifactManager:
         artifact_id: str,
         artifact_type: ArtifactType,
         uri: str,
+        organization_id: str,
         step_id: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -32,7 +34,6 @@ class ArtifactManager:
         thought_id: str | None = None,
         task_v2_id: str | None = None,
         ai_suggestion_id: str | None = None,
-        organization_id: str | None = None,
         data: bytes | None = None,
         path: str | None = None,
     ) -> str:
@@ -40,6 +41,15 @@ class ArtifactManager:
             raise ValueError("Either data or path must be provided to create an artifact.")
         if data and path:
             raise ValueError("Both data and path cannot be provided to create an artifact.")
+
+        context = skyvern_context.current()
+        if not workflow_run_id and context:
+            workflow_run_id = context.workflow_run_id
+        if not task_v2_id and context:
+            task_v2_id = context.task_v2_id
+        if not task_id and context:
+            task_id = context.task_id
+
         artifact = await app.DATABASE.create_artifact(
             artifact_id,
             artifact_type,

@@ -599,6 +599,7 @@ class WorkflowService:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        extra_http_headers: dict[str, str] | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -616,6 +617,7 @@ class WorkflowService:
             version=version,
             is_saved_task=is_saved_task,
             status=status,
+            extra_http_headers=extra_http_headers,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -782,6 +784,7 @@ class WorkflowService:
             totp_identifier=workflow_request.totp_identifier,
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
+            extra_http_headers=workflow_request.extra_http_headers,
         )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str) -> WorkflowRun:
@@ -1181,6 +1184,7 @@ class WorkflowService:
             webhook_callback_url=workflow_run.webhook_callback_url,
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
+            extra_http_headers=workflow_run.extra_http_headers,
             queued_at=workflow_run.queued_at,
             started_at=workflow_run.started_at,
             finished_at=workflow_run.finished_at,
@@ -1470,6 +1474,7 @@ class WorkflowService:
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
+                    extra_http_headers=request.extra_http_headers,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -1488,6 +1493,7 @@ class WorkflowService:
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
+                    extra_http_headers=request.extra_http_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                 )
@@ -2069,6 +2075,8 @@ class WorkflowService:
         organization: Organization,
         title: str,
         proxy_location: ProxyLocation | None = None,
+        max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
         """
@@ -2083,6 +2091,8 @@ class WorkflowService:
             ),
             proxy_location=proxy_location,
             status=status,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            extra_http_headers=extra_http_headers,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,

@@ -166,6 +166,8 @@ async def initialize_task_v2(
     create_task_run: bool = False,
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
+    browser_session_id: str | None = None,
+    extra_http_headers: dict[str, str] | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -178,6 +180,7 @@ async def initialize_task_v2(
         error_code_mapping=error_code_mapping,
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+        extra_http_headers=extra_http_headers,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -221,11 +224,15 @@ async def initialize_task_v2(
             metadata.workflow_title,
             proxy_location=proxy_location,
             status=workflow_status,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            extra_http_headers=extra_http_headers,
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
             workflow_request=WorkflowRequestBody(
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                browser_session_id=browser_session_id,
+                extra_http_headers=extra_http_headers,
             ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
