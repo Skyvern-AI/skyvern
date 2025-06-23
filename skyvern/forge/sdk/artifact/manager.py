@@ -42,11 +42,13 @@ class ArtifactManager:
         if data and path:
             raise ValueError("Both data and path cannot be provided to create an artifact.")
 
-        if not workflow_run_id:
-            context = skyvern_context.current()
-
-            if context:
-                workflow_run_id = context.workflow_run_id
+        context = skyvern_context.current()
+        if not workflow_run_id and context:
+            workflow_run_id = context.workflow_run_id
+        if not task_v2_id and context:
+            task_v2_id = context.task_v2_id
+        if not task_id and context:
+            task_id = context.task_id
 
         artifact = await app.DATABASE.create_artifact(
             artifact_id,
