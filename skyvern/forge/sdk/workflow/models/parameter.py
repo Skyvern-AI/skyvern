@@ -140,6 +140,12 @@ class OnePasswordCredentialParameter(Parameter):
     modified_at: datetime
     deleted_at: datetime | None = None
 
+    def model_dump(self, **kwargs) -> dict[str, Any]:
+        """Override serialization to return 'credential' as parameter_type for consistency with frontend display."""
+        data = super().model_dump(**kwargs)
+        data["parameter_type"] = "credential"
+        return data
+
 
 class WorkflowParameterType(StrEnum):
     STRING = "string"
