@@ -27,39 +27,34 @@ class TaskCredential(BaseModel):
     Credential information for task execution.
     This can be a credential ID for Skyvern-managed credentials or external credential parameters.
     """
+
     credential_type: str = Field(
         ...,
         description="Type of credential: 'skyvern_credential', 'onepassword', or 'bitwarden'",
-        examples=["skyvern_credential", "onepassword", "bitwarden"]
+        examples=["skyvern_credential", "onepassword", "bitwarden"],
     )
-    
+
     # For Skyvern-managed credentials
     credential_id: str | None = Field(
-        default=None,
-        description="Skyvern credential ID for skyvern_credential type",
-        examples=["cred_123456789"]
+        default=None, description="Skyvern credential ID for skyvern_credential type", examples=["cred_123456789"]
     )
-    
+
     # For OnePassword credentials
     vault_id: str | None = Field(
-        default=None,
-        description="OnePassword vault ID for onepassword type",
-        examples=["vault_123"]
+        default=None, description="OnePassword vault ID for onepassword type", examples=["vault_123"]
     )
     item_id: str | None = Field(
-        default=None,
-        description="OnePassword item ID for onepassword type",
-        examples=["item_123"]
+        default=None, description="OnePassword item ID for onepassword type", examples=["item_123"]
     )
-    
-    # For Bitwarden credentials  
+
+    # For Bitwarden credentials
     bitwarden_client_id_aws_secret_key: str | None = Field(
         default=None,
         description="AWS secret key for Bitwarden client ID",
     )
     bitwarden_client_secret_aws_secret_key: str | None = Field(
         default=None,
-        description="AWS secret key for Bitwarden client secret", 
+        description="AWS secret key for Bitwarden client secret",
     )
     bitwarden_master_password_aws_secret_key: str | None = Field(
         default=None,
@@ -160,10 +155,7 @@ class TaskBase(BaseModel):
     credentials: list[TaskCredential] | None = Field(
         default=None,
         description="List of credentials to use during task execution",
-        examples=[[{
-            "credential_type": "skyvern_credential",
-            "credential_id": "cred_123456789"
-        }]]
+        examples=[[{"credential_type": "skyvern_credential", "credential_id": "cred_123456789"}]],
     )
 
 

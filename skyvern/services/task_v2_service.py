@@ -618,16 +618,17 @@ async def run_task_v2_helper(
             # Resolve credentials if they exist from task v2
             credential_context = ""
             try:
+                from skyvern.forge.sdk.schemas.tasks import TaskCredential
                 from skyvern.forge.sdk.task_credential_manager import TaskCredentialManager
-                
+
                 if task_v2.credentials:
-                    organization = await app.DATABASE.get_organization(task_v2.organization_id)
-                    if organization:
-                        task_credential_manager = TaskCredentialManager(
-                            task_credentials=task_v2.credentials,
-                            organization=organization
-                        )
-                        credential_context = await task_credential_manager.build_credential_context()
+                    # Convert dict credentials back to TaskCredential objects
+                    task_credentials = [TaskCredential(**cred) for cred in task_v2.credentials]
+
+                    task_credential_manager = TaskCredentialManager(aws_client=app.WORKFLOW_CONTEXT_MANAGER.aws_client)
+                    credential_context = await task_credential_manager.build_credential_context(
+                        credentials=task_credentials, organization=organization
+                    )
             except Exception:
                 LOG.warning("Failed to resolve task v2 credentials", task_v2_id=task_v2_id, exc_info=True)
 

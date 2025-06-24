@@ -223,12 +223,12 @@ class ForgeAgent:
     async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
         webhook_callback_url = str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None
         totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
-        
+
         # Convert TaskCredential objects to dictionaries for storage
         credentials_dict = None
         if task_request.credentials:
             credentials_dict = [credential.model_dump() for credential in task_request.credentials]
-        
+
         task = await app.DATABASE.create_task(
             url=str(task_request.url),
             title=task_request.title,
@@ -1943,15 +1943,18 @@ class ForgeAgent:
         credential_context = ""
         if task.credentials:
             try:
+                from skyvern.forge.sdk.schemas.tasks import TaskCredential
                 from skyvern.forge.sdk.task_credential_manager import TaskCredentialManager
-                
+
                 organization = await app.DATABASE.get_organization(task.organization_id)
                 if organization:
-                    task_credential_manager = TaskCredentialManager(
-                        task_credentials=task.credentials,
-                        organization=organization
+                    # Convert dict credentials back to TaskCredential objects
+                    task_credentials = [TaskCredential(**cred) for cred in task.credentials]
+
+                    task_credential_manager = TaskCredentialManager(aws_client=app.WORKFLOW_CONTEXT_MANAGER.aws_client)
+                    credential_context = await task_credential_manager.build_credential_context(
+                        credentials=task_credentials, organization=organization
                     )
-                    credential_context = await task_credential_manager.build_credential_context()
             except Exception:
                 LOG.warning("Failed to resolve task credentials", task_id=task.task_id, exc_info=True)
 

@@ -156,10 +156,7 @@ class TaskV2Request(BaseModel):
     credentials: list[TaskCredential] | None = Field(
         default=None,
         description="List of credentials to use during task execution",
-        examples=[[{
-            "credential_type": "skyvern_credential",
-            "credential_id": "cred_123456789"
-        }]]
+        examples=[[{"credential_type": "skyvern_credential", "credential_id": "cred_123456789"}]],
     )
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
