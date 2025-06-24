@@ -144,6 +144,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         started_at=task_obj.started_at,
         finished_at=task_obj.finished_at,
         max_screenshot_scrolling_times=task_obj.max_screenshot_scrolling_times,
+        credentials=task_obj.credentials,
     )
     return task
 

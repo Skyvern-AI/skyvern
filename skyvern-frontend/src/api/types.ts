@@ -127,6 +127,37 @@ export type TaskApiResponse = {
   workflow_run_id: string | null;
 };
 
+export type TaskCredentialType = "skyvern" | "bitwarden" | "onepassword";
+
+export type TaskCredentialBase = {
+  credential_type: TaskCredentialType;
+  key: string;
+  description?: string | null;
+};
+
+export type SkyvernCredentialConfig = TaskCredentialBase & {
+  credential_type: "skyvern";
+  credential_id: string;
+};
+
+export type BitwardenCredentialConfig = TaskCredentialBase & {
+  credential_type: "bitwarden";
+  bitwarden_client_id_aws_secret_key: string;
+  bitwarden_client_secret_aws_secret_key: string;
+  bitwarden_master_password_aws_secret_key: string;
+  bitwarden_collection_id?: string | null;
+  bitwarden_item_id?: string | null;
+  url_parameter_key?: string | null;
+};
+
+export type OnePasswordCredentialConfig = TaskCredentialBase & {
+  credential_type: "onepassword";
+  vault_id: string;
+  item_id: string;
+};
+
+export type TaskCredentialConfig = SkyvernCredentialConfig | BitwardenCredentialConfig | OnePasswordCredentialConfig;
+
 export type CreateTaskRequest = {
   title?: string | null;
   url: string;
@@ -143,6 +174,7 @@ export type CreateTaskRequest = {
   application?: string | null;
   include_action_history_in_verification?: boolean | null;
   max_screenshot_scrolling_times?: number | null;
+  credentials?: TaskCredentialConfig[] | null;
 };
 
 export type User = {

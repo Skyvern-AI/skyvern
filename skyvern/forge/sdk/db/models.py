@@ -90,6 +90,7 @@ class TaskModel(Base):
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
+    credentials = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
         DateTime,

@@ -151,9 +151,15 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        credentials: list[dict[str, Any]] | None = None,  # Add credentials parameter
     ) -> Task:
         try:
             async with self.Session() as session:
+                # Convert credentials to JSON if provided
+                credentials_json = None
+                if credentials:
+                    credentials_json = [cred if isinstance(cred, dict) else cred.model_dump() for cred in credentials]
+                
                 new_task = TaskModel(
                     status="created",
                     task_type=task_type,
@@ -180,6 +186,7 @@ class AgentDB:
                     model=model,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
+                    credentials=credentials_json,  # Add credentials field
                 )
                 session.add(new_task)
                 await session.commit()

@@ -221,8 +221,21 @@ class ForgeAgent:
         return task, step
 
     async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
-        webhook_callback_url = str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None
-        totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
+        """
+        Create a task from a task request
+        :param task_request: task request
+        :param organization_id: organization id
+        :return: task
+        """
+
+        webhook_callback_url = None
+        if task_request.webhook_callback_url:
+            webhook_callback_url = str(task_request.webhook_callback_url)
+
+        totp_verification_url = None
+        if task_request.totp_verification_url:
+            totp_verification_url = str(task_request.totp_verification_url)
+
         task = await app.DATABASE.create_task(
             url=str(task_request.url),
             title=task_request.title,
@@ -230,26 +243,21 @@ class ForgeAgent:
             totp_verification_url=totp_verification_url,
             totp_identifier=task_request.totp_identifier,
             navigation_goal=task_request.navigation_goal,
-            complete_criterion=task_request.complete_criterion,
-            terminate_criterion=task_request.terminate_criterion,
             data_extraction_goal=task_request.data_extraction_goal,
             navigation_payload=task_request.navigation_payload,
             organization_id=organization_id,
             proxy_location=task_request.proxy_location,
             extracted_information_schema=task_request.extracted_information_schema,
+            complete_criterion=task_request.complete_criterion,
+            terminate_criterion=task_request.terminate_criterion,
+            max_steps_per_run=task_request.max_steps_per_run,
             error_code_mapping=task_request.error_code_mapping,
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolling_times,
             extra_http_headers=task_request.extra_http_headers,
-        )
-        LOG.info(
-            "Created new task",
-            task_id=task.task_id,
-            url=task.url,
-            proxy_location=task.proxy_location,
-            organization_id=organization_id,
+            credentials=task_request.credentials,  # Add credentials parameter
         )
         return task
 

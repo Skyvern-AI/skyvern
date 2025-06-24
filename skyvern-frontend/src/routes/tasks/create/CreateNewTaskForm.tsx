@@ -3,6 +3,7 @@ import {
   CreateTaskRequest,
   OrganizationApiResponse,
   ProxyLocation,
+  TaskCredentialConfig,
 } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "@/components/ui/button";
@@ -41,6 +42,8 @@ import {
 import { ProxySelector } from "@/components/ProxySelector";
 import { Switch } from "@/components/ui/switch";
 import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import { TaskCredentialSelector } from "@/components/TaskCredentialSelector";
+
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
@@ -51,6 +54,7 @@ function transform<T>(value: T): T | null {
 
 function createTaskRequestObject(
   formValues: CreateNewTaskFormValues,
+  credentials: TaskCredentialConfig[]
 ): CreateTaskRequest {
   let extractedInformationSchema = null;
   if (formValues.extractedInformationSchema) {
@@ -94,6 +98,7 @@ function createTaskRequestObject(
     max_screenshot_scrolling_times: formValues.maxScreenshotScrollingTimes,
     include_action_history_in_verification:
       formValues.includeActionHistoryInVerification,
+    credentials: credentials.length > 0 ? credentials : null,
   };
 }
 
@@ -107,6 +112,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
     "base",
   ]);
   const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
+  const [credentials, setCredentials] = useState<TaskCredentialConfig[]>([]);
 
   const { data: organizations } = useQuery<Array<OrganizationApiResponse>>({
     queryKey: ["organizations"],
@@ -134,13 +140,13 @@ function CreateNewTaskForm({ initialValues }: Props) {
 
   const mutation = useMutation({
     mutationFn: async (formValues: CreateNewTaskFormValues) => {
-      const taskRequest = createTaskRequestObject(formValues);
+      const taskRequest = createTaskRequestObject(formValues, credentials);
       const client = await getClient(credentialGetter);
       const includeOverrideHeader =
         formValues.maxStepsOverride !== null &&
         formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;
       return client.post<
-        ReturnType<typeof createTaskRequestObject>,
+        CreateTaskRequest,
         { data: { task_id: string } }
       >("/tasks", taskRequest, {
         ...(includeOverrideHeader && {
@@ -698,6 +704,16 @@ function CreateNewTaskForm({ initialValues }: Props) {
                     </FormItem>
                   )}
                 />
+                <div className="space-y-4">
+                  <h3 className="text-lg font-medium">Task Credentials</h3>
+                  <p className="text-sm text-slate-400">
+                    Credentials to be used in the task for authentication and form filling.
+                  </p>
+                  <TaskCredentialSelector
+                    credentials={credentials}
+                    onChange={setCredentials}
+                  />
+                </div>
               </div>
             </div>
           )}
@@ -709,7 +725,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
               ({
                 method: "POST",
                 url: `${apiBaseUrl}/tasks`,
-                body: createTaskRequestObject(form.getValues()),
+                body: createTaskRequestObject(form.getValues(), credentials),
                 headers: {
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",

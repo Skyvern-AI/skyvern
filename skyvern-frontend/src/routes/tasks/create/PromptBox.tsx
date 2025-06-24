@@ -4,6 +4,7 @@ import {
   TaskV2,
   ProxyLocation,
   TaskGenerationApiResponse,
+  TaskCredentialConfig,
 } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
@@ -48,6 +49,7 @@ import {
   MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT,
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import { TaskCredentialSelector } from "@/components/TaskCredentialSelector";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -163,6 +165,7 @@ function PromptBox() {
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
+  const [credentials, setCredentials] = useState<TaskCredentialConfig[]>([]);
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
@@ -195,6 +198,7 @@ function PromptBox() {
                 }
               })()
             : null,
+          credentials: credentials.length > 0 ? credentials : null,  // Add credentials to the request
         },
         {
           headers: {
@@ -278,7 +282,7 @@ function PromptBox() {
   });
 
   return (
-    <div>
+    <div className="flex h-full flex-col">
       <div
         className="rounded-sm py-[4.25rem]"
         style={{
@@ -510,6 +514,20 @@ function PromptBox() {
                         setMaxScreenshotScrollingTimes(event.target.value);
                       }}
                     />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Task Credentials</div>
+                      <div className="text-xs text-slate-400">
+                        Credentials to be used in the task for authentication and form filling.
+                      </div>
+                    </div>
+                    <div className="flex-1">
+                      <TaskCredentialSelector
+                        credentials={credentials}
+                        onChange={setCredentials}
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
