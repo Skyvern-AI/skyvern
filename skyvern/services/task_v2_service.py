@@ -168,6 +168,7 @@ async def initialize_task_v2(
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    credentials: list[dict[str, Any]] | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -181,6 +182,7 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        credentials=credentials,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -613,6 +615,22 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
+            # Resolve credentials if they exist from task v2
+            credential_context = ""
+            try:
+                from skyvern.forge.sdk.task_credential_manager import TaskCredentialManager
+                
+                if task_v2.credentials:
+                    organization = await app.DATABASE.get_organization(task_v2.organization_id)
+                    if organization:
+                        task_credential_manager = TaskCredentialManager(
+                            task_credentials=task_v2.credentials,
+                            organization=organization
+                        )
+                        credential_context = await task_credential_manager.build_credential_context()
+            except Exception:
+                LOG.warning("Failed to resolve task v2 credentials", task_v2_id=task_v2_id, exc_info=True)
+
             task_v2_prompt = load_prompt_with_elements(
                 scraped_page,
                 prompt_engine,
@@ -621,6 +639,7 @@ async def run_task_v2_helper(
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
+                credential_context=credential_context,
             )
             thought = await app.DATABASE.create_thought(
                 task_v2_id=task_v2_id,

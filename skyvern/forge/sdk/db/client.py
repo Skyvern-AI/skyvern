@@ -151,40 +151,43 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        credentials: list[dict[str, Any]] | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
                 new_task = TaskModel(
-                    status="created",
-                    task_type=task_type,
                     url=url,
                     title=title,
+                    complete_criterion=complete_criterion,
+                    terminate_criterion=terminate_criterion,
+                    navigation_goal=navigation_goal,
+                    data_extraction_goal=data_extraction_goal,
+                    navigation_payload=navigation_payload,
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
                     totp_identifier=totp_identifier,
-                    navigation_goal=navigation_goal,
-                    complete_criterion=complete_criterion,
-                    terminate_criterion=terminate_criterion,
-                    data_extraction_goal=data_extraction_goal,
-                    navigation_payload=navigation_payload,
                     organization_id=organization_id,
-                    proxy_location=proxy_location,
+                    proxy_location=proxy_location.value if proxy_location else None,
                     extracted_information_schema=extracted_information_schema,
                     workflow_run_id=workflow_run_id,
                     order=order,
                     retry=retry,
                     max_steps_per_run=max_steps_per_run,
                     error_code_mapping=error_code_mapping,
+                    task_type=task_type,
                     application=application,
                     include_action_history_in_verification=include_action_history_in_verification,
                     model=model,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
+                    credentials=credentials,
                 )
                 session.add(new_task)
                 await session.commit()
                 await session.refresh(new_task)
-                return convert_to_task(new_task, self.debug_enabled)
+
+                return convert_to_task(new_task, debug_enabled=self.debug_enabled)
+
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2530,29 +2533,39 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        credentials: list[dict[str, Any]] | None = None,
     ) -> TaskV2:
-        async with self.Session() as session:
-            new_task_v2 = TaskV2Model(
-                workflow_run_id=workflow_run_id,
-                workflow_id=workflow_id,
-                workflow_permanent_id=workflow_permanent_id,
-                prompt=prompt,
-                url=url,
-                proxy_location=proxy_location,
-                totp_identifier=totp_identifier,
-                totp_verification_url=totp_verification_url,
-                webhook_callback_url=webhook_callback_url,
-                extracted_information_schema=extracted_information_schema,
-                error_code_mapping=error_code_mapping,
-                organization_id=organization_id,
-                model=model,
-                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-                extra_http_headers=extra_http_headers,
-            )
-            session.add(new_task_v2)
-            await session.commit()
-            await session.refresh(new_task_v2)
-            return TaskV2.model_validate(new_task_v2)
+        try:
+            async with self.Session() as session:
+                new_task_v2 = TaskV2Model(
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    prompt=prompt,
+                    url=url,
+                    organization_id=organization_id,
+                    proxy_location=proxy_location.value if proxy_location else None,
+                    totp_identifier=totp_identifier,
+                    totp_verification_url=totp_verification_url,
+                    webhook_callback_url=webhook_callback_url,
+                    extracted_information_schema=extracted_information_schema,
+                    error_code_mapping=error_code_mapping,
+                    model=model,
+                    max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                    extra_http_headers=extra_http_headers,
+                    credentials=credentials,
+                )
+                session.add(new_task_v2)
+                await session.commit()
+                await session.refresh(new_task_v2)
+                return TaskV2.model_validate(new_task_v2)
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
 
     async def create_thought(
         self,

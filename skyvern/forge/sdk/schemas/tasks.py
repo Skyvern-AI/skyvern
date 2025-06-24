@@ -22,6 +22,59 @@ from skyvern.schemas.runs import ProxyLocation
 from skyvern.utils.url_validators import validate_url
 
 
+class TaskCredential(BaseModel):
+    """
+    Credential information for task execution.
+    This can be a credential ID for Skyvern-managed credentials or external credential parameters.
+    """
+    credential_type: str = Field(
+        ...,
+        description="Type of credential: 'skyvern_credential', 'onepassword', or 'bitwarden'",
+        examples=["skyvern_credential", "onepassword", "bitwarden"]
+    )
+    
+    # For Skyvern-managed credentials
+    credential_id: str | None = Field(
+        default=None,
+        description="Skyvern credential ID for skyvern_credential type",
+        examples=["cred_123456789"]
+    )
+    
+    # For OnePassword credentials
+    vault_id: str | None = Field(
+        default=None,
+        description="OnePassword vault ID for onepassword type",
+        examples=["vault_123"]
+    )
+    item_id: str | None = Field(
+        default=None,
+        description="OnePassword item ID for onepassword type",
+        examples=["item_123"]
+    )
+    
+    # For Bitwarden credentials  
+    bitwarden_client_id_aws_secret_key: str | None = Field(
+        default=None,
+        description="AWS secret key for Bitwarden client ID",
+    )
+    bitwarden_client_secret_aws_secret_key: str | None = Field(
+        default=None,
+        description="AWS secret key for Bitwarden client secret", 
+    )
+    bitwarden_master_password_aws_secret_key: str | None = Field(
+        default=None,
+        description="AWS secret key for Bitwarden master password",
+    )
+    bitwarden_collection_id: str | None = Field(
+        default=None,
+        description="Bitwarden collection ID",
+    )
+    bitwarden_item_id: str | None = Field(
+        default=None,
+        description="Bitwarden item ID",
+    )
+
+
 class TaskBase(BaseModel):
     title: str | None = Field(
         default=None,
@@ -103,6 +156,14 @@ class TaskBase(BaseModel):
         default=None,
         description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
         examples=[10],
+    )
+    credentials: list[TaskCredential] | None = Field(
+        default=None,
+        description="List of credentials to use during task execution",
+        examples=[[{
+            "credential_type": "skyvern_credential",
+            "credential_id": "cred_123456789"
+        }]]
     )
 
 

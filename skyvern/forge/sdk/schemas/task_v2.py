@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.config import settings
+from skyvern.forge.sdk.schemas.tasks import TaskCredential
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.utils.url_validators import validate_url
 
@@ -152,6 +153,14 @@ class TaskV2Request(BaseModel):
     error_code_mapping: dict[str, str] | None = None
     max_screenshot_scrolling_times: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    credentials: list[TaskCredential] | None = Field(
+        default=None,
+        description="List of credentials to use during task execution",
+        examples=[[{
+            "credential_type": "skyvern_credential",
+            "credential_id": "cred_123456789"
+        }]]
+    )
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

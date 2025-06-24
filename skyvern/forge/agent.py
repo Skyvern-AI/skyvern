@@ -223,6 +223,12 @@ class ForgeAgent:
     async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
         webhook_callback_url = str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None
         totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
+        
+        # Convert TaskCredential objects to dictionaries for storage
+        credentials_dict = None
+        if task_request.credentials:
+            credentials_dict = [credential.model_dump() for credential in task_request.credentials]
+        
         task = await app.DATABASE.create_task(
             url=str(task_request.url),
             title=task_request.title,
@@ -243,6 +249,7 @@ class ForgeAgent:
             model=task_request.model,
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolling_times,
             extra_http_headers=task_request.extra_http_headers,
+            credentials=credentials_dict,
         )
         LOG.info(
             "Created new task",
@@ -1932,6 +1939,22 @@ class ForgeAgent:
             task, expire_verification_code=expire_verification_code
         )
 
+        # Resolve credentials if they exist
+        credential_context = ""
+        if task.credentials:
+            try:
+                from skyvern.forge.sdk.task_credential_manager import TaskCredentialManager
+                
+                organization = await app.DATABASE.get_organization(task.organization_id)
+                if organization:
+                    task_credential_manager = TaskCredentialManager(
+                        task_credentials=task.credentials,
+                        organization=organization
+                    )
+                    credential_context = await task_credential_manager.build_credential_context()
+            except Exception:
+                LOG.warning("Failed to resolve task credentials", task_id=task.task_id, exc_info=True)
+
         task_type = task.task_type if task.task_type else TaskType.general
         template = ""
         if task_type == TaskType.general:
@@ -1988,6 +2011,7 @@ class ForgeAgent:
             verification_code_check=verification_code_check,
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+            credential_context=credential_context,
         )
 
     def _build_navigation_payload(

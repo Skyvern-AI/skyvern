@@ -1810,6 +1810,11 @@ async def run_task_v2(
         )
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
 
+    # Convert TaskCredential objects to dictionaries for storage
+    credentials_dict = None
+    if data.credentials:
+        credentials_dict = [credential.model_dump() for credential in data.credentials]
+
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,
@@ -1826,6 +1831,7 @@ async def run_task_v2(
             max_screenshot_scrolling_times=data.max_screenshot_scrolling_times,
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
+            credentials=credentials_dict,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

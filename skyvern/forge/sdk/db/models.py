@@ -90,6 +90,7 @@ class TaskModel(Base):
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
+    credentials = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(
         DateTime,
@@ -633,6 +634,7 @@ class TaskV2Model(Base):
     max_steps = Column(Integer, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    credentials = Column(JSON, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
