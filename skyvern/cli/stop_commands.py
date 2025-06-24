@@ -43,7 +43,10 @@ def kill_pids(pids: List[int], service_name: str) -> bool:
             except psutil.TimeoutExpired:
                 console.print(f"[yellow]Process {pid} didn't terminate gracefully, forcing kill...[/yellow]")
                 process.kill()
-                process.wait(timeout=3)
+                try:
+                    process.wait(timeout=3)
+                except psutil.TimeoutExpired:
+                    console.print(f"[red]Process {pid} remains unresponsive even after force kill[/red]")
             
             killed_any = True
             console.print(f"[green]✅ Stopped {service_name} process (PID: {pid})[/green]")
