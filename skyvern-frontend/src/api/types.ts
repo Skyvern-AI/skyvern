@@ -411,3 +411,7 @@ export const RunEngine = {
 } as const;
 
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
+
+export type PylonEmailHash = {
+  hash: string;
+};
