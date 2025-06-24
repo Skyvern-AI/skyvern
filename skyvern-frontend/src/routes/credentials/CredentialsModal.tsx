@@ -10,7 +10,7 @@ import {
   CredentialModalTypes,
 } from "./useCredentialModalState";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { CreditCardCredentialContent } from "./CreditCardCredentialContent";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -20,7 +20,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
 import { AxiosError } from "axios";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
@@ -38,24 +37,6 @@ const CREDIT_CARD_CREDENTIAL_INITIAL_VALUES = {
   cardHolderName: "",
 };
 
-// Function to generate a unique credential name
-function generateDefaultCredentialName(existingNames: string[]): string {
-  const baseName = "credentials";
-
-  // Check if "credentials" is available
-  if (!existingNames.includes(baseName)) {
-    return baseName;
-  }
-
-  // Find the next available number
-  let counter = 1;
-  while (existingNames.includes(`${baseName}_${counter}`)) {
-    counter++;
-  }
-
-  return `${baseName}_${counter}`;
-}
-
 type Props = {
   onCredentialCreated?: (id: string) => void;
 };
@@ -64,30 +45,12 @@ function CredentialsModal({ onCredentialCreated }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { isOpen, type, setIsOpen } = useCredentialModalState();
-  const { data: credentials } = useCredentialsQuery();
   const [passwordCredentialValues, setPasswordCredentialValues] = useState(
     PASSWORD_CREDENTIAL_INITIAL_VALUES,
   );
   const [creditCardCredentialValues, setCreditCardCredentialValues] = useState(
     CREDIT_CARD_CREDENTIAL_INITIAL_VALUES,
   );
-
-  // Set default name when modal opens
-  useEffect(() => {
-    if (isOpen && credentials) {
-      const existingNames = credentials.map((cred) => cred.name);
-      const defaultName = generateDefaultCredentialName(existingNames);
-
-      setPasswordCredentialValues((prev) => ({
-        ...prev,
-        name: defaultName,
-      }));
-      setCreditCardCredentialValues((prev) => ({
-        ...prev,
-        name: defaultName,
-      }));
-    }
-  }, [isOpen, credentials]);
 
   function reset() {
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
