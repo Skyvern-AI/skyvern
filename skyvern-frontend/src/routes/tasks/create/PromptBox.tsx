@@ -4,7 +4,6 @@ import {
   TaskV2,
   ProxyLocation,
   TaskGenerationApiResponse,
-  TaskCredentialConfig,
 } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
@@ -27,7 +26,6 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
   FileTextIcon,
   GearIcon,
@@ -47,9 +45,10 @@ import {
 import { ExampleCasePill } from "./ExampleCasePill";
 import {
   MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT,
-  MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
-import { TaskCredentialSelector } from "@/components/TaskCredentialSelector";
+import { TaskParametersPanel } from "../components/TaskParametersPanel";
+import { TaskParametersStateContext } from "../hooks/TaskParametersStateContext";
+import { ParametersState } from "@/routes/workflows/editor/types";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -159,13 +158,13 @@ function PromptBox() {
   const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
-  const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
+  const [maxStepsOverride] = useState<string | null>(null);
   const [maxScreenshotScrollingTimes, setMaxScreenshotScrollingTimes] =
     useState<string | null>(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
-  const [dataSchema, setDataSchema] = useState<string | null>(null);
+  const [dataSchema] = useState<string | null>(null);
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
-  const [credentials, setCredentials] = useState<TaskCredentialConfig[]>([]);
+  const [taskParameters, setTaskParameters] = useState<ParametersState>([]);
 
   const startObserverCruiseMutation = useMutation({
     mutationFn: async (prompt: string) => {
@@ -198,7 +197,7 @@ function PromptBox() {
                 }
               })()
             : null,
-          credentials: credentials.length > 0 ? credentials : null,  // Add credentials to the request
+          parameters: taskParameters.length > 0 ? taskParameters : null,
         },
         {
           headers: {
@@ -282,274 +281,240 @@ function PromptBox() {
   });
 
   return (
-    <div className="flex h-full flex-col">
-      <div
-        className="rounded-sm py-[4.25rem]"
-        style={{
-          background: `url(${img}) 50% / cover no-repeat`,
-        }}
-      >
-        <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
-          <span className="text-2xl">
-            What task would you like to accomplish?
-          </span>
-          <div className="flex w-full max-w-xl flex-col">
-            <div className="flex w-full items-center gap-2 rounded-xl bg-slate-700 py-2 pr-4">
-              <AutoResizingTextarea
-                className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                placeholder="Enter your prompt..."
-              />
-              <Select
-                value={selectValue}
-                onValueChange={(value: "v1" | "v2") => {
-                  setSelectValue(value);
-                }}
-              >
-                <SelectTrigger className="w-48 focus:ring-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="border-slate-500 bg-slate-elevation3">
-                  <CustomSelectItem value="v1">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 1.0</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        Best for simple tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 2.0</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        Best for complex tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                </SelectContent>
-              </Select>
-              <div className="flex items-center">
-                <GearIcon
-                  className="size-6 cursor-pointer"
-                  onClick={() => {
-                    setShowAdvancedSettings((value) => !value);
-                  }}
+    <TaskParametersStateContext.Provider value={[taskParameters, setTaskParameters]}>
+      <div className="flex h-full flex-col">
+        <div
+          className="rounded-sm py-[4.25rem]"
+          style={{
+            background: `url(${img}) 50% / cover no-repeat`,
+          }}
+        >
+          <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
+            <span className="text-2xl">
+              What task would you like to accomplish?
+            </span>
+            <div className="flex w-full max-w-xl flex-col">
+              <div className="flex w-full items-center gap-2 rounded-xl bg-slate-700 py-2 pr-4">
+                <AutoResizingTextarea
+                  className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  placeholder="Enter your prompt..."
                 />
-              </div>
-              <div className="flex items-center">
-                {startObserverCruiseMutation.isPending ||
-                getTaskFromPromptMutation.isPending ||
-                saveTaskMutation.isPending ? (
-                  <ReloadIcon className="size-6 animate-spin" />
-                ) : (
-                  <PaperPlaneIcon
+                <Select
+                  value={selectValue}
+                  onValueChange={(value: "v1" | "v2") => {
+                    setSelectValue(value);
+                  }}
+                >
+                  <SelectTrigger className="w-48 focus:ring-0">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="border-slate-500 bg-slate-elevation3">
+                    <CustomSelectItem value="v1">
+                      <div className="space-y-2">
+                        <div>
+                          <SelectItemText>Skyvern 1.0</SelectItemText>
+                        </div>
+                        <div className="text-xs text-slate-400">
+                          Best for simple tasks
+                        </div>
+                      </div>
+                    </CustomSelectItem>
+                    <CustomSelectItem value="v2" className="hover:bg-slate-800">
+                      <div className="space-y-2">
+                        <div>
+                          <SelectItemText>Skyvern 2.0</SelectItemText>
+                        </div>
+                        <div className="text-xs text-slate-400">
+                          Best for complex tasks
+                        </div>
+                      </div>
+                    </CustomSelectItem>
+                  </SelectContent>
+                </Select>
+                <div className="flex items-center">
+                  <GearIcon
                     className="size-6 cursor-pointer"
-                    onClick={async () => {
-                      if (selectValue === "v2") {
-                        startObserverCruiseMutation.mutate(prompt);
-                        return;
-                      }
-                      const taskGenerationResponse =
-                        await getTaskFromPromptMutation.mutateAsync(prompt);
-                      await saveTaskMutation.mutateAsync(
-                        taskGenerationResponse,
-                      );
-                      navigate("/tasks/create/from-prompt", {
-                        state: {
-                          data: taskGenerationResponse,
-                        },
-                      });
+                    onClick={() => {
+                      setShowAdvancedSettings((value) => !value);
                     }}
                   />
-                )}
-              </div>
-            </div>
-            {showAdvancedSettings ? (
-              <div className="rounded-b-lg px-2">
-                <div className="space-y-4 rounded-b-xl bg-slate-900 p-4">
-                  <header>Advanced Settings</header>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Webhook Callback URL</div>
-                      <div className="text-xs text-slate-400">
-                        The URL of a webhook endpoint to send the extracted
-                        information
-                      </div>
-                    </div>
-                    <Input
-                      value={webhookCallbackUrl ?? ""}
-                      onChange={(event) => {
-                        setWebhookCallbackUrl(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Proxy Location</div>
-                      <div className="text-xs text-slate-400">
-                        Route Skyvern through one of our available proxies.
-                      </div>
-                    </div>
-                    <ProxySelector
-                      value={proxyLocation}
-                      onChange={setProxyLocation}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Browser Session ID</div>
-                      <div className="text-xs text-slate-400">
-                        The ID of a persistent browser session
-                      </div>
-                    </div>
-                    <Input
-                      value={browserSessionId ?? ""}
-                      placeholder="pbs_xxx"
-                      onChange={(event) => {
-                        setBrowserSessionId(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">2FA Identifier</div>
-                      <div className="text-xs text-slate-400">
-                        The identifier for a 2FA code for this task.
-                      </div>
-                    </div>
-                    <Input
-                      value={totpIdentifier}
-                      onChange={(event) => {
-                        setTotpIdentifier(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Extra HTTP Headers</div>
-                      <div className="text-xs text-slate-400">
-                        Specify some self defined HTTP requests headers in Dict
-                        format
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <KeyValueInput
-                        value={extraHttpHeaders ?? ""}
-                        onChange={(val) =>
-                          setExtraHttpHeaders(
-                            val === null
-                              ? null
-                              : typeof val === "string"
-                                ? val || null
-                                : JSON.stringify(val),
-                          )
+                </div>
+                <div className="flex items-center">
+                  {startObserverCruiseMutation.isPending ||
+                  getTaskFromPromptMutation.isPending ||
+                  saveTaskMutation.isPending ? (
+                    <ReloadIcon className="size-6 animate-spin" />
+                  ) : (
+                    <PaperPlaneIcon
+                      className="size-6 cursor-pointer"
+                      onClick={async () => {
+                        if (selectValue === "v2") {
+                          startObserverCruiseMutation.mutate(prompt);
+                          return;
                         }
-                        addButtonText="Add Header"
-                      />
-                    </div>
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Publish Workflow</div>
-                      <div className="text-xs text-slate-400">
-                        Whether to create a workflow alongside this task run.
-                      </div>
-                    </div>
-                    <Switch
-                      checked={publishWorkflow}
-                      onCheckedChange={(checked) => {
-                        setPublishWorkflow(Boolean(checked));
+                        const taskGenerationResponse =
+                          await getTaskFromPromptMutation.mutateAsync(prompt);
+                        await saveTaskMutation.mutateAsync(
+                          taskGenerationResponse,
+                        );
+                        navigate("/tasks/create/from-prompt", {
+                          state: {
+                            data: taskGenerationResponse,
+                          },
+                        });
                       }}
                     />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Steps Override</div>
-                      <div className="text-xs text-slate-400">
-                        The maximum number of steps to take for this task.
+                  )}
+                </div>
+              </div>
+              {showAdvancedSettings ? (
+                <div className="rounded-b-lg px-2">
+                  <div className="space-y-4 rounded-b-xl bg-slate-900 p-4">
+                    <header>Advanced Settings</header>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Webhook Callback URL</div>
+                        <div className="text-xs text-slate-400">
+                          The URL of a webhook endpoint to send the extracted
+                          information
+                        </div>
                       </div>
-                    </div>
-                    <Input
-                      value={maxStepsOverride ?? ""}
-                      placeholder={`Default: ${MAX_STEPS_DEFAULT}`}
-                      onChange={(event) => {
-                        setMaxStepsOverride(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Data Schema</div>
-                      <div className="text-xs text-slate-400">
-                        Specify the output data schema in JSON format
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <CodeEditor
-                        value={dataSchema ?? ""}
-                        onChange={(value) => setDataSchema(value || null)}
-                        language="json"
-                        minHeight="100px"
-                        maxHeight="500px"
-                        fontSize={8}
+                      <Input
+                        value={webhookCallbackUrl ?? ""}
+                        onChange={(event) => {
+                          setWebhookCallbackUrl(event.target.value);
+                        }}
                       />
                     </div>
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Scrolling Screenshots</div>
-                      <div className="text-xs text-slate-400">
-                        {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Proxy Location</div>
+                        <div className="text-xs text-slate-400">
+                          Route Skyvern through one of our available proxies.
+                        </div>
                       </div>
-                    </div>
-                    <Input
-                      value={maxScreenshotScrollingTimes ?? ""}
-                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
-                      onChange={(event) => {
-                        setMaxScreenshotScrollingTimes(event.target.value);
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-16">
-                    <div className="w-48 shrink-0">
-                      <div className="text-sm">Task Credentials</div>
-                      <div className="text-xs text-slate-400">
-                        Credentials to be used in the task for authentication and form filling.
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <TaskCredentialSelector
-                        credentials={credentials}
-                        onChange={setCredentials}
+                      <ProxySelector
+                        value={proxyLocation}
+                        onChange={setProxyLocation}
                       />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Browser Session ID</div>
+                        <div className="text-xs text-slate-400">
+                          The ID of a persistent browser session
+                        </div>
+                      </div>
+                      <Input
+                        value={browserSessionId ?? ""}
+                        placeholder="pbs_xxx"
+                        onChange={(event) => {
+                          setBrowserSessionId(event.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">2FA Identifier</div>
+                        <div className="text-xs text-slate-400">
+                          The identifier for a 2FA code for this task.
+                        </div>
+                      </div>
+                      <Input
+                        value={totpIdentifier}
+                        onChange={(event) => {
+                          setTotpIdentifier(event.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Extra HTTP Headers</div>
+                        <div className="text-xs text-slate-400">
+                          Specify some self defined HTTP requests headers in Dict
+                          format
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <KeyValueInput
+                          value={extraHttpHeaders ?? ""}
+                          onChange={(val) =>
+                            setExtraHttpHeaders(
+                              val === null
+                                ? null
+                                : typeof val === "string"
+                                  ? val || null
+                                  : JSON.stringify(val),
+                            )
+                          }
+                          addButtonText="Add Header"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Publish Workflow</div>
+                        <div className="text-xs text-slate-400">
+                          Whether to create a workflow alongside this task run.
+                        </div>
+                      </div>
+                      <Switch
+                        checked={publishWorkflow}
+                        onCheckedChange={(checked) => {
+                          setPublishWorkflow(Boolean(checked));
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Max Screenshot Scrolling Times</div>
+                        <div className="text-xs text-slate-400">
+                          {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                        </div>
+                      </div>
+                      <Input
+                        value={maxScreenshotScrollingTimes ?? ""}
+                        placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                        onChange={(event) => {
+                          setMaxScreenshotScrollingTimes(event.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Task Parameters</div>
+                        <div className="text-xs text-slate-400">
+                          Task parameters to be used in the task
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <TaskParametersPanel />
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
-            ) : null}
+              ) : null}
+            </div>
           </div>
         </div>
+        <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
+          {exampleCases.map((example) => {
+            return (
+              <ExampleCasePill
+                key={example.key}
+                exampleId={example.key}
+                icon={example.icon}
+                label={example.label}
+                prompt={example.prompt}
+                version={selectValue}
+              />
+            );
+          })}
+        </div>
       </div>
-      <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
-        {exampleCases.map((example) => {
-          return (
-            <ExampleCasePill
-              key={example.key}
-              exampleId={example.key}
-              icon={example.icon}
-              label={example.label}
-              prompt={example.prompt}
-              version={selectValue}
-            />
-          );
-        })}
-      </div>
-    </div>
+    </TaskParametersStateContext.Provider>
   );
 }
 

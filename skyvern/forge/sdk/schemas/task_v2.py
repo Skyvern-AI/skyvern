@@ -50,6 +50,7 @@ class TaskV2(BaseModel):
     finished_at: datetime | None = None
     max_screenshot_scrolling_times: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    credentials: list[str] | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -71,6 +72,8 @@ class TaskV2(BaseModel):
                     return llm_key
 
         return None
+
+
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -152,6 +155,11 @@ class TaskV2Request(BaseModel):
     error_code_mapping: dict[str, str] | None = None
     max_screenshot_scrolling_times: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    credentials: list[str] | None = Field(
+        default=None,
+        description="List of credential IDs to use for this task. Credentials will be masked from LLMs for security.",
+        examples=[["cred_12345", "cred_67890"]],
+    )
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

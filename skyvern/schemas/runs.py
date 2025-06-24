@@ -286,6 +286,11 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
     )
+    credentials: list[str] | None = Field(
+        default=None,
+        description="List of credential IDs to use for this task. Credentials will be masked from LLMs for security.",
+        examples=[["cred_12345", "cred_67890"]],
+    )
 
     @field_validator("url", "webhook_url", "totp_url")
     @classmethod

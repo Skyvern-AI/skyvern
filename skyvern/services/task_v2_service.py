@@ -168,7 +168,10 @@ async def initialize_task_v2(
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    credentials: list[str] | None = None,
 ) -> TaskV2:
+    # Credentials are now stored in a dedicated field
+
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -181,6 +184,7 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        credentials=credentials,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -474,7 +478,7 @@ async def run_task_v2_helper(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-    await _set_up_workflow_context(workflow_id, workflow_run_id, organization)
+    await _set_up_workflow_context(workflow_id, workflow_run_id, organization, task_v2.credentials)
 
     url = str(task_v2.url)
     user_prompt = task_v2.prompt
@@ -985,20 +989,45 @@ async def handle_block_result(
     )
 
 
-async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str, organization: Organization) -> None:
+async def _set_up_workflow_context(
+    workflow_id: str,
+    workflow_run_id: str,
+    organization: Organization,
+    credentials: list[str] | None = None,
+) -> None:
     """
     TODO: see if we could remove this function as we can just set an empty workflow context
     """
     # Get all <workflow parameter, workflow run parameter> tuples
     wp_wps_tuples = await app.WORKFLOW_SERVICE.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
     workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(workflow_id=workflow_id)
+
+    # Create credential parameters if credentials are provided
+    secret_parameters = []
+    if credentials:
+        from datetime import datetime
+
+        from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
+
+        for idx, credential_id in enumerate(credentials):
+            credential_param = CredentialParameter(
+                parameter_type="credential",
+                credential_parameter_id=f"task_v2_credential_{idx}",
+                workflow_id=workflow_id,
+                key=f"credential_{idx}",
+                credential_id=credential_id,
+                created_at=datetime.now(),
+                modified_at=datetime.now(),
+            )
+            secret_parameters.append(credential_param)
+
     await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
         organization,
         workflow_run_id,
         wp_wps_tuples,
         workflow_output_parameters,
         [],
-        [],
+        secret_parameters,
     )
 
 

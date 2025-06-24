@@ -22,46 +22,6 @@ from skyvern.schemas.runs import ProxyLocation
 from skyvern.utils.url_validators import validate_url
 
 
-class TaskCredentialType(StrEnum):
-    SKYVERN = "skyvern"
-    BITWARDEN = "bitwarden"
-    ONEPASSWORD = "onepassword"
-
-
-class TaskCredentialBase(BaseModel):
-    """Base class for task credentials"""
-    credential_type: TaskCredentialType
-    key: str = Field(..., description="The key to reference this credential in the task")
-    description: str | None = Field(None, description="Optional description for the credential")
-
-
-class SkyvernCredentialConfig(TaskCredentialBase):
-    """Configuration for Skyvern credential"""
-    credential_type: TaskCredentialType = TaskCredentialType.SKYVERN
-    credential_id: str = Field(..., description="The ID of the Skyvern credential")
-
-
-class BitwardenCredentialConfig(TaskCredentialBase):
-    """Configuration for Bitwarden credential"""
-    credential_type: TaskCredentialType = TaskCredentialType.BITWARDEN
-    bitwarden_client_id_aws_secret_key: str = Field(..., description="AWS secret key for Bitwarden client ID")
-    bitwarden_client_secret_aws_secret_key: str = Field(..., description="AWS secret key for Bitwarden client secret")
-    bitwarden_master_password_aws_secret_key: str = Field(..., description="AWS secret key for Bitwarden master password")
-    bitwarden_collection_id: str | None = Field(None, description="Bitwarden collection ID to filter credentials")
-    bitwarden_item_id: str | None = Field(None, description="Specific Bitwarden item ID")
-    url_parameter_key: str | None = Field(None, description="URL parameter key for credential lookup")
-
-
-class OnePasswordCredentialConfig(TaskCredentialBase):
-    """Configuration for 1Password credential"""
-    credential_type: TaskCredentialType = TaskCredentialType.ONEPASSWORD
-    vault_id: str = Field(..., description="1Password vault ID")
-    item_id: str = Field(..., description="1Password item ID")
-
-
-TaskCredentialConfig = SkyvernCredentialConfig | BitwardenCredentialConfig | OnePasswordCredentialConfig
-
-
 class TaskBase(BaseModel):
     title: str | None = Field(
         default=None,
@@ -144,20 +104,6 @@ class TaskBase(BaseModel):
         description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
         examples=[10],
     )
-    credentials: list[TaskCredentialConfig] | None = Field(
-        default=None,
-        description="List of credentials to be used in the task. These credentials will be available to the LLM for authentication and form filling.",
-        examples=[
-            [
-                {
-                    "credential_type": "skyvern",
-                    "key": "login_credentials",
-                    "credential_id": "cred_123",
-                    "description": "Main login credentials"
-                }
-            ]
-        ]
-    )
 
 
 class TaskRequest(TaskBase):
@@ -174,6 +120,11 @@ class TaskRequest(TaskBase):
     totp_verification_url: str | None = None
     browser_session_id: str | None = None
     model: dict[str, Any] | None = None
+    credentials: list[str] | None = Field(
+        default=None,
+        description="List of credential IDs to use for this task. Credentials will be masked from LLMs for security.",
+        examples=[["cred_12345", "cred_67890"]],
+    )
 
     @model_validator(mode="after")
     def validate_url(self) -> Self:
@@ -304,6 +255,8 @@ class Task(TaskBase):
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    max_screenshot_scrolling_times: int | None = None
+    credentials: list[str] | None = None
 
     @property
     def llm_key(self) -> str | None:

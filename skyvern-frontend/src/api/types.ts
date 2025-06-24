@@ -111,53 +111,6 @@ export type Task = {
   application: string | null;
 };
 
-export type TaskApiResponse = {
-  request: CreateTaskRequest;
-  task_id: string;
-  status: Status;
-  created_at: string; // ISO 8601
-  modified_at: string; // ISO 8601
-  extracted_information: Record<string, unknown> | string | null;
-  screenshot_url: string | null;
-  recording_url: string | null;
-  failure_reason: string | null;
-  errors: Array<Record<string, unknown>>;
-  max_steps_per_run: number | null;
-  task_v2: TaskV2 | null;
-  workflow_run_id: string | null;
-};
-
-export type TaskCredentialType = "skyvern" | "bitwarden" | "onepassword";
-
-export type TaskCredentialBase = {
-  credential_type: TaskCredentialType;
-  key: string;
-  description?: string | null;
-};
-
-export type SkyvernCredentialConfig = TaskCredentialBase & {
-  credential_type: "skyvern";
-  credential_id: string;
-};
-
-export type BitwardenCredentialConfig = TaskCredentialBase & {
-  credential_type: "bitwarden";
-  bitwarden_client_id_aws_secret_key: string;
-  bitwarden_client_secret_aws_secret_key: string;
-  bitwarden_master_password_aws_secret_key: string;
-  bitwarden_collection_id?: string | null;
-  bitwarden_item_id?: string | null;
-  url_parameter_key?: string | null;
-};
-
-export type OnePasswordCredentialConfig = TaskCredentialBase & {
-  credential_type: "onepassword";
-  vault_id: string;
-  item_id: string;
-};
-
-export type TaskCredentialConfig = SkyvernCredentialConfig | BitwardenCredentialConfig | OnePasswordCredentialConfig;
-
 export type CreateTaskRequest = {
   title?: string | null;
   url: string;
@@ -174,7 +127,23 @@ export type CreateTaskRequest = {
   application?: string | null;
   include_action_history_in_verification?: boolean | null;
   max_screenshot_scrolling_times?: number | null;
-  credentials?: TaskCredentialConfig[] | null;
+  parameters?: any[] | null;
+};
+
+export type TaskApiResponse = {
+  request: CreateTaskRequest;
+  task_id: string;
+  status: Status;
+  created_at: string; // ISO 8601
+  modified_at: string; // ISO 8601
+  extracted_information: Record<string, unknown> | string | null;
+  screenshot_url: string | null;
+  recording_url: string | null;
+  failure_reason: string | null;
+  errors: Array<Record<string, unknown>>;
+  max_steps_per_run: number | null;
+  task_v2: TaskV2 | null;
+  workflow_run_id: string | null;
 };
 
 export type User = {
@@ -380,6 +349,15 @@ export type Createv2TaskRequest = {
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
   browser_session_id?: string | null;
+  totp_identifier?: string | null;
+  publish_workflow?: boolean | null;
+  max_screenshot_scrolling_times?: string | null;
+  extracted_information_schema?: 
+    | Record<string, unknown>
+    | string
+    | null;
+  extra_http_headers?: Record<string, string> | null;
+  parameters?: any[] | null;
 };
 
 export type PasswordCredentialApiResponse = {

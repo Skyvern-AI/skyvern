@@ -131,6 +131,13 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
 
+    # Validate credentials if provided
+    if run_request.credentials:
+        for credential_id in run_request.credentials:
+            credential = await app.DATABASE.get_credential(credential_id, organization_id=current_org.organization_id)
+            if credential is None:
+                raise HTTPException(status_code=400, detail=f"Credential not found: {credential_id}")
+
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
@@ -168,6 +175,7 @@ async def run_task(
             model=run_request.model,
             max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
             extra_http_headers=run_request.extra_http_headers,
+            credentials=run_request.credentials,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -206,6 +214,7 @@ async def run_task(
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+                credentials=run_request.credentials,
             ),
         )
     if run_request.engine == RunEngine.skyvern_v2:
@@ -226,6 +235,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
                 extra_http_headers=run_request.extra_http_headers,
+                credentials=run_request.credentials,
             )
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -269,6 +279,7 @@ async def run_task(
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+                credentials=run_request.credentials,
             ),
         )
     LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)

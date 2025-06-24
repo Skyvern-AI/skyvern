@@ -151,14 +151,10 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        credentials: list[dict[str, Any]] | None = None,  # Add credentials parameter
+        credentials: list[str] | None = None,  # Credential IDs for the task
     ) -> Task:
         try:
             async with self.Session() as session:
-                # Convert credentials to JSON if provided
-                credentials_json = None
-                if credentials:
-                    credentials_json = [cred if isinstance(cred, dict) else cred.model_dump() for cred in credentials]
                 
                 new_task = TaskModel(
                     status="created",
@@ -186,7 +182,7 @@ class AgentDB:
                     model=model,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
-                    credentials=credentials_json,  # Add credentials field
+                    credentials=credentials,  # Credentials field
                 )
                 session.add(new_task)
                 await session.commit()
@@ -2537,6 +2533,7 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        credentials: list[str] | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2552,10 +2549,11 @@ class AgentDB:
                 extracted_information_schema=extracted_information_schema,
                 error_code_mapping=error_code_mapping,
                 organization_id=organization_id,
-                model=model,
-                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-                extra_http_headers=extra_http_headers,
-            )
+                                    model=model,
+                    max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                    extra_http_headers=extra_http_headers,
+                    credentials=credentials,
+                )
             session.add(new_task_v2)
             await session.commit()
             await session.refresh(new_task_v2)

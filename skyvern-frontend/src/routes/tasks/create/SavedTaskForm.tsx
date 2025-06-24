@@ -31,9 +31,11 @@ import { stringify as convertToYAML } from "yaml";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
 import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
-import { OrganizationApiResponse, ProxyLocation, TaskCredentialConfig } from "@/api/types";
+import { OrganizationApiResponse, ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
-import { TaskCredentialSelector } from "@/components/TaskCredentialSelector";
+import { TaskParametersPanel } from "../components/TaskParametersPanel";
+import { TaskParametersStateContext } from "../hooks/TaskParametersStateContext";
+import { ParametersState } from "@/routes/workflows/editor/types";
 
 type Props = {
   initialValues: SavedTaskFormValues;
@@ -43,7 +45,7 @@ function transform(value: unknown) {
   return value === "" ? null : value;
 }
 
-function createTaskRequestObject(formValues: SavedTaskFormValues, credentials: TaskCredentialConfig[]) {
+function createTaskRequestObject(formValues: SavedTaskFormValues, taskParameters: ParametersState) {
   return {
     title: formValues.title,
     url: formValues.url,
@@ -57,7 +59,7 @@ function createTaskRequestObject(formValues: SavedTaskFormValues, credentials: T
     ),
     totp_identifier: transform(formValues.totpIdentifier),
     error_code_mapping: safeParseMaybeJSONString(formValues.errorCodeMapping),
-    credentials: credentials.length > 0 ? credentials : null,
+              parameters: taskParameters.length > 0 ? taskParameters : null,
   };
 }
 
@@ -72,7 +74,7 @@ function safeParseMaybeJSONString(payload: unknown) {
   return payload;
 }
 
-function createTaskTemplateRequestObject(values: SavedTaskFormValues, credentials: TaskCredentialConfig[]) {
+function createTaskTemplateRequestObject(values: SavedTaskFormValues, taskParameters: ParametersState) {
   return {
     title: values.title,
     description: values.description,
@@ -103,7 +105,7 @@ function createTaskTemplateRequestObject(values: SavedTaskFormValues, credential
           error_code_mapping: safeParseMaybeJSONString(values.errorCodeMapping),
           include_action_history_in_verification:
             values.includeActionHistoryInVerification,
-          credentials: credentials.length > 0 ? credentials : null,
+          parameters: taskParameters.length > 0 ? taskParameters : null,
         },
       ],
     },
@@ -122,7 +124,7 @@ function SavedTaskForm({ initialValues }: Props) {
     "base",
   ]);
   const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
-  const [credentials, setCredentials] = useState<TaskCredentialConfig[]>([]);
+  const [taskParameters, setTaskParameters] = useState<ParametersState>([]);
 
   const { data: organizations } = useQuery<Array<OrganizationApiResponse>>({
     queryKey: ["organizations"],
@@ -149,7 +151,7 @@ function SavedTaskForm({ initialValues }: Props) {
 
   const createAndSaveTaskMutation = useMutation({
     mutationFn: async (formValues: SavedTaskFormValues) => {
-      const saveTaskRequest = createTaskTemplateRequestObject(formValues, credentials);
+      const saveTaskRequest = createTaskTemplateRequestObject(formValues, taskParameters);
       const yaml = convertToYAML(saveTaskRequest);
       const client = await getClient(credentialGetter);
 
@@ -160,7 +162,7 @@ function SavedTaskForm({ initialValues }: Props) {
           },
         })
         .then(() => {
-          const taskRequest = createTaskRequestObject(formValues, credentials);
+          const taskRequest = createTaskRequestObject(formValues, taskParameters);
           const includeOverrideHeader =
             formValues.maxStepsOverride !== null &&
             formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;
@@ -224,7 +226,7 @@ function SavedTaskForm({ initialValues }: Props) {
 
   const saveTaskMutation = useMutation({
     mutationFn: async (formValues: SavedTaskFormValues) => {
-      const saveTaskRequest = createTaskTemplateRequestObject(formValues, credentials);
+      const saveTaskRequest = createTaskTemplateRequestObject(formValues, taskParameters);
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(saveTaskRequest);
       return client
@@ -275,8 +277,9 @@ function SavedTaskForm({ initialValues }: Props) {
   }
 
   return (
-    <Form {...form}>
-      <form
+    <TaskParametersStateContext.Provider value={[taskParameters, setTaskParameters]}>
+      <Form {...form}>
+        <form
         onSubmit={(event) => {
           const submitter = (
             (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement
@@ -737,16 +740,13 @@ function SavedTaskForm({ initialValues }: Props) {
                 />
                 <div className="flex gap-16">
                   <div className="w-48 shrink-0">
-                    <div className="text-sm">Task Credentials</div>
+                    <div className="text-sm">Task Parameters</div>
                     <div className="text-xs text-slate-400">
-                      Credentials to be used in the task for authentication and form filling.
+                      Parameters to be used in the task including credentials and other values.
                     </div>
                   </div>
                   <div className="flex-1">
-                    <TaskCredentialSelector
-                      credentials={credentials}
-                      onChange={setCredentials}
-                    />
+                    <TaskParametersPanel />
                   </div>
                 </div>
               </div>
@@ -760,7 +760,7 @@ function SavedTaskForm({ initialValues }: Props) {
               ({
                 method: "POST",
                 url: `${apiBaseUrl}/tasks`,
-                body: createTaskRequestObject(form.getValues(), credentials),
+                body: createTaskRequestObject(form.getValues(), taskParameters),
                 headers: {
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
@@ -796,6 +796,7 @@ function SavedTaskForm({ initialValues }: Props) {
         </div>
       </form>
     </Form>
+    </TaskParametersStateContext.Provider>
   );
 }
 
