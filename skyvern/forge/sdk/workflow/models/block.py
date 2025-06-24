@@ -2480,6 +2480,10 @@ class TaskV2Block(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
+            output_reason = f"Failed to format jinja template: {str(e)}"
+            await self.record_output_parameter_value(
+                workflow_run_context, workflow_run_id, {"failure_reason": output_reason}
+            )
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
@@ -2567,6 +2571,14 @@ class TaskV2Block(Block):
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure
+        task_v2_output = {
+            "task_id": task_v2.observer_cruise_id,
+            "status": task_v2.status,
+            "summary": task_v2.summary,
+            "extracted_information": result_dict,
+            "failure_reason": failure_reason,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
         return await self.build_block_result(
             success=success or self.continue_on_failure,
             failure_reason=failure_reason,
