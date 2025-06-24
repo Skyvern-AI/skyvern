@@ -1,5 +1,3 @@
-import os
-import subprocess
 import typer
 from typing import List
 
@@ -16,7 +14,10 @@ def get_pids_on_port(port: int) -> List[int]:
     pids = []
     try:
         for conn in psutil.net_connections(kind="inet"):
-            if conn.laddr and conn.laddr.port == port and conn.pid:
+            if (conn.laddr and 
+                conn.laddr.port == port and 
+                conn.pid and 
+                conn.status == psutil.CONN_LISTEN):
                 pids.append(conn.pid)
     except Exception:
         pass
@@ -35,6 +36,15 @@ def kill_pids(pids: List[int], service_name: str) -> bool:
             # Use psutil for cross-platform process killing
             process = psutil.Process(pid)
             process.terminate()
+            
+            # Wait for the process to exit, use kill() as fallback
+            try:
+                process.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                console.print(f"[yellow]Process {pid} didn't terminate gracefully, forcing kill...[/yellow]")
+                process.kill()
+                process.wait(timeout=3)
+            
             killed_any = True
             console.print(f"[green]✅ Stopped {service_name} process (PID: {pid})[/green]")
         except psutil.NoSuchProcess:
@@ -48,12 +58,14 @@ def kill_pids(pids: List[int], service_name: str) -> bool:
 
 
 @stop_app.command(name="server")
-def stop_server() -> None:
-    """Stop the Skyvern API server running on port 8000."""
-    console.print(Panel("[bold red]Stopping Skyvern API Server...[/bold red]", border_style="red"))
+def stop_server(
+    port: int = typer.Option(8000, "--port", "-p", help="Port number for the Skyvern API server")
+) -> None:
+    """Stop the Skyvern API server running on the specified port (default: 8000)."""
+    console.print(Panel(f"[bold red]Stopping Skyvern API Server (port {port})...[/bold red]", border_style="red"))
     
-    pids = get_pids_on_port(8000)
-    if kill_pids(pids, "Skyvern API server"):
-        console.print("[green]🛑 Skyvern API server stopped successfully.[/green]")
+    pids = get_pids_on_port(port)
+    if kill_pids(pids, f"Skyvern API server (port {port})"):
+        console.print(f"[green]🛑 Skyvern API server on port {port} stopped successfully.[/green]")
     else:
-        console.print("[yellow]No Skyvern API server found running on port 8000.[/yellow]") 
+        console.print(f"[yellow]No Skyvern API server found running on port {port}.[/yellow]") 
