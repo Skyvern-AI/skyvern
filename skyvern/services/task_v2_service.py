@@ -170,12 +170,6 @@ async def initialize_task_v2(
     extra_http_headers: dict[str, str] | None = None,
     credential_ids: list[str] | None = None,
 ) -> TaskV2:
-    # Store credential_ids in the model field for now
-    if model is None:
-        model = {}
-    if credential_ids:
-        model["credential_ids"] = credential_ids
-
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -188,6 +182,7 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        credential_ids=credential_ids,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -481,7 +476,7 @@ async def run_task_v2_helper(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-    await _set_up_workflow_context(workflow_id, workflow_run_id, organization, task_v2.credential_ids_from_model)
+    await _set_up_workflow_context(workflow_id, workflow_run_id, organization, task_v2.credential_ids)
 
     url = str(task_v2.url)
     user_prompt = task_v2.prompt

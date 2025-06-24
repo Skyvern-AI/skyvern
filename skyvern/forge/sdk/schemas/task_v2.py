@@ -73,12 +73,7 @@ class TaskV2(BaseModel):
 
         return None
 
-    @property
-    def credential_ids_from_model(self) -> list[str] | None:
-        """Extract credential_ids from the model field."""
-        if self.model and isinstance(self.model, dict):
-            return self.model.get("credential_ids")
-        return None
+
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

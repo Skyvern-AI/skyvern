@@ -252,6 +252,7 @@ class Task(TaskBase):
     max_steps_per_run: int | None = None
     errors: list[dict[str, Any]] = []
     model: dict[str, Any] | None = None
+    credential_ids: list[str] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None

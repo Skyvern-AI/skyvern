@@ -151,6 +151,7 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        credential_ids: list[str] | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -180,6 +181,7 @@ class AgentDB:
                     model=model,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
+                    credential_ids=credential_ids,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -2530,6 +2532,7 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        credential_ids: list[str] | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2548,6 +2551,7 @@ class AgentDB:
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
+                credential_ids=credential_ids,
             )
             session.add(new_task_v2)
             await session.commit()
