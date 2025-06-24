@@ -275,8 +275,13 @@ class Settings(BaseSettings):
 
     SKYVERN_BROWSER_VNC_PORT: int = 6080
     """
-    The websockified port on which the VNC server of a persistent browser is 
+    The websockified port on which the VNC server of a persistent browser is
     listening.
+    """
+
+    PYLON_IDENTITY_VERIFICATION_SECRET: str | None = None
+    """
+    The secret used to sign the email/identity of the user.
     """
 
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
