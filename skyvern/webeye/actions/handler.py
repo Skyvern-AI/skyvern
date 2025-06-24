@@ -682,6 +682,22 @@ async def handle_sequential_click_for_dropdown(
     if dropdown_menu_element is None:
         return None
 
+    dropdown_select_context = await _get_input_or_select_context(
+        action=AbstractActionForContextParse(
+            reasoning=action.reasoning, intention=action.intention, element_id=action.element_id
+        ),
+        step=step,
+        scraped_page=scraped_page,
+    )
+
+    if dropdown_select_context.is_date_related:
+        LOG.info(
+            "The dropdown is date related, exiting the sequential click logic",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        return None
+
     LOG.info(
         "Found the dropdown menu element after clicking, triggering the sequential click logic",
         step_id=step.step_id,
@@ -692,8 +708,12 @@ async def handle_sequential_click_for_dropdown(
     return await select_from_emerging_elements(
         current_element_id=anchor_element.get_id(),
         options=CustomSelectPromptOptions(
-            field_information=action.intention if action.intention else action.reasoning,
-        ),  # FIXME: need a better options data
+            field_information=dropdown_select_context.intention
+            if dropdown_select_context.intention
+            else dropdown_select_context.field,
+            is_date_related=dropdown_select_context.is_date_related,
+            required_field=dropdown_select_context.is_required,
+        ),
         page=page,
         scraped_page=scraped_page,
         step=step,
@@ -3540,8 +3560,14 @@ async def _get_verification_code_from_db(
     return None
 
 
+class AbstractActionForContextParse(BaseModel):
+    reasoning: str | None
+    element_id: str
+    intention: str | None
+
+
 async def _get_input_or_select_context(
-    action: InputTextAction | SelectOptionAction, scraped_page: ScrapedPage, step: Step
+    action: InputTextAction | SelectOptionAction | AbstractActionForContextParse, scraped_page: ScrapedPage, step: Step
 ) -> InputOrSelectContext:
     prompt = load_prompt_with_elements(
         scraped_page=scraped_page,
