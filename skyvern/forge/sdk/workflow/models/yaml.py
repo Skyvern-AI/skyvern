@@ -373,10 +373,10 @@ class TaskV2BlockYAML(BlockYAML):
 
 class HttpRequestBlockYAML(BlockYAML):
     block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST  # type: ignore
-    
+
     # Either curl_command or individual HTTP parameters can be used
     curl_command: str | None = None
-    
+
     # Individual HTTP parameters (alternative to curl_command)
     method: str = "GET"
     url: str | None = None
@@ -384,7 +384,7 @@ class HttpRequestBlockYAML(BlockYAML):
     body: dict[str, Any] | str | None = None
     timeout: int = 30
     follow_redirects: bool = True
-    
+
     # Parameter keys for templating
     parameter_keys: list[str] | None = None
 
