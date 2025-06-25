@@ -111,6 +111,17 @@ const nodeLibraryItems: Array<{
     description: "Navigates to a URL",
   },
   {
+    nodeType: "httpRequest",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.HttpRequest}
+        className="size-6"
+      />
+    ),
+    title: "HTTP Request Block",
+    description: "Make HTTP/API requests",
+  },
+  {
     nodeType: "textPrompt",
     icon: (
       <WorkflowBlockIcon
