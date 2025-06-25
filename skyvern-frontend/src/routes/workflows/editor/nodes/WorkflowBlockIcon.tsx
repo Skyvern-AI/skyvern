@@ -13,6 +13,7 @@ import {
   StopwatchIcon,
   UpdateIcon,
   UploadIcon,
+  LinkBreak2Icon,
 } from "@radix-ui/react-icons";
 import { ExtractIcon } from "@/components/icons/ExtractIcon";
 import { RobotIcon } from "@/components/icons/RobotIcon";
@@ -78,6 +79,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "goto_url": {
       return <ExternalLinkIcon className={className} />;
+    }
+    case "http_request": {
+      return <LinkBreak2Icon className={className} />;
     }
   }
 }

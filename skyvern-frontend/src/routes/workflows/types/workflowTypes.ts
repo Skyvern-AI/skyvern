@@ -190,7 +190,8 @@ export type WorkflowBlock =
   | FileDownloadBlock
   | PDFParserBlock
   | Taskv2Block
-  | URLBlock;
+  | URLBlock
+  | HttpRequestBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -212,6 +213,7 @@ export const WorkflowBlockTypes = {
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
   URL: "goto_url",
+  HttpRequest: "http_request",
 } as const;
 
 export function isTaskVariantBlock(item: {
@@ -448,6 +450,18 @@ export type PDFParserBlock = WorkflowBlockBase & {
 export type URLBlock = WorkflowBlockBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type HttpRequestBlock = WorkflowBlockBase & {
+  block_type: "http_request";
+  curl_command: string | null;
+  method: string;
+  url: string | null;
+  headers: Record<string, string> | null;
+  body: Record<string, unknown> | string | null;
+  timeout: number;
+  follow_redirects: boolean;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type WorkflowDefinition = {
