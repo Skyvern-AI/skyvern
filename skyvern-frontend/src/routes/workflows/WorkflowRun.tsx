@@ -125,7 +125,7 @@ function WorkflowRun() {
     // Add more tips as needed
   ];
 
-  const matchedHints =
+  const matchedTips =
     workflowRun?.failure_reason
       ? failureTips
         .filter(({ match }) => match(workflowRun.failure_reason!))
@@ -145,7 +145,7 @@ function WorkflowRun() {
     >
       <div className="font-bold">Workflow Failure Reason</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
-      {matchedHints}
+      {matchedTips}
     </div>
   ) : null;
 
