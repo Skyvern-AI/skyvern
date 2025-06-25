@@ -2575,10 +2575,10 @@ class TaskV2Block(Block):
 
 class HttpRequestBlock(Block):
     block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST
-    
+
     # Either curl_command or individual HTTP parameters can be used
     curl_command: str | None = None
-    
+
     # Individual HTTP parameters (alternative to curl_command)
     method: str = "GET"
     url: str | None = None
@@ -2586,64 +2586,64 @@ class HttpRequestBlock(Block):
     body: dict[str, Any] | str | None = None
     timeout: int = 30
     follow_redirects: bool = True
-    
+
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
-    
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
     ) -> list[PARAMETER_TYPE]:
         parameters = self.parameters
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        
+
         # Check if url is a parameter
         if self.url and workflow_run_context.has_parameter(self.url):
             if self.url not in [parameter.key for parameter in parameters]:
                 parameters.append(workflow_run_context.get_parameter(self.url))
-                
+
         return parameters
-    
+
     def parse_curl_command(self, curl_command: str) -> dict[str, Any]:
         """Parse a curl command into HTTP request parameters"""
         import shlex
-        import re
-        
+
         # Basic parsing of curl command
         parts = shlex.split(curl_command)
-        
-        parsed = {
+
+        parsed: dict[str, Any] = {
             "method": "GET",
             "url": None,
             "headers": {},
             "body": None,
         }
-        
+
         i = 0
         while i < len(parts):
             part = parts[i]
-            
+
             if part == "curl":
                 i += 1
                 continue
-                
+
             # Parse method
             if part in ["-X", "--request"]:
                 if i + 1 < len(parts):
                     parsed["method"] = parts[i + 1].upper()
                     i += 2
                     continue
-                    
+
             # Parse headers
             if part in ["-H", "--header"]:
                 if i + 1 < len(parts):
                     header = parts[i + 1]
                     if ":" in header:
                         key, value = header.split(":", 1)
-                        parsed["headers"][key.strip()] = value.strip()
+                        if isinstance(parsed["headers"], dict):
+                            parsed["headers"][key.strip()] = value.strip()
                     i += 2
                     continue
-                    
+
             # Parse data/body
             if part in ["-d", "--data", "--data-raw", "--data-binary"]:
                 if i + 1 < len(parts):
@@ -2652,38 +2652,34 @@ class HttpRequestBlock(Block):
                         parsed["method"] = "POST"
                     i += 2
                     continue
-                    
+
             # Parse URL (usually the last non-option argument)
             if not part.startswith("-") and parsed["url"] is None:
                 parsed["url"] = part
-                
+
             i += 1
-            
+
         return parsed
-    
+
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         """Format template parameters in the block fields"""
         if self.curl_command:
             self.curl_command = self.format_block_parameter_template_from_workflow_run_context(
                 self.curl_command, workflow_run_context
             )
-            
+
         if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(
-                self.url, workflow_run_context
-            )
-            
+            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+
         if self.body and isinstance(self.body, str):
-            self.body = self.format_block_parameter_template_from_workflow_run_context(
-                self.body, workflow_run_context
-            )
-            
+            self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
+
         if self.headers:
             for key, value in self.headers.items():
                 self.headers[key] = self.format_block_parameter_template_from_workflow_run_context(
                     value, workflow_run_context
                 )
-    
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -2694,7 +2690,7 @@ class HttpRequestBlock(Block):
     ) -> BlockResult:
         """Execute the HTTP request and return the response"""
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        
+
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
@@ -2706,7 +2702,7 @@ class HttpRequestBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-        
+
         # Parse curl command if provided
         if self.curl_command:
             try:
@@ -2724,7 +2720,7 @@ class HttpRequestBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
-        
+
         # Validate URL
         if not self.url:
             return await self.build_block_result(
@@ -2735,12 +2731,13 @@ class HttpRequestBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-        
+
         # Execute HTTP request
         try:
-            import aiohttp
             import json as json_module
-            
+
+            import aiohttp
+
             LOG.info(
                 "Executing HTTP request",
                 method=self.method,
@@ -2749,17 +2746,15 @@ class HttpRequestBlock(Block):
                 has_body=bool(self.body),
                 workflow_run_id=workflow_run_id,
             )
-            
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as session:
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
                 # Prepare request kwargs
                 request_kwargs = {
                     "url": self.url,
                     "headers": self.headers or {},
                     "allow_redirects": self.follow_redirects,
                 }
-                
+
                 # Handle body based on content type and method
                 if self.body and self.method.upper() != "GET":
                     if isinstance(self.body, dict):
@@ -2768,10 +2763,10 @@ class HttpRequestBlock(Block):
                         # Try to parse as JSON
                         try:
                             request_kwargs["json"] = json_module.loads(self.body)
-                        except:
+                        except (json_module.JSONDecodeError, TypeError):
                             # If not JSON, send as raw data
                             request_kwargs["data"] = self.body
-                
+
                 # Make the request
                 try:
                     async with session.request(self.method.upper(), **request_kwargs) as response:
@@ -2781,14 +2776,14 @@ class HttpRequestBlock(Block):
                             "headers": dict(response.headers),
                             "url": str(response.url),
                         }
-                        
+
                         # Try to parse response as JSON
                         try:
                             response_data["body"] = await response.json()
-                        except:
+                        except (aiohttp.ContentTypeError, json_module.JSONDecodeError):
                             # If not JSON, get as text
                             response_data["body"] = await response.text()
-                        
+
                         LOG.info(
                             "HTTP request completed",
                             status_code=response.status,
@@ -2796,7 +2791,7 @@ class HttpRequestBlock(Block):
                             method=self.method,
                             workflow_run_id=workflow_run_id,
                         )
-                        
+
                 except aiohttp.ClientError as e:
                     # Handle client errors (connection errors, timeouts, etc.)
                     error_msg = f"HTTP client error: {str(e)}"
@@ -2817,13 +2812,13 @@ class HttpRequestBlock(Block):
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
                     )
-            
+
             # Determine success based on status code
             status_code = response_data.get("status_code", 0)
             success = 200 <= status_code < 300
-            
+
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
-            
+
             return await self.build_block_result(
                 success=success,
                 failure_reason=None if success else f"HTTP {status_code}: {response_data.get('body', '')}",
@@ -2832,7 +2827,7 @@ class HttpRequestBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-                    
+
         except asyncio.TimeoutError:
             error_data = {"error": "Request timed out", "error_type": "timeout"}
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)

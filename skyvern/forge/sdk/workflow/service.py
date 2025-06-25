@@ -48,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     FileParserBlock,
     FileUploadBlock,
     ForLoopBlock,
+    HttpRequestBlock,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
@@ -59,7 +60,6 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
-    HttpRequestBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
