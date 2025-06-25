@@ -196,8 +196,8 @@ class SkyvernFrame:
             async with asyncio.timeout(timeout_ms / 1000):
                 return await frame.evaluate(expression=expression, arg=arg)
         except asyncio.TimeoutError:
-            LOG.exception("Timeout to evaluate expression", expression=expression)
-            raise TimeoutError("timeout to evaluate expression")
+            LOG.exception("Skyvern timed out trying to analyze the page", expression=expression)
+            raise TimeoutError("Skyvern timed out trying to analyze the page")
 
     @staticmethod
     async def get_url(frame: Page | Frame) -> str:
