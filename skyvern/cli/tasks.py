@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Optional
 
 import typer
 from dotenv import load_dotenv
@@ -20,7 +21,7 @@ tasks_app = typer.Typer(help="Manage Skyvern tasks and operations.")
 @tasks_app.callback()
 def tasks_callback(
     ctx: typer.Context,
-    api_key: str | None = typer.Option(
+    api_key: Optional[str] = typer.Option(
         None,
         "--api-key",
         help="Skyvern API key",
@@ -31,7 +32,7 @@ def tasks_callback(
     ctx.obj = {"api_key": api_key}
 
 
-def _get_client(api_key: str | None = None) -> Skyvern:
+def _get_client(api_key: Optional[str] = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
     load_dotenv()
     load_dotenv(".env")
