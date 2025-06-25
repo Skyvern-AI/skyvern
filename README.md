@@ -23,7 +23,7 @@
   <a href="https://www.linkedin.com/company/95726232"><img src="https://img.shields.io/badge/Follow%20 on%20LinkedIn-8A2BE2?logo=linkedin"/></a>
 </p>
 
-[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a simple API endpoint to fully automate manual workflows on a large number of websites, replacing brittle or unreliable automation solutions. 
+[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a simple API endpoint to fully automate manual workflows on a large number of websites, replacing brittle or unreliable automation solutions.
 
 <p align="center">
   <img src="fern/images/geico_shu_recording_cropped.gif"/>
@@ -254,9 +254,9 @@ If you encounter any database related errors while using Docker to run Skyvern, 
 # Skyvern Features
 
 ## Skyvern Tasks
-Tasks are the fundamental building block inside Skyvern. Each task is a single request to Skyvern, instructing it to navigate through a website and accomplish a specific goal. 
+Tasks are the fundamental building block inside Skyvern. Each task is a single request to Skyvern, instructing it to navigate through a website and accomplish a specific goal.
 
-Tasks require you to specify a `url`, `prompt`, and can optionally include a `data schema` (if you want the output to conform to a specific schema) and `error codes` (if you want Skyvern to stop running in specific situations). 
+Tasks require you to specify a `url`, `prompt`, and can optionally include a `data schema` (if you want the output to conform to a specific schema) and `error codes` (if you want Skyvern to stop running in specific situations).
 
 <p align="center">
   <img src="fern/images/skyvern_2_0_screenshot.png"/>
@@ -264,7 +264,7 @@ Tasks require you to specify a `url`, `prompt`, and can optionally include a `da
 
 
 ## Skyvern Workflows
-Workflows are a way to chain multiple tasks together to form a cohesive unit of work. 
+Workflows are a way to chain multiple tasks together to form a cohesive unit of work.
 
 For example, if you wanted to download all invoices newer than January 1st, you could create a workflow that first navigated to the invoices page, then filtered down to only show invoices newer than January 1st, extracted a list of all eligible invoices, and iterated through each invoice to download it.
 
@@ -310,10 +310,10 @@ Skyvern supports a number of different authentication methods to make it easier 
 
 
 ### 🔐 2FA Support (TOTP)
-Skyvern supports a number of different 2FA methods to allow you to automate workflows that require 2FA. 
+Skyvern supports a number of different 2FA methods to allow you to automate workflows that require 2FA.
 
 Examples include:
-1. QR-based 2FA (e.g. Google Authenticator, Authy) 
+1. QR-based 2FA (e.g. Google Authenticator, Authy)
 1. Email based 2FA
 1. SMS based 2FA
 
@@ -321,18 +321,13 @@ Examples include:
 
 ### Password Manager Integrations
 Skyvern currently supports the following password manager integrations:
-- [x] Bitwarden 
+- [x] Bitwarden
 - [ ] 1Password
 - [ ] LastPass
 
 
-<<<<<<< HEAD
 ## Model Context Protocol (MCP)
 Skyvern supports the Model Context Protocol (MCP) to allow you to use any LLM that supports MCP.
-=======
-### 🔐 2FA Support (TOTP)
-Skyvern supports a number of different 2FA methods to allow you to automate workflows that require 2FA. 
->>>>>>> 51daa43e (Update README)
 
 See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main/integrations/mcp/README.md)
 
@@ -368,7 +363,7 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
   <img src="fern/images/finditparts_recording_crop.gif"/>
 </p>
 
-## Navigating to government websites to register accounts or fill out forms 
+## Navigating to government websites to register accounts or fill out forms
 [💡 See it in action](https://app.skyvern.com/tasks/create/california_edd)
 <p align="center">
   <img src="fern/images/edd_services.gif"/>
@@ -546,7 +541,7 @@ If you want to chat with the skyvern repository to get a high level overview of 
 By Default, Skyvern collects basic usage statistics to help us understand how Skyvern is being used. If you would like to opt-out of telemetry, please set the `SKYVERN_TELEMETRY` environment variable to `false`.
 
 # License
-Skyvern's open source repository is supported via a managed cloud. All of the core logic powering Skyvern is available in this open source repository licensed under the [AGPL-3.0 License](LICENSE), with the exception of anti-bot measures available in our managed cloud offering. 
+Skyvern's open source repository is supported via a managed cloud. All of the core logic powering Skyvern is available in this open source repository licensed under the [AGPL-3.0 License](LICENSE), with the exception of anti-bot measures available in our managed cloud offering.
 
 If you have any questions or concerns around licensing, please [contact us](mailto:support@skyvern.com) and we would be happy to help.
 
