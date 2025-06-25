@@ -6,7 +6,6 @@ This commonly happens when working on multiple branches with different migration
 The database stores a revision ID that doesn't exist in the current branch's migrations.
 """
 
-import os
 import sys
 from pathlib import Path
 
@@ -14,34 +13,35 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-def main():
+
+def main() -> None:
     """Fix alembic revision issues by stamping the head revision."""
     print("🔧 Fixing Alembic Revision Issues")
     print("=" * 50)
-    
+
     try:
         # Import alembic after adding project to path
         from alembic import command
         from alembic.config import Config
         from skyvern.forge.sdk.settings_manager import SettingsManager
-        
+
         # Get the alembic config
         alembic_cfg = Config("alembic.ini")
-        
+
         # Set the database URL from settings
         database_url = SettingsManager.get_settings().DATABASE_STRING
         alembic_cfg.set_main_option("sqlalchemy.url", database_url)
-        
+
         print(f"📍 Using database: {database_url}")
         print("🔄 Attempting to stamp head revision...")
-        
+
         # Stamp the head revision
         command.stamp(alembic_cfg, "head")
-        
+
         print("✅ Successfully stamped head revision!")
         print("🎉 Alembic revision issue fixed!")
         print("\nYou can now run 'alembic check' to verify the fix.")
-        
+
     except ImportError as e:
         print(f"❌ Error importing required modules: {e}")
         print("Make sure you're running this from the project root directory.")
@@ -57,5 +57,6 @@ def main():
             print("3. Or delete the alembic_version table and recreate your database")
         sys.exit(1)
 
+
 if __name__ == "__main__":
-    main() 
+    main()
