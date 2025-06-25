@@ -1,0 +1,68 @@
+title: HTTP Request Example Workflow
+description: This workflow demonstrates how to use the HTTP Request block to make API calls
+proxy_location: NONE
+workflow_definition:
+  parameters:
+    # Optional parameters for dynamic values
+    - parameter_type: workflow
+      key: api_key
+      description: API key for authentication
+      workflow_parameter_type: string
+      default_value: ""
+  blocks:
+    # Example 1: Using curl command directly
+    - block_type: http_request
+      label: curl_example
+      curl_command: 'curl -X GET "https://api.github.com/users/octocat" -H "Accept: application/json"'
+    # Example 2: Using individual HTTP parameters
+    - block_type: http_request
+      label: github_user_api
+      method: GET
+      url: https://api.github.com/users/octocat
+      headers:
+        Accept: application/json
+        User-Agent: Skyvern-HTTP-Block
+      timeout: 10
+    # Example 3: POST request with JSON body
+    - block_type: http_request
+      label: post_example
+      method: POST
+      url: https://httpbin.org/post
+      headers:
+        Content-Type: application/json
+      body:
+        name: "Test User"
+        email: "test@example.com"
+        message: "Hello from Skyvern!"
+    # Example 4: Using templated values from previous blocks
+    - block_type: http_request
+      label: templated_request
+      method: GET
+      url: "https://api.github.com/users/{{ github_user_api_output.body.login }}/repos"
+      headers:
+        Accept: application/json
+        Authorization: "Bearer {{ api_key }}"
+    # Example 5: Using the response in a subsequent block
+    - block_type: text_prompt
+      label: analyze_response
+      prompt: |
+        Analyze the following API response and summarize the key information:
+
+        Response from GitHub API: {{ github_user_api_output }}
+
+        Please provide:
+        1. User name and bio
+        2. Number of public repos
+        3. Account creation date
+    # Example 6: Extract data and use in another request
+    - block_type: http_request
+      label: webhook_notification
+      method: POST
+      url: https://httpbin.org/post
+      headers:
+        Content-Type: application/json
+      body:
+        event: "workflow_completed"
+        user_data: "{{ github_user_api_output.body }}"
+        analysis: "{{ analyze_response_output }}"
+        timestamp: "{{ current_timestamp }}"
