@@ -371,6 +371,24 @@ class TaskV2BlockYAML(BlockYAML):
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
 
+class HttpRequestBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST  # type: ignore
+    
+    # Either curl_command or individual HTTP parameters can be used
+    curl_command: str | None = None
+    
+    # Individual HTTP parameters (alternative to curl_command)
+    method: str = "GET"
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    body: dict[str, Any] | str | None = None
+    timeout: int = 30
+    follow_redirects: bool = True
+    
+    # Parameter keys for templating
+    parameter_keys: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -404,6 +422,7 @@ BLOCK_YAML_SUBCLASSES = (
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML
+    | HttpRequestBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

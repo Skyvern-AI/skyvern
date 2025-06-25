@@ -605,6 +605,14 @@ class WorkflowRunBlockModel(Base):
     # wait block
     wait_sec = Column(Integer, nullable=True)
 
+    # http request block
+    curl_command = Column(String, nullable=True)
+    method = Column(String(10), nullable=True)
+    url = Column(String, nullable=True)
+    headers = Column(JSON, nullable=True)
+    timeout = Column(Integer, nullable=True)
+    follow_redirects = Column(Boolean, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
