@@ -141,9 +141,7 @@ function WorkflowParametersPanel() {
                         </span>
                       ) : (
                         <span className="text-sm text-slate-400">
-                          {parameter.parameterType === "onepassword"
-                            ? "credential"
-                            : parameter.parameterType}
+                          {parameter.parameterType}
                         </span>
                       )}
                     </div>
