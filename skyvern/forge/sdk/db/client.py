@@ -224,14 +224,15 @@ class AgentDB:
         artifact_id: str,
         artifact_type: str,
         uri: str,
+        organization_id: str,
         step_id: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         task_v2_id: str | None = None,
+        run_id: str | None = None,
         thought_id: str | None = None,
         ai_suggestion_id: str | None = None,
-        organization_id: str | None = None,
     ) -> Artifact:
         try:
             async with self.Session() as session:
@@ -245,6 +246,7 @@ class AgentDB:
                     workflow_run_block_id=workflow_run_block_id,
                     observer_cruise_id=task_v2_id,
                     observer_thought_id=thought_id,
+                    run_id=run_id,
                     ai_suggestion_id=ai_suggestion_id,
                     organization_id=organization_id,
                 )
@@ -1024,18 +1026,7 @@ class AgentDB:
         async with self.Session() as session:
             query = select(ArtifactModel).filter_by(organization_id=organization_id)
 
-            if run.task_run_type in [
-                RunType.task_v1,
-                RunType.openai_cua,
-                RunType.anthropic_cua,
-            ]:
-                query = query.filter_by(task_id=run.run_id)
-            elif run.task_run_type == RunType.task_v2:
-                query = query.filter_by(observer_cruise_id=run.run_id)
-            elif run.task_run_type == RunType.workflow_run:
-                query = query.filter_by(workflow_run_id=run.run_id)
-            else:
-                return []
+            query = query.filter_by(run_id=run.run_id)
 
             if artifact_types:
                 query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
