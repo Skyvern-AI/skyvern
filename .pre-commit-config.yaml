@@ -57,7 +57,8 @@ repos:
       - id: pyupgrade
         exclude: |
           (?x)(
-            ^skyvern/client/.*
+            ^skyvern/client/.*|
+            ^skyvern/cli/.*
           )
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.16.0

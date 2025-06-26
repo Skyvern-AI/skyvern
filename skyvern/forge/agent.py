@@ -2854,8 +2854,10 @@ class ForgeAgent:
         json_response: dict[str, Any],
     ) -> dict[str, Any]:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
+        should_enter_verification_code = json_response.get("should_enter_verification_code")
         if (
             place_to_enter_verification_code
+            and should_enter_verification_code
             and (task.totp_verification_url or task.totp_identifier)
             and task.organization_id
         ):
