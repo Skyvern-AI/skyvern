@@ -39,7 +39,9 @@ export class Skyvern implements INodeType {
         defaults: {
             name: 'Skyvern',
         },
+        // @ts-ignore - ESLint requires string literal but TS wants a different type
         inputs: ['main'],
+        // @ts-ignore - ESLint requires string literal but TS wants a different type
         outputs: ['main'],
         credentials: [
             {
@@ -178,6 +180,8 @@ export class Skyvern implements INodeType {
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         body: {
                             prompt: '={{$value}}',
                         },
@@ -199,6 +203,8 @@ export class Skyvern implements INodeType {
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         body: {
                             url: '={{$value ? $value : null}}',
                         },
@@ -220,6 +226,8 @@ export class Skyvern implements INodeType {
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         body: {
                             webhook_url: '={{$value ? $value : null}}',
                         },
@@ -236,11 +244,12 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['getTask'],
+                        operation: ['get'],
                     },
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
                         method: 'GET',
                         url: '={{"/v1/runs/" + $value}}',
                     },
@@ -341,11 +350,13 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['getWorkflow'],
+                        operation: ['get'],
                     },
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'GET',
                         url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/runs/" + $value}}',
                     },
                 },
@@ -364,7 +375,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatchWorkflow'],
+                        operation: ['dispatchTask'],
                     },
                 },
                 typeOptions: {
@@ -382,6 +393,8 @@ export class Skyvern implements INodeType {
                 },
                 routing: {
                     request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: 'POST',
                         url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
                         body: {
                             data: '={{$value["value"]}}',
@@ -399,7 +412,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatchWorkflow'],
+                        operation: ['dispatchTask'],
                     },
                 },
                 routing: {
