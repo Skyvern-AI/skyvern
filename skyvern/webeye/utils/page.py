@@ -39,6 +39,31 @@ class ScreenshotMode(StrEnum):
     DETAILED = "detailed"
 
 
+async def _page_screenshot_helper(
+    page: Page,
+    file_path: str | None = None,
+    full_page: bool = False,
+    timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+) -> bytes:
+    try:
+        return await page.screenshot(
+            path=file_path,
+            timeout=timeout,
+            full_page=full_page,
+            animations="disabled",
+        )
+    except TimeoutError as timeout_error:
+        LOG.info(
+            f"Timeout error while taking screenshot: {str(timeout_error)}. Going to take a screenshot again with animation allowed."
+        )
+        return await page.screenshot(
+            path=file_path,
+            timeout=timeout,
+            full_page=full_page,
+            animations="allow",
+        )
+
+
 async def _current_viewpoint_screenshot_helper(
     page: Page,
     file_path: str | None = None,
@@ -55,18 +80,11 @@ async def _current_viewpoint_screenshot_helper(
         start_time = time.time()
         screenshot: bytes = b""
         if file_path:
-            screenshot = await page.screenshot(
-                path=file_path,
-                timeout=timeout,
-                full_page=full_page,
-                animations="disabled",
+            screenshot = await _page_screenshot_helper(
+                page=page, file_path=file_path, full_page=full_page, timeout=timeout
             )
         else:
-            screenshot = await page.screenshot(
-                timeout=timeout,
-                full_page=full_page,
-                animations="disabled",
-            )
+            screenshot = await _page_screenshot_helper(page=page, full_page=full_page, timeout=timeout)
         end_time = time.time()
         LOG.debug(
             "Screenshot taking time",
