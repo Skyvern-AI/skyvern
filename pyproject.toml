@@ -76,6 +76,8 @@ onepassword-sdk = "0.3.0"
 types-boto3 = {extras = ["full"], version = "^1.38.31"}
 lark = "^1.2.2"
 libcst = "^1.8.2"
+azure-storage-blob = "^12.19.0"
+azure-identity = "^1.15.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"

@@ -88,6 +88,7 @@ class BlockType(StrEnum):
     TEXT_PROMPT = "text_prompt"
     DOWNLOAD_TO_S3 = "download_to_s3"
     UPLOAD_TO_S3 = "upload_to_s3"
+    UPLOAD_TO_AZURE_BLOB = "upload_to_azure_blob"
     FILE_UPLOAD = "file_upload"
     SEND_EMAIL = "send_email"
     FILE_URL_PARSER = "file_url_parser"
@@ -1647,14 +1648,215 @@ class UploadToS3Block(Block):
         )
 
 
+class UploadToAzureBlobBlock(Block):
+    block_type: Literal[BlockType.UPLOAD_TO_AZURE_BLOB] = BlockType.UPLOAD_TO_AZURE_BLOB
+
+    path: str | None = None
+    azure_account_name: str | None = None
+    azure_account_key: str | None = None
+    azure_container: str | None = None
+    azure_connection_string: str | None = None
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        parameters = []
+
+        if self.path and workflow_run_context.has_parameter(self.path):
+            parameters.append(workflow_run_context.get_parameter(self.path))
+
+        if self.azure_account_name and workflow_run_context.has_parameter(self.azure_account_name):
+            parameters.append(workflow_run_context.get_parameter(self.azure_account_name))
+
+        if self.azure_account_key and workflow_run_context.has_parameter(self.azure_account_key):
+            parameters.append(workflow_run_context.get_parameter(self.azure_account_key))
+
+        if self.azure_container and workflow_run_context.has_parameter(self.azure_container):
+            parameters.append(workflow_run_context.get_parameter(self.azure_container))
+
+        if self.azure_connection_string and workflow_run_context.has_parameter(self.azure_connection_string):
+            parameters.append(workflow_run_context.get_parameter(self.azure_connection_string))
+
+        return parameters
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        if self.path:
+            self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+        if self.azure_account_name:
+            self.azure_account_name = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_account_name, workflow_run_context
+            )
+        if self.azure_account_key:
+            self.azure_account_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_account_key, workflow_run_context
+            )
+        if self.azure_container:
+            self.azure_container = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_container, workflow_run_context
+            )
+        if self.azure_connection_string:
+            self.azure_connection_string = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_connection_string, workflow_run_context
+            )
+
+    @staticmethod
+    def _get_azure_blob_uri(workflow_run_id: str, path: str, account_name: str, container: str) -> str:
+        blob_key = f"{settings.ENV}/{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
+        return f"https://{account_name}.blob.core.windows.net/{container}/{blob_key}"
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Handle path parameter resolution
+        if self.path and workflow_run_context.has_parameter(self.path) and workflow_run_context.has_value(self.path):
+            file_path_parameter_value = workflow_run_context.get_value(self.path)
+            if file_path_parameter_value:
+                LOG.info(
+                    "UploadToAzureBlobBlock: File path is parameterized, using parameter value",
+                    file_path_parameter_value=file_path_parameter_value,
+                    file_path_parameter_key=self.path,
+                )
+                self.path = file_path_parameter_value
+        elif self.path == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
+            self.path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # Validate required parameters
+        if not self.azure_container:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="azure_container is required for UploadToAzureBlobBlock",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        has_connection_string = bool(self.azure_connection_string)
+        has_account_credentials = bool(self.azure_account_name and self.azure_account_key)
+        
+        if not has_connection_string and not has_account_credentials:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Either azure_connection_string OR (azure_account_name + azure_account_key) is required",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        if not self.path or not os.path.exists(self.path):
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"File not found at path: {self.path}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        blob_uris = []
+        try:
+            from skyvern.forge.sdk.api.azure import AsyncAzureClient
+
+            # Get actual values for secret parameters
+            actual_azure_account_name = (
+                workflow_run_context.get_original_secret_value_or_none(self.azure_account_name) or self.azure_account_name
+            )
+            actual_azure_account_key = (
+                workflow_run_context.get_original_secret_value_or_none(self.azure_account_key) or self.azure_account_key
+            )
+            actual_azure_connection_string = (
+                workflow_run_context.get_original_secret_value_or_none(self.azure_connection_string) or self.azure_connection_string
+            )
+
+            client = AsyncAzureClient(
+                account_name=actual_azure_account_name,
+                account_key=actual_azure_account_key,
+                connection_string=actual_azure_connection_string,
+            )
+
+            if os.path.isdir(self.path):
+                files = os.listdir(self.path)
+                if len(files) > MAX_UPLOAD_FILE_COUNT:
+                    raise ValueError("Too many files in the directory, not uploading")
+                for file in files:
+                    if os.path.isdir(os.path.join(self.path, file)):
+                        LOG.warning("UploadToAzureBlobBlock: Skipping directory", file=file)
+                        continue
+                    file_path = os.path.join(self.path, file)
+                    blob_uri = self._get_azure_blob_uri(
+                        workflow_run_id, file_path, actual_azure_account_name, self.azure_container
+                    )
+                    blob_uris.append(blob_uri)
+                    await client.upload_file_from_path(uri=blob_uri, file_path=file_path, raise_exception=True)
+            else:
+                blob_uri = self._get_azure_blob_uri(
+                    workflow_run_id, self.path, actual_azure_account_name, self.azure_container
+                )
+                blob_uris.append(blob_uri)
+                await client.upload_file_from_path(uri=blob_uri, file_path=self.path, raise_exception=True)
+
+        except Exception as e:
+            LOG.exception("UploadToAzureBlobBlock: Failed to upload file to Azure Blob", file_path=self.path)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to upload file to Azure Blob: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        LOG.info("UploadToAzureBlobBlock: File(s) uploaded to Azure Blob", file_path=self.path)
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, blob_uris)
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=blob_uris,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+
 class FileUploadBlock(Block):
     block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD
 
     storage_type: FileStorageType = FileStorageType.S3
+    
+    # AWS S3 Parameters
     s3_bucket: str | None = None
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     region_name: str | None = None
+    
+    # Azure Blob Parameters
+    azure_account_name: str | None = None
+    azure_account_key: str | None = None
+    azure_container: str | None = None
+    azure_connection_string: str | None = None
+    
     path: str | None = None
 
     def get_all_parameters(
@@ -1667,6 +1869,7 @@ class FileUploadBlock(Block):
         if self.path and workflow_run_context.has_parameter(self.path):
             parameters.append(workflow_run_context.get_parameter(self.path))
 
+        # S3 Parameters
         if self.s3_bucket and workflow_run_context.has_parameter(self.s3_bucket):
             parameters.append(workflow_run_context.get_parameter(self.s3_bucket))
 
@@ -1676,11 +1879,26 @@ class FileUploadBlock(Block):
         if self.aws_secret_access_key and workflow_run_context.has_parameter(self.aws_secret_access_key):
             parameters.append(workflow_run_context.get_parameter(self.aws_secret_access_key))
 
+        # Azure Blob Parameters
+        if self.azure_account_name and workflow_run_context.has_parameter(self.azure_account_name):
+            parameters.append(workflow_run_context.get_parameter(self.azure_account_name))
+
+        if self.azure_account_key and workflow_run_context.has_parameter(self.azure_account_key):
+            parameters.append(workflow_run_context.get_parameter(self.azure_account_key))
+
+        if self.azure_container and workflow_run_context.has_parameter(self.azure_container):
+            parameters.append(workflow_run_context.get_parameter(self.azure_container))
+
+        if self.azure_connection_string and workflow_run_context.has_parameter(self.azure_connection_string):
+            parameters.append(workflow_run_context.get_parameter(self.azure_connection_string))
+
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+        
+        # S3 Parameters
         if self.s3_bucket:
             self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
                 self.s3_bucket, workflow_run_context
@@ -1693,12 +1911,38 @@ class FileUploadBlock(Block):
             self.aws_secret_access_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.aws_secret_access_key, workflow_run_context
             )
+        
+        # Azure Blob Parameters
+        if self.azure_account_name:
+            self.azure_account_name = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_account_name, workflow_run_context
+            )
+        if self.azure_account_key:
+            self.azure_account_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_account_key, workflow_run_context
+            )
+        if self.azure_container:
+            self.azure_container = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_container, workflow_run_context
+            )
+        if self.azure_connection_string:
+            self.azure_connection_string = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_connection_string, workflow_run_context
+            )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         s3_suffix = f"{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
         if not self.path:
             return f"s3://{self.s3_bucket}/{s3_suffix}"
         return f"s3://{self.s3_bucket}/{self.path}/{s3_suffix}"
+
+    def _get_azure_blob_uri(self, workflow_run_id: str, path: str, account_name: str) -> str:
+        blob_suffix = f"{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
+        if not self.path:
+            blob_path = blob_suffix
+        else:
+            blob_path = f"{self.path}/{blob_suffix}"
+        return f"https://{account_name}.blob.core.windows.net/{self.azure_container}/{blob_path}"
 
     async def execute(
         self,
@@ -1708,10 +1952,30 @@ class FileUploadBlock(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
-        # get workflow run context
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        # get all parameters into a dictionary
-        # data validate before uploading
+        
+        if self.storage_type == FileStorageType.S3:
+            return await self._execute_s3_upload(workflow_run_id, workflow_run_block_id, organization_id, workflow_run_context)
+        elif self.storage_type == FileStorageType.AZURE_BLOB:
+            return await self._execute_azure_upload(workflow_run_id, workflow_run_block_id, organization_id, workflow_run_context)
+        else:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Unsupported storage type: {self.storage_type}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+    async def _execute_s3_upload(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        workflow_run_context: WorkflowRunContext,
+    ) -> BlockResult:
+        # Validate S3 parameters
         missing_parameters = []
         if not self.s3_bucket:
             missing_parameters.append("s3_bucket")
@@ -1723,7 +1987,7 @@ class FileUploadBlock(Block):
         if missing_parameters:
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Required block values are missing in the FileUploadBlock (label: {self.label}): {', '.join(missing_parameters)}",
+                failure_reason=f"Required S3 parameters are missing in FileUploadBlock (label: {self.label}): {', '.join(missing_parameters)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -1743,10 +2007,9 @@ class FileUploadBlock(Block):
             )
 
         download_files_path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
-
-        s3_uris = []
+        upload_uris = []
+        
         try:
-            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
             actual_aws_access_key_id = (
                 workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id) or self.aws_access_key_id
             )
@@ -1759,25 +2022,24 @@ class FileUploadBlock(Block):
                 aws_secret_access_key=actual_aws_secret_access_key,
                 region_name=self.region_name,
             )
-            # is the file path a file or a directory?
+            
             if os.path.isdir(download_files_path):
-                # get all files in the directory, if there are more than 25 files, we will not upload them
                 files = os.listdir(download_files_path)
                 if len(files) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file in files:
-                    # if the file is a directory, we will not upload it
                     if os.path.isdir(os.path.join(download_files_path, file)):
                         LOG.warning("FileUploadBlock: Skipping directory", file=file)
                         continue
                     file_path = os.path.join(download_files_path, file)
                     s3_uri = self._get_s3_uri(workflow_run_id, file_path)
-                    s3_uris.append(s3_uri)
+                    upload_uris.append(s3_uri)
                     await client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
             else:
                 s3_uri = self._get_s3_uri(workflow_run_id, download_files_path)
-                s3_uris.append(s3_uri)
+                upload_uris.append(s3_uri)
                 await client.upload_file_from_path(uri=s3_uri, file_path=download_files_path, raise_exception=True)
+                
         except Exception as e:
             LOG.exception("FileUploadBlock: Failed to upload file to S3", file_path=self.path)
             return await self.build_block_result(
@@ -1790,11 +2052,113 @@ class FileUploadBlock(Block):
             )
 
         LOG.info("FileUploadBlock: File(s) uploaded to S3", file_path=self.path)
-        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, s3_uris)
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, upload_uris)
         return await self.build_block_result(
             success=True,
             failure_reason=None,
-            output_parameter_value=s3_uris,
+            output_parameter_value=upload_uris,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+    async def _execute_azure_upload(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        workflow_run_context: WorkflowRunContext,
+    ) -> BlockResult:
+        # Validate Azure parameters
+        missing_parameters = []
+        if not self.azure_container:
+            missing_parameters.append("azure_container")
+        
+        # Need either connection string OR (account_name + account_key)
+        has_connection_string = bool(self.azure_connection_string)
+        has_account_credentials = bool(self.azure_account_name and self.azure_account_key)
+        
+        if not has_connection_string and not has_account_credentials:
+            missing_parameters.append("azure_connection_string OR (azure_account_name + azure_account_key)")
+
+        if missing_parameters:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Required Azure parameters are missing in FileUploadBlock (label: {self.label}): {', '.join(missing_parameters)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        download_files_path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
+        upload_uris = []
+        
+        try:
+            from skyvern.forge.sdk.api.azure import AsyncAzureClient
+            
+            actual_azure_account_name = (
+                workflow_run_context.get_original_secret_value_or_none(self.azure_account_name) or self.azure_account_name
+            )
+            actual_azure_account_key = (
+                workflow_run_context.get_original_secret_value_or_none(self.azure_account_key) or self.azure_account_key
+            )
+            actual_azure_connection_string = (
+                workflow_run_context.get_original_secret_value_or_none(self.azure_connection_string) or self.azure_connection_string
+            )
+            
+            client = AsyncAzureClient(
+                account_name=actual_azure_account_name,
+                account_key=actual_azure_account_key,
+                connection_string=actual_azure_connection_string,
+            )
+            
+            if os.path.isdir(download_files_path):
+                files = os.listdir(download_files_path)
+                if len(files) > MAX_UPLOAD_FILE_COUNT:
+                    raise ValueError("Too many files in the directory, not uploading")
+                for file in files:
+                    if os.path.isdir(os.path.join(download_files_path, file)):
+                        LOG.warning("FileUploadBlock: Skipping directory", file=file)
+                        continue
+                    file_path = os.path.join(download_files_path, file)
+                    blob_uri = self._get_azure_blob_uri(workflow_run_id, file_path, actual_azure_account_name)
+                    upload_uris.append(blob_uri)
+                    await client.upload_file_from_path(uri=blob_uri, file_path=file_path, raise_exception=True)
+            else:
+                blob_uri = self._get_azure_blob_uri(workflow_run_id, download_files_path, actual_azure_account_name)
+                upload_uris.append(blob_uri)
+                await client.upload_file_from_path(uri=blob_uri, file_path=download_files_path, raise_exception=True)
+                
+        except Exception as e:
+            LOG.exception("FileUploadBlock: Failed to upload file to Azure Blob", file_path=self.path)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to upload file to Azure Blob: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        LOG.info("FileUploadBlock: File(s) uploaded to Azure Blob", file_path=self.path)
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, upload_uris)
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=upload_uris,
             status=BlockStatus.completed,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
