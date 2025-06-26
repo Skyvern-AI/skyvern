@@ -460,7 +460,7 @@ async def run_task_v2_helper(
     ###################### run task v2 ######################
 
     context: skyvern_context.SkyvernContext | None = skyvern_context.current()
-    current_run_id = context.run_id if context and context.run_id else task_v2.task_id
+    current_run_id = context.run_id if context and context.run_id else task_v2_id
     skyvern_context.set(
         SkyvernContext(
             organization_id=organization_id,
