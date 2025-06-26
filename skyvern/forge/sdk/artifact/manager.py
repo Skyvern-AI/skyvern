@@ -33,6 +33,7 @@ class ArtifactManager:
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
+        run_id: str | None = None,
         ai_suggestion_id: str | None = None,
         data: bytes | None = None,
         path: str | None = None,
@@ -49,6 +50,8 @@ class ArtifactManager:
             task_v2_id = context.task_v2_id
         if not task_id and context:
             task_id = context.task_id
+        if not run_id and context:
+            run_id = context.run_id
 
         artifact = await app.DATABASE.create_artifact(
             artifact_id,
@@ -60,6 +63,7 @@ class ArtifactManager:
             workflow_run_block_id=workflow_run_block_id,
             thought_id=thought_id,
             task_v2_id=task_v2_id,
+            run_id=run_id,
             organization_id=organization_id,
             ai_suggestion_id=ai_suggestion_id,
         )
