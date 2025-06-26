@@ -120,6 +120,11 @@ class TaskRequest(TaskBase):
     totp_verification_url: str | None = None
     browser_session_id: str | None = None
     model: dict[str, Any] | None = None
+    credential_ids: list[str] | None = Field(
+        default=None,
+        description="List of credential IDs to use for this task. Credentials will be masked from LLMs for security.",
+        examples=[["cred_12345", "cred_67890"]],
+    )
 
     @model_validator(mode="after")
     def validate_url(self) -> Self:
@@ -247,6 +252,7 @@ class Task(TaskBase):
     max_steps_per_run: int | None = None
     errors: list[dict[str, Any]] = []
     model: dict[str, Any] | None = None
+    credential_ids: list[str] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None

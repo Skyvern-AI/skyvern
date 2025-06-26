@@ -1,5 +1,6 @@
 import copy
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Self
 
 import structlog
@@ -875,3 +876,124 @@ class WorkflowContextManager:
             output_parameter,
             value,
         )
+
+
+class TaskRunContext:
+    """
+    Context manager for task runs to handle credential masking and parameter management.
+    Simplified version of WorkflowRunContext for single task execution.
+    """
+
+    def __init__(self, aws_client: AsyncAWSClient) -> None:
+        self.parameters: dict[str, PARAMETER_TYPE] = {}
+        self.values: dict[str, Any] = {}
+        self.secrets: dict[str, Any] = {}
+        self._aws_client = aws_client
+
+    @classmethod
+    async def init_for_task(
+        cls,
+        aws_client: AsyncAWSClient,
+        organization: Organization,
+        credential_ids: list[str] | None = None,
+    ) -> Self:
+        """
+        Initialize a TaskRunContext for a task with the provided credential IDs.
+        """
+        task_context = cls(aws_client=aws_client)
+
+        if credential_ids:
+            for idx, credential_id in enumerate(credential_ids):
+                # Create a temporary CredentialParameter for each credential
+                credential_param = CredentialParameter(
+                    parameter_type="credential",
+                    credential_parameter_id=f"task_credential_{idx}",
+                    workflow_id="",  # Not applicable for tasks
+                    key=f"credential_{idx}",
+                    credential_id=credential_id,
+                    created_at=datetime.now(),
+                    modified_at=datetime.now(),
+                )
+                await task_context.register_credential_parameter_value(credential_param, organization)
+
+        return task_context
+
+    def get_parameter(self, key: str) -> PARAMETER_TYPE:
+        return self.parameters[key]
+
+    def get_value(self, key: str) -> Any:
+        """
+        Get the value of a parameter. If the parameter is a credential, the value will be the random secret id, not
+        the actual secret value. This will be used when building the navigation payload since we don't want to expose
+        the actual secret value in the payload.
+        """
+        return self.values[key]
+
+    def has_parameter(self, key: str) -> bool:
+        return key in self.parameters
+
+    def has_value(self, key: str) -> bool:
+        return key in self.values
+
+    def set_value(self, key: str, value: Any) -> None:
+        self.values[key] = value
+
+    def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
+        """
+        Get the original secret value from the secrets dict. If the secret id is not found, return None.
+        This function can be called with any possible parameter value, not just the random secret id.
+        """
+        if isinstance(secret_id_or_value, str):
+            return self.secrets.get(secret_id_or_value)
+        return None
+
+    def get_all_secrets(self) -> dict[str, Any]:
+        """Get all secrets for the task context."""
+        return self.secrets.copy()
+
+    def get_all_credential_values(self) -> dict[str, Any]:
+        """Get all credential values (with secret IDs) for the task context."""
+        return {k: v for k, v in self.values.items() if isinstance(self.parameters.get(k), CredentialParameter)}
+
+    @staticmethod
+    def generate_random_secret_id() -> str:
+        return f"secret_{uuid.uuid4()}"
+
+    async def register_credential_parameter_value(
+        self,
+        parameter: CredentialParameter,
+        organization: Organization,
+    ) -> None:
+        LOG.info(f"Fetching credential parameter value for credential: {parameter.credential_id}")
+
+        credential_id = parameter.credential_id
+        if credential_id is None:
+            LOG.error(f"Credential ID not found for credential: {parameter.credential_id}")
+            raise CredentialParameterNotFoundError(parameter.credential_id)
+
+        db_credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        if db_credential is None:
+            raise CredentialParameterNotFoundError(credential_id)
+
+        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
+        credential_item = bitwarden_credential.credential
+
+        self.parameters[parameter.key] = parameter
+        self.values[parameter.key] = {}
+        credential_dict = credential_item.model_dump()
+        for key, value in credential_dict.items():
+            random_secret_id = self.generate_random_secret_id()
+            secret_id = f"{random_secret_id}_{key}"
+            self.secrets[secret_id] = value
+            self.values[parameter.key][key] = secret_id
+
+        if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+            random_secret_id = self.generate_random_secret_id()
+            totp_secret_id = f"{random_secret_id}_totp"
+            self.secrets[totp_secret_id] = BitwardenConstants.TOTP
+            totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+            self.secrets[totp_secret_value] = credential_item.totp
+            self.values[parameter.key]["totp"] = totp_secret_id
+
+    def totp_secret_value_key(self, totp_secret_id: str) -> str:
+        return f"{totp_secret_id}_value"

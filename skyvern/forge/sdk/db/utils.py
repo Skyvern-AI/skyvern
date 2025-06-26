@@ -140,6 +140,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         errors=task_obj.errors,
         application=task_obj.application,
         model=task_obj.model,
+        credential_ids=task_obj.credential_ids,
         queued_at=task_obj.queued_at,
         started_at=task_obj.started_at,
         finished_at=task_obj.finished_at,
