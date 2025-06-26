@@ -32,15 +32,10 @@ class AzureBlobStorage(BaseStorage):
     _PATH_VERSION = "v1"
 
     def __init__(
-        self, 
-        account_name: str | None = None, 
-        account_key: str | None = None,
-        connection_string: str | None = None
+        self, account_name: str | None = None, account_key: str | None = None, connection_string: str | None = None
     ) -> None:
         self.async_client = AsyncAzureClient(
-            account_name=account_name,
-            account_key=account_key,
-            connection_string=connection_string
+            account_name=account_name, account_key=account_key, connection_string=connection_string
         )
         self.container_artifacts = settings.AZURE_CONTAINER_ARTIFACTS
         self.container_screenshots = settings.AZURE_CONTAINER_SCREENSHOTS
@@ -132,7 +127,9 @@ class AzureBlobStorage(BaseStorage):
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         blob_name = f"{settings.ENV}/{organization_id}/{file_name}"
-        to_uri = f"https://{self.async_client.account_name}.blob.core.windows.net/{self.container_screenshots}/{blob_name}"
+        to_uri = (
+            f"https://{self.async_client.account_name}.blob.core.windows.net/{self.container_screenshots}/{blob_name}"
+        )
         sc = await self._get_storage_class_for_org(organization_id)
         metadata = await self._get_metadata_for_org(organization_id)
         await self.async_client.upload_file_from_path(to_uri, from_path, storage_class=sc, metadata=metadata)
@@ -149,7 +146,9 @@ class AzureBlobStorage(BaseStorage):
         browser_session_uri = f"https://{self.async_client.account_name}.blob.core.windows.net/{self.container_browser_sessions}/{blob_name}"
         sc = await self._get_storage_class_for_org(organization_id)
         metadata = await self._get_metadata_for_org(organization_id)
-        await self.async_client.upload_file_from_path(browser_session_uri, zip_file_path, storage_class=sc, metadata=metadata)
+        await self.async_client.upload_file_from_path(
+            browser_session_uri, zip_file_path, storage_class=sc, metadata=metadata
+        )
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         blob_name = f"{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
@@ -174,7 +173,7 @@ class AzureBlobStorage(BaseStorage):
         sc = await self._get_storage_class_for_org(organization_id)
         metadata = await self._get_metadata_for_org(organization_id)
         base_blob_path = f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
-        
+
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -195,13 +194,15 @@ class AzureBlobStorage(BaseStorage):
     ) -> list[FileInfo]:
         prefix = f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}/"
         blob_names = await self.async_client.list_blobs(self.container_uploads, prefix=prefix)
-        
+
         if len(blob_names) == 0:
             return []
 
         file_infos: list[FileInfo] = []
         for blob_name in blob_names:
-            blob_uri = f"https://{self.async_client.account_name}.blob.core.windows.net/{self.container_uploads}/{blob_name}"
+            blob_uri = (
+                f"https://{self.async_client.account_name}.blob.core.windows.net/{self.container_uploads}/{blob_name}"
+            )
             metadata = await self.async_client.get_file_metadata(blob_uri, log_exception=False)
             filename = os.path.basename(blob_name)
             checksum = metadata.get("sha256_checksum") if metadata else None
@@ -225,13 +226,15 @@ class AzureBlobStorage(BaseStorage):
         container = self.container_uploads
         sc = await self._get_storage_class_for_org(organization_id)
         metadata = await self._get_metadata_for_org(organization_id)
-        
+
         # First try uploading with original filename
         try:
             sanitized_filename = os.path.basename(filename)
             blob_name = f"{settings.ENV}/{organization_id}/{todays_date}/{sanitized_filename}"
             blob_uri = f"https://{self.async_client.account_name}.blob.core.windows.net/{container}/{blob_name}"
-            uploaded_blob_uri = await self.async_client.upload_file_stream(blob_uri, fileObj, storage_class=sc, metadata=metadata)
+            uploaded_blob_uri = await self.async_client.upload_file_stream(
+                blob_uri, fileObj, storage_class=sc, metadata=metadata
+            )
         except Exception:
             LOG.error("Failed to upload file to Azure Blob", exc_info=True)
             uploaded_blob_uri = None
@@ -242,12 +245,14 @@ class AzureBlobStorage(BaseStorage):
             blob_name = f"{settings.ENV}/{organization_id}/{todays_date}/{uuid_prefixed_filename}"
             blob_uri = f"https://{self.async_client.account_name}.blob.core.windows.net/{container}/{blob_name}"
             fileObj.seek(0)
-            uploaded_blob_uri = await self.async_client.upload_file_stream(blob_uri, fileObj, storage_class=sc, metadata=metadata)
+            uploaded_blob_uri = await self.async_client.upload_file_stream(
+                blob_uri, fileObj, storage_class=sc, metadata=metadata
+            )
 
         if not uploaded_blob_uri:
             return None
-            
+
         presigned_urls = await self.async_client.create_presigned_urls([uploaded_blob_uri])
         if not presigned_urls:
             return None
-        return presigned_urls[0], uploaded_blob_uri 
+        return presigned_urls[0], uploaded_blob_uri

@@ -9,9 +9,11 @@ class StorageFactory:
     def create_storage(storage_type: str) -> BaseStorage:
         if storage_type == "s3":
             from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+
             return S3Storage()
         elif storage_type == "azure_blob":
             from skyvern.forge.sdk.artifact.storage.azure_blob import AzureBlobStorage
+
             return AzureBlobStorage()
         elif storage_type == "local":
             return LocalStorage()
