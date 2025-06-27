@@ -2068,7 +2068,6 @@ class WorkflowService:
             )
             return HttpRequestBlock(
                 label=block_yaml.label,
-                curl_command=block_yaml.curl_command,
                 method=block_yaml.method,
                 url=block_yaml.url,
                 headers=block_yaml.headers,
