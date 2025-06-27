@@ -61,8 +61,9 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
                 result["body"] = {"data": data_str}
 
         # Process JSON data if provided
-        if hasattr(parsed, 'json') and parsed.json:
+        if hasattr(parsed, "json") and parsed.json:
             import json
+
             try:
                 result["body"] = json.loads(parsed.json)
             except (json.JSONDecodeError, TypeError):
