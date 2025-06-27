@@ -50,6 +50,7 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_NZ = "RESIDENTIAL_NZ"
     RESIDENTIAL_ZA = "RESIDENTIAL_ZA"
     RESIDENTIAL_AR = "RESIDENTIAL_AR"
+    RESIDENTIAL_AU = "RESIDENTIAL_AU"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
@@ -81,6 +82,7 @@ class ProxyLocation(StrEnum):
             cls.RESIDENTIAL_NZ,
             cls.RESIDENTIAL_ZA,
             cls.RESIDENTIAL_AR,
+            cls.RESIDENTIAL_AU,
         }
 
     @staticmethod
@@ -97,6 +99,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_NZ: 2000,
             ProxyLocation.RESIDENTIAL_ZA: 2000,
             ProxyLocation.RESIDENTIAL_AR: 2000,
+            ProxyLocation.RESIDENTIAL_AU: 2000,
         }
         return counts.get(proxy_location, 10000)
 
@@ -114,6 +117,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_NZ: "NZ",
             ProxyLocation.RESIDENTIAL_ZA: "ZA",
             ProxyLocation.RESIDENTIAL_AR: "AR",
+            ProxyLocation.RESIDENTIAL_AU: "AU",
         }
         return mapping.get(proxy_location, "US")
 
@@ -169,6 +173,9 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
 
     if proxy_location == ProxyLocation.RESIDENTIAL_AR:
         return ZoneInfo("America/Argentina/Buenos_Aires")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_AU:
+        return ZoneInfo("Australia/Sydney")
 
     if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
         return ZoneInfo("America/New_York")

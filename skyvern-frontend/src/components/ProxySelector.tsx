@@ -27,14 +27,14 @@ function ProxySelector({ value, onChange, className }: Props) {
         <SelectItem value={ProxyLocation.ResidentialAR}>
           Residential (Argentina)
         </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialDE}>
-          Residential (Germany)
+        <SelectItem value={ProxyLocation.ResidentialAU}>
+          Residential (Australia)
         </SelectItem>
         <SelectItem value={ProxyLocation.ResidentialFR}>
           Residential (France)
         </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialGB}>
-          Residential (United Kingdom)
+        <SelectItem value={ProxyLocation.ResidentialDE}>
+          Residential (Germany)
         </SelectItem>
         <SelectItem value={ProxyLocation.ResidentialIN}>
           Residential (India)
@@ -48,11 +48,14 @@ function ProxySelector({ value, onChange, className }: Props) {
         <SelectItem value={ProxyLocation.ResidentialNZ}>
           Residential (New Zealand)
         </SelectItem>
+        <SelectItem value={ProxyLocation.ResidentialZA}>
+          Residential (South Africa)
+        </SelectItem>
         <SelectItem value={ProxyLocation.ResidentialES}>
           Residential (Spain)
         </SelectItem>
-        <SelectItem value={ProxyLocation.ResidentialZA}>
-          Residential (South Africa)
+        <SelectItem value={ProxyLocation.ResidentialGB}>
+          Residential (United Kingdom)
         </SelectItem>
       </SelectContent>
     </Select>
