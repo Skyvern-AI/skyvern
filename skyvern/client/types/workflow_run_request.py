@@ -40,6 +40,7 @@ class WorkflowRunRequest(UniversalBaseModel):
     - RESIDENTIAL_NZ: New Zealand
     - RESIDENTIAL_ZA: South Africa
     - RESIDENTIAL_AR: Argentina
+    - RESIDENTIAL_AU: Australia
     - RESIDENTIAL_ISP: ISP proxy
     - US-CA: California
     - US-NY: New York
