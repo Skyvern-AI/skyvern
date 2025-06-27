@@ -1,3 +1,4 @@
+import logging
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config, pool, text
@@ -77,28 +78,28 @@ def run_migrations_online() -> None:
                 context.run_migrations()
             except Exception as e:
                 if "Can't locate revision identified by" in str(e):
-                    # If we encounter a missing revision error, automatically fix it
-                    import logging
-                    logger = logging.getLogger("alembic.env")
-                    logger.warning(f"Missing revision error encountered: {e}")
-                    logger.warning("This typically happens when switching between branches with different migrations.")
-                    logger.warning("Automatically fixing by stamping to head revision...")
-                    
-                    # Get the script directory to find the head revision
+                    # Get the script directory to find the head revision for instructions
                     script = ScriptDirectory.from_config(config)
                     head_revision = script.get_current_head()
                     
+                    logger = logging.getLogger("alembic.env")
+                    logger.error(f"Missing revision error encountered: {e}")
+                    logger.error("This typically happens when switching between branches with different migrations.")
+                    logger.error("The database contains a revision that doesn't exist in this branch.")
+                    logger.error("")
+                    logger.error("🔧 To fix this issue, run ONE of the following commands:")
+                    logger.error("1. alembic stamp head  # Recommended: stamps to current head revision")
                     if head_revision:
-                        # Update the alembic_version table directly using parameterized query
-                        connection.execute(
-                            text("UPDATE alembic_version SET version_num = :revision"),
-                            {"revision": head_revision}
-                        )
-                        logger.info(f"Successfully updated revision to head: {head_revision}")
-                        logger.info("Alembic revision issue has been automatically fixed!")
-                    else:
-                        logger.error("Could not determine head revision")
-                        raise
+                        logger.error(f"2. python scripts/fix_alembic_revision.py  # Uses head revision: {head_revision}")
+                    logger.error("3. Reset your database if you don't have important data")
+                    logger.error("")
+                    logger.error("⚠️  WARNING: Do NOT manually update the alembic_version table unless you know what you're doing!")
+                    
+                    raise RuntimeError(
+                        "Alembic revision mismatch detected. "
+                        "Please run 'alembic stamp head' or 'python scripts/fix_alembic_revision.py' to fix this issue. "
+                        "See logs above for detailed instructions."
+                    )
                 else:
                     raise
 
