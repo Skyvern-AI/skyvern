@@ -855,7 +855,7 @@ if settings.ENABLE_NOVITA:
 # Get the credentials json file. See documentation: https://support.google.com/a/answer/7378726?hl=en
 # my_vertex_credentials = json.dumps(json.load(open("my_credentials_file.json")))
 # Set the value of my_vertex_credentials as the environment variable VERTEX_CREDENTIALS
-# NOTE: If you want to specify a location, make sure the model is availale in the target location.
+# NOTE: If you want to specify a location, make sure the model is available in the target location.
 # See documentation: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations#united-states
 if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
     if not settings.VERTEX_PROJECT_ID:
