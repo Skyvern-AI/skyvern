@@ -53,7 +53,7 @@ def main() -> None:
             print("This is normal when switching between branches with different migrations.")
             print("\n🔧 Manual fix:")
             print("1. Connect to your database directly")
-            print("2. Run: UPDATE alembic_version SET version_num = 'afeed80576cb';")
+            print("2. Run: alembic stamp head")
             print("3. Or delete the alembic_version table and recreate your database")
         sys.exit(1)
 

@@ -89,11 +89,11 @@ def run_migrations_online() -> None:
                     head_revision = script.get_current_head()
                     
                     if head_revision:
-                        # Update the alembic_version table directly using text() for raw SQL
+                        # Update the alembic_version table directly using parameterized query
                         connection.execute(
-                            text(f"UPDATE alembic_version SET version_num = '{head_revision}'")
+                            text("UPDATE alembic_version SET version_num = :revision"),
+                            {"revision": head_revision}
                         )
-                        connection.commit()
                         logger.info(f"Successfully updated revision to head: {head_revision}")
                         logger.info("Alembic revision issue has been automatically fixed!")
                     else:
