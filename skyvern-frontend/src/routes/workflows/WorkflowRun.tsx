@@ -128,7 +128,7 @@ function WorkflowRun() {
   const matchedTips =
     workflowRun?.failure_reason
       ? failureTips
-        .filter(({ match }) => match(workflowRun.failure_reason!))
+        .filter(({ match }) => match(workflowRun.failure_reason))
         .map(({ tip }, index) => (
           <div key={index} className="text-sm italic text-red-700">
             {tip}
