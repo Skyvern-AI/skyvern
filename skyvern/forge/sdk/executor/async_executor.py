@@ -105,6 +105,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
 
         context: SkyvernContext = skyvern_context.ensure_context()
         context.task_id = task.task_id
+        context.run_id = context.run_id or task.task_id
         context.organization_id = organization_id
         context.max_steps_override = max_steps_override
         context.max_screenshot_scrolling_times = task.max_screenshot_scrolling_times

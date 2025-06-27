@@ -3421,7 +3421,9 @@ async def click_listbox_option(
     action: actions.SelectOptionAction,
     listbox_element_id: str,
 ) -> bool:
-    listbox_element = scraped_page.id_to_element_dict[listbox_element_id]
+    listbox_element = scraped_page.id_to_element_dict.get(listbox_element_id)
+    if listbox_element is None:
+        return False
     # this is a listbox element, get all the children
     if "children" not in listbox_element:
         return False
