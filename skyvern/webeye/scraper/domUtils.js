@@ -599,7 +599,7 @@ function isDOMNodeRepresentDiv(element) {
   }
   const style = getElementComputedStyle(element);
   const children = getChildElements(element);
-  // flex ususally means there are multiple elements in the div as a line or a column
+  // flex usually means there are multiple elements in the div as a line or a column
   // if the children elements are not just one, we should keep it in the HTML tree to represent a tree structure
   if (style?.display === "flex" && children.length > 1) {
     return true;
@@ -1479,7 +1479,7 @@ async function buildElementTree(
       return;
     }
 
-    // skip proccessing option element as they are already added to the select.options
+    // skip processing option element as they are already added to the select.options
     if (tagName === "option") {
       return;
     }
@@ -1499,7 +1499,7 @@ async function buildElementTree(
     }
 
     let shadowDOMchildren = [];
-    // sometimes the shadowRoot is not visible, but the elemnets in the shadowRoot are visible
+    // sometimes the shadowRoot is not visible, but the elements in the shadowRoot are visible
     if (element.shadowRoot) {
       shadowDOMchildren = getChildElements(element.shadowRoot);
     }
@@ -1530,7 +1530,7 @@ async function buildElementTree(
         (isParentSVG = element.closest("svg")) &&
         isParentSVG.getAttribute("unique_id")
       ) {
-        // if elemnet is the children of the <svg> with an unique_id
+        // if element is the children of the <svg> with an unique_id
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (tagName === "div" && isDOMNodeRepresentDiv(element)) {
         elementObj = await buildElementObject(frame, element, interactable);
@@ -2586,7 +2586,7 @@ async function getIncrementElements(wait_until_finished = true) {
     }
   }
 
-  // cleanup the chidren tree, remove the duplicated element
+  // cleanup the children tree, remove the duplicated element
   // search starting from the shallowest node:
   // 1. if deeper, the node could only be the children of the shallower one or no related one.
   // 2. if depth is same, the node could only be duplicated one or no related one.

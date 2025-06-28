@@ -1058,7 +1058,7 @@ async def handle_input_text_action(
             skyvern_element = blocking_element
     except Exception:
         LOG.info(
-            "Failed to find the blocking element, continue with the orignal element",
+            "Failed to find the blocking element, continue with the original element",
             exc_info=True,
             task_id=task.task_id,
             step_id=step.step_id,
@@ -1290,9 +1290,9 @@ async def handle_select_option_action(
 
     if not await skyvern_element.is_selectable():
         # 1. find from children
-        # TODO: 2. find from siblings and their chidren
+        # TODO: 2. find from siblings and their children
         LOG.info(
-            "Element is not selectable, try to find the selectable element in the chidren",
+            "Element is not selectable, try to find the selectable element in the children",
             tag_name=tag_name,
             action=action,
         )
@@ -1302,7 +1302,7 @@ async def handle_select_option_action(
             selectable_child = await skyvern_element.find_selectable_child(dom=dom)
         except Exception as e:
             LOG.error(
-                "Failed to find selectable element in chidren",
+                "Failed to find selectable element in children",
                 exc_info=True,
                 tag_name=tag_name,
                 action=action,
@@ -1347,7 +1347,7 @@ async def handle_select_option_action(
             blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
         except Exception:
             LOG.warning(
-                "Failed to find the blocking element, continue to select on the orignal <select>",
+                "Failed to find the blocking element, continue to select on the original <select>",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 exc_info=True,
@@ -1949,10 +1949,10 @@ async def chain_click(
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for", msg=str(e))))
 
             try:
-                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # sometimes the element is the direct children of the label, instead of using for="xx" attribute
                 # since it's a click action, the target element we're searching should only be INPUT
                 LOG.info(
-                    "Chain click: it's a label element. going to check for input of the direct chidren",
+                    "Chain click: it's a label element. going to check for input of the direct children",
                     task_id=task.task_id,
                     action=action,
                     element=str(skyvern_element),
@@ -1986,7 +1986,7 @@ async def chain_click(
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="attr_id", msg=str(e))))
 
             try:
-                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # sometimes the element is the direct children of the label, instead of using for="xx" attribute
                 # so we check the direct parent if it's a label element
                 LOG.info(
                     "Chain click: it's a non-label element. going to find the bound label element by direct parent",
@@ -2257,10 +2257,10 @@ async def input_or_auto_complete_input(
         element_id=skyvern_element.get_id(),
     )
 
-    # 1. press the orignal text to see if there's a match
+    # 1. press the original text to see if there's a match
     # 2. call LLM to find 5 potential values based on the orginal text
     # 3. try each potential values from #2
-    # 4. call LLM to tweak the orignal text according to the information from #3, then start #1 again
+    # 4. call LLM to tweak the original text according to the information from #3, then start #1 again
 
     # FIXME: try the whole loop for once now, to speed up skyvern
     MAX_AUTO_COMPLETE_ATTEMP = 1
@@ -2439,7 +2439,7 @@ async def sequentially_select_from_dropdown(
         )
         return None
 
-    # TODO: only suport the third-level dropdown selection now
+    # TODO: only support the third-level dropdown selection now
     MAX_SELECT_DEPTH = 3
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
@@ -2716,7 +2716,7 @@ async def select_from_dropdown(
 ) -> CustomSingleSelectResult:
     """
     force_select: is used to choose an element to click even there's no dropdown menu;
-    targe_value: only valid when force_select is "False". When target_value is not empty, the matched option must be relevent to target value;
+    targe_value: only valid when force_select is "False". When target_value is not empty, the matched option must be relevant to target value;
     None will be only returned when:
         1. force_select is false and no dropdown menu popped
         2. force_select is false and match value is not relevant to the target value
@@ -2854,7 +2854,7 @@ async def select_from_dropdown(
     # sometimes we have multiple elements pointed to the same value,
     # but only one option is clickable on the page
     LOG.debug(
-        "Searching option with the same value in incremetal elements",
+        "Searching option with the same value in incremental elements",
         value=value,
         elements=incremental_scraped.element_tree,
     )
@@ -3090,7 +3090,7 @@ async def try_to_find_potential_scrollable_element(
     """
     check any <ul> or <role="listbox"> element in the chidlren.
     if yes, return the found element,
-    eles, return the orginal one
+    else, return the orginal one
     """
     found_element_id = await skyvern_element.find_children_element_id_by_callback(
         cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
@@ -3107,7 +3107,7 @@ async def try_to_find_potential_scrollable_element(
             skyvern_element = await SkyvernElement.create_from_incremental(incremental_scraped, found_element_id)
         except Exception:
             LOG.debug(
-                "Failed to get head element by found element id, use the orignal element id",
+                "Failed to get head element by found element id, use the original element id",
                 element_id=found_element_id,
                 step_id=step.step_id,
                 task_id=task.task_id,
@@ -3158,7 +3158,7 @@ async def scroll_down_to_load_all_options(
             # wait until animation ends, otherwise the scroll operation could be overwritten
             await asyncio.sleep(2)
 
-        # scoll a little back and scoll down to trigger the loading
+        # scroll a little back and scroll down to trigger the loading
         await page.mouse.wheel(0, -1e-5)
         await page.mouse.wheel(0, 1e-5)
         # wait for while to load new options
@@ -3181,7 +3181,7 @@ async def scroll_down_to_load_all_options(
     else:
         LOG.warning("Timeout to load all options, maybe some options will be missed")
 
-    # scoll back to the start point and wait for a while to make all options invisible on the page
+    # scroll back to the start point and wait for a while to make all options invisible on the page
     if dropdown_menu_element_handle is None:
         LOG.info("element handle is None, using mouse to scroll back", element_id=scrollable_element.get_id())
         await page.mouse.wheel(0, -scroll_pace)
