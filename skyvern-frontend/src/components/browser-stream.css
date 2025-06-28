@@ -1,4 +1,4 @@
-.workflow-run-stream-vnc {
+.browser-stream {
   position: relative;
   width: 100%;
   height: 100%;
@@ -9,11 +9,11 @@
   transition: padding 0.2s ease-in-out;
 }
 
-.workflow-run-stream-vnc.user-is-controlling {
+.browser-stream.user-is-controlling {
   padding: 0rem;
 }
 
-.workflow-run-stream-vnc .overlay-container {
+.browser-stream .overlay-container {
   position: absolute;
   top: 0;
   left: 0;
@@ -24,7 +24,7 @@
   justify-content: center;
 }
 
-.workflow-run-stream-vnc .overlay {
+.browser-stream .overlay {
   position: relative;
   height: auto;
   width: 100%;
@@ -36,15 +36,15 @@
   justify-content: center;
 }
 
-.workflow-run-stream-vnc.user-is-controlling .overlay {
+.browser-stream.user-is-controlling .overlay {
   pointer-events: none;
 }
 
-.workflow-run-stream-vnc.user-is-controlling .overlay-container {
+.browser-stream.user-is-controlling .overlay-container {
   pointer-events: none;
 }
 
-.workflow-run-stream-vnc .take-control {
+.browser-stream .take-control {
   transform: translateY(0);
   transition:
     transform 0.2s ease-in-out,
@@ -52,17 +52,17 @@
   opacity: 0.3;
 }
 
-.workflow-run-stream-vnc .take-control:not(.hide):hover {
+.browser-stream .take-control:not(.hide):hover {
   opacity: 1;
 }
 
-.workflow-run-stream-vnc .take-control.hide {
+.browser-stream .take-control.hide {
   transform: translateY(100%);
   opacity: 0;
   pointer-events: none;
 }
 
-.workflow-run-stream-vnc .relinquish-control {
+.browser-stream .relinquish-control {
   transform: translateY(0);
   transition:
     transform 0.2s ease-in-out,
@@ -71,17 +71,17 @@
   pointer-events: all;
 }
 
-.workflow-run-stream-vnc .relinquish-control:not(.hide):hover {
+.browser-stream .relinquish-control:not(.hide):hover {
   opacity: 1;
 }
 
-.workflow-run-stream-vnc .relinquish-control.hide {
+.browser-stream .relinquish-control.hide {
   transform: translateY(100%);
   opacity: 0;
   pointer-events: none;
 }
 
-.workflow-run-stream-vnc > div > canvas {
+.browser-stream > div > canvas {
   opacity: 0;
   animation: skyvern-anim-fadeIn 1s ease-in forwards;
 }
