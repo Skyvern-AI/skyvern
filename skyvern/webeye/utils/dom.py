@@ -844,8 +844,8 @@ class DomUtil:
                 raise MissingElement(selector=css, element_id=element_id)
             else:
                 # WARNING: current xpath is based on the tag name.
-                # It can only represent the element possition in the DOM tree with tag name, it's not 100% reliable.
-                # As long as the current possition has the same element with the tag name, the locator can be found.
+                # It can only represent the element position in the DOM tree with tag name, it's not 100% reliable.
+                # As long as the current position has the same element with the tag name, the locator can be found.
                 # (maybe) we should validate the element hash to make sure the element is the same?
                 LOG.warning("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id)
                 locator = frame_content.locator(f"xpath={xpath}")
