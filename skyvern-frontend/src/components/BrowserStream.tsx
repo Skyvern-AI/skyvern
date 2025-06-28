@@ -1,21 +1,22 @@
 import { Status } from "@/api/types";
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { HandIcon, PlayIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useParams } from "react-router-dom";
 import { envCredential } from "@/util/env";
 import { toast } from "@/components/ui/use-toast";
-import { useQueryClient } from "@tanstack/react-query";
 import RFB from "@novnc/novnc/lib/rfb.js";
 import { environment } from "@/util/env";
 import { cn } from "@/util/utils";
 import { useClientIdStore } from "@/store/useClientIdStore";
+import type {
+  TaskApiResponse,
+  WorkflowRunStatusApiResponse,
+} from "@/api/types";
 
-import "./workflow-run-stream-vnc.css";
+import "./browser-stream.css";
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
@@ -29,13 +30,38 @@ interface CommandCedeControl {
 
 type Command = CommandTakeControl | CommandCedeControl;
 
-function WorkflowRunStreamVnc() {
-  const { data: workflowRun } = useWorkflowRunQuery();
+type Props = {
+  task?: {
+    run: TaskApiResponse;
+  };
+  workflow?: {
+    run: WorkflowRunStatusApiResponse;
+  };
+  // --
+  onClose?: () => void;
+};
 
-  const { workflowRunId, workflowPermanentId } = useParams<{
-    workflowRunId: string;
-    workflowPermanentId: string;
-  }>();
+function BrowserStream({
+  task = undefined,
+  workflow = undefined,
+  // --
+  onClose,
+}: Props) {
+  let showStream: boolean = false;
+  let runId: string;
+  let entity: "task" | "workflow";
+
+  if (task) {
+    runId = task.run.task_id;
+    showStream = statusIsNotFinalized(task.run);
+    entity = "task";
+  } else if (workflow) {
+    runId = workflow.run.workflow_run_id;
+    showStream = statusIsNotFinalized(workflow.run);
+    entity = "workflow";
+  } else {
+    throw new Error("No task or workflow provided");
+  }
 
   const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
   const [userIsControlling, setUserIsControlling] = useState<boolean>(false);
@@ -46,8 +72,8 @@ function WorkflowRunStreamVnc() {
     useState(0);
   const prevCommandConnectedRef = useRef<boolean>(false);
   const [isCommandConnected, setIsCommandConnected] = useState<boolean>(false);
-  const showStream = workflowRun && statusIsNotFinalized(workflowRun);
-  const queryClient = useQueryClient();
+  // goes up a level
+  // const queryClient = useQueryClient();
   const [canvasContainer, setCanvasContainer] = useState<HTMLDivElement | null>(
     null,
   );
@@ -78,37 +104,28 @@ function WorkflowRunStreamVnc() {
     return `${params}`;
   }, [clientId, credentialGetter]);
 
-  const invalidateQueries = useCallback(() => {
-    queryClient.invalidateQueries({
-      queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
-    });
-    queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
-    queryClient.invalidateQueries({
-      queryKey: ["workflowTasks", workflowRunId],
-    });
-    queryClient.invalidateQueries({ queryKey: ["runs"] });
-  }, [queryClient, workflowPermanentId, workflowRunId]);
-
   // effect for vnc disconnects only
   useEffect(() => {
     if (prevVncConnectedRef.current && !isVncConnected) {
       setVncDisconnectedTrigger((x) => x + 1);
+      onClose?.();
     }
     prevVncConnectedRef.current = isVncConnected;
-  }, [isVncConnected]);
+  }, [isVncConnected, onClose]);
 
   // effect for command disconnects only
   useEffect(() => {
     if (prevCommandConnectedRef.current && !isCommandConnected) {
       setCommandDisconnectedTrigger((x) => x + 1);
+      onClose?.();
     }
     prevCommandConnectedRef.current = isCommandConnected;
-  }, [isCommandConnected]);
+  }, [isCommandConnected, onClose]);
 
   // vnc socket
   useEffect(
     () => {
-      if (!showStream || !canvasContainer || !workflowRunId) {
+      if (!showStream || !canvasContainer || !runId) {
         if (rfbRef.current) {
           rfbRef.current.disconnect();
           rfbRef.current = null;
@@ -123,7 +140,16 @@ function WorkflowRunStreamVnc() {
         }
 
         const wsParams = await getWebSocketParams();
-        const vncUrl = `${wssBaseUrl}/stream/vnc/workflow_run/${workflowRunId}?${wsParams}`;
+        const vncUrl =
+          entity === "task"
+            ? `${wssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
+            : entity === "workflow"
+              ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
+              : null;
+
+        if (!vncUrl) {
+          throw new Error("No vnc url");
+        }
 
         if (rfbRef.current) {
           rfbRef.current.disconnect();
@@ -147,7 +173,6 @@ function WorkflowRunStreamVnc() {
 
         rfb.addEventListener("disconnect", async (/* e: RfbEvent */) => {
           setIsVncConnected(false);
-          invalidateQueries();
         });
       }
 
@@ -165,20 +190,35 @@ function WorkflowRunStreamVnc() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       canvasContainer,
-      invalidateQueries,
       showStream,
       vncDisconnectedTrigger, // will re-run on disconnects
-      workflowRunId,
+      runId,
+      entity,
     ],
   );
 
   // command socket
   useEffect(() => {
+    if (!showStream || !canvasContainer || !runId) {
+      return;
+    }
+
     let ws: WebSocket | null = null;
 
     const connect = async () => {
       const wsParams = await getWebSocketParams();
-      const commandUrl = `${wssBaseUrl}/stream/commands/workflow_run/${workflowRunId}?${wsParams}`;
+
+      const commandUrl =
+        entity === "task"
+          ? `${wssBaseUrl}/stream/commands/task/${runId}?${wsParams}`
+          : entity === "workflow"
+            ? `${wssBaseUrl}/stream/commands/workflow_run/${runId}?${wsParams}`
+            : null;
+
+      if (!commandUrl) {
+        throw new Error("No command url");
+      }
+
       ws = new WebSocket(commandUrl);
 
       ws.onopen = () => {
@@ -188,7 +228,6 @@ function WorkflowRunStreamVnc() {
 
       ws.onclose = () => {
         setIsCommandConnected(false);
-        invalidateQueries();
         setCommandSocket(null);
       };
     };
@@ -203,10 +242,12 @@ function WorkflowRunStreamVnc() {
       }
     };
   }, [
+    canvasContainer,
     commandDisconnectedTrigger,
+    entity,
     getWebSocketParams,
-    invalidateQueries,
-    workflowRunId,
+    runId,
+    showStream,
   ]);
 
   // effect to send a command when the user is controlling, vs not controlling
@@ -233,34 +274,41 @@ function WorkflowRunStreamVnc() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userIsControlling, isCommandConnected]);
 
-  // Effect to show toast when workflow reaches a final state based on hook updates
+  // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {
-    if (workflowRun) {
-      if (
-        workflowRun.status === Status.Failed ||
-        workflowRun.status === Status.Terminated
-      ) {
-        // Only show toast if VNC is not connected or was never connected,
-        // to avoid double toasting if disconnect handler also triggers similar logic.
-        // However, the disconnect handler now primarily invalidates queries.
-        toast({
-          title: "Run Ended",
-          description: `The workflow run has ${workflowRun.status}.`,
-          variant: "destructive",
-        });
-      } else if (workflowRun.status === Status.Completed) {
-        toast({
-          title: "Run Completed",
-          description: "The workflow run has been completed.",
-          variant: "success",
-        });
-      }
+    const run = task ? task.run : workflow ? workflow.run : null;
+
+    if (!run) {
+      return;
     }
-  }, [workflowRun, workflowRun?.status]);
+
+    const name = task ? "task" : workflow ? "workflow" : null;
+
+    if (!name) {
+      return;
+    }
+
+    if (run.status === Status.Failed || run.status === Status.Terminated) {
+      // Only show toast if VNC is not connected or was never connected,
+      // to avoid double toasting if disconnect handler also triggers similar logic.
+      // However, the disconnect handler now primarily invalidates queries.
+      toast({
+        title: "Run Ended",
+        description: `The ${name} run has ${run.status}.`,
+        variant: "destructive",
+      });
+    } else if (run.status === Status.Completed) {
+      toast({
+        title: "Run Completed",
+        description: `The ${name} run has been completed.`,
+        variant: "success",
+      });
+    }
+  }, [task, workflow]);
 
   return (
     <div
-      className={cn("workflow-run-stream-vnc", {
+      className={cn("browser-stream", {
         "user-is-controlling": userIsControlling,
       })}
       ref={setCanvasContainerRef}
@@ -301,4 +349,4 @@ function WorkflowRunStreamVnc() {
   );
 }
 
-export { WorkflowRunStreamVnc };
+export { BrowserStream };
