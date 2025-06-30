@@ -86,6 +86,7 @@ from skyvern.schemas.runs import (
 from skyvern.schemas.workflows import WorkflowRequest
 from skyvern.services import run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -128,6 +129,7 @@ async def run_task(
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
+    LOG.info(f"[DEBUG] Handler received browser_session_id: {run_request.browser_session_id}")
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
 
@@ -143,7 +145,43 @@ async def run_task(
             user_prompt=run_request.prompt,
             organization=current_org,
         )
-        url = url or task_generation.url
+        
+        # Determine the URL to use
+        url = run_request.url
+        if not url and not run_request.browser_session_id:
+            url = task_generation.url
+        elif not url and run_request.browser_session_id:
+            # Try to get current URL from browser session, else leave url empty
+            LOG.info(f"No URL from request, attempting to extract from browser session. browser_session_id={run_request.browser_session_id}, org_id={current_org.organization_id}")
+            try:
+                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    run_request.browser_session_id, organization_id=current_org.organization_id
+                )
+                if browser_state:
+                    LOG.info(f"Got browser_state for session {run_request.browser_session_id}")
+                    if browser_state.browser_context and browser_state.browser_context.pages:
+                        current_page = browser_state.browser_context.pages[-1]
+                        LOG.info(f"Got current page from browser context for session {run_request.browser_session_id}")
+                        await browser_state.set_working_page(current_page, len(browser_state.browser_context.pages) - 1)
+                        LOG.info(f"Set working page for session {run_request.browser_session_id}")
+                        current_url = await SkyvernFrame.get_url(current_page)
+                        LOG.info(f"Current URL from browser session: {current_url}")
+                        if current_url and current_url != "about:blank":
+                            url = current_url
+                            LOG.info(f"Using current URL from browser session: {url}")
+                        else:
+                            LOG.info(f"Browser session has blank page ({current_url}), but allowing task to proceed since user will navigate manually")
+                    else:
+                        LOG.warning(f"No pages found in browser context for session {run_request.browser_session_id}")
+                else:
+                    LOG.error(f"Could not get browser state for session {run_request.browser_session_id}")
+            except Exception as e:
+                LOG.error(f"Failed to extract URL from browser session {run_request.browser_session_id}: {e}")
+            # Do not use task_generation.url here; url remains empty or set from browser session
+        # else: url is already provided by user
+
+        # create task v1
+        # Always use these from task_generation if present
         navigation_goal = task_generation.navigation_goal or run_request.prompt
         if run_request.engine in CUA_ENGINES:
             navigation_goal = run_request.prompt
@@ -226,6 +264,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
                 extra_http_headers=run_request.extra_http_headers,
+                browser_session_id=run_request.browser_session_id,
             )
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -901,6 +940,35 @@ async def run_task_v1(
 ) -> CreateTaskResponse:
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
+
+    # Apply same URL extraction logic as in /v1/run/tasks endpoint for browser sessions
+    if not task.url and task.browser_session_id:
+        # Try to get current URL from browser session, else leave url empty
+        LOG.info(f"No URL from request, attempting to extract from browser session. browser_session_id={task.browser_session_id}, org_id={current_org.organization_id}")
+        try:
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                task.browser_session_id, organization_id=current_org.organization_id
+            )
+            if browser_state:
+                LOG.info(f"Got browser_state for session {task.browser_session_id}")
+                if browser_state.browser_context and browser_state.browser_context.pages:
+                    current_page = browser_state.browser_context.pages[-1]
+                    LOG.info(f"Got current page from browser context for session {task.browser_session_id}")
+                    await browser_state.set_working_page(current_page, len(browser_state.browser_context.pages) - 1)
+                    LOG.info(f"Set working page for session {task.browser_session_id}")
+                    current_url = await SkyvernFrame.get_url(current_page)
+                    LOG.info(f"Current URL from browser session: {current_url}")
+                    if current_url and current_url != "about:blank":
+                        task.url = current_url
+                        LOG.info(f"Using current URL from browser session: {task.url}")
+                    else:
+                        LOG.info(f"Browser session has blank page ({current_url}), but allowing task to proceed since user will navigate manually")
+                else:
+                    LOG.warning(f"No pages found in browser context for session {task.browser_session_id}")
+            else:
+                LOG.error(f"Could not get browser state for session {task.browser_session_id}")
+        except Exception as e:
+            LOG.error(f"Failed to extract URL from browser session {task.browser_session_id}: {e}")
 
     created_task = await task_v1_service.run_task(
         task=task,

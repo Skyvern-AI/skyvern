@@ -100,7 +100,14 @@ class BrowserManager:
                     LOG.warning("Organization ID is not set for task", task_id=task.task_id)
                 page = await browser_state.get_working_page()
                 if page:
-                    await browser_state.navigate_to_url(page=page, url=task.url)
+                    if task.url:
+                        # Check if we're already on the same URL to avoid unnecessary navigation
+                        current_url = page.url
+                        if current_url != task.url:
+                            await browser_state.navigate_to_url(page=page, url=task.url)
+                        else:
+                            LOG.info("Already on the target URL, skipping navigation", url=task.url)
+                    # If no URL provided, continue with current page (only allowed with browser session)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=task.workflow_run_id)
 
@@ -163,10 +170,20 @@ class BrowserManager:
                 raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                # Store the browser state in the browser manager's pages dictionary with the workflow run ID
+                self.pages[workflow_run_id] = browser_state
+                if parent_workflow_run_id:
+                    self.pages[parent_workflow_run_id] = browser_state
                 page = await browser_state.get_working_page()
                 if page:
                     if url:
-                        await browser_state.navigate_to_url(page=page, url=url)
+                        # Check if we're already on the same URL to avoid unnecessary navigation
+                        current_url = page.url
+                        if current_url != url:
+                            await browser_state.navigate_to_url(page=page, url=url)
+                        else:
+                            LOG.info("Already on the target URL, skipping navigation", url=url)
+                    # If no URL provided, continue with current page (only allowed with browser session)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
