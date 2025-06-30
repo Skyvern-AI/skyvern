@@ -611,6 +611,7 @@ class WorkflowRunBlockModel(Base):
     url = Column(String, nullable=True)
     headers = Column(JSON, nullable=True)
     body = Column(JSON, nullable=True)
+    parameters = Column(JSON, nullable=True)
     timeout = Column(Integer, nullable=True)
     follow_redirects = Column(Boolean, nullable=True)
 
