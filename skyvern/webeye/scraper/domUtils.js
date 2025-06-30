@@ -816,7 +816,11 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "p" ||
     tagName === "td" ||
     tagName === "svg" ||
-    tagName === "strong"
+    tagName === "strong" ||
+    tagName === "h1" ||
+    tagName === "h2" ||
+    tagName === "h3" ||
+    tagName === "h4"
   ) {
     if (isHoverPointerElement(element, hoverStylesMap)) {
       return true;
