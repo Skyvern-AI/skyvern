@@ -1,20 +1,19 @@
 """add parameters column to workflow_run_blocks
 
-Revision ID: a74efd596bdb
-Revises: 08050a2f4618
-Create Date: 2025-06-30 20:36:32.576661+00:00
+Revision ID: efc33363efa0
+Revises: 6cf2c1e15039
+Create Date: 2025-06-30 23:23:09.816459+00:00
 
 """
-
 from typing import Sequence, Union
 
+from alembic import op
 import sqlalchemy as sa
 
-from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "a74efd596bdb"
-down_revision: Union[str, None] = "08050a2f4618"
+revision: str = "efc33363efa0"
+down_revision: Union[str, None] = "6cf2c1e15039"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

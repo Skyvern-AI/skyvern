@@ -1,7 +1,7 @@
 """add http request block columns to workflow_run_blocks
 
 Revision ID: 6cf2c1e15039
-Revises: afeed80576cb
+Revises: 760ae45a1345
 Create Date: 2025-06-27 02:11:36.372859+00:00
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "6cf2c1e15039"
-down_revision: Union[str, None] = "afeed80576cb"
+down_revision: Union[str, None] = "760ae45a1345"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
