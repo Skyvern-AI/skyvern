@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
 
-    # Supported storage types: local, s3
+    # Supported storage types: local, s3, azure_blob
     SKYVERN_STORAGE_TYPE: str = "local"
 
     # S3 bucket settings
@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
+
+    # Azure Blob Storage settings
+    AZURE_STORAGE_ACCOUNT_NAME: str | None = None
+    AZURE_STORAGE_ACCOUNT_KEY: str | None = None
+    AZURE_STORAGE_CONNECTION_STRING: str | None = None
+    AZURE_CONTAINER_ARTIFACTS: str = "skyvern-artifacts"
+    AZURE_CONTAINER_SCREENSHOTS: str = "skyvern-screenshots"
+    AZURE_CONTAINER_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
+    AZURE_CONTAINER_UPLOADS: str = "skyvern-uploads"
 
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
