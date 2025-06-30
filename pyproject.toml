@@ -12,7 +12,7 @@ python-dotenv = "^1.0.0"
 openai = ">=1.68.2"
 sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
 aiohttp = "^3.8.5"
-python-multipart = "^0.0.6"
+python-multipart = "^0.0.18"
 toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
@@ -36,13 +36,13 @@ psycopg = [
     {version = ">=3.2.2,<3.3.0", extras = ["binary", "pool"], python = ">=3.13, <3.14"}
 ]
 alembic = "^1.12.1"
-python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+python-jose = {extras = ["cryptography"], version = "^3.4.0"}
 cachetools = "^5.3.2"
 aioboto3 = "^14.3.0"
 asyncache = "^0.3.1"
 orjson = "^3.9.10"
 structlog = "^23.2.0"
-typer = ">=0.9.0,<0.10.0"
+typer = ">=0.16.0"
 types-toml = "^0.10.8.7"
 httpx = {version = ">=0.27.0", extras = ["socks"]}
 filetype = "^1.2.0"
@@ -90,7 +90,7 @@ mock = "^5.1.0"
 autoflake = "^2.2.0"
 pydevd-pycharm = "^233.6745.319"
 ipython = "^8.17.2"
-typer = "^0.9.0"
+typer = "^0.16.0"
 ipykernel = "^6.26.0"
 notebook = "^7.0.6"
 freezegun = "^1.2.2"

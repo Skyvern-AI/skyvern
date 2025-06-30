@@ -2481,6 +2481,10 @@ class TaskV2Block(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
+            output_reason = f"Failed to format jinja template: {str(e)}"
+            await self.record_output_parameter_value(
+                workflow_run_context, workflow_run_id, {"failure_reason": output_reason}
+            )
             return await self.build_block_result(
                 success=False,
                 failure_reason=f"Failed to format jinja template: {str(e)}",
@@ -2541,6 +2545,8 @@ class TaskV2Block(Block):
                 browser_session_id=browser_session_id,
             )
         finally:
+            context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+            current_run_id = context.run_id if context and context.run_id else workflow_run_id
             skyvern_context.set(
                 skyvern_context.SkyvernContext(
                     organization_id=organization_id,
@@ -2548,6 +2554,7 @@ class TaskV2Block(Block):
                     workflow_id=workflow_run.workflow_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
+                    run_id=current_run_id,
                     browser_session_id=browser_session_id,
                     max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
                 )
@@ -2559,10 +2566,23 @@ class TaskV2Block(Block):
         # Determine block status from task status using module-level mapping
         block_status = TASKV2_TO_BLOCK_STATUS.get(task_v2.status, BlockStatus.failed)
         success = task_v2.status == TaskV2Status.completed
-        failure_reason = task_v2.failure_reason
+        failure_reason: str | None = None
+        task_v2_workflow_run_id = task_v2.workflow_run_id
+        if task_v2_workflow_run_id:
+            task_v2_workflow_run = await app.DATABASE.get_workflow_run(task_v2_workflow_run_id, organization_id)
+            if task_v2_workflow_run:
+                failure_reason = task_v2_workflow_run.failure_reason
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure
+        task_v2_output = {
+            "task_id": task_v2.observer_cruise_id,
+            "status": task_v2.status,
+            "summary": task_v2.summary,
+            "extracted_information": result_dict,
+            "failure_reason": failure_reason,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
         return await self.build_block_result(
             success=success or self.continue_on_failure,
             failure_reason=failure_reason,

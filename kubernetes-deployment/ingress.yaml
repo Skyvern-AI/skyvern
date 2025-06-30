@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: skyvern-ingress
+  namespace: skyvern
+  annotations:
+    # You may need to change the ingress data to match your environment
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: skyvern.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: skyvern-backend
+                port:
+                  number: 8000
+          - path: /artifacts
+            pathType: Prefix
+            backend:
+              service:
+                name: skyvern-frontend
+                port:
+                  number: 9090
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: skyvern-frontend
+                port:
+                  number: 8080
+                  #tls:
+                  #  - hosts:
+                  #      - skyvern.example.com
+                  #    secretName: ""

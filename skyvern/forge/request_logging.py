@@ -14,7 +14,7 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 
 LOG = structlog.get_logger()
 
-_SENSITIVE_HEADERS = {"authorization", "cookie"}
+_SENSITIVE_HEADERS = {"authorization", "cookie", "x-api-key"}
 _MAX_BODY_LENGTH = 1000
 _BINARY_PLACEHOLDER = "<binary>"
 

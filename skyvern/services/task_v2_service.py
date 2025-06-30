@@ -186,6 +186,7 @@ async def initialize_task_v2(
     context = skyvern_context.current()
     if context:
         context.task_v2_id = task_v2.observer_cruise_id
+        context.run_id = context.run_id or task_v2.observer_cruise_id
         context.max_screenshot_scrolling_times = max_screenshot_scrolling_times
 
     thought = await app.DATABASE.create_thought(
@@ -458,6 +459,8 @@ async def run_task_v2_helper(
 
     ###################### run task v2 ######################
 
+    context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+    current_run_id = context.run_id if context and context.run_id else task_v2_id
     skyvern_context.set(
         SkyvernContext(
             organization_id=organization_id,
@@ -465,6 +468,7 @@ async def run_task_v2_helper(
             workflow_run_id=workflow_run_id,
             request_id=request_id,
             task_v2_id=task_v2_id,
+            run_id=current_run_id,
             browser_session_id=browser_session_id,
             max_screenshot_scrolling_times=task_v2.max_screenshot_scrolling_times,
         )

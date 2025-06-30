@@ -282,6 +282,39 @@ function FlowRenderer({
         return;
       }
       const client = await getClient(credentialGetter);
+      const extraHttpHeaders: Record<string, string> = {};
+      if (data.settings.extraHttpHeaders) {
+        try {
+          const parsedHeaders = JSON.parse(data.settings.extraHttpHeaders);
+          if (
+            parsedHeaders &&
+            typeof parsedHeaders === "object" &&
+            !Array.isArray(parsedHeaders)
+          ) {
+            for (const [key, value] of Object.entries(parsedHeaders)) {
+              if (key && typeof key === "string") {
+                if (key in extraHttpHeaders) {
+                  toast({
+                    title: "Error",
+                    description: `Duplicate key '${key}' in extra http headers`,
+                    variant: "destructive",
+                  });
+                  continue;
+                }
+                extraHttpHeaders[key] = String(value);
+              }
+            }
+          }
+        } catch (error) {
+          toast({
+            title: "Error",
+            description: "Invalid JSON format in extra http headers",
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+
       const requestBody: WorkflowCreateYAMLRequest = {
         title: data.title,
         description: workflow.description,
@@ -292,6 +325,7 @@ function FlowRenderer({
         max_screenshot_scrolling_times:
           data.settings.maxScreenshotScrollingTimes,
         totp_verification_url: workflow.totp_verification_url,
+        extra_http_headers: extraHttpHeaders,
         workflow_definition: {
           parameters: data.parameters,
           blocks: data.blocks,
