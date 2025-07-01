@@ -49,6 +49,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -2474,8 +2475,8 @@ class TaskV2Block(Block):
         browser_session_id: str | None = None,
         **kwargs: dict,
     ) -> BlockResult:
-        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-        from skyvern.services import task_v2_service
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus  # noqa: PLC0415
+        from skyvern.services import task_v2_service  # noqa: PLC0415
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
@@ -2657,7 +2658,6 @@ class HttpRequestBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         """Execute the HTTP request and return the response"""
-        from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
 

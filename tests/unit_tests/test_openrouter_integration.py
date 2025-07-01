@@ -1,4 +1,5 @@
 import importlib
+import json
 import types
 from unittest.mock import AsyncMock
 
@@ -16,8 +17,6 @@ class DummyResponse(dict):
         self.choices = [types.SimpleNamespace(message=types.SimpleNamespace(content=content))]
 
     def model_dump_json(self, indent: int = 2):
-        import json
-
         return json.dumps(self, indent=indent)
 
 
