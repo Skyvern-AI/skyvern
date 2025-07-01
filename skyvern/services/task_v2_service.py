@@ -1251,7 +1251,7 @@ async def _generate_extraction_task(
     # extract the data
     context = skyvern_context.ensure_context()
     generate_extraction_task_prompt = load_prompt_with_elements(
-        scraped_page=scraped_page,
+        element_tree_builder=scraped_page,
         prompt_engine=prompt_engine,
         template_name="task_v2_generate_extraction_task",
         current_url=current_url,
