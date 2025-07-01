@@ -134,6 +134,10 @@ navigation:
         contents:
           - page: Introduction
             path: browser-sessions/introduction.mdx
+      - section: Observability
+        contents:
+          - page: Overview
+            path: observability/overview.mdx
       - section: Integrations
         contents:
           - page: Skyvern MCP
