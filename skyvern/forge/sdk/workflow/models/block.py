@@ -15,7 +15,7 @@ from email.message import EmailMessage
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import filetype
 import structlog
@@ -100,6 +100,7 @@ class BlockType(StrEnum):
     FILE_DOWNLOAD = "file_download"
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
+    HTTP_REQUEST = "http_request"
 
 
 class BlockStatus(StrEnum):
@@ -2592,6 +2593,188 @@ class TaskV2Block(Block):
         )
 
 
+class HttpRequestBlock(Block):
+    block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST
+
+    # Individual HTTP parameters
+    method: str = "GET"
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    body: dict[str, Any] | None = None  # Changed to consistently be dict only
+    timeout: int = 30
+    follow_redirects: bool = True
+
+    # Parameters for templating
+    parameters: list[PARAMETER_TYPE] = []
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,
+    ) -> list[PARAMETER_TYPE]:
+        parameters = self.parameters
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Check if url is a parameter
+        if self.url and workflow_run_context.has_parameter(self.url):
+            if self.url not in [parameter.key for parameter in parameters]:
+                parameters.append(workflow_run_context.get_parameter(self.url))
+
+        return parameters
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        """Format template parameters in the block fields"""
+        if self.url:
+            self.url = self.format_block_parameter_template_from_workflow_run_context(self.url, workflow_run_context)
+
+        if self.body:
+            # If body is provided as a template string, try to parse it as JSON
+            for key, value in self.body.items():
+                if isinstance(value, str):
+                    self.body[key] = self.format_block_parameter_template_from_workflow_run_context(
+                        value, workflow_run_context
+                    )
+
+        if self.headers:
+            for key, value in self.headers.items():
+                self.headers[key] = self.format_block_parameter_template_from_workflow_run_context(
+                    value, workflow_run_context
+                )
+
+    def validate_url(self, url: str) -> bool:
+        """Validate if the URL is properly formatted"""
+        try:
+            result = urlparse(url)
+            return all([result.scheme, result.netloc])
+        except Exception:
+            return False
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        """Execute the HTTP request and return the response"""
+        from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # Validate URL
+        if not self.url:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="URL is required for HTTP request",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        if not self.validate_url(self.url):
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Invalid URL format: {self.url}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # Execute HTTP request using the generic aiohttp_request function
+        try:
+            LOG.info(
+                "Executing HTTP request",
+                method=self.method,
+                url=self.url,
+                headers=self.headers,
+                has_body=bool(self.body),
+                workflow_run_id=workflow_run_id,
+            )
+
+            # Use the generic aiohttp_request function
+            status_code, response_headers, response_body = await aiohttp_request(
+                method=self.method,
+                url=self.url,
+                headers=self.headers,
+                json_data=self.body,
+                timeout=self.timeout,
+                follow_redirects=self.follow_redirects,
+            )
+
+            response_data = {
+                "status_code": status_code,
+                "headers": response_headers,
+                "body": response_body,
+                "url": self.url,
+            }
+
+            LOG.info(
+                "HTTP request completed",
+                status_code=status_code,
+                url=self.url,
+                method=self.method,
+                workflow_run_id=workflow_run_id,
+            )
+
+            # Determine success based on status code
+            success = 200 <= status_code < 300
+
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
+
+            return await self.build_block_result(
+                success=success,
+                failure_reason=None if success else f"HTTP {status_code}: {response_body}",
+                output_parameter_value=response_data,
+                status=BlockStatus.completed if success else BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        except asyncio.TimeoutError:
+            error_data = {"error": "Request timed out", "error_type": "timeout"}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Request timed out after {self.timeout} seconds",
+                output_parameter_value=error_data,
+                status=BlockStatus.timed_out,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except Exception as e:
+            error_data = {"error": str(e), "error_type": "unknown"}
+            LOG.warning(  # Changed from LOG.exception to LOG.warning as requested
+                "HTTP request failed with unexpected error",
+                error=str(e),
+                url=self.url,
+                method=self.method,
+                workflow_run_id=workflow_run_id,
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"HTTP request failed: {str(e)}",
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
@@ -2612,5 +2795,6 @@ BlockSubclasses = Union[
     UrlBlock,
     TaskV2Block,
     FileUploadBlock,
+    HttpRequestBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
