@@ -607,13 +607,13 @@ class WorkflowRunBlockModel(Base):
     wait_sec = Column(Integer, nullable=True)
 
     # http request block
-    method = Column(String(10), nullable=True)
-    url = Column(String, nullable=True)
-    headers = Column(JSON, nullable=True)
-    body = Column(JSON, nullable=True)
-    parameters = Column(JSON, nullable=True)
-    timeout = Column(Integer, nullable=True)
-    follow_redirects = Column(Boolean, nullable=True)
+    http_request_method = Column(String(10), nullable=True)
+    http_request_url = Column(String, nullable=True)
+    http_request_headers = Column(JSON, nullable=True)
+    http_request_body = Column(JSON, nullable=True)
+    http_request_parameters = Column(JSON, nullable=True)
+    http_request_timeout = Column(Integer, nullable=True)
+    http_request_follow_redirects = Column(Boolean, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

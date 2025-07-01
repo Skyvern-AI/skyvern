@@ -683,7 +683,7 @@ async def delete_workflow(
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
 
 
-@base_router.post(
+@legacy_base_router.post(
     "/utilities/curl-to-http",
     tags=["Utilities"],
     openapi_extra={
@@ -697,6 +697,7 @@ async def delete_workflow(
         400: {"description": "Invalid curl command"},
     },
 )
+@legacy_base_router.post("/utilities/curl-to-http/", include_in_schema=False)
 async def convert_curl_to_http(
     request: dict[str, str],
     current_org: Organization = Depends(org_auth_service.get_current_org),

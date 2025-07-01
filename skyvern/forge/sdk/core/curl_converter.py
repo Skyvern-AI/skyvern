@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import curlparser
@@ -28,8 +29,15 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
         parsed = curlparser.parse(curl_command)
 
         # Extract the components
+        method = parsed.method.upper() if parsed.method else "GET"
+        if not parsed.method:
+            LOG.info(
+                "No HTTP method found in curl command, defaulting to GET",
+                curl_command=curl_command[:100],
+            )
+
         result = {
-            "method": parsed.method.upper() if parsed.method else "GET",
+            "method": method,
             "url": parsed.url,
             "headers": {},
             "body": None,
@@ -41,8 +49,6 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
 
         # Process body/data
         if parsed.data:
-            import json
-
             # Try to parse as JSON
             try:
                 if isinstance(parsed.data, list):
@@ -52,22 +58,30 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
                     data_str = parsed.data
 
                 result["body"] = json.loads(data_str)
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as e:
                 # If not valid JSON, convert to dict with single "data" key
                 LOG.warning(
                     "Curl data is not valid JSON, wrapping in data key",
                     data=parsed.data,
+                    data_str=data_str if "data_str" in locals() else None,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    curl_command=curl_command[:100],
                 )
-                result["body"] = {"data": data_str}
+                result["body"] = {"data": data_str if "data_str" in locals() else parsed.data}
 
         # Process JSON data if provided
         if hasattr(parsed, "json") and parsed.json:
-            import json
-
             try:
                 result["body"] = json.loads(parsed.json)
-            except (json.JSONDecodeError, TypeError):
-                LOG.warning("Curl json is not valid JSON", json=parsed.json)
+            except (json.JSONDecodeError, TypeError) as e:
+                LOG.warning(
+                    "Curl json is not valid JSON",
+                    json=parsed.json,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    curl_command=curl_command[:100],
+                )
                 result["body"] = {"data": parsed.json}
 
         # Validate URL
@@ -77,9 +91,8 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
         return result
 
     except Exception as e:
-        LOG.error(
+        LOG.exception(
             "Failed to parse curl command",
-            error=str(e),
             curl_command=curl_command[:100],  # Log first 100 chars for debugging
         )
         raise ValueError(f"Failed to parse curl command: {str(e)}")
