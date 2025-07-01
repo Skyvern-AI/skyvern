@@ -463,6 +463,11 @@ class FailToSelectByIndex(SkyvernException):
         super().__init__(f"Failed to select by index. element_id={element_id}")
 
 
+class EmptyDomOrHtmlTree(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Empty dom or html tree")
+
+
 class OptionIndexOutOfBound(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Option index is out of bound. element_id={element_id}")
