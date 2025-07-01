@@ -63,8 +63,11 @@ async def test_openrouter_dynamic_model(monkeypatch):
     async_mock = AsyncMock(return_value=DummyResponse('{"status": "ok"}'))
     monkeypatch.setattr(api_handler_factory.litellm, "acompletion", async_mock)
 
-    handler = api_handler_factory.LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER")
-    result = await handler("hi", "test", llm_key_override="openrouter/other-model")
+    base_handler = api_handler_factory.LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER")
+    override_handler = api_handler_factory.LLMAPIHandlerFactory.get_override_llm_api_handler(
+        "openrouter/other-model", default=base_handler
+    )
+    result = await override_handler("hi", "test")
     assert result == {"status": "ok"}
     called_model = async_mock.call_args.kwargs.get("model")
     assert called_model == "openrouter/other-model"
