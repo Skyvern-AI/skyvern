@@ -33,7 +33,7 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
         if not parsed.method:
             LOG.info(
                 "No HTTP method found in curl command, defaulting to GET",
-                curl_command=curl_command[:100],
+                curl_command=curl_command,
             )
 
         result = {
@@ -66,7 +66,7 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
                     data_str=data_str if "data_str" in locals() else None,
                     error_type=type(e).__name__,
                     error_message=str(e),
-                    curl_command=curl_command[:100],
+                    curl_command=curl_command,
                 )
                 result["body"] = {"data": data_str if "data_str" in locals() else parsed.data}
 
@@ -80,7 +80,7 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
                     json=parsed.json,
                     error_type=type(e).__name__,
                     error_message=str(e),
-                    curl_command=curl_command[:100],
+                    curl_command=curl_command,
                 )
                 result["body"] = {"data": parsed.json}
 
@@ -93,7 +93,7 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
     except Exception as e:
         LOG.exception(
             "Failed to parse curl command",
-            curl_command=curl_command[:100],  # Log first 100 chars for debugging
+            curl_command=curl_command,  # Log entire command for debugging
         )
         raise ValueError(f"Failed to parse curl command: {str(e)}")
 
