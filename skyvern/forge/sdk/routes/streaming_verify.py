@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 
 import structlog
 
@@ -77,8 +78,6 @@ async def verify_workflow_run(
     """
 
     if settings.ENV == "local":
-        from datetime import datetime
-
         dummy_workflow_run = WorkflowRun(
             workflow_id="123",
             workflow_permanent_id="wpid_123",

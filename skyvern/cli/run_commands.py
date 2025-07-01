@@ -85,7 +85,7 @@ def run_server() -> None:
     """Run the Skyvern API server."""
     load_dotenv()
     load_dotenv(".env")
-    from skyvern.config import settings
+    from skyvern.config import settings  # noqa: PLC0415
 
     port = settings.PORT
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))

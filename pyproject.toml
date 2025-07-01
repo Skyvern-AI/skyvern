@@ -143,6 +143,9 @@ exclude = [
 line-length = 120
 target-version = "py311"
 
+[tool.ruff.lint]
+extend-select = ["PLC0415"]
+
 [tool.isort]
 profile = "black"
 multi_line_output = 3
