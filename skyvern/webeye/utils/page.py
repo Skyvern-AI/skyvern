@@ -101,13 +101,12 @@ async def _current_viewpoint_screenshot_helper(
 
 
 async def _scrolling_screenshots_helper(
-    page: Page,
+    skyvern_page: SkyvernFrame,
     url: str | None = None,
     draw_boxes: bool = False,
     max_number: int = settings.MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
 ) -> tuple[list[bytes], list[int]]:
-    skyvern_page = await SkyvernFrame.create_instance(frame=page)
     # page is the main frame and the index must be 0
     assert isinstance(skyvern_page.frame, Page)
     frame = "main.frame"
@@ -251,35 +250,40 @@ class SkyvernFrame:
         # use spilt screenshot with lite mode, isntead of fullpage screenshot from playwright
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
         start_time = time.time()
-        async with asyncio.timeout(timeout):
-            screenshots, positions = await _scrolling_screenshots_helper(
-                page=page, mode=mode, max_number=scrolling_number
-            )
-            images = []
+        skyvern_frame = await SkyvernFrame.create_instance(frame=page)
+        x, y = await skyvern_frame.get_scroll_x_y()
+        try:
+            async with asyncio.timeout(timeout):
+                screenshots, positions = await _scrolling_screenshots_helper(
+                    skyvern_page=skyvern_frame, mode=mode, max_number=scrolling_number
+                )
+                images = []
 
-            for screenshot in screenshots:
-                with Image.open(BytesIO(screenshot)) as img:
-                    img.load()
-                    images.append(img)
+                for screenshot in screenshots:
+                    with Image.open(BytesIO(screenshot)) as img:
+                        img.load()
+                        images.append(img)
 
-            merged_img = _merge_images_by_position(images, positions)
+                merged_img = _merge_images_by_position(images, positions)
 
-            buffer = BytesIO()
-            merged_img.save(buffer, format="PNG")
-            buffer.seek(0)
+                buffer = BytesIO()
+                merged_img.save(buffer, format="PNG")
+                buffer.seek(0)
 
-            img_data = buffer.read()
-            if file_path is not None:
-                with open(file_path, "wb") as f:
-                    f.write(img_data)
+                img_data = buffer.read()
+                if file_path is not None:
+                    with open(file_path, "wb") as f:
+                        f.write(img_data)
 
-            end_time = time.time()
-            LOG.debug(
-                "Full page screenshot taking time",
-                screenshot_time=end_time - start_time,
-                file_path=file_path,
-            )
-            return img_data
+                end_time = time.time()
+                LOG.debug(
+                    "Full page screenshot taking time",
+                    screenshot_time=end_time - start_time,
+                    file_path=file_path,
+                )
+                return img_data
+        finally:
+            await skyvern_frame.scroll_to_x_y(x, y)
 
     @staticmethod
     async def take_split_screenshots(
@@ -292,8 +296,13 @@ class SkyvernFrame:
         if not scroll:
             return [await _current_viewpoint_screenshot_helper(page=page, mode=ScreenshotMode.DETAILED)]
 
+        skyvern_frame = await SkyvernFrame.create_instance(frame=page)
         screenshots, _ = await _scrolling_screenshots_helper(
-            page=page, url=url, max_number=max_number, draw_boxes=draw_boxes, mode=ScreenshotMode.DETAILED
+            skyvern_page=skyvern_frame,
+            url=url,
+            max_number=max_number,
+            draw_boxes=draw_boxes,
+            mode=ScreenshotMode.DETAILED,
         )
         return screenshots
 
