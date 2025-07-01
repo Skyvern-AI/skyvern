@@ -1373,7 +1373,7 @@ class ForgeAgent:
                 reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
                 assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
                 skyvern_repsonse_prompt = load_prompt_with_elements(
-                    scraped_page=scraped_page,
+                    element_tree_builder=scraped_page,
                     prompt_engine=prompt_engine,
                     template_name="cua-answer-question",
                     navigation_goal=task.navigation_goal,
@@ -1597,7 +1597,7 @@ class ForgeAgent:
             actions_and_results_str = await self._get_action_results(task, current_step=step)
 
         verification_prompt = load_prompt_with_elements(
-            scraped_page=scraped_page_refreshed,
+            element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
             template_name="check-user-goal",
             navigation_goal=task.navigation_goal,
@@ -1974,7 +1974,7 @@ class ForgeAgent:
 
         context = skyvern_context.ensure_context()
         return load_prompt_with_elements(
-            scraped_page=scraped_page,
+            element_tree_builder=scraped_page,
             prompt_engine=prompt_engine,
             template_name=template,
             navigation_goal=navigation_goal,
