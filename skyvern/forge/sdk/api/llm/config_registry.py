@@ -653,6 +653,16 @@ if settings.ENABLE_GEMINI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "GEMINI_2.5_PRO",
+        LLMConfig(
+            "gemini/gemini-2.5-pro",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "GEMINI_2.5_PRO_PREVIEW",
         LLMConfig(
             "gemini/gemini-2.5-pro-preview-05-06",
@@ -666,6 +676,16 @@ if settings.ENABLE_GEMINI:
         "GEMINI_2.5_PRO_EXP_03_25",
         LLMConfig(
             "gemini/gemini-2.5-pro-exp-03-25",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_2.5_FLASH",
+        LLMConfig(
+            "gemini/gemini-2.5-flash",
             ["GEMINI_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
@@ -856,18 +876,28 @@ if settings.ENABLE_NOVITA:
 # my_vertex_credentials = json.dumps(json.load(open("my_credentials_file.json")))
 # Set the value of my_vertex_credentials as the environment variable VERTEX_CREDENTIALS
 # NOTE: If you want to specify a location, make sure the model is available in the target location.
+# If you want to use the global location, you must set the VERTEX_PROJECT_ID environment variable.
 # See documentation: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations#united-states
 if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
-    if not settings.VERTEX_PROJECT_ID:
-        import json
-
-        credentials = json.loads(settings.VERTEX_CREDENTIALS)
-        settings.VERTEX_PROJECT_ID = credentials.get("project_id")
-
     api_base: str | None = None
-    if settings.VERTEX_LOCATION == "global":
+    if settings.VERTEX_LOCATION == "global" and settings.VERTEX_PROJECT_ID:
         api_base = f"https://aiplatform.googleapis.com/v1/projects/{settings.VERTEX_PROJECT_ID}/locations/global/publishers/google/models"
 
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_PRO",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-pro",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                api_base=f"{api_base}/gemini-2.5-pro" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+            ),
+        ),
+    )
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_2.5_PRO_PREVIEW",
         LLMConfig(
@@ -879,6 +909,21 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
             litellm_params=LiteLLMParams(
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-pro-preview-05-06" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_FLASH",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-flash",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
             ),
         ),
