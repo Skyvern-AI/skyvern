@@ -5,6 +5,9 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+import logging
+
+logger = logging.getLogger(__name__)
 
 from skyvern.client import AsyncSkyvern
 from skyvern.client.core.pydantic_utilities import parse_obj_as
@@ -42,17 +45,34 @@ class Skyvern(AsyncSkyvern):
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
     ) -> None:
+        env_base_url = ""
+        if base_url is None:
+            if os.path.exists(".env"):
+                load_dotenv(".env")
+            env_base_url = (os.getenv("SKYVERN_BASE_URL") or "").strip()
+
+        final_base_url = base_url or (env_base_url if env_base_url else None)
+
+        if base_url is not None:
+            logger.debug("Using explicit base_url: %s", base_url)
+        elif env_base_url:
+            logger.debug("Using SKYVERN_BASE_URL from environment: %s", env_base_url)
+        else:
+            logger.debug("Using base_url from environment enum: %s", environment.value)
+
         super().__init__(
-            base_url=base_url,
+            base_url=final_base_url,
             api_key=api_key,
             environment=environment,
             timeout=timeout,
             follow_redirects=follow_redirects,
             httpx_client=httpx_client,
         )
-        if base_url is None and api_key is None:
+        if final_base_url is None and api_key is None:
             if not os.path.exists(".env"):
-                raise Exception("No .env file found. Please run 'skyvern init' first to set up your environment.")
+                raise Exception(
+                    "No .env file found. Please run 'skyvern init' first to set up your environment."
+                )
 
             load_dotenv(".env")
             migrate_db()
