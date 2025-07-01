@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Self
@@ -75,7 +76,7 @@ def load_js_script() -> str:
     try:
         # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
         # This will allow our code to be type safe.
-        with open(path, "r") as f:
+        with open(path) as f:
             return f.read()
     except FileNotFoundError as e:
         LOG.exception("Failed to load the JS script", path=path)
@@ -212,7 +213,28 @@ class ElementTreeFormat(StrEnum):
     HTML = "html"
 
 
-class ScrapedPage(BaseModel):
+class ElementTreeBuilder(ABC):
+    @abstractmethod
+    def support_economy_elements_tree(self) -> bool:
+        pass
+
+    @abstractmethod
+    def build_element_tree(
+        self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
+    ) -> str:
+        pass
+
+    @abstractmethod
+    def build_economy_elements_tree(
+        self,
+        fmt: ElementTreeFormat = ElementTreeFormat.HTML,
+        html_need_skyvern_attrs: bool = True,
+        percent_to_keep: float = 1,
+    ) -> str:
+        pass
+
+
+class ScrapedPage(BaseModel, ElementTreeBuilder):
     """
     Scraped response from a webpage, including:
     1. List of elements
@@ -258,6 +280,9 @@ class ScrapedPage(BaseModel):
         self._browser_state = browser_state
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
+
+    def support_economy_elements_tree(self) -> bool:
+        return True
 
     def build_element_tree(
         self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
@@ -675,7 +700,7 @@ async def get_interactable_element_tree(
     return elements, element_tree
 
 
-class IncrementalScrapePage:
+class IncrementalScrapePage(ElementTreeBuilder):
     def __init__(self, skyvern_frame: SkyvernFrame) -> None:
         self.id_to_element_dict: dict[str, dict] = dict()
         self.id_to_css_dict: dict[str, str] = dict()
@@ -683,6 +708,9 @@ class IncrementalScrapePage:
         self.element_tree: list[dict] = list()
         self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
+
+    def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
+        self.element_tree_trimmed = element_tree_trimmed
 
     def check_id_in_page(self, element_id: str) -> bool:
         css_selector = self.id_to_css_dict.get(element_id, "")
@@ -798,8 +826,36 @@ class IncrementalScrapePage:
                 return locator
         return None
 
-    def build_html_tree(self, element_tree: list[dict] | None = None) -> str:
-        return "".join([json_to_html(element) for element in (element_tree or self.element_tree_trimmed)])
+    def build_html_tree(self, element_tree: list[dict] | None = None, need_skyvern_attrs: bool = True) -> str:
+        return "".join(
+            [
+                json_to_html(element, need_skyvern_attrs=need_skyvern_attrs)
+                for element in (element_tree or self.element_tree_trimmed)
+            ]
+        )
+
+    def support_economy_elements_tree(self) -> bool:
+        return False
+
+    def build_element_tree(
+        self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
+    ) -> str:
+        if fmt == ElementTreeFormat.HTML:
+            return self.build_html_tree(
+                element_tree=self.element_tree_trimmed, need_skyvern_attrs=html_need_skyvern_attrs
+            )
+        if fmt == ElementTreeFormat.JSON:
+            return json.dumps(self.element_tree_trimmed)
+
+        raise UnknownElementTreeFormat(fmt=fmt)
+
+    def build_economy_elements_tree(
+        self,
+        fmt: ElementTreeFormat = ElementTreeFormat.HTML,
+        html_need_skyvern_attrs: bool = True,
+        percent_to_keep: float = 1,
+    ) -> str:
+        raise NotImplementedError("Not implemented")
 
 
 def _should_keep_unique_id(element: dict) -> bool:

@@ -62,6 +62,8 @@ function CreateNewTaskFormPage() {
             webhookCallbackUrl: null,
             proxyLocation: null,
             includeActionHistoryInVerification: null,
+            maxScreenshotScrollingTimes: null,
+            extraHttpHeaders: null,
           }}
         />
       </div>
@@ -131,6 +133,10 @@ function CreateNewTaskFormPage() {
           includeActionHistoryInVerification:
             data.workflow_definition.blocks[0]
               .include_action_history_in_verification,
+          maxScreenshotScrollingTimes: data.max_screenshot_scrolling_times,
+          extraHttpHeaders: data.extra_http_headers
+            ? JSON.stringify(data.extra_http_headers)
+            : null,
         }}
       />
     </div>

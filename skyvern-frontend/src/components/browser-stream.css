@@ -1,0 +1,96 @@
+.browser-stream {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0.5rem;
+  overflow: visible;
+
+  transition: padding 0.2s ease-in-out;
+}
+
+.browser-stream.user-is-controlling {
+  padding: 0rem;
+}
+
+.browser-stream .overlay-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.browser-stream .overlay {
+  position: relative;
+  height: auto;
+  width: 100%;
+  max-height: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.browser-stream.user-is-controlling .overlay {
+  pointer-events: none;
+}
+
+.browser-stream.user-is-controlling .overlay-container {
+  pointer-events: none;
+}
+
+.browser-stream .take-control {
+  transform: translateY(0);
+  transition:
+    transform 0.2s ease-in-out,
+    opacity 0.2s ease-in-out;
+  opacity: 0.3;
+}
+
+.browser-stream .take-control:not(.hide):hover {
+  opacity: 1;
+}
+
+.browser-stream .take-control.hide {
+  transform: translateY(100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.browser-stream .relinquish-control {
+  transform: translateY(0);
+  transition:
+    transform 0.2s ease-in-out,
+    opacity 0.2s ease-in-out;
+  opacity: 0.3;
+  pointer-events: all;
+}
+
+.browser-stream .relinquish-control:not(.hide):hover {
+  opacity: 1;
+}
+
+.browser-stream .relinquish-control.hide {
+  transform: translateY(100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.browser-stream > div > canvas {
+  opacity: 0;
+  animation: skyvern-anim-fadeIn 1s ease-in forwards;
+}
+
+@keyframes skyvern-anim-fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

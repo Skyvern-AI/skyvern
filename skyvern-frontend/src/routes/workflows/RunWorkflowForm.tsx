@@ -11,14 +11,17 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { KeyValueInput } from "@/components/KeyValueInput";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { copyText } from "@/util/copyText";
+import { useSyncFormFieldToStorage } from "@/hooks/useSyncFormFieldToStorage";
+import { useLocalStorageFormDefault } from "@/hooks/useLocalStorageFormDefault";
 import { apiBaseUrl } from "@/util/env";
-import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { type ApiCommandOptions } from "@/util/apiCommands";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import fetchToCurl from "fetch-to-curl";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { useForm } from "react-hook-form";
 import { useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
@@ -26,12 +29,15 @@ import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { AxiosError } from "axios";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
+import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
   initialValues: Record<string, unknown>;
   initialSettings: {
     proxyLocation: ProxyLocation;
     webhookCallbackUrl: string;
+    maxScreenshotScrollingTimes: number | null;
+    extraHttpHeaders: Record<string, string> | null;
   };
 };
 
@@ -70,26 +76,52 @@ type RunWorkflowRequestBody = {
   data: Record<string, unknown>; // workflow parameters and values
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
+  browser_session_id: string | null;
+  max_screenshot_scrolling_times?: number | null;
+  extra_http_headers?: Record<string, string> | null;
 };
 
 function getRunWorkflowRequestBody(
   values: RunWorkflowFormType,
   workflowParameters: Array<WorkflowParameter>,
 ): RunWorkflowRequestBody {
-  const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+  const {
+    webhookCallbackUrl,
+    proxyLocation,
+    browserSessionId,
+    maxScreenshotScrollingTimes,
+    extraHttpHeaders,
+    ...parameters
+  } = values;
 
   const parsedParameters = parseValuesForWorkflowRun(
     parameters,
     workflowParameters,
   );
 
+  const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
+
   const body: RunWorkflowRequestBody = {
     data: parsedParameters,
     proxy_location: proxyLocation,
+    browser_session_id: bsi,
   };
+
+  if (maxScreenshotScrollingTimes) {
+    body.max_screenshot_scrolling_times = maxScreenshotScrollingTimes;
+  }
 
   if (webhookCallbackUrl) {
     body.webhook_callback_url = webhookCallbackUrl;
+  }
+
+  if (extraHttpHeaders) {
+    try {
+      body.extra_http_headers = JSON.parse(extraHttpHeaders);
+    } catch (e) {
+      console.error("Invalid extra Header JSON");
+      body.extra_http_headers = null;
+    }
   }
 
   return body;
@@ -98,6 +130,9 @@ function getRunWorkflowRequestBody(
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
+  browserSessionId: string | null;
+  maxScreenshotScrollingTimes: number | null;
+  extraHttpHeaders: string | null;
 };
 
 function RunWorkflowForm({
@@ -109,14 +144,29 @@ function RunWorkflowForm({
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const browserSessionIdDefault = useLocalStorageFormDefault(
+    "skyvern.browserSessionId",
+    (initialValues.browserSessionId as string | undefined) ?? null,
+  );
   const form = useForm<RunWorkflowFormType>({
     defaultValues: {
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation,
+      browserSessionId: browserSessionIdDefault,
+      maxScreenshotScrollingTimes: initialSettings.maxScreenshotScrollingTimes,
+      extraHttpHeaders: initialSettings.extraHttpHeaders
+        ? JSON.stringify(initialSettings.extraHttpHeaders)
+        : null,
     },
   });
   const apiCredential = useApiCredential();
+
+  useSyncFormFieldToStorage(
+    form,
+    "browserSessionId",
+    "skyvern.browserSessionId",
+  );
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
@@ -154,7 +204,15 @@ function RunWorkflowForm({
   });
 
   function onSubmit(values: RunWorkflowFormType) {
-    const { webhookCallbackUrl, proxyLocation, ...parameters } = values;
+    const {
+      webhookCallbackUrl,
+      proxyLocation,
+      browserSessionId,
+      maxScreenshotScrollingTimes,
+      extraHttpHeaders,
+      ...parameters
+    } = values;
+
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
       workflowParameters,
@@ -163,6 +221,9 @@ function RunWorkflowForm({
       ...parsedParameters,
       webhookCallbackUrl,
       proxyLocation,
+      browserSessionId,
+      maxScreenshotScrollingTimes,
+      extraHttpHeaders,
     });
   }
 
@@ -330,20 +391,128 @@ function RunWorkflowForm({
               );
             }}
           />
+          <FormField
+            key="browserSessionId"
+            control={form.control}
+            name="browserSessionId"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Browser Session ID
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          Use a persistent browser session to maintain state and
+                          enable browser interaction.
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <Input
+                          {...field}
+                          placeholder="pbs_xxx"
+                          value={
+                            field.value === null ? "" : (field.value as string)
+                          }
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
+          <FormField
+            key="extraHttpHeaders"
+            control={form.control}
+            name="extraHttpHeaders"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Extra HTTP Headers
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          Specify some self defined HTTP requests headers in
+                          Dict format
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <KeyValueInput
+                          value={field.value ?? ""}
+                          onChange={(val) => field.onChange(val)}
+                          addButtonText="Add Header"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
+          <FormField
+            key="maxScreenshotScrollingTimes"
+            control={form.control}
+            name="maxScreenshotScrollingTimes"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Max Scrolling Screenshots
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="number"
+                          min={0}
+                          value={field.value ?? ""}
+                          placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                          onChange={(event) => {
+                            const value =
+                              event.target.value === ""
+                                ? null
+                                : Number(event.target.value);
+                            field.onChange(value);
+                          }}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
         </div>
-
         <div className="flex justify-end gap-2">
-          <Button
-            type="button"
-            variant="secondary"
-            onClick={() => {
+          <CopyApiCommandDropdown
+            getOptions={() => {
               const values = form.getValues();
               const body = getRunWorkflowRequestBody(
                 values,
                 workflowParameters,
               );
-
-              const curl = fetchToCurl({
+              return {
                 method: "POST",
                 url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
                 body,
@@ -351,21 +520,9 @@ function RunWorkflowForm({
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 },
-              });
-
-              copyText(curl).then(() => {
-                toast({
-                  variant: "success",
-                  title: "Copied to Clipboard",
-                  description:
-                    "The cURL command has been copied to your clipboard.",
-                });
-              });
+              } satisfies ApiCommandOptions;
             }}
-          >
-            <CopyIcon className="mr-2 h-4 w-4" />
-            cURL
-          </Button>
+          />
           <Button type="submit" disabled={runWorkflowMutation.isPending}>
             {runWorkflowMutation.isPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />

@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     ENV: str = "local"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
+    LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
@@ -79,6 +80,7 @@ class Settings(BaseSettings):
     BROWSER_TIMEZONE: str = "America/New_York"
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
+    BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
@@ -133,6 +135,12 @@ class Settings(BaseSettings):
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
+
+    # VOLCENGINE (Doubao)
+    ENABLE_VOLCENGINE: bool = False
+    VOLCENGINE_API_KEY: str | None = None
+    VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
+    VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
@@ -242,6 +250,7 @@ class Settings(BaseSettings):
     BITWARDEN_CLIENT_ID: str | None = None
     BITWARDEN_CLIENT_SECRET: str | None = None
     BITWARDEN_MASTER_PASSWORD: str | None = None
+    OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
@@ -264,6 +273,17 @@ class Settings(BaseSettings):
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"
     SKYVERN_API_KEY: str = "PLACEHOLDER"
 
+    SKYVERN_BROWSER_VNC_PORT: int = 6080
+    """
+    The websockified port on which the VNC server of a persistent browser is
+    listening.
+    """
+
+    PYLON_IDENTITY_VERIFICATION_SECRET: str | None = None
+    """
+    The secret used to sign the email/identity of the user.
+    """
+
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
@@ -272,9 +292,9 @@ class Settings(BaseSettings):
 
         if self.is_cloud_environment():
             return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO_PREVIEW", "label": "Gemini 2.5 Pro"},
+                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
                 "gemini-2.5-flash-preview-05-20": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
@@ -291,9 +311,9 @@ class Settings(BaseSettings):
         else:
             # TODO: apparently the list for OSS is to be much larger
             return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO_PREVIEW", "label": "Gemini 2.5 Pro"},
+                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
                 "gemini-2.5-flash-preview-05-20": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},

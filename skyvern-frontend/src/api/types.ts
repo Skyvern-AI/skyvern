@@ -41,6 +41,7 @@ export const ProxyLocation = {
   ResidentialNZ: "RESIDENTIAL_NZ",
   ResidentialZA: "RESIDENTIAL_ZA",
   ResidentialAR: "RESIDENTIAL_AR",
+  ResidentialAU: "RESIDENTIAL_AU",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -135,12 +136,14 @@ export type CreateTaskRequest = {
   data_extraction_goal?: string | null;
   navigation_payload?: Record<string, unknown> | string | null;
   extracted_information_schema?: Record<string, unknown> | string | null;
+  extra_http_headers?: Record<string, string> | null;
   error_code_mapping?: Record<string, string> | null;
   proxy_location?: ProxyLocation | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   application?: string | null;
   include_action_history_in_verification?: boolean | null;
+  max_screenshot_scrolling_times?: number | null;
 };
 
 export type User = {
@@ -281,6 +284,7 @@ export type WorkflowRunStatusApiResponse = {
   status: Status;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
+  extra_http_headers: Record<string, string> | null;
   created_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
@@ -293,6 +297,8 @@ export type WorkflowRunStatusApiResponse = {
   total_cost: number | null;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
+  browser_session_id: string | null;
+  max_screenshot_scrolling_times: number | null;
 };
 
 export type TaskGenerationApiResponse = {
@@ -335,12 +341,14 @@ export type TaskV2 = {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   proxy_location: ProxyLocation | null;
+  extra_http_headers: Record<string, string> | null;
 };
 
 export type Createv2TaskRequest = {
   user_prompt: string;
   webhook_callback_url?: string | null;
   proxy_location?: ProxyLocation | null;
+  browser_session_id?: string | null;
 };
 
 export type PasswordCredentialApiResponse = {
@@ -404,3 +412,7 @@ export const RunEngine = {
 } as const;
 
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
+
+export type PylonEmailHash = {
+  hash: string;
+};

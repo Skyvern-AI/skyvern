@@ -13,9 +13,17 @@ repos:
       - id: check-symlinks
       - id: debug-statements
       - id: detect-private-key
+  - repo: local
+    hooks:
+      - id: check-python-version
+        name: Check Python Version (3.11-3.13)
+        entry: python -c "import sys; assert (3,11) <= sys.version_info[:2] <= (3,13), f'Python {sys.version_info[:2]} not supported. Use Python 3.11-3.13'"
+        language: system
+        pass_filenames: false
+        always_run: true
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.11.13
+    rev: v0.12.1
     hooks:
       # Run the linter.
       - id: ruff
@@ -43,8 +51,16 @@ repos:
       - id: python-check-mock-methods
       - id: python-no-log-warn
       - id: python-use-type-annotations
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.20.0
+    hooks:
+      - id: pyupgrade
+        exclude: |
+          (?x)(
+          ^skyvern/client/.*
+          )
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.16.0
+    rev: v1.16.1
     hooks:
       - id: mypy
         args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs]
@@ -53,7 +69,7 @@ repos:
           - types-requests
           - types-cachetools
           - alembic
-          - "sqlalchemy[mypy]"
+          - 'sqlalchemy[mypy]'
           - types-PyYAML
           - types-aiofiles
         exclude: |
@@ -83,7 +99,7 @@ repos:
         #   pass_filenames: false
         #   always_run: true
   - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: "v4.0.0-alpha.8" # Use the sha or tag you want to point at
+    rev: 'v4.0.0-alpha.8' # Use the sha or tag you want to point at
     hooks:
       - id: prettier
         types: [javascript]
@@ -99,6 +115,6 @@ repos:
     hooks:
       - id: shellcheck
   - repo: https://github.com/google/yamlfmt
-    rev: v0.17.0
+    rev: v0.17.2
     hooks:
       - id: yamlfmt
