@@ -224,14 +224,15 @@ class AgentDB:
         artifact_id: str,
         artifact_type: str,
         uri: str,
+        organization_id: str,
         step_id: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         task_v2_id: str | None = None,
+        run_id: str | None = None,
         thought_id: str | None = None,
         ai_suggestion_id: str | None = None,
-        organization_id: str | None = None,
     ) -> Artifact:
         try:
             async with self.Session() as session:
@@ -245,6 +246,7 @@ class AgentDB:
                     workflow_run_block_id=workflow_run_block_id,
                     observer_cruise_id=task_v2_id,
                     observer_thought_id=thought_id,
+                    run_id=run_id,
                     ai_suggestion_id=ai_suggestion_id,
                     organization_id=organization_id,
                 )
@@ -1024,18 +1026,7 @@ class AgentDB:
         async with self.Session() as session:
             query = select(ArtifactModel).filter_by(organization_id=organization_id)
 
-            if run.task_run_type in [
-                RunType.task_v1,
-                RunType.openai_cua,
-                RunType.anthropic_cua,
-            ]:
-                query = query.filter_by(task_id=run.run_id)
-            elif run.task_run_type == RunType.task_v2:
-                query = query.filter_by(observer_cruise_id=run.run_id)
-            elif run.task_run_type == RunType.workflow_run:
-                query = query.filter_by(workflow_run_id=run.run_id)
-            else:
-                return []
+            query = query.filter_by(run_id=run.run_id)
 
             if artifact_types:
                 query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
@@ -2774,6 +2765,14 @@ class AgentDB:
         description: str | None = None,
         block_workflow_run_id: str | None = None,
         engine: str | None = None,
+        # HTTP request block parameters
+        http_request_method: str | None = None,
+        http_request_url: str | None = None,
+        http_request_headers: dict[str, str] | None = None,
+        http_request_body: dict[str, Any] | None = None,
+        http_request_parameters: dict[str, Any] | None = None,
+        http_request_timeout: int | None = None,
+        http_request_follow_redirects: bool | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2816,6 +2815,21 @@ class AgentDB:
                     workflow_run_block.block_workflow_run_id = block_workflow_run_id
                 if engine:
                     workflow_run_block.engine = engine
+                # HTTP request block fields
+                if http_request_method:
+                    workflow_run_block.http_request_method = http_request_method
+                if http_request_url:
+                    workflow_run_block.http_request_url = http_request_url
+                if http_request_headers:
+                    workflow_run_block.http_request_headers = http_request_headers
+                if http_request_body:
+                    workflow_run_block.http_request_body = http_request_body
+                if http_request_parameters:
+                    workflow_run_block.http_request_parameters = http_request_parameters
+                if http_request_timeout:
+                    workflow_run_block.http_request_timeout = http_request_timeout
+                if http_request_follow_redirects is not None:
+                    workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

@@ -193,6 +193,7 @@ class ArtifactModel(Base):
     step_id = Column(String, index=True)
     artifact_type = Column(String)
     uri = Column(String)
+    run_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -604,6 +605,15 @@ class WorkflowRunBlockModel(Base):
 
     # wait block
     wait_sec = Column(Integer, nullable=True)
+
+    # http request block
+    http_request_method = Column(String(10), nullable=True)
+    http_request_url = Column(String, nullable=True)
+    http_request_headers = Column(JSON, nullable=True)
+    http_request_body = Column(JSON, nullable=True)
+    http_request_parameters = Column(JSON, nullable=True)
+    http_request_timeout = Column(Integer, nullable=True)
+    http_request_follow_redirects = Column(Boolean, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

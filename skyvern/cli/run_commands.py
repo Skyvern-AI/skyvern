@@ -85,7 +85,7 @@ def run_server() -> None:
     """Run the Skyvern API server."""
     load_dotenv()
     load_dotenv(".env")
-    from skyvern.config import settings
+    from skyvern.config import settings  # noqa: PLC0415
 
     port = settings.PORT
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))
@@ -117,11 +117,37 @@ def run_ui() -> None:
     except Exception as e:  # pragma: no cover - CLI safeguards
         console.print(f"[red]Error checking for process: {e}[/red]")
 
-    current_dir = Path(__file__).parent.parent.parent
-    frontend_dir = current_dir / "skyvern-frontend"
-    if not frontend_dir.exists():
+    # Try multiple methods to find the frontend directory
+    frontend_dir = None
+
+    # Method 1: Relative to current working directory
+    cwd_frontend = Path.cwd() / "skyvern-frontend"
+    if cwd_frontend.exists():
+        frontend_dir = cwd_frontend
+
+    # Method 2: Relative to the module file (original method)
+    if frontend_dir is None:
+        module_based_frontend = Path(__file__).parent.parent.parent / "skyvern-frontend"
+        if module_based_frontend.exists():
+            frontend_dir = module_based_frontend
+
+    # Method 3: Search up the directory tree from current working directory
+    if frontend_dir is None:
+        current = Path.cwd()
+        while current != current.parent:  # Stop at filesystem root
+            candidate = current / "skyvern-frontend"
+            if candidate.exists() and candidate.is_dir():
+                frontend_dir = candidate
+                break
+            current = current.parent
+
+    if frontend_dir is None:
         console.print(
-            f"[bold red]ERROR: Skyvern Frontend directory not found at [path]{frontend_dir}[/path]. Are you in the right repo?[/bold red]"
+            f"[bold red]ERROR: Skyvern Frontend directory not found. Searched in:[/bold red]\n"
+            f"  • {cwd_frontend}\n"
+            f"  • {Path(__file__).parent.parent.parent / 'skyvern-frontend'}\n"
+            f"  • Parent directories of {Path.cwd()}\n"
+            f"[bold red]Are you in the right repo?[/bold red]"
         )
         return
 
@@ -131,8 +157,20 @@ def run_ui() -> None:
         shutil.copy(frontend_dir / ".env.example", frontend_env_path)
         console.print("✅ [green]Successfully set up frontend .env file[/green]")
 
-    main_env_path = current_dir / ".env"
-    if main_env_path.exists():
+    # Look for .env file in multiple locations
+    main_env_path = None
+    env_search_paths = [
+        Path.cwd() / ".env",
+        frontend_dir.parent / ".env",
+        Path(__file__).parent.parent.parent / ".env",
+    ]
+
+    for env_path in env_search_paths:
+        if env_path.exists():
+            main_env_path = env_path
+            break
+
+    if main_env_path and main_env_path.exists():
         load_dotenv(main_env_path)
         skyvern_api_key = os.getenv("SKYVERN_API_KEY")
         if skyvern_api_key:
