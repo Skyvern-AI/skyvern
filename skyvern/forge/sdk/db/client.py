@@ -2765,6 +2765,14 @@ class AgentDB:
         description: str | None = None,
         block_workflow_run_id: str | None = None,
         engine: str | None = None,
+        # HTTP request block parameters
+        http_request_method: str | None = None,
+        http_request_url: str | None = None,
+        http_request_headers: dict[str, str] | None = None,
+        http_request_body: dict[str, Any] | None = None,
+        http_request_parameters: dict[str, Any] | None = None,
+        http_request_timeout: int | None = None,
+        http_request_follow_redirects: bool | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2807,6 +2815,21 @@ class AgentDB:
                     workflow_run_block.block_workflow_run_id = block_workflow_run_id
                 if engine:
                     workflow_run_block.engine = engine
+                # HTTP request block fields
+                if http_request_method:
+                    workflow_run_block.http_request_method = http_request_method
+                if http_request_url:
+                    workflow_run_block.http_request_url = http_request_url
+                if http_request_headers:
+                    workflow_run_block.http_request_headers = http_request_headers
+                if http_request_body:
+                    workflow_run_block.http_request_body = http_request_body
+                if http_request_parameters:
+                    workflow_run_block.http_request_parameters = http_request_parameters
+                if http_request_timeout:
+                    workflow_run_block.http_request_timeout = http_request_timeout
+                if http_request_follow_redirects is not None:
+                    workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

@@ -48,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     FileParserBlock,
     FileUploadBlock,
     ForLoopBlock,
+    HttpRequestBlock,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
@@ -2063,6 +2064,24 @@ class WorkflowService:
                 max_steps=block_yaml.max_steps,
                 model=block_yaml.model,
                 output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.HTTP_REQUEST:
+            http_request_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return HttpRequestBlock(
+                label=block_yaml.label,
+                method=block_yaml.method,
+                url=block_yaml.url,
+                headers=block_yaml.headers,
+                body=block_yaml.body,
+                timeout=block_yaml.timeout,
+                follow_redirects=block_yaml.follow_redirects,
+                parameters=http_request_block_parameters,
+                output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:
             return UrlBlock(
