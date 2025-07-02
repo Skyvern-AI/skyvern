@@ -1614,7 +1614,7 @@ async def _summarize_task_v2(
 
 async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
-    from skyvern.services import workflow_service  # noqa: PLC0415
+    from skyvern.services import workflow_service
 
     workflow_run_resp = None
     if task_v2.workflow_run_id:

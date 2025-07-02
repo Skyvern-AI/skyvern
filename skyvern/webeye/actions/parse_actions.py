@@ -1,6 +1,4 @@
-import ast
-import re
-from typing import Any, Dict, Match
+from typing import Any, Dict
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -864,6 +862,8 @@ def _parse_ui_tars_response(response_content: str, browser_window_dimension: Res
 
     Extracts essential parsing logic from action_parser.py without the complex coordinate transformations.
     """
+    import re
+
     text = response_content.strip()
 
     # Convert point format to coordinates if needed
@@ -947,6 +947,7 @@ def _parse_ui_tars_response(response_content: str, browser_window_dimension: Res
 
 def _parse_single_action(action_str: str) -> dict[str, Any] | None:
     """Parse a single action string into structured data."""
+    import ast
 
     try:
         # Clean up the action string
@@ -989,6 +990,9 @@ def _parse_single_action(action_str: str) -> dict[str, Any] | None:
 
 def _convert_point_to_coordinates(text: str) -> str:
     """Convert <point>x y</point> format to (x,y) format."""
+    import re
+    from typing import Match
+
     pattern = r"<point>(\d+)\s+(\d+)</point>"
 
     def replace_match(match: Match[str]) -> str:
@@ -1150,6 +1154,8 @@ def _extract_ui_tars_coordinates(box_str: str, browser_window_dimension: Resolut
     format to relative coordinates (0-1 range), then multiplied by screen dimensions
     to get absolute pixel coordinates.
     """
+    import ast
+
     if not box_str:
         return None, None
 
