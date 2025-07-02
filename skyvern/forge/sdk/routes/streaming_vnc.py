@@ -1,233 +1,36 @@
+"""
+Streaming VNC WebSocket connections.
+"""
+
 import asyncio
-import dataclasses
-import typing as t
-from enum import IntEnum
 
 import structlog
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
 from websockets import Data
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.exceptions import ConnectionClosedError
 
+import skyvern.forge.sdk.routes.streaming_clients as sc
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import legacy_base_router
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
-from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.services.org_auth_service import get_current_org
+from skyvern.forge.sdk.routes.streaming_auth import auth
+from skyvern.forge.sdk.routes.streaming_verify import (
+    loop_verify_task,
+    loop_verify_workflow_run,
+    verify_task,
+    verify_workflow_run,
+)
 from skyvern.forge.sdk.utils.aio import collect
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
-
-Interactor = t.Literal["agent", "user"]
-Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
-
-
-class MessageType(IntEnum):
-    Keyboard = 4
-    Mouse = 5
-
-
-class Keys:
-    """
-    VNC RFB keycodes. There's likely a pithier repr (indexes 6-7). This is ok for now.
-    """
-
-    class Down:
-        Ctrl = b"\x04\x01\x00\x00\x00\x00\xff\xe3"
-        Cmd = b"\x04\x01\x00\x00\x00\x00\xff\xe9"
-        Alt = b"\x04\x01\x00\x00\x00\x00\xff~"  # option
-        OKey = b"\x04\x01\x00\x00\x00\x00\x00o"
-
-    class Up:
-        Ctrl = b"\x04\x00\x00\x00\x00\x00\xff\xe3"
-        Cmd = b"\x04\x00\x00\x00\x00\x00\xff\xe9"
-        Alt = b"\x04\x00\x00\x00\x00\x00\xff\x7e"  # option
-
-
-def is_rmb(data: bytes) -> bool:
-    return data[0:2] == b"\x05\x04"
-
-
-class Mouse:
-    class Up:
-        Right = is_rmb
-
 
 LOG = structlog.get_logger()
 
 
-@dataclasses.dataclass
-class KeyState:
-    ctrl_is_down: bool = False
-    alt_is_down: bool = False
-    cmd_is_down: bool = False
-    o_is_down: bool = False
-
-    def is_forbidden(self, data: bytes) -> bool:
-        """
-        :return: True if the key is forbidden, else False
-        """
-        return self.is_ctrl_o(data)
-
-    def is_ctrl_o(self, data: bytes) -> bool:
-        """
-        Do not allow the opening of files.
-        """
-        return self.ctrl_is_down and data == Keys.Down.OKey
-
-
-@dataclasses.dataclass
-class Streaming:
-    """
-    Streaming state.
-    """
-
-    interactor: Interactor
-    """
-    Whether the user or the agent are the interactor.
-    """
-
-    organization_id: str
-    vnc_port: int
-    websocket: WebSocket
-
-    # --
-
-    browser_session: AddressablePersistentBrowserSession | None = None
-    key_state: KeyState = dataclasses.field(default_factory=KeyState)
-    task: Task | None = None
-    workflow_run: WorkflowRun | None = None
-
-    @property
-    def is_open(self) -> bool:
-        if self.websocket.client_state not in (WebSocketState.CONNECTED, WebSocketState.CONNECTING):
-            return False
-
-        if not self.task and not self.workflow_run:
-            return False
-
-        return True
-
-    async def close(self, code: int = 1000, reason: str | None = None) -> "Streaming":
-        LOG.info("Closing Streaming.", reason=reason, code=code)
-
-        self.browser_session = None
-        self.task = None
-        self.workflow_run = None
-
-        try:
-            await self.websocket.close(code=code, reason=reason)
-        except Exception:
-            pass
-
-        return self
-
-    def update_key_state(self, data: bytes) -> None:
-        if data == Keys.Down.Ctrl:
-            self.key_state.ctrl_is_down = True
-        elif data == Keys.Up.Ctrl:
-            self.key_state.ctrl_is_down = False
-        elif data == Keys.Down.Alt:
-            self.key_state.alt_is_down = True
-        elif data == Keys.Up.Alt:
-            self.key_state.alt_is_down = False
-        elif data == Keys.Down.Cmd:
-            self.key_state.cmd_is_down = True
-        elif data == Keys.Up.Cmd:
-            self.key_state.cmd_is_down = False
-
-
-async def auth(apikey: str | None, token: str | None, websocket: WebSocket) -> str | None:
-    """
-    Accepts the websocket connection.
-
-    Authenticates the user; cannot proceed with WS connection if an organization_id cannot be
-    determined.
-    """
-
-    try:
-        await websocket.accept()
-        if not token and not apikey:
-            await websocket.close(code=1002)
-            return None
-    except ConnectionClosedOK:
-        LOG.info("WebSocket connection closed cleanly.")
-        return None
-
-    try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
-        organization_id = organization.organization_id
-
-        if not organization_id:
-            await websocket.close(code=1002)
-            return None
-    except Exception:
-        LOG.exception("Error occurred while retrieving organization information.")
-        try:
-            await websocket.close(code=1002)
-        except ConnectionClosedOK:
-            LOG.info("WebSocket connection closed due to invalid credentials.")
-        return None
-
-    return organization_id
-
-
-async def verify_task(
-    task_id: str, organization_id: str
-) -> tuple[Task | None, AddressablePersistentBrowserSession | None]:
-    """
-    Verify the task is running, and that it has a browser session associated
-    with it.
-    """
-
-    task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
-
-    if not task:
-        LOG.info("Task not found.", task_id=task_id, organization_id=organization_id)
-        return None, None
-
-    if task.status.is_final():
-        LOG.info("Task is in a final state.", task_status=task.status, task_id=task_id, organization_id=organization_id)
-
-        return None, None
-
-    if not task.status == TaskStatus.running:
-        LOG.info("Task is not running.", task_status=task.status, task_id=task_id, organization_id=organization_id)
-
-        return None, None
-
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session_by_runnable_id(
-        organization_id=organization_id,
-        runnable_id=task_id,  # is this correct; is there a task_run_id?
-    )
-
-    if not browser_session:
-        LOG.info("No browser session found for task.", task_id=task_id, organization_id=organization_id)
-        return task, None
-
-    if not browser_session.browser_address:
-        LOG.info("Browser session address not found for task.", task_id=task_id, organization_id=organization_id)
-        return task, None
-
-    try:
-        addressable_browser_session = AddressablePersistentBrowserSession(
-            **browser_session.model_dump() | {"browser_address": browser_session.browser_address},
-        )
-    except Exception as e:
-        LOG.error(
-            "streaming-vnc.browser-session-reify-error", task_id=task_id, organization_id=organization_id, error=e
-        )
-        return task, None
-
-    return task, addressable_browser_session
-
-
 async def get_streaming_for_task(
+    client_id: str,
     task_id: str,
     organization_id: str,
     websocket: WebSocket,
-) -> tuple[Streaming, Loops] | None:
+) -> tuple[sc.Streaming, sc.Loops] | None:
     """
     Return a streaming context for a task, with a list of loops to run concurrently.
     """
@@ -242,8 +45,9 @@ async def get_streaming_for_task(
         LOG.info("No initial browser session found for task.", task_id=task_id, organization_id=organization_id)
         return None
 
-    streaming = Streaming(
-        interactor="user",
+    streaming = sc.Streaming(
+        client_id=client_id,
+        interactor="agent",
         organization_id=organization_id,
         vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
         websocket=websocket,
@@ -260,10 +64,11 @@ async def get_streaming_for_task(
 
 
 async def get_streaming_for_workflow_run(
+    client_id: str,
     workflow_run_id: str,
     organization_id: str,
     websocket: WebSocket,
-) -> tuple[Streaming, Loops] | None:
+) -> tuple[sc.Streaming, sc.Loops] | None:
     """
     Return a streaming context for a workflow run, with a list of loops to run concurrently.
     """
@@ -287,8 +92,9 @@ async def get_streaming_for_workflow_run(
         )
         return None
 
-    streaming = Streaming(
-        interactor="user",
+    streaming = sc.Streaming(
+        client_id=client_id,
+        interactor="agent",
         organization_id=organization_id,
         vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
         browser_session=browser_session,
@@ -306,128 +112,7 @@ async def get_streaming_for_workflow_run(
     return streaming, loops
 
 
-async def verify_workflow_run(
-    workflow_run_id: str,
-    organization_id: str,
-) -> tuple[WorkflowRun | None, AddressablePersistentBrowserSession | None]:
-    """
-    Verify the workflow run is running, and that it has a browser session associated
-    with it.
-    """
-
-    workflow_run = await app.DATABASE.get_workflow_run(
-        workflow_run_id=workflow_run_id,
-        organization_id=organization_id,
-    )
-
-    if not workflow_run:
-        LOG.info("Workflow run not found.", workflow_run_id=workflow_run_id, organization_id=organization_id)
-        return None, None
-
-    if workflow_run.status in [
-        WorkflowRunStatus.completed,
-        WorkflowRunStatus.failed,
-        WorkflowRunStatus.terminated,
-    ]:
-        LOG.info(
-            "Workflow run is in a final state. Closing connection.",
-            workflow_run_status=workflow_run.status,
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
-
-        return None, None
-
-    if workflow_run.status not in [WorkflowRunStatus.created, WorkflowRunStatus.queued, WorkflowRunStatus.running]:
-        LOG.info(
-            "Workflow run is not running.",
-            workflow_run_status=workflow_run.status,
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
-
-        return None, None
-
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session_by_runnable_id(
-        organization_id=organization_id,
-        runnable_id=workflow_run_id,
-    )
-
-    if not browser_session:
-        LOG.info(
-            "No browser session found for workflow run.",
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
-        return workflow_run, None
-
-    browser_address = browser_session.browser_address
-
-    if not browser_address:
-        LOG.info(
-            "Waiting for browser session address.", workflow_run_id=workflow_run_id, organization_id=organization_id
-        )
-
-        try:
-            _, host, cdp_port = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
-                session_id=browser_session.persistent_browser_session_id,
-                organization_id=organization_id,
-            )
-            browser_address = f"{host}:{cdp_port}"
-        except Exception as ex:
-            LOG.info(
-                "Browser session address not found for workflow run.",
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                ex=ex,
-            )
-            return workflow_run, None
-
-    try:
-        addressable_browser_session = AddressablePersistentBrowserSession(
-            **browser_session.model_dump() | {"browser_address": browser_address},
-        )
-    except Exception:
-        return workflow_run, None
-
-    return workflow_run, addressable_browser_session
-
-
-async def loop_verify_task(streaming: Streaming) -> None:
-    """
-    Loop until the task is cleared or the websocket is closed.
-    """
-
-    while streaming.task and streaming.is_open:
-        task, browser_session = await verify_task(
-            task_id=streaming.task.task_id,
-            organization_id=streaming.organization_id,
-        )
-
-        streaming.task = task
-        streaming.browser_session = browser_session
-
-        await asyncio.sleep(2)
-
-
-async def loop_verify_workflow_run(streaming: Streaming) -> None:
-    """
-    Loop until the workflow run is cleared or the websocket is closed.
-    """
-
-    while streaming.workflow_run and streaming.is_open:
-        workflow_run, browser_session = await verify_workflow_run(
-            workflow_run_id=streaming.workflow_run.workflow_run_id,
-            organization_id=streaming.organization_id,
-        )
-
-        streaming.workflow_run = workflow_run
-        streaming.browser_session = browser_session
-
-        await asyncio.sleep(2)
-
-
-async def loop_stream_vnc(streaming: Streaming) -> None:
+async def loop_stream_vnc(streaming: sc.Streaming) -> None:
     """
     Actually stream the VNC session data between a frontend and a browser
     session.
@@ -465,19 +150,19 @@ async def loop_stream_vnc(streaming: Streaming) -> None:
                     if data:
                         message_type = data[0]
 
-                        if message_type == MessageType.Keyboard.value:
+                        if message_type == sc.MessageType.Keyboard.value:
                             streaming.update_key_state(data)
 
                             if streaming.key_state.is_forbidden(data):
                                 continue
 
-                        if message_type == MessageType.Mouse.value:
-                            if Mouse.Up.Right(data):
+                        if message_type == sc.MessageType.Mouse.value:
+                            if sc.Mouse.Up.Right(data):
                                 continue
 
                         if not streaming.interactor == "user" and message_type in (
-                            MessageType.Keyboard.value,
-                            MessageType.Mouse.value,
+                            sc.MessageType.Keyboard.value,
+                            sc.MessageType.Mouse.value,
                         ):
                             LOG.info(
                                 "Blocking user message.", task=streaming.task, organization_id=streaming.organization_id
@@ -615,9 +300,10 @@ async def task_stream(
     websocket: WebSocket,
     task_id: str,
     apikey: str | None = None,
+    client_id: str | None = None,
     token: str | None = None,
 ) -> None:
-    await stream(websocket, apikey=apikey, task_id=task_id, token=token)
+    await stream(websocket, apikey=apikey, client_id=client_id, task_id=task_id, token=token)
 
 
 @legacy_base_router.websocket("/stream/vnc/workflow_run/{workflow_run_id}")
@@ -625,32 +311,43 @@ async def workflow_run_stream(
     websocket: WebSocket,
     workflow_run_id: str,
     apikey: str | None = None,
+    client_id: str | None = None,
     token: str | None = None,
 ) -> None:
-    await stream(websocket, apikey=apikey, workflow_run_id=workflow_run_id, token=token)
+    await stream(websocket, apikey=apikey, client_id=client_id, workflow_run_id=workflow_run_id, token=token)
 
 
 async def stream(
     websocket: WebSocket,
     *,
     apikey: str | None = None,
+    client_id: str | None = None,
     task_id: str | None = None,
     token: str | None = None,
     workflow_run_id: str | None = None,
 ) -> None:
-    LOG.info("Starting VNC stream.", task_id=task_id, workflow_run_id=workflow_run_id)
+    if not client_id:
+        LOG.error("Client ID not provided for VNC stream.", task_id=task_id, workflow_run_id=workflow_run_id)
+        return
+
+    LOG.info("Starting VNC stream.", client_id=client_id, task_id=task_id, workflow_run_id=workflow_run_id)
 
     organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
 
     if not organization_id:
-        LOG.info("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
+        LOG.error("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
         return
 
-    streaming: Streaming
+    streaming: sc.Streaming
     loops: list[asyncio.Task] = []
 
     if task_id:
-        result = await get_streaming_for_task(task_id=task_id, organization_id=organization_id, websocket=websocket)
+        result = await get_streaming_for_task(
+            client_id=client_id,
+            task_id=task_id,
+            organization_id=organization_id,
+            websocket=websocket,
+        )
 
         if not result:
             LOG.error("No streaming context found for the task.", task_id=task_id, organization_id=organization_id)
@@ -666,6 +363,7 @@ async def stream(
             "Starting streaming for workflow run.", workflow_run_id=workflow_run_id, organization_id=organization_id
         )
         result = await get_streaming_for_workflow_run(
+            client_id=client_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             websocket=websocket,

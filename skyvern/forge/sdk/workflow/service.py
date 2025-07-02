@@ -48,6 +48,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     FileParserBlock,
     FileUploadBlock,
     ForLoopBlock,
+    HttpRequestBlock,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
@@ -177,6 +178,8 @@ class WorkflowService:
             webhook_callback_url=workflow_request.webhook_callback_url,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
         )
+        context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+        current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
         skyvern_context.set(
             SkyvernContext(
                 organization_id=organization.organization_id,
@@ -184,6 +187,8 @@ class WorkflowService:
                 request_id=request_id,
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
+                run_id=current_run_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
                 max_steps_override=max_steps_override,
                 max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
             )
@@ -2059,6 +2064,24 @@ class WorkflowService:
                 max_steps=block_yaml.max_steps,
                 model=block_yaml.model,
                 output_parameter=output_parameter,
+            )
+        elif block_yaml.block_type == BlockType.HTTP_REQUEST:
+            http_request_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return HttpRequestBlock(
+                label=block_yaml.label,
+                method=block_yaml.method,
+                url=block_yaml.url,
+                headers=block_yaml.headers,
+                body=block_yaml.body,
+                timeout=block_yaml.timeout,
+                follow_redirects=block_yaml.follow_redirects,
+                parameters=http_request_block_parameters,
+                output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:
             return UrlBlock(

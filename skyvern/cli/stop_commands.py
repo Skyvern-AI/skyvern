@@ -81,7 +81,6 @@ def stop_ui() -> None:
     else:
         console.print("[yellow]No Skyvern UI servers found running on ports 8080 or 9090.[/yellow]")
 
-
 @stop_app.command(name="server")
 def stop_server(port: int = typer.Option(8000, "--port", "-p", help="Port number for the Skyvern API server")) -> None:
     """Stop the Skyvern API server running on the specified port (default: 8000)."""
