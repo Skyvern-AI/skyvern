@@ -63,6 +63,7 @@ def kill_pids(pids: List[int], service_name: str) -> bool:
     return killed_any
 
 
+
 @stop_app.command(name="all")
 def stop_all() -> None:
     """Stop all Skyvern services running on ports 8000, 8080, and 9090."""

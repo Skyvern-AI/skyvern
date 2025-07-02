@@ -91,6 +91,7 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
+    ElementTreeBuilder,
     IncrementalScrapePage,
     ScrapedPage,
     hash_element,
@@ -682,6 +683,22 @@ async def handle_sequential_click_for_dropdown(
     if dropdown_menu_element is None:
         return None
 
+    dropdown_select_context = await _get_input_or_select_context(
+        action=AbstractActionForContextParse(
+            reasoning=action.reasoning, intention=action.intention, element_id=action.element_id
+        ),
+        step=step,
+        scraped_page=scraped_page,
+    )
+
+    if dropdown_select_context.is_date_related:
+        LOG.info(
+            "The dropdown is date related, exiting the sequential click logic",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        return None
+
     LOG.info(
         "Found the dropdown menu element after clicking, triggering the sequential click logic",
         step_id=step.step_id,
@@ -692,8 +709,12 @@ async def handle_sequential_click_for_dropdown(
     return await select_from_emerging_elements(
         current_element_id=anchor_element.get_id(),
         options=CustomSelectPromptOptions(
-            field_information=action.intention if action.intention else action.reasoning,
-        ),  # FIXME: need a better options data
+            field_information=dropdown_select_context.intention
+            if dropdown_select_context.intention
+            else dropdown_select_context.field,
+            is_date_related=dropdown_select_context.is_date_related,
+            required_field=dropdown_select_context.is_required,
+        ),
         page=page,
         scraped_page=scraped_page,
         step=step,
@@ -1038,7 +1059,7 @@ async def handle_input_text_action(
             skyvern_element = blocking_element
     except Exception:
         LOG.info(
-            "Failed to find the blocking element, continue with the orignal element",
+            "Failed to find the blocking element, continue with the original element",
             exc_info=True,
             task_id=task.task_id,
             step_id=step.step_id,
@@ -1270,9 +1291,9 @@ async def handle_select_option_action(
 
     if not await skyvern_element.is_selectable():
         # 1. find from children
-        # TODO: 2. find from siblings and their chidren
+        # TODO: 2. find from siblings and their children
         LOG.info(
-            "Element is not selectable, try to find the selectable element in the chidren",
+            "Element is not selectable, try to find the selectable element in the children",
             tag_name=tag_name,
             action=action,
         )
@@ -1282,7 +1303,7 @@ async def handle_select_option_action(
             selectable_child = await skyvern_element.find_selectable_child(dom=dom)
         except Exception as e:
             LOG.error(
-                "Failed to find selectable element in chidren",
+                "Failed to find selectable element in children",
                 exc_info=True,
                 tag_name=tag_name,
                 action=action,
@@ -1327,15 +1348,19 @@ async def handle_select_option_action(
             blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
         except Exception:
             LOG.warning(
-                "Failed to find the blocking element, continue to select on the orignal <select>",
+                "Failed to find the blocking element, continue to select on the original <select>",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 exc_info=True,
             )
-            return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
+            return await normal_select(
+                action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
+            )
 
         if not exist:
-            return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
+            return await normal_select(
+                action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
+            )
 
         if blocking_element is None:
             LOG.info(
@@ -1353,11 +1378,13 @@ async def handle_select_option_action(
                     exc_info=True,
                 )
                 return await normal_select(
-                    action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step
+                    action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
                 )
 
         if not exist or blocking_element is None:
-            return await normal_select(action=action, skyvern_element=skyvern_element, dom=dom, task=task, step=step)
+            return await normal_select(
+                action=action, skyvern_element=skyvern_element, builder=dom.scraped_page, task=task, step=step
+            )
         LOG.info(
             "<select> is blocked by another element, going to select on the blocking element",
             task_id=task.task_id,
@@ -1929,10 +1956,10 @@ async def chain_click(
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="for", msg=str(e))))
 
             try:
-                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # sometimes the element is the direct children of the label, instead of using for="xx" attribute
                 # since it's a click action, the target element we're searching should only be INPUT
                 LOG.info(
-                    "Chain click: it's a label element. going to check for input of the direct chidren",
+                    "Chain click: it's a label element. going to check for input of the direct children",
                     task_id=task.task_id,
                     action=action,
                     element=str(skyvern_element),
@@ -1966,7 +1993,7 @@ async def chain_click(
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="attr_id", msg=str(e))))
 
             try:
-                # sometimes the element is the direct chidren of the label, instead of using for="xx" attribute
+                # sometimes the element is the direct children of the label, instead of using for="xx" attribute
                 # so we check the direct parent if it's a label element
                 LOG.info(
                     "Chain click: it's a non-label element. going to find the bound label element by direct parent",
@@ -2237,10 +2264,10 @@ async def input_or_auto_complete_input(
         element_id=skyvern_element.get_id(),
     )
 
-    # 1. press the orignal text to see if there's a match
+    # 1. press the original text to see if there's a match
     # 2. call LLM to find 5 potential values based on the orginal text
     # 3. try each potential values from #2
-    # 4. call LLM to tweak the orignal text according to the information from #3, then start #1 again
+    # 4. call LLM to tweak the original text according to the information from #3, then start #1 again
 
     # FIXME: try the whole loop for once now, to speed up skyvern
     MAX_AUTO_COMPLETE_ATTEMP = 1
@@ -2419,10 +2446,11 @@ async def sequentially_select_from_dropdown(
         )
         return None
 
-    # TODO: only suport the third-level dropdown selection now
-    MAX_SELECT_DEPTH = 3
+    # TODO: only support the third-level dropdown selection now, but for date picker, we need to support more levels as it will move the month, year, etc.
+    MAX_SELECT_DEPTH = 5 if input_or_select_context.is_date_related else 3
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
+    single_select_result: CustomSingleSelectResult | None = None
 
     check_filter_funcs: list[CheckFilterOutElementIDFunc] = [check_existed_but_not_option_element_in_dom_factory(dom)]
     for i in range(MAX_SELECT_DEPTH):
@@ -2444,39 +2472,6 @@ async def sequentially_select_from_dropdown(
         values.append(single_select_result.value)
         # wait 1s until DOM finished updating
         await asyncio.sleep(1)
-
-        # HACK: if agent took mini actions 2 times, stop executing the rest actions
-        # this is a hack to fix some date picker issues.
-        if input_or_select_context.is_date_related and i >= 1:
-            if skyvern_element.get_tag_name() == InteractiveElement.INPUT and action.option.label:
-                try:
-                    LOG.info(
-                        "Try to input the date directly",
-                        step_id=step.step_id,
-                        task_id=task.task_id,
-                    )
-                    await skyvern_element.input_sequentially(action.option.label)
-                    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
-                    result.action_result = ActionSuccess()
-                    return result
-
-                except Exception:
-                    LOG.warning(
-                        "Failed to input the date directly",
-                        exc_info=True,
-                        step_id=step.step_id,
-                        task_id=task.task_id,
-                    )
-
-            if single_select_result.action_result:
-                LOG.warning(
-                    "It's a date picker, going to skip reamaining actions",
-                    depth=i,
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                )
-                single_select_result.action_result.skip_remaining_actions = True
-                break
 
         if await single_select_result.is_done():
             return single_select_result
@@ -2560,6 +2555,31 @@ async def sequentially_select_from_dropdown(
         if json_response.get("is_mini_goal_finished", False):
             LOG.info("The user has finished the selection for the current opened dropdown", step_id=step.step_id)
             return single_select_result
+    else:
+        if input_or_select_context.is_date_related:
+            if skyvern_element.get_tag_name() == InteractiveElement.INPUT and action.option.label:
+                try:
+                    LOG.info(
+                        "Try to input the date directly",
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
+                    await skyvern_element.input_sequentially(action.option.label)
+                    result = CustomSingleSelectResult(skyvern_frame=skyvern_frame)
+                    result.action_result = ActionSuccess()
+                    return result
+
+                except Exception:
+                    LOG.warning(
+                        "Failed to input the date directly",
+                        exc_info=True,
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
+
+            if single_select_result and single_select_result.action_result:
+                single_select_result.action_result.skip_remaining_actions = True
+                return single_select_result
 
     return select_history[-1] if len(select_history) > 0 else None
 
@@ -2620,7 +2640,7 @@ async def select_from_emerging_elements(
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
 
     prompt = load_prompt_with_elements(
-        scraped_page=scraped_page_after_open,
+        element_tree_builder=scraped_page_after_open,
         prompt_engine=prompt_engine,
         template_name="custom-select",
         is_date_related=options.is_date_related,
@@ -2696,7 +2716,7 @@ async def select_from_dropdown(
 ) -> CustomSingleSelectResult:
     """
     force_select: is used to choose an element to click even there's no dropdown menu;
-    targe_value: only valid when force_select is "False". When target_value is not empty, the matched option must be relevent to target value;
+    targe_value: only valid when force_select is "False". When target_value is not empty, the matched option must be relevant to target value;
     None will be only returned when:
         1. force_select is false and no dropdown menu popped
         2. force_select is false and match value is not relevant to the target value
@@ -2739,8 +2759,8 @@ async def select_from_dropdown(
     trimmed_element_tree = await incremental_scraped.get_incremental_element_tree(
         clean_and_remove_element_tree_factory(task=task, step=step, check_filter_funcs=check_filter_funcs),
     )
-
-    html = incremental_scraped.build_html_tree(element_tree=trimmed_element_tree)
+    incremental_scraped.set_element_tree_trimmed(trimmed_element_tree)
+    html = incremental_scraped.build_element_tree(html_need_skyvern_attrs=True)
 
     skyvern_context = ensure_context()
     prompt = prompt_engine.load_prompt(
@@ -2817,6 +2837,21 @@ async def select_from_dropdown(
 
     try:
         selected_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
+        # TODO Some popup dropdowns include <select> element, we only handle the <select> element now, to prevent infinite recursion. Need to support more types of dropdowns.
+        if selected_element.get_tag_name() == InteractiveElement.SELECT and value:
+            await selected_element.scroll_into_view()
+            action = SelectOptionAction(
+                reasoning=select_reason,
+                element_id=element_id,
+                option=SelectOption(label=value),
+            )
+            results = await normal_select(
+                action=action, skyvern_element=selected_element, task=task, step=step, builder=incremental_scraped
+            )
+            assert len(results) > 0
+            single_select_result.action_result = results[0]
+            return single_select_result
+
         if await selected_element.get_attr("role") == "listbox":
             single_select_result.action_result = ActionFailure(
                 exception=InteractWithDropdownContainer(element_id=element_id)
@@ -2834,7 +2869,7 @@ async def select_from_dropdown(
     # sometimes we have multiple elements pointed to the same value,
     # but only one option is clickable on the page
     LOG.debug(
-        "Searching option with the same value in incremetal elements",
+        "Searching option with the same value in incremental elements",
         value=value,
         elements=incremental_scraped.element_tree,
     )
@@ -3070,7 +3105,7 @@ async def try_to_find_potential_scrollable_element(
     """
     check any <ul> or <role="listbox"> element in the chidlren.
     if yes, return the found element,
-    eles, return the orginal one
+    else, return the orginal one
     """
     found_element_id = await skyvern_element.find_children_element_id_by_callback(
         cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
@@ -3087,7 +3122,7 @@ async def try_to_find_potential_scrollable_element(
             skyvern_element = await SkyvernElement.create_from_incremental(incremental_scraped, found_element_id)
         except Exception:
             LOG.debug(
-                "Failed to get head element by found element id, use the orignal element id",
+                "Failed to get head element by found element id, use the original element id",
                 element_id=found_element_id,
                 step_id=step.step_id,
                 task_id=task.task_id,
@@ -3138,7 +3173,7 @@ async def scroll_down_to_load_all_options(
             # wait until animation ends, otherwise the scroll operation could be overwritten
             await asyncio.sleep(2)
 
-        # scoll a little back and scoll down to trigger the loading
+        # scroll a little back and scroll down to trigger the loading
         await page.mouse.wheel(0, -1e-5)
         await page.mouse.wheel(0, 1e-5)
         # wait for while to load new options
@@ -3161,7 +3196,7 @@ async def scroll_down_to_load_all_options(
     else:
         LOG.warning("Timeout to load all options, maybe some options will be missed")
 
-    # scoll back to the start point and wait for a while to make all options invisible on the page
+    # scroll back to the start point and wait for a while to make all options invisible on the page
     if dropdown_menu_element_handle is None:
         LOG.info("element handle is None, using mouse to scroll back", element_id=scrollable_element.get_id())
         await page.mouse.wheel(0, -scroll_pace)
@@ -3173,9 +3208,9 @@ async def scroll_down_to_load_all_options(
 async def normal_select(
     action: actions.SelectOptionAction,
     skyvern_element: SkyvernElement,
-    dom: DomUtil,
     task: Task,
     step: Step,
+    builder: ElementTreeBuilder,
 ) -> List[ActionResult]:
     try:
         current_text = await skyvern_element.get_attr("selected")
@@ -3189,7 +3224,7 @@ async def normal_select(
     locator = skyvern_element.get_locator()
 
     prompt = load_prompt_with_elements(
-        scraped_page=dom.scraped_page,
+        element_tree_builder=builder,
         prompt_engine=prompt_engine,
         template_name="parse-input-or-select-context",
         action_reasoning=action.reasoning,
@@ -3362,7 +3397,7 @@ async def extract_information_for_navigation_goal(
     scraped_page_refreshed = await scraped_page.refresh()
     context = ensure_context()
     extract_information_prompt = load_prompt_with_elements(
-        scraped_page=scraped_page_refreshed,
+        element_tree_builder=scraped_page_refreshed,
         prompt_engine=prompt_engine,
         template_name="extract-information",
         html_need_skyvern_attrs=False,
@@ -3401,7 +3436,9 @@ async def click_listbox_option(
     action: actions.SelectOptionAction,
     listbox_element_id: str,
 ) -> bool:
-    listbox_element = scraped_page.id_to_element_dict[listbox_element_id]
+    listbox_element = scraped_page.id_to_element_dict.get(listbox_element_id)
+    if listbox_element is None:
+        return False
     # this is a listbox element, get all the children
     if "children" not in listbox_element:
         return False
@@ -3540,11 +3577,17 @@ async def _get_verification_code_from_db(
     return None
 
 
+class AbstractActionForContextParse(BaseModel):
+    reasoning: str | None
+    element_id: str
+    intention: str | None
+
+
 async def _get_input_or_select_context(
-    action: InputTextAction | SelectOptionAction, scraped_page: ScrapedPage, step: Step
+    action: InputTextAction | SelectOptionAction | AbstractActionForContextParse, scraped_page: ScrapedPage, step: Step
 ) -> InputOrSelectContext:
     prompt = load_prompt_with_elements(
-        scraped_page=scraped_page,
+        element_tree_builder=scraped_page,
         prompt_engine=prompt_engine,
         template_name="parse-input-or-select-context",
         action_reasoning=action.reasoning,

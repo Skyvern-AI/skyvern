@@ -15,6 +15,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -680,6 +681,60 @@ async def delete_workflow(
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
+
+
+@legacy_base_router.post(
+    "/utilities/curl-to-http",
+    tags=["Utilities"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "utilities",
+        "x-fern-sdk-method-name": "convert_curl_to_http",
+    },
+    description="Convert a curl command to HTTP request parameters",
+    summary="Convert curl to HTTP parameters",
+    responses={
+        200: {"description": "Successfully converted curl command"},
+        400: {"description": "Invalid curl command"},
+    },
+)
+@legacy_base_router.post("/utilities/curl-to-http/", include_in_schema=False)
+async def convert_curl_to_http(
+    request: dict[str, str],
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, Any]:
+    """
+    Convert a curl command to HTTP request parameters.
+
+    This endpoint is useful for converting curl commands to the format
+    needed by the HTTP Request workflow block.
+
+    Request body should contain:
+    - curl_command: The curl command string to convert
+
+    Returns:
+    - method: HTTP method
+    - url: The URL
+    - headers: Dict of headers
+    - body: Request body as dict
+    - timeout: Default timeout
+    - follow_redirects: Default follow redirects setting
+    """
+    curl_command = request.get("curl_command")
+    if not curl_command:
+        raise HTTPException(status_code=400, detail="curl_command is required in the request body")
+
+    try:
+        result = curl_to_http_request_block_params(curl_command)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        LOG.error(
+            "Failed to convert curl command",
+            error=str(e),
+            organization_id=current_org.organization_id,
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to convert curl command: {str(e)}")
 
 
 @base_router.get(

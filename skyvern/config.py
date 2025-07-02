@@ -275,8 +275,13 @@ class Settings(BaseSettings):
 
     SKYVERN_BROWSER_VNC_PORT: int = 6080
     """
-    The websockified port on which the VNC server of a persistent browser is 
+    The websockified port on which the VNC server of a persistent browser is
     listening.
+    """
+
+    PYLON_IDENTITY_VERIFICATION_SECRET: str | None = None
+    """
+    The secret used to sign the email/identity of the user.
     """
 
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
@@ -287,9 +292,9 @@ class Settings(BaseSettings):
 
         if self.is_cloud_environment():
             return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO_PREVIEW", "label": "Gemini 2.5 Pro"},
+                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
                 "gemini-2.5-flash-preview-05-20": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
@@ -306,9 +311,9 @@ class Settings(BaseSettings):
         else:
             # TODO: apparently the list for OSS is to be much larger
             return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO_PREVIEW", "label": "Gemini 2.5 Pro"},
+                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
                 "gemini-2.5-flash-preview-05-20": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},

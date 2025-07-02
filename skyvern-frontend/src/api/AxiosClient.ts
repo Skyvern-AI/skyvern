@@ -1,8 +1,13 @@
 import { apiBaseUrl, artifactApiBaseUrl, envCredential } from "@/util/env";
 import axios from "axios";
 
+type ApiVersion = "sans-api-v1" | "v1" | "v2";
+
 const apiV1BaseUrl = apiBaseUrl;
 const apiV2BaseUrl = apiBaseUrl.replace("v1", "v2");
+const url = new URL(apiBaseUrl);
+const pathname = url.pathname.replace("/api", "");
+const apiSansApiV1BaseUrl = `${url.origin}${pathname}`;
 
 const client = axios.create({
   baseURL: apiV1BaseUrl,
@@ -14,6 +19,14 @@ const client = axios.create({
 
 const v2Client = axios.create({
   baseURL: apiV2BaseUrl,
+  headers: {
+    "Content-Type": "application/json",
+    "x-api-key": envCredential,
+  },
+});
+
+const clientSansApiV1 = axios.create({
+  baseURL: apiSansApiV1BaseUrl,
   headers: {
     "Content-Type": "application/json",
     "x-api-key": envCredential,
@@ -52,18 +65,36 @@ export function removeApiKeyHeader() {
 
 async function getClient(
   credentialGetter: CredentialGetter | null,
-  version: string = "v1",
+  version: ApiVersion = "v1",
 ) {
+  const get = () => {
+    switch (version) {
+      case "sans-api-v1":
+        return clientSansApiV1;
+      case "v1":
+        return client;
+      case "v2":
+        return v2Client;
+      default: {
+        throw new Error(`Unknown version: ${version}`);
+      }
+    }
+  };
+
   if (credentialGetter) {
     removeApiKeyHeader();
+
     const credential = await credentialGetter();
+
     if (!credential) {
       console.warn("No credential found");
-      return version === "v1" ? client : v2Client;
+      return get();
     }
+
     setAuthorizationHeader(credential);
   }
-  return version === "v1" ? client : v2Client;
+
+  return get();
 }
 
 export type CredentialGetter = () => Promise<string | null>;
