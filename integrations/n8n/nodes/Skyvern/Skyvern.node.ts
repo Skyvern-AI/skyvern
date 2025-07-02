@@ -122,7 +122,7 @@ export class Skyvern implements INodeType {
                             request: {
                                 baseURL: '={{$credentials.baseUrl}}',
                                 method: 'GET',
-                                url: '/v1/run/tasks',
+                                url: '={{"/v1/runs/" + $parameter["taskId"]}}',
                             },
                         },
                     },
@@ -140,6 +140,7 @@ export class Skyvern implements INodeType {
                             request: {
                                 baseURL: '={{$credentials.baseUrl}}',
                                 method: 'GET',
+                                url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/runs/" + $parameter["workflowRunId"]}}',
                             },
                         },
                     },
