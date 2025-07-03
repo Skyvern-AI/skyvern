@@ -176,7 +176,7 @@ class WorkflowService:
             organization_id=workflow.organization_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
-            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
         )
         context: skyvern_context.SkyvernContext | None = skyvern_context.current()
         current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
@@ -190,7 +190,7 @@ class WorkflowService:
                 run_id=current_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 max_steps_override=max_steps_override,
-                max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
+                max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
             )
         )
 
@@ -788,7 +788,7 @@ class WorkflowService:
             totp_verification_url=workflow_request.totp_verification_url,
             totp_identifier=workflow_request.totp_identifier,
             parent_workflow_run_id=parent_workflow_run_id,
-            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolling_times,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             extra_http_headers=workflow_request.extra_http_headers,
         )
 
@@ -1204,7 +1204,7 @@ class WorkflowService:
             total_steps=total_steps,
             total_cost=total_cost,
             workflow_title=workflow.title,
-            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
+            max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         )
 
     async def clean_up_workflow(
@@ -1478,7 +1478,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
-                    max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
@@ -1497,7 +1497,7 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
-                    max_screenshot_scrolling_times=request.max_screenshot_scrolling_times,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
@@ -2114,7 +2114,7 @@ class WorkflowService:
             ),
             proxy_location=proxy_location,
             status=status,
-            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            max_screenshot_scrolls=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(

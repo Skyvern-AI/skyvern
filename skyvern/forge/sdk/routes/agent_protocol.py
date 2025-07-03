@@ -167,7 +167,7 @@ async def run_task(
             totp_identifier=run_request.totp_identifier,
             include_action_history_in_verification=run_request.include_action_history_in_verification,
             model=run_request.model,
-            max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+            max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             extra_http_headers=run_request.extra_http_headers,
         )
         task_v1_response = await task_v1_service.run_task(
@@ -206,7 +206,7 @@ async def run_task(
                 data_extraction_schema=task_v1_response.extracted_information_schema,
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
-                max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+                max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
     if run_request.engine == RunEngine.skyvern_v2:
@@ -225,7 +225,7 @@ async def run_task(
                 error_code_mapping=run_request.error_code_mapping,
                 create_task_run=True,
                 model=run_request.model,
-                max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+                max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
                 extra_http_headers=run_request.extra_http_headers,
             )
         except MissingBrowserAddressError as e:
@@ -269,7 +269,7 @@ async def run_task(
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
-                max_screenshot_scrolling_times=run_request.max_screenshot_scrolling_times,
+                max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
     LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
@@ -325,7 +325,7 @@ async def run_workflow(
         totp_identifier=workflow_run_request.totp_identifier,
         totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
-        max_screenshot_scrolling_times=workflow_run_request.max_screenshot_scrolling_times,
+        max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
     )
 
@@ -1878,7 +1878,7 @@ async def run_task_v2(
             create_task_run=True,
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
-            max_screenshot_scrolling_times=data.max_screenshot_scrolling_times,
+            max_screenshot_scrolling_times=data.max_screenshot_scrolls,
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
         )
