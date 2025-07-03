@@ -60,7 +60,7 @@ function WorkflowEditor() {
     proxyLocation: workflow.proxy_location,
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
-    maxScreenshotScrollingTimes: workflow.max_screenshot_scrolling_times,
+    maxScreenshotScrolls: workflow.max_screenshot_scrolls,
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
