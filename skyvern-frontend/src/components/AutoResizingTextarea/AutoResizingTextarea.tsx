@@ -64,7 +64,7 @@ const AutoResizingTextarea = forwardRef<HTMLTextAreaElement, Props>(
       }
       textareaElement.style.height = "auto";
       textareaElement.style.height = `${textareaElement.scrollHeight + 2}px`;
-    }, [getTextarea]);
+    }, [getTextarea, value]);
 
     return (
       <Textarea
