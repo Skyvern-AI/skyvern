@@ -97,7 +97,7 @@ async def get_workflow_run_response(
             webhook_url=workflow_run.webhook_callback_url or None,
             totp_url=workflow_run.totp_verification_url or None,
             totp_identifier=workflow_run.totp_identifier,
-            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
+            max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             # TODO: add browser session id
         ),
     )

@@ -19,7 +19,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
-    DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES,
+    DEFAULT_MAX_SCREENSHOT_SCROLLS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -183,7 +183,7 @@ class ForgeAgent:
             error_code_mapping=task_block.error_code_mapping,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
             model=task_block.model,
-            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
+            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             extra_http_headers=workflow_run.extra_http_headers,
         )
         LOG.info(
@@ -241,7 +241,7 @@ class ForgeAgent:
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
-            max_screenshot_scrolling_times=task_request.max_screenshot_scrolling_times,
+            max_screenshot_scrolling_times=task_request.max_screenshot_scrolls,
             extra_http_headers=task_request.extra_http_headers,
         )
         LOG.info(
@@ -1662,9 +1662,9 @@ class ForgeAgent:
             raise BrowserStateMissingPage()
 
         context = skyvern_context.ensure_context()
-        scrolling_number = context.max_screenshot_scrolling_times
+        scrolling_number = context.max_screenshot_scrolls
         if scrolling_number is None:
-            scrolling_number = DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES
+            scrolling_number = DEFAULT_MAX_SCREENSHOT_SCROLLS
 
         if engine in CUA_ENGINES:
             scrolling_number = 0

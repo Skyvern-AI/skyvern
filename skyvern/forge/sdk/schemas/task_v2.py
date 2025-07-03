@@ -48,7 +48,7 @@ class TaskV2(BaseModel):
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
-    max_screenshot_scrolling_times: int | None = None
+    max_screenshot_scrolls: int | None = Field(default=None, alias="max_screenshot_scrolling_times")
     extra_http_headers: dict[str, str] | None = None
 
     created_at: datetime
@@ -150,7 +150,7 @@ class TaskV2Request(BaseModel):
     publish_workflow: bool = False
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
-    max_screenshot_scrolling_times: int | None = None
+    max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")

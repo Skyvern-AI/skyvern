@@ -22,7 +22,7 @@ class WorkflowRequestBody(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     browser_session_id: str | None = None
-    max_screenshot_scrolling_times: int | None = None
+    max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
@@ -78,7 +78,7 @@ class Workflow(BaseModel):
     persist_browser_session: bool = False
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
-    max_screenshot_scrolling_times: int | None = None
+    max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
 
     created_at: datetime
@@ -120,7 +120,7 @@ class WorkflowRun(BaseModel):
     failure_reason: str | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
-    max_screenshot_scrolling_times: int | None = None
+    max_screenshot_scrolls: int | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -169,4 +169,4 @@ class WorkflowRunResponseBase(BaseModel):
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
     browser_session_id: str | None = None
-    max_screenshot_scrolling_times: int | None = None
+    max_screenshot_scrolls: int | None = None

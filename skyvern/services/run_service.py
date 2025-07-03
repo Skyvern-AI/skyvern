@@ -67,7 +67,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
                 max_steps=task_v1_response.max_steps_per_run,
                 data_extraction_schema=task_v1_response.request.extracted_information_schema,
                 error_code_mapping=task_v1_response.request.error_code_mapping,
-                max_screenshot_scrolling_times=task_v1_response.request.max_screenshot_scrolling_times,
+                max_screenshot_scrolls=task_v1_response.request.max_screenshot_scrolls,
             ),
         )
     elif run.task_run_type == RunType.task_v2:
