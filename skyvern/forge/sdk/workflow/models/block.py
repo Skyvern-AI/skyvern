@@ -2522,7 +2522,7 @@ class TaskV2Block(Block):
                 proxy_location=workflow_run.proxy_location,
                 totp_identifier=self.totp_identifier,
                 totp_verification_url=self.totp_verification_url,
-                max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
+                max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             )
             await app.DATABASE.update_task_v2(
                 task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
@@ -2557,7 +2557,7 @@ class TaskV2Block(Block):
                     workflow_run_id=workflow_run_id,
                     run_id=current_run_id,
                     browser_session_id=browser_session_id,
-                    max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
+                    max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
                 )
             )
         result_dict = None

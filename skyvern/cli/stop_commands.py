@@ -63,6 +63,48 @@ def kill_pids(pids: List[int], service_name: str) -> bool:
     return killed_any
 
 
+@stop_app.command(name="all")
+def stop_all() -> None:
+    """Stop all Skyvern services running on ports 8000, 8080, and 9090."""
+    console.print(Panel("[bold red]Stopping All Skyvern Services...[/bold red]", border_style="red"))
+
+    # Stop processes on port 8000 (API server)
+    pids_8000 = get_pids_on_port(8000)
+    killed_8000 = kill_pids(pids_8000, "Skyvern API server (port 8000)")
+
+    # Stop processes on port 8080 (UI server)
+    pids_8080 = get_pids_on_port(8080)
+    killed_8080 = kill_pids(pids_8080, "Skyvern UI server (port 8080)")
+
+    # Stop processes on port 9090 (UI server)
+    pids_9090 = get_pids_on_port(9090)
+    killed_9090 = kill_pids(pids_9090, "Skyvern UI server (port 9090)")
+
+    if killed_8000 or killed_8080 or killed_9090:
+        console.print("[green]🛑 All Skyvern services stopped successfully.[/green]")
+    else:
+        console.print("[yellow]No Skyvern services found running on ports 8000, 8080, or 9090.[/yellow]")
+
+
+@stop_app.command(name="ui")
+def stop_ui() -> None:
+    """Stop the Skyvern UI servers running on ports 8080 and 9090."""
+    console.print(Panel("[bold red]Stopping Skyvern UI Servers...[/bold red]", border_style="red"))
+
+    # Stop processes on port 8080
+    pids_8080 = get_pids_on_port(8080)
+    killed_8080 = kill_pids(pids_8080, "Skyvern UI server (port 8080)")
+
+    # Stop processes on port 9090
+    pids_9090 = get_pids_on_port(9090)
+    killed_9090 = kill_pids(pids_9090, "Skyvern UI server (port 9090)")
+
+    if killed_8080 or killed_9090:
+        console.print("[green]🛑 Skyvern UI servers stopped successfully.[/green]")
+    else:
+        console.print("[yellow]No Skyvern UI servers found running on ports 8080 or 9090.[/yellow]")
+
+
 @stop_app.command(name="server")
 def stop_server(port: int = typer.Option(8000, "--port", "-p", help="Port number for the Skyvern API server")) -> None:
     """Stop the Skyvern API server running on the specified port (default: 8000)."""

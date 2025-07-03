@@ -289,9 +289,9 @@ class TaskRunRequest(BaseModel):
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
     )
-    max_screenshot_scrolling_times: int | None = Field(
+    max_screenshot_scrolls: int | None = Field(
         default=None,
-        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+        description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
 
     @field_validator("url", "webhook_url", "totp_url")
@@ -340,9 +340,9 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
-    max_screenshot_scrolling_times: int | None = Field(
+    max_screenshot_scrolls: int | None = Field(
         default=None,
-        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+        description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
     extra_http_headers: dict[str, str] | None = Field(
         default=None,
@@ -392,9 +392,9 @@ class BaseRunResponse(BaseModel):
     browser_session_id: str | None = Field(
         default=None, description="ID of the Skyvern persistent browser session used for this run", examples=["pbs_123"]
     )
-    max_screenshot_scrolling_times: int | None = Field(
+    max_screenshot_scrolls: int | None = Field(
         default=None,
-        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's NONE or 0, it takes the current view point screenshot.",
+        description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot",
     )
 
 

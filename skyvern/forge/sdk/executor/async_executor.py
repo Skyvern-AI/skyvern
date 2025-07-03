@@ -108,7 +108,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.run_id = context.run_id or task.task_id
         context.organization_id = organization_id
         context.max_steps_override = max_steps_override
-        context.max_screenshot_scrolling_times = task.max_screenshot_scrolling_times
+        context.max_screenshot_scrolls = task.max_screenshot_scrolls
 
         if background_tasks:
             await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)
