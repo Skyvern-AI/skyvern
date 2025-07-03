@@ -68,7 +68,7 @@ export class Skyvern implements INodeType {
             // Task Operations
             {
                 displayName: 'Operation',
-                name: 'operation',
+                name: 'taskOperation',
                 type: 'options',
                 noDataExpression: true,
                 required: true,
@@ -126,7 +126,7 @@ export class Skyvern implements INodeType {
             // Workflow Operations
             {
                 displayName: 'Operation',
-                name: 'operation',
+                name: 'workflowOperation',
                 type: 'options',
                 noDataExpression: true,
                 required: true,
@@ -175,7 +175,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        taskOperation: ['dispatchTask'],
                     },
                 },
                 routing: {
@@ -196,7 +196,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        taskOperation: ['dispatchTask'],
                     },
                 },
                 routing: {
@@ -217,7 +217,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        taskOperation: ['dispatchTask'],
                     },
                 },
                 routing: {
@@ -238,7 +238,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['getTask'],
+                        taskOperation: ['getTask'],
                     },
                 },
                 routing: {
@@ -312,7 +312,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['task'],
-                        operation: ['dispatchTask'],
+                        taskOperation: ['dispatchTask'],
                     },
                 },
             },
@@ -343,7 +343,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['getWorkflow'],
+                        workflowOperation: ['getWorkflow'],
                     },
                 },
                 routing: {
@@ -366,7 +366,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatchWorkflow'],
+                        workflowOperation: ['dispatchWorkflow'],
                     },
                 },
                 typeOptions: {
@@ -400,7 +400,7 @@ export class Skyvern implements INodeType {
                 displayOptions: {
                     show: {
                         resource: ['workflow'],
-                        operation: ['dispatchWorkflow'],
+                        workflowOperation: ['dispatchWorkflow'],
                     },
                 },
                 routing: {
@@ -438,7 +438,7 @@ export class Skyvern implements INodeType {
                 const resource = this.getCurrentNodeParameter('resource') as string;
                 if (resource !== 'workflow') return { fields: [] };
 
-                const operation = this.getCurrentNodeParameter('operation') as string;
+                const operation = this.getCurrentNodeParameter('workflowOperation') as string;
                 if (operation !== 'dispatchWorkflow') return { fields: [] };
 
                 const workflowId = this.getCurrentNodeParameter('workflowId') as string;
