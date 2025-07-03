@@ -45,7 +45,7 @@ import {
 } from "../data/sampleTaskData";
 import { ExampleCasePill } from "./ExampleCasePill";
 import {
-  MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT,
+  MAX_SCREENSHOT_SCROLLS_DEFAULT,
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 
@@ -158,8 +158,9 @@ function PromptBox() {
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
-  const [maxScreenshotScrollingTimes, setMaxScreenshotScrollingTimes] =
-    useState<string | null>(null);
+  const [maxScreenshotScrolls, setMaxScreenshotScrolls] = useState<
+    string | null
+  >(null);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
@@ -176,7 +177,7 @@ function PromptBox() {
           browser_session_id: browserSessionId,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
-          max_screenshot_scrolling_times: maxScreenshotScrollingTimes,
+          max_screenshot_scrolls: maxScreenshotScrolls,
           extracted_information_schema: dataSchema
             ? (() => {
                 try {
@@ -498,16 +499,16 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Max Scrolling Screenshots</div>
+                      <div className="text-sm">Max Screenshot Scrolls</div>
                       <div className="text-xs text-slate-400">
-                        {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                        {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                       </div>
                     </div>
                     <Input
-                      value={maxScreenshotScrollingTimes ?? ""}
-                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                      value={maxScreenshotScrolls ?? ""}
+                      placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
                       onChange={(event) => {
-                        setMaxScreenshotScrollingTimes(event.target.value);
+                        setMaxScreenshotScrolls(event.target.value);
                       }}
                     />
                   </div>

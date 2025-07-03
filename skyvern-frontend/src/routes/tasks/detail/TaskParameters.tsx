@@ -7,7 +7,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
@@ -147,14 +147,14 @@ function TaskParameters() {
       </div>
       <div className="flex gap-16">
         <div className="w-72">
-          <h1 className="text-lg">Max Scrolling Screenshots</h1>
+          <h1 className="text-lg">Max Screenshot Scrolls</h1>
           <h2 className="text-base text-slate-400">
             The maximum number of times to scroll the page
           </h2>
         </div>
         <Input
-          placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
-          value={task.request.max_screenshot_scrolling_times ?? ""}
+          placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
+          value={task.request.max_screenshot_scrolls ?? ""}
           readOnly
         />
       </div>
