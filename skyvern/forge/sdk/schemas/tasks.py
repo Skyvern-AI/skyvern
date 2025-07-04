@@ -242,6 +242,7 @@ class Task(TaskBase):
     organization_id: str
     workflow_run_id: str | None = None
     workflow_permanent_id: str | None = None
+    browser_session_id: str | None = None
     order: int | None = None
     retry: int | None = None
     max_steps_per_run: int | None = None

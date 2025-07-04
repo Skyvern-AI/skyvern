@@ -1,6 +1,6 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import {
   Cross2Icon,
   PlusIcon,
@@ -232,10 +232,45 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
   const workflowPanelData = useWorkflowPanelStore(
     (state) => state.workflowPanelState.data,
   );
+  const workflowPanelActive = useWorkflowPanelStore(
+    (state) => state.workflowPanelState.active,
+  );
   const closeWorkflowPanel = useWorkflowPanelStore(
     (state) => state.closeWorkflowPanel,
   );
   const [search, setSearch] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    // Focus the input when the panel becomes active
+    if (workflowPanelActive && inputRef.current) {
+      // Use multiple approaches to ensure focus works
+      const focusInput = () => {
+        if (inputRef.current) {
+          inputRef.current.focus();
+          inputRef.current.select(); // Also select any existing text
+        }
+      };
+
+      // Try immediate focus
+      focusInput();
+
+      // Also try with a small delay for animations/transitions
+      const timeoutId = setTimeout(() => {
+        focusInput();
+      }, 100);
+
+      // And try with a longer delay as backup
+      const backupTimeoutId = setTimeout(() => {
+        focusInput();
+      }, 300);
+
+      return () => {
+        clearTimeout(timeoutId);
+        clearTimeout(backupTimeoutId);
+      };
+    }
+  }, [workflowPanelActive]);
 
   const filteredItems = nodeLibraryItems.filter((item) => {
     if (workflowPanelData?.disableLoop && item.nodeType === "loop") {
@@ -288,6 +323,9 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
             }}
             placeholder="Search blocks..."
             className="pl-9"
+            ref={inputRef}
+            autoFocus
+            tabIndex={0}
           />
         </div>
         <ScrollArea>
