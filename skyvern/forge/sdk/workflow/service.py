@@ -10,7 +10,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
-    BrowserSessionNotFound,
+    BlockNotFound,
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
@@ -252,6 +252,7 @@ class WorkflowService:
         workflow_run_id: str,
         api_key: str,
         organization: Organization,
+        block_labels: list[str] | None = None,
         browser_session_id: str | None = None,
     ) -> WorkflowRun:
         """Execute a workflow."""
@@ -326,8 +327,32 @@ class WorkflowService:
             )
             return workflow_run
 
+        all_blocks = workflow.workflow_definition.blocks
+
+        if block_labels and len(block_labels):
+            blocks: list[BlockTypeVar] = []
+            all_labels = {block.label: block for block in all_blocks}
+
+            for label in block_labels:
+                if label not in all_labels:
+                    raise BlockNotFound(block_label=label)
+
+                blocks.append(all_labels[label])
+
+            LOG.info(
+                "Executing workflow blocks via whitelist",
+                workflow_run_id=workflow_run.workflow_run_id,
+                block_cnt=len(blocks),
+                block_labels=block_labels,
+            )
+
+        else:
+            blocks = all_blocks
+
+        if not blocks:
+            raise SkyvernException(f"No blocks found for the given block labels: {block_labels}")
+
         # Execute workflow blocks
-        blocks = workflow.workflow_definition.blocks
         blocks_cnt = len(blocks)
         block_result = None
         for block_idx, block in enumerate(blocks):
@@ -780,15 +805,6 @@ class WorkflowService:
         organization_id: str,
         parent_workflow_run_id: str | None = None,
     ) -> WorkflowRun:
-        # validate the browser session id
-        if workflow_request.browser_session_id:
-            browser_session = await app.DATABASE.get_persistent_browser_session(
-                session_id=workflow_request.browser_session_id,
-                organization_id=organization_id,
-            )
-            if not browser_session:
-                raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
-
         return await app.DATABASE.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
