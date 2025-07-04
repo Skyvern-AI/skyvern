@@ -12,18 +12,18 @@ from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, Workflo
 LOG = structlog.get_logger(__name__)
 
 
-async def run_workflow(
+async def prepare_workflow(
     workflow_id: str,
     organization: Organization,
     workflow_request: WorkflowRequestBody,  # this is the deprecated workflow request body
     template: bool = False,
     version: int | None = None,
     max_steps: int | None = None,
-    api_key: str | None = None,
     request_id: str | None = None,
-    request: Request | None = None,
-    background_tasks: BackgroundTasks | None = None,
 ) -> WorkflowRun:
+    """
+    Prepare a workflow to be run.
+    """
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
             raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_id)
@@ -37,19 +37,48 @@ async def run_workflow(
         max_steps_override=max_steps,
         is_template_workflow=template,
     )
+
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_id,
         organization_id=None if template else organization.organization_id,
         version=version,
     )
+
     await app.DATABASE.create_task_run(
         task_run_type=RunType.workflow_run,
         organization_id=organization.organization_id,
         run_id=workflow_run.workflow_run_id,
         title=workflow.title,
     )
+
     if max_steps:
         LOG.info("Overriding max steps per run", max_steps_override=max_steps)
+
+    return workflow_run
+
+
+async def run_workflow(
+    workflow_id: str,
+    organization: Organization,
+    workflow_request: WorkflowRequestBody,  # this is the deprecated workflow request body
+    template: bool = False,
+    version: int | None = None,
+    max_steps: int | None = None,
+    api_key: str | None = None,
+    request_id: str | None = None,
+    request: Request | None = None,
+    background_tasks: BackgroundTasks | None = None,
+) -> WorkflowRun:
+    workflow_run = await prepare_workflow(
+        workflow_id=workflow_id,
+        organization=organization,
+        workflow_request=workflow_request,
+        template=template,
+        version=version,
+        max_steps=max_steps,
+        request_id=request_id,
+    )
+
     await AsyncExecutorFactory.get_executor().execute_workflow(
         request=request,
         background_tasks=background_tasks,
@@ -60,6 +89,7 @@ async def run_workflow(
         browser_session_id=workflow_request.browser_session_id,
         api_key=api_key,
     )
+
     return workflow_run
 
 
