@@ -10,6 +10,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
+    BrowserSessionNotFound,
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
@@ -779,10 +780,20 @@ class WorkflowService:
         organization_id: str,
         parent_workflow_run_id: str | None = None,
     ) -> WorkflowRun:
+        # validate the browser session id
+        if workflow_request.browser_session_id:
+            browser_session = await app.DATABASE.get_persistent_browser_session(
+                session_id=workflow_request.browser_session_id,
+                organization_id=organization_id,
+            )
+            if not browser_session:
+                raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
+
         return await app.DATABASE.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
             organization_id=organization_id,
+            browser_session_id=workflow_request.browser_session_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
