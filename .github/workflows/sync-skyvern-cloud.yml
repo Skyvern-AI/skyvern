@@ -20,7 +20,7 @@ jobs:
       - name: Determine Git credentials
         id: git-creds
         run: |
-          case "${{ github.event.comment.user.login }}" in
+          case "${{ github.event.pull_request.user.login }}" in
             wintonzheng)
               echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=shu@skyvern.com" >> $GITHUB_OUTPUT
@@ -47,7 +47,7 @@ jobs:
               echo "GIT_USERNAME=Prakash Maheshwaran" >> $GITHUB_OUTPUT
               ;;
             *)
-              echo "GH_PAT=${{ secrets.SKYVERN_OSS_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GH_PAT=${{ secrets.SKYVERN_CLOUD_GH_PAT }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=shu@skyvern.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=Shuchang Zheng" >> $GITHUB_OUTPUT
               ;;
