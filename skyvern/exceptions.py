@@ -715,3 +715,11 @@ class MissingBrowserSessionError(SkyvernHTTPException):
 class MissingBrowserAddressError(SkyvernException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(f"Browser session {browser_session_id} does not have an address.")
+
+
+class BrowserSessionNotFound(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} does not exist or is not live.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
