@@ -243,6 +243,7 @@ class ForgeAgent:
             model=task_request.model,
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolls,
             extra_http_headers=task_request.extra_http_headers,
+            browser_session_id=task_request.browser_session_id,
         )
         LOG.info(
             "Created new task",

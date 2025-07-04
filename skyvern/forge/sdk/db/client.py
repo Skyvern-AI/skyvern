@@ -151,6 +151,7 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_session_id: str | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -180,6 +181,7 @@ class AgentDB:
                     model=model,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
+                    browser_session_id=browser_session_id,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -1553,6 +1555,7 @@ class AgentDB:
         workflow_permanent_id: str,
         workflow_id: str,
         organization_id: str,
+        browser_session_id: str | None = None,
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
@@ -1567,6 +1570,7 @@ class AgentDB:
                     workflow_permanent_id=workflow_permanent_id,
                     workflow_id=workflow_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                     proxy_location=proxy_location,
                     status="created",
                     webhook_callback_url=webhook_callback_url,
