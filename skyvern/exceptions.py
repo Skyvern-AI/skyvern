@@ -128,6 +128,11 @@ class UnknownBlockType(SkyvernException):
         super().__init__(f"Unknown block type {block_type}")
 
 
+class BlockNotFound(SkyvernException):
+    def __init__(self, block_label: str) -> None:
+        super().__init__(f"Block {block_label} not found")
+
+
 class WorkflowNotFound(SkyvernHTTPException):
     def __init__(
         self,

@@ -1,3 +1,4 @@
+import asyncio
 from enum import Enum
 from typing import Annotated, Any
 
@@ -76,6 +77,8 @@ from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.runs import (
     CUA_ENGINES,
+    BlockRunRequest,
+    BlockRunResponse,
     RunEngine,
     RunResponse,
     RunType,
@@ -85,7 +88,7 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
 )
 from skyvern.schemas.workflows import WorkflowRequest
-from skyvern.services import run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -848,6 +851,57 @@ async def retry_run_webhook(
 ) -> None:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
     await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
+
+@base_router.post(
+    "/run/workflows/blocks",
+    include_in_schema=False,
+    response_model=BlockRunResponse,
+)
+async def run_block(
+    block_run_request: BlockRunRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> BlockRunResponse:
+    """
+    Kick off the execution of one or more blocks in a workflow. Returns the
+    workflow_run_id.
+    """
+
+    workflow_run = await block_service.ensure_workflow_run(
+        organization=organization,
+        template=template,
+        workflow_permanent_id=block_run_request.workflow_id,
+        workflow_run_request=block_run_request,
+    )
+
+    browser_session_id = block_run_request.browser_session_id
+
+    asyncio.create_task(
+        block_service.execute_blocks(
+            api_key=x_api_key or "",
+            block_labels=block_run_request.block_labels,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization=organization,
+            browser_session_id=browser_session_id,
+        )
+    )
+
+    return BlockRunResponse(
+        block_labels=block_run_request.block_labels,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        status=str(workflow_run.status),
+        output=None,
+        failure_reason=workflow_run.failure_reason,
+        created_at=workflow_run.created_at,
+        modified_at=workflow_run.modified_at,
+        run_request=block_run_request,
+        downloaded_files=None,
+        recording_url=None,
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+    )
 
 
 ################# Legacy Endpoints #################
