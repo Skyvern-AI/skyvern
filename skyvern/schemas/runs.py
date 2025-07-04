@@ -357,6 +357,13 @@ class WorkflowRunRequest(BaseModel):
         return validate_url(url)
 
 
+class BlockRunRequest(WorkflowRunRequest):
+    block_labels: list[str] = Field(
+        description="Labels of the blocks to execute",
+        examples=["block_1", "block_2"],
+    )
+
+
 class BaseRunResponse(BaseModel):
     run_id: str = Field(
         description="Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs.",
@@ -415,3 +422,7 @@ class WorkflowRunResponse(BaseRunResponse):
 
 
 RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discriminator="run_type")]
+
+
+class BlockRunResponse(WorkflowRunResponse):
+    block_labels: list[str] = Field(description="A whitelist of block labels; only these blocks will execute")
