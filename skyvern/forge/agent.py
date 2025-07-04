@@ -27,6 +27,7 @@ from skyvern.constants import (
     ScrapeType,
 )
 from skyvern.exceptions import (
+    BrowserSessionNotFound,
     BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
@@ -223,6 +224,15 @@ class ForgeAgent:
     async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
         webhook_callback_url = str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None
         totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
+        # validate browser session id
+        if task_request.browser_session_id:
+            browser_session = await app.DATABASE.get_persistent_browser_session(
+                session_id=task_request.browser_session_id,
+                organization_id=organization_id,
+            )
+            if not browser_session:
+                raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
+
         task = await app.DATABASE.create_task(
             url=str(task_request.url),
             title=task_request.title,
@@ -243,6 +253,7 @@ class ForgeAgent:
             model=task_request.model,
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolls,
             extra_http_headers=task_request.extra_http_headers,
+            browser_session_id=task_request.browser_session_id,
         )
         LOG.info(
             "Created new task",

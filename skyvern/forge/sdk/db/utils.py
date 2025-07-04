@@ -144,6 +144,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         started_at=task_obj.started_at,
         finished_at=task_obj.finished_at,
         max_screenshot_scrolls=task_obj.max_screenshot_scrolling_times,
+        browser_session_id=task_obj.browser_session_id,
     )
     return task
 
@@ -268,6 +269,7 @@ def convert_to_workflow_run(
         parent_workflow_run_id=workflow_run_model.parent_workflow_run_id,
         workflow_id=workflow_run_model.workflow_id,
         organization_id=workflow_run_model.organization_id,
+        browser_session_id=workflow_run_model.browser_session_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
         proxy_location=(
