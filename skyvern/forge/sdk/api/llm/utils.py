@@ -146,7 +146,16 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
         if add_assistant_prefix:
             content = "{" + content
 
-        return json_repair.loads(content)
+        parsed_result = json_repair.loads(content)
+        # Ensure the result is a dictionary
+        if not isinstance(parsed_result, dict):
+            LOG.warning(
+                "LLM response parsed to non-dictionary type",
+                parsed_result=parsed_result,
+                result_type=type(parsed_result).__name__,
+            )
+            return {}
+        return parsed_result
 
     except Exception:
         LOG.warning(
@@ -157,7 +166,16 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
             if not content:
                 raise EmptyLLMResponseError(str(response))
             content = _try_to_extract_json_from_markdown_format(content)
-            return commentjson.loads(content)
+            parsed_result = commentjson.loads(content)
+            # Ensure the result is a dictionary
+            if not isinstance(parsed_result, dict):
+                LOG.warning(
+                    "LLM response parsed to non-dictionary type",
+                    parsed_result=parsed_result,
+                    result_type=type(parsed_result).__name__,
+                )
+                return {}
+            return parsed_result
         except Exception as e:
             if content:
                 LOG.warning(
@@ -166,10 +184,24 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
                     content=content,
                 )
                 try:
-                    return _fix_and_parse_json_string(content)
+                    parsed_result = _fix_and_parse_json_string(content)
+                    # Ensure the result is a dictionary
+                    if not isinstance(parsed_result, dict):
+                        LOG.warning(
+                            "LLM response parsed to non-dictionary type",
+                            parsed_result=parsed_result,
+                            result_type=type(parsed_result).__name__,
+                        )
+                        return {}
+                    return parsed_result
                 except Exception as e2:
                     LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
-                    raise InvalidLLMResponseFormat(str(response)) from e2
+                    # Return empty dict as fallback instead of raising exception
+                    LOG.warning(
+                        "Returning empty dictionary as fallback for unparseable LLM response",
+                        content=content[:200] if content else None,
+                    )
+                    return {}
 
             raise InvalidLLMResponseFormat(str(response)) from e
 
