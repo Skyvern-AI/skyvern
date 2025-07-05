@@ -651,6 +651,23 @@ async def run_task_v2_helper(
                 current_url=current_url,
                 workflow_run_id=workflow_run_id,
             )
+
+            # Validate that the LLM response is a dictionary
+            if not isinstance(task_v2_response, dict):
+                LOG.error(
+                    "LLM response is not a valid dictionary",
+                    task_v2_response=task_v2_response,
+                    response_type=type(task_v2_response).__name__,
+                    workflow_run_id=workflow_run_id,
+                )
+                await mark_task_v2_as_failed(
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=f"LLM response format error: Expected JSON object but received {type(task_v2_response).__name__}. This usually indicates the LLM model is not following the expected response format. Please try using a different model such as qwen2.5-vl, qwen2.5-14b, or gemma-3.",
+                    organization_id=organization_id,
+                )
+                break
+
             # see if the user goal has achieved or not
             user_goal_achieved = task_v2_response.get("user_goal_achieved", False)
             observation = task_v2_response.get("page_info", "")
@@ -861,6 +878,23 @@ async def run_task_v2_helper(
                 workflow_run_id=workflow_run_id,
                 task_history=task_history,
             )
+
+            # Validate that the completion response is a dictionary
+            if not isinstance(completion_resp, dict):
+                LOG.error(
+                    "LLM completion check response is not a valid dictionary",
+                    completion_resp=completion_resp,
+                    response_type=type(completion_resp).__name__,
+                    workflow_run_id=workflow_run_id,
+                )
+                await mark_task_v2_as_failed(
+                    task_v2_id=task_v2_id,
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=f"LLM completion check response format error: Expected JSON object but received {type(completion_resp).__name__}. This usually indicates the LLM model is not following the expected response format. Please try using a different model such as qwen2.5-vl, qwen2.5-14b, or gemma-3.",
+                    organization_id=organization_id,
+                )
+                break
+
             user_goal_achieved = completion_resp.get("user_goal_achieved", False)
             thought_content = completion_resp.get("thoughts", "")
             await app.DATABASE.update_thought(
