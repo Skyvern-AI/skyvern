@@ -42,6 +42,11 @@ class WorkflowRunResponse(UniversalBaseModel):
     List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot.
     """
 
+    steps_executed: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    Number of workflow steps (blocks) executed in this run
+    """
+
     failure_reason: typing.Optional[str] = pydantic.Field(default=None)
     """
     Reason for failure if the run failed or terminated
