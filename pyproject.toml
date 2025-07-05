@@ -51,7 +51,6 @@ onnxruntime = [
     { version = ">=1.20.0,<1.23.0", python = ">=3.12, <3.14"},
     { version = "<1.17", python = ">=3.11, <3.12"}
 ]
-aioredlock = "^0.7.3"
 stripe = "^9.7.0"
 tldextract = "^5.1.2"
 websockets = "^12.0"
