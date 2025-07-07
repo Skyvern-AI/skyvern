@@ -54,6 +54,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomizedCodeException,
@@ -292,6 +293,7 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
             )
 
+    @TraceManager.traced_async(ignore_inputs=["kwargs"])
     async def execute_safe(
         self,
         workflow_run_id: str,

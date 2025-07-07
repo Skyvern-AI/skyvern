@@ -30,6 +30,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import (
     BlockResult,
     BlockStatus,
@@ -298,6 +299,7 @@ async def initialize_task_v2(
     return task_v2
 
 
+@TraceManager.traced_async(ignore_inputs=["organization"])
 async def run_task_v2(
     organization: Organization,
     task_v2_id: str,
