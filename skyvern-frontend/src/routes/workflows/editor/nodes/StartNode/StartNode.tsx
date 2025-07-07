@@ -7,7 +7,7 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ProxyLocation } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
@@ -22,8 +22,10 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
+import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
+  const workflowSettingsStore = useWorkflowSettingsStore();
   const credentialGetter = useCredentialGetter();
   const { updateNodeData } = useReactFlow();
 
@@ -58,6 +60,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       : null,
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
   });
+
+  useEffect(() => {
+    workflowSettingsStore.setWorkflowSettings(inputs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inputs]);
 
   function handleChange(key: string, value: unknown) {
     if (!data.editable) {

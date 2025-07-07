@@ -30,6 +30,8 @@ import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { AxiosError } from "axios";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
+import { lsKeys } from "@/util/env";
+
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
   initialValues: Record<string, unknown>;
@@ -145,7 +147,7 @@ function RunWorkflowForm({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const browserSessionIdDefault = useLocalStorageFormDefault(
-    "skyvern.browserSessionId",
+    lsKeys.browserSessionId,
     (initialValues.browserSessionId as string | undefined) ?? null,
   );
   const form = useForm<RunWorkflowFormType>({
@@ -162,11 +164,7 @@ function RunWorkflowForm({
   });
   const apiCredential = useApiCredential();
 
-  useSyncFormFieldToStorage(
-    form,
-    "browserSessionId",
-    "skyvern.browserSessionId",
-  );
+  useSyncFormFieldToStorage(form, "browserSessionId", lsKeys.browserSessionId);
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {

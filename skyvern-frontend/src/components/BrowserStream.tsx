@@ -1,6 +1,6 @@
 import { Status } from "@/api/types";
 import { useEffect, useState, useRef, useCallback } from "react";
-import { HandIcon, PlayIcon } from "@radix-ui/react-icons";
+import { HandIcon, StopIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
@@ -317,13 +317,15 @@ function BrowserStream({
         <div className="overlay-container">
           <div className="overlay">
             <Button
-              // className="take-control"
-              className={cn("take-control", { hide: userIsControlling })}
+              className={cn(
+                "take-control absolute bottom-[-1rem] left-[1rem]",
+                { hide: userIsControlling },
+              )}
               type="button"
               onClick={() => setUserIsControlling(true)}
             >
               <HandIcon className="mr-2 h-4 w-4" />
-              take control
+              interact
             </Button>
             <div className="absolute bottom-[-1rem] right-[1rem]">
               <Button
@@ -333,8 +335,8 @@ function BrowserStream({
                 type="button"
                 onClick={() => setUserIsControlling(false)}
               >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                run agent
+                <StopIcon className="mr-2 h-4 w-4" />
+                stop interacting
               </Button>
             </div>
           </div>
