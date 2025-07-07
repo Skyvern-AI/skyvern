@@ -16,6 +16,7 @@ from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, DEFAULT_MAX_TOKE
 from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.browser_factory import BrowserState
@@ -392,6 +393,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         return await self.generate_scraped_page(take_screenshots=False)
 
 
+@TraceManager.traced_async(ignore_input=True)
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
@@ -646,11 +648,9 @@ async def add_frame_interactable_elements(
         )
         return elements, element_tree
 
-    frame_js_script = f"async () => await buildTreeFromBody('{unique_id}', {frame_index})"
-
-    await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
-    frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
-        frame=frame, expression=frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+    skyvern_frame = await SkyvernFrame.create_instance(frame)
+    frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
+        frame_name=unique_id, frame_index=frame_index
     )
 
     for element in elements:
@@ -662,6 +662,7 @@ async def add_frame_interactable_elements(
     return elements, element_tree
 
 
+@TraceManager.traced_async(ignore_input=True)
 async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
@@ -671,12 +672,9 @@ async def get_interactable_element_tree(
     :param page: Page instance to get the element tree from.
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
-    await SkyvernFrame.evaluate(frame=page, expression=JS_FUNCTION_DEFS)
     # main page index is 0
-    main_frame_js_script = "async () => await buildTreeFromBody('main.frame', 0)"
-    elements, element_tree = await SkyvernFrame.evaluate(
-        frame=page, expression=main_frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
-    )
+    skyvern_page = await SkyvernFrame.create_instance(page)
+    elements, element_tree = await skyvern_page.build_tree_from_body(frame_name="main.frame", frame_index=0)
 
     context = skyvern_context.ensure_context()
     frames = await get_all_children_frames(page)
@@ -718,25 +716,23 @@ class IncrementalScrapePage(ElementTreeBuilder):
             return True
         return False
 
+    @TraceManager.traced_async(ignore_input=True)
     async def get_incremental_element_tree(
         self,
         cleanup_element_tree: CleanupElementTreeFunc,
     ) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
-        js_script = "async () => await getIncrementElements()"
         try:
-            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
-                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
+                wait_until_finished=True
             )
         except TimeoutError:
             LOG.warning(
                 "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
             )
-
-            js_script = "async () => await getIncrementElements(false)"
-            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
-                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
+                wait_until_finished=False
             )
 
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame

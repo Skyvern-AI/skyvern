@@ -284,6 +284,12 @@ class Settings(BaseSettings):
     The secret used to sign the email/identity of the user.
     """
 
+    # Trace settings
+    TRACE_ENABLED: bool = False
+    TRACE_PROVIDER: str = "lmnr"
+    TRACE_PROVIDER_HOST: str | None = None
+    TRACE_PROVIDER_API_KEY: str = "fillmein"
+
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
