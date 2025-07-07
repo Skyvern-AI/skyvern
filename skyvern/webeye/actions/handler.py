@@ -2447,13 +2447,15 @@ async def sequentially_select_from_dropdown(
         return None
 
     # TODO: only support the third-level dropdown selection now, but for date picker, we need to support more levels as it will move the month, year, etc.
-    MAX_SELECT_DEPTH = 5 if input_or_select_context.is_date_related else 3
+    MAX_DATEPICKER_DEPTH = 30
+    MAX_SELECT_DEPTH = 3
+    max_depth = MAX_DATEPICKER_DEPTH if input_or_select_context.is_date_related else MAX_SELECT_DEPTH
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
     single_select_result: CustomSingleSelectResult | None = None
 
     check_filter_funcs: list[CheckFilterOutElementIDFunc] = [check_existed_but_not_option_element_in_dom_factory(dom)]
-    for i in range(MAX_SELECT_DEPTH):
+    for i in range(max_depth):
         single_select_result = await select_from_dropdown(
             context=input_or_select_context,
             page=page,
