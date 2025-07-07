@@ -41,9 +41,6 @@ function WorkflowHeader({
   onTitleChange,
   saving,
 }: Props) {
-  const email = "noone@nowhere.com";
-  // parse out the domain of the email
-  const domain = email?.split("@")[1];
   const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
@@ -100,23 +97,21 @@ function WorkflowHeader({
           </Button>
         ) : (
           <>
-            {domain === "skyvern.com" && (
-              <Button
-                size="lg"
-                variant={debugStore.isDebugMode ? "default" : "tertiary"}
-                disabled={debuggableBlockCount === 0 || anyBlockIsPlaying}
-                onClick={() => {
-                  if (debugStore.isDebugMode) {
-                    navigate(`/workflows/${workflowPermanentId}/edit`);
-                  } else {
-                    navigate(`/workflows/${workflowPermanentId}/debug`);
-                  }
-                }}
-              >
-                <Crosshair1Icon className="mr-2 h-6 w-6" />
-                {debugStore.isDebugMode ? "End" : "Start Debugging"}
-              </Button>
-            )}
+            <Button
+              size="lg"
+              variant={debugStore.isDebugMode ? "default" : "tertiary"}
+              disabled={debuggableBlockCount === 0 || anyBlockIsPlaying}
+              onClick={() => {
+                if (debugStore.isDebugMode) {
+                  navigate(`/workflows/${workflowPermanentId}/edit`);
+                } else {
+                  navigate(`/workflows/${workflowPermanentId}/debug`);
+                }
+              }}
+            >
+              <Crosshair1Icon className="mr-2 h-6 w-6" />
+              {debugStore.isDebugMode ? "End" : "Start Debugging"}
+            </Button>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
