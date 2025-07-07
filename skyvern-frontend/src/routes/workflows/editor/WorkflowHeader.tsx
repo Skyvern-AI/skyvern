@@ -1,5 +1,3 @@
-import { useUser } from "@clerk/clerk-react";
-
 import { SaveIcon } from "@/components/icons/SaveIcon";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,8 +41,7 @@ function WorkflowHeader({
   onTitleChange,
   saving,
 }: Props) {
-  const { user } = useUser();
-  const email = user?.primaryEmailAddress?.emailAddress;
+  const email = "noone@nowhere.com";
   // parse out the domain of the email
   const domain = email?.split("@")[1];
   const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
