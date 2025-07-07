@@ -107,6 +107,17 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    labels:
+      - traefik.enable=true
+      # Router:  https://${COOLIFY_FQDN}/api/…
+      - traefik.http.routers.skyvern-api.rule=Host(`${COOLIFY_FQDN}`) && PathPrefix(`/api/`)
+      - traefik.http.routers.skyvern-api.entrypoints=websecure
+      - traefik.http.routers.skyvern-api.tls=true
+      # Strip the public “/api” prefix before the request reaches FastAPI
+      - traefik.http.routers.skyvern-api.middlewares=api-stripprefix
+      - traefik.http.middlewares.api-stripprefix.stripprefix.prefixes=/api
+      # Port where the API listens *inside* the container
+      - traefik.http.services.skyvern-api.loadbalancer.server.port=8000
   ## Begin New Artifact Service
   artifact-server:
     build:
@@ -156,7 +167,17 @@ services:
     depends_on:
       skyvern:
         condition: service_healthy
-
+    labels:
+      - traefik.enable=true
+      # Router:  https://${COOLIFY_FQDN}/artifacts/…
+      - traefik.http.routers.skyvern-art.rule=Host(`${COOLIFY_FQDN}`) && PathPrefix(`/artifacts/`)
+      - traefik.http.routers.skyvern-art.entrypoints=websecure
+      - traefik.http.routers.skyvern-art.tls=true
+      # Strip the public “/artifacts” prefix
+      - traefik.http.routers.skyvern-art.middlewares=art-stripprefix
+      - traefik.http.middlewares.art-stripprefix.stripprefix.prefixes=/artifacts
+      # Container port where the artifact UI/API listens
+      - traefik.http.services.skyvern-art.loadbalancer.server.port=9090
 # Top-level declaration for all named volumes used by the services.
 # This is required for Docker to create them.
 volumes:
