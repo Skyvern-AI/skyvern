@@ -94,11 +94,11 @@ services:
       # Maximum tokens to use: (only set for OpenRouter and Ollama)
       # - LLM_CONFIG_MAX_TOKENS=128000
       # Bitwarden (or Vaultwarden) Settings
-        - BITWARDEN_SERVER: ${BITWARDEN_SERVER}
-        - BITWARDEN_SERVER_PORT: 8002
-        - BITWARDEN_CLIENT_ID: ${BITWARDEN_CLIENT_ID}
-        - BITWARDEN_CLIENT_SECRET: ${BITWARDEN_CLIENT_SECRET}
-        - BITWARDEN_MASTER_PASSWORD: ${BITWARDEN_MASTER_PASSWORD}
+      - BITWARDEN_SERVER: ${BITWARDEN_SERVER}
+      - BITWARDEN_SERVER_PORT: 8002
+      - BITWARDEN_CLIENT_ID: ${BITWARDEN_CLIENT_ID}
+      - BITWARDEN_CLIENT_SECRET: ${BITWARDEN_CLIENT_SECRET}
+      - BITWARDEN_MASTER_PASSWORD: ${BITWARDEN_MASTER_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
