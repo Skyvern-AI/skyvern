@@ -69,7 +69,9 @@ jobs:
           if [ -f .github/workflows/sync-skyvern-cloud.yml ]; then
             git rm -f .github/workflows/sync-skyvern-cloud.yml
           fi
-
+          if [ -f .github/workflows/codeflash.yaml ]; then
+            git rm -f .github/workflows/codeflash.yaml
+          fi
       # Restore skyvern-frontend/dockerfile.artifact if missing
       - name: Restore skyvern-frontend/dockerfile.artifact if missing
         run: |
