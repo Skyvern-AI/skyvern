@@ -216,6 +216,7 @@ export const WorkflowBlockTypes = {
 
 export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "action",
+  "code",
   "extraction",
   "goto_url",
   "login",

@@ -1,3 +1,5 @@
+import { useUser } from "@clerk/clerk-react";
+
 import { SaveIcon } from "@/components/icons/SaveIcon";
 import { Button } from "@/components/ui/button";
 import {
@@ -41,6 +43,10 @@ function WorkflowHeader({
   onTitleChange,
   saving,
 }: Props) {
+  const { user } = useUser();
+  const email = user?.primaryEmailAddress?.emailAddress;
+  // parse out the domain of the email
+  const domain = email?.split("@")[1];
   const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
@@ -97,21 +103,23 @@ function WorkflowHeader({
           </Button>
         ) : (
           <>
-            <Button
-              size="lg"
-              variant={debugStore.isDebugMode ? "default" : "tertiary"}
-              disabled={debuggableBlockCount === 0 || anyBlockIsPlaying}
-              onClick={() => {
-                if (debugStore.isDebugMode) {
-                  navigate(`/workflows/${workflowPermanentId}/edit`);
-                } else {
-                  navigate(`/workflows/${workflowPermanentId}/debug`);
-                }
-              }}
-            >
-              <Crosshair1Icon className="mr-2 h-6 w-6" />
-              {debugStore.isDebugMode ? "End" : "Start Debugging"}
-            </Button>
+            {domain === "skyvern.com" && (
+              <Button
+                size="lg"
+                variant={debugStore.isDebugMode ? "default" : "tertiary"}
+                disabled={debuggableBlockCount === 0 || anyBlockIsPlaying}
+                onClick={() => {
+                  if (debugStore.isDebugMode) {
+                    navigate(`/workflows/${workflowPermanentId}/edit`);
+                  } else {
+                    navigate(`/workflows/${workflowPermanentId}/debug`);
+                  }
+                }}
+              >
+                <Crosshair1Icon className="mr-2 h-6 w-6" />
+                {debugStore.isDebugMode ? "End" : "Start Debugging"}
+              </Button>
+            )}
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
