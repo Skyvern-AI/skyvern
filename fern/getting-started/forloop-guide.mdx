@@ -74,9 +74,9 @@ You know this is an array because the **square brackets** are surrounding the li
 
 There’s one other thing we need configure before we can run this ForLoop: the Current Value. The Loop Value’s current item needs to be inputted into the blocks nested within the ForLoop. In this case, we only need to add the current value to the search because there’s only one place Skyvern needs to act on that information. 
 
-The structure for adding the current value parameter is always {{blockname.current_value}}
+The structure for adding the current value parameter is always {{blockname.current_value}} or {{current_value}}
 
-In this case the block name is **search_case** so the parameter is **{{search_case.current_value}}**
+In this case the block name is **search_case** so the parameter could be either **{{search_case.current_value}}** or {{current_value}}
 
 These would fail: 
 
