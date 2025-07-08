@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: skyvern-frontend
+  namespace: skyvern
+spec:
+  type: ClusterIP # Or LoadBalancer
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: artifact
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: skyvern-frontend

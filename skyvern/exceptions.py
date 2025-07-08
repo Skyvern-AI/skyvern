@@ -128,6 +128,11 @@ class UnknownBlockType(SkyvernException):
         super().__init__(f"Unknown block type {block_type}")
 
 
+class BlockNotFound(SkyvernException):
+    def __init__(self, block_label: str) -> None:
+        super().__init__(f"Block {block_label} not found")
+
+
 class WorkflowNotFound(SkyvernHTTPException):
     def __init__(
         self,
@@ -159,6 +164,14 @@ class MissingValueForParameter(SkyvernHTTPException):
     def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str) -> None:
         super().__init__(
             f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidCredentialId(SkyvernHTTPException):
+    def __init__(self, credential_id: str) -> None:
+        super().__init__(
+            f"Invalid credential ID: {credential_id}. Failed to resolve to a valid credential.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -455,6 +468,11 @@ class FailToSelectByIndex(SkyvernException):
         super().__init__(f"Failed to select by index. element_id={element_id}")
 
 
+class EmptyDomOrHtmlTree(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Empty dom or html tree")
+
+
 class OptionIndexOutOfBound(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Option index is out of bound. element_id={element_id}")
@@ -687,3 +705,26 @@ class SkyvernContextWindowExceededError(SkyvernException):
 class LLMCallerNotFoundError(SkyvernException):
     def __init__(self, uid: str) -> None:
         super().__init__(f"LLM caller for {uid} is not found")
+
+
+class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is already occupied")
+
+
+class MissingBrowserSessionError(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} does not exist.")
+
+
+class MissingBrowserAddressError(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} does not have an address.")
+
+
+class BrowserSessionNotFound(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} does not exist or is not live.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )

@@ -107,7 +107,9 @@ jobs:
         env:
           ENABLE_OPENAI: "true"
           OPENAI_API_KEY: "sk-dummy"
-        run: poetry run pytest tests
+          AWS_ACCESS_KEY_ID: "dummy"
+          AWS_SECRET_ACCESS_KEY: "dummy"
+        run: poetry run pytest
   fe-lint-build:
     name: Frontend Lint and Build
     runs-on: ubuntu-latest

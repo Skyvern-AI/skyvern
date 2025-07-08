@@ -10,8 +10,10 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useOnChange } from "@/hooks/useOnChange";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
+import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
@@ -22,10 +24,12 @@ import {
   Controls,
   Edge,
   Panel,
+  PanOnScrollMode,
   ReactFlow,
   useEdgesState,
   useNodesInitialized,
   useNodesState,
+  useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { AxiosError } from "axios";
@@ -35,6 +39,7 @@ import { useBlocker, useParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import {
   AWSSecretParameter,
+  debuggableWorkflowBlockTypes,
   WorkflowApiResponse,
   WorkflowEditorParameterTypes,
   WorkflowParameterTypes,
@@ -48,6 +53,7 @@ import {
   BlockYAML,
   ContextParameterYAML,
   CredentialParameterYAML,
+  OnePasswordCredentialParameterYAML,
   ParameterYAML,
   WorkflowCreateYAMLRequest,
   WorkflowParameterYAML,
@@ -68,6 +74,12 @@ import {
 } from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
+import {
+  ParametersState,
+  parameterIsSkyvernCredential,
+  parameterIsOnePasswordCredential,
+  parameterIsBitwardenCredential,
+} from "./types";
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
@@ -84,7 +96,7 @@ import {
   nodeAdderNode,
   startNode,
 } from "./workflowEditorUtils";
-import { parameterIsBitwardenCredential, ParametersState } from "./types";
+import { cn } from "@/util/utils";
 import { useAutoPan } from "./useAutoPan";
 
 function convertToParametersYAML(
@@ -95,86 +107,133 @@ function convertToParametersYAML(
   | ContextParameterYAML
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
+  | OnePasswordCredentialParameterYAML
   | CredentialParameterYAML
 > {
-  return parameters.map((parameter) => {
-    if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
-      return {
-        parameter_type: WorkflowParameterTypes.Workflow,
-        key: parameter.key,
-        description: parameter.description || null,
-        workflow_parameter_type: parameter.dataType,
-        ...(parameter.defaultValue === null
-          ? {}
-          : { default_value: parameter.defaultValue }),
-      };
-    } else if (
-      parameter.parameterType === WorkflowEditorParameterTypes.Context
-    ) {
-      return {
-        parameter_type: WorkflowParameterTypes.Context,
-        key: parameter.key,
-        description: parameter.description || null,
-        source_parameter_key: parameter.sourceParameterKey,
-      };
-    } else if (
-      parameter.parameterType === WorkflowEditorParameterTypes.Secret
-    ) {
-      return {
-        parameter_type: WorkflowParameterTypes.Bitwarden_Sensitive_Information,
-        key: parameter.key,
-        bitwarden_identity_key: parameter.identityKey,
-        bitwarden_identity_fields: parameter.identityFields,
-        description: parameter.description || null,
-        bitwarden_collection_id: parameter.collectionId,
-        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
-        bitwarden_client_secret_aws_secret_key:
-          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
-        bitwarden_master_password_aws_secret_key:
-          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
-      };
-    } else if (
-      parameter.parameterType === WorkflowEditorParameterTypes.CreditCardData
-    ) {
-      return {
-        parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
-        key: parameter.key,
-        description: parameter.description || null,
-        bitwarden_item_id: parameter.itemId,
-        bitwarden_collection_id: parameter.collectionId,
-        bitwarden_client_id_aws_secret_key: BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
-        bitwarden_client_secret_aws_secret_key:
-          BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
-        bitwarden_master_password_aws_secret_key:
-          BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
-      };
-    } else {
-      if (parameterIsBitwardenCredential(parameter)) {
-        return {
-          parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
-          key: parameter.key,
-          description: parameter.description || null,
-          bitwarden_collection_id: parameter.collectionId,
-          bitwarden_item_id: parameter.itemId,
-          url_parameter_key: parameter.urlParameterKey,
-          bitwarden_client_id_aws_secret_key:
-            BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
-          bitwarden_client_secret_aws_secret_key:
-            BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
-          bitwarden_master_password_aws_secret_key:
-            BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
-        };
-      } else {
-        return {
-          parameter_type: WorkflowParameterTypes.Workflow,
-          workflow_parameter_type: WorkflowParameterValueType.CredentialId,
-          default_value: parameter.credentialId,
-          key: parameter.key,
-          description: parameter.description || null,
-        };
-      }
-    }
-  });
+  return parameters
+    .map(
+      (
+        parameter: ParametersState[number],
+      ):
+        | WorkflowParameterYAML
+        | BitwardenLoginCredentialParameterYAML
+        | ContextParameterYAML
+        | BitwardenSensitiveInformationParameterYAML
+        | BitwardenCreditCardDataParameterYAML
+        | OnePasswordCredentialParameterYAML
+        | CredentialParameterYAML
+        | undefined => {
+        if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
+          return {
+            parameter_type: WorkflowParameterTypes.Workflow,
+            key: parameter.key,
+            description: parameter.description || null,
+            workflow_parameter_type: parameter.dataType,
+            ...(parameter.defaultValue === null
+              ? {}
+              : { default_value: parameter.defaultValue }),
+          };
+        } else if (
+          parameter.parameterType === WorkflowEditorParameterTypes.Context
+        ) {
+          return {
+            parameter_type: WorkflowParameterTypes.Context,
+            key: parameter.key,
+            description: parameter.description || null,
+            source_parameter_key: parameter.sourceParameterKey,
+          };
+        } else if (
+          parameter.parameterType === WorkflowEditorParameterTypes.Secret
+        ) {
+          return {
+            parameter_type:
+              WorkflowParameterTypes.Bitwarden_Sensitive_Information,
+            key: parameter.key,
+            bitwarden_identity_key: parameter.identityKey,
+            bitwarden_identity_fields: parameter.identityFields,
+            description: parameter.description || null,
+            bitwarden_collection_id: parameter.collectionId,
+            bitwarden_client_id_aws_secret_key:
+              BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+            bitwarden_client_secret_aws_secret_key:
+              BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+            bitwarden_master_password_aws_secret_key:
+              BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+          };
+        } else if (
+          parameter.parameterType ===
+          WorkflowEditorParameterTypes.CreditCardData
+        ) {
+          return {
+            parameter_type: WorkflowParameterTypes.Bitwarden_Credit_Card_Data,
+            key: parameter.key,
+            description: parameter.description || null,
+            bitwarden_item_id: parameter.itemId,
+            bitwarden_collection_id: parameter.collectionId,
+            bitwarden_client_id_aws_secret_key:
+              BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+            bitwarden_client_secret_aws_secret_key:
+              BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+            bitwarden_master_password_aws_secret_key:
+              BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+          };
+        } else {
+          if (parameterIsBitwardenCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Bitwarden_Login_Credential,
+              key: parameter.key,
+              description: parameter.description || null,
+              bitwarden_collection_id: parameter.collectionId,
+              bitwarden_item_id: parameter.itemId,
+              url_parameter_key: parameter.urlParameterKey,
+              bitwarden_client_id_aws_secret_key:
+                BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
+              bitwarden_client_secret_aws_secret_key:
+                BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
+              bitwarden_master_password_aws_secret_key:
+                BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
+            };
+          } else if (parameterIsSkyvernCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Workflow,
+              workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+              default_value: parameter.credentialId,
+              key: parameter.key,
+              description: parameter.description || null,
+            };
+          } else if (parameterIsOnePasswordCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.OnePassword,
+              key: parameter.key,
+              description: parameter.description || null,
+              vault_id: parameter.vaultId,
+              item_id: parameter.itemId,
+            };
+          }
+        }
+        return undefined;
+      },
+    )
+    .filter(
+      (
+        param:
+          | WorkflowParameterYAML
+          | BitwardenLoginCredentialParameterYAML
+          | ContextParameterYAML
+          | BitwardenSensitiveInformationParameterYAML
+          | BitwardenCreditCardDataParameterYAML
+          | OnePasswordCredentialParameterYAML
+          | CredentialParameterYAML
+          | undefined,
+      ): param is
+        | WorkflowParameterYAML
+        | BitwardenLoginCredentialParameterYAML
+        | ContextParameterYAML
+        | BitwardenSensitiveInformationParameterYAML
+        | BitwardenCreditCardDataParameterYAML
+        | OnePasswordCredentialParameterYAML
+        | CredentialParameterYAML => param !== undefined,
+    );
 }
 
 type Props = {
@@ -200,6 +259,8 @@ function FlowRenderer({
   initialParameters,
   workflow,
 }: Props) {
+  const reactFlowInstance = useReactFlow();
+  const debugStore = useDebugStore();
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -207,8 +268,10 @@ function FlowRenderer({
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const [parameters, setParameters] = useState(initialParameters);
+  const [parameters, setParameters] =
+    useState<ParametersState>(initialParameters);
   const [title, setTitle] = useState(initialTitle);
+  const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
   const nodesInitialized = useNodesInitialized();
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
   useShouldNotifyWhenClosingTab(hasChanges);
@@ -227,6 +290,39 @@ function FlowRenderer({
         return;
       }
       const client = await getClient(credentialGetter);
+      const extraHttpHeaders: Record<string, string> = {};
+      if (data.settings.extraHttpHeaders) {
+        try {
+          const parsedHeaders = JSON.parse(data.settings.extraHttpHeaders);
+          if (
+            parsedHeaders &&
+            typeof parsedHeaders === "object" &&
+            !Array.isArray(parsedHeaders)
+          ) {
+            for (const [key, value] of Object.entries(parsedHeaders)) {
+              if (key && typeof key === "string") {
+                if (key in extraHttpHeaders) {
+                  toast({
+                    title: "Error",
+                    description: `Duplicate key '${key}' in extra http headers`,
+                    variant: "destructive",
+                  });
+                  continue;
+                }
+                extraHttpHeaders[key] = String(value);
+              }
+            }
+          }
+        } catch (error) {
+          toast({
+            title: "Error",
+            description: "Invalid JSON format in extra http headers",
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+
       const requestBody: WorkflowCreateYAMLRequest = {
         title: data.title,
         description: workflow.description,
@@ -234,7 +330,9 @@ function FlowRenderer({
         webhook_callback_url: data.settings.webhookCallbackUrl,
         persist_browser_session: data.settings.persistBrowserSession,
         model: data.settings.model,
+        max_screenshot_scrolls: data.settings.maxScreenshotScrolls,
         totp_verification_url: workflow.totp_verification_url,
+        extra_http_headers: extraHttpHeaders,
         workflow_definition: {
           parameters: data.parameters,
           blocks: data.blocks,
@@ -288,6 +386,14 @@ function FlowRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
+
+  useEffect(() => {
+    const blocks = getWorkflowBlocks(nodes, edges);
+    const debuggable = blocks.filter((block) =>
+      debuggableWorkflowBlockTypes.has(block.block_type),
+    );
+    setDebuggableBlockCount(debuggable.length);
+  }, [nodes, edges]);
 
   async function handleSave() {
     const blocks = getWorkflowBlocks(nodes, edges);
@@ -500,6 +606,47 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
 
+  const zoomLock = 1 as const;
+  const yLockMax = 140 as const;
+
+  /**
+   * TODO(jdo): hack
+   */
+  const getXLock = () => {
+    const hasForLoopNode = nodes.some((node) => node.type === "loop");
+    return hasForLoopNode ? 24 : 104;
+  };
+
+  useOnChange(debugStore.isDebugMode, (newValue) => {
+    const xLock = getXLock();
+    if (newValue) {
+      const currentY = reactFlowInstance.getViewport().y;
+      reactFlowInstance.setViewport({ x: xLock, y: currentY, zoom: zoomLock });
+    }
+  });
+
+  const constrainPan = (y: number) => {
+    const yLockMin = nodes.reduce(
+      (acc, node) => {
+        const nodeBottom = node.position.y + (node.height ?? 0);
+        if (nodeBottom > acc.value) {
+          return { value: nodeBottom };
+        }
+        return acc;
+      },
+      { value: -Infinity },
+    );
+
+    const yLockMinValue = yLockMin.value;
+    const xLock = getXLock();
+    const newY = Math.max(-yLockMinValue + yLockMax, Math.min(yLockMax, y));
+    reactFlowInstance.setViewport({
+      x: xLock,
+      y: newY,
+      zoom: zoomLock,
+    });
+  };
+
   return (
     <>
       <Dialog
@@ -587,16 +734,33 @@ function FlowRenderer({
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             colorMode="dark"
-            fitView
+            fitView={!debugStore.isDebugMode}
             fitViewOptions={{
               maxZoom: 1,
             }}
             deleteKeyCode={null}
+            onMove={(_, viewport) => {
+              const y = viewport.y;
+              debugStore.isDebugMode && constrainPan(y);
+            }}
+            maxZoom={debugStore.isDebugMode ? 1 : 2}
+            minZoom={debugStore.isDebugMode ? 1 : 0.5}
+            panOnDrag={!debugStore.isDebugMode}
+            panOnScroll={debugStore.isDebugMode}
+            panOnScrollMode={
+              debugStore.isDebugMode
+                ? PanOnScrollMode.Vertical
+                : PanOnScrollMode.Free
+            }
+            zoomOnDoubleClick={!debugStore.isDebugMode}
+            zoomOnPinch={!debugStore.isDebugMode}
+            zoomOnScroll={!debugStore.isDebugMode}
           >
             <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
             <Controls position="bottom-left" />
-            <Panel position="top-center" className="h-20">
+            <Panel position="top-center" className={cn("h-20")}>
               <WorkflowHeader
+                debuggableBlockCount={debuggableBlockCount}
                 title={title}
                 saving={saveWorkflowMutation.isPending}
                 onTitleChange={(newTitle) => {

@@ -2,12 +2,17 @@ import json
 import os
 from typing import Any, Optional, cast
 
+import pytest
 import requests
 from dotenv import load_dotenv
 
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
 
+# Skip tests if network access is not available
+pytest.skip("requires network access", allow_module_level=True)
+
+# Load environment variables and set up configuration
 load_dotenv("./skyvern-frontend/.env")
 API_KEY = os.getenv("VITE_SKYVERN_API_KEY")
 

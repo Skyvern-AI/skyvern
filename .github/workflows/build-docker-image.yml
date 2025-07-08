@@ -7,6 +7,7 @@ env:
   ECR_BACKEND_REPOSITORY: skyvern
   ECR_UI_REPOSITORY: skyvern-ui
   REGISTRY_ALIAS: skyvern # t6d4b5t4 
+  DOCKERHUB_USERNAME: skyvern
 jobs:
   run-ci:
     uses: ./.github/workflows/ci.yml
@@ -27,11 +28,16 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
         with:
           registry-type: public
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      - name: Build, tag, and push backend image to Amazon Public ECR
+        uses: docker/setup-buildx-action@v3
+      - name: Build, tag, and push backend image to Amazon Public ECR and Docker Hub
         id: build-image
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v6
         env:
           ECR_REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
         with:
@@ -40,18 +46,25 @@ jobs:
             linux/amd64
             linux/arm64
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.event.release.tag_name }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_BACKEND_REPOSITORY }}:latest
-      - name: Build, tag, and push ui image to Amazon Public ECR
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.sha }}
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_BACKEND_REPOSITORY }}:latest
+      - name: Build, tag, and push ui image to Amazon Public ECR and Docker Hub
         id: build-ui-image
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v6
         env:
           ECR_REGISTRY: ${{ steps.login-ecr-public.outputs.registry }}
         with:
           context: .
           file: Dockerfile.ui
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           platforms: |
             linux/amd64
             linux/arm64
@@ -60,3 +73,6 @@ jobs:
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.sha }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.event.release.tag_name }}
             ${{ env.ECR_REGISTRY}}/${{ env.REGISTRY_ALIAS }}/${{ env.ECR_UI_REPOSITORY }}:latest
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.sha }}
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_UI_REPOSITORY }}:${{ github.event.release.tag_name }}
+            ${{ env.DOCKERHUB_USERNAME }}/${{ env.ECR_UI_REPOSITORY }}:latest

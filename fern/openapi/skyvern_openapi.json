@@ -85,6 +85,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task",
         "x-fern-examples": [
           {
@@ -203,6 +204,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
           {
@@ -282,6 +284,7 @@
                       "task_v2": "#/components/schemas/TaskRunResponse",
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
+                      "ui_tars": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
                   },
@@ -304,6 +307,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
         "x-fern-examples": [
           {
@@ -362,9 +366,7 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -379,6 +381,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [
           {
@@ -445,13 +448,14 @@
             "description": "Invalid workflow definition"
           }
         },
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
@@ -576,6 +580,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "get_workflows",
         "x-fern-examples": [
           {
@@ -656,13 +661,14 @@
             "description": "Invalid workflow definition"
           }
         },
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
         "x-fern-examples": [
           {
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
@@ -720,9 +726,7 @@
             "description": "Successfully deleted workflow",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -737,6 +741,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [
           {
@@ -812,7 +817,96 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "artifacts",
         "x-fern-sdk-method-name": "get_artifact"
+      }
+    },
+    "/v1/runs/{run_id}/artifacts": {
+      "get": {
+        "tags": [
+          "Artifacts"
+        ],
+        "summary": "Get artifacts for a run",
+        "description": "Get artifacts for a run",
+        "operationId": "get_run_artifacts_v1_runs__run_id__artifacts_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the task run or the workflow run.",
+              "title": "Run Id"
+            },
+            "description": "The id of the task run or the workflow run."
+          },
+          {
+            "name": "artifact_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ArtifactType"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Artifact Type"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Artifact"
+                  },
+                  "title": "Response Get Run Artifacts V1 Runs  Run Id  Artifacts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_run_artifacts"
       }
     },
     "/v1/runs/{run_id}/retry_webhook": {
@@ -863,9 +957,7 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -880,6 +972,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [
           {
@@ -956,6 +1049,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "create_browser_session",
         "x-fern-examples": [
           {
@@ -1024,6 +1118,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_sessions",
         "x-fern-examples": [
           {
@@ -1084,9 +1179,7 @@
             "description": "Successfully closed browser session",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -1104,6 +1197,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "close_browser_session",
         "x-fern-examples": [
           {
@@ -1170,11 +1264,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "422": {
             "description": "Validation Error",
@@ -1187,6 +1281,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_session",
         "x-fern-examples": [
           {
@@ -1260,6 +1355,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "send_totp_code"
       }
     },
@@ -1336,6 +1432,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "create_credential",
         "x-fern-examples": [
           {
@@ -1368,14 +1465,16 @@
               "type": "integer",
               "minimum": 1,
               "description": "Page number for pagination",
+              "examples": [
+                1
+              ],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "page"
               },
               "default": 1,
               "title": "Page"
             },
-            "description": "Page number for pagination",
-            "example": 1
+            "description": "Page number for pagination"
           },
           {
             "name": "page_size",
@@ -1385,14 +1484,16 @@
               "type": "integer",
               "minimum": 1,
               "description": "Number of items per page",
+              "examples": [
+                10
+              ],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "page_size"
               },
               "default": 10,
               "title": "Page Size"
             },
-            "description": "Number of items per page",
-            "example": 10
+            "description": "Number of items per page"
           },
           {
             "name": "x-api-key",
@@ -1439,6 +1540,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credentials",
         "x-fern-examples": [
           {
@@ -1468,13 +1570,15 @@
             "schema": {
               "type": "string",
               "description": "The unique identifier of the credential to delete",
+              "examples": [
+                "cred_1234567890"
+              ],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "credential_id"
               },
               "title": "Credential Id"
             },
-            "description": "The unique identifier of the credential to delete",
-            "example": "cred_1234567890"
+            "description": "The unique identifier of the credential to delete"
           },
           {
             "name": "x-api-key",
@@ -1510,6 +1614,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "delete_credential",
         "x-fern-examples": [
           {
@@ -1539,13 +1644,15 @@
             "schema": {
               "type": "string",
               "description": "The unique identifier of the credential",
+              "examples": [
+                "cred_1234567890"
+              ],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "credential_id"
               },
               "title": "Credential Id"
             },
-            "description": "The unique identifier of the credential",
-            "example": "cred_1234567890"
+            "description": "The unique identifier of the credential"
           },
           {
             "name": "x-api-key",
@@ -1588,6 +1695,7 @@
             }
           }
         },
+        "x-fern-sdk-group-name": "credentials",
         "x-fern-sdk-method-name": "get_credential",
         "x-fern-examples": [
           {
@@ -1816,9 +1924,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -1879,6 +1985,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -1894,6 +2003,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -2225,14 +2335,7 @@
             "title": "Signed Url"
           },
           "organization_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
             "title": "Organization Id"
           }
         },
@@ -2242,7 +2345,8 @@
           "modified_at",
           "artifact_id",
           "artifact_type",
-          "uri"
+          "uri",
+          "organization_id"
         ],
         "title": "Artifact"
       },
@@ -2829,7 +2933,10 @@
             ],
             "title": "Timeout",
             "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.",
-            "examples": [60, 120]
+            "examples": [
+              60,
+              120
+            ]
           },
           "started_at": {
             "anyOf": [
@@ -2951,6 +3058,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -2966,6 +3076,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -3083,6 +3194,9 @@
                 "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
               },
               {
+                "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+              },
+              {
                 "$ref": "#/components/schemas/OutputParameter"
               },
               {
@@ -3110,9 +3224,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -3599,9 +3711,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -3662,6 +3772,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -3677,6 +3790,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -3808,9 +3922,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -3970,9 +4082,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -4033,6 +4143,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -4048,6 +4161,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -4693,6 +4807,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileUploadBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/HttpRequestBlock"
                 }
               ],
               "discriminator": {
@@ -4707,6 +4824,7 @@
                   "file_url_parser": "#/components/schemas/FileParserBlock",
                   "for_loop": "#/components/schemas/ForLoopBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
+                  "http_request": "#/components/schemas/HttpRequestBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
@@ -4746,6 +4864,9 @@
                     "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                   },
                   {
+                    "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                  },
+                  {
                     "$ref": "#/components/schemas/OutputParameter"
                   },
                   {
@@ -4761,6 +4882,7 @@
                     "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                     "context": "#/components/schemas/ContextParameter",
                     "credential": "#/components/schemas/CredentialParameter",
+                    "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                     "output": "#/components/schemas/OutputParameter",
                     "workflow": "#/components/schemas/WorkflowParameter"
                   }
@@ -4885,6 +5007,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/TaskV2BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/HttpRequestBlockYAML"
                 }
               ]
             },
@@ -4932,6 +5057,250 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HttpRequestBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "block_type": {
+            "type": "string",
+            "const": "http_request",
+            "title": "Block Type",
+            "default": "http_request"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "method": {
+            "type": "string",
+            "title": "Method",
+            "default": "GET"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headers"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
+          "timeout": {
+            "type": "integer",
+            "title": "Timeout",
+            "default": 30
+          },
+          "follow_redirects": {
+            "type": "boolean",
+            "title": "Follow Redirects",
+            "default": true
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter"
+        ],
+        "title": "HttpRequestBlock"
+      },
+      "HttpRequestBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "http_request",
+            "title": "Block Type",
+            "default": "http_request"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "method": {
+            "type": "string",
+            "title": "Method",
+            "default": "GET"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headers"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
+          "timeout": {
+            "type": "integer",
+            "title": "Timeout",
+            "default": 30
+          },
+          "follow_redirects": {
+            "type": "boolean",
+            "title": "Follow Redirects",
+            "default": true
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label"
+        ],
+        "title": "HttpRequestBlockYAML"
       },
       "LoginBlock": {
         "properties": {
@@ -5041,9 +5410,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -5104,6 +5471,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -5119,6 +5489,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -5455,9 +5826,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -5518,6 +5887,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -5533,6 +5905,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -5897,6 +6270,120 @@
         "title": "NonEmptyPasswordCredential",
         "description": "Password credential model that requires non-empty values."
       },
+      "OnePasswordCredentialParameter": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "onepassword",
+            "title": "Parameter Type",
+            "default": "onepassword"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "onepassword_credential_parameter_id": {
+            "type": "string",
+            "title": "Onepassword Credential Parameter Id"
+          },
+          "workflow_id": {
+            "type": "string",
+            "title": "Workflow Id"
+          },
+          "vault_id": {
+            "type": "string",
+            "title": "Vault Id"
+          },
+          "item_id": {
+            "type": "string",
+            "title": "Item Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "onepassword_credential_parameter_id",
+          "workflow_id",
+          "vault_id",
+          "item_id",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "OnePasswordCredentialParameter"
+      },
+      "OnePasswordCredentialParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "onepassword",
+            "title": "Parameter Type",
+            "default": "onepassword"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "vault_id": {
+            "type": "string",
+            "title": "Vault Id"
+          },
+          "item_id": {
+            "type": "string",
+            "title": "Item Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "vault_id",
+          "item_id"
+        ],
+        "title": "OnePasswordCredentialParameterYAML"
+      },
       "OutputParameter": {
         "properties": {
           "parameter_type": {
@@ -6138,6 +6625,7 @@
           "RESIDENTIAL_NZ",
           "RESIDENTIAL_ZA",
           "RESIDENTIAL_AR",
+          "RESIDENTIAL_AU",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -6149,7 +6637,8 @@
           "skyvern-1.0",
           "skyvern-2.0",
           "openai-cua",
-          "anthropic-cua"
+          "anthropic-cua",
+          "ui-tars"
         ],
         "title": "RunEngine"
       },
@@ -6699,9 +7188,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -6762,6 +7249,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -6777,6 +7267,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -6925,9 +7416,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -7118,7 +7607,7 @@
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
             "default": "RESIDENTIAL"
           },
           "data_extraction_schema": {
@@ -7128,9 +7617,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -7177,7 +7664,10 @@
             ],
             "title": "Max Steps",
             "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
-            "examples": [10, 25]
+            "examples": [
+              10,
+              25
+            ]
           },
           "webhook_url": {
             "anyOf": [
@@ -7189,7 +7679,7 @@
               }
             ],
             "title": "Webhook Url",
-            "description": "\nURL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.\n",
+            "description": "\nAfter a run is finished, send an update to this URL. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.\n",
             "examples": [
               "https://my-site.com/webhook"
             ]
@@ -7254,6 +7744,21 @@
             "title": "Model",
             "description": "\nOptional model configuration.\n"
           },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers",
+            "description": "The extra HTTP headers for the requests in browser."
+          },
           "publish_workflow": {
             "type": "boolean",
             "title": "Publish Workflow",
@@ -7272,6 +7777,18 @@
             "title": "Include Action History In Verification",
             "description": "Whether to include action history when verifying that the task is complete",
             "default": false
+          },
+          "max_screenshot_scrolls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolls",
+            "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot."
           }
         },
         "type": "object",
@@ -7313,9 +7830,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -7400,6 +7915,45 @@
               "2025-01-01T00:05:00Z"
             ]
           },
+          "queued_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Queued At",
+            "description": "Timestamp when this run was queued"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At",
+            "description": "Timestamp when this run started execution"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At",
+            "description": "Timestamp when this run finished"
+          },
           "app_url": {
             "anyOf": [
               {
@@ -7416,16 +7970,44 @@
               "https://app.skyvern.com/workflows/wpid_123/wr_123"
             ]
           },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "ID of the Skyvern persistent browser session used for this run",
+            "examples": [
+              "pbs_123"
+            ]
+          },
+          "max_screenshot_scrolls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolls",
+            "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
+          },
           "run_type": {
             "type": "string",
             "enum": [
               "task_v1",
               "task_v2",
               "openai_cua",
-              "anthropic_cua"
+              "anthropic_cua",
+              "ui_tars"
             ],
             "title": "Run Type",
-            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua"
+            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
           },
           "run_request": {
             "anyOf": [
@@ -7656,7 +8238,7 @@
           "llm_key": {
             "type": "string",
             "title": "Llm Key",
-            "default": "AZURE_OPENAI"
+            "default": "AZURE_OPENAI_GPT4_1"
           },
           "prompt": {
             "type": "string",
@@ -7684,6 +8266,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -7699,6 +8284,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -7761,7 +8347,7 @@
           "llm_key": {
             "type": "string",
             "title": "Llm Key",
-            "default": "OPENAI_GPT4O_MINI"
+            "default": "GEMINI_2_5_FLASH_WITH_GPT_4_1_MINI_FALLBACK"
           },
           "prompt": {
             "type": "string",
@@ -8000,9 +8586,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -8063,6 +8647,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -8078,6 +8665,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -8298,9 +8886,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -8361,6 +8947,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -8376,6 +8965,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -8623,6 +9213,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -8638,6 +9231,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -8801,6 +9395,31 @@
             "$ref": "#/components/schemas/WorkflowStatus",
             "default": "published"
           },
+          "max_screenshot_scrolls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolls"
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -8923,6 +9542,31 @@
             "title": "Is Saved Task",
             "default": false
           },
+          "max_screenshot_scrolls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolls"
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers"
+          },
           "status": {
             "$ref": "#/components/schemas/WorkflowStatus",
             "default": "published"
@@ -8959,6 +9603,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -8974,6 +9621,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
                   "context": "#/components/schemas/ContextParameter",
                   "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
                   "output": "#/components/schemas/OutputParameter",
                   "workflow": "#/components/schemas/WorkflowParameter"
                 }
@@ -9041,6 +9689,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/FileUploadBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/HttpRequestBlock"
                 }
               ],
               "discriminator": {
@@ -9055,6 +9706,7 @@
                   "file_url_parser": "#/components/schemas/FileParserBlock",
                   "for_loop": "#/components/schemas/ForLoopBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
+                  "http_request": "#/components/schemas/HttpRequestBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
@@ -9097,6 +9749,9 @@
                   "$ref": "#/components/schemas/BitwardenCreditCardDataParameterYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameterYAML"
+                },
+                {
                   "$ref": "#/components/schemas/WorkflowParameterYAML"
                 },
                 {
@@ -9118,6 +9773,7 @@
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameterYAML",
                   "context": "#/components/schemas/ContextParameterYAML",
                   "credential": "#/components/schemas/CredentialParameterYAML",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameterYAML",
                   "output": "#/components/schemas/OutputParameterYAML",
                   "workflow": "#/components/schemas/WorkflowParameterYAML"
                 }
@@ -9185,6 +9841,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/TaskV2BlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/HttpRequestBlockYAML"
                 }
               ],
               "discriminator": {
@@ -9199,6 +9858,7 @@
                   "file_url_parser": "#/components/schemas/FileParserBlockYAML",
                   "for_loop": "#/components/schemas/ForLoopBlockYAML",
                   "goto_url": "#/components/schemas/UrlBlockYAML",
+                  "http_request": "#/components/schemas/HttpRequestBlockYAML",
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
@@ -9276,9 +9936,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -9379,9 +10037,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -9442,9 +10098,7 @@
             "type": "object",
             "title": "Parameters",
             "description": "Parameters to pass to the workflow",
-            "default": {
-
-            }
+            "default": {}
           },
           "title": {
             "anyOf": [
@@ -9467,7 +10121,7 @@
                 "type": "null"
               }
             ],
-            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n",
             "default": "RESIDENTIAL"
           },
           "webhook_url": {
@@ -9525,6 +10179,33 @@
             ],
             "title": "Browser Session Id",
             "description": "ID of a Skyvern browser session to reuse, having it continue from the current screen state"
+          },
+          "max_screenshot_scrolls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolls",
+            "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot."
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers",
+            "description": "The extra HTTP headers for the requests in browser."
           }
         },
         "type": "object",
@@ -9566,9 +10247,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -9653,6 +10332,45 @@
               "2025-01-01T00:05:00Z"
             ]
           },
+          "queued_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Queued At",
+            "description": "Timestamp when this run was queued"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At",
+            "description": "Timestamp when this run started execution"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At",
+            "description": "Timestamp when this run finished"
+          },
           "app_url": {
             "anyOf": [
               {
@@ -9668,6 +10386,33 @@
               "https://app.skyvern.com/tasks/tsk_123",
               "https://app.skyvern.com/workflows/wpid_123/wr_123"
             ]
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "ID of the Skyvern persistent browser session used for this run",
+            "examples": [
+              "pbs_123"
+            ]
+          },
+          "max_screenshot_scrolls": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolls",
+            "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
           },
           "run_type": {
             "type": "string",

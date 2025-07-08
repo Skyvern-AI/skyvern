@@ -10,6 +10,53 @@ LOG = structlog.get_logger()
 DEFAULT_REQUEST_TIMEOUT = 30
 
 
+async def aiohttp_request(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    data: dict[str, Any] | None = None,
+    json_data: dict[str, Any] | None = None,
+    cookies: dict[str, str] | None = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    follow_redirects: bool = True,
+    proxy: str | None = None,
+) -> tuple[int, dict[str, str], Any]:
+    """
+    Generic HTTP request function that supports all HTTP methods.
+
+    Returns:
+        Tuple of (status_code, response_headers, response_body)
+        where response_body can be dict (for JSON) or str (for text)
+    """
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        request_kwargs = {
+            "url": url,
+            "headers": headers or {},
+            "cookies": cookies,
+            "proxy": proxy,
+            "allow_redirects": follow_redirects,
+        }
+
+        # Handle body based on content type and method
+        if method.upper() != "GET":
+            if json_data is not None:
+                request_kwargs["json"] = json_data
+            elif data is not None:
+                request_kwargs["data"] = data
+
+        async with session.request(method.upper(), **request_kwargs) as response:
+            response_headers = dict(response.headers)
+
+            # Try to parse response as JSON
+            try:
+                response_body = await response.json()
+            except (aiohttp.ContentTypeError, Exception):
+                # If not JSON, get as text
+                response_body = await response.text()
+
+            return response.status, response_headers, response_body
+
+
 async def aiohttp_get_json(
     url: str,
     params: dict[str, Any] | None = None,

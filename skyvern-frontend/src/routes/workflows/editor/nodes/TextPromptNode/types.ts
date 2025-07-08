@@ -1,6 +1,7 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
 import { AppNode } from "..";
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type TextPromptNodeData = NodeBaseData & {
   prompt: string;
@@ -11,6 +12,7 @@ export type TextPromptNodeData = NodeBaseData & {
 export type TextPromptNode = Node<TextPromptNodeData, "textPrompt">;
 
 export const textPromptNodeDefaultData: TextPromptNodeData = {
+  debuggable: debuggableWorkflowBlockTypes.has("text_prompt"),
   editable: true,
   label: "",
   prompt: "",

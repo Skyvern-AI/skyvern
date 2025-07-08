@@ -5,7 +5,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
-from skyvern.webeye.actions.actions import ActionType
+from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.models import AgentStepOutput
 
 

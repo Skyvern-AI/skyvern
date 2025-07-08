@@ -86,6 +86,12 @@ class BitwardenCreditCardDataParameterYAML(ParameterYAML):
     bitwarden_item_id: str
 
 
+class OnePasswordCredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.ONEPASSWORD] = ParameterType.ONEPASSWORD  # type: ignore
+    vault_id: str
+    item_id: str
+
+
 class WorkflowParameterYAML(ParameterYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -365,11 +371,27 @@ class TaskV2BlockYAML(BlockYAML):
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
 
 
+class HttpRequestBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST  # type: ignore
+
+    # Individual HTTP parameters
+    method: str = "GET"
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    body: dict[str, Any] | None = None  # Changed to consistently be dict only
+    timeout: int = 30
+    follow_redirects: bool = True
+
+    # Parameter keys for templating
+    parameter_keys: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
     | BitwardenSensitiveInformationParameterYAML
     | BitwardenCreditCardDataParameterYAML
+    | OnePasswordCredentialParameterYAML
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
@@ -397,6 +419,7 @@ BLOCK_YAML_SUBCLASSES = (
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML
+    | HttpRequestBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
@@ -417,4 +440,6 @@ class WorkflowCreateYAMLRequest(BaseModel):
     model: dict[str, Any] | None = None
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
+    max_screenshot_scrolls: int | None = None
+    extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published

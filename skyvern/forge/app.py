@@ -15,6 +15,8 @@ from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace.lmnr import LaminarTrace
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
@@ -46,6 +48,14 @@ ANTHROPIC_CLIENT = AsyncAnthropic(api_key=SettingsManager.get_settings().ANTHROP
 if SettingsManager.get_settings().ENABLE_BEDROCK_ANTHROPIC:
     ANTHROPIC_CLIENT = AsyncAnthropicBedrock()
 
+# Add UI-TARS client setup
+UI_TARS_CLIENT = None
+if SettingsManager.get_settings().ENABLE_VOLCENGINE:
+    UI_TARS_CLIENT = AsyncOpenAI(
+        api_key=SettingsManager.get_settings().VOLCENGINE_API_KEY,
+        base_url=SettingsManager.get_settings().VOLCENGINE_API_BASE,
+    )
+
 SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
     SETTINGS_MANAGER.SECONDARY_LLM_KEY if SETTINGS_MANAGER.SECONDARY_LLM_KEY else SETTINGS_MANAGER.LLM_KEY
 )
@@ -68,3 +78,7 @@ authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
 
 agent = ForgeAgent()
+
+if SettingsManager.get_settings().TRACE_ENABLED:
+    if SettingsManager.get_settings().TRACE_PROVIDER == "lmnr":
+        TraceManager.set_trace_provider(LaminarTrace(api_key=SettingsManager.get_settings().TRACE_PROVIDER_API_KEY))

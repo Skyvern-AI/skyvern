@@ -108,7 +108,7 @@ services:
     # - GROQ_API_KEY=<your_groq_api_key>
     # - GROQ_MODEL=llama-3.1-8b-instant
 
-    # Maximum tokens to use: (only set for OpenRouter aand Ollama)
+    # Maximum tokens to use: (only set for OpenRouter and Ollama)
     # - LLM_CONFIG_MAX_TOKENS=128000
 
     # Bitwarden Settings
@@ -118,6 +118,10 @@ services:
     # - BITWARDEN_CLIENT_ID=FILL_ME_IN_PLEASE
     # - BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
     # - BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
+
+    # 1Password Integration
+    # If you are looking to integrate Skyvern with 1Password, you can use the following environment variables.
+    # OP_SERVICE_ACCOUNT_TOKEN=""
     depends_on:
       postgres:
         condition: service_healthy

@@ -117,7 +117,7 @@ function WorkflowParametersPanel() {
                 });
               }}
             >
-              Credit Card Data Parameter
+              Credit Card Parameter
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -141,7 +141,9 @@ function WorkflowParametersPanel() {
                         </span>
                       ) : (
                         <span className="text-sm text-slate-400">
-                          {parameter.parameterType}
+                          {parameter.parameterType === "onepassword"
+                            ? "credential"
+                            : parameter.parameterType}
                         </span>
                       )}
                     </div>
@@ -153,7 +155,10 @@ function WorkflowParametersPanel() {
                             active: true,
                             operation: "edit",
                             parameter: parameter,
-                            type: parameter.parameterType,
+                            type:
+                              parameter.parameterType === "onepassword"
+                                ? WorkflowEditorParameterTypes.Credential
+                                : parameter.parameterType,
                           });
                         }}
                       />

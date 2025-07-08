@@ -39,7 +39,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
 
 class BaseStorage(ABC):
     @abstractmethod
-    def build_uri(self, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
+    def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         pass
 
     @abstractmethod
@@ -47,26 +47,37 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def build_log_uri(self, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType) -> str:
+    def build_log_uri(
+        self, *, organization_id: str, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType
+    ) -> str:
         pass
 
     @abstractmethod
-    def build_thought_uri(self, artifact_id: str, thought: Thought, artifact_type: ArtifactType) -> str:
+    def build_thought_uri(
+        self, *, organization_id: str, artifact_id: str, thought: Thought, artifact_type: ArtifactType
+    ) -> str:
         pass
 
     @abstractmethod
-    def build_task_v2_uri(self, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType) -> str:
+    def build_task_v2_uri(
+        self, *, organization_id: str, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType
+    ) -> str:
         pass
 
     @abstractmethod
     def build_workflow_run_block_uri(
-        self, artifact_id: str, workflow_run_block: WorkflowRunBlock, artifact_type: ArtifactType
+        self,
+        *,
+        organization_id: str,
+        artifact_id: str,
+        workflow_run_block: WorkflowRunBlock,
+        artifact_type: ArtifactType,
     ) -> str:
         pass
 
     @abstractmethod
     def build_ai_suggestion_uri(
-        self, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
+        self, *, organization_id: str, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
     ) -> str:
         pass
 

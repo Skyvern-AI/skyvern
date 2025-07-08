@@ -21,10 +21,16 @@ if (!artifactApiBaseUrl) {
 
 const apiPathPrefix = import.meta.env.VITE_API_PATH_PREFIX ?? "";
 
+const lsKeys = {
+  browserSessionId: "skyvern.browserSessionId",
+  optimisticBrowserSession: "skyvern.optimisticBrowserSession",
+};
+
 export {
   apiBaseUrl,
   environment,
   envCredential,
   artifactApiBaseUrl,
   apiPathPrefix,
+  lsKeys,
 };

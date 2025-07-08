@@ -70,7 +70,7 @@ navigation:
             path: getting-started/quickstart.mdx
           - page: Skyvern In Action
             path: getting-started/skyvern-in-action.mdx
-          - page: Task Prompting Guide
+          - page: Prompting and Troubleshooting Guide
             path: getting-started/prompting-guide.mdx
       - section: Tasks
         contents:
@@ -134,6 +134,10 @@ navigation:
         contents:
           - page: Introduction
             path: browser-sessions/introduction.mdx
+      - section: Observability
+        contents:
+          - page: Overview
+            path: observability/overview.mdx
       - section: Integrations
         contents:
           - page: Skyvern MCP
@@ -161,26 +165,13 @@ navigation:
           - section: Workflows
             contents:
               - POST /v1/run/workflows
+              - GET /v1/runs/{run_id}
+              - POST /v1/runs/{run_id}/cancel
+              - POST /v1/runs/{run_id}/retry_webhook
               - GET /v1/workflows
               - POST /v1/workflows
               - POST /v1/workflows/{workflow_id}
               - POST /v1/workflows/{workflow_id}/delete
-          - section: Artifacts
-            contents:
-              - GET /v1/artifacts/{artifact_id}
-          - section: Browser Session
-            contents:
-              - GET /v1/browser_sessions
-              - POST /v1/browser_sessions
-              - POST /v1/browser_sessions/{browser_session_id}/close
-              - GET /v1/browser_sessions/{browser_session_id}
-          - section: Credentials
-            contents:
-              - POST /v1/credentials/totp
-              - GET /v1/credentials
-              - POST /v1/credentials
-              - POST /v1/credentials/{credential_id}/delete
-              - GET /v1/credentials/{credential_id}
   - tab: blog
   - tab: community
   - tab: github

@@ -5,7 +5,8 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType, SelectOption
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()

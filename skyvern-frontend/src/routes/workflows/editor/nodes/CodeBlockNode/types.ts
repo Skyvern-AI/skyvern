@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type CodeBlockNodeData = NodeBaseData & {
   code: string;
@@ -20,6 +21,7 @@ const codeLead = `
 `;
 
 export const codeBlockNodeDefaultData: CodeBlockNodeData = {
+  debuggable: debuggableWorkflowBlockTypes.has("code"),
   editable: true,
   label: "",
   code: codeLead,

@@ -13,9 +13,6 @@ import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import {
   Handle,
   NodeProps,
@@ -26,10 +23,7 @@ import {
 } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
 import { errorMappingExampleValue } from "../types";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { NavigationNode } from "./types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { AppNode } from "..";
@@ -37,32 +31,36 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
+import { useDebugStore } from "@/store/useDebugStore";
+import { cn } from "@/util/utils";
+import { useParams } from "react-router-dom";
+import { NodeHeader } from "../components/NodeHeader";
 
-function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
+function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
+  const { blockLabel: urlBlockLabel } = useParams();
+  const debugStore = useDebugStore();
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+  const { editable, debuggable, label } = data;
+  const thisBlockIsPlaying =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
+  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const [inputs, setInputs] = useState({
-    url: data.url,
-    navigationGoal: data.navigationGoal,
-    errorCodeMapping: data.errorCodeMapping,
-    maxStepsOverride: data.maxStepsOverride,
     allowDownloads: data.allowDownloads,
-    continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
-    downloadSuffix: data.downloadSuffix,
-    totpVerificationUrl: data.totpVerificationUrl,
-    totpIdentifier: data.totpIdentifier,
     completeCriterion: data.completeCriterion,
-    terminateCriterion: data.terminateCriterion,
+    continueOnFailure: data.continueOnFailure,
+    downloadSuffix: data.downloadSuffix,
     engine: data.engine,
-    model: data.model,
+    errorCodeMapping: data.errorCodeMapping,
     includeActionHistoryInVerification: data.includeActionHistoryInVerification,
+    maxStepsOverride: data.maxStepsOverride,
+    model: data.model,
+    navigationGoal: data.navigationGoal,
+    terminateCriterion: data.terminateCriterion,
+    totpIdentifier: data.totpIdentifier,
+    totpVerificationUrl: data.totpVerificationUrl,
+    url: data.url,
   });
-  const deleteNodeCallback = useDeleteNodeCallback();
 
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -92,33 +90,29 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <header className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.Navigation}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">Navigation Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </header>
-        <div className="space-y-4">
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsPlaying,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          editable={editable}
+          disabled={elideFromDebugging}
+          nodeId={id}
+          totpIdentifier={inputs.totpIdentifier}
+          totpUrl={inputs.totpVerificationUrl}
+          type={type}
+        />
+        <div
+          className={cn("space-y-4", {
+            "opacity-50": thisBlockIsPlaying,
+          })}
+        >
           <div className="space-y-2">
             <div className="flex justify-between">
               <div className="flex gap-2">
@@ -170,7 +164,13 @@ function NavigationNode({ id, data }: NodeProps<NavigationNode>) {
           </div>
         </div>
         <Separator />
-        <Accordion type="single" collapsible>
+        <Accordion
+          className={cn({
+            "pointer-events-none opacity-50": thisBlockIsPlaying,
+          })}
+          type="single"
+          collapsible
+        >
           <AccordionItem value="advanced" className="border-b-0">
             <AccordionTrigger className="py-0">
               Advanced Settings

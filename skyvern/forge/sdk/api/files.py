@@ -238,9 +238,7 @@ def calculate_sha256_for_file(file_path: str) -> str:
 
 def create_folder_if_not_exist(dir: str) -> None:
     path = Path(dir)
-    if path.exists():
-        return
-    path.mkdir(parents=True)
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def get_skyvern_temp_dir() -> str:

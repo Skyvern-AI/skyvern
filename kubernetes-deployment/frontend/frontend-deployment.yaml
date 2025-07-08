@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skyvern-frontend
+  namespace: skyvern
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: skyvern-frontend
+  template:
+    metadata:
+      labels:
+        app: skyvern-frontend
+    spec:
+      containers:
+        - name: skyvern-frontend
+          image: public.ecr.aws/skyvern/skyvern-ui:latest
+          ports:
+            - containerPort: 8080
+            - containerPort: 9090
+          envFrom:
+            - secretRef:
+                name: skyvern-frontend-env
+          volumeMounts:
+            - name: artifacts
+              mountPath: /data/artifacts
+            - name: videos
+              mountPath: /data/videos
+            - name: har
+              mountPath: /data/har
+            - name: streamlit
+              mountPath: /app/.streamlit
+      volumes:
+        - name: artifacts
+          hostPath:
+            path: /data/artifacts
+            type: DirectoryOrCreate
+        - name: videos
+          hostPath:
+            path: /data/videos
+            type: DirectoryOrCreate
+        - name: har
+          hostPath:
+            path: /data/har
+            type: DirectoryOrCreate
+        - name: streamlit
+          hostPath:
+            path: /app/.streamlit
+            type: DirectoryOrCreate

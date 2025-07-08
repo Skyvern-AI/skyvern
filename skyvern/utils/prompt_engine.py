@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.token_counter import count_tokens
-from skyvern.webeye.scraper.scraper import ScrapedPage
+from skyvern.webeye.scraper.scraper import ElementTreeBuilder
 
 LOG = structlog.get_logger()
 
@@ -20,22 +20,26 @@ class CheckPhoneNumberFormatResponse(BaseModel):
     recommended_phone_number: str | None
 
 
+HTMLTreeStr = str
+
+
 def load_prompt_with_elements(
-    scraped_page: ScrapedPage,
+    element_tree_builder: ElementTreeBuilder,
     prompt_engine: PromptEngine,
     template_name: str,
     html_need_skyvern_attrs: bool = True,
     **kwargs: Any,
 ) -> str:
+    elements = element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
     prompt = prompt_engine.load_prompt(
         template_name,
-        elements=scraped_page.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs),
+        elements=elements,
         **kwargs,
     )
     token_count = count_tokens(prompt)
-    if token_count > DEFAULT_MAX_TOKENS:
+    if token_count > DEFAULT_MAX_TOKENS and element_tree_builder.support_economy_elements_tree():
         # get rid of all the secondary elements like SVG, etc
-        economy_elements_tree = scraped_page.build_economy_elements_tree(
+        economy_elements_tree = element_tree_builder.build_economy_elements_tree(
             html_need_skyvern_attrs=html_need_skyvern_attrs
         )
         prompt = prompt_engine.load_prompt(template_name, elements=economy_elements_tree, **kwargs)
@@ -50,7 +54,7 @@ def load_prompt_with_elements(
         if economy_token_count > DEFAULT_MAX_TOKENS:
             # !!! HACK alert
             # dump the last 1/3 of the html context and keep the first 2/3 of the html context
-            economy_elements_tree_dumped = scraped_page.build_economy_elements_tree(
+            economy_elements_tree_dumped = element_tree_builder.build_economy_elements_tree(
                 html_need_skyvern_attrs=html_need_skyvern_attrs,
                 percent_to_keep=2 / 3,
             )

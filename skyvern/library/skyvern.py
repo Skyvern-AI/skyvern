@@ -136,11 +136,14 @@ class Skyvern(AsyncSkyvern):
             organization_id=organization.organization_id,
         )
         try:
+            context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+            current_run_id = context.run_id if context and context.run_id else task.task_id
             skyvern_context.set(
                 SkyvernContext(
                     organization_id=organization.organization_id,
                     organization_name=organization.organization_name,
                     task_id=task.task_id,
+                    run_id=current_run_id,
                     max_steps_override=max_steps,
                 )
             )

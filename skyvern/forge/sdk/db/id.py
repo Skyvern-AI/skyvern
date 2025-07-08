@@ -34,6 +34,7 @@ AWS_SECRET_PARAMETER_PREFIX = "asp"
 BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX = "bccd"
 BITWARDEN_LOGIN_CREDENTIAL_PARAMETER_PREFIX = "blc"
 BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
+CREDENTIAL_ONEPASSWORD_PARAMETER_PREFIX = "opp"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
@@ -104,6 +105,11 @@ def generate_bitwarden_sensitive_information_parameter_id() -> str:
 def generate_bitwarden_credit_card_data_parameter_id() -> str:
     int_id = generate_id()
     return f"{BITWARDEN_CREDIT_CARD_DATA_PARAMETER_PREFIX}_{int_id}"
+
+
+def generate_onepassword_credential_parameter_id() -> str:
+    int_id = generate_id()
+    return f"{CREDENTIAL_ONEPASSWORD_PARAMETER_PREFIX}_{int_id}"
 
 
 def generate_organization_auth_token_id() -> str:

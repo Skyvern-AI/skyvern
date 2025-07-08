@@ -1,3 +1,4 @@
+import asyncio
 from enum import Enum
 from typing import Annotated, Any
 
@@ -9,11 +10,13 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
+from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -74,6 +77,8 @@ from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.runs import (
     CUA_ENGINES,
+    BlockRunRequest,
+    BlockRunResponse,
     RunEngine,
     RunResponse,
     RunType,
@@ -83,7 +88,7 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
 )
 from skyvern.schemas.workflows import WorkflowRequest
-from skyvern.services import run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -165,6 +170,8 @@ async def run_task(
             totp_identifier=run_request.totp_identifier,
             include_action_history_in_verification=run_request.include_action_history_in_verification,
             model=run_request.model,
+            max_screenshot_scrolls=run_request.max_screenshot_scrolls,
+            extra_http_headers=run_request.extra_http_headers,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -202,6 +209,7 @@ async def run_task(
                 data_extraction_schema=task_v1_response.extracted_information_schema,
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
+                max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
     if run_request.engine == RunEngine.skyvern_v2:
@@ -220,7 +228,11 @@ async def run_task(
                 error_code_mapping=run_request.error_code_mapping,
                 create_task_run=True,
                 model=run_request.model,
+                max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
+                extra_http_headers=run_request.extra_http_headers,
             )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except LLMProviderError:
             LOG.error("LLM failure to initialize task v2", exc_info=True)
             raise HTTPException(
@@ -260,6 +272,7 @@ async def run_task(
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
+                max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
     LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
@@ -313,21 +326,27 @@ async def run_workflow(
         proxy_location=workflow_run_request.proxy_location,
         webhook_callback_url=workflow_run_request.webhook_url,
         totp_identifier=workflow_run_request.totp_identifier,
-        totp_url=workflow_run_request.totp_url,
+        totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
+        max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
+        extra_http_headers=workflow_run_request.extra_http_headers,
     )
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=legacy_workflow_request,
-        template=template,
-        version=None,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=legacy_workflow_request,
+            template=template,
+            version=None,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -667,6 +686,60 @@ async def delete_workflow(
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
 
 
+@legacy_base_router.post(
+    "/utilities/curl-to-http",
+    tags=["Utilities"],
+    openapi_extra={
+        "x-fern-sdk-group-name": "utilities",
+        "x-fern-sdk-method-name": "convert_curl_to_http",
+    },
+    description="Convert a curl command to HTTP request parameters",
+    summary="Convert curl to HTTP parameters",
+    responses={
+        200: {"description": "Successfully converted curl command"},
+        400: {"description": "Invalid curl command"},
+    },
+)
+@legacy_base_router.post("/utilities/curl-to-http/", include_in_schema=False)
+async def convert_curl_to_http(
+    request: dict[str, str],
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, Any]:
+    """
+    Convert a curl command to HTTP request parameters.
+
+    This endpoint is useful for converting curl commands to the format
+    needed by the HTTP Request workflow block.
+
+    Request body should contain:
+    - curl_command: The curl command string to convert
+
+    Returns:
+    - method: HTTP method
+    - url: The URL
+    - headers: Dict of headers
+    - body: Request body as dict
+    - timeout: Default timeout
+    - follow_redirects: Default follow redirects setting
+    """
+    curl_command = request.get("curl_command")
+    if not curl_command:
+        raise HTTPException(status_code=400, detail="curl_command is required in the request body")
+
+    try:
+        result = curl_to_http_request_block_params(curl_command)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        LOG.error(
+            "Failed to convert curl command",
+            error=str(e),
+            organization_id=current_org.organization_id,
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to convert curl command: {str(e)}")
+
+
 @base_router.get(
     "/artifacts/{artifact_id}",
     tags=["Artifacts"],
@@ -709,6 +782,56 @@ async def get_artifact(
     return artifact
 
 
+@base_router.get(
+    "/runs/{run_id}/artifacts",
+    tags=["Artifacts"],
+    response_model=list[Artifact],
+    openapi_extra={
+        "x-fern-sdk-group-name": "artifacts",
+        "x-fern-sdk-method-name": "get_run_artifacts",
+    },
+    description="Get artifacts for a run",
+    summary="Get artifacts for a run",
+)
+@base_router.get("/runs/{run_id}/artifacts/", response_model=list[Artifact], include_in_schema=False)
+async def get_run_artifacts(
+    run_id: str = Path(..., description="The id of the task run or the workflow run."),
+    artifact_type: Annotated[list[ArtifactType] | None, Query()] = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    analytics.capture("skyvern-oss-run-artifacts-get")
+    # Get artifacts as a list (not grouped by type)
+    artifacts = await app.DATABASE.get_artifacts_for_run(
+        run_id=run_id,
+        organization_id=current_org.organization_id,
+        artifact_types=artifact_type,
+        group_by_type=False,  # This ensures we get a list, not a dict
+    )
+
+    # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
+    artifacts_list = artifacts if isinstance(artifacts, list) else []
+
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        # Get signed URLs for all artifacts
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
+
+        if signed_urls and len(signed_urls) == len(artifacts_list):
+            for i, artifact in enumerate(artifacts_list):
+                if hasattr(artifact, "signed_url"):
+                    artifact.signed_url = signed_urls[i]
+        elif signed_urls:
+            LOG.warning(
+                "Mismatch between artifacts and signed URLs count",
+                artifacts_count=len(artifacts_list),
+                urls_count=len(signed_urls),
+                run_id=run_id,
+            )
+        else:
+            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+
+    return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
+
+
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
     tags=["Agent"],
@@ -728,6 +851,57 @@ async def retry_run_webhook(
 ) -> None:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
     await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
+
+@base_router.post(
+    "/run/workflows/blocks",
+    include_in_schema=False,
+    response_model=BlockRunResponse,
+)
+async def run_block(
+    block_run_request: BlockRunRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> BlockRunResponse:
+    """
+    Kick off the execution of one or more blocks in a workflow. Returns the
+    workflow_run_id.
+    """
+
+    workflow_run = await block_service.ensure_workflow_run(
+        organization=organization,
+        template=template,
+        workflow_permanent_id=block_run_request.workflow_id,
+        workflow_run_request=block_run_request,
+    )
+
+    browser_session_id = block_run_request.browser_session_id
+
+    asyncio.create_task(
+        block_service.execute_blocks(
+            api_key=x_api_key or "",
+            block_labels=block_run_request.block_labels,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization=organization,
+            browser_session_id=browser_session_id,
+        )
+    )
+
+    return BlockRunResponse(
+        block_labels=block_run_request.block_labels,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        status=str(workflow_run.status),
+        output=None,
+        failure_reason=workflow_run.failure_reason,
+        created_at=workflow_run.created_at,
+        modified_at=workflow_run.modified_at,
+        run_request=block_run_request,
+        downloaded_files=None,
+        recording_url=None,
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+    )
 
 
 ################# Legacy Endpoints #################
@@ -1128,13 +1302,10 @@ async def get_artifacts(
         )
 
     analytics.capture("skyvern-oss-agent-entity-artifacts-get")
-
     params = {
-        "organization_id": current_org.organization_id,
         entity_type_to_param[entity_type]: entity_id,
     }
-
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
@@ -1253,18 +1424,21 @@ async def run_workflow_legacy(
         browser_session_id=workflow_request.browser_session_id,
     )
 
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=workflow_request,
-        template=template,
-        version=version,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=workflow_request,
+            template=template,
+            version=version,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return RunWorkflowResponse(
         workflow_id=workflow_id,
@@ -1357,12 +1531,24 @@ async def get_workflow_run_with_workflow_id(
         include_cost=True,
     )
     return_dict = workflow_run_status_response.model_dump()
+
+    browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+
+    return_dict["browser_session_id"] = browser_session_id
+
     task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
+
     if task_v2:
         return_dict["task_v2"] = task_v2.model_dump(by_alias=True)
+
     return return_dict
 
 
@@ -1746,7 +1932,12 @@ async def run_task_v2(
             create_task_run=True,
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
+            max_screenshot_scrolling_times=data.max_screenshot_scrolls,
+            browser_session_id=data.browser_session_id,
+            extra_http_headers=data.extra_http_headers,
         )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except LLMProviderError:
         LOG.error("LLM failure to initialize task v2", exc_info=True)
         raise HTTPException(

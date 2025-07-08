@@ -61,6 +61,17 @@ export type BitwardenCreditCardDataParameter = WorkflowParameterBase & {
   deleted_at: string | null;
 };
 
+export type OnePasswordCredentialParameter = WorkflowParameterBase & {
+  parameter_type: "onepassword";
+  workflow_id: string;
+  onepassword_credential_parameter_id: string;
+  vault_id: string;
+  item_id: string;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+};
+
 export type CredentialParameter = WorkflowParameterBase & {
   parameter_type: "credential";
   workflow_id: string;
@@ -118,6 +129,7 @@ export const WorkflowParameterTypes = {
   Bitwarden_Login_Credential: "bitwarden_login_credential",
   Bitwarden_Sensitive_Information: "bitwarden_sensitive_information",
   Bitwarden_Credit_Card_Data: "bitwarden_credit_card_data",
+  OnePassword: "onepassword",
   Credential: "credential",
 } as const;
 
@@ -132,6 +144,7 @@ export function isDisplayedInWorkflowEditor(
   | BitwardenCreditCardDataParameter
   | BitwardenLoginCredentialParameter
   | BitwardenSensitiveInformationParameter
+  | OnePasswordCredentialParameter
   | CredentialParameter {
   return (
     parameter.parameter_type === WorkflowParameterTypes.Workflow ||
@@ -142,6 +155,7 @@ export function isDisplayedInWorkflowEditor(
       WorkflowParameterTypes.Bitwarden_Sensitive_Information ||
     parameter.parameter_type ===
       WorkflowParameterTypes.Bitwarden_Credit_Card_Data ||
+    parameter.parameter_type === WorkflowParameterTypes.OnePassword ||
     parameter.parameter_type === WorkflowParameterTypes.Credential
   );
 }
@@ -153,6 +167,7 @@ export type Parameter =
   | BitwardenLoginCredentialParameter
   | BitwardenSensitiveInformationParameter
   | BitwardenCreditCardDataParameter
+  | OnePasswordCredentialParameter
   | AWSSecretParameter
   | CredentialParameter;
 
@@ -199,6 +214,18 @@ export const WorkflowBlockTypes = {
   URL: "goto_url",
 } as const;
 
+export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
+  "action",
+  "extraction",
+  "goto_url",
+  "login",
+  "navigation",
+  "task",
+  "task_v2",
+  "text_prompt",
+  "validation",
+]);
+
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
 }): boolean {
@@ -222,6 +249,7 @@ export const WorkflowEditorParameterTypes = {
   Secret: "secret",
   Context: "context",
   CreditCardData: "creditCardData",
+  OnePassword: "onepassword",
 } as const;
 
 export type WorkflowEditorParameterType =
@@ -450,10 +478,12 @@ export type WorkflowApiResponse = {
   workflow_definition: WorkflowDefinition;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
+  extra_http_headers: Record<string, string> | null;
   persist_browser_session: boolean;
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
+  max_screenshot_scrolls: number | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
@@ -464,6 +494,8 @@ export type WorkflowSettings = {
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
+  maxScreenshotScrolls: number | null;
+  extraHttpHeaders: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;
