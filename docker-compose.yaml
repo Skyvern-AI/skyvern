@@ -94,11 +94,11 @@ services:
       # Maximum tokens to use: (only set for OpenRouter and Ollama)
       # - LLM_CONFIG_MAX_TOKENS=128000
       # Bitwarden (or Vaultwarden) Settings
-      - BITWARDEN_SERVER: ${BITWARDEN_SERVER}
+      - BITWARDEN_SERVER=${BITWARDEN_SERVER}
       - BITWARDEN_SERVER_PORT: 8002
-      - BITWARDEN_CLIENT_ID: ${BITWARDEN_CLIENT_ID}
-      - BITWARDEN_CLIENT_SECRET: ${BITWARDEN_CLIENT_SECRET}
-      - BITWARDEN_MASTER_PASSWORD: ${BITWARDEN_MASTER_PASSWORD}
+      - BITWARDEN_CLIENT_ID=${BITWARDEN_CLIENT_ID}
+      - BITWARDEN_CLIENT_SECRET=${BITWARDEN_CLIENT_SECRET}
+      - BITWARDEN_MASTER_PASSWORD=${BITWARDEN_MASTER_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
@@ -138,8 +138,8 @@ services:
     environment:
     # Declare the Service FQDN in Coolify
       - VITE_ENABLE_CODE_BLOCK=true
-      - API_DOMAIN: ${API_DOMAIN}
-      - ARTIFACT_DOMAIN: ${ARTIFACT_DOMAIN}
+      - API_DOMAIN=${API_DOMAIN}
+      - ARTIFACT_DOMAIN=${ARTIFACT_DOMAIN}
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip
     # If you're self-hosting this behind a dns, you'll want to set:
