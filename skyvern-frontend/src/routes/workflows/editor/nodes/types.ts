@@ -2,6 +2,7 @@ import { WorkflowBlockType } from "../../types/workflowTypes";
 import type { WorkflowModel } from "../../types/workflowTypes";
 
 export type NodeBaseData = {
+  debuggable: boolean;
   label: string;
   continueOnFailure: boolean;
   editable: boolean;

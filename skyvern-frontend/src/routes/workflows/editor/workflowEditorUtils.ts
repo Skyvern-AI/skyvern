@@ -99,6 +99,8 @@ import {
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
@@ -205,6 +207,7 @@ function convertToNode(
     connectable: false,
   };
   const commonData: NodeBaseData = {
+    debuggable: debuggableWorkflowBlockTypes.has(block.block_type),
     label: block.label,
     continueOnFailure: block.continue_on_failure,
     editable,
