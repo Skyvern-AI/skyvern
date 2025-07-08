@@ -1,6 +1,7 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
 import { RunEngine } from "@/api/types";
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type LoginNodeData = NodeBaseData & {
   url: string;
@@ -20,6 +21,7 @@ export type LoginNodeData = NodeBaseData & {
 export type LoginNode = Node<LoginNodeData, "login">;
 
 export const loginNodeDefaultData: LoginNodeData = {
+  debuggable: debuggableWorkflowBlockTypes.has("login"),
   label: "",
   url: "",
   navigationGoal:
