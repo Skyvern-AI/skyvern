@@ -13,9 +13,6 @@ import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import {
   Handle,
   NodeProps,
@@ -28,30 +25,30 @@ import { useState } from "react";
 import { AppNode } from "..";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
 import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode } from "./types";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
+import { useDebugStore } from "@/store/useDebugStore";
+import { cn } from "@/util/utils";
+import { NodeHeader } from "../components/NodeHeader";
+import { useParams } from "react-router-dom";
 
-function TaskNode({ id, data }: NodeProps<TaskNode>) {
+function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const { debuggable, editable, label } = data;
+  const debugStore = useDebugStore();
+  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { blockLabel: urlBlockLabel } = useParams();
+  const thisBlockIsPlaying =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
 
   const [inputs, setInputs] = useState({
     url: data.url,
@@ -95,32 +92,24 @@ function TaskNode({ id, data }: NodeProps<TaskNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-2 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <div className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.Task}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">Task Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </div>
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsPlaying,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          disabled={elideFromDebugging}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={inputs.totpIdentifier}
+          totpUrl={inputs.totpVerificationUrl}
+          type={type}
+        />
         <Accordion type="multiple" defaultValue={["content", "extraction"]}>
           <AccordionItem value="content">
             <AccordionTrigger>Content</AccordionTrigger>

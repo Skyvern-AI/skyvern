@@ -1,5 +1,4 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { ExtractIcon } from "@/components/icons/ExtractIcon";
 import {
   Accordion,
   AccordionContent,
@@ -10,8 +9,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import {
   Handle,
   NodeProps,
@@ -21,8 +18,6 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import { useState } from "react";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
 import { dataSchemaExampleValue } from "../types";
 import type { ExtractionNode } from "./types";
 
@@ -35,14 +30,19 @@ import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
+import { useDebugStore } from "@/store/useDebugStore";
+import { cn } from "@/util/utils";
+import { NodeHeader } from "../components/NodeHeader";
+import { useParams } from "react-router-dom";
 
-function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
+function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+  const { debuggable, editable, label } = data;
+  const debugStore = useDebugStore();
+  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { blockLabel: urlBlockLabel } = useParams();
+  const thisBlockIsPlaying =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
   const [inputs, setInputs] = useState({
     url: data.url,
     dataExtractionGoal: data.dataExtractionGoal,
@@ -53,7 +53,6 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
     engine: data.engine,
     model: data.model,
   });
-  const deleteNodeCallback = useDeleteNodeCallback();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
@@ -82,29 +81,24 @@ function ExtractionNode({ id, data }: NodeProps<ExtractionNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <header className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <ExtractIcon className="size-6" />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">Extraction Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </header>
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsPlaying,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          disabled={elideFromDebugging}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={null}
+          totpUrl={null}
+          type={type}
+        />
         <div className="space-y-2">
           <div className="flex justify-between">
             <div className="flex gap-2">

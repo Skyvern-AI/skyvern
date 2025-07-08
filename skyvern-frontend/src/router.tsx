@@ -22,11 +22,16 @@ import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/Workfl
 import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
+import { DebugStoreProvider } from "@/store/DebugStoreContext";
 
 const router = createBrowserRouter([
   {
     path: "/",
-    element: <RootLayout />,
+    element: (
+      <DebugStoreProvider>
+        <RootLayout />
+      </DebugStoreProvider>
+    ),
     children: [
       {
         index: true,
@@ -97,6 +102,14 @@ const router = createBrowserRouter([
               {
                 index: true,
                 element: <Navigate to="runs" />,
+              },
+              {
+                path: "debug",
+                element: <WorkflowEditor />,
+              },
+              {
+                path: ":workflowRunId/:blockLabel/debug",
+                element: <WorkflowEditor />,
               },
               {
                 path: "edit",
