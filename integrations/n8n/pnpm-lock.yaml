@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      braces:
+        specifier: ^3.0.3
+        version: 3.0.3
       n8n-workflow:
         specifier: ^1.82.0
         version: 1.82.0
