@@ -1,5 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type LoopNodeData = NodeBaseData & {
   loopValue: string;
@@ -10,6 +11,7 @@ export type LoopNodeData = NodeBaseData & {
 export type LoopNode = Node<LoopNodeData, "loop">;
 
 export const loopNodeDefaultData: LoopNodeData = {
+  debuggable: debuggableWorkflowBlockTypes.has("for_loop"),
   editable: true,
   label: "",
   loopValue: "",

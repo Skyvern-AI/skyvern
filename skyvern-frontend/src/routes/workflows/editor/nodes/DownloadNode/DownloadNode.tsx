@@ -1,22 +1,21 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import type { DownloadNode } from "./types";
+import { useDebugStore } from "@/store/useDebugStore";
+import { cn } from "@/util/utils";
+import { NodeHeader } from "../components/NodeHeader";
+import { useParams } from "react-router-dom";
 
 function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const { debuggable, editable, label } = data;
+  const debugStore = useDebugStore();
+  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { blockLabel: urlBlockLabel } = useParams();
+  const thisBlockIsPlaying =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
 
   return (
     <div>
@@ -32,32 +31,24 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <div className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.DownloadToS3}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={data.editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">Download Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </div>
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsPlaying,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          disabled={elideFromDebugging}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={null}
+          totpUrl={null}
+          type="file_download" // sic: the naming is not consistent
+        />
         <div className="space-y-4">
           <div className="space-y-2">
             <div className="flex items-center gap-2">

@@ -214,6 +214,18 @@ export const WorkflowBlockTypes = {
   URL: "goto_url",
 } as const;
 
+export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
+  "action",
+  "extraction",
+  "goto_url",
+  "login",
+  "navigation",
+  "task",
+  "task_v2",
+  "text_prompt",
+  "validation",
+]);
+
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
 }): boolean {

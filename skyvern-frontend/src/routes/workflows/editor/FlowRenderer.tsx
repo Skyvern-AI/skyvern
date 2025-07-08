@@ -10,8 +10,10 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useOnChange } from "@/hooks/useOnChange";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
+import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
@@ -22,10 +24,12 @@ import {
   Controls,
   Edge,
   Panel,
+  PanOnScrollMode,
   ReactFlow,
   useEdgesState,
   useNodesInitialized,
   useNodesState,
+  useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { AxiosError } from "axios";
@@ -35,6 +39,7 @@ import { useBlocker, useParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import {
   AWSSecretParameter,
+  debuggableWorkflowBlockTypes,
   WorkflowApiResponse,
   WorkflowEditorParameterTypes,
   WorkflowParameterTypes,
@@ -91,7 +96,7 @@ import {
   nodeAdderNode,
   startNode,
 } from "./workflowEditorUtils";
-
+import { cn } from "@/util/utils";
 import { useAutoPan } from "./useAutoPan";
 
 function convertToParametersYAML(
@@ -254,6 +259,8 @@ function FlowRenderer({
   initialParameters,
   workflow,
 }: Props) {
+  const reactFlowInstance = useReactFlow();
+  const debugStore = useDebugStore();
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -264,6 +271,7 @@ function FlowRenderer({
   const [parameters, setParameters] =
     useState<ParametersState>(initialParameters);
   const [title, setTitle] = useState(initialTitle);
+  const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
   const nodesInitialized = useNodesInitialized();
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
   useShouldNotifyWhenClosingTab(hasChanges);
@@ -378,6 +386,14 @@ function FlowRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
+
+  useEffect(() => {
+    const blocks = getWorkflowBlocks(nodes, edges);
+    const debuggable = blocks.filter((block) =>
+      debuggableWorkflowBlockTypes.has(block.block_type),
+    );
+    setDebuggableBlockCount(debuggable.length);
+  }, [nodes, edges]);
 
   async function handleSave() {
     const blocks = getWorkflowBlocks(nodes, edges);
@@ -590,6 +606,47 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
 
+  const zoomLock = 1 as const;
+  const yLockMax = 140 as const;
+
+  /**
+   * TODO(jdo): hack
+   */
+  const getXLock = () => {
+    const hasForLoopNode = nodes.some((node) => node.type === "loop");
+    return hasForLoopNode ? 24 : 104;
+  };
+
+  useOnChange(debugStore.isDebugMode, (newValue) => {
+    const xLock = getXLock();
+    if (newValue) {
+      const currentY = reactFlowInstance.getViewport().y;
+      reactFlowInstance.setViewport({ x: xLock, y: currentY, zoom: zoomLock });
+    }
+  });
+
+  const constrainPan = (y: number) => {
+    const yLockMin = nodes.reduce(
+      (acc, node) => {
+        const nodeBottom = node.position.y + (node.height ?? 0);
+        if (nodeBottom > acc.value) {
+          return { value: nodeBottom };
+        }
+        return acc;
+      },
+      { value: -Infinity },
+    );
+
+    const yLockMinValue = yLockMin.value;
+    const xLock = getXLock();
+    const newY = Math.max(-yLockMinValue + yLockMax, Math.min(yLockMax, y));
+    reactFlowInstance.setViewport({
+      x: xLock,
+      y: newY,
+      zoom: zoomLock,
+    });
+  };
+
   return (
     <>
       <Dialog
@@ -677,16 +734,33 @@ function FlowRenderer({
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             colorMode="dark"
-            fitView
+            fitView={!debugStore.isDebugMode}
             fitViewOptions={{
               maxZoom: 1,
             }}
             deleteKeyCode={null}
+            onMove={(_, viewport) => {
+              const y = viewport.y;
+              debugStore.isDebugMode && constrainPan(y);
+            }}
+            maxZoom={debugStore.isDebugMode ? 1 : 2}
+            minZoom={debugStore.isDebugMode ? 1 : 0.5}
+            panOnDrag={!debugStore.isDebugMode}
+            panOnScroll={debugStore.isDebugMode}
+            panOnScrollMode={
+              debugStore.isDebugMode
+                ? PanOnScrollMode.Vertical
+                : PanOnScrollMode.Free
+            }
+            zoomOnDoubleClick={!debugStore.isDebugMode}
+            zoomOnPinch={!debugStore.isDebugMode}
+            zoomOnScroll={!debugStore.isDebugMode}
           >
             <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
             <Controls position="bottom-left" />
-            <Panel position="top-center" className="h-20">
+            <Panel position="top-center" className={cn("h-20")}>
               <WorkflowHeader
+                debuggableBlockCount={debuggableBlockCount}
                 title={title}
                 saving={saveWorkflowMutation.isPending}
                 onTitleChange={(newTitle) => {
