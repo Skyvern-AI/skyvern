@@ -8,6 +8,7 @@ import {
   EnvelopeClosedIcon,
   ExternalLinkIcon,
   FileTextIcon,
+  GlobeIcon,
   ListBulletIcon,
   LockOpen1Icon,
   StopwatchIcon,
@@ -78,6 +79,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "goto_url": {
       return <ExternalLinkIcon className={className} />;
+    }
+    case "http_request": {
+      return <GlobeIcon className={className} />;
     }
   }
 }
