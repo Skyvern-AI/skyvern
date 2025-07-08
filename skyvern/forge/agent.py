@@ -71,6 +71,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -268,6 +269,9 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
+    @TraceManager.traced_async(
+        ignore_inputs=["api_key", "close_browser_on_completion", "task_block", "cua_response", "llm_caller"]
+    )
     async def execute_step(
         self,
         organization: Organization,
@@ -428,8 +432,9 @@ class ForgeAgent:
                 if not llm_caller:
                     # create a new UI-TARS llm_caller
                     llm_key = task.llm_key or settings.VOLCENGINE_CUA_LLM_KEY
-                    llm_caller = UITarsLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=True)
-                    llm_caller.initialize_conversation(task)
+                    ui_tars_llm_caller = UITarsLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=True)
+                    ui_tars_llm_caller.initialize_conversation(task)
+                    llm_caller = ui_tars_llm_caller
 
             # TODO: remove the code after migrating everything to llm callers
             # currently, only anthropic cua and ui_tars tasks use llm_caller
@@ -829,6 +834,9 @@ class ForgeAgent:
             )
             return True
 
+    @TraceManager.traced_async(
+        ignore_inputs=["browser_state", "organization", "task_block", "cua_response", "llm_caller"]
+    )
     async def agent_step(
         self,
         task: Task,

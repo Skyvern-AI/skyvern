@@ -15,6 +15,8 @@ from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace.lmnr import LaminarTrace
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
@@ -76,3 +78,7 @@ authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
 
 agent = ForgeAgent()
+
+if SettingsManager.get_settings().TRACE_ENABLED:
+    if SettingsManager.get_settings().TRACE_PROVIDER == "lmnr":
+        TraceManager.set_trace_provider(LaminarTrace(api_key=SettingsManager.get_settings().TRACE_PROVIDER_API_KEY))

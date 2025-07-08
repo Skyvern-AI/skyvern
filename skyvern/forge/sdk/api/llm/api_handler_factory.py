@@ -31,6 +31,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
 LOG = structlog.get_logger()
@@ -89,6 +90,7 @@ class LLMAPIHandlerFactory:
         )
         main_model_group = llm_config.main_model_group
 
+        @TraceManager.traced_async(tags=[llm_key], ignore_inputs=["prompt", "screenshots", "parameters"])
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             prompt_name: str,
@@ -286,6 +288,7 @@ class LLMAPIHandlerFactory:
 
         assert isinstance(llm_config, LLMConfig)
 
+        @TraceManager.traced_async(tags=[llm_key], ignore_inputs=["prompt", "screenshots", "parameters"])
         async def llm_api_handler(
             prompt: str,
             prompt_name: str,
@@ -743,6 +746,7 @@ class LLMCaller:
             return get_resize_target_dimension(window_dimension)
         return self.screenshot_resize_target_dimension
 
+    @TraceManager.traced_async(ignore_input=True)
     async def _dispatch_llm_call(
         self,
         messages: list[dict[str, Any]],

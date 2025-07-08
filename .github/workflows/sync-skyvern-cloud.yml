@@ -43,7 +43,7 @@ jobs:
               ;;
             Prakashmaheshwaran)
               echo "GH_PAT=${{ secrets.KASH_GH_PAT }}" >> $GITHUB_OUTPUT
-              echo "GIT_EMAIL=kash@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=diinoprakash@gmail.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=Prakash Maheshwaran" >> $GITHUB_OUTPUT
               ;;
             *)

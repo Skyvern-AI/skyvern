@@ -18,6 +18,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
@@ -538,6 +539,7 @@ class AgentFunction:
     ) -> CleanupElementTreeFunc:
         MAX_ELEMENT_CNT = 3000
 
+        @TraceManager.traced_async(ignore_input=True)
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
             Remove rect and attribute.unique_id from the elements.
