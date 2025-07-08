@@ -7,6 +7,7 @@ import {
   WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
+  debuggableWorkflowBlockTypes,
   type AWSSecretParameter,
   type OutputParameter,
   type Parameter,
@@ -37,6 +38,7 @@ import {
   Taskv2BlockYAML,
   URLBlockYAML,
   FileUploadBlockYAML,
+  HttpRequestBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -99,7 +101,7 @@ import {
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
-import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+import { httpRequestNodeDefaultData } from "./nodes/HttpRequestNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -529,6 +531,23 @@ function convertToNode(
         },
       };
     }
+    case "http_request": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "http_request",
+        data: {
+          ...commonData,
+          method: block.method,
+          url: block.url ?? "",
+          headers: JSON.stringify(block.headers || {}, null, 2),
+          body: JSON.stringify(block.body || {}, null, 2),
+          timeout: block.timeout,
+          followRedirects: block.follow_redirects,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
   }
 }
 
@@ -951,6 +970,17 @@ function createNode(
         },
       };
     }
+    case "http_request": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "http_request",
+        data: {
+          ...httpRequestNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -1231,6 +1261,22 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "goto_url",
         url: node.data.url,
+      };
+    }
+    case "http_request": {
+      return {
+        ...base,
+        block_type: "http_request",
+        method: node.data.method,
+        url: node.data.url,
+        headers: JSONParseSafe(node.data.headers) as Record<
+          string,
+          string
+        > | null,
+        body: JSONParseSafe(node.data.body) as Record<string, unknown> | null,
+        timeout: node.data.timeout,
+        follow_redirects: node.data.followRedirects,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     default: {
@@ -1983,6 +2029,20 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "goto_url",
           url: block.url,
+        };
+        return blockYaml;
+      }
+      case "http_request": {
+        const blockYaml: HttpRequestBlockYAML = {
+          ...base,
+          block_type: "http_request",
+          method: block.method,
+          url: block.url,
+          headers: block.headers,
+          body: block.body,
+          timeout: block.timeout,
+          follow_redirects: block.follow_redirects,
+          parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
       }
