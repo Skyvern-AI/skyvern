@@ -592,6 +592,40 @@ class SkyvernElement:
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
 
+    async def check(self, delay: int = 2, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        # HACK: sometimes playwright will raise exception when checking the element.
+        # we need to trigger the hack to check again in several seconds
+        try:
+            await self.get_locator().check(timeout=timeout)
+        except Exception:
+            LOG.info(
+                f"Failed to check the element at the first time, trigger the hack to check again in {delay} seconds",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            await asyncio.sleep(delay)
+            if await self.get_locator().count() == 0:
+                LOG.info("Element is not on the page, the checking should work", element_id=self.get_id())
+                return
+            await self.get_locator().check(timeout=timeout)
+
+    async def uncheck(self, delay: int = 2, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        # HACK: sometimes playwright will raise exception when unchecking the element.
+        # we need to trigger the hack to uncheck again in several seconds
+        try:
+            await self.get_locator().uncheck(timeout=timeout)
+        except Exception:
+            LOG.info(
+                f"Failed to uncheck the element at the first time, trigger the hack to uncheck again in {delay} seconds",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            await asyncio.sleep(delay)
+            if await self.get_locator().count() == 0:
+                LOG.info("Element is not on the page, the unchecking should work", element_id=self.get_id())
+                return
+            await self.get_locator().uncheck(timeout=timeout)
+
     async def move_mouse_to_safe(
         self,
         page: Page,
