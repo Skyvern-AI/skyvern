@@ -12,9 +12,6 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { DownloadIcon } from "@radix-ui/react-icons";
 import {
   Handle,
   NodeProps,
@@ -25,8 +22,6 @@ import {
 } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
 import { errorMappingExampleValue } from "../types";
 import type { FileDownloadNode } from "./types";
 import { AppNode } from "..";
@@ -35,6 +30,10 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
+import { useDebugStore } from "@/store/useDebugStore";
+import { cn } from "@/util/utils";
+import { NodeHeader } from "../components/NodeHeader";
+import { useParams } from "react-router-dom";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -45,11 +44,12 @@ const navigationGoalPlaceholder = "Tell Skyvern which file to download.";
 
 function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+  const { debuggable, editable, label } = data;
+  const debugStore = useDebugStore();
+  const { blockLabel: urlBlockLabel } = useParams();
+  const thisBlockIsPlaying =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
+  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const [inputs, setInputs] = useState({
     url: data.url,
     navigationGoal: data.navigationGoal,
@@ -63,14 +63,10 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
     engine: data.engine,
     model: data.model,
   });
-  const deleteNodeCallback = useDeleteNodeCallback();
-
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
   function handleChange(key: string, value: unknown) {
     if (!editable) {
       return;
@@ -93,31 +89,24 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <header className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <DownloadIcon className="size-6" />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">
-                File Download Block
-              </span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </header>
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsPlaying,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          disabled={elideFromDebugging}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={inputs.totpIdentifier}
+          totpUrl={inputs.totpVerificationUrl}
+          type="file_download" // sic: the naming for this block is not consistent
+        />
         <div className="space-y-4">
           <div className="space-y-2">
             <div className="flex justify-between">

@@ -2,6 +2,7 @@ import { WorkflowBlockType } from "../../types/workflowTypes";
 import type { WorkflowModel } from "../../types/workflowTypes";
 
 export type NodeBaseData = {
+  debuggable: boolean;
   label: string;
   continueOnFailure: boolean;
   editable: boolean;
@@ -51,4 +52,5 @@ export const workflowBlockTitle: {
   pdf_parser: "PDF Parser",
   task_v2: "Task v2",
   goto_url: "Go to URL",
+  http_request: "HTTP Request",
 };

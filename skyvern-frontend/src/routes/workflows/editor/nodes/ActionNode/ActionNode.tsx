@@ -6,8 +6,6 @@ import {
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import {
   Handle,
   NodeProps,
@@ -17,8 +15,6 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import { useState } from "react";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
 import type { ActionNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -28,14 +24,16 @@ import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
+import { useDebugStore } from "@/store/useDebugStore";
+import { cn } from "@/util/utils";
+import { useParams } from "react-router-dom";
+import { NodeHeader } from "../components/NodeHeader";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -44,13 +42,9 @@ const navigationGoalTooltip =
 
 const navigationGoalPlaceholder = 'Input {{ name }} into "Name" field.';
 
-function ActionNode({ id, data }: NodeProps<ActionNode>) {
+function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+  const { editable, debuggable, label } = data;
   const [inputs, setInputs] = useState({
     url: data.url,
     navigationGoal: data.navigationGoal,
@@ -64,7 +58,11 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     totpIdentifier: data.totpIdentifier,
     engine: data.engine,
   });
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const { blockLabel: urlBlockLabel } = useParams();
+  const debugStore = useDebugStore();
+  const thisBlockIsPlaying =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
+  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
 
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -94,33 +92,29 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <header className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.Action}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">Action Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </header>
-        <div className="space-y-4">
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsPlaying,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          disabled={elideFromDebugging}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={inputs.totpIdentifier}
+          totpUrl={inputs.totpVerificationUrl}
+          type={type}
+        />
+        <div
+          className={cn("space-y-4", {
+            "opacity-50": thisBlockIsPlaying,
+          })}
+        >
           <div className="space-y-2">
             <div className="flex justify-between">
               <div className="flex gap-2">
@@ -169,7 +163,13 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
           </div>
         </div>
         <Separator />
-        <Accordion type="single" collapsible>
+        <Accordion
+          className={cn({
+            "pointer-events-none opacity-50": thisBlockIsPlaying,
+          })}
+          type="single"
+          collapsible
+        >
           <AccordionItem value="advanced" className="border-b-0">
             <AccordionTrigger className="py-0">
               Advanced Settings

@@ -1,6 +1,6 @@
 import { Status } from "@/api/types";
 import { useEffect, useState, useRef, useCallback } from "react";
-import { HandIcon, PlayIcon } from "@radix-ui/react-icons";
+import { HandIcon, StopIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
@@ -19,6 +19,7 @@ import type {
 import "./browser-stream.css";
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
+const newWssBaseUrl = wssBaseUrl.replace("/api", "");
 
 interface CommandTakeControl {
   kind: "take-control";
@@ -31,6 +32,7 @@ interface CommandCedeControl {
 type Command = CommandTakeControl | CommandCedeControl;
 
 type Props = {
+  browserSessionId?: string;
   task?: {
     run: TaskApiResponse;
   };
@@ -42,6 +44,7 @@ type Props = {
 };
 
 function BrowserStream({
+  browserSessionId = undefined,
   task = undefined,
   workflow = undefined,
   // --
@@ -49,9 +52,13 @@ function BrowserStream({
 }: Props) {
   let showStream: boolean = false;
   let runId: string;
-  let entity: "task" | "workflow";
+  let entity: "browserSession" | "task" | "workflow";
 
-  if (task) {
+  if (browserSessionId) {
+    runId = browserSessionId;
+    entity = "browserSession";
+    showStream = true;
+  } else if (task) {
     runId = task.run.task_id;
     showStream = statusIsNotFinalized(task.run);
     entity = "task";
@@ -60,7 +67,7 @@ function BrowserStream({
     showStream = statusIsNotFinalized(workflow.run);
     entity = "workflow";
   } else {
-    throw new Error("No task or workflow provided");
+    throw new Error("No browser session, task or workflow provided");
   }
 
   const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
@@ -141,11 +148,13 @@ function BrowserStream({
 
         const wsParams = await getWebSocketParams();
         const vncUrl =
-          entity === "task"
-            ? `${wssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
-            : entity === "workflow"
-              ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
-              : null;
+          entity === "browserSession"
+            ? `${newWssBaseUrl}/stream/vnc/browser_session/${runId}?${wsParams}`
+            : entity === "task"
+              ? `${wssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
+              : entity === "workflow"
+                ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
+                : null;
 
         if (!vncUrl) {
           throw new Error("No vnc url");
@@ -209,11 +218,13 @@ function BrowserStream({
       const wsParams = await getWebSocketParams();
 
       const commandUrl =
-        entity === "task"
-          ? `${wssBaseUrl}/stream/commands/task/${runId}?${wsParams}`
-          : entity === "workflow"
-            ? `${wssBaseUrl}/stream/commands/workflow_run/${runId}?${wsParams}`
-            : null;
+        entity === "browserSession"
+          ? `${newWssBaseUrl}/stream/commands/browser_session/${runId}?${wsParams}`
+          : entity === "task"
+            ? `${wssBaseUrl}/stream/commands/task/${runId}?${wsParams}`
+            : entity === "workflow"
+              ? `${wssBaseUrl}/stream/commands/workflow_run/${runId}?${wsParams}`
+              : null;
 
       if (!commandUrl) {
         throw new Error("No command url");
@@ -317,13 +328,15 @@ function BrowserStream({
         <div className="overlay-container">
           <div className="overlay">
             <Button
-              // className="take-control"
-              className={cn("take-control", { hide: userIsControlling })}
+              className={cn(
+                "take-control absolute bottom-[-1rem] left-[1rem]",
+                { hide: userIsControlling },
+              )}
               type="button"
               onClick={() => setUserIsControlling(true)}
             >
               <HandIcon className="mr-2 h-4 w-4" />
-              take control
+              interact
             </Button>
             <div className="absolute bottom-[-1rem] right-[1rem]">
               <Button
@@ -333,8 +346,8 @@ function BrowserStream({
                 type="button"
                 onClick={() => setUserIsControlling(false)}
               >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                run agent
+                <StopIcon className="mr-2 h-4 w-4" />
+                stop interacting
               </Button>
             </div>
           </div>

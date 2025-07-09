@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { AxiosInstance } from "axios";
+import { lsKeys } from "@/util/env";
 
 export interface BrowserSessionData {
   browser_session_id: string | null;
@@ -10,7 +11,6 @@ interface OptimisticBrowserSessionIdState extends BrowserSessionData {
   run: (client: AxiosInstance) => Promise<BrowserSessionData>;
 }
 
-const SESSION_KEY = "skyvern.optimisticBrowserSession";
 const SESSION_TIMEOUT_MINUTES = 60;
 
 export const useOptimisticallyRequestBrowserSessionId =
@@ -18,7 +18,7 @@ export const useOptimisticallyRequestBrowserSessionId =
     browser_session_id: null,
     expires_at: null,
     run: async (client) => {
-      const stored = localStorage.getItem(SESSION_KEY);
+      const stored = localStorage.getItem(lsKeys.optimisticBrowserSession);
       if (stored) {
         try {
           const parsed = JSON.parse(stored);
@@ -41,16 +41,16 @@ export const useOptimisticallyRequestBrowserSessionId =
       }
 
       const resp = await client.post("/browser_sessions", {
-        timeout: SESSION_TIMEOUT_MINUTES * 60, // accepts seconds, so have to mult
+        timeout: SESSION_TIMEOUT_MINUTES,
       });
       const { browser_session_id: newBrowserSessionId, timeout } = resp.data;
-      const newExpiresAt = Math.floor(Date.now() / 1000) + timeout * 0.9;
+      const newExpiresAt = Math.floor(Date.now() / 1000) + timeout * 60 * 0.9;
       set({
         browser_session_id: newBrowserSessionId,
         expires_at: newExpiresAt,
       });
       localStorage.setItem(
-        SESSION_KEY,
+        lsKeys.optimisticBrowserSession,
         JSON.stringify({
           browser_session_id: newBrowserSessionId,
           expires_at: newExpiresAt,

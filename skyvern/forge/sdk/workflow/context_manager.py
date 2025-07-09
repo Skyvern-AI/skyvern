@@ -323,8 +323,14 @@ class WorkflowRunContext:
             integration_name="Skyvern",
             integration_version="v1.0.0",
         )
+        item_id = parameter.item_id
+        vault_id = parameter.vault_id
+        if self.has_parameter(parameter.item_id) and self.has_value(parameter.item_id):
+            item_id = self.values[parameter.item_id]
+        if self.has_parameter(parameter.vault_id) and self.has_value(parameter.vault_id):
+            vault_id = self.values[parameter.vault_id]
 
-        item = await client.items.get(parameter.vault_id, parameter.item_id)
+        item = await client.items.get(vault_id, item_id)
 
         # Check if item is None
         if item is None:
