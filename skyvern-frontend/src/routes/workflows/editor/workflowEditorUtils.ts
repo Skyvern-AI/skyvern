@@ -226,7 +226,10 @@ function convertToNode(
           url: block.url ?? "",
           navigationGoal: block.navigation_goal ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
-          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          dataSchema:
+            typeof block.data_schema === "string"
+              ? block.data_schema
+              : JSON.stringify(block.data_schema, null, 2),
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
@@ -330,7 +333,10 @@ function convertToNode(
           ...commonData,
           url: block.url ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
-          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          dataSchema:
+            typeof block.data_schema === "string"
+              ? block.data_schema
+              : JSON.stringify(block.data_schema, null, 2),
           parameterKeys: block.parameters.map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
@@ -992,6 +998,19 @@ function JSONParseSafe(json: string): Record<string, unknown> | null {
   }
 }
 
+function JSONSafeOrString(
+  json: string,
+): Record<string, unknown> | string | null {
+  if (!json) {
+    return null;
+  }
+  try {
+    return JSON.parse(json);
+  } catch {
+    return json;
+  }
+}
+
 function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
   const base = {
     label: node.data.label,
@@ -1009,7 +1028,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         data_extraction_goal: node.data.dataExtractionGoal,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
-        data_schema: JSONParseSafe(node.data.dataSchema),
+        data_schema: JSONSafeOrString(node.data.dataSchema),
         error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
           string,
           string
@@ -1111,7 +1130,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         url: node.data.url,
         title: node.data.label,
         data_extraction_goal: node.data.dataExtractionGoal,
-        data_schema: JSONParseSafe(node.data.dataSchema),
+        data_schema: JSONSafeOrString(node.data.dataSchema),
         ...(node.data.maxRetries !== null && {
           max_retries: node.data.maxRetries,
         }),
@@ -2113,11 +2132,6 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   const taskNodes = nodes.filter(isTaskNode);
   taskNodes.forEach((node) => {
     try {
-      JSON.parse(node.data.dataSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
-    }
-    try {
       JSON.parse(node.data.errorCodeMapping);
     } catch {
       errors.push(`${node.data.label}: Error messages is not valid JSON.`);
@@ -2152,11 +2166,6 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
-    }
-    try {
-      JSON.parse(node.data.dataSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
     }
   });
 
