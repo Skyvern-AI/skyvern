@@ -33,7 +33,7 @@ jobs:
               ;;
             suchintan)
               echo "GH_PAT=${{ secrets.SUCHINTAN_GH_PAT }}" >> $GITHUB_OUTPUT
-              echo "GIT_EMAIL=suchintan@skyvern.com" >> $GITHUB_OUTPUT
+              echo "GIT_EMAIL=suchintansingh@gmail.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=Suchintan Singh" >> $GITHUB_OUTPUT
               ;;
             jomido)
