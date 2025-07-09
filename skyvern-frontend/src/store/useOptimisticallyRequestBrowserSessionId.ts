@@ -41,10 +41,10 @@ export const useOptimisticallyRequestBrowserSessionId =
       }
 
       const resp = await client.post("/browser_sessions", {
-        timeout: SESSION_TIMEOUT_MINUTES * 60, // accepts seconds, so have to mult
+        timeout: SESSION_TIMEOUT_MINUTES,
       });
       const { browser_session_id: newBrowserSessionId, timeout } = resp.data;
-      const newExpiresAt = Math.floor(Date.now() / 1000) + timeout * 0.9;
+      const newExpiresAt = Math.floor(Date.now() / 1000) + timeout * 60 * 0.9;
       set({
         browser_session_id: newBrowserSessionId,
         expires_at: newExpiresAt,

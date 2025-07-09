@@ -120,7 +120,8 @@ export type BlockYAML =
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
   | Taskv2BlockYAML
-  | URLBlockYAML;
+  | URLBlockYAML
+  | HttpRequestBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -134,7 +135,7 @@ export type TaskBlockYAML = BlockYAMLBase & {
   title?: string;
   navigation_goal: string | null;
   data_extraction_goal: string | null;
-  data_schema: Record<string, unknown> | null;
+  data_schema: Record<string, unknown> | string | null;
   error_code_mapping: Record<string, string> | null;
   max_retries?: number;
   max_steps_per_run?: number | null;
@@ -209,7 +210,7 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   url: string | null;
   title?: string;
   data_extraction_goal: string | null;
-  data_schema: Record<string, unknown> | null;
+  data_schema: Record<string, unknown> | string | null;
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
@@ -327,4 +328,15 @@ export type PDFParserBlockYAML = BlockYAMLBase & {
 export type URLBlockYAML = BlockYAMLBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type HttpRequestBlockYAML = BlockYAMLBase & {
+  block_type: "http_request";
+  method: string;
+  url: string | null;
+  headers: Record<string, string> | null;
+  body: Record<string, unknown> | null;
+  timeout: number;
+  follow_redirects: boolean;
+  parameter_keys?: Array<string> | null;
 };
