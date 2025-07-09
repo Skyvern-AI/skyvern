@@ -35,6 +35,9 @@ class PersistentSessionsManager:
         cls.instance.database = database
         return cls.instance
 
+    def watch_session_pool(self) -> None:
+        return None
+
     async def begin_session(
         self,
         *,

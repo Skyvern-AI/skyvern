@@ -40,18 +40,21 @@ const artifactApiClient = axios.create({
 export function setAuthorizationHeader(token: string) {
   client.defaults.headers.common["Authorization"] = `Bearer ${token}`;
   v2Client.defaults.headers.common["Authorization"] = `Bearer ${token}`;
+  clientSansApiV1.defaults.headers.common["Authorization"] = `Bearer ${token}`;
 }
 
 export function removeAuthorizationHeader() {
   if (client.defaults.headers.common["Authorization"]) {
     delete client.defaults.headers.common["Authorization"];
     delete v2Client.defaults.headers.common["Authorization"];
+    delete clientSansApiV1.defaults.headers.common["Authorization"];
   }
 }
 
 export function setApiKeyHeader(apiKey: string) {
   client.defaults.headers.common["X-API-Key"] = apiKey;
   v2Client.defaults.headers.common["X-API-Key"] = apiKey;
+  clientSansApiV1.defaults.headers.common["X-API-Key"] = apiKey;
 }
 
 export function removeApiKeyHeader() {
@@ -60,6 +63,9 @@ export function removeApiKeyHeader() {
   }
   if (v2Client.defaults.headers.common["X-API-Key"]) {
     delete v2Client.defaults.headers.common["X-API-Key"];
+  }
+  if (clientSansApiV1.defaults.headers.common["X-API-Key"]) {
+    delete clientSansApiV1.defaults.headers.common["X-API-Key"];
   }
 }
 

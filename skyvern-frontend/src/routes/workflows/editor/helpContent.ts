@@ -3,7 +3,7 @@ export const baseHelpTooltipContent = {
   navigationGoal:
     "Give Skyvern an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails. Use {{ parameter_name }} to reference a parameter value",
   parameters:
-    "Define placeholder values using the “parameters” drop down that you predefine or redefine run-to-run.",
+    'Define placeholder values using the "parameters" drop down that you predefine or redefine run-to-run.',
   dataExtractionGoal:
     "Tell Skyvern what data you would like to scrape at the end of your run.",
   dataSchema: "Specify a format for extracted data in JSON.",
@@ -115,6 +115,17 @@ export const helpTooltips = {
     jsonSchema: "Specify a format for the extracted information from the file",
   },
   url: baseHelpTooltipContent,
+  httpRequest: {
+    ...baseHelpTooltipContent,
+    url: "The URL to send the HTTP request to. You can use {{ parameter_name }} to reference parameters.",
+    method: "The HTTP method to use for the request.",
+    headers: "HTTP headers to include with the request as JSON object.",
+    body: "Request body as JSON object. Only used for POST, PUT, PATCH methods.",
+    timeout: "Request timeout in seconds.",
+    followRedirects: "Whether to automatically follow HTTP redirects.",
+    continueOnFailure:
+      "Allow the workflow to continue if the HTTP request fails.",
+  },
 };
 
 export const placeholders = {
@@ -158,5 +169,12 @@ export const placeholders = {
   url: {
     ...basePlaceholderContent,
     url: "(required) Navigate to this URL: https://...",
+  },
+  httpRequest: {
+    ...basePlaceholderContent,
+    url: "https://api.example.com/endpoint",
+    headers:
+      '{\n  "Content-Type": "application/json",\n  "Authorization": "Bearer {{ token }}"\n}',
+    body: '{\n  "key": "value",\n  "parameter": "{{ parameter_name }}"\n}',
   },
 };

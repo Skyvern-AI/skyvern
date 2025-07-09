@@ -392,7 +392,7 @@ class BaseTaskBlock(Block):
     terminate_criterion: str | None = None
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
-    data_schema: dict[str, Any] | list | None = None
+    data_schema: dict[str, Any] | list | str | None = None
     # error code to error description for the LLM
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -452,6 +452,11 @@ class BaseTaskBlock(Block):
         if self.data_extraction_goal:
             self.data_extraction_goal = self.format_block_parameter_template_from_workflow_run_context(
                 self.data_extraction_goal, workflow_run_context
+            )
+
+        if isinstance(self.data_schema, str):
+            self.data_schema = self.format_block_parameter_template_from_workflow_run_context(
+                self.data_schema, workflow_run_context
             )
 
         if self.complete_criterion:

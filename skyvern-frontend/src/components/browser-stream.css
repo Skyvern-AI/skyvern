@@ -86,6 +86,10 @@
   animation: skyvern-anim-fadeIn 1s ease-in forwards;
 }
 
+.browser-stream > div {
+  background: transparent !important;
+}
+
 @keyframes skyvern-anim-fadeIn {
   from {
     opacity: 0;

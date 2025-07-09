@@ -1,4 +1,5 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
+import { BrowserSession } from "@/routes/browserSession/BrowserSession";
 import { PageLayout } from "./components/PageLayout";
 import { DiscoverPage } from "./routes/discover/DiscoverPage";
 import { HistoryPage } from "./routes/history/HistoryPage";
@@ -25,6 +26,10 @@ import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRun
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
 
 const router = createBrowserRouter([
+  {
+    path: "browser-session/:browserSessionId",
+    element: <BrowserSession />,
+  },
   {
     path: "/",
     element: (

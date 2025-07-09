@@ -9,12 +9,59 @@ from fastapi import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedError
 
 import skyvern.forge.sdk.routes.streaming_clients as sc
-from skyvern.forge.sdk.routes.routers import legacy_base_router
+from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming_auth import auth
-from skyvern.forge.sdk.routes.streaming_verify import loop_verify_workflow_run, verify_workflow_run
+from skyvern.forge.sdk.routes.streaming_verify import (
+    loop_verify_browser_session,
+    loop_verify_workflow_run,
+    verify_browser_session,
+    verify_workflow_run,
+)
 from skyvern.forge.sdk.utils.aio import collect
 
 LOG = structlog.get_logger()
+
+
+async def get_commands_for_browser_session(
+    client_id: str,
+    browser_session_id: str,
+    organization_id: str,
+    websocket: WebSocket,
+) -> tuple[sc.CommandChannel, sc.Loops] | None:
+    """
+    Return a commands channel for a browser session, with a list of loops to run concurrently.
+    """
+
+    LOG.info("Getting commands channel for browser session.", browser_session_id=browser_session_id)
+
+    browser_session = await verify_browser_session(
+        browser_session_id=browser_session_id,
+        organization_id=organization_id,
+    )
+
+    if not browser_session:
+        LOG.info(
+            "Command channel: no initial browser session found.",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        return None
+
+    commands = sc.CommandChannel(
+        client_id=client_id,
+        organization_id=organization_id,
+        browser_session=browser_session,
+        websocket=websocket,
+    )
+
+    LOG.info("Got command channel for browser session.", commands=commands)
+
+    loops = [
+        asyncio.create_task(loop_verify_browser_session(commands)),
+        asyncio.create_task(loop_channel(commands)),
+    ]
+
+    return commands, loops
 
 
 async def get_commands_for_workflow_run(
@@ -161,6 +208,70 @@ async def loop_channel(commands: sc.CommandChannel) -> None:
             organization_id=commands.organization_id,
         )
         await commands.close(reason="loop-channel-closed")
+
+
+@base_router.websocket("/stream/commands/browser_session/{browser_session_id}")
+async def browser_session_commands(
+    websocket: WebSocket,
+    browser_session_id: str,
+    apikey: str | None = None,
+    client_id: str | None = None,
+    token: str | None = None,
+) -> None:
+    LOG.info("Starting stream commands for browser session.", browser_session_id=browser_session_id)
+
+    organization_id = await auth(apikey=apikey, token=token, websocket=websocket)
+
+    if not organization_id:
+        LOG.error("Authentication failed.", browser_session_id=browser_session_id)
+        return
+
+    if not client_id:
+        LOG.error("No client ID provided.", browser_session_id=browser_session_id)
+        return
+
+    commands: sc.CommandChannel
+    loops: list[asyncio.Task] = []
+
+    result = await get_commands_for_browser_session(
+        client_id=client_id,
+        browser_session_id=browser_session_id,
+        organization_id=organization_id,
+        websocket=websocket,
+    )
+
+    if not result:
+        LOG.error(
+            "No streaming context found for the browser session.",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        await websocket.close(code=1013)
+        return
+
+    commands, loops = result
+
+    try:
+        LOG.info(
+            "Starting command stream loops for browser session.",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        await collect(loops)
+    except Exception:
+        LOG.exception(
+            "An exception occurred in the command stream function for browser session.",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+    finally:
+        LOG.info(
+            "Closing the command stream session for browser session.",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+
+        await commands.close(reason="stream-closed")
 
 
 @legacy_base_router.websocket("/stream/commands/workflow_run/{workflow_run_id}")

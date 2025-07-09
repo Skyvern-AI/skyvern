@@ -44,6 +44,17 @@ const nodeLibraryItems: Array<{
     description: "Navigate on the page",
   },
   {
+    nodeType: "task",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Task}
+        className="size-6"
+      />
+    ),
+    title: "Task Block",
+    description: "Complete multi-step browser automation tasks",
+  },
+  {
     nodeType: "taskv2",
     icon: (
       <WorkflowBlockIcon
@@ -74,141 +85,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Extraction Block",
-    description: "Extract data from the page",
-  },
-  {
-    nodeType: "validation",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Validation}
-        className="size-6"
-      />
-    ),
-    title: "Validation Block",
-    description: "Validate the state of the workflow or terminate",
-  },
-  {
-    nodeType: "task",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Task}
-        className="size-6"
-      />
-    ),
-    title: "Task Block",
-    description: "Takes actions or extracts information",
-  },
-
-  {
-    nodeType: "url",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.URL}
-        className="size-6"
-      />
-    ),
-    title: "Go to URL Block",
-    description: "Navigates to a URL",
-  },
-  {
-    nodeType: "textPrompt",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.TextPrompt}
-        className="size-6"
-      />
-    ),
-    title: "Text Prompt Block",
-    description: "Generates AI response",
-  },
-  {
-    nodeType: "sendEmail",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.SendEmail}
-        className="size-6"
-      />
-    ),
-    title: "Send Email Block",
-    description: "Sends an email",
-  },
-  {
-    nodeType: "loop",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.ForLoop}
-        className="size-6"
-      />
-    ),
-    title: "For Loop Block",
-    description: "Repeats nested elements",
-  },
-  {
-    nodeType: "codeBlock",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Code}
-        className="size-6"
-      />
-    ),
-    title: "Code Block",
-    description: "Executes Python code",
-  },
-  {
-    nodeType: "fileParser",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.FileURLParser}
-        className="size-6"
-      />
-    ),
-    title: "File Parser Block",
-    description: "Downloads and parses a file",
-  },
-  {
-    nodeType: "pdfParser",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.PDFParser}
-        className="size-6"
-      />
-    ),
-    title: "PDF Parser Block",
-    description: "Downloads and parses a PDF file with an optional data schema",
-  },
-  // disabled
-  // {
-  //   nodeType: "download",
-  //   icon: (
-  //     <WorkflowBlockIcon
-  //       workflowBlockType={WorkflowBlockTypes.DownloadToS3}
-  //       className="size-6"
-  //     />
-  //   ),
-  //   title: "Download Block",
-  //   description: "Downloads a file from S3",
-  // },
-  {
-    nodeType: "fileUpload",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.FileUpload}
-        className="size-6"
-      />
-    ),
-    title: "File Upload Block",
-    description: "Uploads downloaded files to where you want.",
-  },
-  {
-    nodeType: "fileDownload",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.FileDownload}
-        className="size-6"
-      />
-    ),
-    title: "File Download Block",
-    description: "Download a file",
+    description: "Extract data from a webpage",
   },
   {
     nodeType: "wait",
@@ -219,7 +96,150 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Wait Block",
-    description: "Wait for some time",
+    description: "Wait for a specified amount of time",
+  },
+  {
+    nodeType: "validation",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Validation}
+        className="size-6"
+      />
+    ),
+    title: "Validation Block",
+    description: "Validate completion criteria",
+  },
+  {
+    nodeType: "url",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.URL}
+        className="size-6"
+      />
+    ),
+    title: "Go to URL Block",
+    description: "Navigate to a specific URL",
+  },
+  {
+    nodeType: "http_request",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.HttpRequest}
+        className="size-6"
+      />
+    ),
+    title: "HTTP Request Block",
+    description: "Make HTTP API calls",
+  },
+  {
+    nodeType: "textPrompt",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.TextPrompt}
+        className="size-6"
+      />
+    ),
+    title: "Text Prompt Block",
+    description: "Process text with LLM",
+  },
+  {
+    nodeType: "codeBlock",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Code}
+        className="size-6"
+      />
+    ),
+    title: "Code Block",
+    description: "Execute custom Python code",
+  },
+  {
+    nodeType: "fileDownload",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.FileDownload}
+        className="size-6"
+      />
+    ),
+    title: "File Download Block",
+    description: "Download files from a website",
+  },
+  {
+    nodeType: "loop",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.ForLoop}
+        className="size-6"
+      />
+    ),
+    title: "Loop Block",
+    description: "Repeat blocks for each item",
+  },
+  {
+    nodeType: "sendEmail",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.SendEmail}
+        className="size-6"
+      />
+    ),
+    title: "Send Email Block",
+    description: "Send email notifications",
+  },
+  {
+    nodeType: "fileParser",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.FileURLParser}
+        className="size-6"
+      />
+    ),
+    title: "File Parser Block",
+    description: "Parse data from files",
+  },
+  {
+    nodeType: "upload",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.UploadToS3}
+        className="size-6"
+      />
+    ),
+    title: "Upload to S3 Block",
+    description: "Upload files to AWS S3",
+  },
+  {
+    nodeType: "fileUpload",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.FileUpload}
+        className="size-6"
+      />
+    ),
+    title: "File Upload Block",
+    description: "Upload files to storage",
+  },
+  {
+    nodeType: "download",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.DownloadToS3}
+        className="size-6"
+      />
+    ),
+    title: "Download to S3 Block",
+    description: "Download files to AWS S3",
+  },
+  {
+    nodeType: "pdfParser",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.PDFParser}
+        className="size-6"
+      />
+    ),
+    title: "PDF Parser Block",
+    description: "Extract data from PDF files",
   },
 ];
 

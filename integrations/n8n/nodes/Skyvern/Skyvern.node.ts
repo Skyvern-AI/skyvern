@@ -8,6 +8,7 @@ import {
     INodePropertyOptions,
     INodeType,
     INodeTypeDescription,
+    NodeConnectionType,
     ResourceMapperField,
     ResourceMapperFields,
 } from 'n8n-workflow';
@@ -39,8 +40,8 @@ export class Skyvern implements INodeType {
         defaults: {
             name: 'Skyvern',
         },
-        inputs: ['main'],
-        outputs: ['main'],
+        inputs: [NodeConnectionType.Main],
+        outputs: [NodeConnectionType.Main],
         credentials: [
             {
                 name: 'skyvernApi',
@@ -318,7 +319,7 @@ export class Skyvern implements INodeType {
             },
             {
                 displayName: 'Workflow Name or ID',
-                description: 'The title of the workflow. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code-examples/expressions/">expression</a>.',
+                description: 'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
                 name: 'workflowId',
                 type: 'options',
                 typeOptions: {

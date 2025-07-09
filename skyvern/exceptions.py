@@ -728,3 +728,8 @@ class BrowserSessionNotFound(SkyvernHTTPException):
             f"Browser session {browser_session_id} does not exist or is not live.",
             status_code=status.HTTP_404_NOT_FOUND,
         )
+
+
+class APIKeyNotFound(SkyvernHTTPException):
+    def __init__(self, organization_id: str) -> None:
+        super().__init__(f"No valid API key token found for organization {organization_id}")
