@@ -2149,7 +2149,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
     ) -> None:
         """
-        send the task response to the webhook callback url
+        send the task response to the webhook url
         """
         # refresh the task from the db to get the latest status
         try:
@@ -2258,7 +2258,7 @@ class ForgeAgent:
 
         if not task.webhook_callback_url:
             LOG.warning(
-                "Task has no webhook callback url. Not sending task response",
+                "Task has no webhook url. Not sending task response",
                 task_id=task.task_id,
             )
             return
@@ -2274,7 +2274,7 @@ class ForgeAgent:
             if run_response is not None:
                 task_run_response_json = run_response.model_dump_json(exclude={"run_request"})
 
-            # send task_response to the webhook callback url
+            # send task_response to the webhook url
             payload_json = task_response.model_dump_json(exclude={"request"})
             payload_dict = json.loads(payload_json)
             if task_run_response_json:
@@ -2282,7 +2282,7 @@ class ForgeAgent:
             payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
             headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
             LOG.info(
-                "Sending task response to webhook callback url",
+                "Sending task response to webhook url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
                 payload=payload,
@@ -2420,7 +2420,7 @@ class ForgeAgent:
         This function should handle exceptions gracefully.
         If errors are raised and not caught inside this function, please catch and handle them.
         """
-        # We need to close the browser even if there is no webhook callback url or api key
+        # We need to close the browser even if there is no webhook url or api key
         browser_state = await app.BROWSER_MANAGER.cleanup_for_task(
             task.task_id,
             close_browser_on_completion,

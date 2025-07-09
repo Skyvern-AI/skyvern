@@ -331,7 +331,7 @@ function RunWorkflowForm({
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          Webhook Callback URL
+                          Webhook URL
                         </div>
                         <h2 className="text-sm text-slate-400">
                           The URL of a webhook endpoint to send the details of
