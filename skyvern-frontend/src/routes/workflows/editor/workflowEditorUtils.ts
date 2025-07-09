@@ -7,6 +7,7 @@ import {
   WorkflowBlockTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
+  debuggableWorkflowBlockTypes,
   type AWSSecretParameter,
   type OutputParameter,
   type Parameter,
@@ -37,6 +38,7 @@ import {
   Taskv2BlockYAML,
   URLBlockYAML,
   FileUploadBlockYAML,
+  HttpRequestBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -99,6 +101,8 @@ import {
 import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
+import { httpRequestNodeDefaultData } from "./nodes/HttpRequestNode/types";
+
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 function layoutUtil(
@@ -205,6 +209,7 @@ function convertToNode(
     connectable: false,
   };
   const commonData: NodeBaseData = {
+    debuggable: debuggableWorkflowBlockTypes.has(block.block_type),
     label: block.label,
     continueOnFailure: block.continue_on_failure,
     editable,
@@ -221,7 +226,10 @@ function convertToNode(
           url: block.url ?? "",
           navigationGoal: block.navigation_goal ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
-          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          dataSchema:
+            typeof block.data_schema === "string"
+              ? block.data_schema
+              : JSON.stringify(block.data_schema, null, 2),
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
@@ -325,7 +333,10 @@ function convertToNode(
           ...commonData,
           url: block.url ?? "",
           dataExtractionGoal: block.data_extraction_goal ?? "",
-          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          dataSchema:
+            typeof block.data_schema === "string"
+              ? block.data_schema
+              : JSON.stringify(block.data_schema, null, 2),
           parameterKeys: block.parameters.map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
@@ -523,6 +534,23 @@ function convertToNode(
         data: {
           ...commonData,
           url: block.url,
+        },
+      };
+    }
+    case "http_request": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "http_request",
+        data: {
+          ...commonData,
+          method: block.method,
+          url: block.url ?? "",
+          headers: JSON.stringify(block.headers || {}, null, 2),
+          body: JSON.stringify(block.body || {}, null, 2),
+          timeout: block.timeout,
+          followRedirects: block.follow_redirects,
+          parameterKeys: block.parameters.map((p) => p.key),
         },
       };
     }
@@ -948,6 +976,17 @@ function createNode(
         },
       };
     }
+    case "http_request": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "http_request",
+        data: {
+          ...httpRequestNodeDefaultData,
+          label,
+        },
+      };
+    }
   }
 }
 
@@ -956,6 +995,19 @@ function JSONParseSafe(json: string): Record<string, unknown> | null {
     return JSON.parse(json);
   } catch {
     return null;
+  }
+}
+
+function JSONSafeOrString(
+  json: string,
+): Record<string, unknown> | string | null {
+  if (!json) {
+    return null;
+  }
+  try {
+    return JSON.parse(json);
+  } catch {
+    return json;
   }
 }
 
@@ -976,7 +1028,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         data_extraction_goal: node.data.dataExtractionGoal,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
-        data_schema: JSONParseSafe(node.data.dataSchema),
+        data_schema: JSONSafeOrString(node.data.dataSchema),
         error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
           string,
           string
@@ -1078,7 +1130,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         url: node.data.url,
         title: node.data.label,
         data_extraction_goal: node.data.dataExtractionGoal,
-        data_schema: JSONParseSafe(node.data.dataSchema),
+        data_schema: JSONSafeOrString(node.data.dataSchema),
         ...(node.data.maxRetries !== null && {
           max_retries: node.data.maxRetries,
         }),
@@ -1228,6 +1280,22 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "goto_url",
         url: node.data.url,
+      };
+    }
+    case "http_request": {
+      return {
+        ...base,
+        block_type: "http_request",
+        method: node.data.method,
+        url: node.data.url,
+        headers: JSONParseSafe(node.data.headers) as Record<
+          string,
+          string
+        > | null,
+        body: JSONParseSafe(node.data.body) as Record<string, unknown> | null,
+        timeout: node.data.timeout,
+        follow_redirects: node.data.followRedirects,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     default: {
@@ -1983,6 +2051,20 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "http_request": {
+        const blockYaml: HttpRequestBlockYAML = {
+          ...base,
+          block_type: "http_request",
+          method: block.method,
+          url: block.url,
+          headers: block.headers,
+          body: block.body,
+          timeout: block.timeout,
+          follow_redirects: block.follow_redirects,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -2050,11 +2132,6 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   const taskNodes = nodes.filter(isTaskNode);
   taskNodes.forEach((node) => {
     try {
-      JSON.parse(node.data.dataSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
-    }
-    try {
       JSON.parse(node.data.errorCodeMapping);
     } catch {
       errors.push(`${node.data.label}: Error messages is not valid JSON.`);
@@ -2089,11 +2166,6 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
-    }
-    try {
-      JSON.parse(node.data.dataSchema);
-    } catch {
-      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
     }
   });
 
