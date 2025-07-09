@@ -138,7 +138,7 @@ class TaskBlockYAML(BlockYAML):
     engine: RunEngine = RunEngine.skyvern_v1
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
-    data_schema: dict[str, Any] | list | None = None
+    data_schema: dict[str, Any] | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -308,7 +308,7 @@ class ExtractionBlockYAML(BlockYAML):
     url: str | None = None
     title: str = ""
     engine: RunEngine = RunEngine.skyvern_v1
-    data_schema: dict[str, Any] | list | None = None
+    data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
