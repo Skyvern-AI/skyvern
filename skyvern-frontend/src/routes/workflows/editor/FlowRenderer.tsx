@@ -35,7 +35,7 @@ import "@xyflow/react/dist/style.css";
 import { AxiosError } from "axios";
 import { nanoid } from "nanoid";
 import { useEffect, useRef, useState } from "react";
-import { useBlocker, useParams } from "react-router-dom";
+import { useBlocker, useNavigate, useParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import {
   AWSSecretParameter,
@@ -262,6 +262,7 @@ function FlowRenderer({
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
   const { workflowPermanentId } = useParams();
+  const navigate = useNavigate();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
@@ -801,6 +802,12 @@ function FlowRenderer({
                     return;
                   }
                   await handleSave();
+                }}
+                onCancel={() => {
+                  // Reset hasChanges to prevent the beforeunload warning
+                  setHasChanges(false);
+                  // Navigate back to the workflow runs page
+                  navigate(`/workflows/${workflow.workflow_permanent_id}/runs`);
                 }}
               />
             </Panel>

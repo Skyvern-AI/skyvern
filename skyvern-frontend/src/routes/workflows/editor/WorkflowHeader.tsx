@@ -10,6 +10,7 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   CopyIcon,
+  Cross2Icon,
   Crosshair1Icon,
   PlayIcon,
   ReloadIcon,
@@ -28,6 +29,7 @@ type Props = {
   parametersPanelOpen: boolean;
   onParametersClick: () => void;
   onSave: () => void;
+  onCancel: () => void;
   onTitleChange: (title: string) => void;
   saving: boolean;
 };
@@ -38,6 +40,7 @@ function WorkflowHeader({
   parametersPanelOpen,
   onParametersClick,
   onSave,
+  onCancel,
   onTitleChange,
   saving,
 }: Props) {
@@ -132,6 +135,24 @@ function WorkflowHeader({
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Save</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant="tertiary"
+                    className="size-10"
+                    disabled={isGlobalWorkflow}
+                    onClick={() => {
+                      onCancel();
+                    }}
+                  >
+                    <Cross2Icon className="size-6" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Cancel</TooltipContent>
               </Tooltip>
             </TooltipProvider>
             <Button variant="tertiary" size="lg" onClick={onParametersClick}>
