@@ -308,7 +308,7 @@ export class Skyvern implements INodeType {
             },
             {
                 displayName: 'Workflow Name or ID',
-                description: 'The title of the workflow. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code-examples/expressions/">expression</a>.',
+                description: 'Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>',
                 name: 'workflowId',
                 type: 'options',
                 typeOptions: {

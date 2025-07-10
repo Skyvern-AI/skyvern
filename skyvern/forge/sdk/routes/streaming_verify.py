@@ -13,6 +13,69 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 LOG = structlog.get_logger()
 
 
+async def verify_browser_session(
+    browser_session_id: str,
+    organization_id: str,
+) -> AddressablePersistentBrowserSession | None:
+    """
+    Verify the browser session exists, and is usable.
+    """
+
+    if settings.ENV == "local":
+        dummy_browser_session = AddressablePersistentBrowserSession(
+            persistent_browser_session_id=browser_session_id,
+            organization_id=organization_id,
+            browser_address="0.0.0.0:9223",
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+        )
+
+        return dummy_browser_session
+
+    browser_session = await app.DATABASE.get_persistent_browser_session(browser_session_id, organization_id)
+
+    if not browser_session:
+        LOG.info(
+            "No browser session found.",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        return None
+
+    browser_address = browser_session.browser_address
+
+    if not browser_address:
+        LOG.info(
+            "Waiting for browser session address.",
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+
+        try:
+            _, host, cdp_port = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+                session_id=browser_session_id,
+                organization_id=organization_id,
+            )
+            browser_address = f"{host}:{cdp_port}"
+        except Exception as ex:
+            LOG.info(
+                "Browser session address not found for browser session.",
+                browser_session_id=browser_session_id,
+                organization_id=organization_id,
+                ex=ex,
+            )
+            return None
+
+    try:
+        addressable_browser_session = AddressablePersistentBrowserSession(
+            **browser_session.model_dump() | {"browser_address": browser_address},
+        )
+    except Exception:
+        return None
+
+    return addressable_browser_session
+
+
 async def verify_task(
     task_id: str, organization_id: str
 ) -> tuple[Task | None, AddressablePersistentBrowserSession | None]:
@@ -170,6 +233,22 @@ async def verify_workflow_run(
         return workflow_run, None
 
     return workflow_run, addressable_browser_session
+
+
+async def loop_verify_browser_session(verifiable: sc.CommandChannel | sc.Streaming) -> None:
+    """
+    Loop until the browser session is cleared or the websocket is closed.
+    """
+
+    while verifiable.browser_session and verifiable.is_open:
+        browser_session = await verify_browser_session(
+            browser_session_id=verifiable.browser_session.persistent_browser_session_id,
+            organization_id=verifiable.organization_id,
+        )
+
+        verifiable.browser_session = browser_session
+
+        await asyncio.sleep(2)
 
 
 async def loop_verify_task(streaming: sc.Streaming) -> None:
