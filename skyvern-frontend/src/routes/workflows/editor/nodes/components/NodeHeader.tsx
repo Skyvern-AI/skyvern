@@ -5,7 +5,7 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
-import { ProxyLocation } from "@/api/types";
+import { ProxyLocation, User } from "@/api/types";
 import { Timer } from "@/components/Timer";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -29,11 +29,15 @@ import {
   statusIsFinalized,
   statusIsRunningOrQueued,
 } from "@/routes/tasks/types";
+import {
+  useOptimisticallyRequestBrowserSessionId,
+  type OptimisticBrowserSession,
+} from "@/store/useOptimisticallyRequestBrowserSessionId";
+import { useUser } from "@/hooks/useUser";
 
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
-import { lsKeys } from "@/util/env";
 
 interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
@@ -69,12 +73,24 @@ const blockTypeToTitle = (type: WorkflowBlockType): string => {
 
 const getPayload = (opts: {
   blockLabel: string;
+  optimistic: OptimisticBrowserSession;
   parameters: Record<string, unknown>;
   totpIdentifier: string | null;
   totpUrl: string | null;
+  user: User | null;
   workflowPermanentId: string;
   workflowSettings: WorkflowSettingsState;
-}): Payload => {
+}): Payload | null => {
+  if (!opts.user) {
+    toast({
+      variant: "warning",
+      title: "Error",
+      description: "No user found",
+    });
+
+    return null;
+  }
+
   const webhook_url = opts.workflowSettings.webhookCallbackUrl.trim();
 
   let extraHttpHeaders = null;
@@ -92,15 +108,12 @@ const getPayload = (opts: {
     });
   }
 
-  const stored = localStorage.getItem(lsKeys.optimisticBrowserSession);
-  let browserSessionId: string | null = null;
-  try {
-    const parsed = JSON.parse(stored ?? "");
-    const { browser_session_id } = parsed;
-    browserSessionId = browser_session_id as string;
-  } catch {
-    // pass
-  }
+  const browserSessionData = opts.optimistic.get(
+    opts.user,
+    opts.workflowPermanentId,
+  );
+
+  const browserSessionId = browserSessionData?.browser_session_id;
 
   if (!browserSessionId) {
     toast({
@@ -108,6 +121,8 @@ const getPayload = (opts: {
       title: "Error",
       description: "No browser session ID found",
     });
+
+    return null;
   } else {
     toast({
       variant: "default",
@@ -166,6 +181,8 @@ function NodeHeader({
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
+  const optimistic = useOptimisticallyRequestBrowserSessionId();
+  const user = useUser().get();
 
   useEffect(() => {
     if (!workflowRun || !workflowPermanentId || !workflowRunId) {
@@ -227,12 +244,18 @@ function NodeHeader({
 
       const body = getPayload({
         blockLabel,
+        optimistic,
         parameters,
         totpIdentifier,
         totpUrl,
+        user,
         workflowPermanentId,
         workflowSettings: workflowSettingsStore,
       });
+
+      if (!body) {
+        return;
+      }
 
       return await client.post<Payload, { data: { run_id: string } }>(
         "/run/workflows/blocks",
@@ -268,8 +291,10 @@ function NodeHeader({
   const cancelBlock = useMutation({
     mutationFn: async () => {
       const browserSessionId =
-        debugStore.getCurrentBrowserSessionId() ??
-        "<missing-browser-session-id>";
+        user && workflowPermanentId
+          ? optimistic.get(user, workflowPermanentId)?.browser_session_id ??
+            "<missing-browser-session-id>"
+          : "<missing-user-or-workflow-permanent-id>";
       const client = await getClient(credentialGetter);
       return client
         .post(`/runs/${browserSessionId}/workflow_run/${workflowRunId}/cancel/`)
