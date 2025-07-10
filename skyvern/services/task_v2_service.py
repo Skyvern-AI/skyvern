@@ -245,7 +245,7 @@ async def initialize_task_v2(
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
         # fail the workflow run
-        await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=task_v2.workflow_run_id,
             failure_reason="Skyvern failed to setup the workflow run",
@@ -288,7 +288,7 @@ async def initialize_task_v2(
     except Exception:
         LOG.warning("Failed to update task 2.0", exc_info=True)
         # fail the workflow run
-        await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             failure_reason="Skyvern failed to update the task 2.0 after initializing the workflow run",
@@ -317,7 +317,7 @@ async def run_task_v2(
             organization_id=organization_id,
             exc_info=True,
         )
-        return await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id,
             organization_id=organization_id,
             failure_reason="Failed to get task v2",
@@ -414,7 +414,7 @@ async def run_task_v2_helper(
             failure_reason = "Task prompt is missing"
         elif not task_v2.url:
             failure_reason = "Task url is missing"
-        await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=task_v2.workflow_run_id,
             failure_reason=failure_reason,
@@ -510,7 +510,7 @@ async def run_task_v2_helper(
                 workflow_run_id=workflow_run_id,
                 task_v2_id=task_v2_id,
             )
-            await mark_task_v2_as_canceled(
+            task_v2 = await mark_task_v2_as_canceled(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -690,7 +690,7 @@ async def run_task_v2_helper(
             # parse task v2 response and run the next task
             if not task_type:
                 LOG.error("No task type found in task v2 response", task_v2_response=task_v2_response)
-                await mark_task_v2_as_failed(
+                task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
                     failure_reason="Skyvern failed to generate a task. Please try again later.",
@@ -742,7 +742,7 @@ async def run_task_v2_helper(
                     }
                 except Exception:
                     LOG.exception("Failed to generate loop task")
-                    await mark_task_v2_as_failed(
+                    task_v2 = await mark_task_v2_as_failed(
                         task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
                         failure_reason="Failed to generate the loop.",
@@ -750,7 +750,7 @@ async def run_task_v2_helper(
                     break
             else:
                 LOG.info("Unsupported task type", task_type=task_type)
-                await mark_task_v2_as_failed(
+                task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
                     failure_reason=f"Unsupported task block type gets generated: {task_type}",
@@ -814,6 +814,10 @@ async def run_task_v2_helper(
                 "Workflow run is not running anymore, stopping the task v2",
                 workflow_run_id=workflow_run_id,
                 status=workflow_run.status,
+            )
+            task_v2 = await update_task_v2_status_to_workflow_run_status(
+                task_v2_id=task_v2_id,
+                workflow_run_status=workflow_run.status,
             )
             break
         if block_result.success is True:
@@ -895,7 +899,7 @@ async def run_task_v2_helper(
         if total_step_count >= max_steps:
             LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
             failure_reason = await _summarize_max_steps_failure_reason(task_v2, organization_id, browser_state)
-            await mark_task_v2_as_failed(
+            task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
                 failure_reason=f'Reached the max number of {max_steps} steps. Possible failure reasons: {failure_reason} If you need more steps, update the "Max Steps Override" configuration when running the task. Or add/update the "x-max-steps-override" header with your desired number of steps in the API request.',
@@ -1493,6 +1497,19 @@ async def mark_task_v2_as_timed_out(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
     await send_task_v2_webhook(task_v2)
+    return task_v2
+
+
+async def update_task_v2_status_to_workflow_run_status(
+    task_v2_id: str,
+    workflow_run_status: WorkflowRunStatus,
+    organization_id: str | None = None,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id,
+        organization_id=organization_id,
+        status=TaskV2Status(workflow_run_status),
+    )
     return task_v2
 
 
