@@ -1,5 +1,6 @@
 import React, { createContext, useMemo } from "react";
 import { useLocation } from "react-router-dom";
+import { lsKeys } from "@/util/env";
 
 function useIsDebugMode() {
   const location = useLocation();
@@ -9,8 +10,23 @@ function useIsDebugMode() {
   );
 }
 
+function getCurrentBrowserSessionId() {
+  const stored = localStorage.getItem(lsKeys.optimisticBrowserSession);
+  let browserSessionId: string | null = null;
+  try {
+    const parsed = JSON.parse(stored ?? "");
+    const { browser_session_id } = parsed;
+    browserSessionId = browser_session_id as string;
+  } catch {
+    // pass
+  }
+
+  return browserSessionId;
+}
+
 export type DebugStoreContextType = {
   isDebugMode: boolean;
+  getCurrentBrowserSessionId: () => string | null;
 };
 
 export const DebugStoreContext = createContext<
@@ -23,7 +39,9 @@ export const DebugStoreProvider: React.FC<{ children: React.ReactNode }> = ({
   const isDebugMode = useIsDebugMode();
 
   return (
-    <DebugStoreContext.Provider value={{ isDebugMode }}>
+    <DebugStoreContext.Provider
+      value={{ isDebugMode, getCurrentBrowserSessionId }}
+    >
       {children}
     </DebugStoreContext.Provider>
   );

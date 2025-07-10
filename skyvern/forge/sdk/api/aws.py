@@ -268,6 +268,8 @@ class AsyncAWSClient:
         task_definition: str,
         subnets: list[str],
         security_groups: list[str],
+        assign_public_ip: str = "DISABLED",
+        enable_execute_command: bool = False,
     ) -> dict:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/run_task.html
         async with self._ecs_client() as client:
@@ -279,9 +281,10 @@ class AsyncAWSClient:
                     "awsvpcConfiguration": {
                         "subnets": subnets,
                         "securityGroups": security_groups,
-                        "assignPublicIp": "DISABLED",
+                        "assignPublicIp": assign_public_ip,
                     }
                 },
+                enableExecuteCommand=enable_execute_command,
             )
 
     async def stop_task(self, cluster: str, task: str, reason: str | None = None) -> dict:

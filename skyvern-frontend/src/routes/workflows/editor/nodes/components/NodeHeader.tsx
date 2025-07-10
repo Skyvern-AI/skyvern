@@ -267,9 +267,12 @@ function NodeHeader({
 
   const cancelBlock = useMutation({
     mutationFn: async () => {
+      const browserSessionId =
+        debugStore.getCurrentBrowserSessionId() ??
+        "<missing-browser-session-id>";
       const client = await getClient(credentialGetter);
       return client
-        .post(`/workflows/runs/${workflowRunId}/cancel`)
+        .post(`/runs/${browserSessionId}/workflow_run/${workflowRunId}/cancel/`)
         .then((response) => response.data);
     },
     onSuccess: () => {
