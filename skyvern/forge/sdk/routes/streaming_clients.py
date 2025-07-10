@@ -78,7 +78,7 @@ class CommandChannel:
         if self.websocket.client_state not in (WebSocketState.CONNECTED, WebSocketState.CONNECTING):
             return False
 
-        if not self.workflow_run:
+        if not self.workflow_run and not self.browser_session:
             return False
 
         if not get_command_client(self.client_id):
@@ -231,7 +231,7 @@ class Streaming:
         if self.websocket.client_state not in (WebSocketState.CONNECTED, WebSocketState.CONNECTING):
             return False
 
-        if not self.task and not self.workflow_run:
+        if not self.task and not self.workflow_run and not self.browser_session:
             return False
 
         if not get_streaming_client(self.client_id):
