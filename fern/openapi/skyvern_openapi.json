@@ -9350,7 +9350,7 @@
                 "type": "null"
               }
             ],
-            "title": "Webhook Callback Url"
+            "title": "Webhook Url"
           },
           "totp_verification_url": {
             "anyOf": [
@@ -9493,7 +9493,7 @@
                 "type": "null"
               }
             ],
-            "title": "Webhook Callback Url"
+            "title": "Webhook Url"
           },
           "totp_verification_url": {
             "anyOf": [

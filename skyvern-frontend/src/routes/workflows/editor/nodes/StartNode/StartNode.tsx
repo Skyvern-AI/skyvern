@@ -105,7 +105,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                     </div>
                     <div className="space-y-2">
                       <div className="flex gap-2">
-                        <Label>Webhook Callback URL</Label>
+                        <Label>Webhook URL</Label>
                         <HelpTooltip content="The URL of a webhook endpoint to send the workflow results" />
                       </div>
                       <Input

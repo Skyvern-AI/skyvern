@@ -1710,7 +1710,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
         headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
         LOG.info(
-            "Sending task v2 response to webhook callback url",
+            "Sending task v2 response to webhook url",
             task_v2_id=task_v2.observer_cruise_id,
             webhook_callback_url=task_v2.webhook_callback_url,
             payload=payload,

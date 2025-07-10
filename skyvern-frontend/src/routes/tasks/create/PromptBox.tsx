@@ -372,7 +372,7 @@ function PromptBox() {
                   <header>Advanced Settings</header>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">Webhook Callback URL</div>
+                      <div className="text-sm">Webhook URL</div>
                       <div className="text-xs text-slate-400">
                         The URL of a webhook endpoint to send the extracted
                         information

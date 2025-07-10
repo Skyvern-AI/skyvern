@@ -209,7 +209,7 @@ export class Skyvern implements INodeType {
                 },
             },
             {
-                displayName: 'Webhook Callback URL',
+                displayName: 'Webhook URL',
                 description: 'Optional URL that Skyvern will call when the task finishes',
                 name: 'webhookUrl',
                 type: 'string',
@@ -392,7 +392,7 @@ export class Skyvern implements INodeType {
                 },
             },
             {
-                displayName: 'Webhook Callback URL',
+                displayName: 'Webhook URL',
                 description: 'Optional URL that Skyvern will call when the workflow run finishes',
                 name: 'webhookCallbackUrl',
                 type: 'string',

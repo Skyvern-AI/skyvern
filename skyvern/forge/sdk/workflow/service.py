@@ -1319,7 +1319,7 @@ class WorkflowService:
 
         if not workflow_run.webhook_callback_url:
             LOG.warning(
-                "Workflow has no webhook callback url. Not sending workflow response",
+                "Workflow has no webhook url. Not sending workflow response",
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
@@ -1369,7 +1369,7 @@ class WorkflowService:
             api_key=api_key,
         )
         LOG.info(
-            "Sending webhook run status to webhook callback url",
+            "Sending webhook run status to webhook url",
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
