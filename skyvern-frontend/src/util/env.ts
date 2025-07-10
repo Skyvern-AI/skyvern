@@ -26,6 +26,19 @@ const lsKeys = {
   optimisticBrowserSession: "skyvern.optimisticBrowserSession",
 };
 
+const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
+
+let newWssBaseUrl = wssBaseUrl;
+try {
+  const url = new URL(wssBaseUrl);
+  if (url.pathname.startsWith("/api")) {
+    url.pathname = url.pathname.replace(/^\/api/, "");
+  }
+  newWssBaseUrl = url.toString();
+} catch (e) {
+  newWssBaseUrl = wssBaseUrl.replace("/api", "");
+}
+
 export {
   apiBaseUrl,
   environment,
@@ -33,4 +46,6 @@ export {
   artifactApiBaseUrl,
   apiPathPrefix,
   lsKeys,
+  wssBaseUrl,
+  newWssBaseUrl,
 };

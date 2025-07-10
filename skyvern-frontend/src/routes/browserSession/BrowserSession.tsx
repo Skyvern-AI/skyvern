@@ -20,8 +20,10 @@ function BrowserSession() {
       try {
         await client.get(`/browser_sessions/${browserSessionId}`);
         setHasBrowserSession(true);
+        return true;
       } catch (error) {
         setHasBrowserSession(false);
+        return false;
       }
     },
   });

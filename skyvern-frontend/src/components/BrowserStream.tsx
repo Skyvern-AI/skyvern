@@ -8,18 +8,14 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { envCredential } from "@/util/env";
 import { toast } from "@/components/ui/use-toast";
 import RFB from "@novnc/novnc/lib/rfb.js";
-import { environment } from "@/util/env";
+import { environment, wssBaseUrl, newWssBaseUrl } from "@/util/env";
 import { cn } from "@/util/utils";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import type {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
-
 import "./browser-stream.css";
-
-const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
-const newWssBaseUrl = wssBaseUrl.replace("/api", "");
 
 interface CommandTakeControl {
   kind: "take-control";
