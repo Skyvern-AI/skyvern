@@ -3,6 +3,7 @@ Streaming VNC WebSocket connections.
 """
 
 import asyncio
+from urllib.parse import urlparse
 
 import structlog
 import websockets
@@ -169,7 +170,9 @@ async def loop_stream_vnc(streaming: sc.Streaming) -> None:
         return
 
     browser_address = streaming.browser_session.browser_address
-    host, _ = browser_address.rsplit(":")
+
+    parsed_browser_address = urlparse(browser_address)
+    host = parsed_browser_address.hostname
     vnc_url = f"ws://{host}:{streaming.vnc_port}"
 
     LOG.info(

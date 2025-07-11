@@ -16,8 +16,6 @@ LOG = structlog.get_logger()
 @dataclass
 class BrowserSession:
     browser_state: BrowserState
-    cdp_port: int
-    cdp_host: str = "localhost"
 
 
 class PersistentSessionsManager:
@@ -138,16 +136,6 @@ class PersistentSessionsManager:
             runnable_id=runnable_id,
             organization_id=organization_id,
         )
-
-    async def get_network_info(self, session_id: str) -> tuple[int | None, str | None]:
-        """Returns cdp port and ip address of the browser session"""
-        browser_session = self._browser_sessions.get(session_id)
-        if browser_session:
-            return (
-                browser_session.cdp_port,
-                browser_session.cdp_host,
-            )
-        return None, None
 
     async def release_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a specific browser session."""
