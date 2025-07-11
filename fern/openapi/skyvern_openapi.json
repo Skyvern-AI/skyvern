@@ -1928,6 +1928,9 @@
                 "type": "array"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -3282,7 +3285,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 10080,
+                "maximum": 120,
                 "minimum": 5
               },
               {
@@ -3290,7 +3293,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 10080. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 120. Defaults to 60.",
             "default": 60
           }
         },
@@ -3715,6 +3718,9 @@
                 "type": "array"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -3926,6 +3932,9 @@
                 "type": "array"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -4084,6 +4093,9 @@
               {
                 "items": {},
                 "type": "array"
+              },
+              {
+                "type": "string"
               },
               {
                 "type": "null"
@@ -5414,6 +5426,9 @@
                 "type": "array"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -5828,6 +5843,9 @@
               {
                 "items": {},
                 "type": "array"
+              },
+              {
+                "type": "string"
               },
               {
                 "type": "null"
@@ -7192,6 +7210,9 @@
                 "type": "array"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -7418,6 +7439,9 @@
               {
                 "items": {},
                 "type": "array"
+              },
+              {
+                "type": "string"
               },
               {
                 "type": "null"
@@ -8590,6 +8614,9 @@
                 "type": "array"
               },
               {
+                "type": "string"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -8888,6 +8915,9 @@
               {
                 "items": {},
                 "type": "array"
+              },
+              {
+                "type": "string"
               },
               {
                 "type": "null"
