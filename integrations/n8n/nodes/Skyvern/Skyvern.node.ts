@@ -85,44 +85,41 @@ export class Skyvern implements INodeType {
                         value: 'dispatchTask',
                         action: 'Dispatch a task to execute asynchronously',
                         description: 'Dispatch a task to execute asynchronously',
-                        routing: {
-                            request: {
-                                baseURL: '={{$credentials.baseUrl}}',
-                                method: 'POST',
-                                url: '/v1/run/tasks',
-                            },
-                            send: {
-                                preSend: [
-                                    async function (
-                                        this: IExecuteSingleFunctions,
-                                        requestOptions: IHttpRequestOptions,
-                                    ): Promise<IHttpRequestOptions> {
-                                        const taskOptions = this.getNodeParameter('taskOptions') as IDataObject;
-                                        const legacy_engine = taskOptions['engine'] as string | null;
-                                        if (legacy_engine === 'v1') {
-                                            (requestOptions.body as IDataObject)['engine'] = 'skyvern-1.0';
-                                        } else if (legacy_engine === 'v2') {
-                                            (requestOptions.body as IDataObject)['engine'] = 'skyvern-2.0';
-                                        }
-                                        return requestOptions;
-                                    },
-                                ],
-                            },
-                        },
                     },
                     {
                         name: 'Get a Task',
                         value: 'getTask',
                         action: 'Get a task by ID',
                         description: 'Get a task by ID',
-                        routing: {
-                            request: {
-                                baseURL: '={{$credentials.baseUrl}}',
-                                method: 'GET',
-                            },
-                        },
                     },
                 ],
+                routing: {
+                    request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: '={{ $value === "dispatchTask" ? "POST" : "GET" }}' as IHttpRequestMethods,
+                        url: '={{"/v1/run/tasks"}}',
+                    },
+                    send: {
+                        preSend: [
+                            async function (
+                                this: IExecuteSingleFunctions,
+                                requestOptions: IHttpRequestOptions,
+                            ): Promise<IHttpRequestOptions> {
+                                const taskOperation = this.getNodeParameter('taskOperation');
+                                if (taskOperation === "getTask") return requestOptions;
+
+                                const taskOptions = this.getNodeParameter('taskOptions') as IDataObject;
+                                const legacy_engine = taskOptions['engine'] as string | null;
+                                if (legacy_engine === 'v1') {
+                                    (requestOptions.body as IDataObject)['engine'] = 'skyvern-1.0';
+                                } else if (legacy_engine === 'v2') {
+                                    (requestOptions.body as IDataObject)['engine'] = 'skyvern-2.0';
+                                }
+                                return requestOptions;
+                            },
+                        ],
+                    },
+                },
             },
             // Workflow Operations
             {
@@ -143,27 +140,20 @@ export class Skyvern implements INodeType {
                         value: 'getWorkflow',
                         action: 'Get a workflow run by ID',
                         description: 'Get a workflow run by ID',
-                        routing: {
-                            request: {
-                                baseURL: '={{$credentials.baseUrl}}',
-                                method: 'GET',
-                            },
-                        },
                     },
                     {
                         name: 'Dispatch a Workflow Run',
                         value: 'dispatchWorkflow',
                         action: 'Dispatch a workflow run to execute asynchronously',
                         description: 'Dispatch a workflow run to execute asynchronously',
-                        routing: {
-                            request: {
-                                baseURL: '={{$credentials.baseUrl}}',
-                                method: 'POST',
-                                url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
-                            },
-                        },
                     },
                 ],
+                routing: {
+                    request: {
+                        baseURL: '={{$credentials.baseUrl}}',
+                        method: '={{ $value === "dispatchWorkflow" ? "POST" : "GET" }}' as IHttpRequestMethods,
+                    },
+                },
             },
             {
                 displayName: 'User Prompt',
@@ -385,6 +375,7 @@ export class Skyvern implements INodeType {
                 },
                 routing: {
                     request: {
+                        url: '={{"/api/v1/workflows/" + $parameter["workflowId"] + "/run"}}',
                         body: {
                             data: '={{$value["value"]}}',
                         },
