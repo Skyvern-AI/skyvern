@@ -195,38 +195,37 @@ class BitwardenService:
         max_retries: int = settings.BITWARDEN_MAX_RETRIES,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
     ) -> dict[str, str]:
-        """
-        Get the secret value from the Bitwarden CLI.
-        """
+        """Get a login secret from Bitwarden via the Vault Management API."""
+
         fail_reasons: list[str] = []
         if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
 
         for i in range(max_retries):
-            # FIXME: just simply double the timeout for the second try. maybe a better backoff policy when needed
             timeout = (i + 1) * timeout
             try:
                 async with asyncio.timeout(timeout):
-                    return await BitwardenService._get_secret_value_from_url(
-                        client_id=client_id,
-                        client_secret=client_secret,
+                    return await BitwardenService._get_secret_value_from_url_using_server(
                         master_password=master_password,
                         bw_organization_id=bw_organization_id,
                         bw_collection_ids=bw_collection_ids,
                         url=url,
                         collection_id=collection_id,
                         item_id=item_id,
-                        timeout=timeout,
                     )
             except BitwardenAccessDeniedError as e:
                 raise e
             except Exception as e:
-                LOG.info("Failed to get secret value from Bitwarden", tried_times=i + 1, exc_info=True)
+                LOG.info(
+                    "Failed to get secret value from Bitwarden",
+                    tried_times=i + 1,
+                    exc_info=True,
+                )
                 fail_reasons.append(f"{type(e).__name__}: {str(e)}")
-        else:
-            raise BitwardenListItemsError(
-                f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
-            )
+
+        raise BitwardenListItemsError(
+            f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
+        )
 
     @staticmethod
     def extract_totp_secret(totp_value: str) -> str:
@@ -751,6 +750,92 @@ class BitwardenService:
             password=login["password"] or "",
             totp=totp,
         )
+
+    @staticmethod
+    async def _get_secret_value_from_url_using_server(
+        master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
+        url: str | None = None,
+        collection_id: str | None = None,
+        item_id: str | None = None,
+    ) -> dict[str, str]:
+        await BitwardenService._unlock_using_server(master_password)
+
+        if item_id:
+            login_item = await BitwardenService._get_login_item_by_id_using_server(item_id)
+            return {
+                BitwardenConstants.USERNAME: login_item.username,
+                BitwardenConstants.PASSWORD: login_item.password,
+                BitwardenConstants.TOTP: login_item.totp,
+            }
+
+        if not url:
+            raise BitwardenGetItemError("No url or item ID provided")
+
+        extract_url = tldextract.extract(url)
+        domain = extract_url.domain
+
+        params = {"search": domain}
+        if bw_organization_id:
+            params["organizationId"] = bw_organization_id
+        if collection_id:
+            params["collectionId"] = collection_id
+        if not bw_organization_id and not collection_id:
+            LOG.error("No collection ID or organization ID provided -- this is required")
+            raise BitwardenListItemsError("No collection ID or organization ID provided -- this is required")
+
+        query = urllib.parse.urlencode(params)
+        response = await aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/list/object/items?{query}")
+        if not response or response.get("success") is False:
+            raise BitwardenListItemsError("Failed to get collection items")
+
+        items = response["data"]["data"]
+
+        if bw_organization_id and collection_id:
+            items = [
+                item
+                for item in items
+                if "collectionIds" in item and collection_id in item["collectionIds"]
+            ]
+
+        if not items:
+            collection_id_str = f" in collection with ID: {collection_id}" if collection_id else ""
+            raise BitwardenListItemsError(f"No items found in Bitwarden for URL: {url}{collection_id_str}")
+
+        bitwarden_result: list[BitwardenQueryResult] = []
+        for item in items:
+            if "login" not in item:
+                continue
+
+            login = item["login"]
+            totp = BitwardenService.extract_totp_secret(login.get("totp", ""))
+
+            bitwarden_result.append(
+                BitwardenQueryResult(
+                    credential={
+                        BitwardenConstants.USERNAME: login.get("username", ""),
+                        BitwardenConstants.PASSWORD: login.get("password", ""),
+                        BitwardenConstants.TOTP: totp,
+                    },
+                    uris=[uri.get("uri") for uri in login.get("uris", []) if "uri" in uri],
+                )
+            )
+
+        if len(bitwarden_result) == 0:
+            return {}
+
+        if len(bitwarden_result) == 1:
+            return bitwarden_result[0].credential
+
+        for single_result in bitwarden_result:
+            if is_valid_email(single_result.credential.get(BitwardenConstants.USERNAME)):
+                for uri in single_result.uris:
+                    if extract_url.registered_domain == tldextract.extract(uri).registered_domain:
+                        return single_result.credential
+
+        LOG.warning("No credential in Bitwarden matches the rule, returning the first match")
+        return bitwarden_result[0].credential
 
     @staticmethod
     async def _create_login_item_using_server(
