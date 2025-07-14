@@ -617,7 +617,7 @@ function isHoverPointerElement(element, hoverStylesMap) {
 
   // Check if element has hover styles that change cursor to pointer
   // This is to handle the case where an element's cursor is "auto", but resolves to "pointer" on hover
-  if (elementCursor === "auto") {
+  if (elementCursor === "auto" || elementCursor === "default") {
     // TODO: we need a better algorithm to match the selector with better performance
     for (const [selector, styles] of hoverStylesMap) {
       let shouldMatch = false;
