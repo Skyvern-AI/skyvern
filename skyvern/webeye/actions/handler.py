@@ -2055,6 +2055,22 @@ async def chain_click(
                 )
                 return action_results
 
+            try:
+                LOG.info(
+                    "Chain click: element is blocked by an non-interactable element, try to click by the coordinates",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                await skyvern_element.coordinate_click(page=page)
+                action_results.append(ActionSuccess())
+                return action_results
+            except Exception as e:
+                action_results.append(
+                    ActionFailure(FailToClick(action.element_id, anchor="coordinate_click", msg=str(e)))
+                )
+
             LOG.info(
                 "Chain click: element is blocked by an non-interactable element, going to use javascript click instead of playwright click",
                 task_id=task.task_id,
