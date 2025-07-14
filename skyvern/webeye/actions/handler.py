@@ -834,7 +834,6 @@ async def handle_input_text_action(
         await page.keyboard.type(action.text)
         return [ActionSuccess()]
 
-    input_or_select_context: InputOrSelectContext | None = None
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
@@ -883,8 +882,19 @@ async def handle_input_text_action(
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
+
+    input_or_select_context = await _get_input_or_select_context(
+        action=action,
+        scraped_page=scraped_page,
+        step=step,
+    )
+
     # check if it's selectable
-    if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
+    if (
+        not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
+        and skyvern_element.get_tag_name() == InteractiveElement.INPUT
+        and not await skyvern_element.is_raw_input()
+    ):
         await skyvern_element.scroll_into_view()
         # press arrowdown to watch if there's any options popping up
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
@@ -931,12 +941,6 @@ async def handle_input_text_action(
             try_to_quit_dropdown = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
-                if input_or_select_context is None:
-                    input_or_select_context = await _get_input_or_select_context(
-                        action=action,
-                        scraped_page=scraped_page,
-                        step=step,
-                    )
 
                 select_result = await sequentially_select_from_dropdown(
                     action=select_action,
@@ -1089,13 +1093,6 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if not await skyvern_element.is_raw_input():
-            if input_or_select_context is None:
-                input_or_select_context = await _get_input_or_select_context(
-                    action=action,
-                    scraped_page=scraped_page,
-                    step=step,
-                )
-
             if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
