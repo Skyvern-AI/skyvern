@@ -1463,6 +1463,10 @@ async function buildElementTree(
     hoverStylesMap = await getHoverStylesMap();
   }
 
+  if (window.GlobalEnableAllTextualElements === undefined) {
+    window.GlobalEnableAllTextualElements = false;
+  }
+
   var elements = [];
   var resultArray = [];
 
@@ -1509,7 +1513,7 @@ async function buildElementTree(
     }
     const isVisible = isElementVisible(element);
     if (isVisible && !isHidden(element) && !isScriptOrStyle(element)) {
-      const interactable = isInteractable(element, hoverStylesMap);
+      let interactable = isInteractable(element, hoverStylesMap);
       let elementObj = null;
       let isParentSVG = null;
       if (interactable) {
@@ -1542,6 +1546,10 @@ async function buildElementTree(
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000
       ) {
+        if (window.GlobalEnableAllTextualElements) {
+          // force all textual elements to be interactable
+          interactable = true;
+        }
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (full_tree) {
         // when building full tree, we only get text from element itself

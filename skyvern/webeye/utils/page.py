@@ -11,9 +11,9 @@ from PIL import Image
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
-from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import TraceManager
 
 LOG = structlog.get_logger()
@@ -44,7 +44,7 @@ async def _page_screenshot_helper(
     page: Page,
     file_path: str | None = None,
     full_page: bool = False,
-    timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+    timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
 ) -> bytes:
     try:
         return await page.screenshot(
@@ -69,14 +69,14 @@ async def _current_viewpoint_screenshot_helper(
     page: Page,
     file_path: str | None = None,
     full_page: bool = False,
-    timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+    timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
 ) -> bytes:
     if page.is_closed():
         raise FailedToTakeScreenshot(error_message="Page is closed")
     try:
         if mode == ScreenshotMode.DETAILED:
-            await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
             LOG.debug("Page is fully loaded, agent is about to take screenshots")
         start_time = time.time()
         screenshot: bytes = b""
@@ -105,7 +105,7 @@ async def _scrolling_screenshots_helper(
     skyvern_page: SkyvernFrame,
     url: str | None = None,
     draw_boxes: bool = False,
-    max_number: int = settings.MAX_NUM_SCREENSHOTS,
+    max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
 ) -> tuple[list[bytes], list[int]]:
     # page is the main frame and the index must be 0
@@ -208,7 +208,7 @@ class SkyvernFrame:
         frame: Page | Frame,
         expression: str,
         arg: Any | None = None,
-        timeout_ms: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
@@ -226,9 +226,9 @@ class SkyvernFrame:
     async def take_scrolling_screenshot(
         page: Page,
         file_path: str | None = None,
-        timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+        timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
         mode: ScreenshotMode = ScreenshotMode.DETAILED,
-        scrolling_number: int = settings.MAX_NUM_SCREENSHOTS,
+        scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         if scrolling_number <= 0:
@@ -241,13 +241,13 @@ class SkyvernFrame:
                 page=page, file_path=file_path, timeout=timeout, full_page=True
             )
 
-        if scrolling_number > settings.MAX_NUM_SCREENSHOTS:
+        if scrolling_number > SettingsManager.get_settings().MAX_NUM_SCREENSHOTS:
             LOG.warning(
                 "scrolling_number is greater than the max number of screenshots, setting it to the max number of screenshots",
                 scrolling_number=scrolling_number,
-                max_number=settings.MAX_NUM_SCREENSHOTS,
+                max_number=SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
             )
-            scrolling_number = settings.MAX_NUM_SCREENSHOTS
+            scrolling_number = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS
 
         # use spilt screenshot with lite mode, isntead of fullpage screenshot from playwright
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
@@ -293,7 +293,7 @@ class SkyvernFrame:
         page: Page,
         url: str | None = None,
         draw_boxes: bool = False,
-        max_number: int = settings.MAX_NUM_SCREENSHOTS,
+        max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
     ) -> list[bytes]:
         if not scroll:
@@ -313,6 +313,10 @@ class SkyvernFrame:
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
         instance = cls(frame=frame)
         await cls.evaluate(frame=instance.frame, expression=JS_FUNCTION_DEFS)
+        if SettingsManager.get_settings().ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE:
+            await instance.evaluate(
+                frame=instance.frame, expression="() => window.GlobalEnableAllTextualElements = true"
+            )
         return instance
 
     def __init__(self, frame: Page | Frame) -> None:

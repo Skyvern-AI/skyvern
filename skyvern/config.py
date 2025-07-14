@@ -7,6 +7,9 @@ from skyvern.constants import SKYVERN_DIR
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=(".env", ".env.staging", ".env.prod"), extra="ignore")
 
+    # settings for experimentation
+    ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
+
     ADDITIONAL_MODULES: list[str] = []
 
     BROWSER_TYPE: str = "chromium-headful"
