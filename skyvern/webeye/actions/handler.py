@@ -724,6 +724,7 @@ async def handle_sequential_click_for_dropdown(
         scraped_page=scraped_page,
         step=step,
         task=task,
+        support_complete_action=True,
     )
 
 
@@ -2675,6 +2676,7 @@ async def select_from_emerging_elements(
     scraped_page: ScrapedPage,
     step: Step,
     task: Task,
+    support_complete_action: bool = False,
 ) -> ActionResult:
     """
     This is the function to select an element from the new showing elements.
@@ -2705,6 +2707,7 @@ async def select_from_emerging_elements(
         target_value=options.target_value,
         navigation_goal=task.navigation_goal,
         new_elements_ids=new_interactable_element_ids,
+        support_complete_action=support_complete_action,
         navigation_payload_str=json.dumps(task.navigation_payload),
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
@@ -2728,8 +2731,16 @@ async def select_from_emerging_elements(
     action_type_str: str = json_response.get("action_type", "") or ""
     action_type = ActionType(action_type_str.lower())
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
+    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT, ActionType.COMPLETE]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+
+    if action_type == ActionType.COMPLETE:
+        LOG.info(
+            "The user has completed the user goal in the current opened dropdown, although the dropdown might not be closed",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        return ActionSuccess()
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         LOG.info(
