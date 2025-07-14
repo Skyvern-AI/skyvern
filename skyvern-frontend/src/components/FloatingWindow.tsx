@@ -1,5 +1,9 @@
 /**
  * A draggable, resizable, floating window.
+ *
+ * NOTE: there is copious use of flushSync; see TODOs. We will need to remove
+ * this. (We can build our own windowing from scratch, sans `react-draggable`
+ * and `re-resizable`; but I don't want to do that until it's worth the effort.)
  */
 
 import { Resizable } from "re-resizable";
@@ -13,7 +17,6 @@ import {
 import { flushSync } from "react-dom";
 import Draggable from "react-draggable";
 
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 
 type OS = "Windows" | "macOS" | "Linux" | "Unknown";
@@ -95,8 +98,6 @@ function FloatingWindow({
   children: React.ReactNode;
   title: string;
 }) {
-  const debugStore = useDebugStore();
-  const isDebugMode = debugStore.isDebugMode;
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [size, setSize] = useState({
     left: 0,
@@ -333,7 +334,7 @@ function FloatingWindow({
     };
   }, [isMaximized]);
 
-  return !isDebugMode ? null : (
+  return (
     <div
       ref={parentRef}
       style={{
