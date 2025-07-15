@@ -11,6 +11,7 @@ from skyvern.client.core.pydantic_utilities import parse_obj_as
 from skyvern.client.environment import SkyvernEnvironment
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
+from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
@@ -338,6 +339,7 @@ class Skyvern(AsyncSkyvern):
                     proxy_location=proxy_location,
                     totp_identifier=totp_identifier,
                     totp_verification_url=totp_url,
+                    browser_session_id=browser_session_id,
                 )
 
                 created_task = await app.agent.create_task(task_request, organization.organization_id)
@@ -408,7 +410,45 @@ class Skyvern(AsyncSkyvern):
                     if RunStatus(task_run.status).is_final():
                         break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
-        return TaskRunResponse.model_validate(task_run.dict())
+        return TaskRunResponse.model_validate(task_run.model_dump())
+
+    async def run_workflow(
+        self,
+        workflow_id: str,
+        parameters: dict[str, Any] | None = None,
+        template: bool | None = None,
+        title: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        webhook_url: str | None = None,
+        totp_url: str | None = None,
+        totp_identifier: str | None = None,
+        browser_session_id: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> WorkflowRunResponse:
+        if not self._api_key:
+            raise ValueError(
+                "Local mode is not supported for run_workflow. Please instantiate Skyvern with an API key like this: Skyvern(api_key='your-api-key')"
+            )
+        workflow_run = await super().run_workflow(
+            workflow_id=workflow_id,
+            parameters=parameters,
+            template=template,
+            title=title,
+            proxy_location=proxy_location,
+            webhook_url=webhook_url,
+            totp_url=totp_url,
+            totp_identifier=totp_identifier,
+            browser_session_id=browser_session_id,
+        )
+        if wait_for_completion:
+            async with asyncio.timeout(timeout):
+                while True:
+                    workflow_run = await super().get_run(workflow_run.run_id)
+                    if RunStatus(workflow_run.status).is_final():
+                        break
+                    await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
+        return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
 
 def from_run_to_task_run_response(run_obj: GetRunResponse) -> TaskRunResponse:
