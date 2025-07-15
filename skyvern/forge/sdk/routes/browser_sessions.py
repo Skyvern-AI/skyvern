@@ -21,7 +21,6 @@ from skyvern.webeye.schemas import BrowserSessionResponse
     response_model=BrowserSessionResponse,
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "create_browser_session",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CREATE_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
@@ -52,7 +51,6 @@ async def create_browser_session(
     "/browser_sessions/{browser_session_id}/close",
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "close_browser_session",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CLOSE_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
@@ -88,7 +86,6 @@ async def close_browser_session(
     response_model=BrowserSessionResponse,
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_session",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
@@ -126,7 +123,6 @@ async def get_browser_session(
     response_model=list[BrowserSessionResponse],
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_sessions",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSIONS_CODE_SAMPLE}]}],
     },
