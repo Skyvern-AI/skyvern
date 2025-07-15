@@ -103,7 +103,6 @@ class AISuggestionType(str, Enum):
     "/run/tasks",
     tags=["Agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task",
         "x-fern-examples": [
             {
@@ -283,7 +282,6 @@ async def run_task(
     "/run/workflows",
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
             {
@@ -370,7 +368,6 @@ async def run_workflow(
     description="Get run information (task run, workflow run)",
     summary="Get a run by id",
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
     },
@@ -403,7 +400,6 @@ async def get_run(
     "/runs/{run_id}/cancel",
     tags=["Agent", "Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE}]}],
     },
@@ -428,7 +424,6 @@ async def cancel_run(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "create_workflow",
     },
     response_model=Workflow,
@@ -473,7 +468,6 @@ async def create_workflow_legacy(
     response_model=Workflow,
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [
             {
@@ -532,7 +526,6 @@ async def create_workflow(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
     },
     response_model=Workflow,
@@ -587,7 +580,6 @@ async def update_workflow_legacy(
     response_model=Workflow,
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
         "x-fern-examples": [
             {
@@ -658,7 +650,6 @@ async def update_workflow(
     "/workflows/{workflow_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
     },
 )
@@ -667,7 +658,6 @@ async def update_workflow(
     "/workflows/{workflow_id}/delete",
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
     },
@@ -690,7 +680,6 @@ async def delete_workflow(
     "/utilities/curl-to-http",
     tags=["Utilities"],
     openapi_extra={
-        "x-fern-sdk-group-name": "utilities",
         "x-fern-sdk-method-name": "convert_curl_to_http",
     },
     description="Convert a curl command to HTTP request parameters",
@@ -745,7 +734,6 @@ async def convert_curl_to_http(
     tags=["Artifacts"],
     response_model=Artifact,
     openapi_extra={
-        "x-fern-sdk-group-name": "artifacts",
         "x-fern-sdk-method-name": "get_artifact",
     },
     description="Get an artifact",
@@ -787,7 +775,6 @@ async def get_artifact(
     tags=["Artifacts"],
     response_model=list[Artifact],
     openapi_extra={
-        "x-fern-sdk-group-name": "artifacts",
         "x-fern-sdk-method-name": "get_run_artifacts",
     },
     description="Get artifacts for a run",
@@ -836,7 +823,6 @@ async def get_run_artifacts(
     "/runs/{run_id}/retry_webhook",
     tags=["Agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE}]}],
     },
@@ -909,7 +895,6 @@ async def run_block(
     "/webhook",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "webhook",
     },
     include_in_schema=False,
@@ -955,7 +940,6 @@ async def webhook(
     "/heartbeat",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "heartbeat",
     },
 )
@@ -970,9 +954,7 @@ async def heartbeat() -> Response:
 @legacy_base_router.get(
     "/models",
     tags=["agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-    },
+    openapi_extra={},
 )
 @legacy_base_router.get("/models/", include_in_schema=False)
 async def models() -> ModelsResponse:
@@ -990,7 +972,6 @@ async def models() -> ModelsResponse:
     tags=["agent"],
     response_model=CreateTaskResponse,
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task_v1",
     },
 )
@@ -1027,7 +1008,6 @@ async def run_task_v1(
     tags=["agent"],
     response_model=TaskResponse,
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_task_v1",
     },
 )
@@ -1044,7 +1024,6 @@ async def get_task_v1(
     "/tasks/{task_id}/cancel",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_task",
     },
 )
@@ -1103,7 +1082,6 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
     "/workflows/runs/{workflow_run_id}/cancel",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_workflow_run",
     },
 )
@@ -1120,7 +1098,6 @@ async def cancel_workflow_run(
     "/runs/{browser_session_id}/workflow_run/{workflow_run_id}/cancel/",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_workflow_run",
     },
 )
@@ -1141,7 +1118,6 @@ async def cancel_persistent_browser_session_workflow_run(
     tags=["agent"],
     response_model=TaskResponse,
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "retry_webhook",
     },
 )
@@ -1179,7 +1155,6 @@ async def retry_webhook(
     tags=["agent"],
     response_model=list[Task],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_tasks",
     },
 )
@@ -1236,7 +1211,6 @@ async def get_tasks(
     tags=["agent"],
     response_model=list[WorkflowRun | Task],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_runs",
     },
 )
@@ -1266,7 +1240,6 @@ async def get_runs(
     tags=["agent"],
     response_model=list[Step],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_steps",
     },
 )
@@ -1294,7 +1267,6 @@ async def get_steps(
     tags=["agent"],
     response_model=list[Artifact],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_artifacts",
     },
 )
@@ -1355,7 +1327,6 @@ async def get_artifacts(
     tags=["agent"],
     response_model=list[Artifact],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_step_artifacts",
     },
 )
@@ -1400,7 +1371,6 @@ async def get_step_artifacts(
     response_model=list[Action],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_actions",
     },
 )
@@ -1423,7 +1393,6 @@ async def get_actions(
     response_model=RunWorkflowResponse,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_workflow_legacy",
     },
 )
@@ -1479,7 +1448,6 @@ async def run_workflow_legacy(
     response_model=list[WorkflowRun],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_runs",
     },
 )
@@ -1508,7 +1476,6 @@ async def get_workflow_runs(
     response_model=list[WorkflowRun],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_runs_by_id",
     },
 )
@@ -1538,7 +1505,6 @@ async def get_workflow_runs_by_id(
     "/workflows/{workflow_id}/runs/{workflow_run_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_run_with_workflow_id",
     },
 )
@@ -1584,7 +1550,6 @@ async def get_workflow_run_with_workflow_id(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_run_timeline",
     },
 )
@@ -1606,7 +1571,6 @@ async def get_workflow_run_timeline(
     response_model=WorkflowRunResponseBase,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_run",
     },
 )
@@ -1631,7 +1595,6 @@ async def get_workflow_run(
     response_model=list[Workflow],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflows",
     },
 )
@@ -1645,7 +1608,6 @@ async def get_workflow_run(
     response_model=list[Workflow],
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "get_workflows",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_WORKFLOWS_CODE_SAMPLE}]}],
     },
@@ -1700,7 +1662,6 @@ async def get_workflows(
     response_model=list[Workflow],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_templates",
     },
 )
@@ -1728,7 +1689,6 @@ async def get_workflow_templates() -> list[Workflow]:
     response_model=Workflow,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow",
     },
 )
@@ -1756,7 +1716,6 @@ async def get_workflow(
     include_in_schema=False,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "suggest",
     },
 )
@@ -1793,7 +1752,6 @@ async def suggest(
     "/generate/task",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "generate_task",
     },
 )
@@ -1813,7 +1771,6 @@ async def generate_task(
     "/organizations",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "update_organization",
     },
 )
@@ -1835,7 +1792,6 @@ async def update_organization(
     "/organizations",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "get_organizations",
     },
 )
@@ -1853,7 +1809,6 @@ async def get_organizations(
     "/organizations/{organization_id}/apikeys/",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "get_api_keys",
     },
 )
@@ -1894,7 +1849,6 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
     "/upload_file",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "upload_file",
     },
 )
@@ -1923,7 +1877,6 @@ async def upload_file(
     "/tasks",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task_v2",
     },
 )
@@ -1987,7 +1940,6 @@ async def run_task_v2(
     "/tasks/{task_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_task_v2",
     },
 )

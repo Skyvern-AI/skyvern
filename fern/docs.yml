@@ -172,6 +172,23 @@ navigation:
               - POST /v1/workflows
               - POST /v1/workflows/{workflow_id}
               - POST /v1/workflows/{workflow_id}/delete
+          - section: Browser Sessions
+            contents:
+              - POST /v1/browser_sessions
+              - GET /v1/browser_sessions/{browser_session_id}
+              - POST /v1/browser_sessions/{browser_session_id}/close
+              - GET /v1/browser_sessions
+          - section: Credentials
+            contents:
+              - POST /v1/credentials
+              - GET /v1/credentials/{credential_id}
+              - POST /v1/credentials/{credential_id}/delete
+              - GET /v1/credentials
+              - POST /v1/credentials/totp
+          - section: Artifacts
+            contents:
+              - GET /v1/artifacts/{artifact_id}
+              - GET /v1/runs/{run_id}/artifacts
   - tab: blog
   - tab: community
   - tab: github
