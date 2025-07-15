@@ -39,7 +39,7 @@ async def parse_totp_code(content: str) -> str | None:
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
-    summary="Send TOTP (2FA, MFA) code to Skyvern",
+    summary="Send TOTP code",
     description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
     tags=["Credentials"],
     openapi_extra={
