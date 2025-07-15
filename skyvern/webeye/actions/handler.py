@@ -2529,7 +2529,7 @@ async def sequentially_select_from_dropdown(
         if await single_select_result.is_done():
             return single_select_result
 
-        if i == MAX_SELECT_DEPTH - 1:
+        if i == max_depth - 1:
             LOG.warning(
                 "Reaching the max selection depth",
                 depth=i,
