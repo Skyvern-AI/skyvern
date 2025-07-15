@@ -2941,6 +2941,37 @@
               120
             ]
           },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "Url for connecting to the browser",
+            "examples": [
+              "http://localhost:9222",
+              "https://3.12.10.11/browser/123456"
+            ]
+          },
+          "app_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Url",
+            "description": "Url for the browser session page",
+            "examples": [
+              "https://app.skyvern.com/browser-session/pbs_123456"
+            ]
+          },
           "started_at": {
             "anyOf": [
               {
