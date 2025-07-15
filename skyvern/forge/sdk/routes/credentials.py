@@ -34,14 +34,7 @@ async def parse_totp_code(content: str) -> str | None:
     return code_resp.get("code", None)
 
 
-@legacy_base_router.post(
-    "/totp",
-    tags=["agent"],
-    openapi_extra={
-        "x-fern-sdk-method-name": "send_totp_code",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
-    },
-)
+@legacy_base_router.post("/totp")
 @legacy_base_router.post("/totp/", include_in_schema=False)
 @base_router.post(
     "/credentials/totp",
@@ -51,6 +44,7 @@ async def parse_totp_code(content: str) -> str | None:
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "send_totp_code",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
     },
 )
 @base_router.post(
