@@ -28,6 +28,11 @@ class BrowserSessionResponse(BaseModel):
         description="Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.",
         examples=[60, 120],
     )
+    browser_address: str | None = Field(
+        None,
+        description="Url for connecting to the browser",
+        examples=["http://localhost:9222", "https://3.12.10.11/browser/123456"],
+    )
     started_at: datetime | None = Field(None, description="Timestamp when the session was started")
     completed_at: datetime | None = Field(None, description="Timestamp when the session was completed")
     created_at: datetime = Field(
@@ -53,6 +58,7 @@ class BrowserSessionResponse(BaseModel):
             runnable_type=browser_session.runnable_type,
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
+            browser_address=browser_session.browser_address,
             started_at=browser_session.started_at,
             completed_at=browser_session.completed_at,
             created_at=browser_session.created_at,
