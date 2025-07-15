@@ -100,6 +100,10 @@ function FloatingWindow({
   children,
   initialWidth,
   initialHeight,
+  maximized,
+  showCloseButton,
+  showMaximizeButton,
+  showMinimizeButton,
   title,
   zIndex,
   // --
@@ -108,12 +112,15 @@ function FloatingWindow({
   children: React.ReactNode;
   initialHeight?: number;
   initialWidth?: number;
+  maximized?: boolean;
+  showCloseButton?: boolean;
+  showMaximizeButton?: boolean;
+  showMinimizeButton?: boolean;
   title: string;
   zIndex?: string;
   // --
   onInteract?: () => void;
 }) {
-  console.log(title, initialWidth, initialHeight);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [size, setSize] = useState({
     left: 0,
@@ -133,7 +140,7 @@ function FloatingWindow({
     height: initialHeight ?? Constants.MinHeight,
     width: initialWidth ?? Constants.MinWidth,
   });
-  const [isMaximized, setIsMaximized] = useState(false);
+  const [isMaximized, setIsMaximized] = useState(maximized ?? false);
   const [isMinimized, setIsMinimized] = useState(false);
   const parentRef = useRef<HTMLDivElement>(null);
   const resizableRef = useRef<HTMLDivElement>(null);
@@ -464,23 +471,31 @@ function FloatingWindow({
               {os === "macOS" ? (
                 <>
                   <div className="buttons-container flex items-center gap-2">
-                    <MacOsButton
-                      color="#FF605C"
-                      disabled={true}
-                      tip="close"
-                      onClick={() => {}}
-                    />
-                    <MacOsButton
-                      color="#FFBD44"
-                      disabled={true}
-                      tip="minimize"
-                      onClick={onMinimize}
-                    />
-                    <MacOsButton
-                      color="#00CA4E"
-                      tip={isMaximized || isMinimized ? "restore" : "maximize"}
-                      onClick={toggleMaximized}
-                    />
+                    {showCloseButton && (
+                      <MacOsButton
+                        color="#FF605C"
+                        disabled={true}
+                        tip="close"
+                        onClick={() => {}}
+                      />
+                    )}
+                    {showMinimizeButton && (
+                      <MacOsButton
+                        color="#FFBD44"
+                        disabled={true}
+                        tip="minimize"
+                        onClick={onMinimize}
+                      />
+                    )}
+                    {showMaximizeButton && (
+                      <MacOsButton
+                        color="#00CA4E"
+                        tip={
+                          isMaximized || isMinimized ? "restore" : "maximize"
+                        }
+                        onClick={toggleMaximized}
+                      />
+                    )}
                   </div>
                   <div className="ml-auto">{title}</div>
                 </>
@@ -488,9 +503,11 @@ function FloatingWindow({
                 <>
                   <div>{title}</div>
                   <div className="buttons-container ml-auto flex h-full items-center gap-4">
-                    <WindowsButton onClick={toggleMaximized}>
-                      <div>{isMaximized ? "-" : "□"}</div>
-                    </WindowsButton>
+                    {showMaximizeButton && (
+                      <WindowsButton onClick={toggleMaximized}>
+                        <div>{isMaximized ? "-" : "□"}</div>
+                      </WindowsButton>
+                    )}
                   </div>
                 </>
               )}
