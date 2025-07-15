@@ -21,6 +21,11 @@ import { cn } from "@/util/utils";
 
 type OS = "Windows" | "macOS" | "Linux" | "Unknown";
 
+const Constants = {
+  MinHeight: 52,
+  MinWidth: 256,
+} as const;
+
 function MacOsButton(props: {
   color: string;
   children?: React.ReactNode;
@@ -93,29 +98,40 @@ function getOs(): OS {
 
 function FloatingWindow({
   children,
+  initialWidth,
+  initialHeight,
   title,
+  zIndex,
+  // --
+  onInteract,
 }: {
   children: React.ReactNode;
+  initialHeight?: number;
+  initialWidth?: number;
   title: string;
+  zIndex?: string;
+  // --
+  onInteract?: () => void;
 }) {
+  console.log(title, initialWidth, initialHeight);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [size, setSize] = useState({
     left: 0,
     top: 0,
-    width: 800,
-    height: 680,
+    height: initialHeight ?? Constants.MinHeight,
+    width: initialWidth ?? Constants.MinWidth,
   });
   const [lastSize, setLastSize] = useState({
     left: 0,
     top: 0,
-    width: 800,
-    height: 680,
+    height: initialHeight ?? Constants.MinHeight,
+    width: initialWidth ?? Constants.MinWidth,
   });
   const [sizeBeforeMaximize, setSizeBeforeMaximize] = useState({
     left: 0,
     top: 0,
-    width: 800,
-    height: 680,
+    height: initialHeight ?? Constants.MinHeight,
+    width: initialWidth ?? Constants.MinWidth,
   });
   const [isMaximized, setIsMaximized] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
@@ -197,6 +213,19 @@ function FloatingWindow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [dragStartSize],
   );
+
+  useEffect(() => {
+    if (!initialWidth || !initialHeight) {
+      return;
+    }
+    setSize({
+      left: 0,
+      top: 0,
+      width: initialWidth,
+      height: initialHeight,
+    });
+    setPosition({ x: 0, y: 0 });
+  }, [initialWidth, initialHeight]);
 
   /**
    * Forces the sizing to take place after the resize is complete.
@@ -346,6 +375,7 @@ function FloatingWindow({
         height: "100%",
         pointerEvents: "none",
         padding: "0.5rem",
+        zIndex,
       }}
     >
       <Draggable
@@ -365,11 +395,15 @@ function FloatingWindow({
             background: "#020817",
             boxSizing: "border-box",
             pointerEvents: "auto",
+            overflow: "hidden",
           }}
-          className={cn("border-8 border-gray-900", {
+          className={cn("border-2 border-gray-700", {
             "hover:border-slate-500": !isMaximized,
           })}
-          bounds={parentRef.current ?? "parent"}
+          minHeight={Constants.MinHeight}
+          minWidth={Constants.MinWidth}
+          // TODO: turn back on; turning off clears a resize bug atm
+          // bounds={parentRef.current ?? "parent"}
           enable={
             isMaximized
               ? false
@@ -421,11 +455,12 @@ function FloatingWindow({
               display: "flex",
               flexDirection: "column",
             }}
+            onMouseDownCapture={() => onInteract?.()}
             onDoubleClick={() => {
               toggleMaximized();
             }}
           >
-            <div className="my-window-header flex w-full cursor-move items-center justify-start gap-2 bg-[#031827] p-3">
+            <div className="my-window-header flex h-[3rem] w-full cursor-move items-center justify-start gap-2 bg-[#031827] p-3">
               {os === "macOS" ? (
                 <>
                   <div className="buttons-container flex items-center gap-2">
