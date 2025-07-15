@@ -6,14 +6,11 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
 
-class TextPromptBlockYaml(UniversalBaseModel):
-    label: str
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    llm_key: typing.Optional[str] = None
-    prompt: str
-    parameter_keys: typing.Optional[typing.List[str]] = None
-    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+class OnePasswordCredentialParameterYaml(UniversalBaseModel):
+    key: str
+    description: typing.Optional[str] = None
+    vault_id: str
+    item_id: str
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
