@@ -2,18 +2,21 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import typing
+import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
 
 
-class TextPromptBlockYaml(UniversalBaseModel):
-    label: str
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    llm_key: typing.Optional[str] = None
-    prompt: str
-    parameter_keys: typing.Optional[typing.List[str]] = None
-    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+class OnePasswordCredentialParameter(UniversalBaseModel):
+    key: str
+    description: typing.Optional[str] = None
+    onepassword_credential_parameter_id: str
+    workflow_id: str
+    vault_id: str
+    item_id: str
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

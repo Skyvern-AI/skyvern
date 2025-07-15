@@ -9,6 +9,7 @@ import pydantic
 class WaitBlockYaml(UniversalBaseModel):
     label: str
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     wait_sec: typing.Optional[int] = None
 
     if IS_PYDANTIC_V2:

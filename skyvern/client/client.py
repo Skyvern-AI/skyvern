@@ -22,6 +22,7 @@ from .errors.not_found_error import NotFoundError
 from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.artifact import Artifact
+from .types.artifact_type import ArtifactType
 from .types.browser_session_response import BrowserSessionResponse
 from .errors.forbidden_error import ForbiddenError
 import datetime as dt
@@ -54,6 +55,7 @@ class Skyvern:
 
 
     api_key : typing.Optional[str]
+    x_api_key : str
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -69,6 +71,7 @@ class Skyvern:
 
     client = Skyvern(
         api_key="YOUR_API_KEY",
+        x_api_key="YOUR_X_API_KEY",
     )
     """
 
@@ -78,6 +81,7 @@ class Skyvern:
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
         api_key: typing.Optional[str] = None,
+        x_api_key: str,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.Client] = None,
@@ -86,6 +90,7 @@ class Skyvern:
         self._client_wrapper = SyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
             api_key=api_key,
+            x_api_key=x_api_key,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.Client(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -110,8 +115,11 @@ class Skyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
+        max_screenshot_scrolls: typing.Optional[int] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -152,6 +160,7 @@ class Skyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California
             - US-NY: New York
@@ -174,7 +183,7 @@ class Skyvern:
 
         webhook_url : typing.Optional[str]
 
-            URL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
+            After a run is finished, send an update to this URL. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
 
         totp_identifier : typing.Optional[str]
 
@@ -188,11 +197,21 @@ class Skyvern:
 
             Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
+        model : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
+
+            Optional model configuration.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            The extra HTTP headers for the requests in browser.
+
         publish_workflow : typing.Optional[bool]
             Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
 
         include_action_history_in_verification : typing.Optional[bool]
             Whether to include action history when verifying that the task is complete
+
+        max_screenshot_scrolls : typing.Optional[int]
+            The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -208,6 +227,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.run_task(
             prompt="Find the top 3 posts on Hacker News.",
@@ -231,8 +251,11 @@ class Skyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "model": model,
+                "extra_http_headers": extra_http_headers,
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
+                "max_screenshot_scrolls": max_screenshot_scrolls,
             },
             headers={
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -288,6 +311,8 @@ class Skyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -326,6 +351,7 @@ class Skyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California
             - US-NY: New York
@@ -348,6 +374,12 @@ class Skyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        max_screenshot_scrolls : typing.Optional[int]
+            The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            The extra HTTP headers for the requests in browser.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -362,6 +394,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.run_workflow(
             workflow_id="wpid_123",
@@ -382,6 +415,8 @@ class Skyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
+                "max_screenshot_scrolls": max_screenshot_scrolls,
+                "extra_http_headers": extra_http_headers,
             },
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
@@ -447,6 +482,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_run(
             run_id="tsk_123",
@@ -516,6 +552,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.cancel_run(
             run_id="run_id",
@@ -592,6 +629,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_workflows()
         """
@@ -664,6 +702,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.create_workflow()
         """
@@ -739,6 +778,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.update_workflow(
             workflow_id="wpid_123",
@@ -805,6 +845,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.delete_workflow(
             workflow_id="wpid_123",
@@ -861,6 +902,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_artifact(
             artifact_id="artifact_id",
@@ -905,6 +947,75 @@ class Skyvern:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    def get_run_artifacts(
+        self,
+        run_id: str,
+        *,
+        artifact_type: typing.Optional[typing.Union[ArtifactType, typing.Sequence[ArtifactType]]] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Artifact]:
+        """
+        Get artifacts for a run
+
+        Parameters
+        ----------
+        run_id : str
+            The id of the task run or the workflow run.
+
+        artifact_type : typing.Optional[typing.Union[ArtifactType, typing.Sequence[ArtifactType]]]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Artifact]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+        client.get_run_artifacts(
+            run_id="run_id",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/runs/{jsonable_encoder(run_id)}/artifacts",
+            method="GET",
+            params={
+                "artifact_type": artifact_type,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[Artifact],
+                    parse_obj_as(
+                        type_=typing.List[Artifact],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     def retry_run_webhook(
         self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
@@ -930,6 +1041,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.retry_run_webhook(
             run_id="tsk_123",
@@ -986,6 +1098,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_browser_sessions()
         """
@@ -1037,7 +1150,7 @@ class Skyvern:
         Parameters
         ----------
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 10080. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 120. Defaults to 60.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1053,6 +1166,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.create_browser_session()
         """
@@ -1127,6 +1241,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.close_browser_session(
             browser_session_id="pbs_123456",
@@ -1196,6 +1311,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_browser_session(
             browser_session_id="pbs_123456",
@@ -1302,6 +1418,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.send_totp_code(
             totp_identifier="john.doe@example.com",
@@ -1382,8 +1499,12 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
-        client.get_credentials()
+        client.get_credentials(
+            page=1,
+            page_size=10,
+        )
         """
         _response = self._client_wrapper.httpx_client.request(
             "v1/credentials",
@@ -1454,6 +1575,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.create_credential(
             name="My Credential",
@@ -1527,6 +1649,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.delete_credential(
             credential_id="cred_1234567890",
@@ -1580,6 +1703,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
         client.get_credential(
             credential_id="cred_1234567890",
@@ -1634,6 +1758,7 @@ class AsyncSkyvern:
 
 
     api_key : typing.Optional[str]
+    x_api_key : str
     timeout : typing.Optional[float]
         The timeout to be used, in seconds, for requests. By default the timeout is 60 seconds, unless a custom httpx client is used, in which case this default is not enforced.
 
@@ -1649,6 +1774,7 @@ class AsyncSkyvern:
 
     client = AsyncSkyvern(
         api_key="YOUR_API_KEY",
+        x_api_key="YOUR_X_API_KEY",
     )
     """
 
@@ -1658,6 +1784,7 @@ class AsyncSkyvern:
         base_url: typing.Optional[str] = None,
         environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
         api_key: typing.Optional[str] = None,
+        x_api_key: str,
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.AsyncClient] = None,
@@ -1666,6 +1793,7 @@ class AsyncSkyvern:
         self._client_wrapper = AsyncClientWrapper(
             base_url=_get_base_url(base_url=base_url, environment=environment),
             api_key=api_key,
+            x_api_key=x_api_key,
             httpx_client=httpx_client
             if httpx_client is not None
             else httpx.AsyncClient(timeout=_defaulted_timeout, follow_redirects=follow_redirects)
@@ -1690,8 +1818,11 @@ class AsyncSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
+        max_screenshot_scrolls: typing.Optional[int] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -1732,6 +1863,7 @@ class AsyncSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California
             - US-NY: New York
@@ -1754,7 +1886,7 @@ class AsyncSkyvern:
 
         webhook_url : typing.Optional[str]
 
-            URL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
+            After a run is finished, send an update to this URL. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
 
         totp_identifier : typing.Optional[str]
 
@@ -1768,11 +1900,21 @@ class AsyncSkyvern:
 
             Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
+        model : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
+
+            Optional model configuration.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            The extra HTTP headers for the requests in browser.
+
         publish_workflow : typing.Optional[bool]
             Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
 
         include_action_history_in_verification : typing.Optional[bool]
             Whether to include action history when verifying that the task is complete
+
+        max_screenshot_scrolls : typing.Optional[int]
+            The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1790,6 +1932,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -1819,8 +1962,11 @@ class AsyncSkyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "model": model,
+                "extra_http_headers": extra_http_headers,
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
+                "max_screenshot_scrolls": max_screenshot_scrolls,
             },
             headers={
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -1876,6 +2022,8 @@ class AsyncSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -1914,6 +2062,7 @@ class AsyncSkyvern:
             - RESIDENTIAL_NZ: New Zealand
             - RESIDENTIAL_ZA: South Africa
             - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_AU: Australia
             - RESIDENTIAL_ISP: ISP proxy
             - US-CA: California
             - US-NY: New York
@@ -1936,6 +2085,12 @@ class AsyncSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        max_screenshot_scrolls : typing.Optional[int]
+            The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
+
+        extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
+            The extra HTTP headers for the requests in browser.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -1952,6 +2107,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -1978,6 +2134,8 @@ class AsyncSkyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
+                "max_screenshot_scrolls": max_screenshot_scrolls,
+                "extra_http_headers": extra_http_headers,
             },
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
@@ -2045,6 +2203,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2122,6 +2281,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2206,6 +2366,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2286,6 +2447,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2369,6 +2531,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2443,6 +2606,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2509,6 +2673,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2559,6 +2724,83 @@ class AsyncSkyvern:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    async def get_run_artifacts(
+        self,
+        run_id: str,
+        *,
+        artifact_type: typing.Optional[typing.Union[ArtifactType, typing.Sequence[ArtifactType]]] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Artifact]:
+        """
+        Get artifacts for a run
+
+        Parameters
+        ----------
+        run_id : str
+            The id of the task run or the workflow run.
+
+        artifact_type : typing.Optional[typing.Union[ArtifactType, typing.Sequence[ArtifactType]]]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Artifact]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_run_artifacts(
+                run_id="run_id",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/runs/{jsonable_encoder(run_id)}/artifacts",
+            method="GET",
+            params={
+                "artifact_type": artifact_type,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[Artifact],
+                    parse_obj_as(
+                        type_=typing.List[Artifact],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     async def retry_run_webhook(
         self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
@@ -2586,6 +2828,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2650,6 +2893,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2707,7 +2951,7 @@ class AsyncSkyvern:
         Parameters
         ----------
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 10080. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 120. Defaults to 60.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2725,6 +2969,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2807,6 +3052,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2884,6 +3130,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -2998,6 +3245,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -3086,11 +3334,15 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
         async def main() -> None:
-            await client.get_credentials()
+            await client.get_credentials(
+                page=1,
+                page_size=10,
+            )
 
 
         asyncio.run(main())
@@ -3166,6 +3418,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -3249,6 +3502,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 
@@ -3310,6 +3564,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
         )
 
 

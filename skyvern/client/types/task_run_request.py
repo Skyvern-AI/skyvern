@@ -50,6 +50,7 @@ class TaskRunRequest(UniversalBaseModel):
     - RESIDENTIAL_NZ: New Zealand
     - RESIDENTIAL_ZA: South Africa
     - RESIDENTIAL_AR: Argentina
+    - RESIDENTIAL_AU: Australia
     - RESIDENTIAL_ISP: ISP proxy
     - US-CA: California
     - US-NY: New York
@@ -101,6 +102,17 @@ class TaskRunRequest(UniversalBaseModel):
     Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
     """
 
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
+    """
+    
+    Optional model configuration.
+    """
+
+    extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
+    """
+    The extra HTTP headers for the requests in browser.
+    """
+
     publish_workflow: typing.Optional[bool] = pydantic.Field(default=None)
     """
     Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
@@ -109,6 +121,11 @@ class TaskRunRequest(UniversalBaseModel):
     include_action_history_in_verification: typing.Optional[bool] = pydantic.Field(default=None)
     """
     Whether to include action history when verifying that the task is complete
+    """
+
+    max_screenshot_scrolls: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
     """
 
     if IS_PYDANTIC_V2:

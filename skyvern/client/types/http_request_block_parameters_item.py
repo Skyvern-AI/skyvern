@@ -12,7 +12,7 @@ from .workflow_parameter_default_value import WorkflowParameterDefaultValue
 from ..core.pydantic_utilities import update_forward_refs
 
 
-class ValidationBlockParametersItem_AwsSecret(UniversalBaseModel):
+class HttpRequestBlockParametersItem_AwsSecret(UniversalBaseModel):
     parameter_type: typing.Literal["aws_secret"] = "aws_secret"
     key: str
     description: typing.Optional[str] = None
@@ -33,7 +33,7 @@ class ValidationBlockParametersItem_AwsSecret(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ValidationBlockParametersItem_BitwardenCreditCardData(UniversalBaseModel):
+class HttpRequestBlockParametersItem_BitwardenCreditCardData(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_credit_card_data"] = "bitwarden_credit_card_data"
     key: str
     description: typing.Optional[str] = None
@@ -58,7 +58,7 @@ class ValidationBlockParametersItem_BitwardenCreditCardData(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ValidationBlockParametersItem_BitwardenLoginCredential(UniversalBaseModel):
+class HttpRequestBlockParametersItem_BitwardenLoginCredential(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_login_credential"] = "bitwarden_login_credential"
     key: str
     description: typing.Optional[str] = None
@@ -84,7 +84,7 @@ class ValidationBlockParametersItem_BitwardenLoginCredential(UniversalBaseModel)
             extra = pydantic.Extra.allow
 
 
-class ValidationBlockParametersItem_BitwardenSensitiveInformation(UniversalBaseModel):
+class HttpRequestBlockParametersItem_BitwardenSensitiveInformation(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_sensitive_information"] = "bitwarden_sensitive_information"
     key: str
     description: typing.Optional[str] = None
@@ -110,7 +110,7 @@ class ValidationBlockParametersItem_BitwardenSensitiveInformation(UniversalBaseM
             extra = pydantic.Extra.allow
 
 
-class ValidationBlockParametersItem_Context(UniversalBaseModel):
+class HttpRequestBlockParametersItem_Context(UniversalBaseModel):
     parameter_type: typing.Literal["context"] = "context"
     key: str
     description: typing.Optional[str] = None
@@ -131,7 +131,7 @@ from .context_parameter import ContextParameter  # noqa: E402
 from .context_parameter_source import ContextParameterSource  # noqa: E402
 
 
-class ValidationBlockParametersItem_Credential(UniversalBaseModel):
+class HttpRequestBlockParametersItem_Credential(UniversalBaseModel):
     parameter_type: typing.Literal["credential"] = "credential"
     key: str
     description: typing.Optional[str] = None
@@ -152,7 +152,7 @@ class ValidationBlockParametersItem_Credential(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ValidationBlockParametersItem_Onepassword(UniversalBaseModel):
+class HttpRequestBlockParametersItem_Onepassword(UniversalBaseModel):
     parameter_type: typing.Literal["onepassword"] = "onepassword"
     key: str
     description: typing.Optional[str] = None
@@ -174,7 +174,7 @@ class ValidationBlockParametersItem_Onepassword(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ValidationBlockParametersItem_Output(UniversalBaseModel):
+class HttpRequestBlockParametersItem_Output(UniversalBaseModel):
     parameter_type: typing.Literal["output"] = "output"
     key: str
     description: typing.Optional[str] = None
@@ -194,7 +194,7 @@ class ValidationBlockParametersItem_Output(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class ValidationBlockParametersItem_Workflow(UniversalBaseModel):
+class HttpRequestBlockParametersItem_Workflow(UniversalBaseModel):
     parameter_type: typing.Literal["workflow"] = "workflow"
     key: str
     description: typing.Optional[str] = None
@@ -216,15 +216,15 @@ class ValidationBlockParametersItem_Workflow(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-ValidationBlockParametersItem = typing.Union[
-    ValidationBlockParametersItem_AwsSecret,
-    ValidationBlockParametersItem_BitwardenCreditCardData,
-    ValidationBlockParametersItem_BitwardenLoginCredential,
-    ValidationBlockParametersItem_BitwardenSensitiveInformation,
-    ValidationBlockParametersItem_Context,
-    ValidationBlockParametersItem_Credential,
-    ValidationBlockParametersItem_Onepassword,
-    ValidationBlockParametersItem_Output,
-    ValidationBlockParametersItem_Workflow,
+HttpRequestBlockParametersItem = typing.Union[
+    HttpRequestBlockParametersItem_AwsSecret,
+    HttpRequestBlockParametersItem_BitwardenCreditCardData,
+    HttpRequestBlockParametersItem_BitwardenLoginCredential,
+    HttpRequestBlockParametersItem_BitwardenSensitiveInformation,
+    HttpRequestBlockParametersItem_Context,
+    HttpRequestBlockParametersItem_Credential,
+    HttpRequestBlockParametersItem_Onepassword,
+    HttpRequestBlockParametersItem_Output,
+    HttpRequestBlockParametersItem_Workflow,
 ]
-update_forward_refs(ValidationBlockParametersItem_Context)
+update_forward_refs(HttpRequestBlockParametersItem_Context)
