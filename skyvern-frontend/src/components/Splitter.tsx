@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState, RefObject } from "react";
+import { useMountEffect } from "@/hooks/useMountEffect";
 import { cn } from "@/util/utils";
+import { useOnChange } from "@/hooks/useOnChange";
 
 interface Props {
   /**
@@ -58,26 +60,14 @@ const getStoredSizing = (
   return storedFirstSizing;
 };
 
-const setStoredSizing = (
-  sizingTarget: SizingTarget,
-  storageKey: string,
-  sizing: string,
-) => {
-  const key = getStorageKey(storageKey, sizingTarget);
-  localStorage.setItem(key, sizing);
-};
-
-function Splitter({ children, direction, split, storageKey }: Props) {
-  if (!Array.isArray(children) || children.length !== 2) {
-    throw new Error("Splitter must have exactly two children");
-  }
-
-  const [firstChild, secondChild] = children;
-
+const getFirstSizing = (
+  direction: Props["direction"],
+  split: Props["split"],
+  storageKey: Props["storageKey"],
+): [string, SizingTarget] => {
   split = split || {};
-  const splitterThickness = "5px";
   let firstSizing = "50%";
-  let firstSizingTarget: SizingTarget | null = null;
+  let firstSizingTarget: SizingTarget = "left";
 
   if (direction === "vertical") {
     if (split.left && split.right) {
@@ -107,6 +97,8 @@ function Splitter({ children, direction, split, storageKey }: Props) {
       firstSizing = split.bottom;
       firstSizingTarget = "bottom";
     }
+  } else {
+    throw new Error(`Invalid direction: ${direction}`);
   }
 
   if (storageKey) {
@@ -117,7 +109,111 @@ function Splitter({ children, direction, split, storageKey }: Props) {
     }
   }
 
+  return [firstSizing, firstSizingTarget];
+};
+
+const normalize = (sizing: string, containerSize: number) => {
+  const defaultSizing = 50;
+  const percentMatch = sizing.match(/([0-9.]+)%/);
+
+  if (percentMatch) {
+    return parseFloat(percentMatch[1] ?? defaultSizing.toString());
+  }
+
+  // px
+  const pxMatch = sizing.match(/([0-9.]+)px/);
+  if (pxMatch) {
+    const pxValue = parseFloat(pxMatch[1] ?? defaultSizing.toString());
+    return (pxValue / containerSize) * 100;
+  }
+
+  // rem
+  const remMatch = sizing.match(/([0-9.]+)rem/);
+  if (remMatch) {
+    const remValue = parseFloat(remMatch[1] ?? defaultSizing.toString());
+    const pxValue = remValue * 16; // Assuming 1rem = 16px
+    return (pxValue / containerSize) * 100;
+  }
+
+  const fallbackMatch = sizing.match(/([0-9.]+)/);
+  if (fallbackMatch) {
+    const numValue = parseFloat(fallbackMatch[1] ?? defaultSizing.toString());
+    return numValue;
+  }
+
+  return defaultSizing;
+};
+
+const normalizeUnitsToPercent = (
+  containerRef: RefObject<HTMLDivElement | null>,
+  direction: Props["direction"],
+  firstSizingTarget: SizingTarget,
+  sizing: string,
+  storageKey?: string,
+): number => {
+  const lastChar = parseFloat(sizing.charAt(sizing.length - 1));
+
+  if (!isNaN(lastChar)) {
+    const floatSizing = parseFloat(sizing);
+
+    if (!isNaN(floatSizing)) {
+      return floatSizing;
+    }
+  }
+
+  const container = containerRef.current;
+
+  if (!container) {
+    return 50;
+  }
+
+  const containerSize =
+    direction === "vertical" ? container.offsetWidth : container.offsetHeight;
+
+  if (storageKey) {
+    const stored = getStoredSizing(firstSizingTarget, storageKey);
+
+    if (!stored) {
+      const normalized = normalize(sizing, containerSize);
+
+      if (firstSizingTarget === "right" || firstSizingTarget === "bottom") {
+        return 100 - normalized;
+      }
+
+      return normalized;
+    } else {
+      return parseFloat(stored);
+    }
+  } else {
+    const normalized = normalize(sizing, containerSize);
+
+    return normalized;
+  }
+};
+
+const setStoredSizing = (
+  firstSizingTarget: SizingTarget,
+  storageKey: string,
+  sizing: string,
+) => {
+  const key = getStorageKey(storageKey, firstSizingTarget);
+  localStorage.setItem(key, sizing);
+};
+
+function Splitter({ children, direction, split, storageKey }: Props) {
+  if (!Array.isArray(children) || children.length !== 2) {
+    throw new Error("Splitter must have exactly two children");
+  }
+
+  const [firstChild, secondChild] = children;
   const containerRef = useRef<HTMLDivElement>(null);
+  const splitterThickness = "5px";
+
+  const [firstSizing, firstSizingTarget] = getFirstSizing(
+    direction,
+    split,
+    storageKey,
+  );
 
   const onMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -160,72 +256,38 @@ function Splitter({ children, direction, split, storageKey }: Props) {
     document.addEventListener("mouseup", onMouseUp);
   };
 
-  const normalizeUnitsToPercent = (sizing: string): number => {
-    const floatSizing = parseFloat(sizing);
-
-    if (!isNaN(floatSizing)) {
-      return floatSizing;
-    }
-
-    const defaultSizing = 50;
-    const percentMatch = sizing.match(/([0-9.]+)%/);
-
-    if (percentMatch) {
-      return parseFloat(percentMatch[1] ?? defaultSizing.toString());
-    }
-
-    const container = containerRef.current;
-    if (!container) {
-      return defaultSizing;
-    }
-
-    const containerSize =
-      direction === "vertical" ? container.offsetWidth : container.offsetHeight;
-
-    // px
-    const pxMatch = sizing.match(/([0-9.]+)px/);
-    if (pxMatch) {
-      const pxValue = parseFloat(pxMatch[1] ?? defaultSizing.toString());
-      return (pxValue / containerSize) * 100;
-    }
-
-    // rem
-    const remMatch = sizing.match(/([0-9.]+)rem/);
-    if (remMatch) {
-      const remValue = parseFloat(remMatch[1] ?? defaultSizing.toString());
-      const pxValue = remValue * 16; // Assuming 1rem = 16px
-      return (pxValue / containerSize) * 100;
-    }
-
-    const fallbackMatch = sizing.match(/([0-9.]+)/);
-    if (fallbackMatch) {
-      const numValue = parseFloat(fallbackMatch[1] ?? defaultSizing.toString());
-      return numValue;
-    }
-
-    return defaultSizing;
-  };
-
-  const [splitPosition, setSplitPosition] = useState<number>(
-    normalizeUnitsToPercent(firstSizing),
-  );
-
+  const [splitPosition, setSplitPosition] = useState<number>(50);
   const [isDragging, setIsDragging] = useState(false);
 
-  useEffect(() => {
+  useMountEffect(() => {
     if (containerRef.current) {
-      const newPosition = normalizeUnitsToPercent(firstSizing);
-      setSplitPosition(newPosition);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [containerRef.current]);
+      const newPosition = normalizeUnitsToPercent(
+        containerRef,
+        direction,
+        firstSizingTarget,
+        firstSizing,
+        storageKey,
+      );
 
-  useEffect(() => {
-    if (storageKey && firstSizingTarget) {
-      setStoredSizing(firstSizingTarget, storageKey, splitPosition.toString());
+      setSplitPosition(newPosition);
+
+      if (storageKey) {
+        setStoredSizing(firstSizingTarget, storageKey, newPosition.toString());
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [splitPosition]);
+  });
+
+  useOnChange(isDragging, (newValue, oldValue) => {
+    if (!newValue && oldValue) {
+      if (storageKey) {
+        setStoredSizing(
+          firstSizingTarget,
+          storageKey,
+          splitPosition.toString(),
+        );
+      }
+    }
+  });
 
   return (
     <div
@@ -239,7 +301,8 @@ function Splitter({ children, direction, split, storageKey }: Props) {
         <>
           <div
             className={cn("left h-full", {
-              "pointer-events-none cursor-col-resize select-none": isDragging,
+              "pointer-events-none cursor-col-resize select-none opacity-80":
+                isDragging,
             })}
             style={{
               width: `calc(${splitPosition}% - (${splitterThickness} / 2))`,
@@ -256,7 +319,8 @@ function Splitter({ children, direction, split, storageKey }: Props) {
           ></div>
           <div
             className={cn("right h-full", {
-              "pointer-events-none cursor-col-resize select-none": isDragging,
+              "pointer-events-none cursor-col-resize select-none opacity-80":
+                isDragging,
             })}
             style={{
               width: `calc(100% - ${splitPosition}% - (${splitterThickness} / 2))`,
@@ -269,7 +333,8 @@ function Splitter({ children, direction, split, storageKey }: Props) {
         <>
           <div
             className={cn("top h-full", {
-              "pointer-events-none cursor-row-resize select-none": isDragging,
+              "pointer-events-none cursor-row-resize select-none opacity-80":
+                isDragging,
             })}
             style={{
               height: `calc(${splitPosition}% - (${splitterThickness} / 2))`,
@@ -286,7 +351,8 @@ function Splitter({ children, direction, split, storageKey }: Props) {
           ></div>
           <div
             className={cn("bottom h-full", {
-              "pointer-events-none cursor-row-resize select-none": isDragging,
+              "pointer-events-none cursor-row-resize select-none opacity-80":
+                isDragging,
             })}
             style={{
               height: `calc(100% - ${splitPosition}% - (${splitterThickness} / 2))`,
