@@ -1243,6 +1243,7 @@ class WorkflowService:
             total_steps=total_steps,
             total_cost=total_cost,
             workflow_title=workflow.title,
+            browser_session_id=workflow_run.browser_session_id,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         )
 

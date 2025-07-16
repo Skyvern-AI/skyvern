@@ -1533,7 +1533,7 @@ async def get_workflow_run_with_workflow_id(
 
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
 
-    return_dict["browser_session_id"] = browser_session_id
+    return_dict["browser_session_id"] = browser_session_id or return_dict.get("browser_session_id")
 
     task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
         workflow_run_id=workflow_run_id,
