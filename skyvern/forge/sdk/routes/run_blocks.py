@@ -29,14 +29,17 @@ If you fail to login to find the login page or can't login after several trials,
 If login is completed, you're successful."""
 
 
-@base_router.post("/run/tasks/login")
+@base_router.post(
+    "/run/tasks/login",
+    response_model=WorkflowRunResponse,
+)
 async def login(
     request: Request,
     background_tasks: BackgroundTasks,
     login_request: LoginRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
-) -> None:
+) -> WorkflowRunResponse:
     # 0. validate credential
     credential = await app.DATABASE.get_credential(login_request.credential_id, organization.organization_id)
     if not credential:
@@ -75,11 +78,6 @@ async def login(
         totp_verification_url=login_request.totp_url,
         totp_identifier=login_request.totp_identifier,
     )
-    # output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
-    #     workflow_id=new_workflow.workflow_id,
-    #     block_yaml=login_block_yaml,
-    # )
-
     yaml_parameters = [
         CredentialParameterYAML(
             name="credential_id",
@@ -143,7 +141,6 @@ async def login(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
         status=str(workflow_run.status),
-        output=None,
         failure_reason=workflow_run.failure_reason,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
@@ -160,7 +157,6 @@ async def login(
             browser_session_id=login_request.browser_session_id,
             max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
         ),
-        downloaded_files=None,
-        recording_url=None,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        browser_session_id=login_request.browser_session_id,
     )
