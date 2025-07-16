@@ -110,7 +110,7 @@ function WorkflowHeader({
               }}
             >
               <Crosshair1Icon className="mr-2 h-6 w-6" />
-              {debugStore.isDebugMode ? "End" : "Start Debugging"}
+              {debugStore.isDebugMode ? "End Debugging" : "Start Debugging"}
             </Button>
             <TooltipProvider>
               <Tooltip>

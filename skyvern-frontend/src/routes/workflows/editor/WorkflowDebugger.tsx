@@ -1,53 +1,44 @@
-import { useMountEffect } from "@/hooks/useMountEffect";
-import { useSidebarStore } from "@/store/SidebarStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useParams } from "react-router-dom";
+
+import { BrowserStream } from "@/components/BrowserStream";
+import { FloatingWindow } from "@/components/FloatingWindow";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useMountEffect } from "@/hooks/useMountEffect";
+import { statusIsFinalized } from "@/routes/tasks/types.ts";
+import { useSidebarStore } from "@/store/SidebarStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
+import { WorkflowSettings } from "../types/workflowTypes";
 import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
-import { LogoMinimized } from "@/components/LogoMinimized";
-import { WorkflowSettings } from "../types/workflowTypes";
-import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { getInitialParameters } from "./utils";
 
-function WorkflowEditor() {
+function WorkflowDebugger() {
   const { workflowPermanentId } = useParams();
-  const setCollapsed = useSidebarStore((state) => {
-    return state.setCollapsed;
-  });
-  const setHasChanges = useWorkflowHasChangesStore(
-    (state) => state.setHasChanges,
-  );
 
-  const { data: workflow, isLoading } = useWorkflowQuery({
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const { data: workflow } = useWorkflowQuery({
     workflowPermanentId,
   });
 
-  const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
-    useGlobalWorkflowsQuery();
+  const setCollapsed = useSidebarStore((state) => {
+    return state.setCollapsed;
+  });
+
+  const setHasChanges = useWorkflowHasChangesStore(
+    (state) => state.setHasChanges,
+  );
 
   useMountEffect(() => {
     setCollapsed(true);
     setHasChanges(false);
   });
 
-  if (isLoading || isGlobalWorkflowsLoading) {
-    return (
-      <div className="flex h-screen w-full items-center justify-center">
-        <LogoMinimized />
-      </div>
-    );
-  }
-
   if (!workflow) {
     return null;
   }
-
-  const isGlobalWorkflow = globalWorkflows?.some(
-    (globalWorkflow) =>
-      globalWorkflow.workflow_permanent_id === workflowPermanentId,
-  );
 
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
@@ -63,8 +54,12 @@ function WorkflowEditor() {
   const elements = getElements(
     workflow.workflow_definition.blocks,
     settings,
-    !isGlobalWorkflow,
+    true,
   );
+
+  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
+  const interactor = workflowRun && isFinalized === false ? "agent" : "human";
+  const browserTitle = interactor === "agent" ? `Browser [🤖]` : `Browser [👤]`;
 
   return (
     <div className="relative flex h-screen w-full">
@@ -77,8 +72,29 @@ function WorkflowEditor() {
           workflow={workflow}
         />
       </ReactFlowProvider>
+
+      {workflowRun && (
+        <FloatingWindow
+          title={browserTitle}
+          bounded={false}
+          initialWidth={512}
+          initialHeight={360}
+          showMaximizeButton={true}
+          showMinimizeButton={true}
+          showReloadButton={true}
+        >
+          {workflowRun && workflowRun.browser_session_id ? (
+            <BrowserStream
+              interactive={interactor === "human"}
+              browserSessionId={workflowRun.browser_session_id}
+            />
+          ) : (
+            <Skeleton className="h-full w-full" />
+          )}
+        </FloatingWindow>
+      )}
     </div>
   );
 }
 
-export { WorkflowEditor };
+export { WorkflowDebugger };

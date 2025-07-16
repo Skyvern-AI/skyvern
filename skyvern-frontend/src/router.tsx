@@ -18,6 +18,7 @@ import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
+import { WorkflowDebugger } from "./routes/workflows/editor/WorkflowDebugger";
 import { WorkflowEditor } from "./routes/workflows/editor/WorkflowEditor";
 import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/WorkflowPostRunParameters";
 import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
@@ -110,11 +111,11 @@ const router = createBrowserRouter([
               },
               {
                 path: "debug",
-                element: <WorkflowEditor />,
+                element: <WorkflowDebugger />,
               },
               {
                 path: ":workflowRunId/:blockLabel/debug",
-                element: <WorkflowEditor />,
+                element: <WorkflowDebugger />,
               },
               {
                 path: "edit",
