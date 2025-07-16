@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-skyvern",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Skyvern Node for n8n",
   "keywords": [
     "n8n-community-node-package"
@@ -45,6 +45,7 @@
   "devDependencies": {
     "@types/node": "^22.13.10",
     "@typescript-eslint/parser": "^7.15.0",
+    "braces": "^3.0.3",
     "eslint": "^8.56.0",
     "eslint-plugin-n8n-nodes-base": "^1.16.1",
     "gulp": "^4.0.2",
@@ -54,8 +55,5 @@
   },
   "peerDependencies": {
     "n8n-workflow": "^1.82.0"
-  },
-  "dependencies": {
-    "braces": "^3.0.3"
   }
 }
