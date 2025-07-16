@@ -44,17 +44,6 @@ const nodeLibraryItems: Array<{
     description: "Navigate on the page",
   },
   {
-    nodeType: "task",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Task}
-        className="size-6"
-      />
-    ),
-    title: "Task Block",
-    description: "Complete multi-step browser automation tasks",
-  },
-  {
     nodeType: "taskv2",
     icon: (
       <WorkflowBlockIcon
@@ -88,17 +77,6 @@ const nodeLibraryItems: Array<{
     description: "Extract data from a webpage",
   },
   {
-    nodeType: "wait",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Wait}
-        className="size-6"
-      />
-    ),
-    title: "Wait Block",
-    description: "Wait for a specified amount of time",
-  },
-  {
     nodeType: "validation",
     icon: (
       <WorkflowBlockIcon
@@ -108,6 +86,17 @@ const nodeLibraryItems: Array<{
     ),
     title: "Validation Block",
     description: "Validate completion criteria",
+  },
+  {
+    nodeType: "task",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Task}
+        className="size-6"
+      />
+    ),
+    title: "Task Block",
+    description: "Complete multi-step browser automation tasks",
   },
   {
     nodeType: "url",
@@ -121,17 +110,6 @@ const nodeLibraryItems: Array<{
     description: "Navigate to a specific URL",
   },
   {
-    nodeType: "http_request",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.HttpRequest}
-        className="size-6"
-      />
-    ),
-    title: "HTTP Request Block",
-    description: "Make HTTP API calls",
-  },
-  {
     nodeType: "textPrompt",
     icon: (
       <WorkflowBlockIcon
@@ -141,39 +119,6 @@ const nodeLibraryItems: Array<{
     ),
     title: "Text Prompt Block",
     description: "Process text with LLM",
-  },
-  {
-    nodeType: "codeBlock",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Code}
-        className="size-6"
-      />
-    ),
-    title: "Code Block",
-    description: "Execute custom Python code",
-  },
-  {
-    nodeType: "fileDownload",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.FileDownload}
-        className="size-6"
-      />
-    ),
-    title: "File Download Block",
-    description: "Download files from a website",
-  },
-  {
-    nodeType: "loop",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.ForLoop}
-        className="size-6"
-      />
-    ),
-    title: "Loop Block",
-    description: "Repeat blocks for each item",
   },
   {
     nodeType: "sendEmail",
@@ -187,6 +132,28 @@ const nodeLibraryItems: Array<{
     description: "Send email notifications",
   },
   {
+    nodeType: "loop",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.ForLoop}
+        className="size-6"
+      />
+    ),
+    title: "Loop Block",
+    description: "Repeat blocks for each item",
+  },
+  {
+    nodeType: "codeBlock",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.Code}
+        className="size-6"
+      />
+    ),
+    title: "Code Block",
+    description: "Execute custom Python code",
+  },
+  {
     nodeType: "fileParser",
     icon: (
       <WorkflowBlockIcon
@@ -196,6 +163,17 @@ const nodeLibraryItems: Array<{
     ),
     title: "File Parser Block",
     description: "Parse data from files",
+  },
+  {
+    nodeType: "pdfParser",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.PDFParser}
+        className="size-6"
+      />
+    ),
+    title: "PDF Parser Block",
+    description: "Extract data from PDF files",
   },
   {
     nodeType: "upload",
@@ -209,6 +187,17 @@ const nodeLibraryItems: Array<{
     description: "Upload files to AWS S3",
   },
   {
+    nodeType: "download",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.DownloadToS3}
+        className="size-6"
+      />
+    ),
+    title: "Download from S3 Block",
+    description: "Download files from AWS S3",
+  },
+  {
     nodeType: "fileUpload",
     icon: (
       <WorkflowBlockIcon
@@ -220,26 +209,37 @@ const nodeLibraryItems: Array<{
     description: "Upload files to storage",
   },
   {
-    nodeType: "download",
+    nodeType: "fileDownload",
     icon: (
       <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.DownloadToS3}
+        workflowBlockType={WorkflowBlockTypes.FileDownload}
         className="size-6"
       />
     ),
-    title: "Download to S3 Block",
-    description: "Download files to AWS S3",
+    title: "File Download Block",
+    description: "Download files from a website",
   },
   {
-    nodeType: "pdfParser",
+    nodeType: "wait",
     icon: (
       <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.PDFParser}
+        workflowBlockType={WorkflowBlockTypes.Wait}
         className="size-6"
       />
     ),
-    title: "PDF Parser Block",
-    description: "Extract data from PDF files",
+    title: "Wait Block",
+    description: "Wait for a specified amount of time",
+  },
+  {
+    nodeType: "http_request",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.HttpRequest}
+        className="size-6"
+      />
+    ),
+    title: "HTTP Request Block",
+    description: "Make HTTP API calls",
   },
 ];
 
