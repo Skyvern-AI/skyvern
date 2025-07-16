@@ -60,7 +60,7 @@ function WindowsButton(props: {
     <button
       disabled={props.disabled}
       onClick={props.disabled ? undefined : props.onClick}
-      className="flex h-[0.8rem] w-[0.8rem] items-center justify-center gap-2 text-white opacity-80 hover:opacity-100"
+      className="flex h-[0.8rem] w-[0.8rem] items-center justify-center gap-2 p-3 text-white opacity-80 hover:bg-[rgba(255,255,255,0.2)] hover:opacity-100"
       style={{ opacity: props.disabled ? 0.5 : 1 }}
       title={props.tip}
     >
@@ -97,6 +97,7 @@ function getOs(): OS {
 }
 
 function FloatingWindow({
+  bounded,
   children,
   initialWidth,
   initialHeight,
@@ -109,6 +110,7 @@ function FloatingWindow({
   // --
   onInteract,
 }: {
+  bounded?: boolean;
   children: React.ReactNode;
   initialHeight?: number;
   initialWidth?: number;
@@ -134,12 +136,16 @@ function FloatingWindow({
     height: initialHeight ?? Constants.MinHeight,
     width: initialWidth ?? Constants.MinWidth,
   });
-  const [sizeBeforeMaximize, setSizeBeforeMaximize] = useState({
+  const [restoreSize, setRestoreSize] = useState({
     left: 0,
     top: 0,
     height: initialHeight ?? Constants.MinHeight,
     width: initialWidth ?? Constants.MinWidth,
   });
+  const [minimizedPosition, setMinimizedPosition] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [isMaximized, setIsMaximized] = useState(maximized ?? false);
   const [isMinimized, setIsMinimized] = useState(false);
   const parentRef = useRef<HTMLDivElement>(null);
@@ -263,6 +269,10 @@ function FloatingWindow({
       return;
     }
 
+    if (isMinimized) {
+      setMinimizedPosition({ x: position.x, y: position.y });
+    }
+
     setPosition({ x: position.x, y: position.y });
 
     setSize({
@@ -288,8 +298,14 @@ function FloatingWindow({
     setIsMinimized(false);
   };
 
-  const onMinimize = () => {
-    setIsMinimized(true);
+  const toggleMinimized = () => {
+    if (!isMinimized) {
+      minimize();
+    } else {
+      restore();
+    }
+
+    setIsMaximized(false);
   };
 
   const maximize = () => {
@@ -300,13 +316,16 @@ function FloatingWindow({
       return;
     }
 
-    setSizeBeforeMaximize({
-      ...size,
-      left: position.x,
-      top: position.y,
-    });
+    if (!isMinimized) {
+      setRestoreSize({
+        ...size,
+        left: position.x,
+        top: position.y,
+      });
+    }
 
     setIsMaximized(true);
+    setIsMinimized(false);
 
     setSize({
       left: 0,
@@ -319,9 +338,42 @@ function FloatingWindow({
     setPosition({ x: 0, y: 0 });
   };
 
-  const restore = () => {
-    const restoreSize = sizeBeforeMaximize;
+  const minimize = () => {
+    const parent = parentRef.current;
 
+    if (!parent) {
+      console.warn("No parent - cannot minimize.");
+      return;
+    }
+
+    if (!isMaximized) {
+      setRestoreSize({
+        ...size,
+        left: position.x,
+        top: position.y,
+      });
+    }
+
+    setIsMaximized(false);
+    setIsMinimized(true);
+
+    const defaultLeft = 0;
+    const parentBottom = parentRef.current?.offsetHeight;
+    const defaultTop = parentBottom - Constants.MinHeight - 16;
+    const left = minimizedPosition?.x ?? defaultLeft;
+    const top = minimizedPosition?.y ?? defaultTop;
+
+    setSize({
+      left,
+      top,
+      width: Constants.MinWidth,
+      height: Constants.MinHeight,
+    });
+
+    setPosition({ x: left, y: top });
+  };
+
+  const restore = () => {
     const position = isDragging
       ? { left: 0, top: 0 }
       : {
@@ -339,6 +391,7 @@ function FloatingWindow({
     setPosition({ x: position.left, y: position.top });
 
     setIsMaximized(false);
+    setIsMinimized(false);
   };
 
   /**
@@ -391,7 +444,7 @@ function FloatingWindow({
         onStart={() => setIsDragging(true)}
         onDrag={(_, data) => onDrag(data)}
         onStop={() => setIsDragging(false)}
-        bounds="parent"
+        bounds={bounded ?? true ? "parent" : undefined}
         disabled={isResizing}
       >
         <Resizable
@@ -430,6 +483,7 @@ function FloatingWindow({
               return;
             }
 
+            setIsMinimized(false);
             setIsResizing(true);
             setDragStartSize({ ...size, left: position.x, top: position.y });
           }}
@@ -467,7 +521,11 @@ function FloatingWindow({
               toggleMaximized();
             }}
           >
-            <div className="my-window-header flex h-[3rem] w-full cursor-move items-center justify-start gap-2 bg-[#031827] p-3">
+            <div
+              className={cn(
+                "my-window-header flex h-[3rem] w-full cursor-move items-center justify-start gap-2 bg-[#031827] p-3",
+              )}
+            >
               {os === "macOS" ? (
                 <>
                   <div className="buttons-container flex items-center gap-2">
@@ -482,9 +540,10 @@ function FloatingWindow({
                     {showMinimizeButton && (
                       <MacOsButton
                         color="#FFBD44"
-                        disabled={true}
-                        tip="minimize"
-                        onClick={onMinimize}
+                        tip={
+                          isMaximized || isMinimized ? "restore" : "minimize"
+                        }
+                        onClick={toggleMinimized}
                       />
                     )}
                     {showMaximizeButton && (
@@ -502,10 +561,25 @@ function FloatingWindow({
               ) : (
                 <>
                   <div>{title}</div>
-                  <div className="buttons-container ml-auto flex h-full items-center gap-4">
+                  <div className="buttons-container ml-auto flex h-full items-center gap-2">
+                    {showMinimizeButton && (
+                      <WindowsButton
+                        onClick={toggleMinimized}
+                        tip={
+                          isMaximized || isMinimized ? "restore" : "minimize"
+                        }
+                      >
+                        <div>—</div>
+                      </WindowsButton>
+                    )}
                     {showMaximizeButton && (
-                      <WindowsButton onClick={toggleMaximized}>
-                        <div>{isMaximized ? "-" : "□"}</div>
+                      <WindowsButton
+                        onClick={toggleMaximized}
+                        tip={
+                          isMaximized || isMinimized ? "restore" : "maximize"
+                        }
+                      >
+                        <div>□</div>
                       </WindowsButton>
                     )}
                   </div>

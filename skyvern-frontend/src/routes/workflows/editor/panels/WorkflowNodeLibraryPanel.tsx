@@ -186,17 +186,17 @@ const nodeLibraryItems: Array<{
     title: "Upload to S3 Block",
     description: "Upload files to AWS S3",
   },
-  // {
-  //   nodeType: "download",
-  //   icon: (
-  //     <WorkflowBlockIcon
-  //       workflowBlockType={WorkflowBlockTypes.DownloadToS3}
-  //       className="size-6"
-  //     />
-  //   ),
-  //   title: "Download from S3 Block",
-  //   description: "Download files from AWS S3",
-  // },
+  {
+    nodeType: "download",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.DownloadToS3}
+        className="size-6"
+      />
+    ),
+    title: "Download from S3 Block",
+    description: "Download files from AWS S3",
+  },
   {
     nodeType: "fileUpload",
     icon: (
