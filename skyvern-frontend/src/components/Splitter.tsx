@@ -173,22 +173,18 @@ const normalizeUnitsToPercent = (
   if (storageKey) {
     const stored = getStoredSizing(firstSizingTarget, storageKey);
 
-    if (!stored) {
-      const normalized = normalize(sizing, containerSize);
-
-      if (firstSizingTarget === "right" || firstSizingTarget === "bottom") {
-        return 100 - normalized;
-      }
-
-      return normalized;
-    } else {
+    if (stored) {
       return parseFloat(stored);
     }
-  } else {
-    const normalized = normalize(sizing, containerSize);
-
-    return normalized;
   }
+
+  const normalized = normalize(sizing, containerSize);
+
+  if (firstSizingTarget === "right" || firstSizingTarget === "bottom") {
+    return 100 - normalized;
+  }
+
+  return normalized;
 };
 
 const setStoredSizing = (
@@ -217,6 +213,7 @@ function Splitter({ children, direction, split, storageKey }: Props) {
 
   const onMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
+    document.body.classList.add("no-select-global");
     const startCoord = direction === "vertical" ? e.clientX : e.clientY;
     const container = e.currentTarget.closest(".splitter") as HTMLDivElement;
     const containerSize =
@@ -248,6 +245,7 @@ function Splitter({ children, direction, split, storageKey }: Props) {
 
     const onMouseUp = () => {
       setIsDragging(false);
+      document.body.classList.remove("no-select-global");
       document.removeEventListener("mousemove", onMouseMove);
       document.removeEventListener("mouseup", onMouseUp);
     };
@@ -292,7 +290,7 @@ function Splitter({ children, direction, split, storageKey }: Props) {
   return (
     <div
       className={cn(
-        "splitter flex h-full w-full",
+        "splitter flex h-full w-full overflow-hidden",
         direction === "vertical" ? "flex-row" : "flex-col",
       )}
       ref={containerRef}
@@ -312,7 +310,7 @@ function Splitter({ children, direction, split, storageKey }: Props) {
           </div>
           <div
             className={cn(
-              "splitter-bar z-[100] h-full w-[5px] cursor-col-resize bg-[#ccc] opacity-10 hover:opacity-90",
+              "splitter-bar z-[0] h-full w-[5px] cursor-col-resize bg-[#ccc] opacity-10 hover:opacity-90",
               { "opacity-90": isDragging },
             )}
             onMouseDown={onMouseDown}
