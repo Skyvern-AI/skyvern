@@ -1,7 +1,5 @@
 import { Status } from "@/api/types";
 import { useEffect, useState, useRef, useCallback } from "react";
-import { HandIcon, StopIcon } from "@radix-ui/react-icons";
-import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -29,6 +27,7 @@ type Command = CommandTakeControl | CommandCedeControl;
 
 type Props = {
   browserSessionId?: string;
+  interactive?: boolean;
   task?: {
     run: TaskApiResponse;
   };
@@ -41,6 +40,7 @@ type Props = {
 
 function BrowserStream({
   browserSessionId = undefined,
+  interactive = true,
   task = undefined,
   workflow = undefined,
   // --
@@ -67,7 +67,6 @@ function BrowserStream({
   }
 
   const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
-  const [userIsControlling, setUserIsControlling] = useState<boolean>(false);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
@@ -273,13 +272,13 @@ function BrowserStream({
       commandSocket.send(JSON.stringify(command));
     };
 
-    if (userIsControlling) {
+    if (interactive) {
       sendCommand({ kind: "take-control" });
     } else {
       sendCommand({ kind: "cede-control" });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userIsControlling, isCommandConnected]);
+  }, [interactive, isCommandConnected]);
 
   // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {
@@ -316,39 +315,11 @@ function BrowserStream({
   return (
     <div
       className={cn("browser-stream", {
-        "user-is-controlling": userIsControlling,
+        "user-is-controlling": interactive,
       })}
       ref={setCanvasContainerRef}
     >
-      {isVncConnected && (
-        <div className="overlay-container">
-          <div className="overlay">
-            <Button
-              className={cn(
-                "take-control absolute bottom-[-1rem] left-[1rem]",
-                { hide: userIsControlling },
-              )}
-              type="button"
-              onClick={() => setUserIsControlling(true)}
-            >
-              <HandIcon className="mr-2 h-4 w-4" />
-              interact
-            </Button>
-            <div className="absolute bottom-[-1rem] right-[1rem]">
-              <Button
-                className={cn("relinquish-control", {
-                  hide: !userIsControlling,
-                })}
-                type="button"
-                onClick={() => setUserIsControlling(false)}
-              >
-                <StopIcon className="mr-2 h-4 w-4" />
-                stop interacting
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
+      {isVncConnected && <div className="overlay" />}
       {!isVncConnected && (
         <div className="absolute left-0 top-0 flex h-full w-full items-center justify-center bg-black">
           <Skeleton className="aspect-[16/9] h-auto max-h-full w-full max-w-full rounded-lg object-cover" />

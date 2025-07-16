@@ -6,6 +6,7 @@
  * and `re-resizable`; but I don't want to do that until it's worth the effort.)
  */
 
+import { ReloadIcon } from "@radix-ui/react-icons";
 import { Resizable } from "re-resizable";
 import {
   useCallback,
@@ -69,6 +70,14 @@ function WindowsButton(props: {
   );
 }
 
+function ReloadButton(props: { isReloading: boolean; onClick: () => void }) {
+  return (
+    <button onClick={() => props.onClick()}>
+      <ReloadIcon className={props.isReloading ? "animate-spin" : undefined} />
+    </button>
+  );
+}
+
 function getOs(): OS {
   if (typeof navigator === "undefined") {
     return "Unknown"; // For non-browser environments
@@ -105,6 +114,7 @@ function FloatingWindow({
   showCloseButton,
   showMaximizeButton,
   showMinimizeButton,
+  showReloadButton = false,
   title,
   zIndex,
   // --
@@ -118,11 +128,14 @@ function FloatingWindow({
   showCloseButton?: boolean;
   showMaximizeButton?: boolean;
   showMinimizeButton?: boolean;
+  showReloadButton?: boolean;
   title: string;
   zIndex?: string;
   // --
   onInteract?: () => void;
 }) {
+  const [reloadKey, setReloadKey] = useState(0);
+  const [isReloading, setIsReloading] = useState(false);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [size, setSize] = useState({
     left: 0,
@@ -394,6 +407,19 @@ function FloatingWindow({
     setIsMinimized(false);
   };
 
+  const reload = () => {
+    if (isReloading) {
+      return;
+    }
+
+    setReloadKey((prev) => prev + 1);
+    setIsReloading(true);
+
+    setTimeout(() => {
+      setIsReloading(false);
+    }, 1000);
+  };
+
   /**
    * If maximized, need to retain max size during parent resizing.
    */
@@ -507,6 +533,7 @@ function FloatingWindow({
         >
           <div
             ref={resizableRef}
+            key={reloadKey}
             className="my-window"
             style={{
               pointerEvents: "auto",
@@ -523,7 +550,7 @@ function FloatingWindow({
           >
             <div
               className={cn(
-                "my-window-header flex h-[3rem] w-full cursor-move items-center justify-start gap-2 bg-[#031827] p-3",
+                "my-window-header flex h-[3rem] w-full cursor-move items-center justify-start gap-2 bg-[#131519] p-3",
               )}
             >
               {os === "macOS" ? (
@@ -557,9 +584,21 @@ function FloatingWindow({
                     )}
                   </div>
                   <div className="ml-auto">{title}</div>
+                  {showReloadButton && (
+                    <ReloadButton
+                      isReloading={isReloading}
+                      onClick={() => reload()}
+                    />
+                  )}
                 </>
               ) : (
                 <>
+                  {showReloadButton && (
+                    <ReloadButton
+                      isReloading={isReloading}
+                      onClick={() => reload()}
+                    />
+                  )}
                   <div>{title}</div>
                   <div className="buttons-container ml-auto flex h-full items-center gap-2">
                     {showMinimizeButton && (

@@ -26,6 +26,7 @@ import {
   Panel,
   PanOnScrollMode,
   ReactFlow,
+  Viewport,
   useEdgesState,
   useNodesInitialized,
   useNodesState,
@@ -97,6 +98,7 @@ import {
   startNode,
 } from "./workflowEditorUtils";
 import { cn } from "@/util/utils";
+import { WorkflowDebuggerRun } from "@/routes/workflows/editor/WorkflowDebuggerRun";
 import { useAutoPan } from "./useAutoPan";
 
 function convertToParametersYAML(
@@ -273,6 +275,13 @@ function FlowRenderer({
   const [title, setTitle] = useState(initialTitle);
   const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
   const nodesInitialized = useNodesInitialized();
+  const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
+
+  useEffect(() => {
+    if (nodesInitialized) {
+      setShouldConstrainPan(true);
+    }
+  }, [nodesInitialized]);
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
   useShouldNotifyWhenClosingTab(hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
@@ -625,7 +634,8 @@ function FlowRenderer({
     }
   });
 
-  const constrainPan = (y: number) => {
+  const constrainPan = (viewport: Viewport) => {
+    const y = viewport.y;
     const yLockMin = nodes.reduce(
       (acc, node) => {
         const nodeBottom = node.position.y + (node.height ?? 0);
@@ -636,15 +646,22 @@ function FlowRenderer({
       },
       { value: -Infinity },
     );
-
     const yLockMinValue = yLockMin.value;
     const xLock = getXLock();
     const newY = Math.max(-yLockMinValue + yLockMax, Math.min(yLockMax, y));
-    reactFlowInstance.setViewport({
-      x: xLock,
-      y: newY,
-      zoom: zoomLock,
-    });
+
+    // avoid infinite recursion with onMove
+    if (
+      viewport.x !== xLock ||
+      viewport.y !== newY ||
+      viewport.zoom !== zoomLock
+    ) {
+      reactFlowInstance.setViewport({
+        x: xLock,
+        y: newY,
+        zoom: zoomLock,
+      });
+    }
   };
 
   return (
@@ -734,14 +751,15 @@ function FlowRenderer({
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             colorMode="dark"
-            fitView={!debugStore.isDebugMode}
+            fitView={true}
             fitViewOptions={{
               maxZoom: 1,
             }}
             deleteKeyCode={null}
             onMove={(_, viewport) => {
-              const y = viewport.y;
-              debugStore.isDebugMode && constrainPan(y);
+              if (debugStore.isDebugMode && shouldConstrainPan) {
+                constrainPan(viewport);
+              }
             }}
             maxZoom={debugStore.isDebugMode ? 1 : 2}
             minZoom={debugStore.isDebugMode ? 1 : 0.5}
@@ -758,6 +776,18 @@ function FlowRenderer({
           >
             <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
             <Controls position="bottom-left" />
+            {debugStore.isDebugMode && (
+              <Panel
+                position="top-right"
+                className="!bottom-[1rem] !right-[1.5rem] !top-0"
+              >
+                <div className="pointer-events-none absolute right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end">
+                  <div className="pointer-events-auto relative mt-[8.5rem] h-full w-full overflow-hidden rounded-xl border-2 border-slate-500">
+                    <WorkflowDebuggerRun />
+                  </div>
+                </div>
+              </Panel>
+            )}
             <Panel position="top-center" className={cn("h-20")}>
               <WorkflowHeader
                 debuggableBlockCount={debuggableBlockCount}

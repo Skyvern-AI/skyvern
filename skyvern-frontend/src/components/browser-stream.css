@@ -13,35 +13,18 @@
   padding: 0rem;
 }
 
-.browser-stream .overlay-container {
+.browser-stream .overlay {
   position: absolute;
   top: 0;
   left: 0;
   width: 100%;
   height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.browser-stream .overlay {
-  position: relative;
-  height: auto;
-  width: 100%;
-  max-height: 100%;
-  aspect-ratio: 16 / 9;
-  object-fit: cover;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  cursor: not-allowed;
 }
 
 .browser-stream.user-is-controlling .overlay {
   pointer-events: none;
-}
-
-.browser-stream.user-is-controlling .overlay-container {
-  pointer-events: none;
+  cursor: unset;
 }
 
 .browser-stream .take-control {
