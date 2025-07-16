@@ -1285,7 +1285,7 @@
         "tags": [
           "Credentials"
         ],
-        "summary": "Send TOTP (2FA, MFA) code to Skyvern",
+        "summary": "Send TOTP code",
         "description": "Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
         "operationId": "send_totp_code_v1_credentials_totp_post",
         "parameters": [
@@ -1340,7 +1340,17 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "send_totp_code"
+        "x-fern-sdk-method-name": "send_totp_code",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.send_totp_code(totp_code=\"123456\")\n"
+              }
+            ]
+          }
+        ]
       }
     },
     "/v1/credentials": {
