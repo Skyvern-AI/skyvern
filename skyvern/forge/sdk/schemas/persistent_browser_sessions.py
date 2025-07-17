@@ -13,6 +13,9 @@ class PersistentBrowserSession(BaseModel):
     browser_address: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None
+    proxy_configuration: dict | None = None
+    browser_configuration: dict | None = None
+    user_profile: dict | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime

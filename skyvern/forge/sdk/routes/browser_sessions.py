@@ -43,6 +43,7 @@ async def create_browser_session(
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=browser_session_request.timeout,
+        proxy_location=browser_session_request.proxy_location,
     )
     return BrowserSessionResponse.from_browser_session(browser_session)
 

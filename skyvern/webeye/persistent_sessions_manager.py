@@ -8,6 +8,7 @@ from playwright._impl._errors import TargetClosedError
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -105,6 +106,9 @@ class PersistentSessionsManager:
         runnable_id: str | None = None,
         runnable_type: str | None = None,
         timeout_minutes: int | None = None,
+        proxy_location: ProxyLocation | None = None,
+        browser_configuration: dict | None = None,
+        user_profile: dict | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
 
@@ -112,12 +116,19 @@ class PersistentSessionsManager:
             "Creating new browser session",
             organization_id=organization_id,
         )
+        proxy_location = proxy_location or ProxyLocation.RESIDENTIAL
+        proxy_configuration = {
+            "proxy_location": str(proxy_location),
+        }
 
         browser_session_db = await self.database.create_persistent_browser_session(
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
             timeout_minutes=timeout_minutes,
+            proxy_configuration=proxy_configuration,
+            browser_configuration=browser_configuration,
+            user_profile=user_profile,
         )
 
         return browser_session_db
