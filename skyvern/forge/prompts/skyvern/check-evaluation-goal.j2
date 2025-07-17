@@ -1,10 +1,10 @@
-You're provided with a user goal. You need to help analysing the goal.
+You're provided with a user goal. You need to help analyzing the goal.
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in JSON format with the following keys:
 {
-"thought": str, //  Think step by step. Describe your thought in thi field.
+"thought": str, //  Think step by step. Describe your thought in this field.
 "is_booking": bool, // True if the goal is to book something, including room, flight and so on.
 "is_including_date": bool, // True if the goal includes date information.
 "tweaked_user_goal": str, // If is_booking is True and is_including_date is True, repick a date within the next two months to replace the original date in the goal. Otherwise, return the original user goal.
