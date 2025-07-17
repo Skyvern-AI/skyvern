@@ -185,7 +185,6 @@ async def loop_stream_vnc(streaming: sc.Streaming) -> None:
 
     LOG.info(
         "Connecting to VNC URL.",
-        browser_address=browser_address,
         vnc_url=vnc_url,
         task=streaming.task,
         workflow_run=streaming.workflow_run,
