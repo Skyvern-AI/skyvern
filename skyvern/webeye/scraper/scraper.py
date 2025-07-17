@@ -13,7 +13,7 @@ from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
 from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
+from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, ScrapingFailedNoUrl, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import TraceManager
@@ -426,6 +426,10 @@ async def scrape_website(
 
     :raises Exception: When scraping fails after maximum retries.
     """
+
+    if not url.strip():
+        raise ScrapingFailedNoUrl()
+
     try:
         num_retry += 1
         return await scrape_web_unsafe(

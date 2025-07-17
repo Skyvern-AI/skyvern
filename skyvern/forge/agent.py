@@ -749,17 +749,19 @@ class ForgeAgent:
                 close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
             )
             return step, detailed_output, None
-        except ScrapingFailed:
+        except ScrapingFailed as sfe:
             LOG.warning(
                 "Scraping failed, marking the task as failed",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 exc_info=True,
             )
+
             await self.fail_task(
                 task,
                 step,
-                "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+                sfe.reason
+                or "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
             )
             await self.clean_up_task(
                 task=task,
