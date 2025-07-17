@@ -3011,6 +3011,8 @@ class AgentDB:
         self,
         browser_session_id: str,
         browser_address: str,
+        ip_address: str,
+        ecs_task_arn: str | None,
         organization_id: str | None = None,
     ) -> None:
         """Set the browser address for a persistent browser session."""
@@ -3026,6 +3028,8 @@ class AgentDB:
                 ).first()
                 if persistent_browser_session:
                     persistent_browser_session.browser_address = browser_address
+                    persistent_browser_session.ip_address = ip_address
+                    persistent_browser_session.ecs_task_arn = ecs_task_arn
                     # once the address is set, the session is started
                     persistent_browser_session.started_at = datetime.utcnow()
                     await session.commit()
