@@ -20,6 +20,7 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+import { Textarea } from "@/components/ui/textarea";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -66,6 +67,14 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     }
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
+  }
+
+  // Add prompt state
+  const [prompt, setPrompt] = useState(data.loopPrompt || "");
+
+  function handlePromptChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    setPrompt(e.target.value);
+    updateNodeData(id, { loopPrompt: e.target.value });
   }
 
   return (
@@ -127,6 +136,19 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                   handleChange("loopVariableReference", value);
                 }}
               />
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontWeight: 600 }}>Loop Prompt (Recommended)</label>
+              <Textarea
+                value={prompt}
+                onChange={handlePromptChange}
+                placeholder="E.g. Extract all product links from this page"
+              />
+              <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
+                <b>Tip:</b> You can now simply describe what you want to loop over (e.g. "Extract all order IDs from the table").
+                <br />
+                If you leave this blank, you can still use the traditional method by specifying a parameter key to loop over.
+              </div>
             </div>
             <div className="space-y-2">
               <div className="space-y-2">

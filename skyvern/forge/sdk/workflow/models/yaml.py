@@ -162,9 +162,10 @@ class ForLoopBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
 
     loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
-    loop_over_parameter_key: str = ""
+    loop_over_parameter_key: str | None = None
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
+    loop_prompt: str | None = None  # New field for prompt-based loops
 
 
 class CodeBlockYAML(BlockYAML):
