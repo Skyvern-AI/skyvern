@@ -1059,6 +1059,9 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
+    if workflow_run.browser_session_id:
+        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(workflow_run.browser_session_id, organization_id)
+
     # get all the child workflow runs and cancel them
     child_workflow_runs = await app.DATABASE.get_workflow_runs_by_parent_workflow_run_id(
         parent_workflow_run_id=workflow_run_id,
@@ -1108,8 +1111,6 @@ async def cancel_persistent_browser_session_workflow_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
-    await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(browser_session_id, current_org.organization_id)
-
     await _cancel_workflow_run(workflow_run_id, current_org.organization_id, x_api_key)
 
 
