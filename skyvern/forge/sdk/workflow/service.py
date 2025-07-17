@@ -96,6 +96,7 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     ForLoopBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    ExtractionBlockYAML,
 )
 from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.webeye.browser_factory import BrowserState
@@ -1815,7 +1816,7 @@ class WorkflowService:
             if block_yaml.loop_prompt:
                 # Create extraction block for loop values
                 extraction_label = f"extraction_for_loop_{block_yaml.label}"
-                extraction_output_parameter = await self.create_output_parameter_for_block(
+                extraction_output_parameter = await WorkflowService.create_output_parameter_for_block(
                     workflow_id=workflow.workflow_id,
                     block_yaml=ExtractionBlockYAML(
                         label=extraction_label,
@@ -1832,12 +1833,6 @@ class WorkflowService:
                 loop_over_parameter = ContextParameter(
                     key=loop_values_key,
                     source=extraction_output_parameter,
-                )
-                
-                # Add the context parameter to the workflow context
-                app.WORKFLOW_CONTEXT_MANAGER.add_context_parameter(
-                    workflow_run_id=None,  # Will be set during execution
-                    context_parameter=loop_over_parameter
                 )
                 
             elif block_yaml.loop_over_parameter_key:
