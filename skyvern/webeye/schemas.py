@@ -29,6 +29,11 @@ class BrowserSessionResponse(BaseModel):
         description="Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.",
         examples=[60, 120],
     )
+    proxy_configuration: dict | None = Field(
+        None,
+        description="Proxy configuration for the session",
+        examples=[{"proxy_location": "RESIDENTIAL"}],
+    )
     browser_address: str | None = Field(
         None,
         description="Url for connecting to the browser",
@@ -67,6 +72,7 @@ class BrowserSessionResponse(BaseModel):
             runnable_type=browser_session.runnable_type,
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
+            proxy_configuration=browser_session.proxy_configuration,
             browser_address=browser_session.browser_address,
             app_url=app_url,
             started_at=browser_session.started_at,
