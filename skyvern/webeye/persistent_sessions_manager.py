@@ -141,13 +141,6 @@ class PersistentSessionsManager:
         """Release a specific browser session."""
         await self.database.release_persistent_browser_session(session_id, organization_id)
 
-    async def _clean_up_on_session_close(self, session_id: str, organization_id: str) -> None:
-        """Clean up session data when browser session is closed"""
-        browser_session = self._browser_sessions.get(session_id)
-        if browser_session:
-            await self.database.mark_persistent_browser_session_deleted(session_id, organization_id)
-            self._browser_sessions.pop(session_id, None)
-
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
         browser_session = self._browser_sessions.get(browser_session_id)
