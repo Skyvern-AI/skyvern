@@ -29,6 +29,10 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 
 config.set_main_option("sqlalchemy.url", SettingsManager.get_settings().DATABASE_STRING)
 
+import os
+url = os.getenv("DATABASE_URL")
+if url is not None:
+    config.set_main_option("sqlalchemy.url", url)
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
