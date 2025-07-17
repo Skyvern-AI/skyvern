@@ -264,8 +264,14 @@ class EmptyScrapePage(SkyvernException):
 
 
 class ScrapingFailed(SkyvernException):
-    def __init__(self) -> None:
+    def __init__(self, *, reason: str | None = None) -> None:
+        self.reason = reason
         super().__init__("Scraping failed.")
+
+
+class ScrapingFailedNoUrl(ScrapingFailed):
+    def __init__(self) -> None:
+        super().__init__(reason="A URL is missing. Please ensure there is a URL for Skyvern to work with.")
 
 
 class WorkflowRunContextNotInitialized(SkyvernException):
