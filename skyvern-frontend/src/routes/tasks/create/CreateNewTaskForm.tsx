@@ -516,7 +516,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">Webhook Callback URL</h1>
+                            <h1 className="text-lg">Webhook URL</h1>
                             <h2 className="text-base text-slate-400">
                               The URL of a webhook endpoint to send the
                               extracted information

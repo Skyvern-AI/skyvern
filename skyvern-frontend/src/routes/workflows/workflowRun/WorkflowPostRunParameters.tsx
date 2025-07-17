@@ -137,7 +137,7 @@ function WorkflowPostRunParameters() {
           <h1 className="text-lg font-bold">Other Workflow Parameters</h1>
           <div className="flex gap-16">
             <div className="w-80">
-              <h1 className="text-lg">Webhook Callback URL</h1>
+              <h1 className="text-lg">Webhook URL</h1>
             </div>
             <Input value={webhookCallbackUrl ?? ""} readOnly />
           </div>
