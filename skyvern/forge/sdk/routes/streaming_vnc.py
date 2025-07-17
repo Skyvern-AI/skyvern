@@ -169,11 +169,19 @@ async def loop_stream_vnc(streaming: sc.Streaming) -> None:
         LOG.info("No browser session found for task.", task=streaming.task, organization_id=streaming.organization_id)
         return
 
-    browser_address = streaming.browser_session.browser_address
+    vnc_url: str = ""
+    if streaming.browser_session.ip_address:
+        if ":" in streaming.browser_session.ip_address:
+            ip, _ = streaming.browser_session.ip_address.split(":")
+            vnc_url = f"ws://{ip}:{streaming.vnc_port}"
+        else:
+            vnc_url = f"ws://{streaming.browser_session.ip_address}:{streaming.vnc_port}"
+    else:
+        browser_address = streaming.browser_session.browser_address
 
-    parsed_browser_address = urlparse(browser_address)
-    host = parsed_browser_address.hostname
-    vnc_url = f"ws://{host}:{streaming.vnc_port}"
+        parsed_browser_address = urlparse(browser_address)
+        host = parsed_browser_address.hostname
+        vnc_url = f"ws://{host}:{streaming.vnc_port}"
 
     LOG.info(
         "Connecting to VNC URL.",
