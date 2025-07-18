@@ -73,6 +73,17 @@
   background: transparent !important;
 }
 
+.browser-stream .control-button {
+  transition: 0.3s all ease-in-out;
+  transform: translateY(0px);
+}
+
+.browser-stream .control-button.hide {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(15px);
+}
+
 @keyframes skyvern-anim-fadeIn {
   from {
     opacity: 0;
