@@ -2986,7 +2986,7 @@ class AgentDB:
         runnable_type: str | None = None,
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
-    ) -> PersistentBrowserSessionModel:
+    ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         try:
             async with self.Session() as session:
