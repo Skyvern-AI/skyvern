@@ -6,6 +6,7 @@ export type LoopNodeData = NodeBaseData & {
   loopValue: string;
   loopVariableReference: string;
   completeIfEmpty: boolean;
+  loopPrompt?: string;
 };
 
 export type LoopNode = Node<LoopNodeData, "loop">;

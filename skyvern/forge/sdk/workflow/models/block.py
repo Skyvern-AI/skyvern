@@ -876,6 +876,7 @@ class ForLoopBlock(Block):
     loop_over: PARAMETER_TYPE | None = None
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
+    loop_prompt: str | None = None  # New field for prompt-based loops
 
     def get_all_parameters(
         self,
