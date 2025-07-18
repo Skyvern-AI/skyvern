@@ -763,13 +763,9 @@ function FlowRenderer({
             }}
             maxZoom={debugStore.isDebugMode ? 1 : 2}
             minZoom={debugStore.isDebugMode ? 1 : 0.5}
-            panOnDrag={!debugStore.isDebugMode}
-            panOnScroll={debugStore.isDebugMode}
-            panOnScrollMode={
-              debugStore.isDebugMode
-                ? PanOnScrollMode.Vertical
-                : PanOnScrollMode.Free
-            }
+            panOnDrag={true}
+            panOnScroll={true}
+            panOnScrollMode={PanOnScrollMode.Vertical}
             zoomOnDoubleClick={!debugStore.isDebugMode}
             zoomOnPinch={!debugStore.isDebugMode}
             zoomOnScroll={!debugStore.isDebugMode}
