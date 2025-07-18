@@ -52,11 +52,10 @@ async def verify_browser_session(
         )
 
         try:
-            _, host, cdp_port = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+            browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
                 session_id=browser_session_id,
                 organization_id=organization_id,
             )
-            browser_address = f"{host}:{cdp_port}"
         except Exception as ex:
             LOG.info(
                 "Browser session address not found for browser session.",
@@ -211,11 +210,10 @@ async def verify_workflow_run(
         )
 
         try:
-            _, host, cdp_port = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+            browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
                 session_id=browser_session.persistent_browser_session_id,
                 organization_id=organization_id,
             )
-            browser_address = f"{host}:{cdp_port}"
         except Exception as ex:
             LOG.info(
                 "Browser session address not found for workflow run.",

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import structlog
 from playwright._impl._errors import TargetClosedError
 
+from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -69,16 +70,13 @@ class PersistentSessionsManager:
 
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
 
-    async def get_browser_address(self, session_id: str, organization_id: str) -> tuple[str, str, str]:
+    async def get_browser_address(self, session_id: str, organization_id: str) -> str:
         address = await wait_on_persistent_browser_address(self.database, session_id, organization_id)
 
         if address is None:
-            raise Exception(f"Browser address not found for persistent browser session {session_id}")
+            raise MissingBrowserAddressError(session_id)
 
-        protocol = "http"
-        host, cdp_port = address.split(":")
-
-        return protocol, host, cdp_port
+        return address
 
     async def get_session_by_runnable_id(
         self, runnable_id: str, organization_id: str
