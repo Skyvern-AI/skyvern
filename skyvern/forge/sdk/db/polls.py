@@ -3,13 +3,31 @@ import asyncio
 from structlog import get_logger
 
 from skyvern.forge.sdk.db.client import AgentDB
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = get_logger(__name__)
 
 
-async def wait_on_persistent_browser_address(db: AgentDB, session_id: str, organization_id: str) -> str | None:
+async def wait_on_persistent_browser_address(
+    db: AgentDB,
+    session_id: str,
+    organization_id: str,
+    timeout: int = 600,
+    poll_interval: int = 2,
+) -> str | None:
+    persistent_browser_session = await await_browser_session(db, session_id, organization_id, timeout, poll_interval)
+    return persistent_browser_session.browser_address if persistent_browser_session else None
+
+
+async def await_browser_session(
+    db: AgentDB,
+    session_id: str,
+    organization_id: str,
+    timeout: int = 600,
+    poll_interval: int = 2,
+) -> PersistentBrowserSession | None:
     try:
-        async with asyncio.timeout(10 * 60):
+        async with asyncio.timeout(timeout):
             while True:
                 persistent_browser_session = await db.get_persistent_browser_session(session_id, organization_id)
                 if persistent_browser_session is None:
@@ -22,9 +40,9 @@ async def wait_on_persistent_browser_address(db: AgentDB, session_id: str, organ
                 )
 
                 if persistent_browser_session.browser_address:
-                    return persistent_browser_session.browser_address
+                    return persistent_browser_session
 
-                await asyncio.sleep(2)
+                await asyncio.sleep(poll_interval)
     except asyncio.TimeoutError:
         LOG.warning(f"Browser address not found for persistent browser session {session_id}")
 
