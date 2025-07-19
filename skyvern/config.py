@@ -308,13 +308,21 @@ class Settings(BaseSettings):
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/o4-mini": {"llm_key": "AZURE_OPENAI_O4_MINI", "label": "GPT O4 Mini"},
-                "us.anthropic.claude-opus-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Opus",
-                },
-                "us.anthropic.claude-sonnet-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
+                # "us.anthropic.claude-opus-4-20250514-v1:0": {
+                #     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
+                #     "label": "Anthropic Claude 4 Opus",
+                # },
+                # "us.anthropic.claude-sonnet-4-20250514-v1:0": {
+                #     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
+                #     "label": "Anthropic Claude 4 Sonnet",
+                # },
+                "claude-sonnet-4-20250514": {
+                    "llm_key": "ANTHROPIC_CLAUDE4_SONNET",
                     "label": "Anthropic Claude 4 Sonnet",
+                },
+                "claude-opus-4-20250514": {
+                    "llm_key": "ANTHROPIC_CLAUDE4_OPUS",
+                    "label": "Anthropic Claude 4 Opus",
                 },
             }
         else:
