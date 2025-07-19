@@ -12,10 +12,11 @@ from playwright.async_api import ElementHandle, Frame, Locator, Page
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
 from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import count_tokens
@@ -765,7 +766,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
             return
         js_script = "async () => await stopGlobalIncrementalObserver()"
         await SkyvernFrame.evaluate(
-            frame=self.skyvern_frame.get_frame(), expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            frame=self.skyvern_frame.get_frame(),
+            expression=js_script,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
         )
 
     async def get_incremental_elements_num(self) -> int:

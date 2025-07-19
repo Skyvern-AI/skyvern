@@ -11,7 +11,7 @@ from PIL import Image
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
-from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
+from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import TraceManager
@@ -376,7 +376,7 @@ class SkyvernFrame:
         scroll_y_px = await self.evaluate(
             frame=self.frame,
             expression=js_script,
-            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[draw_boxes, frame, frame_index],
         )
         return scroll_y_px
@@ -394,7 +394,7 @@ class SkyvernFrame:
         scroll_y_px = await self.evaluate(
             frame=self.frame,
             expression=js_script,
-            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[draw_boxes, frame, frame_index, need_overlap],
         )
         return scroll_y_px
@@ -405,14 +405,18 @@ class SkyvernFrame:
         :param page: Page instance to remove the bounding boxes from.
         """
         js_script = "() => removeBoundingBoxes()"
-        await self.evaluate(frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS)
+        await self.evaluate(
+            frame=self.frame,
+            expression=js_script,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+        )
 
     async def build_elements_and_draw_bounding_boxes(self, frame: str, frame_index: int) -> None:
         js_script = "async ([frame, frame_index]) => await buildElementsAndDrawBoundingBoxes(frame, frame_index)"
         await self.evaluate(
             frame=self.frame,
             expression=js_script,
-            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[frame, frame_index],
         )
 
@@ -446,7 +450,10 @@ class SkyvernFrame:
 
     @TraceManager.traced_async()
     async def build_tree_from_body(
-        self, frame_name: str | None, frame_index: int, timeout_ms: float = BUILDING_ELEMENT_TREE_TIMEOUT_MS
+        self,
+        frame_name: str | None,
+        frame_index: int,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
         js_script = "async ([frame_name, frame_index]) => await buildTreeFromBody(frame_name, frame_index)"
         return await self.evaluate(
@@ -455,7 +462,9 @@ class SkyvernFrame:
 
     @TraceManager.traced_async()
     async def get_incremental_element_tree(
-        self, wait_until_finished: bool = True, timeout_ms: float = BUILDING_ELEMENT_TREE_TIMEOUT_MS
+        self,
+        wait_until_finished: bool = True,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
         js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
         return await self.evaluate(
