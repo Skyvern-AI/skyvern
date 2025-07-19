@@ -1,0 +1,99 @@
+title: Contact Forms
+description: ""
+proxy_location: RESIDENTIAL
+webhook_callback_url: ""
+persist_browser_session: false
+model: null
+totp_verification_url: null
+workflow_definition:
+  parameters:
+    - key: website_url
+      description: null
+      parameter_type: workflow
+      workflow_parameter_type: string
+      default_value: null
+    - key: name
+      description: null
+      parameter_type: workflow
+      workflow_parameter_type: string
+      default_value: null
+    - key: additional_information
+      description: null
+      parameter_type: workflow
+      workflow_parameter_type: string
+      default_value: |-
+        Message: I'd love to learn more about your...
+        Phone: 123-456-7890
+        Inquiry type: sales
+        Optional Subject: Hello from [Company Here]
+    - key: email
+      description: null
+      parameter_type: workflow
+      workflow_parameter_type: string
+      default_value: null
+  blocks:
+    - label: Fill_Out_Contact_Form
+      continue_on_failure: true
+      block_type: navigation
+      url: "{{website_url}}"
+      title: Fill_Out_Contact_Form
+      engine: skyvern-1.0
+      model: null
+      navigation_goal: >-
+        Find the contact form. Fill out the contact us form and submit it. Your
+        goal is complete when the page says your message has been sent. In the
+        case you can't find a contact us form, terminate.
+
+
+        Fill out required fields as best you can using the following
+        information:
+
+        {{name}}
+
+        {{email}}
+
+        {{additional_information}}
+      error_code_mapping: null
+      max_retries: 0
+      max_steps_per_run: null
+      complete_on_download: false
+      download_suffix: null
+      parameter_keys: []
+      totp_identifier: null
+      totp_verification_url: null
+      cache_actions: false
+      complete_criterion: ""
+      terminate_criterion: ""
+      include_action_history_in_verification: false
+    - label: Extract_latest_blog_post
+      continue_on_failure: false
+      block_type: task_v2
+      prompt: Find the blog page and go to the latest blog post
+      url: ""
+      max_steps: 25
+      totp_identifier: null
+      totp_verification_url: null
+    - label: block_1
+      continue_on_failure: false
+      block_type: extraction
+      url: ""
+      title: block_1
+      data_extraction_goal: Extract the blog title and content
+      data_schema:
+        type: object
+        properties:
+          title:
+            type: string
+            description: Title of the blog post
+          content:
+            type: string
+            description: Main content of the blog post
+        required:
+          - title
+          - content
+      max_retries: 0
+      max_steps_per_run: null
+      parameter_keys: []
+      cache_actions: false
+      engine: skyvern-1.0
+is_saved_task: false
