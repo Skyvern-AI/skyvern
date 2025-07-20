@@ -1810,53 +1810,51 @@ class WorkflowService:
                 for loop_block in block_yaml.loop_blocks
             ]
 
-            loop_over_parameter: Parameter | None = None
+            loop_over_parameter: PARAMETER_TYPE | None = None
             
-            # Handle prompt-based loop creation
-            if block_yaml.loop_prompt:
-                # Create extraction block for loop values
-                extraction_label = f"extraction_for_loop_{block_yaml.label}"
-                extraction_output_parameter = await WorkflowService.create_output_parameter_for_block(
-                    workflow_id=workflow.workflow_id,
-                    block_yaml=ExtractionBlockYAML(
-                        label=extraction_label,
-                        data_extraction_goal=block_yaml.loop_prompt,
-                        data_schema={
-                            "type": "array",
-                            "items": {"type": "string", "description": "A single item to iterate over"}
-                        }
-                    )
-                )
+            # Handle flexible loop_value_or_prompt field
+            if block_yaml.loop_value_or_prompt:
+                # First, try to resolve it as a variable reference
+                trimmed_key = block_yaml.loop_value_or_prompt.strip(" {}")
                 
-                # Create context parameter for the loop
-                loop_values_key = f"loop_values_{block_yaml.label}"
-                loop_over_parameter = ContextParameter(
-                    key=loop_values_key,
-                    source=extraction_output_parameter,
-                )
-                
-            elif block_yaml.loop_over_parameter_key:
-                loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
-
-            if block_yaml.loop_variable_reference:
-                # it's backaward compatible with jinja style parameter and context paramter
-                # we trim the format like {{ loop_key }} into loop_key to initialize the context parater,
-                # otherwise it might break the context parameter initialization chain, blow up the worklofw parameters
-                # TODO: consider remove this if we totally give up context parameter
-                trimmed_key = block_yaml.loop_variable_reference.strip(" {}")
+                # Check if it's a valid parameter key
                 if trimmed_key in parameters:
-                    loop_over_parameter = parameters[trimmed_key]
+                    loop_over_parameter = parameters[trimmed_key]  # type: ignore
+                elif block_yaml.loop_over_parameter_key and block_yaml.loop_over_parameter_key in parameters:
+                    loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]  # type: ignore
+                else:
+                    # If it's not a valid parameter, treat it as a prompt
+                    # Create extraction block for loop values
+                    extraction_label = f"extraction_for_loop_{block_yaml.label}"
+                    extraction_output_parameter = await WorkflowService.create_output_parameter_for_block(
+                        workflow_id=workflow.workflow_id,
+                        block_yaml=ExtractionBlockYAML(
+                            label=extraction_label,
+                            data_extraction_goal=block_yaml.loop_value_or_prompt,
+                            data_schema={
+                                "type": "array",
+                                "items": {"type": "string", "description": "A single item to iterate over"}
+                            }
+                        )
+                    )
+                    
+                    # Create context parameter for the loop
+                    loop_values_key = f"loop_values_{block_yaml.label}"
+                    loop_over_parameter = ContextParameter(
+                        key=loop_values_key,
+                        source=extraction_output_parameter,
+                    )
 
-            if loop_over_parameter is None and not block_yaml.loop_variable_reference and not block_yaml.loop_prompt:
-                raise Exception("Loop value parameter or loop prompt is required for for loop block")
+            if loop_over_parameter is None and not block_yaml.loop_value_or_prompt:
+                raise Exception("Loop value parameter or prompt is required for for loop block")
 
             return ForLoopBlock(
                 label=block_yaml.label,
                 loop_over=loop_over_parameter,
-                loop_variable_reference=block_yaml.loop_variable_reference,
-                loop_prompt=block_yaml.loop_prompt,
+                loop_variable_reference=block_yaml.loop_value_or_prompt,  # Use the flexible field
+                loop_prompt=None,  # No longer used
                 loop_blocks=loop_blocks,
-                output_parameter=output_parameter,
+                output_parameter=output_parameter,  # type: ignore
                 continue_on_failure=block_yaml.continue_on_failure,
                 complete_if_empty=block_yaml.complete_if_empty,
             )

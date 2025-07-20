@@ -36,7 +36,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const thisBlockIsPlaying =
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const [inputs, setInputs] = useState({
-    loopVariableReference: data.loopVariableReference,
+    loopValueOrPrompt: data.loopValueOrPrompt,
   });
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
@@ -67,14 +67,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     }
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
-  }
-
-  // Add prompt state
-  const [prompt, setPrompt] = useState(data.loopPrompt || "");
-
-  function handlePromptChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
-    setPrompt(e.target.value);
-    updateNodeData(id, { loopPrompt: e.target.value });
   }
 
   return (
@@ -120,35 +112,23 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             <div className="space-y-2">
               <div className="flex justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Loop Value</Label>
+                  <Label className="text-xs text-slate-300">Loop Value or Prompt</Label>
                   <HelpTooltip content={helpTooltips["loop"]["loopValue"]} />
                 </div>
                 {isFirstWorkflowBlock ? (
                   <div className="flex justify-end text-xs text-slate-400">
-                    Tip: Use the {"+"} button to add parameters!
+                    Tip: Use the {"+"} button to add parameters or type a prompt!
                   </div>
                 ) : null}
               </div>
               <WorkflowBlockInput
                 nodeId={id}
-                value={inputs.loopVariableReference}
+                value={inputs.loopValueOrPrompt}
                 onChange={(value) => {
-                  handleChange("loopVariableReference", value);
+                  handleChange("loopValueOrPrompt", value);
                 }}
+                placeholder="Type a variable or a prompt (e.g. Extract all product links from this page)"
               />
-            </div>
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ fontWeight: 600 }}>Loop Prompt (Recommended)</label>
-              <Textarea
-                value={prompt}
-                onChange={handlePromptChange}
-                placeholder="E.g. Extract all product links from this page"
-              />
-              <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>
-                <b>Tip:</b> You can now simply describe what you want to loop over (e.g. "Extract all order IDs from the table").
-                <br />
-                If you leave this blank, you can still use the traditional method by specifying a parameter key to loop over.
-              </div>
             </div>
             <div className="space-y-2">
               <div className="space-y-2">

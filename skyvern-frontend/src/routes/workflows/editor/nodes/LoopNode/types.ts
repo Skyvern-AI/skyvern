@@ -4,9 +4,8 @@ import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowT
 
 export type LoopNodeData = NodeBaseData & {
   loopValue: string;
-  loopVariableReference: string;
+  loopValueOrPrompt: string;  // Unified field for variable reference or prompt
   completeIfEmpty: boolean;
-  loopPrompt?: string;
 };
 
 export type LoopNode = Node<LoopNodeData, "loop">;
@@ -16,7 +15,7 @@ export const loopNodeDefaultData: LoopNodeData = {
   editable: true,
   label: "",
   loopValue: "",
-  loopVariableReference: "",
+  loopValueOrPrompt: "",  // Unified field
   completeIfEmpty: false,
   continueOnFailure: false,
   model: null,
