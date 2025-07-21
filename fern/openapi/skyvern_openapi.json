@@ -10145,11 +10145,17 @@
             ]
           },
           "parameters": {
-            "additionalProperties": true,
-            "type": "object",
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Parameters",
-            "description": "Parameters to pass to the workflow",
-            "default": {}
+            "description": "Parameters to pass to the workflow"
           },
           "title": {
             "anyOf": [
