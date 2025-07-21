@@ -1524,7 +1524,20 @@ class ForgeAgent:
                 window_dimension=window_dimension,
             )
         else:
+            current_context = skyvern_context.ensure_context()
+            resp_content = None
+            if task.task_id in current_context.totp_codes:
+                verification_code = current_context.totp_codes[task.task_id]
+                current_context.totp_codes.pop(task.task_id)
+                LOG.info(
+                    "Using verification code from context for anthropic CU call",
+                    task_id=task.task_id,
+                    verification_code=verification_code,
+                )
+                resp_content = f"Here is the verification code: {verification_code}"
+
             llm_response = await llm_caller.call(
+                prompt=resp_content,
                 step=step,
                 screenshots=scraped_page.screenshots,
                 use_message_history=True,
