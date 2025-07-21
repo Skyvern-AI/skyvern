@@ -3246,7 +3246,7 @@ async def scroll_down_to_load_all_options(
     else:
         await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
 
-    await scrollable_element.move_mouse_to(page=page)
+    await scrollable_element.move_mouse_to_safe(page=page)
 
     scroll_pace = 0
     previous_num = await incremental_scraped.get_incremental_elements_num()

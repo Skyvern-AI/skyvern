@@ -14,6 +14,7 @@ from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR, TEXT_INPUT_DELAY
 from skyvern.exceptions import (
     ElementIsNotLabel,
+    ElementOutOfCurrentViewport,
     InteractWithDisabledElement,
     MissingElement,
     MissingElementDict,
@@ -644,6 +645,14 @@ class SkyvernElement:
                 element_id=element_id,
                 exc_info=True,
             )
+        except ElementOutOfCurrentViewport:
+            LOG.warning(
+                "Failed to move mouse to the element - ElementOutOfCurrentViewport",
+                task_id=task_id,
+                step_id=step_id,
+                element_id=element_id,
+                exc_info=True,
+            )
         except Exception:
             LOG.warning(
                 "Failed to move mouse to the element - unexpectd exception",
@@ -666,6 +675,12 @@ class SkyvernElement:
         epsilon = 0.01
         dest_x = uniform(x + epsilon, x + width - epsilon) if width > 2 * epsilon else (x + width) / 2
         dest_y = uniform(y + epsilon, y + height - epsilon) if height > 2 * epsilon else (y + height) / 2
+
+        # TODO: a better way to check if the element is out of current viewport
+        # eg: x > window.innerWidth or y > window.innerHeight; part of the element is out of the viewport
+        if dest_x < 0 or dest_y < 0:
+            raise ElementOutOfCurrentViewport(element_id=self.get_id())
+
         await page.mouse.move(dest_x, dest_y)
 
         return dest_x, dest_y
