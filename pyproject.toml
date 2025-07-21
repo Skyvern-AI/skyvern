@@ -77,7 +77,7 @@ types-boto3 = {extras = ["full"], version = "^1.38.31"}
 lark = "^1.2.2"
 libcst = "^1.8.2"
 curlparser = "^0.1.0"
-lmnr = {extras = ["all"], version = "^0.6.16"}
+lmnr = {extras = ["all"], version = "^0.6.21"}
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"

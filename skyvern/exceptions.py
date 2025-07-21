@@ -739,3 +739,8 @@ class BrowserSessionNotFound(SkyvernHTTPException):
 class APIKeyNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
         super().__init__(f"No valid API key token found for organization {organization_id}")
+
+
+class ElementOutOfCurrentViewport(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Element {element_id} is out of current viewport")
