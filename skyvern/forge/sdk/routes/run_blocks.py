@@ -10,14 +10,17 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.forge.sdk.workflow.models.yaml import (
-    CredentialParameterYAML,
+    BitwardenLoginCredentialParameterYAML,
     LoginBlockYAML,
+    OnePasswordCredentialParameterYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    WorkflowParameterYAML,
 )
-from skyvern.schemas.run_blocks import LoginRequest
+from skyvern.schemas.run_blocks import CredentialType, LoginRequest
 from skyvern.schemas.runs import ProxyLocation, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.services import workflow_service
 
@@ -40,11 +43,6 @@ async def login(
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
-    # 0. validate credential
-    credential = await app.DATABASE.get_credential(login_request.credential_id, organization.organization_id)
-    if not credential:
-        raise HTTPException(status_code=404, detail=f"Credential {login_request.credential_id} not found")
-
     # 1. create empty workflow with a credential parameter
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
         organization,
@@ -53,38 +51,55 @@ async def login(
         max_screenshot_scrolling_times=login_request.max_screenshot_scrolling_times,
         extra_http_headers=login_request.extra_http_headers,
     )
-    workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
-        request_id=None,
-        workflow_request=WorkflowRequestBody(
-            max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
-            browser_session_id=login_request.browser_session_id,
-            extra_http_headers=login_request.extra_http_headers,
-        ),
-        workflow_permanent_id=new_workflow.workflow_permanent_id,
-        organization=organization,
-        version=None,
-        max_steps_override=10,
-        parent_workflow_run_id=None,
-    )
     # 2. add a login block to the workflow
     label = "login"
+    yaml_parameters = []
+    parameter_key = "credential"
+    if login_request.credential_type == CredentialType.skyvern:
+        credential = await app.DATABASE.get_credential(login_request.credential_id, organization.organization_id)
+        if not credential:
+            raise HTTPException(status_code=404, detail=f"Credential {login_request.credential_id} not found")
+
+        yaml_parameters = [
+            WorkflowParameterYAML(
+                key=parameter_key,
+                workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+                description="The ID of the credential to use for login",
+                default_value=login_request.credential_id,
+            )
+        ]
+    elif login_request.credential_type == CredentialType.bitwarden:
+        yaml_parameters = [
+            BitwardenLoginCredentialParameterYAML(
+                key=parameter_key,
+                collection_id=login_request.collection_id,
+                item_id=login_request.item_id,
+                url=login_request.url,
+                description="The ID of the bitwarden collection to use for login",
+                bitwarden_client_id_aws_secret_key="SKYVERN_BITWARDEN_CLIENT_ID",
+                bitwarden_client_secret_aws_secret_key="SKYVERN_BITWARDEN_CLIENT_SECRET",
+                bitwarden_master_password_aws_secret_key="SKYVERN_BITWARDEN_MASTER_PASSWORD",
+            )
+        ]
+    elif login_request.credential_type == CredentialType.onepassword:
+        yaml_parameters = [
+            OnePasswordCredentialParameterYAML(
+                key=parameter_key,
+                vault_id=login_request.vault_id,
+                item_id=login_request.item_id,
+            )
+        ]
+
     login_block_yaml = LoginBlockYAML(
         label=label,
         title=label,
         url=login_request.url,
         navigation_goal=login_request.prompt or DEFAULT_LOGIN_PROMPT,
         max_steps_per_run=10,
-        parameter_keys=[login_request.credential_id],
+        parameter_keys=[parameter_key],
         totp_verification_url=login_request.totp_url,
         totp_identifier=login_request.totp_identifier,
     )
-    yaml_parameters = [
-        CredentialParameterYAML(
-            name="credential_id",
-            type="workflow",
-            description="The ID of the credential to use for login",
-        )
-    ]
     yaml_blocks = [login_block_yaml]
     workflow_definition_yaml = WorkflowDefinitionYAML(
         parameters=yaml_parameters,
@@ -105,14 +120,11 @@ async def login(
     )
     LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
-    # 3. create and run workflow with the credential_id
-    workflow_id = new_workflow.workflow_id
+    # 3. create and run workflow with the credential
+    workflow_id = new_workflow.workflow_permanent_id
     context = skyvern_context.ensure_context()
     request_id = context.request_id
     legacy_workflow_request = WorkflowRequestBody(
-        data={
-            "credential_id": login_request.credential_id,
-        },
         proxy_location=login_request.proxy_location,
         webhook_callback_url=login_request.webhook_url,
         totp_identifier=login_request.totp_identifier,
@@ -146,9 +158,6 @@ async def login(
         modified_at=workflow_run.modified_at,
         run_request=WorkflowRunRequest(
             workflow_id=new_workflow.workflow_id,
-            parameters={
-                "credential_id": login_request.credential_id,
-            },
             title=new_workflow.title,
             proxy_location=login_request.proxy_location,
             webhook_url=login_request.webhook_url,
