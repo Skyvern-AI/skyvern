@@ -1,6 +1,8 @@
 import typer
 from dotenv import load_dotenv
 
+from skyvern.cli.utils import set_asyncio_event_loop_policy
+
 from .docs import docs_app
 from .init_command import init, init_browser
 from .quickstart import quickstart_app
@@ -55,4 +57,5 @@ def init_browser_command() -> None:
 
 if __name__ == "__main__":  # pragma: no cover - manual CLI invocation
     load_dotenv()
+    set_asyncio_event_loop_policy()
     cli_app()

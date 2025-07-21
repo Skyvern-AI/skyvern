@@ -21,7 +21,7 @@ class WorkflowRunResultRequest(BaseModel):
 
 
 def load_webvoyager_case_from_json(file_path: str, group_id: str = "") -> Iterator[WebVoyagerTestCase]:
-    with open("evaluation/datasets/webvoyager_reference_answer.json") as answer_file:
+    with open("evaluation/datasets/webvoyager_reference_answer.json", encoding="utf-8") as answer_file:
         webvoyager_answers: dict = json.load(answer_file)
 
     if not group_id:

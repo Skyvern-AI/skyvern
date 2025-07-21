@@ -5,6 +5,8 @@ from typing import Optional
 
 from alembic import command
 from alembic.config import Config
+
+from skyvern.config import settings
 from skyvern.constants import REPO_ROOT_DIR
 
 
@@ -12,6 +14,7 @@ def migrate_db() -> None:
     alembic_cfg = Config()
     path = f"{REPO_ROOT_DIR}/alembic"
     alembic_cfg.set_main_option("script_location", path)
+    alembic_cfg.set_main_option("sqlalchemy.url", settings.DATABASE_STRING)
     command.upgrade(alembic_cfg, "head")
 
 
@@ -28,7 +31,7 @@ def detect_os() -> str:
     system = platform.system()
     if system == "Linux":
         try:
-            with open("/proc/version") as f:
+            with open("/proc/version", encoding="utf-8") as f:
                 version_info = f.read().lower()
                 if "microsoft" in version_info:
                     return "wsl"

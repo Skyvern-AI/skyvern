@@ -2,6 +2,8 @@
 
 import asyncio
 import subprocess
+import sys
+import traceback
 
 import typer
 from rich.panel import Panel
@@ -10,7 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 # Import console after skyvern.cli to ensure proper initialization
 from skyvern.cli.console import console
 from skyvern.cli.init_command import init  # init is used directly
-from skyvern.cli.utils import start_services
+from skyvern.cli.utils import start_services, start_services_sync
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
 
@@ -77,11 +79,15 @@ def quickstart(
 
         # Start services
         console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
-        asyncio.run(start_services(server_only=server_only))
+        if sys.platform == "win32":
+            start_services_sync(server_only=server_only)
+        else:
+            asyncio.run(start_services(server_only=server_only))
 
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Quickstart process interrupted by user.[/bold yellow]")
         raise typer.Exit(0)
     except Exception as e:
         console.print(f"[bold red]Error during quickstart: {str(e)}[/bold red]")
+        console.print(traceback.format_exc())
         raise typer.Exit(1)

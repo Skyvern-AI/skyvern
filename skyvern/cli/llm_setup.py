@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 from dotenv import load_dotenv, set_key
 from rich.panel import Panel
@@ -12,6 +13,8 @@ def update_or_add_env_var(key: str, value: str) -> None:
     env_path = Path(".env")
     if not env_path.exists():
         env_path.touch()
+
+        dbstr = "postgresql+asyncpg://skyvern@localhost/skyvern" if sys.platform == "win32" else "postgresql+psycopg://skyvern@localhost/skyvern"
         defaults = {
             "ENV": "local",
             "ENABLE_OPENAI": "false",
@@ -41,7 +44,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "MAX_STEPS_PER_RUN": "50",
             "LOG_LEVEL": "INFO",
             "LITELLM_LOG": "CRITICAL",
-            "DATABASE_STRING": "postgresql+psycopg://skyvern@localhost/skyvern",
+            "DATABASE_STRING": dbstr,
             "PORT": "8000",
             "ANALYTICS_ID": "anonymous",
             "ENABLE_LOG_ARTIFACTS": "false",
