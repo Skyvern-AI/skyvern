@@ -363,7 +363,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+
+                }
               }
             }
           },
@@ -450,7 +452,7 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
@@ -661,7 +663,7 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
@@ -719,7 +721,9 @@
             "description": "Successfully deleted workflow",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+
+                }
               }
             }
           },
@@ -947,7 +951,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+
+                }
               }
             }
           },
@@ -980,8 +986,8 @@
         "tags": [
           "Browser Sessions"
         ],
-        "summary": "Create a new browser session",
-        "description": "Create a new browser session",
+        "summary": "Create a session",
+        "description": "Create a browser session that persists across multiple runs",
         "operationId": "create_browser_session_v1_browser_sessions_post",
         "parameters": [
           {
@@ -1054,7 +1060,7 @@
         "tags": [
           "Browser Sessions"
         ],
-        "summary": "Get all active browser sessions",
+        "summary": "Get active browser sessions",
         "description": "Get all active browser sessions for the organization",
         "operationId": "get_browser_sessions_v1_browser_sessions_get",
         "parameters": [
@@ -1124,8 +1130,8 @@
         "tags": [
           "Browser Sessions"
         ],
-        "summary": "Close a browser session",
-        "description": "Close a browser session",
+        "summary": "Close a session",
+        "description": "Close a session. Once closed, the session cannot be used again.",
         "operationId": "close_browser_session_v1_browser_sessions__browser_session_id__close_post",
         "parameters": [
           {
@@ -1166,7 +1172,9 @@
             "description": "Successfully closed browser session",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+
+                }
               }
             }
           },
@@ -1202,8 +1210,8 @@
         "tags": [
           "Browser Sessions"
         ],
-        "summary": "Get browser session details",
-        "description": "Get details about a specific browser session by ID",
+        "summary": "Get a session",
+        "description": "Get details about a specific browser session, including the browser address for cdp connection.",
         "operationId": "get_browser_session_v1_browser_sessions__browser_session_id__get",
         "parameters": [
           {
@@ -1250,11 +1258,11 @@
               }
             }
           },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
           "404": {
             "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
           },
           "422": {
             "description": "Validation Error",
@@ -1458,9 +1466,7 @@
               "type": "integer",
               "minimum": 1,
               "description": "Page number for pagination",
-              "examples": [
-                1
-              ],
+              "examples": [1],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "page"
               },
@@ -1477,9 +1483,7 @@
               "type": "integer",
               "minimum": 1,
               "description": "Number of items per page",
-              "examples": [
-                10
-              ],
+              "examples": [10],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "page_size"
               },
@@ -1701,7 +1705,11 @@
     },
     "/v1/run/tasks/login": {
       "post": {
-        "summary": "Login",
+        "tags": [
+          "Agent"
+        ],
+        "summary": "Login Task",
+        "description": "Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password",
         "operationId": "login_v1_run_tasks_login_post",
         "parameters": [
           {
@@ -1730,7 +1738,7 @@
               "schema": {
                 "oneOf": [
                   {
-                    "$ref": "#/components/schemas/SkyvernCredentialLoginRequest"
+                    "$ref": "#/components/schemas/SkyvernLoginRequest"
                   },
                   {
                     "$ref": "#/components/schemas/BitwardenLoginRequest"
@@ -1742,7 +1750,7 @@
                 "discriminator": {
                   "propertyName": "credential_type",
                   "mapping": {
-                    "skyvern": "#/components/schemas/SkyvernCredentialLoginRequest",
+                    "skyvern": "#/components/schemas/SkyvernLoginRequest",
                     "bitwarden": "#/components/schemas/BitwardenLoginRequest",
                     "1password": "#/components/schemas/OnePasswordLoginRequest"
                   }
@@ -1773,7 +1781,26 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "login",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "# Login with password saved in Skyvern\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(credential_id=\"cred_123\")\n"
+              },
+              {
+                "sdk": "python",
+                "code": "# Login with password saved in Bitwarden\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Login with a Bitwarden collection and website url filter\nawait skyvern.login(bitwarden_collection_id=\"BITWARDEN COLLECTION ID\", url_filter=\"https://example.com\")\n\n# Login with a Bitwarden item\nawait skyvern.login(bitwarden_item_id=\"BITWARDEN ITEM ID\")\n"
+              },
+              {
+                "sdk": "python",
+                "code": "# Login with password saved in 1Password\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(onepassword_vault_id=\"ONEPASSWORD VAULT ID\", onepassword_item_id=\"ONEPASSWORD ITEM ID\")\n"
+              }
+            ]
+          }
+        ]
       }
     }
   },
@@ -1991,7 +2018,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -2796,7 +2825,8 @@
                 "type": "null"
               }
             ],
-            "title": "Url"
+            "title": "Url",
+            "description": "Website url"
           },
           "prompt": {
             "anyOf": [
@@ -2807,7 +2837,8 @@
                 "type": "null"
               }
             ],
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
           },
           "webhook_url": {
             "anyOf": [
@@ -2818,7 +2849,8 @@
                 "type": "null"
               }
             ],
-            "title": "Webhook Url"
+            "title": "Webhook Url",
+            "description": "Webhook URL to send login status updates"
           },
           "proxy_location": {
             "anyOf": [
@@ -2828,7 +2860,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Proxy location to use"
           },
           "totp_identifier": {
             "anyOf": [
@@ -2839,7 +2872,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Identifier"
+            "title": "Totp Identifier",
+            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
           },
           "totp_url": {
             "anyOf": [
@@ -2850,7 +2884,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Url"
+            "title": "Totp Url",
+            "description": "TOTP URL to fetch one-time passwords"
           },
           "browser_session_id": {
             "anyOf": [
@@ -2861,7 +2896,8 @@
                 "type": "null"
               }
             ],
-            "title": "Browser Session Id"
+            "title": "Browser Session Id",
+            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`"
           },
           "extra_http_headers": {
             "anyOf": [
@@ -2875,7 +2911,8 @@
                 "type": "null"
               }
             ],
-            "title": "Extra Http Headers"
+            "title": "Extra Http Headers",
+            "description": "Additional HTTP headers to include in requests"
           },
           "max_screenshot_scrolling_times": {
             "anyOf": [
@@ -2886,7 +2923,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Screenshot Scrolling Times"
+            "title": "Max Screenshot Scrolling Times",
+            "description": "Maximum number of times to scroll for screenshots"
           },
           "credential_type": {
             "type": "string",
@@ -2894,7 +2932,7 @@
             "title": "Credential Type",
             "default": "bitwarden"
           },
-          "collection_id": {
+          "bitwarden_collection_id": {
             "anyOf": [
               {
                 "type": "string"
@@ -2903,9 +2941,10 @@
                 "type": "null"
               }
             ],
-            "title": "Collection Id"
+            "title": "Bitwarden Collection Id",
+            "description": "Bitwarden collection ID"
           },
-          "item_id": {
+          "bitwarden_item_id": {
             "anyOf": [
               {
                 "type": "string"
@@ -2914,11 +2953,13 @@
                 "type": "null"
               }
             ],
-            "title": "Item Id"
+            "title": "Bitwarden Item Id",
+            "description": "Bitwarden item ID"
           }
         },
         "type": "object",
-        "title": "BitwardenLoginRequest"
+        "title": "BitwardenLoginRequest",
+        "description": "Login with password saved in Bitwarden"
       },
       "BitwardenSensitiveInformationParameter": {
         "properties": {
@@ -3138,10 +3179,7 @@
             ],
             "title": "Timeout",
             "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.",
-            "examples": [
-              60,
-              120
-            ]
+            "examples": [60, 120]
           },
           "browser_address": {
             "anyOf": [
@@ -3460,7 +3498,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -3947,7 +3987,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -4161,7 +4203,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -4324,7 +4368,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -5655,7 +5701,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -6074,7 +6122,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -6646,7 +6696,8 @@
                 "type": "null"
               }
             ],
-            "title": "Url"
+            "title": "Url",
+            "description": "Website url"
           },
           "prompt": {
             "anyOf": [
@@ -6657,7 +6708,8 @@
                 "type": "null"
               }
             ],
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
           },
           "webhook_url": {
             "anyOf": [
@@ -6668,7 +6720,8 @@
                 "type": "null"
               }
             ],
-            "title": "Webhook Url"
+            "title": "Webhook Url",
+            "description": "Webhook URL to send login status updates"
           },
           "proxy_location": {
             "anyOf": [
@@ -6678,7 +6731,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Proxy location to use"
           },
           "totp_identifier": {
             "anyOf": [
@@ -6689,7 +6743,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Identifier"
+            "title": "Totp Identifier",
+            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
           },
           "totp_url": {
             "anyOf": [
@@ -6700,7 +6755,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Url"
+            "title": "Totp Url",
+            "description": "TOTP URL to fetch one-time passwords"
           },
           "browser_session_id": {
             "anyOf": [
@@ -6711,7 +6767,8 @@
                 "type": "null"
               }
             ],
-            "title": "Browser Session Id"
+            "title": "Browser Session Id",
+            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`"
           },
           "extra_http_headers": {
             "anyOf": [
@@ -6725,7 +6782,8 @@
                 "type": "null"
               }
             ],
-            "title": "Extra Http Headers"
+            "title": "Extra Http Headers",
+            "description": "Additional HTTP headers to include in requests"
           },
           "max_screenshot_scrolling_times": {
             "anyOf": [
@@ -6736,7 +6794,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Screenshot Scrolling Times"
+            "title": "Max Screenshot Scrolling Times",
+            "description": "Maximum number of times to scroll for screenshots"
           },
           "credential_type": {
             "type": "string",
@@ -6744,21 +6803,24 @@
             "title": "Credential Type",
             "default": "1password"
           },
-          "vault_id": {
+          "onepassword_vault_id": {
             "type": "string",
-            "title": "Vault Id"
+            "title": "Onepassword Vault Id",
+            "description": "1Password vault ID."
           },
-          "item_id": {
+          "onepassword_item_id": {
             "type": "string",
-            "title": "Item Id"
+            "title": "Onepassword Item Id",
+            "description": "1Password item ID."
           }
         },
         "type": "object",
         "required": [
-          "vault_id",
-          "item_id"
+          "onepassword_vault_id",
+          "onepassword_item_id"
         ],
-        "title": "OnePasswordLoginRequest"
+        "title": "OnePasswordLoginRequest",
+        "description": "Login with password saved in 1Password"
       },
       "OutputParameter": {
         "properties": {
@@ -7212,7 +7274,7 @@
         ],
         "title": "SendEmailBlockYAML"
       },
-      "SkyvernCredentialLoginRequest": {
+      "SkyvernLoginRequest": {
         "properties": {
           "url": {
             "anyOf": [
@@ -7223,7 +7285,8 @@
                 "type": "null"
               }
             ],
-            "title": "Url"
+            "title": "Url",
+            "description": "Website url"
           },
           "prompt": {
             "anyOf": [
@@ -7234,7 +7297,8 @@
                 "type": "null"
               }
             ],
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
           },
           "webhook_url": {
             "anyOf": [
@@ -7245,7 +7309,8 @@
                 "type": "null"
               }
             ],
-            "title": "Webhook Url"
+            "title": "Webhook Url",
+            "description": "Webhook URL to send login status updates"
           },
           "proxy_location": {
             "anyOf": [
@@ -7255,7 +7320,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Proxy location to use"
           },
           "totp_identifier": {
             "anyOf": [
@@ -7266,7 +7332,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Identifier"
+            "title": "Totp Identifier",
+            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
           },
           "totp_url": {
             "anyOf": [
@@ -7277,7 +7344,8 @@
                 "type": "null"
               }
             ],
-            "title": "Totp Url"
+            "title": "Totp Url",
+            "description": "TOTP URL to fetch one-time passwords"
           },
           "browser_session_id": {
             "anyOf": [
@@ -7288,7 +7356,8 @@
                 "type": "null"
               }
             ],
-            "title": "Browser Session Id"
+            "title": "Browser Session Id",
+            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`"
           },
           "extra_http_headers": {
             "anyOf": [
@@ -7302,7 +7371,8 @@
                 "type": "null"
               }
             ],
-            "title": "Extra Http Headers"
+            "title": "Extra Http Headers",
+            "description": "Additional HTTP headers to include in requests"
           },
           "max_screenshot_scrolling_times": {
             "anyOf": [
@@ -7313,7 +7383,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Screenshot Scrolling Times"
+            "title": "Max Screenshot Scrolling Times",
+            "description": "Maximum number of times to scroll for screenshots"
           },
           "credential_type": {
             "type": "string",
@@ -7323,14 +7394,16 @@
           },
           "credential_id": {
             "type": "string",
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "description": "ID of the Skyvern credential to use for login."
           }
         },
         "type": "object",
         "required": [
           "credential_id"
         ],
-        "title": "SkyvernCredentialLoginRequest"
+        "title": "SkyvernLoginRequest",
+        "description": "Login with password saved in Skyvern"
       },
       "TOTPCode": {
         "properties": {
@@ -7684,7 +7757,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -7915,7 +7990,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -8119,7 +8196,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -8166,10 +8245,7 @@
             ],
             "title": "Max Steps",
             "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
-            "examples": [
-              10,
-              25
-            ]
+            "examples": [10, 25]
           },
           "webhook_url": {
             "anyOf": [
@@ -8332,7 +8408,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -9088,7 +9166,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -9391,7 +9471,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -10444,7 +10526,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -10545,7 +10629,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {
@@ -10761,7 +10847,9 @@
                 "type": "object"
               },
               {
-                "items": {},
+                "items": {
+
+                },
                 "type": "array"
               },
               {

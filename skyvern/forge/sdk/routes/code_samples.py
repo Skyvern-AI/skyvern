@@ -29,23 +29,40 @@ LOGIN_CODE_SAMPLE_SKYVERN = """# Login with password saved in Skyvern
 from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.login(credential_id="cred_123")
+await skyvern.login(
+    url="https://example.com",
+    credential_type="skyvern",
+    credential_id="cred_123"),
+)
 """
 LOGIN_CODE_SAMPLE_BITWARDEN = """# Login with password saved in Bitwarden
 from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 # Login with a Bitwarden collection and website url filter
-await skyvern.login(bitwarden_collection_id="BITWARDEN COLLECTION ID", url_filter="https://example.com")
+await skyvern.login(
+    url="https://example.com",
+    credential_type="bitwarden",
+    bitwarden_collection_id="BITWARDEN COLLECTION ID",
+)
 
 # Login with a Bitwarden item
-await skyvern.login(bitwarden_item_id="BITWARDEN ITEM ID")
+await skyvern.login(
+    url="https://example.com",
+    credential_type="bitwarden",
+    bitwarden_item_id="BITWARDEN ITEM ID",
+)
 """
 LOGIN_CODE_SAMPLE_ONEPASSWORD = """# Login with password saved in 1Password
 from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-await skyvern.login(onepassword_vault_id="ONEPASSWORD VAULT ID", onepassword_item_id="ONEPASSWORD ITEM ID")
+await skyvern.login(
+    url="https://example.com",
+    credential_type="onepassword",
+    onepassword_vault_id="1PASSWORD VAULT ID",
+    onepassword_item_id="1PASSWORD ITEM ID",
+)
 """
 
 # Workflows

@@ -24,6 +24,7 @@ from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskReques
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
+from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine, RunStatus, RunType
 from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.utils import migrate_db
@@ -450,6 +451,26 @@ class Skyvern(AsyncSkyvern):
                         break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
+
+    async def login(
+        self,
+        credential_type: CredentialType,
+        *,
+        url: str | None = None,
+        credential_id: str | None = None,
+        bitwarden_collection_id: str | None = None,
+        bitwarden_item_id: str | None = None,
+        onepassword_vault_id: str | None = None,
+        onepassword_item_id: str | None = None,
+        prompt: str | None = None,
+        webhook_url: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        browser_session_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+    ) -> None:
+        return
 
 
 def from_run_to_task_run_response(run_obj: GetRunResponse) -> TaskRunResponse:

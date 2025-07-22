@@ -23,6 +23,7 @@ from .bitwarden_credit_card_data_parameter import BitwardenCreditCardDataParamet
 from .bitwarden_credit_card_data_parameter_yaml import BitwardenCreditCardDataParameterYaml
 from .bitwarden_login_credential_parameter import BitwardenLoginCredentialParameter
 from .bitwarden_login_credential_parameter_yaml import BitwardenLoginCredentialParameterYaml
+from .bitwarden_login_request import BitwardenLoginRequest
 from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
 from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
 from .browser_session_response import BrowserSessionResponse
@@ -201,6 +202,12 @@ from .login_block_parameters_item import (
     LoginBlockParametersItem_Workflow,
 )
 from .login_block_yaml import LoginBlockYaml
+from .login_request_body import (
+    LoginRequestBody,
+    LoginRequestBody_1Password,
+    LoginRequestBody_Bitwarden,
+    LoginRequestBody_Skyvern,
+)
 from .navigation_block import NavigationBlock
 from .navigation_block_data_schema import NavigationBlockDataSchema
 from .navigation_block_parameters_item import (
@@ -220,6 +227,7 @@ from .non_empty_credit_card_credential import NonEmptyCreditCardCredential
 from .non_empty_password_credential import NonEmptyPasswordCredential
 from .one_password_credential_parameter import OnePasswordCredentialParameter
 from .one_password_credential_parameter_yaml import OnePasswordCredentialParameterYaml
+from .one_password_login_request import OnePasswordLoginRequest
 from .output_parameter import OutputParameter
 from .output_parameter_yaml import OutputParameterYaml
 from .password_credential_response import PasswordCredentialResponse
@@ -230,6 +238,7 @@ from .run_engine import RunEngine
 from .run_status import RunStatus
 from .send_email_block import SendEmailBlock
 from .send_email_block_yaml import SendEmailBlockYaml
+from .skyvern_login_request import SkyvernLoginRequest
 from .task_block import TaskBlock
 from .task_block_data_schema import TaskBlockDataSchema
 from .task_block_parameters_item import (
@@ -422,6 +431,7 @@ __all__ = [
     "BitwardenCreditCardDataParameterYaml",
     "BitwardenLoginCredentialParameter",
     "BitwardenLoginCredentialParameterYaml",
+    "BitwardenLoginRequest",
     "BitwardenSensitiveInformationParameter",
     "BitwardenSensitiveInformationParameterYaml",
     "BrowserSessionResponse",
@@ -580,6 +590,10 @@ __all__ = [
     "LoginBlockParametersItem_Output",
     "LoginBlockParametersItem_Workflow",
     "LoginBlockYaml",
+    "LoginRequestBody",
+    "LoginRequestBody_1Password",
+    "LoginRequestBody_Bitwarden",
+    "LoginRequestBody_Skyvern",
     "NavigationBlock",
     "NavigationBlockDataSchema",
     "NavigationBlockParametersItem",
@@ -597,6 +611,7 @@ __all__ = [
     "NonEmptyPasswordCredential",
     "OnePasswordCredentialParameter",
     "OnePasswordCredentialParameterYaml",
+    "OnePasswordLoginRequest",
     "OutputParameter",
     "OutputParameterYaml",
     "PasswordCredentialResponse",
@@ -607,6 +622,7 @@ __all__ = [
     "RunStatus",
     "SendEmailBlock",
     "SendEmailBlockYaml",
+    "SkyvernLoginRequest",
     "TaskBlock",
     "TaskBlockDataSchema",
     "TaskBlockParametersItem",
