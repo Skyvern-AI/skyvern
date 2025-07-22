@@ -81,6 +81,7 @@ from skyvern.webeye.actions.actions import (
     ActionStatus,
     CheckboxAction,
     ClickAction,
+    CompleteVerifyResult,
     InputOrSelectContext,
     InputTextAction,
     ScrapeResult,
@@ -626,6 +627,7 @@ async def handle_click_action(
             try:
                 if sequential_click_result := await handle_sequential_click_for_dropdown(
                     action=action,
+                    action_history=results,
                     anchor_element=skyvern_element,
                     dom=dom,
                     page=page,
@@ -657,6 +659,7 @@ async def handle_click_action(
 @TraceManager.traced_async(ignore_inputs=["anchor_element", "scraped_page", "page", "incremental_scraped", "dom"])
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
+    action_history: list[ActionResult],
     anchor_element: SkyvernElement,
     dom: DomUtil,
     page: Page,
@@ -678,6 +681,51 @@ async def handle_sequential_click_for_dropdown(
         return None
 
     LOG.info("Detected new element after clicking", action=action)
+    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+
+    dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
+    new_interactable_element_ids = [
+        element_id
+        for element_id in new_element_ids
+        if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+    ]
+
+    action_history_str = ""
+    if action_history and len(action_history) > 0:
+        result = action_history[-1]
+        action_result = {
+            "action_type": action.action_type,
+            "reasoning": action.reasoning,
+            "result": result.success,
+        }
+        action_history_str = json.dumps(action_result)
+
+    prompt = load_prompt_with_elements(
+        element_tree_builder=scraped_page_after_open,
+        prompt_engine=prompt_engine,
+        template_name="check-user-goal",
+        navigation_goal=task.navigation_goal,
+        navigation_payload=task.navigation_payload,
+        new_elements_ids=new_element_ids,
+        without_screenshots=True,
+        action_history=action_history_str,
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+    response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt,
+        step=step,
+        prompt_name="check-user-goal",
+    )
+    verify_result = CompleteVerifyResult.model_validate(response)
+    if verify_result.user_goal_achieved:
+        LOG.info(
+            "User goal achieved, exiting the sequential click logic",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        return None
+
     dropdown_menu_element = await locate_dropdown_menu(
         current_anchor_element=anchor_element,
         incremental_scraped=incremental_scraped,
@@ -724,7 +772,8 @@ async def handle_sequential_click_for_dropdown(
         scraped_page=scraped_page,
         step=step,
         task=task,
-        support_complete_action=True,
+        scraped_page_after_open=scraped_page_after_open,
+        new_interactable_element_ids=new_interactable_element_ids,
     )
 
 
@@ -2703,7 +2752,8 @@ async def select_from_emerging_elements(
     scraped_page: ScrapedPage,
     step: Step,
     task: Task,
-    support_complete_action: bool = False,
+    scraped_page_after_open: ScrapedPage | None = None,
+    new_interactable_element_ids: list[str] | None = None,
 ) -> ActionResult:
     """
     This is the function to select an element from the new showing elements.
@@ -2711,11 +2761,11 @@ async def select_from_emerging_elements(
     """
 
     # TODO: support to handle the case when options are loaded by scroll
-    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    scraped_page_after_open = scraped_page_after_open or await scraped_page.generate_scraped_page_without_screenshots()
     new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
 
     dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
-    new_interactable_element_ids = [
+    new_interactable_element_ids = new_interactable_element_ids or [
         element_id
         for element_id in new_element_ids
         if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
@@ -2734,7 +2784,6 @@ async def select_from_emerging_elements(
         target_value=options.target_value,
         navigation_goal=task.navigation_goal,
         new_elements_ids=new_interactable_element_ids,
-        support_complete_action=support_complete_action,
         navigation_payload_str=json.dumps(task.navigation_payload),
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
@@ -2758,16 +2807,8 @@ async def select_from_emerging_elements(
     action_type_str: str = json_response.get("action_type", "") or ""
     action_type = ActionType(action_type_str.lower())
     element_id: str | None = json_response.get("id", None)
-    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT, ActionType.COMPLETE]:
+    if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
-
-    if action_type == ActionType.COMPLETE:
-        LOG.info(
-            "The user has completed the user goal in the current opened dropdown, although the dropdown might not be closed",
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-        return ActionSuccess()
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         LOG.info(
