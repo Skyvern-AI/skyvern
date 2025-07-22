@@ -7,7 +7,11 @@ from skyvern.config import settings
 from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.routes.code_samples import LOGIN_CODE_SAMPLE
+from skyvern.forge.sdk.routes.code_samples import (
+    LOGIN_CODE_SAMPLE_BITWARDEN,
+    LOGIN_CODE_SAMPLE_ONEPASSWORD,
+    LOGIN_CODE_SAMPLE_SKYVERN,
+)
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -39,7 +43,24 @@ If login is completed, you're successful."""
     response_model=WorkflowRunResponse,
     openapi_extra={
         "x-fern-sdk-method-name": "login",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": LOGIN_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "python",
+                        "code": LOGIN_CODE_SAMPLE_SKYVERN,
+                    },
+                    {
+                        "sdk": "python",
+                        "code": LOGIN_CODE_SAMPLE_BITWARDEN,
+                    },
+                    {
+                        "sdk": "python",
+                        "code": LOGIN_CODE_SAMPLE_ONEPASSWORD,
+                    },
+                ]
+            }
+        ],
     },
     description="Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password",
     summary="Login Task",
@@ -80,8 +101,8 @@ async def login(
         yaml_parameters = [
             BitwardenLoginCredentialParameterYAML(
                 key=parameter_key,
-                collection_id=login_request.collection_id,
-                item_id=login_request.item_id,
+                collection_id=login_request.bitwarden_collection_id,
+                item_id=login_request.bitwarden_item_id,
                 url=login_request.url,
                 description="The ID of the bitwarden collection to use for login",
                 bitwarden_client_id_aws_secret_key="SKYVERN_BITWARDEN_CLIENT_ID",
@@ -93,8 +114,8 @@ async def login(
         yaml_parameters = [
             OnePasswordCredentialParameterYAML(
                 key=parameter_key,
-                vault_id=login_request.vault_id,
-                item_id=login_request.item_id,
+                vault_id=login_request.onepassword_vault_id,
+                item_id=login_request.onepassword_item_id,
             )
         ]
 
