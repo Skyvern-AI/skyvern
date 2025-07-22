@@ -3,7 +3,7 @@
 from ..core.pydantic_utilities import UniversalBaseModel
 import pydantic
 from .credential_response_credential import CredentialResponseCredential
-from .credential_type import CredentialType
+from .credential_type_output import CredentialTypeOutput
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import typing
 
@@ -23,7 +23,7 @@ class CredentialResponse(UniversalBaseModel):
     The credential data
     """
 
-    credential_type: CredentialType = pydantic.Field()
+    credential_type: CredentialTypeOutput = pydantic.Field()
     """
     Type of the credential
     """
