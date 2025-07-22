@@ -1698,6 +1698,83 @@
           }
         ]
       }
+    },
+    "/v1/run/tasks/login": {
+      "post": {
+        "summary": "Login",
+        "operationId": "login_v1_run_tasks_login_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/SkyvernCredentialLoginRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BitwardenLoginRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/OnePasswordLoginRequest"
+                  }
+                ],
+                "discriminator": {
+                  "propertyName": "credential_type",
+                  "mapping": {
+                    "skyvern": "#/components/schemas/SkyvernCredentialLoginRequest",
+                    "bitwarden": "#/components/schemas/BitwardenLoginRequest",
+                    "1password": "#/components/schemas/OnePasswordLoginRequest"
+                  }
+                },
+                "title": "Login Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2707,6 +2784,141 @@
           "bitwarden_master_password_aws_secret_key"
         ],
         "title": "BitwardenLoginCredentialParameterYAML"
+      },
+      "BitwardenLoginRequest": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers"
+          },
+          "max_screenshot_scrolling_times": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolling Times"
+          },
+          "credential_type": {
+            "type": "string",
+            "const": "bitwarden",
+            "title": "Credential Type",
+            "default": "bitwarden"
+          },
+          "collection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Id"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id"
+          }
+        },
+        "type": "object",
+        "title": "BitwardenLoginRequest"
       },
       "BitwardenSensitiveInformationParameter": {
         "properties": {
@@ -6423,6 +6635,131 @@
         ],
         "title": "OnePasswordCredentialParameterYAML"
       },
+      "OnePasswordLoginRequest": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers"
+          },
+          "max_screenshot_scrolling_times": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolling Times"
+          },
+          "credential_type": {
+            "type": "string",
+            "const": "1password",
+            "title": "Credential Type",
+            "default": "1password"
+          },
+          "vault_id": {
+            "type": "string",
+            "title": "Vault Id"
+          },
+          "item_id": {
+            "type": "string",
+            "title": "Item Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "vault_id",
+          "item_id"
+        ],
+        "title": "OnePasswordLoginRequest"
+      },
       "OutputParameter": {
         "properties": {
           "parameter_type": {
@@ -6874,6 +7211,126 @@
           "body"
         ],
         "title": "SendEmailBlockYAML"
+      },
+      "SkyvernCredentialLoginRequest": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id"
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers"
+          },
+          "max_screenshot_scrolling_times": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolling Times"
+          },
+          "credential_type": {
+            "type": "string",
+            "const": "skyvern",
+            "title": "Credential Type",
+            "default": "skyvern"
+          },
+          "credential_id": {
+            "type": "string",
+            "title": "Credential Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential_id"
+        ],
+        "title": "SkyvernCredentialLoginRequest"
       },
       "TOTPCode": {
         "properties": {
@@ -10145,11 +10602,17 @@
             ]
           },
           "parameters": {
-            "additionalProperties": true,
-            "type": "object",
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Parameters",
-            "description": "Parameters to pass to the workflow",
-            "default": {}
+            "description": "Parameters to pass to the workflow"
           },
           "title": {
             "anyOf": [
