@@ -136,13 +136,6 @@ class SkyvernElement:
     def __repr__(self) -> str:
         return f"SkyvernElement({str(self.__static_element)})"
 
-    async def _trim_target_attr(self) -> None:
-        if "target" not in self.get_attributes():
-            return
-        LOG.debug("Removing target attribute from the element", element=self.get_id())
-        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
-        await skyvern_frame.remove_target_attr(await self.get_element_handler())
-
     def build_HTML(self, need_trim_element: bool = True, need_skyvern_attrs: bool = True) -> str:
         element_dict = self.get_element_dict()
         if need_trim_element:
@@ -815,12 +808,10 @@ class SkyvernElement:
 
     async def navigate_to_a_href(self, page: Page) -> str | None:
         if self.get_tag_name() != InteractiveElement.A:
-            await self._trim_target_attr()
             return None
 
         href = await self.should_use_navigation_instead_click(page)
         if not href:
-            await self._trim_target_attr()
             return None
 
         LOG.info(
