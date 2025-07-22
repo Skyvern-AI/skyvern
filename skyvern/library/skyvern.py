@@ -469,8 +469,37 @@ class Skyvern(AsyncSkyvern):
         totp_url: str | None = None,
         browser_session_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        wait_for_completion: bool = False,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
     ) -> None:
-        return
+        if not self._api_key:
+            raise ValueError(
+                "Local mode is not supported for run_workflow. Please instantiate Skyvern with an API key like this: Skyvern(api_key='your-api-key')"
+            )
+        workflow_run = await super().login(
+            credential_type=credential_type,
+            url=url,
+            credential_id=credential_id,
+            bitwarden_collection_id=bitwarden_collection_id,
+            bitwarden_item_id=bitwarden_item_id,
+            onepassword_vault_id=onepassword_vault_id,
+            onepassword_item_id=onepassword_item_id,
+            prompt=prompt,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            extra_http_headers=extra_http_headers,
+        )
+        if wait_for_completion:
+            async with asyncio.timeout(timeout):
+                while True:
+                    workflow_run = await super().get_run(workflow_run.run_id)
+                    if RunStatus(workflow_run.status).is_final():
+                        break
+                    await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
+        return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
 
 def from_run_to_task_run_response(run_obj: GetRunResponse) -> TaskRunResponse:

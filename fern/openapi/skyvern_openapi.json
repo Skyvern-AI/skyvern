@@ -1736,26 +1736,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "oneOf": [
-                  {
-                    "$ref": "#/components/schemas/SkyvernLoginRequest"
-                  },
-                  {
-                    "$ref": "#/components/schemas/BitwardenLoginRequest"
-                  },
-                  {
-                    "$ref": "#/components/schemas/OnePasswordLoginRequest"
-                  }
-                ],
-                "discriminator": {
-                  "propertyName": "credential_type",
-                  "mapping": {
-                    "skyvern": "#/components/schemas/SkyvernLoginRequest",
-                    "bitwarden": "#/components/schemas/BitwardenLoginRequest",
-                    "1password": "#/components/schemas/OnePasswordLoginRequest"
-                  }
-                },
-                "title": "Login Request"
+                "$ref": "#/components/schemas/LoginRequest"
               }
             }
           }
@@ -1788,15 +1769,15 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "# Login with password saved in Skyvern\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(credential_id=\"cred_123\")\n"
+                "code": "# Login with password saved in Skyvern\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"skyvern\",\n    credential_id=\"cred_123\"),\n)\n"
               },
               {
                 "sdk": "python",
-                "code": "# Login with password saved in Bitwarden\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Login with a Bitwarden collection and website url filter\nawait skyvern.login(bitwarden_collection_id=\"BITWARDEN COLLECTION ID\", url_filter=\"https://example.com\")\n\n# Login with a Bitwarden item\nawait skyvern.login(bitwarden_item_id=\"BITWARDEN ITEM ID\")\n"
+                "code": "# Login with password saved in Bitwarden\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Login with a Bitwarden collection and website url filter\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"bitwarden\",\n    bitwarden_collection_id=\"BITWARDEN COLLECTION ID\",\n)\n\n# Login with a Bitwarden item\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"bitwarden\",\n    bitwarden_item_id=\"BITWARDEN ITEM ID\",\n)\n"
               },
               {
                 "sdk": "python",
-                "code": "# Login with password saved in 1Password\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(onepassword_vault_id=\"ONEPASSWORD VAULT ID\", onepassword_item_id=\"ONEPASSWORD ITEM ID\")\n"
+                "code": "# Login with password saved in 1Password\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"onepassword\",\n    onepassword_vault_id=\"1PASSWORD VAULT ID\",\n    onepassword_item_id=\"1PASSWORD ITEM ID\",\n)\n"
               }
             ]
           }
@@ -2814,153 +2795,6 @@
         ],
         "title": "BitwardenLoginCredentialParameterYAML"
       },
-      "BitwardenLoginRequest": {
-        "properties": {
-          "url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Url",
-            "description": "Website url"
-          },
-          "prompt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prompt",
-            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
-          },
-          "webhook_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Webhook Url",
-            "description": "Webhook URL to send login status updates"
-          },
-          "proxy_location": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ProxyLocation"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Proxy location to use"
-          },
-          "totp_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Identifier",
-            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
-          },
-          "totp_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Url",
-            "description": "TOTP URL to fetch one-time passwords"
-          },
-          "browser_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Session Id",
-            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`"
-          },
-          "extra_http_headers": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extra Http Headers",
-            "description": "Additional HTTP headers to include in requests"
-          },
-          "max_screenshot_scrolling_times": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Max Screenshot Scrolling Times",
-            "description": "Maximum number of times to scroll for screenshots"
-          },
-          "credential_type": {
-            "type": "string",
-            "const": "bitwarden",
-            "title": "Credential Type",
-            "default": "bitwarden"
-          },
-          "bitwarden_collection_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Bitwarden Collection Id",
-            "description": "Bitwarden collection ID"
-          },
-          "bitwarden_item_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Bitwarden Item Id",
-            "description": "Bitwarden item ID"
-          }
-        },
-        "type": "object",
-        "title": "BitwardenLoginRequest",
-        "description": "Login with password saved in Bitwarden"
-      },
       "BitwardenSensitiveInformationParameter": {
         "properties": {
           "parameter_type": {
@@ -3584,7 +3418,7 @@
             ]
           },
           "credential_type": {
-            "$ref": "#/components/schemas/CredentialType",
+            "$ref": "#/components/schemas/skyvern__forge__sdk__schemas__credentials__CredentialType",
             "description": "Type of credential to create"
           },
           "credential": {
@@ -3742,7 +3576,7 @@
             "description": "The credential data"
           },
           "credential_type": {
-            "$ref": "#/components/schemas/CredentialType",
+            "$ref": "#/components/schemas/CredentialType-Output",
             "description": "Type of the credential"
           },
           "name": {
@@ -3764,7 +3598,7 @@
         "title": "CredentialResponse",
         "description": "Response model for credential operations."
       },
-      "CredentialType": {
+      "CredentialType-Output": {
         "type": "string",
         "enum": [
           "password",
@@ -6021,6 +5855,195 @@
         ],
         "title": "LoginBlockYAML"
       },
+      "LoginRequest": {
+        "properties": {
+          "credential_type": {
+            "$ref": "#/components/schemas/skyvern__schemas__run_blocks__CredentialType",
+            "description": "Where to get the credential from"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "Website url"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt",
+            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url",
+            "description": "Webhook URL to send login status updates"
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Proxy location to use"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL to fetch one-time passwords"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`",
+            "examples": [
+              "pbs_123456"
+            ]
+          },
+          "extra_http_headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extra Http Headers",
+            "description": "Additional HTTP headers to include in requests"
+          },
+          "max_screenshot_scrolling_times": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Screenshot Scrolling Times",
+            "description": "Maximum number of times to scroll for screenshots"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id",
+            "description": "ID of the Skyvern credential to use for login.",
+            "examples": [
+              "cred_123"
+            ]
+          },
+          "bitwarden_collection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bitwarden Collection Id",
+            "description": "Bitwarden collection ID. You can find it in the Bitwarden collection URL. e.g. `https://vault.bitwarden.com/vaults/collection_id/items`"
+          },
+          "bitwarden_item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bitwarden Item Id",
+            "description": "Bitwarden item ID"
+          },
+          "onepassword_vault_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Onepassword Vault Id",
+            "description": "1Password vault ID"
+          },
+          "onepassword_item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Onepassword Item Id",
+            "description": "1Password item ID"
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential_type"
+        ],
+        "title": "LoginRequest"
+      },
       "NavigationBlock": {
         "properties": {
           "label": {
@@ -6685,143 +6708,6 @@
         ],
         "title": "OnePasswordCredentialParameterYAML"
       },
-      "OnePasswordLoginRequest": {
-        "properties": {
-          "url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Url",
-            "description": "Website url"
-          },
-          "prompt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prompt",
-            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
-          },
-          "webhook_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Webhook Url",
-            "description": "Webhook URL to send login status updates"
-          },
-          "proxy_location": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ProxyLocation"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Proxy location to use"
-          },
-          "totp_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Identifier",
-            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
-          },
-          "totp_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Url",
-            "description": "TOTP URL to fetch one-time passwords"
-          },
-          "browser_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Session Id",
-            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`"
-          },
-          "extra_http_headers": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extra Http Headers",
-            "description": "Additional HTTP headers to include in requests"
-          },
-          "max_screenshot_scrolling_times": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Max Screenshot Scrolling Times",
-            "description": "Maximum number of times to scroll for screenshots"
-          },
-          "credential_type": {
-            "type": "string",
-            "const": "1password",
-            "title": "Credential Type",
-            "default": "1password"
-          },
-          "onepassword_vault_id": {
-            "type": "string",
-            "title": "Onepassword Vault Id",
-            "description": "1Password vault ID."
-          },
-          "onepassword_item_id": {
-            "type": "string",
-            "title": "Onepassword Item Id",
-            "description": "1Password item ID."
-          }
-        },
-        "type": "object",
-        "required": [
-          "onepassword_vault_id",
-          "onepassword_item_id"
-        ],
-        "title": "OnePasswordLoginRequest",
-        "description": "Login with password saved in 1Password"
-      },
       "OutputParameter": {
         "properties": {
           "parameter_type": {
@@ -7273,137 +7159,6 @@
           "body"
         ],
         "title": "SendEmailBlockYAML"
-      },
-      "SkyvernLoginRequest": {
-        "properties": {
-          "url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Url",
-            "description": "Website url"
-          },
-          "prompt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Prompt",
-            "description": "Login instructions. Skyvern has default prompt/instruction for login if this field is not provided."
-          },
-          "webhook_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Webhook Url",
-            "description": "Webhook URL to send login status updates"
-          },
-          "proxy_location": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ProxyLocation"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Proxy location to use"
-          },
-          "totp_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Identifier",
-            "description": "Identifier for TOTP (Time-based One-Time Password) if required"
-          },
-          "totp_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Url",
-            "description": "TOTP URL to fetch one-time passwords"
-          },
-          "browser_session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Browser Session Id",
-            "description": "ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`"
-          },
-          "extra_http_headers": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extra Http Headers",
-            "description": "Additional HTTP headers to include in requests"
-          },
-          "max_screenshot_scrolling_times": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Max Screenshot Scrolling Times",
-            "description": "Maximum number of times to scroll for screenshots"
-          },
-          "credential_type": {
-            "type": "string",
-            "const": "skyvern",
-            "title": "Credential Type",
-            "default": "skyvern"
-          },
-          "credential_id": {
-            "type": "string",
-            "title": "Credential Id",
-            "description": "ID of the Skyvern credential to use for login."
-          }
-        },
-        "type": "object",
-        "required": [
-          "credential_id"
-        ],
-        "title": "SkyvernLoginRequest",
-        "description": "Login with password saved in Skyvern"
       },
       "TOTPCode": {
         "properties": {
@@ -11052,6 +10807,24 @@
           "auto_generated"
         ],
         "title": "WorkflowStatus"
+      },
+      "skyvern__forge__sdk__schemas__credentials__CredentialType": {
+        "type": "string",
+        "enum": [
+          "password",
+          "credit_card"
+        ],
+        "title": "CredentialType",
+        "description": "Type of credential stored in the system."
+      },
+      "skyvern__schemas__run_blocks__CredentialType": {
+        "type": "string",
+        "enum": [
+          "skyvern",
+          "bitwarden",
+          "1password"
+        ],
+        "title": "CredentialType"
       }
     }
   },
