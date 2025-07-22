@@ -1096,6 +1096,7 @@ async def handle_input_text_action(
             if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
+                    scraped_page=scraped_page,
                     page=page,
                     dom=dom,
                     text=text,
@@ -2132,6 +2133,7 @@ async def chain_click(
 async def choose_auto_completion_dropdown(
     context: InputOrSelectContext,
     page: Page,
+    scraped_page: ScrapedPage,
     dom: DomUtil,
     text: str,
     skyvern_element: SkyvernElement,
@@ -2190,11 +2192,34 @@ async def choose_auto_completion_dropdown(
         incremental_element.extend(confirmed_preserved_list)
 
         result.incremental_elements = copy.deepcopy(incremental_element)
-        if len(incremental_element) == 0:
-            raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+        html = ""
+        new_interactable_element_ids = []
+        if len(incremental_element) > 0:
+            cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+            html = incremental_scraped.build_html_tree(cleaned_incremental_element)
+        else:
+            scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+            new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(
+                scraped_page.id_to_css_dict.keys()
+            )
 
-        cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
-        html = incremental_scraped.build_html_tree(cleaned_incremental_element)
+            dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
+            new_interactable_element_ids = [
+                element_id
+                for element_id in new_element_ids
+                if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+            ]
+            if len(new_interactable_element_ids) == 0:
+                raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+            LOG.info(
+                "New elements detected after the input",
+                new_elements_ids=new_interactable_element_ids,
+            )
+            result.incremental_elements = copy.deepcopy(
+                [scraped_page_after_open.id_to_element_dict[element_id] for element_id in new_interactable_element_ids]
+            )
+            html = scraped_page_after_open.build_element_tree()
+
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             is_search=context.is_search_bar,
@@ -2203,6 +2228,7 @@ async def choose_auto_completion_dropdown(
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             elements=html,
+            new_elements_ids=new_interactable_element_ids,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
         LOG.info(
@@ -2257,6 +2283,7 @@ async def choose_auto_completion_dropdown(
         await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         clear_input = False
         return result
+
     except Exception as e:
         LOG.info(
             "Failed to choose the auto completion dropdown",
@@ -2287,6 +2314,7 @@ def remove_duplicated_HTML_element(elements: list[dict]) -> list[dict]:
 
 async def input_or_auto_complete_input(
     input_or_select_context: InputOrSelectContext,
+    scraped_page: ScrapedPage,
     page: Page,
     dom: DomUtil,
     text: str,
@@ -2326,6 +2354,7 @@ async def input_or_auto_complete_input(
         result = await choose_auto_completion_dropdown(
             context=input_or_select_context,
             page=page,
+            scraped_page=scraped_page,
             dom=dom,
             text=current_value,
             preserved_elements=result.incremental_elements,
@@ -2395,6 +2424,7 @@ async def input_or_auto_complete_input(
             result = await choose_auto_completion_dropdown(
                 context=input_or_select_context,
                 page=page,
+                scraped_page=scraped_page,
                 dom=dom,
                 text=value,
                 preserved_elements=result.incremental_elements,

@@ -13,7 +13,7 @@ async def wait_on_persistent_browser_address(
     session_id: str,
     organization_id: str,
     timeout: int = 600,
-    poll_interval: int = 2,
+    poll_interval: float = 2,
 ) -> str | None:
     persistent_browser_session = await await_browser_session(db, session_id, organization_id, timeout, poll_interval)
     return persistent_browser_session.browser_address if persistent_browser_session else None
@@ -24,7 +24,7 @@ async def await_browser_session(
     session_id: str,
     organization_id: str,
     timeout: int = 600,
-    poll_interval: int = 2,
+    poll_interval: float = 2,
 ) -> PersistentBrowserSession | None:
     try:
         async with asyncio.timeout(timeout):
