@@ -1,5 +1,4 @@
 from enum import StrEnum
-from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -12,7 +11,8 @@ class CredentialType(StrEnum):
     onepassword = "1password"
 
 
-class LoginRequestBase(BaseModel):
+class LoginRequest(BaseModel):
+    credential_type: CredentialType = Field(..., description="Where to get the credential from")
     url: str | None = Field(default=None, description="Website url")
     prompt: str | None = Field(
         default=None,
@@ -25,7 +25,9 @@ class LoginRequestBase(BaseModel):
     )
     totp_url: str | None = Field(default=None, description="TOTP URL to fetch one-time passwords")
     browser_session_id: str | None = Field(
-        default=None, description="ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`"
+        default=None,
+        description="ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`",
+        examples=["pbs_123456"],
     )
     extra_http_headers: dict[str, str] | None = Field(
         default=None, description="Additional HTTP headers to include in requests"
@@ -34,37 +36,18 @@ class LoginRequestBase(BaseModel):
         default=None, description="Maximum number of times to scroll for screenshots"
     )
 
+    # Skyvern credential
+    credential_id: str | None = Field(
+        default=None, description="ID of the Skyvern credential to use for login.", examples=["cred_123"]
+    )
 
-class SkyvernLoginRequest(LoginRequestBase):
-    """
-    Login with password saved in Skyvern
-    """
-
-    credential_type: Literal[CredentialType.skyvern] = CredentialType.skyvern
-    credential_id: str = Field(..., description="ID of the Skyvern credential to use for login.")
-
-
-class BitwardenLoginRequest(LoginRequestBase):
-    """
-    Login with password saved in Bitwarden
-    """
-
-    credential_type: Literal[CredentialType.bitwarden] = CredentialType.bitwarden
-    bitwarden_collection_id: str | None = Field(default=None, description="Bitwarden collection ID")
+    # Bitwarden credential
+    bitwarden_collection_id: str | None = Field(
+        default=None,
+        description="Bitwarden collection ID. You can find it in the Bitwarden collection URL. e.g. `https://vault.bitwarden.com/vaults/collection_id/items`",
+    )
     bitwarden_item_id: str | None = Field(default=None, description="Bitwarden item ID")
 
-
-class OnePasswordLoginRequest(LoginRequestBase):
-    """
-    Login with password saved in 1Password
-    """
-
-    credential_type: Literal[CredentialType.onepassword] = CredentialType.onepassword
-    onepassword_vault_id: str = Field(..., description="1Password vault ID.")
-    onepassword_item_id: str = Field(..., description="1Password item ID.")
-
-
-LoginRequest = Annotated[
-    Union[SkyvernLoginRequest, BitwardenLoginRequest, OnePasswordLoginRequest],
-    Field(discriminator="credential_type"),
-]
+    # 1Password credential
+    onepassword_vault_id: str | None = Field(default=None, description="1Password vault ID")
+    onepassword_item_id: str | None = Field(default=None, description="1Password item ID")
