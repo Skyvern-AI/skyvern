@@ -85,6 +85,8 @@ async def login(
     yaml_parameters = []
     parameter_key = "credential"
     if login_request.credential_type == CredentialType.skyvern:
+        if not login_request.credential_id:
+            raise HTTPException(status_code=400, detail="credential_id is required to login with Skyvern credential")
         credential = await app.DATABASE.get_credential(login_request.credential_id, organization.organization_id)
         if not credential:
             raise HTTPException(status_code=404, detail=f"Credential {login_request.credential_id} not found")
@@ -111,6 +113,14 @@ async def login(
             )
         ]
     elif login_request.credential_type == CredentialType.onepassword:
+        if not login_request.onepassword_vault_id:
+            raise HTTPException(
+                status_code=400, detail="onepassword_vault_id is required to login with 1Password credential"
+            )
+        if not login_request.onepassword_item_id:
+            raise HTTPException(
+                status_code=400, detail="onepassword_item_id is required to login with 1Password credential"
+            )
         yaml_parameters = [
             OnePasswordCredentialParameterYAML(
                 key=parameter_key,
