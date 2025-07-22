@@ -25,6 +25,11 @@ RETRY_RUN_WEBHOOK_CODE_SAMPLE = """from skyvern import Skyvern
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 await skyvern.retry_run_webhook(run_id="tsk_v2_123")
 """
+LOGIN_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.login(workflow_id="wpid_123", parameters={"parameter1": "value1", "parameter2": "value2"})
+"""
 
 # Workflows
 CREATE_WORKFLOW_CODE_SAMPLE = """curl -X POST https://api.skyvern.com/v1/workflows \

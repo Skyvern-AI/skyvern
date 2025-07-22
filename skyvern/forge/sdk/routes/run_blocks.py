@@ -7,6 +7,7 @@ from skyvern.config import settings
 from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.routes.code_samples import LOGIN_CODE_SAMPLE
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -34,7 +35,14 @@ If login is completed, you're successful."""
 
 @base_router.post(
     "/run/tasks/login",
+    tags=["Agent"],
     response_model=WorkflowRunResponse,
+    openapi_extra={
+        "x-fern-sdk-method-name": "login",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": LOGIN_CODE_SAMPLE}]}],
+    },
+    description="Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password",
+    summary="Login Task",
 )
 async def login(
     request: Request,
