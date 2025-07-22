@@ -30,6 +30,7 @@ from .types.totp_code import TotpCode
 from .types.credential_response import CredentialResponse
 from .types.credential_type import CredentialType
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
+from .types.login_request_body import LoginRequestBody
 from .core.client_wrapper import AsyncClientWrapper
 
 # this is used as the default value for optional parameters
@@ -1145,7 +1146,7 @@ class Skyvern:
         self, *, timeout: typing.Optional[int] = OMIT, request_options: typing.Optional[RequestOptions] = None
     ) -> BrowserSessionResponse:
         """
-        Create a new browser session
+        Create a browser session that persists across multiple runs
 
         Parameters
         ----------
@@ -1220,7 +1221,7 @@ class Skyvern:
         self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
         """
-        Close a browser session
+        Close a session. Once closed, the session cannot be used again.
 
         Parameters
         ----------
@@ -1290,7 +1291,7 @@ class Skyvern:
         self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> BrowserSessionResponse:
         """
-        Get details about a specific browser session by ID
+        Get details about a specific browser session, including the browser address for cdp connection.
 
         Parameters
         ----------
@@ -1720,6 +1721,71 @@ class Skyvern:
                     CredentialResponse,
                     parse_obj_as(
                         type_=CredentialResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    def login(
+        self, *, request: LoginRequestBody, request_options: typing.Optional[RequestOptions] = None
+    ) -> WorkflowRunResponse:
+        """
+        Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password
+
+        Parameters
+        ----------
+        request : LoginRequestBody
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import LoginRequestBody_Skyvern, Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+        client.login(
+            request=LoginRequestBody_Skyvern(
+                credential_id="credential_id",
+            ),
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/login",
+            method="POST",
+            json=convert_and_respect_annotation_metadata(
+                object_=request, annotation=LoginRequestBody, direction="write"
+            ),
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -2946,7 +3012,7 @@ class AsyncSkyvern:
         self, *, timeout: typing.Optional[int] = OMIT, request_options: typing.Optional[RequestOptions] = None
     ) -> BrowserSessionResponse:
         """
-        Create a new browser session
+        Create a browser session that persists across multiple runs
 
         Parameters
         ----------
@@ -3029,7 +3095,7 @@ class AsyncSkyvern:
         self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.Optional[typing.Any]:
         """
-        Close a browser session
+        Close a session. Once closed, the session cannot be used again.
 
         Parameters
         ----------
@@ -3107,7 +3173,7 @@ class AsyncSkyvern:
         self, browser_session_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> BrowserSessionResponse:
         """
-        Get details about a specific browser session by ID
+        Get details about a specific browser session, including the browser address for cdp connection.
 
         Parameters
         ----------
@@ -3587,6 +3653,79 @@ class AsyncSkyvern:
                     CredentialResponse,
                     parse_obj_as(
                         type_=CredentialResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def login(
+        self, *, request: LoginRequestBody, request_options: typing.Optional[RequestOptions] = None
+    ) -> WorkflowRunResponse:
+        """
+        Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password
+
+        Parameters
+        ----------
+        request : LoginRequestBody
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern, LoginRequestBody_Skyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.login(
+                request=LoginRequestBody_Skyvern(
+                    credential_id="credential_id",
+                ),
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/run/tasks/login",
+            method="POST",
+            json=convert_and_respect_annotation_metadata(
+                object_=request, annotation=LoginRequestBody, direction="write"
+            ),
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
