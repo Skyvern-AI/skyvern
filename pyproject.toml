@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "skyvern"
-version = "0.2.5"
+version = "0.2.6"
 description = ""
 authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
