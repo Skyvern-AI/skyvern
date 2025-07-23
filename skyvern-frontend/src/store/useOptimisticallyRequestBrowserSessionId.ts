@@ -21,7 +21,7 @@ export interface OptimisticBrowserSession {
   run: (runOpts: RunOpts) => Promise<BrowserSessionData>;
 }
 
-const SESSION_TIMEOUT_MINUTES = 60;
+const SESSION_TIMEOUT_MINUTES = 60 * 4;
 const SPARE = "spare";
 
 const makeKey = (user: User, workflowPermanentId?: string | undefined) => {
