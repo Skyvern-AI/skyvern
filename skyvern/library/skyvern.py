@@ -474,7 +474,7 @@ class Skyvern(AsyncSkyvern):
     ) -> None:
         if not self._api_key:
             raise ValueError(
-                "Local mode is not supported for run_workflow. Please instantiate Skyvern with an API key like this: Skyvern(api_key='your-api-key')"
+                "Local mode is not supported for login. Please instantiate Skyvern with an API key like this: Skyvern(api_key='your-api-key')"
             )
         workflow_run = await super().login(
             credential_type=credential_type,
