@@ -8,8 +8,8 @@ Break down this task into:
 2. A series of blocks to execute for each extracted item
 
 Each block type has required fields that must be included in the parameters:
-- goto_url: requires "url" field
-- navigation: requires "navigation_goal" field
+- goto_url: requires "url" field (use this for direct URL navigation)
+- navigation: requires "navigation_goal" field (use this for complex navigation like "click the login button")
 - extraction: requires "data_extraction_goal" field and "data_schema" field
 - file_download: requires "url" field
 - task_v2: requires "prompt" field
@@ -44,10 +44,10 @@ Response:
   },
   "loop_blocks": [
     {
-      "type": "navigation",
-      "label": "goto_article",
+      "type": "goto_url",
+      "label": "visit_article",
       "parameters": {
-        "navigation_goal": "Navigate to {{ '{{' }} current_value.url {{ '}}' }}"
+        "url": "{{ '{{' }} current_value.url {{ '}}' }}"
       }
     },
     {
@@ -72,7 +72,16 @@ Response:
 
 Other common block types you can use:
 
-1. File Download Block:
+1. Navigation Block (for complex interactions):
+{
+  "type": "navigation",
+  "label": "click_login",
+  "parameters": {
+    "navigation_goal": "Click the login button and wait for the form to appear"
+  }
+}
+
+2. File Download Block:
 {
   "type": "file_download",
   "label": "download_pdf",
@@ -81,7 +90,7 @@ Other common block types you can use:
   }
 }
 
-2. Task V2 Block (for complex actions):
+3. Task V2 Block (for complex actions):
 {
   "type": "task_v2",
   "label": "process_item",
@@ -90,21 +99,12 @@ Other common block types you can use:
   }
 }
 
-3. Wait Block (for timing control):
+4. Wait Block (for timing control):
 {
   "type": "wait",
   "label": "pause_between_actions",
   "parameters": {
     "wait_sec": 2
-  }
-}
-
-4. Goto URL Block (direct navigation):
-{
-  "type": "goto_url",
-  "label": "visit_product",
-  "parameters": {
-    "url": "{{ '{{' }} current_value.product_url {{ '}}' }}"
   }
 }
 

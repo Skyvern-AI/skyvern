@@ -950,8 +950,20 @@ class ForLoopBlock(Block):
         parameter_value = None
         if self.loop_variable_reference:
             LOG.debug("Processing loop variable reference", loop_variable_reference=self.loop_variable_reference)
+            
+            # Check if this looks like a parameter path (contains dots and/or _output)
+            is_likely_parameter_path = (
+                "." in self.loop_variable_reference or 
+                "_output" in self.loop_variable_reference
+            )
+            
+            # Try parsing as Jinja template
             parameter_value = self.try_parse_jinja_template(workflow_run_context)
-            if parameter_value is None:
+            
+            # Only try natural language processing if:
+            # 1. Jinja parsing failed AND
+            # 2. This doesn't look like a parameter path
+            if parameter_value is None and not is_likely_parameter_path:
                 try:
                     # If Jinja parsing failed, treat as natural language and process
                     new_ref, new_blocks = await self.process_natural_language_prompt(
@@ -993,6 +1005,10 @@ class ForLoopBlock(Block):
                 except Exception as e:
                     LOG.error("Error during natural language processing", error=str(e), exc_info=True)
                     raise
+            elif parameter_value is None and is_likely_parameter_path:
+                # If this looks like a parameter path but parsing failed, raise a more specific error
+                LOG.error("Failed to parse parameter path", loop_variable_reference=self.loop_variable_reference)
+                raise ValueError(f"Failed to parse parameter path: {self.loop_variable_reference}")
 
         if parameter_value is None:
             raise ValueError("No parameter value found")
@@ -1007,20 +1023,60 @@ class ForLoopBlock(Block):
         if not self.loop_variable_reference:
             return None
         try:
-            # First try direct access to extracted_information.results
-            value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')}.extracted_information.results | tojson }}}}"
-            value_json = self.format_block_parameter_template_from_workflow_run_context(
-                value_template, workflow_run_context
+            # Log available parameters in context for debugging
+            available_params = {
+                key: value for key, value in workflow_run_context.values.items()
+                if isinstance(key, str) and "_output" in key
+            }
+            LOG.debug(
+                "Available output parameters in context",
+                params=list(available_params.keys()),
+                values=available_params,
+                loop_variable_reference=self.loop_variable_reference
             )
+
+            # Try different access patterns in order:
+            
+            # 1. Try direct access to the parameter (for cases where it's already a list)
             try:
-                return json.loads(value_json)
-            except Exception:
-                # If that fails, try direct access
+                value_template = f"{{{{ {self.loop_variable_reference.split('.')[0]} | tojson }}}}"
+                value_json = self.format_block_parameter_template_from_workflow_run_context(
+                    value_template, workflow_run_context
+                )
+                value = json.loads(value_json)
+                if isinstance(value, list):
+                    LOG.debug("Successfully parsed as direct list", value=value)
+                    return value
+            except Exception as e:
+                LOG.debug("Direct list access failed", error=str(e))
+
+            # 2. Try accessing through extracted_information.results
+            try:
+                value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')}.extracted_information.results | tojson }}}}"
+                value_json = self.format_block_parameter_template_from_workflow_run_context(
+                    value_template, workflow_run_context
+                )
+                value = json.loads(value_json)
+                if isinstance(value, list):
+                    LOG.debug("Successfully parsed through extracted_information.results", value=value)
+                    return value
+            except Exception as e:
+                LOG.debug("Extracted information access failed", error=str(e))
+
+            # 3. Try the exact path as given (fallback)
+            try:
                 value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')} | tojson }}}}"
                 value_json = self.format_block_parameter_template_from_workflow_run_context(
                     value_template, workflow_run_context
                 )
-                return json.loads(value_json)
+                value = json.loads(value_json)
+                if isinstance(value, list):
+                    LOG.debug("Successfully parsed using exact path", value=value)
+                    return value
+            except Exception as e:
+                LOG.debug("Exact path access failed", error=str(e))
+
+            return None
         except Exception as e:
             LOG.debug("Template parsing failed", error=str(e))
             return None
@@ -1043,6 +1099,8 @@ class ForLoopBlock(Block):
             page = await browser_state.get_working_page()
             if page:
                 current_url = await SkyvernFrame.get_url(frame=page)
+
+        LOG.debug("Processing natural language prompt", prompt=self.loop_variable_reference, current_url=current_url)
 
         # Generate prompt for LLM to break down the instruction
         prompt = prompt_engine.load_prompt(
@@ -1130,6 +1188,7 @@ class ForLoopBlock(Block):
         }
 
         # Add subsequent blocks based on LLM response
+        loop_blocks = []
         for block_spec in llm_response["loop_blocks"]:
             block_type = block_spec["type"].lower()
             
@@ -1165,8 +1224,21 @@ class ForLoopBlock(Block):
             # Create the block
             block = block_class(**block_params)
             blocks.append(block)
+            loop_blocks.append(block)
 
-        LOG.debug("Natural language processing complete", num_blocks=len(blocks))
+        # Log the execution plan
+        block_types = [
+            f"extraction ({extraction_block.data_extraction_goal})",
+            *[f"{b.block_type} ({b.label})" for b in loop_blocks]
+        ]
+        LOG.info(
+            "Natural language for-loop execution plan",
+            prompt=self.loop_variable_reference,
+            execution_order=block_types,
+            extraction_schema=schema,
+            num_blocks=len(blocks)
+        )
+
         # Return the loop variable reference and blocks
         return f"{self.label}_extraction_output", blocks
 
