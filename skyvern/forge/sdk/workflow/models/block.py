@@ -1073,9 +1073,6 @@ class ForLoopBlock(Block):
             # Try parsing as Jinja template
             parameter_value = self.try_parse_jinja_template(workflow_run_context)
             
-            # Only try natural language processing if:
-            # 1. Jinja parsing failed AND
-            # 2. This doesn't look like a parameter path
             if parameter_value is None and not is_likely_parameter_path:
                 try:
                     # Create and execute extraction block
@@ -1108,6 +1105,14 @@ class ForLoopBlock(Block):
 
                     # Get the extracted information and create blocks
                     extracted_info = extraction_result.output_parameter_value['extracted_information']
+                    # extracted_info is a list, so we need to access the first element
+                    if isinstance(extracted_info, list) and len(extracted_info) > 0:
+                        extracted_info = extracted_info[0]
+                    
+                    if not isinstance(extracted_info, dict) or 'block_sequence' not in extracted_info:
+                        LOG.error("Invalid extraction result structure", extracted_info=extracted_info)
+                        raise ValueError("Extraction result does not contain expected block_sequence")
+                    
                     block_sequence = extracted_info['block_sequence']
                     self.loop_blocks = []
                     
