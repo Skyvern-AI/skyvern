@@ -1,62 +1,111 @@
-You're an expert browser agent great at breaking down tasks into smaller blocks. The user's goal is:
-```
-{{ natural_language_prompt }}
-```
+You are an expert browser agent great at breaking down tasks into smaller blocks. The user's goal is: {{ natural_language_prompt }}
 
-Break it down into an extraction block followed by subtasks to loop over the extraction results.
+The current URL is: {{ current_url }}
+Local datetime: {{ local_datetime }}
+
+Break down this task into:
+1. An extraction block to get the items to iterate over
+2. A series of blocks to execute for each extracted item
+
+Each block type has required fields that must be included in the parameters:
+- goto_url: requires "url" field
+- navigation: requires "navigation_goal" field
+- extraction: requires "data_extraction_goal" field and "data_schema" field
+- file_download: requires "url" field
+- task_v2: requires "prompt" field
+- wait: requires "wait_sec" field
+- action and login: no required fields
 
 Here's an example:
-User prompt: "Go to each URL of the top 3 articles and download their contents"
+
+User prompt: "Find the URLs of the top 3 articles, visit each one and extract their author"
+
 Response:
 {
-    "extraction_goal": "Extract the URLs and titles of the top 3 articles on the page",
-    "extraction_schema": {
-        "results": [
-            {
-                "url": "string",
-                "title": "string"
+  "extraction_goal": "Extract URLs of the top 3 articles from the current page",
+  "extraction_schema": {
+    "type": "object",
+    "properties": {
+      "results": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "URL of the article"
             }
-        ]
+          },
+          "required": ["url"]
+        }
+      }
     },
-    "loop_blocks": [
-        {
-            "type": "goto_url",
-            "label": "navigate_to_article",
-            "parameters": {
-                "url": "{{ current_value.url }}"
+    "required": ["results"]
+  },
+  "loop_blocks": [
+    {
+      "type": "navigation",
+      "label": "goto_article",
+      "parameters": {
+        "navigation_goal": "Navigate to {{ '{{' }} current_value.url {{ '}}' }}"
+      }
+    },
+    {
+      "type": "extraction",
+      "label": "extract_author",
+      "parameters": {
+        "data_extraction_goal": "Extract the author of the current article",
+        "data_schema": {
+          "type": "object",
+          "properties": {
+            "author": {
+              "type": "string",
+              "description": "Author of the article"
             }
-        },
-        {
-            "type": "file_download",
-            "label": "download_content",
-            "parameters": {
-                "url": "{{ current_value.url }}"
-            }
+          },
+          "required": ["author"]
         }
-    ],
-    "reasoning": "First we need to extract URLs and titles of the top 3 articles. Then for each URL, we'll navigate to it and download its contents."
+      }
+    }
+  ]
 }
 
-Reply in JSON format with the following keys:
+Other common block types you can use:
+
+1. File Download Block:
 {
-    "extraction_goal": str,  // Natural language description of what to extract (e.g. "Extract the top 5 products with their URLs and titles")
-    "extraction_schema": object,  // JSON schema for the extraction output (must include fields you'll reference in loop_blocks)
-    "loop_blocks": [  // Array of blocks to execute for each item
-        {
-            "type": str,  // Block type (e.g., "navigation", "extraction", "file_download", etc.)
-            "label": str,  // Unique label for this block
-            "parameters": object  // Block-specific parameters, can reference current_value.field_name for fields from extraction_schema
-        }
-    ],
-    "reasoning": str  // Step by step explanation of how you broke down the instruction
+  "type": "file_download",
+  "label": "download_pdf",
+  "parameters": {
+    "url": "{{ '{{' }} current_value.pdf_url {{ '}}' }}"
+  }
 }
 
-Current URL: {{ current_url }}
-Current datetime: {{ local_datetime }}
+2. Task V2 Block (for complex actions):
+{
+  "type": "task_v2",
+  "label": "process_item",
+  "parameters": {
+    "prompt": "Click the 'Add to Cart' button for product {{ '{{' }} current_value.name {{ '}}' }}"
+  }
+}
 
-Remember:
-1. The extraction_schema must include all fields you'll need in the loop_blocks
-2. You can reference extracted fields in loop_blocks using {{ current_value.field_name }}
-3. Break down complex tasks into simple, sequential blocks
-4. Use appropriate block types for each action (navigation, extraction, file_download, etc.)
-5. Make sure labels are descriptive and unique within the loop 
+3. Wait Block (for timing control):
+{
+  "type": "wait",
+  "label": "pause_between_actions",
+  "parameters": {
+    "wait_sec": 2
+  }
+}
+
+4. Goto URL Block (direct navigation):
+{
+  "type": "goto_url",
+  "label": "visit_product",
+  "parameters": {
+    "url": "{{ '{{' }} current_value.product_url {{ '}}' }}"
+  }
+}
+
+Now break down the user's task in a similar format, ensuring all required fields are included for each block type. The response should be valid JSON with the same structure as the example above. 

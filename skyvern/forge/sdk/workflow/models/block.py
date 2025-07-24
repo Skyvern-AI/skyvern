@@ -73,6 +73,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ContextParameter,
     OutputParameter,
     WorkflowParameter,
+    ParameterType,
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
@@ -891,6 +892,139 @@ class ForLoopBlock(Block):
                 parameters.add(parameter)
         return list(parameters)
 
+    def get_loop_block_context_parameters(self, workflow_run_id: str, loop_data: Any) -> list[ContextParameter]:
+        """Get context parameters for loop blocks.
+        
+        This method handles both:
+        1. Traditional loop_over parameter-based iteration
+        2. Natural language processing based iteration using current_value
+        
+        Args:
+            workflow_run_id: The workflow run ID
+            loop_data: The current value being iterated over
+            
+        Returns:
+            list[ContextParameter]: List of context parameters with their values
+        """
+        context_parameters = []
+        
+        # Get context parameters from all nested loop blocks
+        for loop_block in self.loop_blocks:
+            # todo: handle the case where the loop_block is a ForLoopBlock
+            all_parameters = loop_block.get_all_parameters(workflow_run_id)
+            for parameter in all_parameters:
+                if isinstance(parameter, ContextParameter):
+                    context_parameters.append(parameter)
+
+        # If we're using loop_over parameter, handle it traditionally
+        if self.loop_over is not None:
+            for context_parameter in context_parameters:
+                if context_parameter.source.key != self.loop_over.key:
+                    continue
+                # If the loop_data is a dict, we need to check if the key exists in the loop_data
+                if isinstance(loop_data, dict):
+                    if context_parameter.key in loop_data:
+                        context_parameter.value = loop_data[context_parameter.key]
+                    else:
+                        raise ContextParameterValueNotFound(
+                            parameter_key=context_parameter.key,
+                            existing_keys=list(loop_data.keys()),
+                            workflow_run_id=workflow_run_id,
+                        )
+                else:
+                    # If the loop_data is a list, we can directly assign the loop_data to the context_parameter value
+                    context_parameter.value = loop_data
+        
+        # For natural language processing, we always need current_value
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        current_value_param = ContextParameter(
+            key="current_value",
+            value=loop_data,
+            source=workflow_run_context.get_parameter(self.output_parameter.key)
+        )
+        context_parameters.append(current_value_param)
+
+        return context_parameters
+
+    async def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None) -> list[Any]:
+        parameter_value = None
+        if self.loop_variable_reference:
+            LOG.debug("Processing loop variable reference", loop_variable_reference=self.loop_variable_reference)
+            parameter_value = self.try_parse_jinja_template(workflow_run_context)
+            if parameter_value is None:
+                try:
+                    # If Jinja parsing failed, treat as natural language and process
+                    new_ref, new_blocks = await self.process_natural_language_prompt(
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                    LOG.debug("Natural language processing complete", new_ref=new_ref, num_blocks=len(new_blocks))
+                    
+                    # Execute the extraction block first
+                    extraction_block = new_blocks[0]  # First block should be the extraction block
+                    extraction_result = await extraction_block.execute(
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id
+                    )
+                    
+                    if not extraction_result.success:
+                        LOG.error("Extraction block failed", failure_reason=extraction_result.failure_reason)
+                        raise ValueError(f"Extraction block failed: {extraction_result.failure_reason}")
+                    
+                    LOG.debug("Extraction block succeeded", output=extraction_result.output_parameter_value)
+                    
+                    # Store the extraction result in the workflow context
+                    await extraction_block.record_output_parameter_value(
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        value=extraction_result.output_parameter_value
+                    )
+                    
+                    # Update the block configuration
+                    self.loop_variable_reference = new_ref
+                    self.loop_blocks = new_blocks[1:]  # Remove the extraction block since we've already executed it
+                    
+                    parameter_value = self.try_parse_jinja_template(workflow_run_context)
+                    if parameter_value is None:
+                        raise ValueError("Failed to get values after extraction")
+                except Exception as e:
+                    LOG.error("Error during natural language processing", error=str(e), exc_info=True)
+                    raise
+
+        if parameter_value is None:
+            raise ValueError("No parameter value found")
+
+        if not isinstance(parameter_value, list):
+            raise ValueError("Parameter value must be a list")
+
+        LOG.debug("Successfully got loop values", num_values=len(parameter_value))
+        return parameter_value
+
+    def try_parse_jinja_template(self, workflow_run_context: WorkflowRunContext) -> Any | None:
+        if not self.loop_variable_reference:
+            return None
+        try:
+            # First try direct access to extracted_information.results
+            value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')}.extracted_information.results | tojson }}}}"
+            value_json = self.format_block_parameter_template_from_workflow_run_context(
+                value_template, workflow_run_context
+            )
+            try:
+                return json.loads(value_json)
+            except Exception:
+                # If that fails, try direct access
+                value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')} | tojson }}}}"
+                value_json = self.format_block_parameter_template_from_workflow_run_context(
+                    value_template, workflow_run_context
+                )
+                return json.loads(value_json)
+        except Exception as e:
+            LOG.debug("Template parsing failed", error=str(e))
+            return None
+
     async def process_natural_language_prompt(
         self,
         workflow_run_context: WorkflowRunContext,
@@ -902,11 +1036,19 @@ class ForLoopBlock(Block):
         Returns:
             tuple[str, list[BlockTypeVar]]: The loop variable reference and list of blocks to execute
         """
+        # Get current URL from browser state
+        current_url = "about:blank"
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+        if browser_state:
+            page = await browser_state.get_working_page()
+            if page:
+                current_url = await SkyvernFrame.get_url(frame=page)
+
         # Generate prompt for LLM to break down the instruction
         prompt = prompt_engine.load_prompt(
             "for-loop-breakdown",
             natural_language_prompt=self.loop_variable_reference,
-            current_url=workflow_run_context.get_current_url(),
+            current_url=current_url,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
 
@@ -915,128 +1057,118 @@ class ForLoopBlock(Block):
             prompt=prompt,
             prompt_name="for-loop-breakdown"
         )
+        LOG.debug("Got LLM response", response=llm_response)
+
+        # Get workflow info for creating output parameters
+        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id, organization_id)
+        if not workflow_run:
+            raise ValueError(f"WorkflowRun not found {workflow_run_id}")
+        
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        if not workflow:
+            raise ValueError(f"Workflow not found {workflow_run.workflow_permanent_id}")
+
+        now = datetime.now()
 
         # Convert LLM response into blocks
         blocks = []
         
         # First block should be extraction to get the items to iterate over
+        # Add schema validation to ensure we get a list of results
+        schema = llm_response["extraction_schema"]
+        if not isinstance(schema, dict):
+            schema = json.loads(schema)
+        
+        # Ensure the schema has the required structure
+        if "type" not in schema or schema["type"] != "object":
+            schema = {
+                "type": "object",
+                "properties": {
+                    "results": schema if isinstance(schema, dict) else {
+                        "type": "array",
+                        "items": schema
+                    }
+                },
+                "required": ["results"]
+            }
+        elif "properties" not in schema or "results" not in schema["properties"]:
+            schema["properties"] = {
+                "results": {
+                    "type": "array",
+                    "items": schema["properties"] if "properties" in schema else {"type": "object"}
+                }
+            }
+            schema["required"] = ["results"]
+
         extraction_block = ExtractionBlock(
             label=f"{self.label}_extraction",
             data_extraction_goal=llm_response["extraction_goal"],
-            data_schema=llm_response["extraction_schema"],
+            data_schema=schema,
             engine=RunEngine.skyvern_v1,
             output_parameter=OutputParameter(
                 output_parameter_id=str(uuid.uuid4()),
-                key=f"{self.label}_extraction_output"
+                key=f"{self.label}_extraction_output",
+                workflow_id=workflow.workflow_id,
+                created_at=now,
+                modified_at=now,
+                parameter_type=ParameterType.OUTPUT,
+                description=f"Output parameter for extraction block {self.label}_extraction"
             )
         )
         blocks.append(extraction_block)
 
+        # Map of block types to their classes and required fields
+        block_type_map = {
+            "goto_url": (UrlBlock, {"url"}),
+            "navigation": (NavigationBlock, {"navigation_goal"}),
+            "extraction": (ExtractionBlock, {"data_extraction_goal"}),
+            "file_download": (FileDownloadBlock, {"url"}),
+            "task_v2": (TaskV2Block, {"prompt"}),
+            "action": (ActionBlock, set()),
+            "login": (LoginBlock, set()),
+            "wait": (WaitBlock, {"wait_sec"}),
+        }
+
         # Add subsequent blocks based on LLM response
         for block_spec in llm_response["loop_blocks"]:
-            block_type = BlockType[block_spec["type"].upper()]
-            block_class = next(cls for cls in Block.get_subclasses() if cls.block_type == block_type)
+            block_type = block_spec["type"].lower()
             
-            block = block_class(
-                label=f"{self.label}_{block_spec['label']}",
-                **block_spec["parameters"],
-                output_parameter=OutputParameter(
+            if block_type not in block_type_map:
+                raise ValueError(f"Unknown block type: {block_type}")
+            
+            block_class, required_fields = block_type_map[block_type]
+            
+            # Prepare parameters with required fields
+            params = block_spec.get("parameters", {})
+            for field in required_fields:
+                if field not in params:
+                    LOG.error("Missing required field", field=field, block_type=block_type, params=params)
+                    raise ValueError(f"Missing required field '{field}' for block type {block_type}")
+            
+            # Create block with base parameters
+            block_params = {
+                "label": f"{self.label}_{block_spec['label']}",
+                "output_parameter": OutputParameter(
                     output_parameter_id=str(uuid.uuid4()),
-                    key=f"{self.label}_{block_spec['label']}_output"
+                    key=f"{self.label}_{block_spec['label']}_output",
+                    workflow_id=workflow.workflow_id,
+                    created_at=now,
+                    modified_at=now,
+                    parameter_type=ParameterType.OUTPUT,
+                    description=f"Output parameter for block {self.label}_{block_spec['label']}"
                 )
-            )
+            }
+            
+            # Add block-specific parameters
+            block_params.update(params)
+            
+            # Create the block
+            block = block_class(**block_params)
             blocks.append(block)
 
+        LOG.debug("Natural language processing complete", num_blocks=len(blocks))
         # Return the loop variable reference and blocks
-        return f"{self.label}_extraction_output.extracted_information.results", blocks
-
-    def try_parse_jinja_template(self, workflow_run_context: WorkflowRunContext) -> Any | None:
-        """Try to parse the loop_variable_reference as a Jinja template.
-        Returns None if parsing fails, otherwise returns the parsed value."""
-        if not self.loop_variable_reference:
-            return None
-            
-        try:
-            value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')} | tojson }}}}"
-            value_json = self.format_block_parameter_template_from_workflow_run_context(
-                value_template, workflow_run_context
-            )
-            return json.loads(value_json)
-        except Exception:
-            return None
-
-    async def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext) -> list[Any]:
-        """Get values to iterate over, either from Jinja template or by processing natural language."""
-        # First try to parse as Jinja template
-        parameter_value = None
-        
-        if self.loop_variable_reference:
-            # Try parsing as Jinja template first
-            parameter_value = self.try_parse_jinja_template(workflow_run_context)
-            
-            if parameter_value is None:
-                # If Jinja parsing failed, treat as natural language and process
-                try:
-                    LOG.info(
-                        "Processing loop_variable_reference as natural language prompt",
-                        loop_variable_reference=self.loop_variable_reference,
-                    )
-                    new_ref, new_blocks = await self.process_natural_language_prompt(
-                        workflow_run_context=workflow_run_context,
-                        workflow_run_id=workflow_run_context.workflow_run_id,
-                        workflow_run_block_id="",  # Will be set in execute()
-                        organization_id=None,  # Will be set in execute()
-                    )
-                    # Update the block configuration
-                    self.loop_variable_reference = new_ref
-                    self.loop_blocks = new_blocks
-                    # Try parsing again with the new reference
-                    parameter_value = self.try_parse_jinja_template(workflow_run_context)
-                    if parameter_value is None:
-                        raise ValueError("Failed to get values after natural language processing")
-                except Exception as e:
-                    LOG.error(
-                        "Failed to process natural language prompt",
-                        error=str(e),
-                        loop_variable_reference=self.loop_variable_reference,
-                        exc_info=True,
-                    )
-                    raise
-
-        elif self.loop_over is not None:
-            if isinstance(self.loop_over, WorkflowParameter):
-                parameter_value = workflow_run_context.get_value(self.loop_over.key)
-            elif isinstance(self.loop_over, OutputParameter):
-                # If the output parameter is for a TaskBlock, it will be a TaskOutput object. We need to extract the
-                # value from the TaskOutput object's extracted_information field.
-                output_parameter_value = workflow_run_context.get_value(self.loop_over.key)
-                if isinstance(output_parameter_value, dict) and "extracted_information" in output_parameter_value:
-                    parameter_value = output_parameter_value["extracted_information"]
-                else:
-                    parameter_value = output_parameter_value
-            elif isinstance(self.loop_over, ContextParameter):
-                parameter_value = self.loop_over.value
-                if not parameter_value:
-                    source_parameter_value = workflow_run_context.get_value(self.loop_over.source.key)
-                    if isinstance(source_parameter_value, dict):
-                        if "extracted_information" in source_parameter_value:
-                            parameter_value = source_parameter_value["extracted_information"].get(self.loop_over.key)
-                        else:
-                            parameter_value = source_parameter_value.get(self.loop_over.key)
-                    else:
-                        raise ValueError("ContextParameter source value should be a dict")
-            else:
-                raise NotImplementedError()
-        else:
-            if self.complete_if_empty:
-                return []
-            else:
-                raise NoIterableValueFound()
-
-        if isinstance(parameter_value, list):
-            return parameter_value
-        else:
-            return [parameter_value]
+        return f"{self.label}_extraction_output", blocks
 
     async def execute_loop_helper(
         self,
@@ -1158,7 +1290,12 @@ class ForLoopBlock(Block):
 
         # Get loop values to iterate over - this now handles both Jinja and natural language
         try:
-            loop_over_values = await self.get_loop_over_parameter_values(workflow_run_context)
+            loop_over_values = await self.get_loop_over_parameter_values(
+                workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id
+            )
         except Exception as e:
             return await self.build_block_result(
                 success=False,
