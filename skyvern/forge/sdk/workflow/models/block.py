@@ -1168,9 +1168,9 @@ class ForLoopBlock(Block):
                 values=available_params,
                 loop_variable_reference=self.loop_variable_reference
             )
-
-            # Try different access patterns in order:
             
+            # Loop variable reference is critical to the extraction block, so we add multiple access patterns
+            # to handle different cases
             # 1. Try direct access to the parameter (for cases where it's already a list)
             try:
                 value_template = f"{{{{ {self.loop_variable_reference.split('.')[0]} | tojson }}}}"
