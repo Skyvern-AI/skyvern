@@ -893,49 +893,16 @@ class ForLoopBlock(Block):
         return list(parameters)
 
     def get_loop_block_context_parameters(self, workflow_run_id: str, loop_data: Any) -> list[ContextParameter]:
-        """Get context parameters for loop blocks.
-        
-        This method handles both:
-        1. Traditional loop_over parameter-based iteration
-        2. Natural language processing based iteration using current_value
-        
-        Args:
-            workflow_run_id: The workflow run ID
-            loop_data: The current value being iterated over
-            
-        Returns:
-            list[ContextParameter]: List of context parameters with their values
-        """
         context_parameters = []
-        
-        # Get context parameters from all nested loop blocks
         for loop_block in self.loop_blocks:
             # todo: handle the case where the loop_block is a ForLoopBlock
+
             all_parameters = loop_block.get_all_parameters(workflow_run_id)
             for parameter in all_parameters:
                 if isinstance(parameter, ContextParameter):
                     context_parameters.append(parameter)
 
-        # If we're using loop_over parameter, handle it traditionally
-        if self.loop_over is not None:
-            for context_parameter in context_parameters:
-                if context_parameter.source.key != self.loop_over.key:
-                    continue
-                # If the loop_data is a dict, we need to check if the key exists in the loop_data
-                if isinstance(loop_data, dict):
-                    if context_parameter.key in loop_data:
-                        context_parameter.value = loop_data[context_parameter.key]
-                    else:
-                        raise ContextParameterValueNotFound(
-                            parameter_key=context_parameter.key,
-                            existing_keys=list(loop_data.keys()),
-                            workflow_run_id=workflow_run_id,
-                        )
-                else:
-                    # If the loop_data is a list, we can directly assign the loop_data to the context_parameter value
-                    context_parameter.value = loop_data
-        
-        # For natural language processing, we always need current_value
+        # Always add current_value to context parameters
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         current_value_param = ContextParameter(
             key="current_value",
@@ -944,7 +911,153 @@ class ForLoopBlock(Block):
         )
         context_parameters.append(current_value_param)
 
+        if self.loop_over is None:
+            return context_parameters
+
+        for context_parameter in context_parameters:
+            if context_parameter.source.key != self.loop_over.key:
+                continue
+            # If the loop_data is a dict, we need to check if the key exists in the loop_data
+            if isinstance(loop_data, dict):
+                if context_parameter.key in loop_data:
+                    context_parameter.value = loop_data[context_parameter.key]
+                else:
+                    raise ContextParameterValueNotFound(
+                        parameter_key=context_parameter.key,
+                        existing_keys=list(loop_data.keys()),
+                        workflow_run_id=workflow_run_id,
+                    )
+            else:
+                # If the loop_data is a list, we can directly assign the loop_data to the context_parameter value
+                context_parameter.value = loop_data
+
         return context_parameters
+
+    def _create_block_from_sequence(
+        self,
+        block_type: str,
+        parameters: dict[str, Any],
+        idx: int,
+    ) -> BlockTypeVar | None:
+        """Create a block instance based on type and parameters.
+        
+        Args:
+            block_type: The type of block to create (goto_url, extraction, etc.)
+            parameters: Block-specific parameters
+            idx: Index in the sequence (used for labeling)
+            
+        Returns:
+            BlockTypeVar | None: The created block or None if type not supported
+        """
+        # Create output parameter for this block
+        output_param = OutputParameter(
+            output_parameter_id=str(uuid.uuid4()),
+            key=f"{self.label}_block_{idx}_output",
+            workflow_id=self.output_parameter.workflow_id,
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+            parameter_type=ParameterType.OUTPUT,
+            description=f"Output parameter for {block_type} block {idx}"
+        )
+        
+        # Create the block with its parameters
+        if block_type == "goto_url":
+            return UrlBlock(
+                label=f"{self.label}_block_{idx}",
+                url=parameters["url"],
+                output_parameter=output_param
+            )
+        elif block_type == "extraction":
+            return ExtractionBlock(
+                label=f"{self.label}_block_{idx}",
+                data_extraction_goal=parameters["data_extraction_goal"],
+                data_schema=parameters.get("data_schema"),
+                engine=RunEngine.skyvern_v1,
+                output_parameter=output_param
+            )
+        elif block_type == 'file_download':
+            return FileDownloadBlock(
+                label=f"{self.label}_block_{idx}",
+                url=parameters["url"],
+                output_parameter=output_param
+            )
+        elif block_type == 'task_v2':
+            return TaskV2Block(
+                label=f"{self.label}_block_{idx}",
+                prompt=parameters["prompt"],
+                output_parameter=output_param
+            )
+        elif block_type == 'action':
+            return ActionBlock(
+                label=f"{self.label}_block_{idx}",
+                action=parameters["action"],
+                output_parameter=output_param
+            )
+        else:
+            LOG.warning(f"Unsupported block type: {block_type}")
+            return None
+
+    def _create_initial_extraction_block(self, natural_language_prompt: str) -> ExtractionBlock:
+        """Create the initial extraction block that determines what to iterate over.
+        
+        Args:
+            natural_language_prompt: The user's natural language description
+            
+        Returns:
+            ExtractionBlock: Configured to extract items and determine block sequence
+        """
+        return ExtractionBlock(
+            label=f"{self.label}_extraction",
+            data_extraction_goal=f"Extract the items to iterate over and determine the sequence of blocks needed. Natural language prompt: {natural_language_prompt}",
+            data_schema={
+                "type": "object",
+                "properties": {
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "data": {
+                                    "type": "object",
+                                    "description": "The data to iterate over (URLs, IDs, etc.)"
+                                }
+                            },
+                            "required": ["data"]
+                        }
+                    },
+                    "block_sequence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "block_type": {
+                                    "type": "string",
+                                    "description": "Type of block to execute (goto_url, extraction, etc.)"
+                                },
+                                "parameters": {
+                                    "type": "object",
+                                    "description": "Parameters for this block (url, data_extraction_goal, etc.)",
+                                    "properties": {
+                                        "url": {
+                                            "type": "string",
+                                            "description": "For URL-based blocks, use {{current_value.data.X}} to reference extracted data"
+                                        },
+                                        "data_extraction_goal": {
+                                            "type": "string",
+                                            "description": "For extraction blocks, what to extract from the page"
+                                        }
+                                    }
+                                }
+                            },
+                            "required": ["block_type", "parameters"]
+                        }
+                    }
+                },
+                "required": ["results", "block_sequence"]
+            },
+            engine=RunEngine.skyvern_v1,
+            output_parameter=self.output_parameter
+        )
 
     async def get_loop_over_parameter_values(self, workflow_run_context: WorkflowRunContext, workflow_run_id: str, workflow_run_block_id: str, organization_id: str | None = None) -> list[Any]:
         parameter_value = None
@@ -965,17 +1078,15 @@ class ForLoopBlock(Block):
             # 2. This doesn't look like a parameter path
             if parameter_value is None and not is_likely_parameter_path:
                 try:
-                    # If Jinja parsing failed, treat as natural language and process
-                    new_ref, new_blocks = await self.process_natural_language_prompt(
-                        workflow_run_context=workflow_run_context,
-                        workflow_run_id=workflow_run_id,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                    )
-                    LOG.debug("Natural language processing complete", new_ref=new_ref, num_blocks=len(new_blocks))
+                    # Create and execute extraction block
+                    extraction_block = self._create_initial_extraction_block(self.loop_variable_reference)
                     
-                    # Execute the extraction block first
-                    extraction_block = new_blocks[0]  # First block should be the extraction block
+                    LOG.info(
+                        "Processing natural language loop input",
+                        prompt=self.loop_variable_reference,
+                        extraction_goal=extraction_block.data_extraction_goal
+                    )
+                    
                     extraction_result = await extraction_block.execute(
                         workflow_run_id=workflow_run_id,
                         workflow_run_block_id=workflow_run_block_id,
@@ -994,16 +1105,34 @@ class ForLoopBlock(Block):
                         workflow_run_id=workflow_run_id,
                         value=extraction_result.output_parameter_value
                     )
+
+                    # Get the extracted information and create blocks
+                    extracted_info = extraction_result.output_parameter_value['extracted_information']
+                    block_sequence = extracted_info['block_sequence']
+                    self.loop_blocks = []
                     
-                    # Update the block configuration
-                    self.loop_variable_reference = new_ref
-                    self.loop_blocks = new_blocks[1:]  # Remove the extraction block since we've already executed it
+                    # Create blocks based on the sequence
+                    for idx, block_info in enumerate(block_sequence):
+                        block_type = block_info["block_type"].lower()
+                        block = self._create_block_from_sequence(block_type, block_info["parameters"], idx)
+                        if block:
+                            self.loop_blocks.append(block)
                     
+                    LOG.info(
+                        "Generated loop blocks from extraction output",
+                        num_blocks=len(self.loop_blocks),
+                        block_types=[b.block_type for b in self.loop_blocks]
+                    )
+                    
+                    # Update the loop variable reference to point to the extraction results
+                    self.loop_variable_reference = f"{self.label}_output.extracted_information.results"
+                    
+                    # Try parsing again with the new reference
                     parameter_value = self.try_parse_jinja_template(workflow_run_context)
                     if parameter_value is None:
                         raise ValueError("Failed to get values after extraction")
                 except Exception as e:
-                    LOG.error("Error during natural language processing", error=str(e), exc_info=True)
+                    LOG.error("Error during extraction", error=str(e), exc_info=True)
                     raise
             elif parameter_value is None and is_likely_parameter_path:
                 # If this looks like a parameter path but parsing failed, raise a more specific error
@@ -1175,27 +1304,15 @@ class ForLoopBlock(Block):
         )
         blocks.append(extraction_block)
 
-        # Map of block types to their classes and required fields
-        block_type_map = {
-            "goto_url": (UrlBlock, {"url"}),
-            "navigation": (NavigationBlock, {"navigation_goal"}),
-            "extraction": (ExtractionBlock, {"data_extraction_goal"}),
-            "file_download": (FileDownloadBlock, {"url"}),
-            "task_v2": (TaskV2Block, {"prompt"}),
-            "action": (ActionBlock, set()),
-            "login": (LoginBlock, set()),
-            "wait": (WaitBlock, {"wait_sec"}),
-        }
-
         # Add subsequent blocks based on LLM response
         loop_blocks = []
         for block_spec in llm_response["loop_blocks"]:
             block_type = block_spec["type"].lower()
             
-            if block_type not in block_type_map:
+            if block_type not in self._block_type_map:
                 raise ValueError(f"Unknown block type: {block_type}")
             
-            block_class, required_fields = block_type_map[block_type]
+            block_class, required_fields = self._block_type_map[block_type]
             
             # Prepare parameters with required fields
             params = block_spec.get("parameters", {})
