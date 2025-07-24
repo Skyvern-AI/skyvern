@@ -10,7 +10,11 @@ if [ ! -f .env ]; then
   echo "Please add your api keys to the .env file."
 fi
 # shellcheck source=/dev/null
-source "$(poetry env info --path)/bin/activate"
-poetry install
+if [ ! -d .venv ]; then
+  uv venv
+fi
+# shellcheck source=/dev/null
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 ./run_alembic_check.sh
-poetry run python -m skyvern.forge
+python -m skyvern.forge
