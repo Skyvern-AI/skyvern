@@ -1,0 +1,62 @@
+You're an expert browser agent great at breaking down tasks into smaller blocks. The user's goal is:
+```
+{{ natural_language_prompt }}
+```
+
+Break it down into an extraction block followed by subtasks to loop over the extraction results.
+
+Here's an example:
+User prompt: "Go to each URL of the top 3 articles and download their contents"
+Response:
+{
+    "extraction_goal": "Extract the URLs and titles of the top 3 articles on the page",
+    "extraction_schema": {
+        "results": [
+            {
+                "url": "string",
+                "title": "string"
+            }
+        ]
+    },
+    "loop_blocks": [
+        {
+            "type": "goto_url",
+            "label": "navigate_to_article",
+            "parameters": {
+                "url": "{{ current_value.url }}"
+            }
+        },
+        {
+            "type": "file_download",
+            "label": "download_content",
+            "parameters": {
+                "url": "{{ current_value.url }}"
+            }
+        }
+    ],
+    "reasoning": "First we need to extract URLs and titles of the top 3 articles. Then for each URL, we'll navigate to it and download its contents."
+}
+
+Reply in JSON format with the following keys:
+{
+    "extraction_goal": str,  // Natural language description of what to extract (e.g. "Extract the top 5 products with their URLs and titles")
+    "extraction_schema": object,  // JSON schema for the extraction output (must include fields you'll reference in loop_blocks)
+    "loop_blocks": [  // Array of blocks to execute for each item
+        {
+            "type": str,  // Block type (e.g., "navigation", "extraction", "file_download", etc.)
+            "label": str,  // Unique label for this block
+            "parameters": object  // Block-specific parameters, can reference current_value.field_name for fields from extraction_schema
+        }
+    ],
+    "reasoning": str  // Step by step explanation of how you broke down the instruction
+}
+
+Current URL: {{ current_url }}
+Current datetime: {{ local_datetime }}
+
+Remember:
+1. The extraction_schema must include all fields you'll need in the loop_blocks
+2. You can reference extracted fields in loop_blocks using {{ current_value.field_name }}
+3. Break down complex tasks into simple, sequential blocks
+4. Use appropriate block types for each action (navigation, extraction, file_download, etc.)
+5. Make sure labels are descriptive and unique within the loop 
