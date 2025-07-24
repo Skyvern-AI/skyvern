@@ -363,9 +363,7 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -452,7 +450,7 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
@@ -663,7 +661,7 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: \u003E-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
               },
               {
                 "sdk": "python",
@@ -721,9 +719,7 @@
             "description": "Successfully deleted workflow",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -951,9 +947,7 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -1172,9 +1166,7 @@
             "description": "Successfully closed browser session",
             "content": {
               "application/json": {
-                "schema": {
-
-                }
+                "schema": {}
               }
             }
           },
@@ -1258,11 +1250,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "422": {
             "description": "Validation Error",
@@ -1466,7 +1458,9 @@
               "type": "integer",
               "minimum": 1,
               "description": "Page number for pagination",
-              "examples": [1],
+              "examples": [
+                1
+              ],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "page"
               },
@@ -1483,7 +1477,9 @@
               "type": "integer",
               "minimum": 1,
               "description": "Number of items per page",
-              "examples": [10],
+              "examples": [
+                10
+              ],
               "openapi_extra": {
                 "x-fern-sdk-parameter-name": "page_size"
               },
@@ -1999,9 +1995,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -3013,7 +3007,10 @@
             ],
             "title": "Timeout",
             "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.",
-            "examples": [60, 120]
+            "examples": [
+              60,
+              120
+            ]
           },
           "browser_address": {
             "anyOf": [
@@ -3332,9 +3329,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -3821,9 +3816,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -4037,9 +4030,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -4202,9 +4193,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -5535,9 +5524,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -6145,9 +6132,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -7512,9 +7497,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -7745,9 +7728,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -7951,9 +7932,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -8000,7 +7979,10 @@
             ],
             "title": "Max Steps",
             "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
-            "examples": [10, 25]
+            "examples": [
+              10,
+              25
+            ]
           },
           "webhook_url": {
             "anyOf": [
@@ -8163,9 +8145,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -8921,9 +8901,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -9226,9 +9204,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -10281,9 +10257,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -10384,9 +10358,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
@@ -10602,9 +10574,7 @@
                 "type": "object"
               },
               {
-                "items": {
-
-                },
+                "items": {},
                 "type": "array"
               },
               {
