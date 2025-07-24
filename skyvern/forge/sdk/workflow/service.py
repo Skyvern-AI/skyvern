@@ -20,7 +20,7 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -2186,15 +2186,35 @@ class WorkflowService:
             task_block = task_id_to_block[action.task_id]
             task_block.actions.append(action)
 
+        # Get artifacts for the workflow run
+        artifacts = await app.DATABASE.get_artifacts_for_run(
+            run_id=workflow_run_id,
+            organization_id=organization_id or "",
+            group_by_type=False,
+        )
+        
+        # Create a mapping of workflow_run_block_id to artifacts
+        block_artifacts: dict[str, list[Artifact]] = {}
+        for artifact in artifacts:
+            if artifact.workflow_run_block_id:
+                if artifact.workflow_run_block_id not in block_artifacts:
+                    block_artifacts[artifact.workflow_run_block_id] = []
+                block_artifacts[artifact.workflow_run_block_id].append(artifact)
+
         result = []
         block_map: dict[str, WorkflowRunTimeline] = {}
         counter = 0
         while workflow_run_blocks:
             counter += 1
             block = workflow_run_blocks.pop(0)
+            
+            # Get artifacts for this block
+            block_artifacts_list = block_artifacts.get(block.workflow_run_block_id, [])
+            
             workflow_run_timeline = WorkflowRunTimeline(
                 type=WorkflowRunTimelineType.block,
                 block=block,
+                artifacts=block_artifacts_list,
                 created_at=block.created_at,
                 modified_at=block.modified_at,
             )
