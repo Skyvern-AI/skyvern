@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 
 MIN_TIMEOUT = 5
-MAX_TIMEOUT = 120
+MAX_TIMEOUT = 60 * 4  # 4 hours
 DEFAULT_TIMEOUT = 60
 
 
