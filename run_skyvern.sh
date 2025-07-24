@@ -9,8 +9,13 @@ if [ ! -f .env ]; then
   cp .env.example .env
   echo "Please add your api keys to the .env file."
 fi
+# Create virtual environment if it doesn't exist
+if [ ! -d ".venv" ]; then
+  uv venv
+fi
+
 # shellcheck source=/dev/null
-source "$(poetry env info --path)/bin/activate"
-poetry install
+source .venv/bin/activate
+uv pip install -e .[dev]
 ./run_alembic_check.sh
-poetry run python -m skyvern.forge
+python -m skyvern.forge

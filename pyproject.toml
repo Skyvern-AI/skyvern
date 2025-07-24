@@ -1,115 +1,118 @@
-[tool.poetry]
+[project]
 name = "skyvern"
 version = "0.2.6"
 description = ""
-authors = ["Skyvern AI <info@skyvern.com>"]
+authors = [{name = "Skyvern AI", email = "info@skyvern.com"}]
 readme = "README.md"
-packages = [{ include = "skyvern" }, { include = "alembic" }]
+requires-python = ">=3.11,<3.14"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.11,<3.14"
-python-dotenv = "^1.0.0"
-openai = ">=1.68.2"
-sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
-aiohttp = "^3.8.5"
-python-multipart = "^0.0.18"
-toml = "^0.10.2"
-jinja2 = "^3.1.2"
-uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = ">=1.73.6"
-playwright = [
-    {version = ">1.46.0", python = ">=3.12,<3.14"},
-    {version = "=1.46.0", python = ">=3.11,<3.12"}
+dependencies = [
+    "python-dotenv>=1.0.0",
+    "openai>=1.68.2",
+    "sqlalchemy[mypy]>=2.0.29",
+    "aiohttp>=3.8.5",
+    "python-multipart>=0.0.18",
+    "toml>=0.10.2",
+    "jinja2>=3.1.2",
+    "uvicorn[standard]>=0.24.0.post1",
+    "litellm>=1.73.6",
+    "playwright>1.46.0; python_version>='3.12'",
+    "playwright==1.46.0; python_version<'3.12'",
+    "greenlet>3.0.3; python_version>='3.12'",
+    "greenlet==3.0.3; python_version<'3.12'",
+    "pillow>=10.1.0",
+    "starlette-context>=0.3.6",
+    "ddtrace>=2.3.2",
+    "pydantic>=2.5.2",
+    "pydantic-settings>=2.1.0",
+    "fastapi>=0.115.4",
+    "psycopg[binary,pool]==3.1.18; python_version<'3.13'",
+    "psycopg[binary,pool]>=3.2.2,<3.3.0; python_version>='3.13'",
+    "alembic>=1.12.1",
+    "python-jose[cryptography]>=3.4.0",
+    "cachetools>=5.3.2",
+    "aioboto3>=14.3.0",
+    "asyncache>=0.3.1",
+    "orjson>=3.9.10",
+    "structlog>=23.2.0",
+    "typer>=0.16.0",
+    "types-toml>=0.10.8.7",
+    "httpx[socks]>=0.27.0",
+    "filetype>=1.2.0",
+    "redis>=5.0.3",
+    "onnxruntime>=1.20.0,<1.23.0; python_version>='3.12'",
+    "onnxruntime<1.17; python_version<'3.12'",
+    "aioredlock>=0.7.3",
+    "stripe>=9.7.0",
+    "tldextract>=5.1.2",
+    "websockets>=12.0",
+    "email-validator>=2.2.0",
+    "temporalio>=1.6.0",
+    "requests-toolbelt>=1.0.0",
+    "rich[jupyter]>=13.7.0",
+    "posthog>=3.7.0",
+    "aiofiles>=24.1.0",
+    "pyotp>=2.9.0",
+    "asyncpg>=0.30.0",
+    "json-repair>=0.34.0",
+    "pypdf>=5.1.0",
+    "fastmcp>=2.10.1",
+    "psutil>=7.0.0",
+    "tiktoken>=0.9.0",
+    "anthropic>=0.50.0",
+    "google-cloud-aiplatform>=1.90.0",
+    "alive-progress>=3.2.0",
+    "colorama>=0.4.6",
+    "onepassword-sdk==0.3.0",
+    "types-boto3[full]>=1.38.31",
+    "lark>=1.2.2",
+    "libcst>=1.8.2",
+    "curlparser>=0.1.0",
+    "lmnr[all]>=0.6.21",
 ]
-greenlet = [
-    {version = ">3.0.3", python = ">=3.12,<3.14"},
-    {version = "=3.0.3", python = ">=3.11,<3.12"}
-]
-pillow = "^10.1.0"
-starlette-context = "^0.3.6"
-ddtrace = "^2.3.2"
-pydantic = "^2.5.2"
-pydantic-settings = "^2.1.0"
-fastapi = "^0.115.4"
-psycopg = [
-    {version = "3.1.18", extras = ["binary", "pool"], python = ">=3.11, <3.13"},
-    {version = ">=3.2.2,<3.3.0", extras = ["binary", "pool"], python = ">=3.13, <3.14"}
-]
-alembic = "^1.12.1"
-python-jose = {extras = ["cryptography"], version = "^3.4.0"}
-cachetools = "^5.3.2"
-aioboto3 = "^14.3.0"
-asyncache = "^0.3.1"
-orjson = "^3.9.10"
-structlog = "^23.2.0"
-typer = ">=0.16.0"
-types-toml = "^0.10.8.7"
-httpx = {version = ">=0.27.0", extras = ["socks"]}
-filetype = "^1.2.0"
-redis = "^5.0.3"
-onnxruntime = [
-    { version = ">=1.20.0,<1.23.0", python = ">=3.12, <3.14"},
-    { version = "<1.17", python = ">=3.11, <3.12"}
-]
-aioredlock = "^0.7.3"
-stripe = "^9.7.0"
-tldextract = "^5.1.2"
-websockets = "^12.0"
-email-validator = "^2.2.0"
-temporalio = "^1.6.0"
-requests-toolbelt = "^1.0.0"
-rich = {extras = ["jupyter"], version = "^13.7.0"}
-posthog = "^3.7.0"
-aiofiles = "^24.1.0"
-pyotp = "^2.9.0"
-asyncpg = "^0.30.0"
-json-repair = "^0.34.0"
-pypdf = "^5.1.0"
-fastmcp = "^2.10.1"
-psutil = ">=7.0.0"
-tiktoken = ">=0.9.0"
-anthropic = "^0.50.0"
-google-cloud-aiplatform = "^1.90.0"
-alive-progress = "^3.2.0"
-colorama = "^0.4.6"
-onepassword-sdk = "0.3.0"
-types-boto3 = {extras = ["full"], version = "^1.38.31"}
-lark = "^1.2.2"
-libcst = "^1.8.2"
-curlparser = "^0.1.0"
-lmnr = {extras = ["all"], version = "^0.6.21"}
 
-[tool.poetry.group.dev.dependencies]
-isort = "^5.13.2"
-mypy = "^1.4.1"
-flake8 = "^6.0.0"
-types-requests = "^2.31.0.2"
-pytest = "^7.4.0"
-pytest-asyncio = "^0.21.1"
-watchdog = "^3.0.0"
-mock = "^5.1.0"
-autoflake = "^2.2.0"
-pydevd-pycharm = "^233.6745.319"
-ipython = "^8.17.2"
-typer = "^0.16.0"
-ipykernel = "^6.26.0"
-notebook = "^7.0.6"
-freezegun = "^1.2.2"
-snoop = "^0.4.3"
-rich = {extras = ["jupyter"], version = "^13.7.0"}
-fpdf = "^1.7.2"
-pypdf = "^5.0.1"
-twine = "^6.1.0"
-build = "^1.2.2.post1"
-pandas = "^2.2.3"
-pre-commit = "^4.2.0"
-ruff = "^0.11.12"
-aiosqlite = "^0.21.0"
-moto = {extras = ["s3", "server"], version = "^5.1.5"}
+[project.optional-dependencies]
+dev = [
+    "isort>=5.13.2",
+    "mypy>=1.4.1",
+    "flake8>=6.0.0",
+    "types-requests>=2.31.0.2",
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.1",
+    "watchdog>=3.0.0",
+    "mock>=5.1.0",
+    "autoflake>=2.2.0",
+    "pydevd-pycharm>=233.6745.319",
+    "ipython>=8.17.2",
+    "typer>=0.16.0",
+    "ipykernel>=6.26.0",
+    "notebook>=7.0.6",
+    "freezegun>=1.2.2",
+    "snoop>=0.4.3",
+    "rich[jupyter]>=13.7.0",
+    "fpdf>=1.7.2",
+    "pypdf>=5.0.1",
+    "twine>=6.1.0",
+    "build>=1.2.2.post1",
+    "pandas>=2.2.3",
+    "pre-commit>=4.2.0",
+    "ruff>=0.11.12",
+    "aiosqlite>=0.21.0",
+    "moto[s3,server]>=5.1.5",
+]
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.ruff]
 exclude = [
@@ -162,8 +165,11 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 [tool.mypy]
 plugins = "sqlalchemy.ext.mypy.plugin"
 
-[tool.poetry.scripts]
+[project.scripts]
 skyvern = "skyvern.cli.commands:cli_app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["skyvern", "alembic"]
 
 [tool.codeflash]                                                                                                                                                                                                                                                                                                             
 # All paths are relative to this pyproject.toml's directory.                                                                                                                                                                                                                                                                 
