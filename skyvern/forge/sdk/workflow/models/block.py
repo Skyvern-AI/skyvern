@@ -1089,15 +1089,44 @@ class ForLoopBlock(Block):
                     )
 
                     # Get the extracted information and create blocks
-                    extracted_info = extraction_result.output_parameter_value["extracted_information"]
-                    # extracted_info is a list, so we need to access the first element
-                    if isinstance(extracted_info, list) and len(extracted_info) > 0:
-                        extracted_info = extracted_info[0]
+                    if not isinstance(extraction_result.output_parameter_value, dict):
+                        LOG.error(
+                            "Extraction result output_parameter_value is not a dict",
+                            output_parameter_value=extraction_result.output_parameter_value,
+                        )
+                        raise ValueError("Extraction result output_parameter_value is not a dictionary")
 
-                    if not isinstance(extracted_info, dict) or "block_sequence" not in extracted_info:
-                        LOG.error("Invalid extraction result structure", extracted_info=extracted_info)
+                    if "extracted_information" not in extraction_result.output_parameter_value:
+                        LOG.error(
+                            "Extraction result missing extracted_information key",
+                            output_parameter_value=extraction_result.output_parameter_value,
+                        )
+                        raise ValueError("Extraction result missing extracted_information key")
+
+                    extracted_info = extraction_result.output_parameter_value["extracted_information"]
+
+                    # Handle different possible structures of extracted_info
+                    if isinstance(extracted_info, list):
+                        # If it's a list, take the first element
+                        if len(extracted_info) > 0:
+                            extracted_info = extracted_info[0]
+                        else:
+                            LOG.error("Extracted information list is empty")
+                            raise ValueError("Extracted information list is empty")
+
+                    # At this point, extracted_info should be a dict
+                    if not isinstance(extracted_info, dict):
+                        LOG.error("Invalid extraction result structure - not a dict", extracted_info=extracted_info)
+                        raise ValueError("Extraction result is not a dictionary")
+
+                    if "block_sequence" not in extracted_info:
+                        LOG.error(
+                            "Invalid extraction result structure - missing block_sequence",
+                            extracted_info=extracted_info,
+                        )
                         raise ValueError("Extraction result does not contain expected block_sequence")
 
+                    # At this point, extracted_info is guaranteed to be a dict with block_sequence
                     block_sequence = extracted_info["block_sequence"]
                     self.loop_blocks = []
 
