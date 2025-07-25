@@ -1022,7 +1022,7 @@ class ForLoopBlock(Block):
                                     "properties": {
                                         "url": {
                                             "type": "string",
-                                            "description": "For URL-based blocks, use {{current_value.data.X}} to reference extracted data",
+                                            "description": "For URL-based blocks, use current_value.data.X (wrapped by 2 curly brackets) to reference extracted data ",
                                         },
                                         "data_extraction_goal": {
                                             "type": "string",
