@@ -299,52 +299,8 @@ class Settings(BaseSettings):
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
         """
-
-        if self.is_cloud_environment():
-            return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash-preview-05-20": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
-                    "label": "Gemini 2.5 Flash",
-                },
-                "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
-                "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
-                "us.anthropic.claude-opus-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Opus",
-                },
-                "us.anthropic.claude-sonnet-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Sonnet",
-                },
-                # "claude-sonnet-4-20250514": {
-                #     "llm_key": "ANTHROPIC_CLAUDE4_SONNET",
-                #     "label": "Anthropic Claude 4 Sonnet",
-                # },
-                # "claude-opus-4-20250514": {
-                #     "llm_key": "ANTHROPIC_CLAUDE4_OPUS",
-                #     "label": "Anthropic Claude 4 Opus",
-                # },
-            }
-        else:
-            # TODO: apparently the list for OSS is to be much larger
-            return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash-preview-05-20": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
-                    "label": "Gemini 2.5 Flash",
-                },
-                "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
-                "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
-                "us.anthropic.claude-opus-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Opus",
-                },
-                "us.anthropic.claude-sonnet-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Sonnet",
-                },
-            }
+        # Use instance-level is_cloud_environment. This avoids repeated string comparisons.
+        return _get_model_name_to_llm_key(self.is_cloud_environment)
 
     def is_cloud_environment(self) -> bool:
         """
@@ -365,4 +321,32 @@ class Settings(BaseSettings):
             return self.EXECUTE_ALL_STEPS
 
 
+def _get_model_name_to_llm_key(is_cloud: bool):
+    # Since dicts are mutable, always return a copy to avoid accidental mutation
+    if is_cloud:
+        return _CLOUD_MODEL_MAPPING.copy()
+    else:
+        return _OSS_MODEL_MAPPING.copy()
+
+
 settings = Settings()
+
+_CLOUD_MODEL_MAPPING = {
+    "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
+    "gemini-2.5-flash-preview-05-20": {
+        "llm_key": "VERTEX_GEMINI_2.5_FLASH",
+        "label": "Gemini 2.5 Flash",
+    },
+    "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
+    "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
+    "us.anthropic.claude-opus-4-20250514-v1:0": {
+        "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
+        "label": "Anthropic Claude 4 Opus",
+    },
+    "us.anthropic.claude-sonnet-4-20250514-v1:0": {
+        "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
+        "label": "Anthropic Claude 4 Sonnet",
+    },
+}
+
+_OSS_MODEL_MAPPING = _CLOUD_MODEL_MAPPING
