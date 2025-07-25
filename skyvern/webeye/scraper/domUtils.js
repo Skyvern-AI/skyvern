@@ -2275,13 +2275,13 @@ async function getHoverStylesMap() {
 
           let newLink = null;
           try {
+            const oldLink = sheet.ownerNode;
+            const url = new URL(sheet.href);
             _jsConsoleLog("recreating the link element: ", sheet.href);
-            const oldLink = document.querySelector(
-              `link[href="${sheet.href}"]`,
-            );
             newLink = document.createElement("link");
             newLink.rel = "stylesheet";
-            newLink.href = oldLink.href + "?v=" + Date.now(); // to void cache
+            url.searchParams.set("v", Date.now());
+            newLink.href = url.toString();
             newLink.crossOrigin = "anonymous";
             // until the new link loaded, removing the old one
             document.head.append(newLink);
