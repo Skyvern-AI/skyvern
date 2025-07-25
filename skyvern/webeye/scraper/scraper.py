@@ -648,6 +648,12 @@ async def add_frame_interactable_elements(
         if not await frame_element.is_visible():
             return elements, element_tree
         unique_id = await frame_element.get_attribute("unique_id")
+        if not unique_id:
+            LOG.info(
+                "No unique_id found for frame, skipping",
+                frame_index=frame_index,
+            )
+            return elements, element_tree
     except Exception:
         LOG.warning(
             "Unable to get unique_id from frame_element",
