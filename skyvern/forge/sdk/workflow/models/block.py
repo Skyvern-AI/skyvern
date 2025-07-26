@@ -875,6 +875,7 @@ class ForLoopBlock(Block):
     loop_over: PARAMETER_TYPE | None = None
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
+    _initial_extraction_completed: bool = False
 
     def get_all_parameters(
         self,
@@ -982,18 +983,29 @@ class ForLoopBlock(Block):
             LOG.warning(f"Unsupported block type: {block_type}")
             return None
 
-    def _create_initial_extraction_block(self, natural_language_prompt: str) -> ExtractionBlock:
-        """Create the initial extraction block that determines what to iterate over.
+
+
+    def _create_safe_initial_extraction_block(self, natural_language_prompt: str) -> ExtractionBlock:
+        """Create a safe initial extraction block that avoids template variables in the initial extraction.
 
         Args:
             natural_language_prompt: The user's natural language description
 
         Returns:
-            ExtractionBlock: Configured to extract items and determine block sequence
+            ExtractionBlock: Configured to extract items without template variables
         """
         return ExtractionBlock(
             label=f"{self.label}_extraction",
-            data_extraction_goal=f"Extract the items to iterate over and determine the sequence of blocks needed. Natural language prompt: {natural_language_prompt}",
+            data_extraction_goal=f"""Extract the items to iterate over and determine the sequence of blocks needed for each item.
+
+IMPORTANT: The block_sequence should ONLY contain blocks that need to be executed for EACH individual item in the loop. Do NOT include blocks that are part of the initial extraction (like going to the source page to find items).
+
+Natural language prompt: {natural_language_prompt}
+
+For example, if the prompt is "Extract the URLs of the top 2 articles, go to each URL, summarize whatever the page is about":
+- The initial extraction (going to the source page and extracting URLs) is already done
+- The block_sequence should only contain blocks for each URL: goto_url and extraction blocks
+- Do NOT include blocks to go back to the source page""",
             data_schema={
                 "type": "object",
                 "properties": {
@@ -1022,7 +1034,7 @@ class ForLoopBlock(Block):
                                     "properties": {
                                         "url": {
                                             "type": "string",
-                                            "description": "For URL-based blocks, use current_value.data.X (wrapped by 2 curly brackets) to reference extracted data ",
+                                            "description": "For URL-based blocks, specify the URL pattern. Use 'current_value.data.url' as a placeholder for the actual URL that will be substituted during loop execution.",
                                         },
                                         "data_extraction_goal": {
                                             "type": "string",
@@ -1041,6 +1053,26 @@ class ForLoopBlock(Block):
             output_parameter=self.output_parameter,
         )
 
+    def _convert_placeholder_urls_to_templates(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Convert placeholder URLs to Jinja2 template variables.
+
+        Args:
+            parameters: The block parameters that may contain placeholder URLs
+
+        Returns:
+            dict: Parameters with placeholder URLs converted to template variables
+        """
+        converted_parameters = parameters.copy()
+        
+        if "url" in converted_parameters and isinstance(converted_parameters["url"], str):
+            url = converted_parameters["url"]
+            # Convert placeholder URLs like 'current_value.data.url' to template variables
+            if "current_value.data." in url:
+                # Replace the placeholder with the actual template variable
+                converted_parameters["url"] = "{{" + url + "}}"
+        
+        return converted_parameters
+
     async def get_loop_over_parameter_values(
         self,
         workflow_run_context: WorkflowRunContext,
@@ -1058,10 +1090,10 @@ class ForLoopBlock(Block):
             # Try parsing as Jinja template
             parameter_value = self.try_parse_jinja_template(workflow_run_context)
 
-            if parameter_value is None and not is_likely_parameter_path:
+            if parameter_value is None and not is_likely_parameter_path and not self._initial_extraction_completed:
                 try:
-                    # Create and execute extraction block
-                    extraction_block = self._create_initial_extraction_block(self.loop_variable_reference)
+                    # Create and execute safe extraction block (no template variables)
+                    extraction_block = self._create_safe_initial_extraction_block(self.loop_variable_reference)
 
                     LOG.info(
                         "Processing natural language loop input",
@@ -1130,10 +1162,12 @@ class ForLoopBlock(Block):
                     block_sequence = extracted_info["block_sequence"]
                     self.loop_blocks = []
 
-                    # Create blocks based on the sequence
+                    # Convert placeholder URLs to template variables and create blocks
                     for idx, block_info in enumerate(block_sequence):
                         block_type = block_info["block_type"].lower()
-                        block = self._create_block_from_sequence(block_type, block_info["parameters"], idx)
+                        # Convert placeholder URLs to template variables
+                        converted_parameters = self._convert_placeholder_urls_to_templates(block_info["parameters"])
+                        block = self._create_block_from_sequence(block_type, converted_parameters, idx)
                         if block:
                             self.loop_blocks.append(block)
 
@@ -1142,6 +1176,9 @@ class ForLoopBlock(Block):
                         num_blocks=len(self.loop_blocks),
                         block_types=[b.block_type for b in self.loop_blocks],
                     )
+                    
+                    # Mark initial extraction as completed to prevent re-running
+                    self._initial_extraction_completed = True
 
                     # Update the loop variable reference to point to the extraction results
                     self.loop_variable_reference = f"{self.label}_output.extracted_information.results"
