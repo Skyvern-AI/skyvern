@@ -1,7 +1,7 @@
 import asyncio
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import structlog
@@ -2187,12 +2187,15 @@ class WorkflowService:
             task_block.actions.append(action)
 
         # Get artifacts for the workflow run
-        artifacts = await app.DATABASE.get_artifacts_for_run(
-            run_id=workflow_run_id,
-            organization_id=organization_id or "",
-            group_by_type=False,
+        artifacts = cast(
+            list[Artifact],
+            await app.DATABASE.get_artifacts_for_run(
+                run_id=workflow_run_id,
+                organization_id=organization_id or "",
+                group_by_type=False,
+            ),
         )
-        
+
         # Create a mapping of workflow_run_block_id to artifacts
         block_artifacts: dict[str, list[Artifact]] = {}
         for artifact in artifacts:
@@ -2207,10 +2210,10 @@ class WorkflowService:
         while workflow_run_blocks:
             counter += 1
             block = workflow_run_blocks.pop(0)
-            
+
             # Get artifacts for this block
             block_artifacts_list = block_artifacts.get(block.workflow_run_block_id, [])
-            
+
             workflow_run_timeline = WorkflowRunTimeline(
                 type=WorkflowRunTimelineType.block,
                 block=block,
