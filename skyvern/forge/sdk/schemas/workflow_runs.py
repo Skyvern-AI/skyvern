@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.schemas.task_v2 import Thought
 from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.schemas.runs import RunEngine
@@ -62,6 +63,7 @@ class WorkflowRunTimeline(BaseModel):
     type: WorkflowRunTimelineType
     block: WorkflowRunBlock | None = None
     thought: Thought | None = None
+    artifacts: list[Artifact] = []
     children: list[WorkflowRunTimeline] = []
     created_at: datetime
     modified_at: datetime
