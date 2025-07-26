@@ -983,8 +983,6 @@ class ForLoopBlock(Block):
             LOG.warning(f"Unsupported block type: {block_type}")
             return None
 
-
-
     def _create_safe_initial_extraction_block(self, natural_language_prompt: str) -> ExtractionBlock:
         """Create a safe initial extraction block that avoids template variables in the initial extraction.
 
@@ -1063,14 +1061,14 @@ For example, if the prompt is "Extract the URLs of the top 2 articles, go to eac
             dict: Parameters with placeholder URLs converted to template variables
         """
         converted_parameters = parameters.copy()
-        
+
         if "url" in converted_parameters and isinstance(converted_parameters["url"], str):
             url = converted_parameters["url"]
             # Convert placeholder URLs like 'current_value.data.url' to template variables
             if "current_value.data." in url:
                 # Replace the placeholder with the actual template variable
                 converted_parameters["url"] = "{{" + url + "}}"
-        
+
         return converted_parameters
 
     async def get_loop_over_parameter_values(
@@ -1176,7 +1174,7 @@ For example, if the prompt is "Extract the URLs of the top 2 articles, go to eac
                         num_blocks=len(self.loop_blocks),
                         block_types=[b.block_type for b in self.loop_blocks],
                     )
-                    
+
                     # Mark initial extraction as completed to prevent re-running
                     self._initial_extraction_completed = True
 
