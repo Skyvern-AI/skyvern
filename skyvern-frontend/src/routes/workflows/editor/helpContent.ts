@@ -72,7 +72,7 @@ export const helpTooltips = {
   loop: {
     ...baseHelpTooltipContent,
     loopValue:
-      "Define this parameterized field with a parameter key to let Skyvern know the core value you're iterating over.",
+      "Define what to iterate over using either a parameter key (e.g., my_extraction_output.extracted_information.results) or a clear, specific natural language prompt (e.g., 'Extract URLs of top 3 articles and visit each one').",
   },
   sendEmail: {
     ...baseHelpTooltipContent,

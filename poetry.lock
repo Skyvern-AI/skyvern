@@ -3881,14 +3881,14 @@ utils = ["numpydoc"]
 
 [[package]]
 name = "lmnr"
-version = "0.6.21"
+version = "0.7.0"
 description = "Python SDK for Laminar"
 optional = false
 python-versions = "<4,>=3.10"
 groups = ["main"]
 files = [
-    {file = "lmnr-0.6.21-py3-none-any.whl", hash = "sha256:45c87f5aa0f0418f3a09b9698f05988fd288a75cf6a063f4e367be465cc9928a"},
-    {file = "lmnr-0.6.21.tar.gz", hash = "sha256:b3de525fe28f7913a54897cf176756e5273c8ef9984c85a68d88aeb29a4d19ac"},
+    {file = "lmnr-0.7.0-py3-none-any.whl", hash = "sha256:a35beee5d1c597f79994fd841f58b9471231712bb438e10220add9c3ce5039f3"},
+    {file = "lmnr-0.7.0.tar.gz", hash = "sha256:2626ae9a92618e2a90c7fb94587852f9286f00a180dc503dadc5da85c71ee7e6"},
 ]
 
 [package.dependencies]
@@ -3897,6 +3897,7 @@ httpx = ">=0.25.0"
 opentelemetry-api = ">=1.33.0"
 opentelemetry-exporter-otlp-proto-grpc = ">=1.33.0"
 opentelemetry-exporter-otlp-proto-http = ">=1.33.0"
+opentelemetry-instrumentation = ">=0.54b0"
 opentelemetry-instrumentation-alephalpha = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
 opentelemetry-instrumentation-bedrock = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
 opentelemetry-instrumentation-chromadb = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
@@ -3916,7 +3917,6 @@ opentelemetry-instrumentation-pinecone = {version = ">=0.40.12", optional = true
 opentelemetry-instrumentation-qdrant = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
 opentelemetry-instrumentation-replicate = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
 opentelemetry-instrumentation-sagemaker = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
-opentelemetry-instrumentation-threading = ">=0.54b0"
 opentelemetry-instrumentation-together = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
 opentelemetry-instrumentation-transformers = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
 opentelemetry-instrumentation-vertexai = {version = ">=0.40.12", optional = true, markers = "extra == \"all\""}
@@ -3926,6 +3926,7 @@ opentelemetry-sdk = ">=1.33.0"
 opentelemetry-semantic-conventions = ">=0.54b0"
 opentelemetry-semantic-conventions-ai = ">=0.4.9"
 orjson = ">=3.10.18"
+packaging = ">=22.0"
 pydantic = ">=2.0.3,<3.0.0"
 python-dotenv = ">=1.0"
 tenacity = ">=8.0"
@@ -5374,23 +5375,6 @@ opentelemetry-api = ">=1.26.0,<2.0.0"
 opentelemetry-instrumentation = ">=0.50b0"
 opentelemetry-semantic-conventions = ">=0.50b0"
 opentelemetry-semantic-conventions-ai = "0.4.9"
-
-[[package]]
-name = "opentelemetry-instrumentation-threading"
-version = "0.55b1"
-description = "Thread context propagation support for OpenTelemetry"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "opentelemetry_instrumentation_threading-0.55b1-py3-none-any.whl", hash = "sha256:f865542b32b219c8fd01deb03b8c3c9ba2eb3f0501ae303338403fd2242962c7"},
-    {file = "opentelemetry_instrumentation_threading-0.55b1.tar.gz", hash = "sha256:4ed68502e7ed017bfc10b1f9e508cc5ccaea0e46ac1010f7f2541ab9c6eacd92"},
-]
-
-[package.dependencies]
-opentelemetry-api = ">=1.12,<2.0"
-opentelemetry-instrumentation = "0.55b1"
-wrapt = ">=1.0.0,<2.0.0"
 
 [[package]]
 name = "opentelemetry-instrumentation-together"
@@ -9779,4 +9763,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.14"
-content-hash = "10919aa660541acddc2084a821a226ffaa9b1646e36b5991c17c8f036c823855"
+content-hash = "667e626dd8d08bae4f9b852616a9c2c5df9bdd4a3a37f7ef87030d7bfdf51f3b"
