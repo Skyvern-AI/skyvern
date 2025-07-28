@@ -1726,6 +1726,11 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )
+            await app.DATABASE.update_task_v2(
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                webhook_failure_reason="",
+            )
         else:
             LOG.info(
                 "Task v2 webhook failed",
@@ -1733,6 +1738,11 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
                 resp=resp,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
+            )
+            await app.DATABASE.update_task_v2(
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
             )
     except Exception as e:
         raise FailedToSendWebhook(task_v2_id=task_v2.observer_cruise_id) from e
