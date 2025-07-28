@@ -52,9 +52,20 @@ function WorkflowRunOutput() {
   const outputs = workflowRun?.outputs;
   const fileUrls = workflowRun?.downloaded_file_urls ?? [];
   const observerOutput = workflowRun?.task_v2?.output;
+  const webhookFailureReasonData = workflowRun?.task_v2?.webhook_failure_reason ?? workflowRun?.webhook_failure_reason;
 
   return (
     <div className="space-y-5">
+      {webhookFailureReasonData ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Webhook Failure Reason</h1>
+            <div className="space-y-2 text-yellow-600">
+              {webhookFailureReasonData}
+            </div>
+          </div>
+        </div>
+      ) : null}
       {activeBlock ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
@@ -115,20 +126,6 @@ function WorkflowRunOutput() {
             <CodeEditor
               language="json"
               value={JSON.stringify(observerOutput, null, 2)}
-              readOnly
-              minHeight="96px"
-              maxHeight="200px"
-            />
-          </div>
-        </div>
-      ) : null}
-      {workflowRun?.webhook_failure_reason ? (
-        <div className="rounded bg-slate-elevation2 p-6">
-          <div className="space-y-4">
-            <h1 className="text-lg font-bold">Webhook Failure Reason</h1>
-            <CodeEditor
-              language="json"
-              value={JSON.stringify(workflowRun.webhook_failure_reason, null, 2)}
               readOnly
               minHeight="96px"
               maxHeight="200px"

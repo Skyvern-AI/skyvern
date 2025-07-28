@@ -138,11 +138,11 @@ function WorkflowRun() {
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
-  const webhookFailureReasonStr = isTaskv2Run ? workflowRun?.task_v2?.webhook_failure_reason : workflowRun?.webhook_failure_reason 
-  const webhookFailureReason = webhookFailureReasonStr ? (
+  const webhookFailureReasonData = workflowRun?.task_v2?.webhook_failure_reason ?? workflowRun?.webhook_failure_reason;
+  const webhookFailureReason = webhookFailureReasonData ? (
     <div className="space-y-4">
       <Label>Webhook Failure Reason</Label>
-      <div className="rounded-md border border-yellow-600 p-4 text-sm">{webhookFailureReasonStr}</div>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">{webhookFailureReasonData}</div>
     </div>
   ) : null;
 
