@@ -37,6 +37,7 @@ BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
 CREDENTIAL_ONEPASSWORD_PARAMETER_PREFIX = "opp"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
+DEBUG_SESSION_PREFIX = "ds"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -190,6 +191,11 @@ def generate_credential_parameter_id() -> str:
 def generate_credential_id() -> str:
     int_id = generate_id()
     return f"{CREDENTIAL_PREFIX}_{int_id}"
+
+
+def generate_debug_session_id() -> str:
+    int_id = generate_id()
+    return f"{DEBUG_SESSION_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:

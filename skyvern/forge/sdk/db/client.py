@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenSensitiveInformationParameterModel,
     CredentialModel,
     CredentialParameterModel,
+    DebugSessionModel,
     OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
@@ -65,6 +66,7 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -3353,3 +3355,73 @@ class AgentDB:
                 query = query.filter_by(organization_id=organization_id)
             task_run = (await session.scalars(query)).first()
             return Run.model_validate(task_run) if task_run else None
+
+    async def get_debug_session(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        user_id: str,
+        timeout_minutes: int = 10,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            debug_session = (
+                await session.scalars(
+                    select(DebugSessionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(user_id=user_id)
+                )
+            ).first()
+
+            if not debug_session:
+                return None
+
+            browser_session = await self.get_persistent_browser_session(
+                debug_session.browser_session_id, organization_id
+            )
+
+            if browser_session and browser_session.completed_at is None:
+                # TODO: should we check for expiry here - within some threshold?
+                return DebugSession.model_validate(debug_session)
+
+            browser_session = await self.create_persistent_browser_session(
+                organization_id=organization_id,
+                runnable_type="workflow",
+                runnable_id=workflow_permanent_id,
+                timeout_minutes=timeout_minutes,
+            )
+
+            debug_session.browser_session_id = browser_session.persistent_browser_session_id
+
+            await session.commit()
+            await session.refresh(debug_session)
+
+            return DebugSession.model_validate(debug_session)
+
+    async def create_debug_session(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        user_id: str,
+        timeout_minutes: int = 10,
+    ) -> DebugSession:
+        async with self.Session() as session:
+            browser_session = await self.create_persistent_browser_session(
+                organization_id=organization_id,
+                runnable_type="workflow",
+                runnable_id=workflow_permanent_id,
+                timeout_minutes=timeout_minutes,
+            )
+
+            debug_session = DebugSessionModel(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                user_id=user_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+            )
+
+            session.add(debug_session)
+            await session.commit()
+            await session.refresh(debug_session)
+
+            return DebugSession.model_validate(debug_session)
