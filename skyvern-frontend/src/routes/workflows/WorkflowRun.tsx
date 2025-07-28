@@ -129,6 +129,13 @@ function WorkflowRun() {
     </div>
   ) : null;
 
+  const webhookFailureReason = workflowRun?.webhook_failure_reason ? (
+    <div className="space-y-4">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">{workflowRun.webhook_failure_reason}</div>
+    </div>
+  ) : null;
+
   function handleSetActiveItem(id: string) {
     searchParams.set("active", id);
     setSearchParams(searchParams, {
@@ -166,7 +173,8 @@ function WorkflowRun() {
 
   const showOutputSection =
     workflowRunIsFinalized &&
-    (hasSomeExtractedInformation || hasFileUrls || hasTaskv2Output) &&
+    (hasSomeExtractedInformation || hasFileUrls || hasTaskv2Output ||
+      workflowRun?.webhook_failure_reason) &&
     workflowRun.status === Status.Completed;
 
   return (
@@ -308,6 +316,7 @@ function WorkflowRun() {
               </ScrollArea>
             </div>
           )}
+          {webhookFailureReason}
         </div>
       )}
       {workflowFailureReason}

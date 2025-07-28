@@ -122,6 +122,20 @@ function WorkflowRunOutput() {
           </div>
         </div>
       ) : null}
+      {workflowRun?.webhook_failure_reason ? (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-lg font-bold">Webhook Failure Reason</h1>
+            <CodeEditor
+              language="json"
+              value={JSON.stringify(workflowRun.webhook_failure_reason, null, 2)}
+              readOnly
+              minHeight="96px"
+              maxHeight="200px"
+            />
+          </div>
+        </div>
+      ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
