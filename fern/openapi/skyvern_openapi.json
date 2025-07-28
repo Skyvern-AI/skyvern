@@ -3387,7 +3387,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 120,
+                "maximum": 240,
                 "minimum": 5
               },
               {
@@ -3395,7 +3395,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 120. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
             "default": 60
           }
         },
