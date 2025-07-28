@@ -558,6 +558,7 @@ if settings.ENABLE_AZURE_O4_MINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=100000,
+            temperature=None,  # Temperature isn't supported in the O-model series
         ),
     )
 
@@ -582,6 +583,7 @@ if settings.ENABLE_AZURE_O3:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=100000,
+            temperature=None,  # Temperature isn't supported in the O-model series
         ),
     )
 if settings.ENABLE_VOLCENGINE:
