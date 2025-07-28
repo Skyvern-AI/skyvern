@@ -196,6 +196,16 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       />
       <div className="w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 text-center">
         Start
+        <div className="mt-4 flex gap-3 rounded-md bg-slate-800 p-3">
+          <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
+          <div className="space-y-1 text-left text-xs text-slate-400">
+            Use{" "}
+            <code className="text-white">
+              &#123;&#123;&nbsp;current_value&nbsp;&#125;&#125;
+            </code>{" "}
+            to get the current loop value for a given iteration.
+          </div>
+        </div>
       </div>
     </div>
   );
