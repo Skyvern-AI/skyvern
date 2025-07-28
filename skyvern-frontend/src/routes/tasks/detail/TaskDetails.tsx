@@ -170,7 +170,9 @@ function TaskDetails() {
   const webhookFailureReason = task?.webhook_failure_reason ? (
     <div className="space-y-1">
       <Label>Webhook Failure Reason</Label>
-      <div className="rounded-md border border-yellow-600 p-4 text-sm">{task.webhook_failure_reason}</div>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {task.webhook_failure_reason}
+      </div>
     </div>
   ) : null;
 

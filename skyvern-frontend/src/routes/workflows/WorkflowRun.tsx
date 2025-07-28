@@ -138,11 +138,16 @@ function WorkflowRun() {
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
-  const webhookFailureReasonData = workflowRun?.task_v2?.webhook_failure_reason ?? workflowRun?.webhook_failure_reason;
+  const webhookFailureReasonData =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
+
   const webhookFailureReason = webhookFailureReasonData ? (
     <div className="space-y-4">
       <Label>Webhook Failure Reason</Label>
-      <div className="rounded-md border border-yellow-600 p-4 text-sm">{webhookFailureReasonData}</div>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {webhookFailureReasonData}
+      </div>
     </div>
   ) : null;
 
@@ -174,8 +179,10 @@ function WorkflowRun() {
 
   const showOutputSection =
     workflowRunIsFinalized &&
-    (hasSomeExtractedInformation || hasFileUrls || hasTaskv2Output ||
-      workflowRun?.webhook_failure_reason) &&
+    (hasSomeExtractedInformation ||
+      hasFileUrls ||
+      hasTaskv2Output ||
+      webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
   return (

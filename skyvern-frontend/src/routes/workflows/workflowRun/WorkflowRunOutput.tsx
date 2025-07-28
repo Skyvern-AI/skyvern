@@ -52,7 +52,9 @@ function WorkflowRunOutput() {
   const outputs = workflowRun?.outputs;
   const fileUrls = workflowRun?.downloaded_file_urls ?? [];
   const observerOutput = workflowRun?.task_v2?.output;
-  const webhookFailureReasonData = workflowRun?.task_v2?.webhook_failure_reason ?? workflowRun?.webhook_failure_reason;
+  const webhookFailureReasonData =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
 
   return (
     <div className="space-y-5">
