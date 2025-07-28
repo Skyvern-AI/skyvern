@@ -16,7 +16,7 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowStatus
 from skyvern.forge.sdk.workflow.models.yaml import (
     BitwardenLoginCredentialParameterYAML,
     LoginBlockYAML,
@@ -79,6 +79,7 @@ async def login(
         proxy_location=login_request.proxy_location,
         max_screenshot_scrolling_times=login_request.max_screenshot_scrolling_times,
         extra_http_headers=login_request.extra_http_headers,
+        status=WorkflowStatus.auto_generated,
     )
     # 2. add a login block to the workflow
     label = "login"
