@@ -129,13 +129,6 @@ function WorkflowRun() {
     </div>
   ) : null;
 
-  const webhookFailureReason = workflowRun?.webhook_failure_reason ? (
-    <div className="space-y-4">
-      <Label>Webhook Failure Reason</Label>
-      <div className="rounded-md border border-yellow-600 p-4 text-sm">{workflowRun.webhook_failure_reason}</div>
-    </div>
-  ) : null;
-
   function handleSetActiveItem(id: string) {
     searchParams.set("active", id);
     setSearchParams(searchParams, {
@@ -144,6 +137,14 @@ function WorkflowRun() {
   }
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
+
+  const webhookFailureReasonStr = isTaskv2Run ? workflowRun?.task_v2?.webhook_failure_reason : workflowRun?.webhook_failure_reason 
+  const webhookFailureReason = webhookFailureReasonStr ? (
+    <div className="space-y-4">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">{webhookFailureReasonStr}</div>
+    </div>
+  ) : null;
 
   const outputs = workflowRun?.outputs;
   const extractedInformation =
