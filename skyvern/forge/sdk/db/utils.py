@@ -120,6 +120,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         terminate_criterion=task_obj.terminate_criterion,
         include_action_history_in_verification=task_obj.include_action_history_in_verification,
         webhook_callback_url=task_obj.webhook_callback_url,
+        webhook_failure_reason=task_obj.webhook_failure_reason,
         totp_verification_url=task_obj.totp_verification_url,
         totp_identifier=task_obj.totp_identifier,
         navigation_goal=task_obj.navigation_goal,
@@ -276,6 +277,7 @@ def convert_to_workflow_run(
             ProxyLocation(workflow_run_model.proxy_location) if workflow_run_model.proxy_location else None
         ),
         webhook_callback_url=workflow_run_model.webhook_callback_url,
+        webhook_failure_reason=workflow_run_model.webhook_failure_reason,
         totp_verification_url=workflow_run_model.totp_verification_url,
         totp_identifier=workflow_run_model.totp_identifier,
         queued_at=workflow_run_model.queued_at,

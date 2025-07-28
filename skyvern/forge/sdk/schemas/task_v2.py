@@ -42,6 +42,7 @@ class TaskV2(BaseModel):
     totp_identifier: str | None = None
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    webhook_failure_reason: str | None = None
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict | None = None
     model: dict[str, Any] | None = None

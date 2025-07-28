@@ -1226,6 +1226,7 @@ class WorkflowService:
             failure_reason=workflow_run.failure_reason,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
+            webhook_failure_reason=workflow_run.webhook_failure_reason,
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
             extra_http_headers=workflow_run.extra_http_headers,
@@ -1390,6 +1391,10 @@ class WorkflowService:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
+                await app.DATABASE.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_failure_reason="",
+                )
             else:
                 LOG.info(
                     "Webhook failed",
@@ -1399,6 +1404,10 @@ class WorkflowService:
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
+                )
+                await app.DATABASE.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
                 )
         except Exception as e:
             raise FailedToSendWebhook(

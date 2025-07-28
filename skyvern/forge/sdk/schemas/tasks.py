@@ -38,6 +38,10 @@ class TaskBase(BaseModel):
         description="The URL to call when the task is completed.",
         examples=["https://my-webhook.com"],
     )
+    webhook_failure_reason: str | None = Field(
+        default=None,
+        description="The reason for the webhook failure.",
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     navigation_goal: str | None = Field(
@@ -314,6 +318,7 @@ class Task(TaskBase):
             finished_at=self.finished_at,
             extracted_information=self.extracted_information,
             failure_reason=failure_reason or self.failure_reason,
+            webhook_failure_reason=self.webhook_failure_reason,
             action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
@@ -341,6 +346,7 @@ class TaskResponse(BaseModel):
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     failure_reason: str | None = None
+    webhook_failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
     max_steps_per_run: int | None = None
     workflow_run_id: str | None = None
