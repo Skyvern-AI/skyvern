@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenSensitiveInformationParameterModel,
     CredentialModel,
     CredentialParameterModel,
+    DebugSessionModel,
     OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
@@ -65,6 +66,7 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -612,6 +614,7 @@ class AgentDB:
         task_id: str,
         status: TaskStatus | None = None,
         extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
         failure_reason: str | None = None,
         errors: list[dict[str, Any]] | None = None,
         max_steps_per_run: int | None = None,
@@ -623,6 +626,7 @@ class AgentDB:
             and failure_reason is None
             and errors is None
             and max_steps_per_run is None
+            and webhook_failure_reason is None
         ):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
@@ -650,6 +654,8 @@ class AgentDB:
                         task.errors = errors
                     if max_steps_per_run is not None:
                         task.max_steps_per_run = max_steps_per_run
+                    if webhook_failure_reason is not None:
+                        task.webhook_failure_reason = webhook_failure_reason
                     await session.commit()
                     updated_task = await self.get_task(task_id, organization_id=organization_id)
                     if not updated_task:
@@ -1588,21 +1594,29 @@ class AgentDB:
             raise
 
     async def update_workflow_run(
-        self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus | None = None,
+        failure_reason: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
             ).first()
             if workflow_run:
-                workflow_run.status = status
-                workflow_run.failure_reason = failure_reason
-                if status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
+                if status:
+                    workflow_run.status = status
+                if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
                     workflow_run.queued_at = datetime.utcnow()
-                if status == WorkflowRunStatus.running and workflow_run.started_at is None:
+                if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
                     workflow_run.started_at = datetime.utcnow()
-                if status.is_final() and workflow_run.finished_at is None:
+                if status and status.is_final() and workflow_run.finished_at is None:
                     workflow_run.finished_at = datetime.utcnow()
+                if failure_reason:
+                    workflow_run.failure_reason = failure_reason
+                if webhook_failure_reason is not None:
+                    workflow_run.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -2665,6 +2679,7 @@ class AgentDB:
         summary: str | None = None,
         output: dict[str, Any] | None = None,
         organization_id: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             task_v2 = (
@@ -2697,6 +2712,8 @@ class AgentDB:
                     task_v2.summary = summary
                 if output:
                     task_v2.output = output
+                if webhook_failure_reason is not None:
+                    task_v2.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(task_v2)
                 return TaskV2.model_validate(task_v2)
@@ -3353,3 +3370,73 @@ class AgentDB:
                 query = query.filter_by(organization_id=organization_id)
             task_run = (await session.scalars(query)).first()
             return Run.model_validate(task_run) if task_run else None
+
+    async def get_debug_session(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        user_id: str,
+        timeout_minutes: int = 10,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            debug_session = (
+                await session.scalars(
+                    select(DebugSessionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(user_id=user_id)
+                )
+            ).first()
+
+            if not debug_session:
+                return None
+
+            browser_session = await self.get_persistent_browser_session(
+                debug_session.browser_session_id, organization_id
+            )
+
+            if browser_session and browser_session.completed_at is None:
+                # TODO: should we check for expiry here - within some threshold?
+                return DebugSession.model_validate(debug_session)
+
+            browser_session = await self.create_persistent_browser_session(
+                organization_id=organization_id,
+                runnable_type="workflow",
+                runnable_id=workflow_permanent_id,
+                timeout_minutes=timeout_minutes,
+            )
+
+            debug_session.browser_session_id = browser_session.persistent_browser_session_id
+
+            await session.commit()
+            await session.refresh(debug_session)
+
+            return DebugSession.model_validate(debug_session)
+
+    async def create_debug_session(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        user_id: str,
+        timeout_minutes: int = 10,
+    ) -> DebugSession:
+        async with self.Session() as session:
+            browser_session = await self.create_persistent_browser_session(
+                organization_id=organization_id,
+                runnable_type="workflow",
+                runnable_id=workflow_permanent_id,
+                timeout_minutes=timeout_minutes,
+            )
+
+            debug_session = DebugSessionModel(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                user_id=user_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+            )
+
+            session.add(debug_session)
+            await session.commit()
+            await session.refresh(debug_session)
+
+            return DebugSession.model_validate(debug_session)
