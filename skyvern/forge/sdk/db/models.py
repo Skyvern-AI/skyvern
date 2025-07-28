@@ -29,6 +29,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_sensitive_information_parameter_id,
     generate_credential_id,
     generate_credential_parameter_id,
+    generate_debug_session_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -751,3 +752,15 @@ class CredentialModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+
+class DebugSessionModel(Base):
+    __tablename__ = "debug_sessions"
+
+    debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
+    organization_id = Column(String, nullable=False)
+    browser_session_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=True)
+    user_id = Column(String, nullable=True)  # comes from identity vendor (Clerk at time of writing)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
