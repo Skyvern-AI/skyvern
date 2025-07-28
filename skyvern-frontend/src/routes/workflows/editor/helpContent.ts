@@ -72,7 +72,7 @@ export const helpTooltips = {
   loop: {
     ...baseHelpTooltipContent,
     loopValue:
-      "Define this parameterized field with a parameter key to let Skyvern know the core value you're iterating over.",
+      "Define this parameterized field with a parameter key to let Skyvern know the core value you're iterating over. Use {{ current_value }} elsewhere in the loop to get the current value for a given iteration.",
   },
   sendEmail: {
     ...baseHelpTooltipContent,
