@@ -2315,6 +2315,11 @@ class ForgeAgent:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
+                await app.DATABASE.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    webhook_failure_reason="",
+                )
             else:
                 LOG.info(
                     "Webhook failed",
@@ -2322,6 +2327,11 @@ class ForgeAgent:
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
+                )
+                await app.DATABASE.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
                 )
         except Exception as e:
             raise FailedToSendWebhook(task_id=task.task_id) from e
@@ -2542,6 +2552,7 @@ class ForgeAgent:
         status: TaskStatus,
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> Task:
         # refresh task from db to get the latest status
         task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)

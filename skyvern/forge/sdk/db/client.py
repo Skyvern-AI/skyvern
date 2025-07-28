@@ -614,6 +614,7 @@ class AgentDB:
         task_id: str,
         status: TaskStatus | None = None,
         extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
         failure_reason: str | None = None,
         errors: list[dict[str, Any]] | None = None,
         max_steps_per_run: int | None = None,
@@ -625,6 +626,7 @@ class AgentDB:
             and failure_reason is None
             and errors is None
             and max_steps_per_run is None
+            and webhook_failure_reason is None
         ):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
@@ -652,6 +654,8 @@ class AgentDB:
                         task.errors = errors
                     if max_steps_per_run is not None:
                         task.max_steps_per_run = max_steps_per_run
+                    if webhook_failure_reason is not None:
+                        task.webhook_failure_reason = webhook_failure_reason
                     await session.commit()
                     updated_task = await self.get_task(task_id, organization_id=organization_id)
                     if not updated_task:
@@ -1590,21 +1594,29 @@ class AgentDB:
             raise
 
     async def update_workflow_run(
-        self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus | None = None,
+        failure_reason: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
             ).first()
             if workflow_run:
-                workflow_run.status = status
-                workflow_run.failure_reason = failure_reason
-                if status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
+                if status:
+                    workflow_run.status = status
+                if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
                     workflow_run.queued_at = datetime.utcnow()
-                if status == WorkflowRunStatus.running and workflow_run.started_at is None:
+                if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
                     workflow_run.started_at = datetime.utcnow()
-                if status.is_final() and workflow_run.finished_at is None:
+                if status and status.is_final() and workflow_run.finished_at is None:
                     workflow_run.finished_at = datetime.utcnow()
+                if failure_reason:
+                    workflow_run.failure_reason = failure_reason
+                if webhook_failure_reason is not None:
+                    workflow_run.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -2667,6 +2679,7 @@ class AgentDB:
         summary: str | None = None,
         output: dict[str, Any] | None = None,
         organization_id: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             task_v2 = (
@@ -2699,6 +2712,8 @@ class AgentDB:
                     task_v2.summary = summary
                 if output:
                     task_v2.output = output
+                if webhook_failure_reason is not None:
+                    task_v2.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(task_v2)
                 return TaskV2.model_validate(task_v2)

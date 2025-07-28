@@ -116,6 +116,7 @@ class WorkflowRun(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     failure_reason: str | None = None
@@ -151,6 +152,7 @@ class WorkflowRunResponseBase(BaseModel):
     failure_reason: str | None = None
     proxy_location: ProxyLocation | None = None
     webhook_callback_url: str | None = None
+    webhook_failure_reason: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     extra_http_headers: dict[str, str] | None = None
