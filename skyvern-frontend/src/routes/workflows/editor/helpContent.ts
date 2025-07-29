@@ -72,7 +72,7 @@ export const helpTooltips = {
   loop: {
     ...baseHelpTooltipContent,
     loopValue:
-      "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block, so you can skip adding a separate one. Use {{ current_value }} in the loop to get the current iteration value.",
+      "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
   },
   sendEmail: {
     ...baseHelpTooltipContent,
