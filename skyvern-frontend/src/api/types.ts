@@ -266,6 +266,14 @@ export interface EvalTask extends Eval {
 
 export type EvalApiResponse = EvalWorkflow[] | EvalTask[];
 
+export type DebugSessionApiResponse = {
+  debug_session_id: string;
+  browser_session_id: string;
+  workflow_permanent_id: string | null;
+  created_at: string;
+  modified_at: string;
+};
+
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
