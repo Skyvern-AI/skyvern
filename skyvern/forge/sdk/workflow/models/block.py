@@ -6,11 +6,14 @@ import asyncio
 import csv
 import json
 import os
+import random
 import smtplib
+import string
 import textwrap
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from email.message import EmailMessage
 from enum import StrEnum
 from pathlib import Path
@@ -71,10 +74,10 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     ContextParameter,
     OutputParameter,
+    ParameterType,
     WorkflowParameter,
 )
 from skyvern.schemas.runs import RunEngine
-
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -85,9 +88,7 @@ jinja_sandbox_env = SandboxedEnvironment()
 
 def _generate_random_string(length: int = 8) -> str:
     """Generate a random string for unique identifiers."""
-    import random
-    import string
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
 class BlockType(StrEnum):
@@ -900,17 +901,14 @@ class ForLoopBlock(Block):
 
     def get_loop_block_context_parameters(self, workflow_run_id: str, loop_data: Any) -> list[ContextParameter]:
         context_parameters = []
-        
+
         # Add current_value parameter for natural language processing
-        from skyvern.forge.sdk.workflow.models.parameter import ContextParameter
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         current_value_param = ContextParameter(
-            key="current_value", 
-            value=loop_data, 
-            source=workflow_run_context.get_parameter(self.output_parameter.key)
+            key="current_value", value=loop_data, source=workflow_run_context.get_parameter(self.output_parameter.key)
         )
         context_parameters.append(current_value_param)
-        
+
         for loop_block in self.loop_blocks:
             # todo: handle the case where the loop_block is a ForLoopBlock
 
@@ -942,7 +940,7 @@ class ForLoopBlock(Block):
         return context_parameters
 
     async def get_loop_over_parameter_values(
-        self, 
+        self,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         workflow_run_block_id: str,
@@ -1094,6 +1092,8 @@ class ForLoopBlock(Block):
         try:
             # Try the exact reference first
             try:
+                if self.loop_variable_reference is None:
+                    return None
                 value_template = f"{{{{ {self.loop_variable_reference.strip(' {}')} | tojson }}}}"
                 value_json = self.format_block_parameter_template_from_workflow_run_context(
                     value_template, workflow_run_context
@@ -1103,14 +1103,16 @@ class ForLoopBlock(Block):
                     return parameter_value
             except Exception:
                 pass
-            
+
             # If that fails, try common access patterns for extraction results
+            if self.loop_variable_reference is None:
+                return None
             access_patterns = [
                 f"{self.loop_variable_reference}.extracted_information",
                 f"{self.loop_variable_reference}.extracted_information.results",
                 f"{self.loop_variable_reference}.results",
             ]
-            
+
             for pattern in access_patterns:
                 try:
                     value_template = f"{{{{ {pattern.strip(' {}')} | tojson }}}}"
@@ -1122,14 +1124,14 @@ class ForLoopBlock(Block):
                         return parameter_value
                 except Exception:
                     continue
-            
+
             return None
         except Exception:
             return None
 
-    def _create_initial_extraction_block(self, natural_language_prompt: str) -> "ExtractionBlock":
+    def _create_initial_extraction_block(self, natural_language_prompt: str) -> ExtractionBlock:
         """Create an extraction block to process natural language input."""
-        
+
         # Create a schema that only extracts loop values
         data_schema = {
             "type": "object",
@@ -1140,21 +1142,15 @@ class ForLoopBlock(Block):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "URL to navigate to or process"
-                            },
-                            "title": {
-                                "type": "string", 
-                                "description": "Title or name of the item"
-                            }
+                            "url": {"type": "string", "description": "URL to navigate to or process"},
+                            "title": {"type": "string", "description": "Title or name of the item"},
                         },
-                        "required": ["url"]
-                    }
+                        "required": ["url"],
+                    },
                 }
-            }
+            },
         }
-        
+
         # Create extraction goal that includes the natural language prompt
         extraction_goal = f"""
         Analyze the current webpage and extract information based on this request: {natural_language_prompt}
@@ -1168,12 +1164,9 @@ class ForLoopBlock(Block):
         
         Return the results in the specified schema format with loop_values containing an array of objects, where each object has at least a url field and optionally a title field.
         """
-        
+
         # Create a temporary output parameter using the current block's workflow_id
-        from datetime import datetime
-        from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-        import uuid
-        
+
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
             key=f"natural_lang_extraction_{_generate_random_string()}",
@@ -1183,7 +1176,7 @@ class ForLoopBlock(Block):
             parameter_type=ParameterType.OUTPUT,
             description="Natural language extraction result",
         )
-        
+
         return ExtractionBlock(
             label=f"natural_lang_extraction_{_generate_random_string()}",
             data_extraction_goal=extraction_goal,
@@ -1236,11 +1229,11 @@ class ForLoopBlock(Block):
                     if workflow_run_context.has_value(block_output.output_parameter.key)
                     else None
                 )
-                
+
                 # Log the output value for debugging
                 if block_output.output_parameter.key.endswith("_output"):
                     LOG.debug("Block output", block_type=loop_block.block_type, output_value=output_value)
-                    
+
                 # Log URL information for goto_url blocks
                 if loop_block.block_type == BlockType.GOTO_URL:
                     LOG.info("Goto URL block executed", url=loop_block.url, loop_idx=loop_idx)
