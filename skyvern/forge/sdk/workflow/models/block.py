@@ -902,13 +902,6 @@ class ForLoopBlock(Block):
     def get_loop_block_context_parameters(self, workflow_run_id: str, loop_data: Any) -> list[ContextParameter]:
         context_parameters = []
 
-        # Add current_value parameter for natural language processing
-        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        current_value_param = ContextParameter(
-            key="current_value", value=loop_data, source=workflow_run_context.get_parameter(self.output_parameter.key)
-        )
-        context_parameters.append(current_value_param)
-
         for loop_block in self.loop_blocks:
             # todo: handle the case where the loop_block is a ForLoopBlock
 
