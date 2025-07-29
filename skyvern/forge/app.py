@@ -75,6 +75,7 @@ AGENT_FUNCTION = AgentFunction()
 PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=DATABASE)
 scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
+authenticate_user_function: Callable[[str], Awaitable[str | None]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
 
 agent = ForgeAgent()

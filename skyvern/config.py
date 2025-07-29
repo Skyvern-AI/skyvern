@@ -294,6 +294,21 @@ class Settings(BaseSettings):
     TRACE_PROVIDER_HOST: str | None = None
     TRACE_PROVIDER_API_KEY: str = "fillmein"
 
+    # Debug Session Settings
+    DEBUG_SESSION_TIMEOUT_MINUTES: int = 60 * 4
+    """
+    The timeout for a persistent browser session backing a debug session,
+    in minutes.
+    """
+
+    DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES: int = 5
+    """
+    If there are `DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES` or more minutes left
+    in the persistent browser session (`started_at` + `timeout_minutes`), then
+    the `timeout_minutes` of the persistent browser session can be extended.
+    Otherwise we'll consider the persistent browser session to be expired.
+    """
+
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names

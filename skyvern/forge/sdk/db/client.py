@@ -3023,6 +3023,38 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def update_persistent_browser_session(
+        self,
+        browser_session_id: str,
+        timeout_minutes: int,
+        organization_id: str | None = None,
+    ) -> PersistentBrowserSession:
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=browser_session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if not persistent_browser_session:
+                    raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+                persistent_browser_session.timeout_minutes = timeout_minutes
+                await session.commit()
+                await session.refresh(persistent_browser_session)
+                return PersistentBrowserSession.model_validate(persistent_browser_session)
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def set_persistent_browser_session_browser_address(
         self,
         browser_session_id: str,
@@ -3373,10 +3405,10 @@ class AgentDB:
 
     async def get_debug_session(
         self,
+        *,
         organization_id: str,
-        workflow_permanent_id: str,
         user_id: str,
-        timeout_minutes: int = 10,
+        workflow_permanent_id: str,
     ) -> DebugSession | None:
         async with self.Session() as session:
             debug_session = (
@@ -3391,51 +3423,47 @@ class AgentDB:
             if not debug_session:
                 return None
 
-            browser_session = await self.get_persistent_browser_session(
-                debug_session.browser_session_id, organization_id
-            )
+            return DebugSession.model_validate(debug_session)
 
-            if browser_session and browser_session.completed_at is None:
-                # TODO: should we check for expiry here - within some threshold?
-                return DebugSession.model_validate(debug_session)
-
-            browser_session = await self.create_persistent_browser_session(
+    async def create_debug_session(
+        self,
+        *,
+        browser_session_id: str,
+        organization_id: str,
+        user_id: str,
+        workflow_permanent_id: str,
+    ) -> DebugSession:
+        async with self.Session() as session:
+            debug_session = DebugSessionModel(
                 organization_id=organization_id,
-                runnable_type="workflow",
-                runnable_id=workflow_permanent_id,
-                timeout_minutes=timeout_minutes,
+                workflow_permanent_id=workflow_permanent_id,
+                user_id=user_id,
+                browser_session_id=browser_session_id,
             )
 
-            debug_session.browser_session_id = browser_session.persistent_browser_session_id
-
+            session.add(debug_session)
             await session.commit()
             await session.refresh(debug_session)
 
             return DebugSession.model_validate(debug_session)
 
-    async def create_debug_session(
+    async def update_debug_session(
         self,
-        organization_id: str,
-        workflow_permanent_id: str,
-        user_id: str,
-        timeout_minutes: int = 10,
+        *,
+        debug_session_id: str,
+        browser_session_id: str | None = None,
     ) -> DebugSession:
         async with self.Session() as session:
-            browser_session = await self.create_persistent_browser_session(
-                organization_id=organization_id,
-                runnable_type="workflow",
-                runnable_id=workflow_permanent_id,
-                timeout_minutes=timeout_minutes,
-            )
+            debug_session = (
+                await session.scalars(select(DebugSessionModel).filter_by(debug_session_id=debug_session_id))
+            ).first()
 
-            debug_session = DebugSessionModel(
-                organization_id=organization_id,
-                workflow_permanent_id=workflow_permanent_id,
-                user_id=user_id,
-                browser_session_id=browser_session.persistent_browser_session_id,
-            )
+            if not debug_session:
+                raise NotFoundError(f"Debug session {debug_session_id} not found")
 
-            session.add(debug_session)
+            if browser_session_id:
+                debug_session.browser_session_id = browser_session_id
+
             await session.commit()
             await session.refresh(debug_session)
 
