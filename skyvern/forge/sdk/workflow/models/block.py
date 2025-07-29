@@ -951,7 +951,7 @@ class ForLoopBlock(Block):
             LOG.debug("Processing loop variable reference", loop_variable_reference=self.loop_variable_reference)
 
             # Check if this looks like a parameter path (contains dots and/or _output)
-            is_likely_parameter_path = "extracted_information" in self.loop_variable_reference
+            is_likely_parameter_path = "extracted_information." in self.loop_variable_reference
 
             # Try parsing as Jinja template
             parameter_value = self.try_parse_jinja_template(workflow_run_context)
