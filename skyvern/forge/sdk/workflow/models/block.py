@@ -1134,8 +1134,8 @@ class ForLoopBlock(Block):
                     "description": "Array of values to iterate over. Each value should be the primary data needed for the loop blocks.",
                     "items": {
                         "type": "string",
-                        "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)"
-                    }
+                        "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)",
+                    },
                 }
             },
         }
