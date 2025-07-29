@@ -72,7 +72,7 @@ export const helpTooltips = {
   loop: {
     ...baseHelpTooltipContent,
     loopValue:
-      "Define this parameterized field with a parameter key to let Skyvern know the core value you're iterating over. Use {{ current_value }} elsewhere in the loop to get the current value for a given iteration.",
+      "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
   },
   sendEmail: {
     ...baseHelpTooltipContent,
