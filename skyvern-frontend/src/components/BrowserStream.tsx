@@ -75,7 +75,7 @@ function BrowserStream({
   } else {
     throw new Error("No browser session, task or workflow provided");
   }
-  const [userIsControlling, setUserIsControlling] = useState(false);
+  const [userIsControlling, setUserIsControlling] = useState(interactive);
   const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const prevVncConnectedRef = useRef<boolean>(false);
@@ -282,13 +282,13 @@ function BrowserStream({
       commandSocket.send(JSON.stringify(command));
     };
 
-    if (interactive) {
+    if (interactive || userIsControlling) {
       sendCommand({ kind: "take-control" });
     } else {
       sendCommand({ kind: "cede-control" });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [interactive, isCommandConnected]);
+  }, [interactive, isCommandConnected, userIsControlling]);
 
   // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {
