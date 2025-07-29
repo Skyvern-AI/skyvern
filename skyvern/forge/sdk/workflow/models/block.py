@@ -1153,8 +1153,7 @@ class ForLoopBlock(Block):
 
         # Create extraction goal that includes the natural language prompt
         extraction_goal = prompt_engine.load_prompt(
-            "extraction_prompt_for_nat_language_loops", 
-            natural_language_prompt=natural_language_prompt
+            "extraction_prompt_for_nat_language_loops", natural_language_prompt=natural_language_prompt
         )
 
         # Create a temporary output parameter using the current block's workflow_id
