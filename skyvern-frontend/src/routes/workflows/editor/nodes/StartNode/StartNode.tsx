@@ -203,7 +203,12 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
             <code className="text-white">
               &#123;&#123;&nbsp;current_value&nbsp;&#125;&#125;
             </code>{" "}
-            to get the current loop value for a given iteration.
+            to get the current loop value for a given iteration. You may
+            specifically want to reference{" "}
+            <code className="text-white">
+              &#123;&#123;&nbsp;current_value.primary_loop_field&nbsp;&#125;&#125;
+            </code>{" "}
+            in your blocks below.
           </div>
         </div>
       </div>
