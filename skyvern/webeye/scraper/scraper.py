@@ -13,7 +13,7 @@ from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
+from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, ScrapingFailedBlankPage, UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -428,11 +428,6 @@ async def scrape_website(
     :raises Exception: When scraping fails after maximum retries.
     """
 
-    # TODO(jdo) why is this a problem?
-    # ref: https://skyvern.slack.com/archives/C074UNDSRJM/p1752771256298149
-    # if not url.strip():
-    #     raise ScrapingFailedNoUrl()
-
     try:
         num_retry += 1
         return await scrape_web_unsafe(
@@ -445,6 +440,8 @@ async def scrape_website(
             max_screenshot_number=max_screenshot_number,
             scroll=scroll,
         )
+    except ScrapingFailedBlankPage:
+        raise
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > settings.MAX_SCRAPING_RETRIES:
@@ -540,6 +537,9 @@ async def scrape_web_unsafe(
     # We check if the scroll_y_px_old is the same as scroll_y_px to determine if we have reached the end of the page.
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
+    url = page.url
+    if url == "about:blank":
+        raise ScrapingFailedBlankPage()
 
     LOG.info("Waiting for 3 seconds before scraping the website.")
     await asyncio.sleep(3)
@@ -598,7 +598,7 @@ async def scrape_web_unsafe(
         element_tree=element_tree,
         element_tree_trimmed=element_tree_trimmed,
         screenshots=screenshots,
-        url=page.url,
+        url=url,
         html=html,
         extracted_text=text_content,
         window_dimension=window_dimension,

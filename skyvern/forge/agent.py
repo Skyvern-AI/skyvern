@@ -1883,7 +1883,7 @@ class ForgeAgent:
                     step_id=step.step_id,
                     exc_info=True,
                 )
-                raise ScrapingFailed()
+                raise e
 
         if scraped_page is None:
             raise EmptyScrapePage()
