@@ -1152,18 +1152,10 @@ class ForLoopBlock(Block):
         }
 
         # Create extraction goal that includes the natural language prompt
-        extraction_goal = f"""
-        Analyze the current webpage and extract information based on this request: {natural_language_prompt}
-        
-        You need to identify what values should be iterated over (loop_values).
-        
-        For example:
-        - If the request is "go to each product page", extract product URLs and titles as objects with url and title fields
-        - If the request is "process each article", extract article links and titles as objects with url and title fields
-        - If the request is "download each file", extract file download links and names as objects with url and title fields
-        
-        Return the results in the specified schema format with loop_values containing an array of objects, where each object has at least a url field and optionally a title field.
-        """
+        extraction_goal = prompt_engine.load_prompt(
+            "extraction_prompt_for_nat_language_loops", 
+            natural_language_prompt=natural_language_prompt
+        )
 
         # Create a temporary output parameter using the current block's workflow_id
 
