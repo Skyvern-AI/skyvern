@@ -253,8 +253,10 @@ class SkyvernFrame:
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
         start_time = time.time()
         skyvern_frame = await SkyvernFrame.create_instance(frame=page)
-        x, y = await skyvern_frame.get_scroll_x_y()
+        x: int | None = None
+        y: int | None = None
         try:
+            x, y = await skyvern_frame.get_scroll_x_y()
             async with asyncio.timeout(timeout):
                 screenshots, positions = await _scrolling_screenshots_helper(
                     skyvern_page=skyvern_frame, mode=mode, max_number=scrolling_number
@@ -284,8 +286,17 @@ class SkyvernFrame:
                     file_path=file_path,
                 )
                 return img_data
+        except Exception:
+            LOG.warning(
+                "Failed to take full page screenshot, fallback to use playwright full page screenshot",
+                exc_info=True,
+            )
+            return await _current_viewpoint_screenshot_helper(
+                page=page, file_path=file_path, timeout=timeout, full_page=True
+            )
         finally:
-            await skyvern_frame.scroll_to_x_y(x, y)
+            if x is not None and y is not None:
+                await skyvern_frame.scroll_to_x_y(x, y)
 
     @staticmethod
     @TraceManager.traced_async(ignore_inputs=["page"])
