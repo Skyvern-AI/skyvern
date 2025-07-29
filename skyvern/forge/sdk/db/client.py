@@ -2921,7 +2921,11 @@ class AgentDB:
                 for workflow_run_block in workflow_run_blocks
             ]
 
-    async def get_active_persistent_browser_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
+    async def get_active_persistent_browser_sessions(
+        self,
+        organization_id: str,
+        active_hours: int = 24,
+    ) -> list[PersistentBrowserSession]:
         """Get all active persistent browser sessions for an organization."""
         try:
             async with self.Session() as session:
@@ -2929,6 +2933,10 @@ class AgentDB:
                     select(PersistentBrowserSessionModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(deleted_at=None)
+                    .filter_by(completed_at=None)
+                    .filter(
+                        PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=active_hours)
+                    )
                 )
                 sessions = result.scalars().all()
                 return [PersistentBrowserSession.model_validate(session) for session in sessions]
