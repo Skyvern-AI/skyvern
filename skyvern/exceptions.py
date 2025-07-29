@@ -271,7 +271,7 @@ class ScrapingFailed(SkyvernException):
 
 class ScrapingFailedBlankPage(ScrapingFailed):
     def __init__(self) -> None:
-        super().__init__(reason="It's an blank page. Please ensure there is a non-blank page for Skyvern to work with.")
+        super().__init__(reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.")
 
 
 class WorkflowRunContextNotInitialized(SkyvernException):
