@@ -1,5 +1,7 @@
 import { ReactFlowProvider } from "@xyflow/react";
 import { useParams } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 
 import { BrowserStream } from "@/components/BrowserStream";
 import { FloatingWindow } from "@/components/FloatingWindow";
@@ -10,6 +12,7 @@ import { useSidebarStore } from "@/store/SidebarStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
+import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
@@ -17,10 +20,17 @@ import { getInitialParameters } from "./utils";
 
 function WorkflowDebugger() {
   const { workflowPermanentId } = useParams();
+  const queryClient = useQueryClient();
+  const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const { data: workflow } = useWorkflowQuery({
     workflowPermanentId,
+  });
+
+  const { data: debugSession } = useDebugSessionQuery({
+    workflowPermanentId,
+    enabled: shouldFetchDebugSession && !!workflowPermanentId,
   });
 
   const setCollapsed = useSidebarStore((state) => {
@@ -34,7 +44,41 @@ function WorkflowDebugger() {
   useMountEffect(() => {
     setCollapsed(true);
     setHasChanges(false);
+
+    if (workflowPermanentId) {
+      queryClient.removeQueries({
+        queryKey: ["debugSession", workflowPermanentId],
+      });
+      setShouldFetchDebugSession(true);
+    }
   });
+
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    if (
+      (!debugSession || !debugSession.browser_session_id) &&
+      shouldFetchDebugSession &&
+      workflowPermanentId
+    ) {
+      intervalRef.current = setInterval(() => {
+        queryClient.invalidateQueries({
+          queryKey: ["debugSession", workflowPermanentId],
+        });
+      }, 2000);
+    } else {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    }
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, [debugSession, shouldFetchDebugSession, workflowPermanentId, queryClient]);
 
   if (!workflow) {
     return null;
@@ -73,7 +117,7 @@ function WorkflowDebugger() {
         />
       </ReactFlowProvider>
 
-      {workflowRun && (
+      {debugSession && (
         <FloatingWindow
           title={browserTitle}
           bounded={false}
@@ -83,10 +127,10 @@ function WorkflowDebugger() {
           showMinimizeButton={true}
           showReloadButton={true}
         >
-          {workflowRun && workflowRun.browser_session_id ? (
+          {debugSession && debugSession.browser_session_id ? (
             <BrowserStream
               interactive={interactor === "human"}
-              browserSessionId={workflowRun.browser_session_id}
+              browserSessionId={debugSession.browser_session_id}
             />
           ) : (
             <Skeleton className="h-full w-full" />

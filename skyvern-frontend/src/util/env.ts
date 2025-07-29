@@ -23,7 +23,6 @@ const apiPathPrefix = import.meta.env.VITE_API_PATH_PREFIX ?? "";
 
 const lsKeys = {
   browserSessionId: "skyvern.browserSessionId",
-  optimisticBrowserSession: "skyvern.optimisticBrowserSession",
 };
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;

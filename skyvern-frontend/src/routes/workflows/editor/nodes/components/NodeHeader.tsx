@@ -5,12 +5,14 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
-import { ProxyLocation, User } from "@/api/types";
+import { ProxyLocation } from "@/api/types";
 import { Timer } from "@/components/Timer";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   debuggableWorkflowBlockTypes,
@@ -29,11 +31,6 @@ import {
   statusIsFinalized,
   statusIsRunningOrQueued,
 } from "@/routes/tasks/types";
-import {
-  useOptimisticallyRequestBrowserSessionId,
-  type OptimisticBrowserSession,
-} from "@/store/useOptimisticallyRequestBrowserSessionId";
-import { useUser } from "@/hooks/useUser";
 
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
@@ -73,24 +70,13 @@ const blockTypeToTitle = (type: WorkflowBlockType): string => {
 
 const getPayload = (opts: {
   blockLabel: string;
-  optimistic: OptimisticBrowserSession;
+  browserSessionId: string | null;
   parameters: Record<string, unknown>;
   totpIdentifier: string | null;
   totpUrl: string | null;
-  user: User | null;
   workflowPermanentId: string;
   workflowSettings: WorkflowSettingsState;
 }): Payload | null => {
-  if (!opts.user) {
-    toast({
-      variant: "warning",
-      title: "Error",
-      description: "No user found",
-    });
-
-    return null;
-  }
-
   const webhook_url = opts.workflowSettings.webhookCallbackUrl.trim();
 
   let extraHttpHeaders = null;
@@ -108,14 +94,7 @@ const getPayload = (opts: {
     });
   }
 
-  const browserSessionData = opts.optimistic.get(
-    opts.user,
-    opts.workflowPermanentId,
-  );
-
-  const browserSessionId = browserSessionData?.browser_session_id;
-
-  if (!browserSessionId) {
+  if (!opts.browserSessionId) {
     toast({
       variant: "warning",
       title: "Error",
@@ -127,13 +106,13 @@ const getPayload = (opts: {
     toast({
       variant: "default",
       title: "Success",
-      description: `Browser session ID found: ${browserSessionId}`,
+      description: `Browser session ID found: ${opts.browserSessionId}`,
     });
   }
 
   const payload: Payload = {
     block_labels: [opts.blockLabel],
-    browser_session_id: browserSessionId,
+    browser_session_id: opts.browserSessionId,
     extra_http_headers: extraHttpHeaders,
     max_screenshot_scrolls: opts.workflowSettings.maxScreenshotScrollingTimes,
     parameters: opts.parameters,
@@ -181,8 +160,9 @@ function NodeHeader({
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
-  const optimistic = useOptimisticallyRequestBrowserSessionId();
-  const user = useUser().get();
+  const { data: debugSession } = useDebugSessionQuery({
+    workflowPermanentId,
+  });
 
   useEffect(() => {
     if (!workflowRun || !workflowPermanentId || !workflowRunId) {
@@ -220,6 +200,21 @@ function NodeHeader({
     mutationFn: async () => {
       if (!workflowPermanentId) {
         console.error("There is no workflowPermanentId");
+        toast({
+          variant: "destructive",
+          title: "Failed to start workflow block run",
+          description: "There is no workflowPermanentId",
+        });
+        return;
+      }
+
+      if (!debugSession) {
+        console.error("There is no debug session, yet");
+        toast({
+          variant: "destructive",
+          title: "Failed to start workflow block run",
+          description: "There is no debug session, yet",
+        });
         return;
       }
 
@@ -244,16 +239,20 @@ function NodeHeader({
 
       const body = getPayload({
         blockLabel,
-        optimistic,
+        browserSessionId: debugSession.browser_session_id,
         parameters,
         totpIdentifier,
         totpUrl,
-        user,
         workflowPermanentId,
         workflowSettings: workflowSettingsStore,
       });
 
       if (!body) {
+        toast({
+          variant: "destructive",
+          title: "Failed to start workflow block run",
+          description: "Could not construct run payload",
+        });
         return;
       }
 
@@ -265,6 +264,11 @@ function NodeHeader({
     onSuccess: (response) => {
       if (!response) {
         console.error("No response");
+        toast({
+          variant: "destructive",
+          title: "Failed to start workflow block run",
+          description: "No response",
+        });
         return;
       }
 
@@ -290,11 +294,17 @@ function NodeHeader({
 
   const cancelBlock = useMutation({
     mutationFn: async () => {
-      const browserSessionId =
-        user && workflowPermanentId
-          ? optimistic.get(user, workflowPermanentId)?.browser_session_id ??
-            "<missing-browser-session-id>"
-          : "<missing-user-or-workflow-permanent-id>";
+      if (!debugSession) {
+        console.error("Missing debug session");
+        toast({
+          variant: "destructive",
+          title: "Failed to cancel workflow block run",
+          description: "Missing debug session",
+        });
+        return;
+      }
+
+      const browserSessionId = debugSession.browser_session_id;
       const client = await getClient(credentialGetter);
       return client
         .post(`/runs/${browserSessionId}/workflow_run/${workflowRunId}/cancel/`)
