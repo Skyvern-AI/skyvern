@@ -1136,17 +1136,14 @@ class ForLoopBlock(Block):
                         "type": "object",
                         "properties": {
                             "primary_loop_field": {
-                                "type": "string", 
-                                "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)"
+                                "type": "string",
+                                "description": "The primary value to be used in the loop iteration (e.g., URL, text, identifier, etc.)",
                             },
-                            "title": {
-                                "type": "string", 
-                                "description": "Optional title or name for context"
-                            },
+                            "title": {"type": "string", "description": "Optional title or name for context"},
                             "additional_data": {
-                                "type": "object", 
-                                "description": "Any additional data that might be useful for the loop blocks"
-                            }
+                                "type": "object",
+                                "description": "Any additional data that might be useful for the loop blocks",
+                            },
                         },
                         "required": ["primary_loop_field"],
                     },
