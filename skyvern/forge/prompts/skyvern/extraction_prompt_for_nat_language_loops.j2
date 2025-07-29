@@ -1,10 +1,11 @@
 Analyze the current webpage and extract information based on this request: {{ natural_language_prompt }}
 
-You need to identify what values should be iterated over (loop_values).
+You need to identify what values should be iterated over (loop_values). The primary_loop_field should contain the main value that will be used in each loop iteration.
 
 For example:
-- If the request is "go to each product page", extract product URLs and titles as objects with url and title fields
-- If the request is "process each article", extract article links and titles as objects with url and title fields
-- If the request is "download each file", extract file download links and names as objects with url and title fields
+- If the request is "go to each product page", extract product URLs as primary_loop_field and titles as title
+- If the request is "extract the authors of the top 4 posts", extract author names as primary_loop_field and post titles as title
+- If the request is "summarize the text of each article", extract article URLs as primary_loop_field and article titles as title
+- If the request is "download each file", extract file URLs as primary_loop_field and file names as title
 
-Return the results in the specified schema format with loop_values containing an array of objects, where each object has at least a url field and optionally a title field. 
+The primary_loop_field can be any type of value that makes sense for the loop (URLs, text, identifiers, etc.). Return the results in the specified schema format with loop_values containing an array of objects, where each object has a primary_loop_field and optionally a title and additional_data. 
