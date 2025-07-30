@@ -1231,10 +1231,6 @@ async def get_runs(
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
 
-    # temporary limit to 100 runs
-    if page > 10:
-        return []
-
     runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
     return ORJSONResponse([run.model_dump() for run in runs])
 
