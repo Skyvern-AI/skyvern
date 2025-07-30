@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
+    get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -330,12 +331,12 @@ class WorkflowService:
             )
             return workflow_run
 
-        all_blocks = workflow.workflow_definition.blocks
+        top_level_blocks = workflow.workflow_definition.blocks
+        all_blocks = get_all_blocks(top_level_blocks)
 
         if block_labels and len(block_labels):
             blocks: list[BlockTypeVar] = []
             all_labels = {block.label: block for block in all_blocks}
-
             for label in block_labels:
                 if label not in all_labels:
                     raise BlockNotFound(block_label=label)
@@ -350,7 +351,7 @@ class WorkflowService:
             )
 
         else:
-            blocks = all_blocks
+            blocks = top_level_blocks
 
         if not blocks:
             raise SkyvernException(f"No blocks found for the given block labels: {block_labels}")

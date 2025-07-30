@@ -2989,6 +2989,26 @@ class HttpRequestBlock(Block):
             )
 
 
+def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
+    """
+    Recursively get "all blocks" in a workflow definition.
+
+    At time of writing, blocks can be nested via the ForLoop block. This function
+    returns all blocks, flattened.
+    """
+
+    all_blocks: list[BlockTypeVar] = []
+
+    for block in blocks:
+        all_blocks.append(block)
+
+        if block.block_type == BlockType.FOR_LOOP:
+            nested_blocks = get_all_blocks(block.loop_blocks)
+            all_blocks.extend(nested_blocks)
+
+    return all_blocks
+
+
 BlockSubclasses = Union[
     ForLoopBlock,
     TaskBlock,
