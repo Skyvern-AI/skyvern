@@ -23,11 +23,9 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
-    SkyvernProjectModel,
 )
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
-from skyvern.forge.sdk.schemas.skyvern_projects import SkyvernProject
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
@@ -223,25 +221,6 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         created_at=artifact_model.created_at,
         modified_at=artifact_model.modified_at,
         organization_id=artifact_model.organization_id,
-    )
-
-
-def convert_to_skyvern_project(
-    project_model: SkyvernProjectModel, debug_enabled: bool = False
-) -> SkyvernProject:
-    if debug_enabled:
-        LOG.debug(
-            "Converting SkyvernProjectModel to SkyvernProject",
-            skyvern_project_id=project_model.skyvern_project_id,
-        )
-    return SkyvernProject(
-        skyvern_project_id=project_model.skyvern_project_id,
-        organization_id=project_model.organization_id,
-        artifact_id=project_model.artifact_id,
-        structure=project_model.structure,
-        created_at=project_model.created_at,
-        modified_at=project_model.modified_at,
-        deleted_at=project_model.deleted_at,
     )
 
 
