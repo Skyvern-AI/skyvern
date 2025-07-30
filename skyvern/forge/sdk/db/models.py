@@ -36,8 +36,6 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
-    generate_project_id,
-    generate_project_revision_id,
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
@@ -769,32 +767,4 @@ class DebugSessionModel(Base):
     user_id = Column(String, nullable=True)  # comes from identity vendor (Clerk at time of writing)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
-
-
-class ProjectModel(Base):
-    __tablename__ = "projects"
-    __table_args__ = (
-        Index("project_org_created_at_index", "organization_id", "created_at"),
-        Index("project_org_wpid_index", "organization_id", "workflow_permanent_id"),
-        Index("project_org_run_id_index", "organization_id", "run_id"),
-        UniqueConstraint("organization_id", "project_id", "version", name="uc_org_project_version"),
-    )
-
-    project_revision_id = Column(String, primary_key=True, default=generate_project_revision_id)
-    project_id = Column(String, default=generate_project_id, nullable=False)  # User-facing, consistent across versions
-    organization_id = Column(String, nullable=False)
-    # the artifact id for the code
-    artifact_id = Column(String, nullable=True)
-    # the wpid that this project is associated with
-    workflow_permanent_id = Column(String, nullable=True)
-    # The workflow run or task run id that this project is generated
-    run_id = Column(String, nullable=True)
-    version = Column(Integer, default=1, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
-    modified_at = Column(
-        DateTime,
-        default=datetime.datetime.utcnow,
-        onupdate=datetime.datetime.utcnow,
-        nullable=False,
-    )
     deleted_at = Column(DateTime, nullable=True)
