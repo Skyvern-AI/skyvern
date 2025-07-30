@@ -67,6 +67,14 @@ class WorkflowDefinitionHasReservedParameterKeys(BaseWorkflowHTTPException):
         )
 
 
+class InvalidParameterKey(BaseWorkflowHTTPException):
+    def __init__(self, parameter_key: str) -> None:
+        super().__init__(
+            f'Parameter names cannot start with a number ("{parameter_key}" is invalid). Please rename your variable.',
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
 class InvalidWorkflowDefinition(BaseWorkflowHTTPException):
     def __init__(self, message: str) -> None:
         super().__init__(
