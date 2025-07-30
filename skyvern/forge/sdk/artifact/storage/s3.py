@@ -28,6 +28,11 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 LOG = structlog.get_logger()
 
 
+def get_timestamp_part() -> str:
+    """Generate a timestamp string for use in artifact URIs."""
+    return datetime.utcnow().isoformat().replace(":", "-")
+
+
 class S3Storage(BaseStorage):
     _PATH_VERSION = "v1"
 
@@ -37,7 +42,7 @@ class S3Storage(BaseStorage):
 
     def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"{self._build_base_uri(organization_id)}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"{self._build_base_uri(organization_id)}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{get_timestamp_part()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
         uri = f"s3://{self.bucket}/{settings.ENV}/global_workflows.txt"
@@ -53,19 +58,19 @@ class S3Storage(BaseStorage):
         self, *, organization_id: str, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"{self._build_base_uri(organization_id)}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
+        return f"{self._build_base_uri(organization_id)}/logs/{log_entity_type}/{log_entity_id}/{get_timestamp_part()}_{artifact_type}.{file_ext}"
 
     def build_thought_uri(
         self, *, organization_id: str, artifact_id: str, thought: Thought, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"{self._build_base_uri(organization_id)}/observers/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"{self._build_base_uri(organization_id)}/observers/{thought.observer_cruise_id}/{thought.observer_thought_id}/{get_timestamp_part()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_task_v2_uri(
         self, *, organization_id: str, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"{self._build_base_uri(organization_id)}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"{self._build_base_uri(organization_id)}/observers/{task_v2.observer_cruise_id}/{get_timestamp_part()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
         self,
@@ -76,13 +81,13 @@ class S3Storage(BaseStorage):
         artifact_type: ArtifactType,
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"{self._build_base_uri(organization_id)}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"{self._build_base_uri(organization_id)}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{get_timestamp_part()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_ai_suggestion_uri(
         self, *, organization_id: str, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"{self._build_base_uri(organization_id)}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"{self._build_base_uri(organization_id)}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{get_timestamp_part()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)

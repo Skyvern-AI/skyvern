@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from rich.panel import Panel
 from rich.prompt import Confirm
 
-from skyvern.cli.utils import start_services
+from skyvern.cli.utils import start_services, start_services_sync, set_asyncio_event_loop_policy
 from skyvern.config import settings
 from skyvern.library.skyvern import Skyvern
 from skyvern.utils import detect_os
@@ -82,6 +83,7 @@ def kill_pids(pids: List[int]) -> None:
 
 @run_app.command(name="server")
 def run_server() -> None:
+    set_asyncio_event_loop_policy()
     """Run the Skyvern API server."""
     load_dotenv()
     load_dotenv(".env")
@@ -99,6 +101,7 @@ def run_server() -> None:
 
 @run_app.command(name="ui")
 def run_ui() -> None:
+    set_asyncio_event_loop_policy()
     """Run the Skyvern UI server."""
     console.print(Panel("[bold blue]Starting Skyvern UI Server...[/bold blue]", border_style="blue"))
     try:
@@ -196,11 +199,15 @@ def run_ui() -> None:
 @run_app.command(name="all")
 def run_all() -> None:
     """Run the Skyvern API server and UI server in parallel."""
-    asyncio.run(start_services())
+    if sys.platform == "win32":
+        start_services_sync()
+    else:
+        asyncio.run(start_services())
 
 
 @run_app.command(name="mcp")
 def run_mcp() -> None:
+    set_asyncio_event_loop_policy()
     """Run the MCP server."""
     # This breaks the MCP processing because it expects json output only
     # console.print(Panel("[bold green]Starting MCP Server...[/bold green]", border_style="green"))

@@ -24,13 +24,20 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 LOG = structlog.get_logger()
 
 
+def _get_windows_safe_timestamp() -> str:
+    """Generate a Windows-safe timestamp for filenames (no colons)."""
+    return datetime.utcnow().isoformat().replace(':', '-')
+
+
 class LocalStorage(BaseStorage):
     def __init__(self, artifact_path: str = settings.ARTIFACT_STORAGE_PATH) -> None:
-        self.artifact_path = artifact_path
+        # Normalize the artifact path to use forward slashes for consistent URI construction
+        # Path objects handle forward slashes correctly on all platforms
+        self.artifact_path = str(Path(artifact_path)).replace('\\', '/')
 
     def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{organization_id}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{organization_id}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{_get_windows_safe_timestamp()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
         file_path = Path(f"{self.artifact_path}/{settings.ENV}/global_workflows.txt")
@@ -38,7 +45,7 @@ class LocalStorage(BaseStorage):
         if not file_path.exists():
             return []
         try:
-            with open(file_path) as f:
+            with open(file_path, encoding="utf-8") as f:
                 return [line.strip() for line in f.readlines() if line.strip()]
         except Exception:
             return []
@@ -47,19 +54,19 @@ class LocalStorage(BaseStorage):
         self, *, organization_id: str, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/logs/{log_entity_type}/{log_entity_id}/{_get_windows_safe_timestamp()}_{artifact_type}.{file_ext}"
 
     def build_thought_uri(
         self, *, organization_id: str, artifact_id: str, thought: Thought, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/tasks/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/tasks/{thought.observer_cruise_id}/{thought.observer_thought_id}/{_get_windows_safe_timestamp()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_task_v2_uri(
         self, *, organization_id: str, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{_get_windows_safe_timestamp()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
         self,
@@ -70,13 +77,13 @@ class LocalStorage(BaseStorage):
         artifact_type: ArtifactType,
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{_get_windows_safe_timestamp()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_ai_suggestion_uri(
         self, *, organization_id: str, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
-        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{_get_windows_safe_timestamp()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None

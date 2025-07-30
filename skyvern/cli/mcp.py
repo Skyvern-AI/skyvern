@@ -144,7 +144,7 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
         claude_config: dict = {"mcpServers": {}}
         if os.path.exists(path_claude_config):
             try:
-                with open(path_claude_config) as f:
+                with open(path_claude_config, encoding="utf-8") as f:
                     claude_config = json.load(f)
                     claude_config["mcpServers"].pop("Skyvern", None)
                     claude_config["mcpServers"]["Skyvern"] = {
@@ -196,7 +196,7 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
         cursor_config: dict = {"mcpServers": {}}
         if os.path.exists(path_cursor_config):
             try:
-                with open(path_cursor_config) as f:
+                with open(path_cursor_config, encoding="utf-8") as f:
                     cursor_config = json.load(f)
                     cursor_config["mcpServers"].pop("Skyvern", None)
                     cursor_config["mcpServers"]["Skyvern"] = {
@@ -245,7 +245,7 @@ def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
         windsurf_config: dict = {"mcpServers": {}}
         if os.path.exists(path_windsurf_config):
             try:
-                with open(path_windsurf_config) as f:
+                with open(path_windsurf_config, encoding="utf-8") as f:
                     windsurf_config = json.load(f)
                     windsurf_config["mcpServers"].pop("Skyvern", None)
                     windsurf_config["mcpServers"]["Skyvern"] = {
