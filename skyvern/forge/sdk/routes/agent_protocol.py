@@ -2048,7 +2048,25 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
         )
 
+        LOG.info(
+            "Existing debug session not found, created a new one",
+            debug_session_id=debug_session.debug_session_id,
+            browser_session_id=new_browser_session.persistent_browser_session_id,
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,  # not sure how we feel about logging this
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
         return debug_session
+
+    LOG.info(
+        "Existing debug session found",
+        debug_session_id=debug_session.debug_session_id,
+        browser_session_id=debug_session.browser_session_id,
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,  # not sure how we feel about logging this
+        workflow_permanent_id=workflow_permanent_id,
+    )
 
     browser_session = await app.DATABASE.get_persistent_browser_session(
         debug_session.browser_session_id, current_org.organization_id
@@ -2097,7 +2115,24 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
             return debug_session
         else:
             LOG.info(
-                "pbs for debug session has expired",
+                "Browser session for debug session has expired",
+                debug_session_id=debug_session.debug_session_id,
+                organization_id=current_org.organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                user_id=current_user_id,
+            )
+    else:
+        if browser_session:
+            LOG.info(
+                "Browser session for debug session has expired, creating a new one",
+                debug_session_id=debug_session.debug_session_id,
+                organization_id=current_org.organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                user_id=current_user_id,
+            )
+        else:
+            LOG.info(
+                "Browser session did not exist for debug session, creating a new one",
                 debug_session_id=debug_session.debug_session_id,
                 organization_id=current_org.organization_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -2112,6 +2147,15 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     await app.DATABASE.update_debug_session(
         debug_session_id=debug_session.debug_session_id,
         browser_session_id=browser_session.persistent_browser_session_id,
+    )
+
+    LOG.info(
+        "Updated debug session with new browser session",
+        debug_session_id=debug_session.debug_session_id,
+        browser_session_id=browser_session.persistent_browser_session_id,
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        user_id=current_user_id,
     )
 
     return debug_session
