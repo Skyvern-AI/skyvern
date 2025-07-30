@@ -291,6 +291,9 @@ class SkyvernFrame:
                 "Failed to take full page screenshot, fallback to use playwright full page screenshot",
                 exc_info=True,
             )
+            # reset x and y to None to avoid the scroll_to_x_y call in finally block
+            x = None
+            y = None
             return await _current_viewpoint_screenshot_helper(
                 page=page, file_path=file_path, timeout=timeout, full_page=True
             )
