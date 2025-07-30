@@ -767,3 +767,20 @@ class DebugSessionModel(Base):
     user_id = Column(String, nullable=True)  # comes from identity vendor (Clerk at time of writing)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+
+
+class SkyvernProjectModel(Base):
+    __tablename__ = "skyvern_projects"
+
+    skyvern_project_id = Column(String, primary_key=True)
+    organization_id = Column(String, nullable=False, index=True)
+    artifact_id = Column(String, nullable=True)
+    structure = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
