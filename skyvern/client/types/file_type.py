@@ -2,4 +2,4 @@
 
 import typing
 
-FileType = typing.Literal["csv", "excel", "pdf"]
+FileType = typing.Literal["csv"]
