@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from math import floor
 
 import structlog
 from playwright._impl._errors import TargetClosedError
 
-from skyvern.exceptions import MissingBrowserAddressError
+from skyvern.config import settings
+from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -17,6 +20,99 @@ LOG = structlog.get_logger()
 @dataclass
 class BrowserSession:
     browser_state: BrowserState
+
+
+async def validate_session_for_renewal(
+    database: AgentDB,
+    session_id: str,
+    organization_id: str,
+) -> tuple[PersistentBrowserSession, datetime, int]:
+    """
+    Validate a specific browser session for renewal. Otherwise raise.
+    """
+
+    browser_session = await database.get_persistent_browser_session(
+        session_id=session_id,
+        organization_id=organization_id,
+    )
+
+    if not browser_session:
+        LOG.warning(
+            "Attempted to renew non-existent browser session",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+        )
+        raise BrowserSessionNotRenewable("Browser session does not exist", session_id)
+
+    if browser_session.completed_at is not None:
+        LOG.warning(
+            "Attempted to renew completed browser session",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+        )
+        raise BrowserSessionNotRenewable("Browser session has already completed", session_id)
+
+    if browser_session.started_at is None or browser_session.timeout_minutes is None:
+        LOG.warning(
+            "Attempted to renew browser session that has not started yet",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+        )
+        raise BrowserSessionNotRenewable("Browser session has not started yet", session_id)
+
+    if browser_session.status != "created":
+        LOG.warning(
+            "Attempted to renew browser session that is not in the 'created' state",
+            browser_session_id=session_id,
+            organization_id=organization_id,
+        )
+        raise BrowserSessionNotRenewable("Browser session is not in the 'created' state", session_id)
+
+    started_at_utc = (
+        browser_session.started_at.replace(tzinfo=timezone.utc)
+        if browser_session.started_at.tzinfo is None
+        else browser_session.started_at
+    )
+
+    return browser_session, started_at_utc, browser_session.timeout_minutes
+
+
+async def renew_session(database: AgentDB, session_id: str, organization_id: str) -> PersistentBrowserSession:
+    """
+    Renew a specific browser session, if it is deemed renewable.
+    """
+
+    browser_session, started_at_utc, current_timeout_minutes = await validate_session_for_renewal(
+        database,
+        organization_id=organization_id,
+        session_id=session_id,
+    )
+
+    right_now = datetime.now(timezone.utc)
+    current_timeout_datetime = started_at_utc + timedelta(minutes=float(current_timeout_minutes))
+    minutes_left = (current_timeout_datetime - right_now).total_seconds() / 60
+
+    if minutes_left >= settings.DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES:
+        new_timeout_datetime = right_now + timedelta(minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES)
+        minutes_diff = floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60)
+        new_timeout_minutes = current_timeout_minutes + minutes_diff
+
+        browser_session = await database.update_persistent_browser_session(
+            browser_session_id=session_id,
+            organization_id=organization_id,
+            timeout_minutes=new_timeout_minutes,
+        )
+
+        LOG.info(
+            f"Extended browser session by {minutes_diff} minute(s)",
+            minutes_diff=minutes_diff,
+            session_id=session_id,
+            organization_id=organization_id,
+        )
+
+        return browser_session
+
+    raise BrowserSessionNotRenewable("Session has expired", session_id)
 
 
 class PersistentSessionsManager:
@@ -134,6 +230,13 @@ class PersistentSessionsManager:
             runnable_id=runnable_id,
             organization_id=organization_id,
         )
+
+    async def renew_or_close_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession:
+        try:
+            return await renew_session(self.database, session_id, organization_id)
+        except BrowserSessionNotRenewable:
+            await self.close_session(organization_id, session_id)
+            raise
 
     async def release_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a specific browser session."""
