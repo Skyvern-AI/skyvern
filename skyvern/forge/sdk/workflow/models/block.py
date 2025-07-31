@@ -2371,9 +2371,9 @@ class FileParserBlock(Block):
     def _detect_file_type_from_url(self, file_url: str) -> FileType:
         """Detect file type based on file extension in the URL."""
         url_lower = file_url.lower()
-        if url_lower.endswith(('.xlsx', '.xls')):
+        if url_lower.endswith((".xlsx", ".xls")):
             return FileType.EXCEL
-        elif url_lower.endswith('.pdf'):
+        elif url_lower.endswith(".pdf"):
             return FileType.PDF
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
@@ -2388,18 +2388,16 @@ class FileParserBlock(Block):
         elif self.file_type == FileType.EXCEL:
             try:
                 # Try to read the file with pandas to validate it's a valid Excel file
-                pd.read_excel(file_path, nrows=1, engine='openpyxl')
+                pd.read_excel(file_path, nrows=1, engine="openpyxl")
             except ImportError as e:
                 raise InvalidFileType(
-                    file_url=file_url_used, 
-                    file_type=self.file_type, 
-                    error=f"Missing required dependency for Excel validation: {str(e)}. Please install openpyxl: pip install openpyxl"
+                    file_url=file_url_used,
+                    file_type=self.file_type,
+                    error=f"Missing required dependency for Excel validation: {str(e)}. Please install openpyxl: pip install openpyxl",
                 )
             except Exception as e:
                 raise InvalidFileType(
-                    file_url=file_url_used, 
-                    file_type=self.file_type, 
-                    error=f"Invalid Excel file format: {str(e)}"
+                    file_url=file_url_used, file_type=self.file_type, error=f"Invalid Excel file format: {str(e)}"
                 )
         elif self.file_type == FileType.PDF:
             try:
@@ -2423,20 +2421,18 @@ class FileParserBlock(Block):
         """Parse Excel file and return list of dictionaries."""
         try:
             # Read Excel file with pandas, specifying engine explicitly
-            df = pd.read_excel(file_path, engine='openpyxl')
+            df = pd.read_excel(file_path, engine="openpyxl")
             # Convert DataFrame to list of dictionaries
             return df.to_dict("records")
         except ImportError as e:
             raise InvalidFileType(
-                file_url=self.file_url, 
-                file_type=self.file_type, 
-                error=f"Missing required dependency for Excel parsing: {str(e)}. Please install openpyxl: pip install openpyxl"
+                file_url=self.file_url,
+                file_type=self.file_type,
+                error=f"Missing required dependency for Excel parsing: {str(e)}. Please install openpyxl: pip install openpyxl",
             )
         except Exception as e:
             raise InvalidFileType(
-                file_url=self.file_url, 
-                file_type=self.file_type, 
-                error=f"Failed to parse Excel file: {str(e)}"
+                file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse Excel file: {str(e)}"
             )
 
     async def _parse_pdf_file(self, file_path: str) -> str:
