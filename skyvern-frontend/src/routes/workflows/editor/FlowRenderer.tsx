@@ -89,6 +89,7 @@ import {
   descendants,
   generateNodeLabel,
   getAdditionalParametersForEmailBlock,
+  getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
   getWorkflowErrors,
@@ -397,10 +398,21 @@ function FlowRenderer({
   }, [nodesInitialized]);
 
   useEffect(() => {
-    const blocks = getWorkflowBlocks(nodes, edges);
-    const debuggable = blocks.filter((block) =>
+    const topLevelBlocks = getWorkflowBlocks(nodes, edges);
+    const debuggable = topLevelBlocks.filter((block) =>
       debuggableWorkflowBlockTypes.has(block.block_type),
     );
+
+    for (const node of nodes) {
+      const childBlocks = getOrderedChildrenBlocks(nodes, edges, node.id);
+
+      for (const child of childBlocks) {
+        if (debuggableWorkflowBlockTypes.has(child.block_type)) {
+          debuggable.push(child);
+        }
+      }
+    }
+
     setDebuggableBlockCount(debuggable.length);
   }, [nodes, edges]);
 
