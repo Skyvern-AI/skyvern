@@ -13,4 +13,3 @@ class Project(BaseModel):
     version: int | None = None
     created_at: datetime
     modified_at: datetime
-    deleted_at: datetime | None = None

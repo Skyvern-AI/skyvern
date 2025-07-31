@@ -45,6 +45,7 @@ ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
+PROJECT_FILE_PREFIX = "pf"
 PROJECT_REVISION_PREFIX = "pv"
 PROJECT_PREFIX = "p"
 STEP_PREFIX = "stp"
@@ -213,6 +214,11 @@ def generate_project_id() -> str:
 def generate_project_revision_id() -> str:
     int_id = generate_id()
     return f"{PROJECT_REVISION_PREFIX}_{int_id}"
+
+
+def generate_project_file_id() -> str:
+    int_id = generate_id()
+    return f"{PROJECT_FILE_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############
