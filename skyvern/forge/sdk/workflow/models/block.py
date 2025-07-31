@@ -2405,7 +2405,7 @@ class FileParserBlock(Block):
             # Read Excel file with pandas
             df = pd.read_excel(file_path)
             # Convert DataFrame to list of dictionaries
-            return df.to_dict('records')
+            return df.to_dict("records")
         except Exception as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
@@ -2421,7 +2421,9 @@ class FileParserBlock(Block):
         except PdfReadError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
-    async def _extract_with_ai(self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext) -> dict[str, Any]:
+    async def _extract_with_ai(
+        self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
+    ) -> dict[str, Any]:
         """Extract structured data using AI based on json_schema."""
         if not self.json_schema:
             # Default schema for general extraction
@@ -2443,9 +2445,7 @@ class FileParserBlock(Block):
             content_str = content
 
         llm_prompt = prompt_engine.load_prompt(
-            "extract-information-from-file-text", 
-            extracted_text_content=content_str, 
-            json_schema=self.json_schema
+            "extract-information-from-file-text", extracted_text_content=content_str, json_schema=self.json_schema
         )
         llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
         return llm_response
@@ -2495,13 +2495,13 @@ class FileParserBlock(Block):
         self.validate_file_type(self.file_url, file_path)
 
         # Parse the file based on type
+        parsed_data: str | list[dict[str, Any]]
         if self.file_type == FileType.CSV:
             parsed_data = await self._parse_csv_file(file_path)
         elif self.file_type == FileType.EXCEL:
             parsed_data = await self._parse_excel_file(file_path)
         elif self.file_type == FileType.PDF:
-            extracted_text = await self._parse_pdf_file(file_path)
-            parsed_data = extracted_text
+            parsed_data = await self._parse_pdf_file(file_path)
         else:
             return await self.build_block_result(
                 success=False,
@@ -2513,6 +2513,7 @@ class FileParserBlock(Block):
             )
 
         # If json_schema is provided, use AI to extract structured data
+        final_data: str | list[dict[str, Any]] | dict[str, Any]
         if self.json_schema:
             try:
                 ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)
@@ -2547,6 +2548,7 @@ class PDFParserBlock(Block):
     DEPRECATED: Use FileParserBlock with file_type=FileType.PDF instead.
     This block will be removed in a future version.
     """
+
     block_type: Literal[BlockType.PDF_PARSER] = BlockType.PDF_PARSER
 
     file_url: str
