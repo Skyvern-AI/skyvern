@@ -10,6 +10,8 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
+import { dataSchemaExampleForFileExtraction } from "../types";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -21,7 +23,16 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const [inputs, setInputs] = useState({
     fileUrl: data.fileUrl,
+    jsonSchema: data.jsonSchema,
   });
+
+  function handleChange(key: string, value: unknown) {
+    if (!data.editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
@@ -75,15 +86,19 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
               nodeId={id}
               value={inputs.fileUrl}
               onChange={(value) => {
-                if (!data.editable) {
-                  return;
-                }
-                setInputs({ ...inputs, fileUrl: value });
-                updateNodeData(id, { fileUrl: value });
+                handleChange("fileUrl", value);
               }}
               className="nopan text-xs"
             />
           </div>
+          <WorkflowDataSchemaInputGroup
+            exampleValue={dataSchemaExampleForFileExtraction}
+            value={inputs.jsonSchema}
+            onChange={(value) => {
+              handleChange("jsonSchema", value);
+            }}
+            suggestionContext={{}}
+          />
         </div>
       </div>
     </div>

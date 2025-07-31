@@ -56,7 +56,10 @@ import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
-import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
+import {
+  isFileParserNode,
+  fileParserNodeDefaultData,
+} from "./nodes/FileParserNode/types";
 import {
   isLoopNode,
   LoopNode,
@@ -468,6 +471,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+          jsonSchema: JSON.stringify(block.json_schema, null, 2),
         },
       };
     }
@@ -1254,7 +1258,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: "csv",
+        file_type: "csv", // Will be overridden by backend based on file extension
+        json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
     case "textPrompt": {
@@ -2180,6 +2185,15 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   const pdfParserNodes = nodes.filter(isPdfParserNode);
   pdfParserNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.jsonSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+  });
+
+  const fileParserNodes = nodes.filter(isFileParserNode);
+  fileParserNodes.forEach((node) => {
     try {
       JSON.parse(node.data.jsonSchema);
     } catch {

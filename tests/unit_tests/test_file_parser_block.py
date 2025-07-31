@@ -184,3 +184,17 @@ class TestFileParserBlock:
                 assert file_parser_block.json_schema is None
                 mock_llm.assert_called_once()
                 mock_prompt.assert_called_once()
+
+    def test_detect_file_type_from_url(self, file_parser_block):
+        """Test file type detection based on URL extension."""
+        # Test Excel files
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xlsx") == FileType.EXCEL
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xls") == FileType.EXCEL
+        
+        # Test PDF files
+        assert file_parser_block._detect_file_type_from_url("https://example.com/document.pdf") == FileType.PDF
+        
+        # Test CSV files (default)
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.csv") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.txt") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data") == FileType.CSV

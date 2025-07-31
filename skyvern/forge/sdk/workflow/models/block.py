@@ -2368,6 +2368,16 @@ class FileParserBlock(Block):
             self.file_url, workflow_run_context
         )
 
+    def _detect_file_type_from_url(self, file_url: str) -> FileType:
+        """Detect file type based on file extension in the URL."""
+        url_lower = file_url.lower()
+        if url_lower.endswith(('.xlsx', '.xls')):
+            return FileType.EXCEL
+        elif url_lower.endswith('.pdf'):
+            return FileType.PDF
+        else:
+            return FileType.CSV  # Default to CSV for .csv and any other extensions
+
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
         if self.file_type == FileType.CSV:
             try:
@@ -2378,9 +2388,19 @@ class FileParserBlock(Block):
         elif self.file_type == FileType.EXCEL:
             try:
                 # Try to read the file with pandas to validate it's a valid Excel file
-                pd.read_excel(file_path, nrows=1)
+                pd.read_excel(file_path, nrows=1, engine='openpyxl')
+            except ImportError as e:
+                raise InvalidFileType(
+                    file_url=file_url_used, 
+                    file_type=self.file_type, 
+                    error=f"Missing required dependency for Excel validation: {str(e)}. Please install openpyxl: pip install openpyxl"
+                )
             except Exception as e:
-                raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+                raise InvalidFileType(
+                    file_url=file_url_used, 
+                    file_type=self.file_type, 
+                    error=f"Invalid Excel file format: {str(e)}"
+                )
         elif self.file_type == FileType.PDF:
             try:
                 # Try to read the file with PyPDF to validate it's a valid PDF file
@@ -2402,12 +2422,22 @@ class FileParserBlock(Block):
     async def _parse_excel_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse Excel file and return list of dictionaries."""
         try:
-            # Read Excel file with pandas
-            df = pd.read_excel(file_path)
+            # Read Excel file with pandas, specifying engine explicitly
+            df = pd.read_excel(file_path, engine='openpyxl')
             # Convert DataFrame to list of dictionaries
             return df.to_dict("records")
+        except ImportError as e:
+            raise InvalidFileType(
+                file_url=self.file_url, 
+                file_type=self.file_type, 
+                error=f"Missing required dependency for Excel parsing: {str(e)}. Please install openpyxl: pip install openpyxl"
+            )
         except Exception as e:
-            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+            raise InvalidFileType(
+                file_url=self.file_url, 
+                file_type=self.file_type, 
+                error=f"Failed to parse Excel file: {str(e)}"
+            )
 
     async def _parse_pdf_file(self, file_path: str) -> str:
         """Parse PDF file and return extracted text."""
@@ -2489,6 +2519,10 @@ class FileParserBlock(Block):
             file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
         else:
             file_path = await download_file(self.file_url)
+
+        # Auto-detect file type based on file extension
+        detected_file_type = self._detect_file_type_from_url(self.file_url)
+        self.file_type = detected_file_type
 
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
