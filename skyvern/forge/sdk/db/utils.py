@@ -15,6 +15,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    ProjectModel,
     StepModel,
     TaskModel,
     WorkflowModel,
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.projects import Project
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.actions.actions import (
     Action,
@@ -490,6 +492,20 @@ def convert_to_workflow_run_block(
         block.include_action_history_in_verification = task.include_action_history_in_verification
 
     return block
+
+
+def convert_to_project(project_model: ProjectModel) -> Project:
+    return Project(
+        project_revision_id=project_model.project_revision_id,
+        project_id=project_model.project_id,
+        organization_id=project_model.organization_id,
+        workflow_id=project_model.workflow_permanent_id,
+        run_id=project_model.run_id,
+        version=project_model.version,
+        created_at=project_model.created_at,
+        modified_at=project_model.modified_at,
+        deleted_at=project_model.deleted_at,
+    )
 
 
 def hydrate_action(action_model: ActionModel) -> Action:

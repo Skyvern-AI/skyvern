@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, delete, desc, distinct, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -29,6 +29,8 @@ from skyvern.forge.sdk.db.models import (
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
+    ProjectFileModel,
+    ProjectModel,
     StepModel,
     TaskGenerationModel,
     TaskModel,
@@ -52,6 +54,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
+    convert_to_project,
     convert_to_step,
     convert_to_task,
     convert_to_workflow,
@@ -96,6 +99,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.projects import Project
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
@@ -3481,3 +3485,228 @@ class AgentDB:
             await session.refresh(debug_session)
 
             return DebugSession.model_validate(debug_session)
+
+    async def update_debug_session(
+        self,
+        *,
+        debug_session_id: str,
+        browser_session_id: str | None = None,
+    ) -> DebugSession:
+        async with self.Session() as session:
+            debug_session = (
+                await session.scalars(select(DebugSessionModel).filter_by(debug_session_id=debug_session_id))
+            ).first()
+
+            if not debug_session:
+                raise NotFoundError(f"Debug session {debug_session_id} not found")
+
+            if browser_session_id:
+                debug_session.browser_session_id = browser_session_id
+
+            await session.commit()
+            await session.refresh(debug_session)
+
+            return DebugSession.model_validate(debug_session)
+
+    async def create_project(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str | None = None,
+        run_id: str | None = None,
+        project_id: str | None = None,
+        version: int | None = None,
+    ) -> Project:
+        try:
+            async with self.Session() as session:
+                project = ProjectModel(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    run_id=run_id,
+                )
+                if project_id:
+                    project.project_id = project_id
+                if version:
+                    project.version = version
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+                return convert_to_project(project)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_project(
+        self,
+        project_id: str,
+        organization_id: str,
+        artifact_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+        run_id: str | None = None,
+        version: int | None = None,
+    ) -> Project:
+        try:
+            async with self.Session() as session:
+                get_project_query = (
+                    select(ProjectModel)
+                    .filter_by(project_id=project_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(ProjectModel.deleted_at.is_(None))
+                )
+                if project := (await session.scalars(get_project_query)).first():
+                    if artifact_id:
+                        project.artifact_id = artifact_id
+                    if workflow_permanent_id:
+                        project.workflow_permanent_id = workflow_permanent_id
+                    if run_id:
+                        project.run_id = run_id
+                    if version:
+                        project.version = version
+                    await session.commit()
+                    await session.refresh(project)
+                    return convert_to_project(project)
+                else:
+                    raise NotFoundError("Project not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except NotFoundError:
+            LOG.error("No project found to update", project_id=project_id)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_projects(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[Project]:
+        try:
+            async with self.Session() as session:
+                # Calculate offset for pagination
+                offset = (page - 1) * page_size
+
+                # Subquery to get the latest version of each project
+                latest_versions_subquery = (
+                    select(ProjectModel.project_id, func.max(ProjectModel.version).label("latest_version"))
+                    .filter_by(organization_id=organization_id)
+                    .filter(ProjectModel.deleted_at.is_(None))
+                    .group_by(ProjectModel.project_id)
+                    .subquery()
+                )
+
+                # Main query to get projects with their latest versions
+                get_projects_query = (
+                    select(ProjectModel)
+                    .join(
+                        latest_versions_subquery,
+                        and_(
+                            ProjectModel.project_id == latest_versions_subquery.c.project_id,
+                            ProjectModel.version == latest_versions_subquery.c.latest_version,
+                        ),
+                    )
+                    .filter_by(organization_id=organization_id)
+                    .filter(ProjectModel.deleted_at.is_(None))
+                    .order_by(ProjectModel.created_at.desc())
+                    .limit(page_size)
+                    .offset(offset)
+                )
+                projects = (await session.scalars(get_projects_query)).all()
+                return [convert_to_project(project) for project in projects]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_project(
+        self,
+        project_id: str,
+        organization_id: str,
+        version: int | None = None,
+    ) -> Project | None:
+        """Get a specific project by ID and optionally by version."""
+        try:
+            async with self.Session() as session:
+                get_project_query = (
+                    select(ProjectModel)
+                    .filter_by(project_id=project_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(ProjectModel.deleted_at.is_(None))
+                )
+
+                if version is not None:
+                    get_project_query = get_project_query.filter_by(version=version)
+                else:
+                    # Get the latest version
+                    get_project_query = get_project_query.order_by(desc(ProjectModel.version)).limit(1)
+
+                if project := (await session.scalars(get_project_query)).first():
+                    return convert_to_project(project)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def create_project_file(
+        self,
+        project_revision_id: str,
+        project_id: str,
+        organization_id: str,
+        file_path: str,
+        file_name: str,
+        file_type: str,
+        content_hash: str | None = None,
+        file_size: int | None = None,
+        mime_type: str | None = None,
+        encoding: str = "utf-8",
+        artifact_id: str | None = None,
+    ) -> None:
+        """Create a project file record."""
+        try:
+            async with self.Session() as session:
+                project_file = ProjectFileModel(
+                    project_revision_id=project_revision_id,
+                    project_id=project_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    content_hash=content_hash,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                    encoding=encoding,
+                    artifact_id=artifact_id,
+                )
+                session.add(project_file)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def delete_project_files(
+        self,
+        project_revision_id: str,
+        organization_id: str,
+    ) -> None:
+        """Delete all files for a project revision."""
+        try:
+            async with self.Session() as session:
+                delete_files_query = (
+                    delete(ProjectFileModel)
+                    .where(ProjectFileModel.project_revision_id == project_revision_id)
+                    .where(ProjectFileModel.organization_id == organization_id)
+                )
+                await session.execute(delete_files_query)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
