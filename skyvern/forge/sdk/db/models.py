@@ -770,6 +770,7 @@ class DebugSessionModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="created")
 
 
 class ProjectModel(Base):
