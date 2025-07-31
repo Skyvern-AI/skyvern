@@ -164,17 +164,17 @@ const nodeLibraryItems: Array<{
     title: "File Parser Block",
     description: "Parse data from files",
   },
-  {
-    nodeType: "pdfParser",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.PDFParser}
-        className="size-6"
-      />
-    ),
-    title: "PDF Parser Block",
-    description: "Extract data from PDF files",
-  },
+  // {
+  //   nodeType: "pdfParser",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.PDFParser}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "PDF Parser Block",
+  //   description: "Extract data from PDF files",
+  // },
   {
     nodeType: "upload",
     icon: (

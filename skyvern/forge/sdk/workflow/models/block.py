@@ -2371,19 +2371,11 @@ class FileParserBlock(Block):
     def _detect_file_type_from_url(self, file_url: str) -> FileType:
         """Detect file type based on file extension in the URL."""
         url_lower = file_url.lower()
-        LOG.debug(
-            "FileParserBlock: Detecting file type from URL",
-            file_url=file_url,
-            url_lower=url_lower,
-        )
         if url_lower.endswith((".xlsx", ".xls")):
-            LOG.debug("FileParserBlock: Detected Excel file type")
             return FileType.EXCEL
         elif url_lower.endswith(".pdf"):
-            LOG.debug("FileParserBlock: Detected PDF file type")
             return FileType.PDF
         else:
-            LOG.debug("FileParserBlock: Defaulting to CSV file type")
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
@@ -2512,6 +2504,7 @@ class FileParserBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        
         if (
             self.file_url
             and workflow_run_context.has_parameter(self.file_url)
@@ -2546,16 +2539,17 @@ class FileParserBlock(Block):
 
         # Auto-detect file type based on file extension
         detected_file_type = self._detect_file_type_from_url(self.file_url)
-        LOG.debug(
-            "FileParserBlock: Auto-detected file type",
-            original_file_type=self.file_type,
-            detected_file_type=detected_file_type,
-            file_url=self.file_url,
-        )
         self.file_type = detected_file_type
 
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
+
+        LOG.debug(
+            "FileParserBlock: After file type validation",
+            file_type=self.file_type,
+            json_schema_present=self.json_schema is not None,
+            json_schema_type=type(self.json_schema),
+        )
 
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]
@@ -2583,6 +2577,7 @@ class FileParserBlock(Block):
             json_schema_type=type(self.json_schema),
             json_schema=self.json_schema,
         )
+        
         if self.json_schema:
             try:
                 ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)
