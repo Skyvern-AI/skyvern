@@ -2425,17 +2425,16 @@ class FileParserBlock(Block):
         self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
     ) -> dict[str, Any]:
         """Extract structured data using AI based on json_schema."""
-        if not self.json_schema:
-            # Default schema for general extraction
-            self.json_schema = {
-                "type": "object",
-                "properties": {
-                    "output": {
-                        "type": "object",
-                        "description": "Information extracted from the file",
-                    }
-                },
-            }
+        # Use local variable to avoid mutating the instance
+        schema_to_use = self.json_schema or {
+            "type": "object",
+            "properties": {
+                "output": {
+                    "type": "object",
+                    "description": "Information extracted from the file",
+                }
+            },
+        }
 
         # Convert content to string for AI processing
         if isinstance(content, list):
@@ -2445,7 +2444,7 @@ class FileParserBlock(Block):
             content_str = content
 
         llm_prompt = prompt_engine.load_prompt(
-            "extract-information-from-file-text", extracted_text_content=content_str, json_schema=self.json_schema
+            "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use
         )
         llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
         return llm_response

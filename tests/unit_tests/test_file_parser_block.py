@@ -180,7 +180,7 @@ class TestFileParserBlock:
                 result = await file_parser_block._extract_with_ai("Some text content", MagicMock())
 
                 assert result == mock_response
-                # Should have set a default schema
-                assert file_parser_block.json_schema is not None
+                # Should NOT mutate the instance - json_schema should remain None
+                assert file_parser_block.json_schema is None
                 mock_llm.assert_called_once()
                 mock_prompt.assert_called_once()
