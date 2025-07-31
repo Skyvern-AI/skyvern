@@ -718,9 +718,9 @@ class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
         super().__init__(f"Browser session {browser_session_id} is already occupied")
 
 
-class MissingBrowserSessionError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} does not exist.")
+class BrowserSessionNotRenewable(SkyvernException):
+    def __init__(self, reason: str, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")
 
 
 class MissingBrowserAddressError(SkyvernException):
