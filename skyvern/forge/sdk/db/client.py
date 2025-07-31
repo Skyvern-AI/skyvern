@@ -3417,6 +3417,9 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
                     .filter_by(user_id=user_id)
+                    .filter_by(deleted_at=None)
+                    .filter_by(status="created")
+                    .order_by(DebugSessionModel.created_at.desc())
                 )
             ).first()
 
@@ -3424,6 +3427,37 @@ class AgentDB:
                 return None
 
             return DebugSession.model_validate(debug_session)
+
+    async def complete_debug_sessions(
+        self,
+        *,
+        organization_id: str,
+        user_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+    ) -> list[DebugSession]:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(status="created")
+            )
+
+            if user_id:
+                query = query.filter_by(user_id=user_id)
+            if workflow_permanent_id:
+                query = query.filter_by(workflow_permanent_id=workflow_permanent_id)
+
+            models = (await session.scalars(query)).all()
+
+            for model in models:
+                model.status = "completed"
+
+            debug_sessions = [DebugSession.model_validate(model) for model in models]
+
+            await session.commit()
+
+            return debug_sessions
 
     async def create_debug_session(
         self,
@@ -3439,6 +3473,7 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 user_id=user_id,
                 browser_session_id=browser_session_id,
+                status="created",
             )
 
             session.add(debug_session)
