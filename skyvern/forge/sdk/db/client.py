@@ -3481,25 +3481,3 @@ class AgentDB:
             await session.refresh(debug_session)
 
             return DebugSession.model_validate(debug_session)
-
-    async def update_debug_session(
-        self,
-        *,
-        debug_session_id: str,
-        browser_session_id: str | None = None,
-    ) -> DebugSession:
-        async with self.Session() as session:
-            debug_session = (
-                await session.scalars(select(DebugSessionModel).filter_by(debug_session_id=debug_session_id))
-            ).first()
-
-            if not debug_session:
-                raise NotFoundError(f"Debug session {debug_session_id} not found")
-
-            if browser_session_id:
-                debug_session.browser_session_id = browser_session_id
-
-            await session.commit()
-            await session.refresh(debug_session)
-
-            return DebugSession.model_validate(debug_session)
