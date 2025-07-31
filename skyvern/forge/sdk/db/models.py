@@ -36,6 +36,7 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_project_file_id,
     generate_project_id,
     generate_project_revision_id,
     generate_step_id,
@@ -785,8 +786,6 @@ class ProjectModel(Base):
     project_revision_id = Column(String, primary_key=True, default=generate_project_revision_id)
     project_id = Column(String, default=generate_project_id, nullable=False)  # User-facing, consistent across versions
     organization_id = Column(String, nullable=False)
-    # the artifact id for the code
-    artifact_id = Column(String, nullable=True)
     # the wpid that this project is associated with
     workflow_permanent_id = Column(String, nullable=True)
     # The workflow run or task run id that this project is generated
@@ -799,4 +798,33 @@ class ProjectModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class ProjectFileModel(Base):
+    __tablename__ = "project_files"
+    __table_args__ = (
+        Index("file_project_path_index", "project_revision_id", "file_path"),
+        UniqueConstraint("project_revision_id", "file_path", name="unique_project_file_path"),
+    )
+
+    file_id = Column(String, primary_key=True, default=generate_project_file_id)
+    project_revision_id = Column(String, nullable=False)
+    project_id = Column(String, nullable=False)
+    organization_id = Column(String, nullable=False)
+
+    file_path = Column(String, nullable=False)  # e.g., "src/utils.py"
+    file_name = Column(String, nullable=False)  # e.g., "utils.py"
+    file_type = Column(String, nullable=False)  # "file" or "directory"
+
+    # File content and metadata
+    content_hash = Column(String, nullable=True)  # SHA-256 hash for deduplication
+    file_size = Column(Integer, nullable=True)  # Size in bytes
+    mime_type = Column(String, nullable=True)  # e.g., "text/python"
+    encoding = Column(String, default="utf-8", nullable=True)
+
+    # Storage reference (could be S3 key, artifact_id, etc.)
+    artifact_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
