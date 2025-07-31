@@ -2422,10 +2422,10 @@ class FileParserBlock(Block):
         # Replace NaN and NaT values with "nan" string
         df_cleaned = df.replace({pd.NA: "nan", pd.NaT: "nan"})
         df_cleaned = df_cleaned.where(pd.notna(df_cleaned), "nan")
-        
+
         # Convert to list of dictionaries
         records = df_cleaned.to_dict("records")
-        
+
         # Additional cleaning for any remaining problematic values
         for record in records:
             for key, value in record.items():
@@ -2434,7 +2434,7 @@ class FileParserBlock(Block):
                 elif isinstance(value, (pd.Timestamp, pd.DatetimeTZDtype)):
                     # Convert pandas timestamps to ISO format strings
                     record[key] = value.isoformat() if pd.notna(value) else "nan"
-        
+
         return records
 
     async def _parse_excel_file(self, file_path: str) -> list[dict[str, Any]]:
@@ -2504,7 +2504,7 @@ class FileParserBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-        
+
         if (
             self.file_url
             and workflow_run_context.has_parameter(self.file_url)
@@ -2577,7 +2577,7 @@ class FileParserBlock(Block):
             json_schema_type=type(self.json_schema),
             json_schema=self.json_schema,
         )
-        
+
         if self.json_schema:
             try:
                 ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)

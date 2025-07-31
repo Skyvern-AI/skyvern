@@ -202,28 +202,30 @@ class TestFileParserBlock:
     def test_clean_dataframe_for_json(self, file_parser_block):
         """Test DataFrame cleaning for JSON serialization."""
         # Create a DataFrame with NaN, NaT, and timestamp values
-        df = pd.DataFrame({
-            'OrderDate': ['2018-01-01', pd.NaT, '2018-01-03'],
-            'Region': ['North', 'South', pd.NA],
-            'Sales': [1000.0, pd.NA, 3000.0],
-            'Timestamp': [pd.Timestamp('2018-01-01'), pd.NaT, pd.Timestamp('2018-01-03')]
-        })
-        
+        df = pd.DataFrame(
+            {
+                "OrderDate": ["2018-01-01", pd.NaT, "2018-01-03"],
+                "Region": ["North", "South", pd.NA],
+                "Sales": [1000.0, pd.NA, 3000.0],
+                "Timestamp": [pd.Timestamp("2018-01-01"), pd.NaT, pd.Timestamp("2018-01-03")],
+            }
+        )
+
         # Clean the DataFrame
         result = file_parser_block._clean_dataframe_for_json(df)
-        
+
         # Check that NaN and NaT values are converted to "nan" string
-        assert result[0]['OrderDate'] == '2018-01-01'
-        assert result[0]['Region'] == 'North'
-        assert result[0]['Sales'] == 1000.0
-        assert result[0]['Timestamp'] == '2018-01-01T00:00:00'
-        
-        assert result[1]['OrderDate'] == 'nan'
-        assert result[1]['Region'] == 'South'
-        assert result[1]['Sales'] == 'nan'
-        assert result[1]['Timestamp'] == 'nan'
-        
-        assert result[2]['OrderDate'] == '2018-01-03'
-        assert result[2]['Region'] == 'nan'
-        assert result[2]['Sales'] == 3000.0
-        assert result[2]['Timestamp'] == '2018-01-03T00:00:00'
+        assert result[0]["OrderDate"] == "2018-01-01"
+        assert result[0]["Region"] == "North"
+        assert result[0]["Sales"] == 1000.0
+        assert result[0]["Timestamp"] == "2018-01-01T00:00:00"
+
+        assert result[1]["OrderDate"] == "nan"
+        assert result[1]["Region"] == "South"
+        assert result[1]["Sales"] == "nan"
+        assert result[1]["Timestamp"] == "nan"
+
+        assert result[2]["OrderDate"] == "2018-01-03"
+        assert result[2]["Region"] == "nan"
+        assert result[2]["Sales"] == 3000.0
+        assert result[2]["Timestamp"] == "2018-01-03T00:00:00"
