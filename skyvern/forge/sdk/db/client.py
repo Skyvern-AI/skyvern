@@ -3256,6 +3256,7 @@ class AgentDB:
         credential_type: CredentialType,
         organization_id: str,
         item_id: str,
+        totp_type: str = "none",
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
@@ -3263,6 +3264,7 @@ class AgentDB:
                 name=name,
                 credential_type=credential_type,
                 item_id=item_id,
+                totp_type=totp_type,
             )
             session.add(credential)
             await session.commit()
