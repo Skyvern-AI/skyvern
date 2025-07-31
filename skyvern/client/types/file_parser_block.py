@@ -15,6 +15,7 @@ class FileParserBlock(UniversalBaseModel):
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
     file_type: FileType = "csv"
+    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

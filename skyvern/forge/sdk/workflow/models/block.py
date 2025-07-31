@@ -21,6 +21,7 @@ from typing import Annotated, Any, Awaitable, Callable, Literal, Union
 from urllib.parse import quote, urlparse
 
 import filetype
+import pandas as pd
 import structlog
 from email_validator import EmailNotValidError, validate_email
 from jinja2.sandbox import SandboxedEnvironment
@@ -2342,6 +2343,8 @@ class SendEmailBlock(Block):
 
 class FileType(StrEnum):
     CSV = "csv"
+    EXCEL = "excel"
+    PDF = "pdf"
 
 
 class FileParserBlock(Block):
@@ -2349,6 +2352,7 @@ class FileParserBlock(Block):
 
     file_url: str
     file_type: FileType
+    json_schema: dict[str, Any] | None = None
 
     def get_all_parameters(
         self,
@@ -2371,6 +2375,80 @@ class FileParserBlock(Block):
                     csv.Sniffer().sniff(file.read(1024))
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+        elif self.file_type == FileType.EXCEL:
+            try:
+                # Try to read the file with pandas to validate it's a valid Excel file
+                pd.read_excel(file_path, nrows=1)
+            except Exception as e:
+                raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+        elif self.file_type == FileType.PDF:
+            try:
+                # Try to read the file with PyPDF to validate it's a valid PDF file
+                reader = PdfReader(file_path)
+                # Just check if we can access pages, don't read content yet
+                _ = len(reader.pages)
+            except Exception as e:
+                raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+
+    async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
+        """Parse CSV file and return list of dictionaries."""
+        parsed_data = []
+        with open(file_path) as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                parsed_data.append(row)
+        return parsed_data
+
+    async def _parse_excel_file(self, file_path: str) -> list[dict[str, Any]]:
+        """Parse Excel file and return list of dictionaries."""
+        try:
+            # Read Excel file with pandas
+            df = pd.read_excel(file_path)
+            # Convert DataFrame to list of dictionaries
+            return df.to_dict('records')
+        except Exception as e:
+            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+
+    async def _parse_pdf_file(self, file_path: str) -> str:
+        """Parse PDF file and return extracted text."""
+        try:
+            reader = PdfReader(file_path)
+            extracted_text = ""
+            page_count = len(reader.pages)
+            for i in range(page_count):
+                extracted_text += reader.pages[i].extract_text() + "\n"
+            return extracted_text
+        except PdfReadError as e:
+            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+
+    async def _extract_with_ai(self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext) -> dict[str, Any]:
+        """Extract structured data using AI based on json_schema."""
+        if not self.json_schema:
+            # Default schema for general extraction
+            self.json_schema = {
+                "type": "object",
+                "properties": {
+                    "output": {
+                        "type": "object",
+                        "description": "Information extracted from the file",
+                    }
+                },
+            }
+
+        # Convert content to string for AI processing
+        if isinstance(content, list):
+            # For CSV/Excel data, convert to a readable format
+            content_str = json.dumps(content, indent=2)
+        else:
+            content_str = content
+
+        llm_prompt = prompt_engine.load_prompt(
+            "extract-information-from-file-text", 
+            extracted_text_content=content_str, 
+            json_schema=self.json_schema
+        )
+        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+        return llm_response
 
     async def execute(
         self,
@@ -2412,21 +2490,52 @@ class FileParserBlock(Block):
             file_path = await download_from_s3(self.get_async_aws_client(), self.file_url)
         else:
             file_path = await download_file(self.file_url)
+
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
-        # Parse the file into a list of dictionaries where each dictionary represents a row in the file
-        parsed_data = []
-        with open(file_path) as file:
-            if self.file_type == FileType.CSV:
-                reader = csv.DictReader(file)
-                for row in reader:
-                    parsed_data.append(row)
+
+        # Parse the file based on type
+        if self.file_type == FileType.CSV:
+            parsed_data = await self._parse_csv_file(file_path)
+        elif self.file_type == FileType.EXCEL:
+            parsed_data = await self._parse_excel_file(file_path)
+        elif self.file_type == FileType.PDF:
+            extracted_text = await self._parse_pdf_file(file_path)
+            parsed_data = extracted_text
+        else:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Unsupported file type: {self.file_type}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # If json_schema is provided, use AI to extract structured data
+        if self.json_schema:
+            try:
+                ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)
+                final_data = ai_extracted_data
+            except Exception as e:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to extract data with AI: {str(e)}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+        else:
+            # Return raw parsed data
+            final_data = parsed_data
+
         # Record the parsed data
-        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, parsed_data)
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, final_data)
         return await self.build_block_result(
             success=True,
             failure_reason=None,
-            output_parameter_value=parsed_data,
+            output_parameter_value=final_data,
             status=BlockStatus.completed,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
@@ -2434,6 +2543,10 @@ class FileParserBlock(Block):
 
 
 class PDFParserBlock(Block):
+    """
+    DEPRECATED: Use FileParserBlock with file_type=FileType.PDF instead.
+    This block will be removed in a future version.
+    """
     block_type: Literal[BlockType.PDF_PARSER] = BlockType.PDF_PARSER
 
     file_url: str
