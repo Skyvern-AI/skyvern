@@ -1259,7 +1259,10 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
         file_type: "csv", // Will be overridden by backend based on file extension
-        json_schema: JSONParseSafe(node.data.jsonSchema),
+        json_schema:
+          node.data.jsonSchema && node.data.jsonSchema !== "null"
+            ? JSONParseSafe(node.data.jsonSchema)
+            : null,
       };
     }
     case "textPrompt": {

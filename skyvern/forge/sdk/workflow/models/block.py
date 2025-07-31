@@ -2371,11 +2371,19 @@ class FileParserBlock(Block):
     def _detect_file_type_from_url(self, file_url: str) -> FileType:
         """Detect file type based on file extension in the URL."""
         url_lower = file_url.lower()
+        LOG.debug(
+            "FileParserBlock: Detecting file type from URL",
+            file_url=file_url,
+            url_lower=url_lower,
+        )
         if url_lower.endswith((".xlsx", ".xls")):
+            LOG.debug("FileParserBlock: Detected Excel file type")
             return FileType.EXCEL
         elif url_lower.endswith(".pdf"):
+            LOG.debug("FileParserBlock: Detected PDF file type")
             return FileType.PDF
         else:
+            LOG.debug("FileParserBlock: Defaulting to CSV file type")
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
@@ -2417,13 +2425,33 @@ class FileParserBlock(Block):
                 parsed_data.append(row)
         return parsed_data
 
+    def _clean_dataframe_for_json(self, df: pd.DataFrame) -> list[dict[str, Any]]:
+        """Clean DataFrame to ensure it can be serialized to JSON."""
+        # Replace NaN and NaT values with "nan" string
+        df_cleaned = df.replace({pd.NA: "nan", pd.NaT: "nan"})
+        df_cleaned = df_cleaned.where(pd.notna(df_cleaned), "nan")
+        
+        # Convert to list of dictionaries
+        records = df_cleaned.to_dict("records")
+        
+        # Additional cleaning for any remaining problematic values
+        for record in records:
+            for key, value in record.items():
+                if pd.isna(value) or value == "NaN" or value == "NaT":
+                    record[key] = "nan"
+                elif isinstance(value, (pd.Timestamp, pd.DatetimeTZDtype)):
+                    # Convert pandas timestamps to ISO format strings
+                    record[key] = value.isoformat() if pd.notna(value) else "nan"
+        
+        return records
+
     async def _parse_excel_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse Excel file and return list of dictionaries."""
         try:
             # Read Excel file with pandas, specifying engine explicitly
             df = pd.read_excel(file_path, engine="openpyxl")
-            # Convert DataFrame to list of dictionaries
-            return df.to_dict("records")
+            # Clean and convert DataFrame to list of dictionaries
+            return self._clean_dataframe_for_json(df)
         except ImportError as e:
             raise InvalidFileType(
                 file_url=self.file_url,
@@ -2518,6 +2546,12 @@ class FileParserBlock(Block):
 
         # Auto-detect file type based on file extension
         detected_file_type = self._detect_file_type_from_url(self.file_url)
+        LOG.debug(
+            "FileParserBlock: Auto-detected file type",
+            original_file_type=self.file_type,
+            detected_file_type=detected_file_type,
+            file_url=self.file_url,
+        )
         self.file_type = detected_file_type
 
         # Validate the file type
@@ -2543,6 +2577,12 @@ class FileParserBlock(Block):
 
         # If json_schema is provided, use AI to extract structured data
         final_data: str | list[dict[str, Any]] | dict[str, Any]
+        LOG.debug(
+            "FileParserBlock: JSON schema check",
+            has_json_schema=self.json_schema is not None,
+            json_schema_type=type(self.json_schema),
+            json_schema=self.json_schema,
+        )
         if self.json_schema:
             try:
                 ai_extracted_data = await self._extract_with_ai(parsed_data, workflow_run_context)
