@@ -190,12 +190,15 @@ function WorkflowRun() {
       {!isEmbedded && (
         <header className="flex justify-between">
           <div className="space-y-3">
-            <div className="flex items-center gap-5">
+            <div className="mr-2 flex items-start gap-5">
               {title}
               {workflowRunIsLoading ? (
                 <Skeleton className="h-8 w-28" />
               ) : workflowRun ? (
-                <StatusBadge status={workflowRun?.status} />
+                <StatusBadge
+                  className="mt-[0.27rem]"
+                  status={workflowRun?.status}
+                />
               ) : null}
             </div>
             <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
