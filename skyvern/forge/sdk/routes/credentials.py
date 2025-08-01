@@ -3,6 +3,7 @@ from fastapi import Body, Depends, HTTPException, Path, Query
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE,
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD,
@@ -19,7 +20,11 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreditCardCredentialResponse,
     PasswordCredentialResponse,
 )
-from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.organizations import (
+    CreateOnePasswordTokenRequest,
+    CreateOnePasswordTokenResponse,
+    Organization,
+)
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
@@ -367,3 +372,117 @@ async def get_credentials(
                 )
             )
     return response_items
+
+
+@base_router.get(
+    "/credentials/onepassword",
+    response_model=CreateOnePasswordTokenResponse,
+    summary="Get OnePassword service account token",
+    description="Retrieves the current OnePassword service account token for the organization.",
+    tags=["Auth Tokens"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_onepassword_token",
+    },
+)
+@base_router.get(
+    "/credentials/onepassword/",
+    response_model=CreateOnePasswordTokenResponse,
+    include_in_schema=False,
+)
+async def get_onepassword_token(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CreateOnePasswordTokenResponse:
+    """
+    Get the current OnePassword service account token for the organization.
+    """
+    try:
+        auth_token = await app.DATABASE.get_valid_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.onepassword_service_account,
+        )
+
+        if not auth_token:
+            raise HTTPException(
+                status_code=404,
+                detail="No OnePassword service account token found for this organization",
+            )
+
+        return CreateOnePasswordTokenResponse(token=auth_token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.error(
+            "Failed to get OnePassword service account token",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get OnePassword service account token: {str(e)}",
+        )
+
+
+@base_router.post(
+    "/credentials/onepassword",
+    response_model=CreateOnePasswordTokenResponse,
+    summary="Create or update OnePassword service account token",
+    description="Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
+    tags=["Auth Tokens"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_onepassword_token",
+    },
+)
+@base_router.post(
+    "/credentials/onepassword/",
+    response_model=CreateOnePasswordTokenResponse,
+    include_in_schema=False,
+)
+async def update_onepassword_token(
+    data: CreateOnePasswordTokenRequest = Body(
+        ...,
+        description="The OnePassword token data",
+        openapi_extra={"x-fern-sdk-parameter-name": "data"},
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CreateOnePasswordTokenResponse:
+    """
+    Create or update a OnePassword service account token for the current organization.
+
+    This endpoint ensures only one valid OnePassword token exists per organization.
+    If a valid token already exists, it will be invalidated before creating the new one.
+    """
+    try:
+        # Invalidate any existing valid OnePassword tokens for this organization
+        await app.DATABASE.invalidate_org_auth_tokens(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.onepassword_service_account,
+        )
+
+        # Create the new token
+        auth_token = await app.DATABASE.create_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.onepassword_service_account,
+            token=data.token,
+        )
+
+        LOG.info(
+            "Created or updated OnePassword service account token",
+            organization_id=current_org.organization_id,
+            token_id=auth_token.id,
+        )
+
+        return CreateOnePasswordTokenResponse(token=auth_token)
+
+    except Exception as e:
+        LOG.error(
+            "Failed to create or update OnePassword service account token",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create or update OnePassword service account token: {str(e)}",
+        )
