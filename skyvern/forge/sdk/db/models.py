@@ -5,7 +5,6 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
-    Enum,
     ForeignKey,
     Index,
     Integer,
@@ -18,7 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
     generate_ai_suggestion_id,
@@ -167,7 +166,7 @@ class OrganizationAuthTokenModel(Base):
     )
 
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
-    token_type = Column(Enum(OrganizationAuthTokenType), nullable=False)
+    token_type = Column(String, nullable=False)
     token = Column(String, index=True, nullable=False)
     valid = Column(Boolean, nullable=False, default=True)
 
