@@ -4,7 +4,6 @@ import hashlib
 import structlog
 from fastapi import Depends, HTTPException, Path, Query
 
-from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -41,12 +40,6 @@ async def create_project(
         organization_id=organization_id,
         file_count=len(data.files) if data.files else 0,
     )
-    # validate workflow_id and run_id
-    if data.workflow_id:
-        if not await app.DATABASE.get_workflow_by_permanent_id(
-            workflow_permanent_id=data.workflow_id, organization_id=organization_id
-        ):
-            raise WorkflowNotFound(workflow_permanent_id=data.workflow_id)
     if data.run_id:
         if not await app.DATABASE.get_run(run_id=data.run_id, organization_id=organization_id):
             raise HTTPException(status_code=404, detail=f"Run_id {data.run_id} not found")
@@ -54,7 +47,6 @@ async def create_project(
         # Create the project in the database
         project = await app.DATABASE.create_project(
             organization_id=organization_id,
-            workflow_permanent_id=data.workflow_id,
             run_id=data.run_id,
         )
         # Process files if provided
@@ -72,7 +64,6 @@ async def create_project(
         return CreateProjectResponse(
             project_id=project.project_id,
             version=project.version,
-            workflow_id=project.workflow_id,
             run_id=project.run_id,
             file_count=file_count,
             created_at=project.created_at,
@@ -221,7 +212,6 @@ async def deploy_project(
         new_version = latest_project.version + 1
         new_project_revision = await app.DATABASE.create_project(
             organization_id=current_org.organization_id,
-            workflow_permanent_id=latest_project.workflow_id,
             run_id=latest_project.run_id,
             project_id=project_id,  # Use the same project_id for versioning
             version=new_version,
@@ -265,7 +255,6 @@ async def deploy_project(
         return CreateProjectResponse(
             project_id=new_project_revision.project_id,
             version=new_project_revision.version,
-            workflow_id=new_project_revision.workflow_id,
             run_id=new_project_revision.run_id,
             file_count=file_count,
             created_at=new_project_revision.created_at,

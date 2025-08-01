@@ -3489,7 +3489,6 @@ class AgentDB:
     async def create_project(
         self,
         organization_id: str,
-        workflow_permanent_id: str | None = None,
         run_id: str | None = None,
         project_id: str | None = None,
         version: int | None = None,
@@ -3498,7 +3497,6 @@ class AgentDB:
             async with self.Session() as session:
                 project = ProjectModel(
                     organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
                     run_id=run_id,
                 )
                 if project_id:
@@ -3518,7 +3516,6 @@ class AgentDB:
         project_revision_id: str,
         organization_id: str,
         artifact_id: str | None = None,
-        workflow_permanent_id: str | None = None,
         run_id: str | None = None,
         version: int | None = None,
     ) -> Project:
@@ -3532,8 +3529,6 @@ class AgentDB:
                 if project := (await session.scalars(get_project_query)).first():
                     if artifact_id:
                         project.artifact_id = artifact_id
-                    if workflow_permanent_id:
-                        project.workflow_permanent_id = workflow_permanent_id
                     if run_id:
                         project.run_id = run_id
                     if version:
