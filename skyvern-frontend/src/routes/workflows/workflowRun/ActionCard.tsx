@@ -13,7 +13,8 @@ type Props = {
 };
 
 function ActionCard({ action, onClick, active, index }: Props) {
-  const success = action.status === Status.Completed;
+  const success =
+    action.status === Status.Completed || action.status === Status.Skipped;
 
   const refCallback = useCallback((element: HTMLDivElement | null) => {
     if (element && active) {
