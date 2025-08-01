@@ -238,6 +238,43 @@ class ArtifactManager:
             path=path,
         )
 
+    async def create_project_file_artifact(
+        self,
+        *,
+        organization_id: str,
+        project_id: str,
+        project_version: int,
+        file_path: str,
+        data: bytes,
+    ) -> str:
+        """Create an artifact for a project file.
+
+        Args:
+            organization_id: The organization ID
+            project_id: The project ID
+            project_version: The project version
+            file_path: The file path relative to project root
+            data: The file content as bytes
+
+        Returns:
+            The artifact ID
+        """
+        artifact_id = generate_artifact_id()
+        uri = app.STORAGE.build_project_file_uri(
+            organization_id=organization_id,
+            project_id=project_id,
+            project_version=project_version,
+            file_path=file_path,
+        )
+        return await self._create_artifact(
+            aio_task_primary_key=f"{project_id}_{project_version}",
+            artifact_id=artifact_id,
+            artifact_type=ArtifactType.PROJECT_FILE,
+            uri=uri,
+            organization_id=organization_id,
+            data=data,
+        )
+
     async def create_llm_artifact(
         self,
         data: bytes,
