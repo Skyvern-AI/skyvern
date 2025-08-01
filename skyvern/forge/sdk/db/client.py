@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, desc, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, delete, distinct, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -3638,7 +3638,7 @@ class AgentDB:
                     get_project_query = get_project_query.filter_by(version=version)
                 else:
                     # Get the latest version
-                    get_project_query = get_project_query.order_by(desc(ProjectModel.version)).limit(1)
+                    get_project_query = get_project_query.order_by(ProjectModel.version.desc()).limit(1)
 
                 if project := (await session.scalars(get_project_query)).first():
                     return convert_to_project(project)
@@ -3681,28 +3681,6 @@ class AgentDB:
                     artifact_id=artifact_id,
                 )
                 session.add(project_file)
-                await session.commit()
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
-
-    async def delete_project_files(
-        self,
-        project_revision_id: str,
-        organization_id: str,
-    ) -> None:
-        """Delete all files for a project revision."""
-        try:
-            async with self.Session() as session:
-                delete_files_query = (
-                    delete(ProjectFileModel)
-                    .where(ProjectFileModel.project_revision_id == project_revision_id)
-                    .where(ProjectFileModel.organization_id == organization_id)
-                )
-                await session.execute(delete_files_query)
                 await session.commit()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
