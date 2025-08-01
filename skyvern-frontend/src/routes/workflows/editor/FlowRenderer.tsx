@@ -16,6 +16,7 @@ import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -269,11 +270,11 @@ function FlowRenderer({
   const queryClient = useQueryClient();
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
+  const { title, initializeTitle } = useWorkflowTitleStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const [parameters, setParameters] =
     useState<ParametersState>(initialParameters);
-  const [title, setTitle] = useState(initialTitle);
   const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
@@ -283,6 +284,11 @@ function FlowRenderer({
       setShouldConstrainPan(true);
     }
   }, [nodesInitialized]);
+
+  useEffect(() => {
+    initializeTitle(initialTitle);
+  }, [initialTitle, initializeTitle]);
+
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
   useShouldNotifyWhenClosingTab(hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
@@ -799,12 +805,7 @@ function FlowRenderer({
             <Panel position="top-center" className={cn("h-20")}>
               <WorkflowHeader
                 debuggableBlockCount={debuggableBlockCount}
-                title={title}
                 saving={saveWorkflowMutation.isPending}
-                onTitleChange={(newTitle) => {
-                  setTitle(newTitle);
-                  setHasChanges(true);
-                }}
                 parametersPanelOpen={
                   workflowPanelState.active &&
                   workflowPanelState.content === "parameters"

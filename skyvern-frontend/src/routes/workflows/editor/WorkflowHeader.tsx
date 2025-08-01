@@ -20,27 +20,27 @@ import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { useCreateWorkflowMutation } from "../hooks/useCreateWorkflowMutation";
 import { convert } from "./workflowEditorUtils";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
 
 type Props = {
   debuggableBlockCount: number;
-  title: string;
   parametersPanelOpen: boolean;
   onParametersClick: () => void;
   onSave: () => void;
-  onTitleChange: (title: string) => void;
   saving: boolean;
 };
 
 function WorkflowHeader({
   debuggableBlockCount,
-  title,
   parametersPanelOpen,
   onParametersClick,
   onSave,
-  onTitleChange,
   saving,
 }: Props) {
+  const { title, setTitle } = useWorkflowTitleStore();
+  const { setHasChanges } = useWorkflowHasChangesStore();
   const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
@@ -66,7 +66,10 @@ function WorkflowHeader({
       <div className="flex h-full items-center">
         <EditableNodeTitle
           editable={true}
-          onChange={onTitleChange}
+          onChange={(newTitle) => {
+            setTitle(newTitle);
+            setHasChanges(true);
+          }}
           value={title}
           titleClassName="text-3xl"
           inputClassName="text-3xl"
