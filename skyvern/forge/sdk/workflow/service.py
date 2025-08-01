@@ -1918,6 +1918,7 @@ class WorkflowService:
                 output_parameter=output_parameter,
                 file_url=block_yaml.file_url,
                 file_type=block_yaml.file_type,
+                json_schema=block_yaml.json_schema,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.PDF_PARSER:
