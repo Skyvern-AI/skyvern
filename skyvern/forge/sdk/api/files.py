@@ -113,15 +113,14 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
                 except Exception:
                     LOG.exception("Failed to retrieve the file extension from HTTP headers")
 
+                # parse the query params to get the file name
+                query_params = dict(parse_qsl(a.query))
+                if "download" in query_params:
+                    file_name = query_params["download"]
+
                 if not file_name:
                     LOG.info("No file name retrieved from HTTP headers, using the file name from the URL")
                     file_name = os.path.basename(a.path)
-
-                # Check for download parameter in Supabase URLs
-                if "supabase.co" in a.netloc.lower():
-                    query_params = dict(parse_qsl(a.query))
-                    if "download" in query_params:
-                        file_name = query_params["download"]
 
                 if not Path(file_name).suffix and file_suffix:
                     LOG.info("No file extension detected, adding the extension from HTTP headers")
