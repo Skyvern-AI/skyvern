@@ -3537,7 +3537,7 @@ class AgentDB:
 
     async def update_project(
         self,
-        project_id: str,
+        project_revision_id: str,
         organization_id: str,
         artifact_id: str | None = None,
         workflow_permanent_id: str | None = None,
@@ -3548,9 +3548,8 @@ class AgentDB:
             async with self.Session() as session:
                 get_project_query = (
                     select(ProjectModel)
-                    .filter_by(project_id=project_id)
                     .filter_by(organization_id=organization_id)
-                    .filter(ProjectModel.deleted_at.is_(None))
+                    .filter_by(project_revision_id=project_revision_id)
                 )
                 if project := (await session.scalars(get_project_query)).first():
                     if artifact_id:
@@ -3570,7 +3569,7 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
         except NotFoundError:
-            LOG.error("No project found to update", project_id=project_id)
+            LOG.error("No project found to update", project_revision_id=project_revision_id)
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
