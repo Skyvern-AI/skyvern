@@ -2389,12 +2389,6 @@ class FileParserBlock(Block):
             try:
                 # Try to read the file with pandas to validate it's a valid Excel file
                 pd.read_excel(file_path, nrows=1, engine="openpyxl")
-            except ImportError as e:
-                raise InvalidFileType(
-                    file_url=file_url_used,
-                    file_type=self.file_type,
-                    error=f"Missing required dependency for Excel validation: {str(e)}. Please install openpyxl: pip install openpyxl",
-                )
             except Exception as e:
                 raise InvalidFileType(
                     file_url=file_url_used, file_type=self.file_type, error=f"Invalid Excel file format: {str(e)}"
