@@ -1,12 +1,13 @@
 from datetime import datetime
+from typing import List
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
 
 class Organization(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = {"from_attributes": True}
 
     organization_id: str
     organization_name: str
@@ -15,9 +16,10 @@ class Organization(BaseModel):
     max_retries_per_step: int | None = None
     domain: str | None = None
     bw_organization_id: str | None = None
-    bw_collection_ids: list[str] | None = None
+    bw_collection_ids: List[str] | None = None
 
     created_at: datetime
+
     modified_at: datetime
 
 
@@ -29,6 +31,25 @@ class OrganizationAuthToken(BaseModel):
     valid: bool
     created_at: datetime
     modified_at: datetime
+
+
+class CreateOnePasswordTokenRequest(BaseModel):
+    """Request model for creating or updating a OnePassword service account token."""
+
+    token: str = Field(
+        ...,
+        description="The OnePassword service account token",
+        examples=["op_1234567890abcdef"],
+    )
+
+
+class CreateOnePasswordTokenResponse(BaseModel):
+    """Response model for OnePassword token operations."""
+
+    token: OrganizationAuthToken = Field(
+        ...,
+        description="The created or updated OnePassword service account token",
+    )
 
 
 class GetOrganizationsResponse(BaseModel):
