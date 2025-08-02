@@ -443,3 +443,5 @@ class WorkflowCreateYAMLRequest(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
+    use_cache: bool = False
+    cache_project_id: str | None = None

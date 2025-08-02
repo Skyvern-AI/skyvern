@@ -635,6 +635,8 @@ class WorkflowService:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         extra_http_headers: dict[str, str] | None = None,
+        use_cache: bool = False,
+        cache_project_id: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -653,6 +655,8 @@ class WorkflowService:
             is_saved_task=is_saved_task,
             status=status,
             extra_http_headers=extra_http_headers,
+            use_cache=use_cache,
+            cache_project_id=cache_project_id,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -1534,6 +1538,8 @@ class WorkflowService:
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    use_cache=request.use_cache,
+                    cache_project_id=request.cache_project_id,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1551,6 +1557,8 @@ class WorkflowService:
                     extra_http_headers=request.extra_http_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    use_cache=request.use_cache,
+                    cache_project_id=request.cache_project_id,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id
