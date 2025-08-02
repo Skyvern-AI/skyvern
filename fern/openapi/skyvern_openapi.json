@@ -1699,6 +1699,300 @@
         ]
       }
     },
+    "/v1/projects": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Create project",
+        "description": "Create a new project with optional files and metadata",
+        "operationId": "create_project_v1_projects_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateProjectResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "create_project"
+      },
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Get all projects",
+        "description": "Retrieves a paginated list of projects for the current organization",
+        "operationId": "get_projects_v1_projects_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number for pagination",
+              "examples": [
+                1
+              ],
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number for pagination"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of items per page",
+              "examples": [
+                10
+              ],
+              "default": 10,
+              "title": "Page Size"
+            },
+            "description": "Number of items per page"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Project"
+                  },
+                  "title": "Response Get Projects V1 Projects Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_projects"
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "get": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Get project by ID",
+        "description": "Retrieves a specific project by its ID",
+        "operationId": "get_project_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the project",
+              "examples": [
+                "proj_abc123"
+              ],
+              "title": "Project Id"
+            },
+            "description": "The unique identifier of the project"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Project"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_project"
+      }
+    },
+    "/v1/projects/{project_id}/deploy": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Deploy project",
+        "description": "Deploy a project with updated files, creating a new version",
+        "operationId": "deploy_project_v1_projects__project_id__deploy_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the project",
+              "examples": [
+                "proj_abc123"
+              ],
+              "title": "Project Id"
+            },
+            "description": "The unique identifier of the project"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeployProjectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateProjectResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "deploy_project"
+      }
+    },
     "/v1/run/tasks/login": {
       "post": {
         "tags": [
@@ -2451,7 +2745,8 @@
           "html_scrape",
           "html_action",
           "trace",
-          "har"
+          "har",
+          "project_file"
         ],
         "title": "ArtifactType"
       },
@@ -3444,6 +3739,137 @@
         "title": "CreateCredentialRequest",
         "description": "Request model for creating a new credential."
       },
+      "CreateProjectRequest": {
+        "properties": {
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id",
+            "description": "Associated workflow ID"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id",
+            "description": "Associated run ID"
+          },
+          "files": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ProjectFile"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files",
+            "description": "Array of files to include in the project",
+            "examples": [
+              {
+                "content": "cHJpbnQoIkhlbGxvLCBXb3JsZCEiKQ==",
+                "encoding": "base64",
+                "mime_type": "text/x-python",
+                "path": "main.py"
+              },
+              {
+                "content": "cmVxdWVzdHM9PTIuMjguMQ==",
+                "encoding": "base64",
+                "mime_type": "text/plain",
+                "path": "requirements.txt"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "title": "CreateProjectRequest"
+      },
+      "CreateProjectResponse": {
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "description": "Unique project identifier",
+            "examples": [
+              "proj_abc123"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "description": "Project version number",
+            "examples": [
+              1
+            ]
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id",
+            "description": "ID of the workflow this project is associated with"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id",
+            "description": "ID of the workflow run or task run that generated this project"
+          },
+          "file_count": {
+            "type": "integer",
+            "title": "File Count",
+            "description": "Total number of files in the project"
+          },
+          "file_tree": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FileNode"
+            },
+            "type": "object",
+            "title": "File Tree",
+            "description": "Hierarchical file tree structure"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Timestamp when the project was created"
+          }
+        },
+        "type": "object",
+        "required": [
+          "project_id",
+          "version",
+          "file_count",
+          "file_tree",
+          "created_at"
+        ],
+        "title": "CreateProjectResponse"
+      },
       "CredentialParameter": {
         "properties": {
           "parameter_type": {
@@ -3628,6 +4054,32 @@
         ],
         "title": "CreditCardCredentialResponse",
         "description": "Response model for credit card credentials, containing only the last four digits and brand."
+      },
+      "DeployProjectRequest": {
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectFile"
+            },
+            "type": "array",
+            "title": "Files",
+            "description": "Array of files to include in the project",
+            "examples": [
+              {
+                "content": "cHJpbnQoIkhlbGxvLCBXb3JsZCEiKQ==",
+                "encoding": "base64",
+                "mime_type": "text/x-python",
+                "path": "src/main.py"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "files"
+        ],
+        "title": "DeployProjectRequest",
+        "description": "Request model for deploying a project with updated files."
       },
       "DownloadToS3Block": {
         "properties": {
@@ -4489,6 +4941,14 @@
         ],
         "title": "FileDownloadBlockYAML"
       },
+      "FileEncoding": {
+        "type": "string",
+        "enum": [
+          "base64"
+        ],
+        "title": "FileEncoding",
+        "description": "Supported file content encodings."
+      },
       "FileInfo": {
         "properties": {
           "url": {
@@ -4527,6 +4987,79 @@
         ],
         "title": "FileInfo",
         "description": "Information about a downloaded file, including URL and checksum."
+      },
+      "FileNode": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "title": "Type",
+            "description": "Type of node: 'file' or 'directory'"
+          },
+          "size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size",
+            "description": "File size in bytes"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type",
+            "description": "MIME type of the file"
+          },
+          "content_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Hash",
+            "description": "SHA256 hash of file content"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Timestamp when the file was created"
+          },
+          "children": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/FileNode"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Children",
+            "description": "Child nodes for directories"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type",
+          "created_at"
+        ],
+        "title": "FileNode",
+        "description": "Model representing a file or directory in the file tree."
       },
       "FileParserBlock": {
         "properties": {
@@ -6914,6 +7447,130 @@
         ],
         "title": "PasswordCredentialResponse",
         "description": "Response model for password credentials, containing only the username."
+      },
+      "Project": {
+        "properties": {
+          "project_revision_id": {
+            "type": "string",
+            "title": "Project Revision Id",
+            "description": "Unique identifier for this specific project revision"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "description": "User-facing project identifier, consistent across versions"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id",
+            "description": "ID of the organization that owns this project"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id",
+            "description": "ID of the workflow this project is associated with"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id",
+            "description": "ID of the workflow run or task run that generated this project"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "description": "Version number of the project"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Timestamp when the project was created"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At",
+            "description": "Timestamp when the project was last modified"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At",
+            "description": "Timestamp when the project was soft deleted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "project_revision_id",
+          "project_id",
+          "organization_id",
+          "version",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "Project"
+      },
+      "ProjectFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "File path relative to project root",
+            "examples": [
+              "src/main.py"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "Base64 encoded file content"
+          },
+          "encoding": {
+            "$ref": "#/components/schemas/FileEncoding",
+            "description": "Content encoding",
+            "default": "base64"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type",
+            "description": "MIME type (auto-detected if not provided)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "title": "ProjectFile",
+        "description": "Model representing a file in a project."
       },
       "ProxyLocation": {
         "type": "string",
