@@ -499,7 +499,6 @@ def convert_to_project(project_model: ProjectModel) -> Project:
         project_revision_id=project_model.project_revision_id,
         project_id=project_model.project_id,
         organization_id=project_model.organization_id,
-        workflow_id=project_model.workflow_permanent_id,
         run_id=project_model.run_id,
         version=project_model.version,
         created_at=project_model.created_at,

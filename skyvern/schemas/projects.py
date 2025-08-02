@@ -75,7 +75,6 @@ class DeployProjectRequest(BaseModel):
 class CreateProjectResponse(BaseModel):
     project_id: str = Field(..., description="Unique project identifier", examples=["proj_abc123"])
     version: int = Field(..., description="Project version number", examples=[1])
-    workflow_id: str | None = Field(default=None, description="ID of the workflow this project is associated with")
     run_id: str | None = Field(
         default=None, description="ID of the workflow run or task run that generated this project"
     )
@@ -90,7 +89,6 @@ class Project(BaseModel):
     project_revision_id: str = Field(description="Unique identifier for this specific project revision")
     project_id: str = Field(description="User-facing project identifier, consistent across versions")
     organization_id: str = Field(description="ID of the organization that owns this project")
-    workflow_id: str | None = Field(default=None, description="ID of the workflow this project is associated with")
     run_id: str | None = Field(
         default=None, description="ID of the workflow run or task run that generated this project"
     )

@@ -1313,6 +1313,8 @@ class AgentDB:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        use_cache: bool = False,
+        cache_project_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1330,6 +1332,8 @@ class AgentDB:
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
+                use_cache=use_cache,
+                cache_project_id=cache_project_id,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1508,6 +1512,8 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
+        use_cache: bool | None = None,
+        cache_project_id: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1517,14 +1523,18 @@ class AgentDB:
                 if organization_id:
                     get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
                 if workflow := (await session.scalars(get_workflow_query)).first():
-                    if title:
+                    if title is not None:
                         workflow.title = title
-                    if description:
+                    if description is not None:
                         workflow.description = description
-                    if workflow_definition:
+                    if workflow_definition is not None:
                         workflow.workflow_definition = workflow_definition
-                    if version:
+                    if version is not None:
                         workflow.version = version
+                    if use_cache is not None:
+                        workflow.use_cache = use_cache
+                    if cache_project_id is not None:
+                        workflow.cache_project_id = cache_project_id
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -3489,7 +3499,6 @@ class AgentDB:
     async def create_project(
         self,
         organization_id: str,
-        workflow_permanent_id: str | None = None,
         run_id: str | None = None,
         project_id: str | None = None,
         version: int | None = None,
@@ -3498,7 +3507,6 @@ class AgentDB:
             async with self.Session() as session:
                 project = ProjectModel(
                     organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
                     run_id=run_id,
                 )
                 if project_id:
@@ -3518,7 +3526,6 @@ class AgentDB:
         project_revision_id: str,
         organization_id: str,
         artifact_id: str | None = None,
-        workflow_permanent_id: str | None = None,
         run_id: str | None = None,
         version: int | None = None,
     ) -> Project:
@@ -3532,8 +3539,6 @@ class AgentDB:
                 if project := (await session.scalars(get_project_query)).first():
                     if artifact_id:
                         project.artifact_id = artifact_id
-                    if workflow_permanent_id:
-                        project.workflow_permanent_id = workflow_permanent_id
                     if run_id:
                         project.run_id = run_id
                     if version:

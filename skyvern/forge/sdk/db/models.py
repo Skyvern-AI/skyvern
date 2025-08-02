@@ -236,6 +236,8 @@ class WorkflowModel(Base):
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
+    use_cache = Column(Boolean, default=False, nullable=False)
+    cache_project_id = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -777,7 +779,6 @@ class ProjectModel(Base):
     __tablename__ = "projects"
     __table_args__ = (
         Index("project_org_created_at_index", "organization_id", "created_at"),
-        Index("project_org_wpid_index", "organization_id", "workflow_permanent_id"),
         Index("project_org_run_id_index", "organization_id", "run_id"),
         UniqueConstraint("organization_id", "project_id", "version", name="uc_org_project_version"),
     )
@@ -785,8 +786,6 @@ class ProjectModel(Base):
     project_revision_id = Column(String, primary_key=True, default=generate_project_revision_id)
     project_id = Column(String, default=generate_project_id, nullable=False)  # User-facing, consistent across versions
     organization_id = Column(String, nullable=False)
-    # the wpid that this project is associated with
-    workflow_permanent_id = Column(String, nullable=True)
     # The workflow run or task run id that this project is generated
     run_id = Column(String, nullable=True)
     version = Column(Integer, default=1, nullable=False)
