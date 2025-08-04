@@ -3002,8 +3002,7 @@ class AgentDB:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
         except NotFoundError:
-            LOG.error("NotFoundError", exc_info=True)
-            raise
+            return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
