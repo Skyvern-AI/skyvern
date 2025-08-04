@@ -744,3 +744,8 @@ class APIKeyNotFound(SkyvernHTTPException):
 class ElementOutOfCurrentViewport(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Element {element_id} is out of current viewport")
+
+
+class ProjectNotFound(SkyvernHTTPException):
+    def __init__(self, project_id: str) -> None:
+        super().__init__(f"Project {project_id} not found")

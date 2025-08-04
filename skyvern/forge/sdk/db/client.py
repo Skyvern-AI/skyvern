@@ -55,6 +55,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_organization_auth_token,
     convert_to_output_parameter,
     convert_to_project,
+    convert_to_project_file,
     convert_to_step,
     convert_to_task,
     convert_to_workflow,
@@ -99,7 +100,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.projects import Project
+from skyvern.schemas.projects import Project, ProjectFile
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
@@ -3632,6 +3633,17 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_project_revision(self, project_revision_id: str, organization_id: str) -> Project | None:
+        async with self.Session() as session:
+            project = (
+                await session.scalars(
+                    select(ProjectModel)
+                    .filter_by(project_revision_id=project_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return convert_to_project(project) if project else None
+
     async def create_project_file(
         self,
         project_revision_id: str,
@@ -3670,3 +3682,14 @@ class AgentDB:
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def get_project_files(self, project_revision_id: str, organization_id: str) -> list[ProjectFile]:
+        async with self.Session() as session:
+            project_files = (
+                await session.scalars(
+                    select(ProjectFileModel)
+                    .filter_by(project_revision_id=project_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).all()
+            return [convert_to_project_file(project_file) for project_file in project_files]

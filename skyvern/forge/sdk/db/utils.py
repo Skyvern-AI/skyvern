@@ -15,6 +15,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    ProjectFileModel,
     ProjectModel,
     StepModel,
     TaskModel,
@@ -47,7 +48,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.projects import Project
+from skyvern.schemas.projects import Project, ProjectFile
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.actions.actions import (
     Action,
@@ -504,6 +505,25 @@ def convert_to_project(project_model: ProjectModel) -> Project:
         created_at=project_model.created_at,
         modified_at=project_model.modified_at,
         deleted_at=project_model.deleted_at,
+    )
+
+
+def convert_to_project_file(project_file_model: ProjectFileModel) -> ProjectFile:
+    return ProjectFile(
+        file_id=project_file_model.file_id,
+        project_revision_id=project_file_model.project_revision_id,
+        project_id=project_file_model.project_id,
+        organization_id=project_file_model.organization_id,
+        file_path=project_file_model.file_path,
+        file_name=project_file_model.file_name,
+        file_type=project_file_model.file_type,
+        content_hash=project_file_model.content_hash,
+        file_size=project_file_model.file_size,
+        mime_type=project_file_model.mime_type,
+        encoding=project_file_model.encoding,
+        artifact_id=project_file_model.artifact_id,
+        created_at=project_file_model.created_at,
+        modified_at=project_file_model.modified_at,
     )
 
 

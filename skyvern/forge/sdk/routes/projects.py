@@ -2,10 +2,11 @@ import base64
 import hashlib
 
 import structlog
-from fastapi import Depends, HTTPException, Path, Query
+from fastapi import BackgroundTasks, Depends, HTTPException, Path, Query, Request
 
 from skyvern.forge import app
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.projects import CreateProjectRequest, CreateProjectResponse, DeployProjectRequest, Project
@@ -74,8 +75,6 @@ async def create_project(
         raise HTTPException(status_code=500, detail="Failed to create project")
 
 
-@legacy_base_router.get("/projects/{project_id}")
-@legacy_base_router.get("/projects/{project_id}/", include_in_schema=False)
 @base_router.get(
     "/projects/{project_id}",
     response_model=Project,
@@ -117,8 +116,6 @@ async def get_project(
     return project
 
 
-@legacy_base_router.get("/projects")
-@legacy_base_router.get("/projects/", include_in_schema=False)
 @base_router.get(
     "/projects",
     response_model=list[Project],
@@ -266,3 +263,33 @@ async def deploy_project(
     except Exception as e:
         LOG.error("Failed to deploy project", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to deploy project")
+
+
+@base_router.post(
+    "/projects/{project_id}/run",
+    summary="Run project",
+    description="Run a project",
+    tags=["Projects"],
+)
+async def run_project(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    project_id: str = Path(
+        ...,
+        description="The unique identifier of the project",
+        examples=["proj_abc123"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    """Run a project."""
+    # await project_service.execute_project(
+    #     project_id=project_id,
+    #     organization_id=current_org.organization_id,
+    #     background_tasks=background_tasks,
+    # )
+    await AsyncExecutorFactory.get_executor().execute_project(
+        request=request,
+        project_id=project_id,
+        organization_id=current_org.organization_id,
+        background_tasks=background_tasks,
+    )
