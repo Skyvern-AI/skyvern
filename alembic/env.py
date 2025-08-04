@@ -1,6 +1,8 @@
+import asyncio
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config, pool
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from alembic import context
 
@@ -27,7 +29,8 @@ target_metadata = models.Base.metadata
 # ... etc.
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
-config.set_main_option("sqlalchemy.url", SettingsManager.get_settings().DATABASE_STRING)
+db_url = SettingsManager.get_settings().DATABASE_STRING
+config.set_main_option("sqlalchemy.url", db_url)
 
 
 def run_migrations_offline() -> None:
@@ -54,13 +57,31 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
-    """Run migrations in 'online' mode.
+def do_run_migrations(connection):
+    context.configure(connection=connection, target_metadata=target_metadata)
+    with context.begin_transaction():
+        context.run_migrations()
 
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
 
-    """
+async def run_migrations_online_async() -> None:
+    """Run migrations in 'online' mode for async drivers."""
+    connectable = AsyncEngine(
+        engine_from_config(
+            config.get_section(config.config_ini_section, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
+            future=True,
+        )
+    )
+
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+
+    await connectable.dispose()
+
+
+def run_migrations_online_sync() -> None:
+    """Run migrations in 'online' mode for sync drivers."""
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -68,14 +89,14 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-
-        with context.begin_transaction():
-            context.run_migrations()
+        do_run_migrations(connection)
 
 
-print("Alembic mode: ", "offline" if context.is_offline_mode() else "online")
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    run_migrations_online()
+    if "asyncpg" in db_url:
+        print("Running migrations in async mode")
+        asyncio.run(run_migrations_online_async())
+    else:
+        run_migrations_online_sync()
