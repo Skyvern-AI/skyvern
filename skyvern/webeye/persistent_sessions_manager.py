@@ -11,7 +11,7 @@ from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, is_final_status
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -98,7 +98,7 @@ async def renew_session(database: AgentDB, session_id: str, organization_id: str
         new_timeout_minutes = current_timeout_minutes + minutes_diff
 
         browser_session = await database.update_persistent_browser_session(
-            browser_session_id=session_id,
+            session_id,
             organization_id=organization_id,
             timeout_minutes=new_timeout_minutes,
         )
@@ -113,6 +113,40 @@ async def renew_session(database: AgentDB, session_id: str, organization_id: str
         return browser_session
 
     raise BrowserSessionNotRenewable("Session has expired", session_id)
+
+
+async def update_status(
+    db: AgentDB, session_id: str, organization_id: str, status: str
+) -> PersistentBrowserSession | None:
+    persistent_browser_session = await db.get_persistent_browser_session(session_id, organization_id)
+
+    if not persistent_browser_session:
+        LOG.warning(
+            "Cannot update browser session status, browser session not found in database",
+            organization_id=organization_id,
+            session_id=session_id,
+            desired_status=status,
+        )
+        return None
+
+    if is_final_status(status):
+        if is_final_status(persistent_browser_session.status):
+            LOG.warning(
+                "Attempted to update browser session status to a final status when it is already final",
+                browser_session_id=session_id,
+                organization_id=organization_id,
+                desired_status=status,
+                current_status=persistent_browser_session.status,
+            )
+            return None
+
+    persistent_browser_session = await db.update_persistent_browser_session(
+        session_id,
+        status=status,
+        organization_id=organization_id,
+    )
+
+    return persistent_browser_session
 
 
 class PersistentSessionsManager:
@@ -237,6 +271,11 @@ class PersistentSessionsManager:
         except BrowserSessionNotRenewable:
             await self.close_session(organization_id, session_id)
             raise
+
+    async def update_status(
+        self, session_id: str, organization_id: str, status: str
+    ) -> PersistentBrowserSession | None:
+        return await update_status(self.database, session_id, organization_id, status)
 
     async def release_browser_session(self, session_id: str, organization_id: str) -> None:
         """Release a specific browser session."""

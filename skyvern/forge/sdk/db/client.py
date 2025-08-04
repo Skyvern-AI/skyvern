@@ -3040,7 +3040,9 @@ class AgentDB:
     async def update_persistent_browser_session(
         self,
         browser_session_id: str,
-        timeout_minutes: int,
+        *,
+        status: str | None = None,
+        timeout_minutes: int | None = None,
         organization_id: str | None = None,
     ) -> PersistentBrowserSession:
         try:
@@ -3055,7 +3057,12 @@ class AgentDB:
                 ).first()
                 if not persistent_browser_session:
                     raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
-                persistent_browser_session.timeout_minutes = timeout_minutes
+
+                if status:
+                    persistent_browser_session.status = status
+                if timeout_minutes:
+                    persistent_browser_session.timeout_minutes = timeout_minutes
+
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return PersistentBrowserSession.model_validate(persistent_browser_session)

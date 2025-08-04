@@ -2,6 +2,12 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
+FINAL_STATUSES = ("completed", "failed")
+
+
+def is_final_status(status: str | None) -> bool:
+    return status in FINAL_STATUSES
+
 
 class PersistentBrowserSession(BaseModel):
     model_config = ConfigDict(from_attributes=True)
