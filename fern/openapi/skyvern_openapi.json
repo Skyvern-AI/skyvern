@@ -3816,18 +3816,6 @@
               1
             ]
           },
-          "workflow_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Workflow Id",
-            "description": "ID of the workflow this project is associated with"
-          },
           "run_id": {
             "anyOf": [
               {
@@ -7465,18 +7453,6 @@
             "title": "Organization Id",
             "description": "ID of the organization that owns this project"
           },
-          "workflow_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Workflow Id",
-            "description": "ID of the workflow this project is associated with"
-          },
           "run_id": {
             "anyOf": [
               {
@@ -10548,6 +10524,22 @@
           "status": {
             "$ref": "#/components/schemas/WorkflowStatus",
             "default": "published"
+          },
+          "use_cache": {
+            "type": "boolean",
+            "title": "Use Cache",
+            "default": false
+          },
+          "cache_project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Project Id"
           }
         },
         "type": "object",
