@@ -1,17 +1,21 @@
 import base64
 import hashlib
+import os
+import subprocess
 from datetime import datetime
 
 import structlog
+from fastapi import BackgroundTasks
 
+from skyvern.exceptions import ProjectNotFound
 from skyvern.forge import app
-from skyvern.schemas.projects import FileNode, ProjectFile
+from skyvern.schemas.projects import FileNode, ProjectFileCreate
 
 LOG = structlog.get_logger(__name__)
 
 
 async def build_file_tree(
-    files: list[ProjectFile],
+    files: list[ProjectFileCreate],
     organization_id: str,
     project_id: str,
     project_version: int,
@@ -90,3 +94,67 @@ async def build_file_tree(
         )
 
     return file_tree
+
+
+async def execute_project(
+    project_id: str,
+    organization_id: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> None:
+    # TODO: assume the project only has one ProjectFile called main.py
+    # step 1: get the project revision
+    # step 2: get the project files
+    # step 3: copy the project files to the local directory
+    # step 4: execute the project
+
+    # step 1: get the project revision
+    project = await app.DATABASE.get_project(
+        project_id=project_id,
+        organization_id=organization_id,
+    )
+    if not project:
+        raise ProjectNotFound(project_id=project_id)
+
+    # step 2: get the project files
+    project_files = await app.DATABASE.get_project_files(
+        project_revision_id=project.project_revision_id, organization_id=organization_id
+    )
+
+    # step 3: copy the project files to the local directory
+    for file in project_files:
+        # retrieve the artifact
+        if not file.artifact_id:
+            continue
+        artifact = await app.DATABASE.get_artifact_by_id(file.artifact_id, organization_id)
+        if not artifact:
+            LOG.error("Artifact not found", artifact_id=file.artifact_id, project_id=project_id)
+            continue
+        file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+        if not file_content:
+            continue
+        file_path = os.path.join(project.project_id, file.file_path)
+        # create the directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        # Determine the encoding to use
+        encoding = "utf-8"
+
+        try:
+            # Try to decode as text
+            if file.mime_type and file.mime_type.startswith("text/"):
+                # Text file - decode as string
+                with open(file_path, "w", encoding=encoding) as f:
+                    f.write(file_content.decode(encoding))
+            else:
+                # Binary file - write as bytes
+                with open(file_path, "wb") as f:
+                    f.write(file_content)
+        except UnicodeDecodeError:
+            # Fallback to binary mode if text decoding fails
+            with open(file_path, "wb") as f:
+                f.write(file_content)
+
+    # step 4: execute the project
+    if background_tasks:
+        background_tasks.add_task(subprocess.run, ["python", f"{project.project_id}/main.py"])
+    LOG.info("Project executed successfully", project_id=project_id)

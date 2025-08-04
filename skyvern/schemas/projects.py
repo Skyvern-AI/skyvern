@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime
 from enum import StrEnum
 
@@ -10,9 +11,37 @@ class FileEncoding(StrEnum):
     """Supported file content encodings."""
 
     BASE64 = "base64"
+    UTF8 = "utf-8"
 
 
 class ProjectFile(BaseModel):
+    file_id: str
+    project_revision_id: str
+    project_id: str
+    organization_id: str
+
+    file_path: str  # e.g., "src/utils.py"
+    file_name: str  # e.g., "utils.py"
+    file_type: str  # "file" or "directory"
+
+    # File content and metadata
+    content_hash: str | None = None  # SHA-256 hash for deduplication
+    file_size: int | None = None  # Size in bytes
+    mime_type: str | None = None  # e.g., "text/x-python"
+    encoding: FileEncoding | None = Field(default=None, description="Content encoding")
+
+    artifact_id: str | None = None
+    created_at: datetime
+    modified_at: datetime
+
+    async def get_content(self) -> str:
+        # get the content from the artifact
+        if self.encoding == FileEncoding.BASE64:
+            return base64.b64decode(self.content).decode("utf-8")
+        return self.content
+
+
+class ProjectFileCreate(BaseModel):
     """Model representing a file in a project."""
 
     path: str = Field(..., description="File path relative to project root", examples=["src/main.py"])
@@ -24,7 +53,7 @@ class ProjectFile(BaseModel):
 class CreateProjectRequest(BaseModel):
     workflow_id: str | None = Field(default=None, description="Associated workflow ID")
     run_id: str | None = Field(default=None, description="Associated run ID")
-    files: list[ProjectFile] | None = Field(
+    files: list[ProjectFileCreate] | None = Field(
         default=None,
         description="Array of files to include in the project",
         examples=[
@@ -58,7 +87,7 @@ class FileNode(BaseModel):
 class DeployProjectRequest(BaseModel):
     """Request model for deploying a project with updated files."""
 
-    files: list[ProjectFile] = Field(
+    files: list[ProjectFileCreate] = Field(
         ...,
         description="Array of files to include in the project",
         examples=[
