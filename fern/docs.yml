@@ -190,6 +190,12 @@ navigation:
             contents:
               - GET /v1/artifacts/{artifact_id}
               - GET /v1/runs/{run_id}/artifacts
+          - section: Projects
+            contents:
+              - POST /v1/projects
+              - POST /v1/projects/{project_id}/deploy
+              - GET /v1/projects/{project_id}
+              - GET /v1/projects
   - tab: blog
   - tab: community
   - tab: github
