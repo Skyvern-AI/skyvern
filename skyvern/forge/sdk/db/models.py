@@ -167,7 +167,9 @@ class OrganizationAuthTokenModel(Base):
 
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     token_type = Column(String, nullable=False)
-    token = Column(String, index=True, nullable=False)
+    token = Column(String, index=True, nullable=True)
+    encrypted_token = Column(String, index=True, nullable=True)
+    encrypted_method = Column(String, nullable=True)
     valid = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
