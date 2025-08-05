@@ -309,6 +309,10 @@ class Settings(BaseSettings):
     Otherwise we'll consider the persistent browser session to be expired.
     """
 
+    ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
+    ENCRYPTOR_AES_SALT: str | None = None
+    ENCRYPTOR_AES_IV: str | None = None
+
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
