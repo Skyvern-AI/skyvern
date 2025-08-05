@@ -14,6 +14,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -90,7 +91,9 @@ class WorkflowRunContext:
             elif isinstance(secrete_parameter, CredentialParameter):
                 await workflow_run_context.register_credential_parameter_value(secrete_parameter, organization)
             elif isinstance(secrete_parameter, OnePasswordCredentialParameter):
-                await workflow_run_context.register_onepassword_credential_parameter_value(secrete_parameter)
+                await workflow_run_context.register_onepassword_credential_parameter_value(
+                    secrete_parameter, organization
+                )
             elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
                     secrete_parameter, organization
@@ -313,10 +316,19 @@ class WorkflowRunContext:
             self.values[parameter.key] = random_secret_id
             self.parameters[parameter.key] = parameter
 
-    async def register_onepassword_credential_parameter_value(self, parameter: OnePasswordCredentialParameter) -> None:
+    async def register_onepassword_credential_parameter_value(
+        self, parameter: OnePasswordCredentialParameter, organization: Organization
+    ) -> None:
+        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+            organization.organization_id, OrganizationAuthTokenType.onepassword_service_account
+        )
         token = settings.OP_SERVICE_ACCOUNT_TOKEN
+        if org_auth_token:
+            token = org_auth_token.token
         if not token:
-            raise ValueError("OP_SERVICE_ACCOUNT_TOKEN environment variable not set")
+            raise ValueError(
+                "OP_SERVICE_ACCOUNT_TOKEN environment variable not set and no valid 1Password service account token found. Please go to the settings and add your 1Password service account token."
+            )
 
         client = await OnePasswordClient.authenticate(
             auth=token,

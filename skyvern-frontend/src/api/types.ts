@@ -175,6 +175,24 @@ export type ApiKeyApiResponse = {
   valid: boolean;
 };
 
+export type OnePasswordTokenApiResponse = {
+  id: string;
+  organization_id: string;
+  token: string;
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+};
+
+export type CreateOnePasswordTokenRequest = {
+  token: string;
+};
+
+export type CreateOnePasswordTokenResponse = {
+  token: OnePasswordTokenApiResponse;
+};
+
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",

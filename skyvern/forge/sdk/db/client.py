@@ -967,6 +967,29 @@ class AgentDB:
 
         return await convert_to_organization_auth_token(auth_token)
 
+    async def invalidate_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> None:
+        """Invalidate all existing tokens of a specific type for an organization."""
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    update(OrganizationAuthTokenModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(token_type=token_type)
+                    .filter_by(valid=True)
+                    .values(valid=False)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_artifacts_for_task_v2(
         self,
         task_v2_id: str,
