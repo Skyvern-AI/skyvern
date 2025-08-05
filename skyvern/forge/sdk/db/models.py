@@ -5,7 +5,6 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
-    Enum,
     ForeignKey,
     Index,
     Integer,
@@ -18,7 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
     generate_ai_suggestion_id,
@@ -36,6 +35,9 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_project_file_id,
+    generate_project_id,
+    generate_project_revision_id,
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
@@ -164,8 +166,10 @@ class OrganizationAuthTokenModel(Base):
     )
 
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
-    token_type = Column(Enum(OrganizationAuthTokenType), nullable=False)
-    token = Column(String, index=True, nullable=False)
+    token_type = Column(String, nullable=False)
+    token = Column(String, index=True, nullable=True)
+    encrypted_token = Column(String, index=True, nullable=True)
+    encrypted_method = Column(String, nullable=True)
     valid = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -234,6 +238,8 @@ class WorkflowModel(Base):
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
+    use_cache = Column(Boolean, default=False, nullable=False)
+    cache_project_id = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -767,3 +773,58 @@ class DebugSessionModel(Base):
     user_id = Column(String, nullable=True)  # comes from identity vendor (Clerk at time of writing)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="created")
+
+
+class ProjectModel(Base):
+    __tablename__ = "projects"
+    __table_args__ = (
+        Index("project_org_created_at_index", "organization_id", "created_at"),
+        Index("project_org_run_id_index", "organization_id", "run_id"),
+        UniqueConstraint("organization_id", "project_id", "version", name="uc_org_project_version"),
+    )
+
+    project_revision_id = Column(String, primary_key=True, default=generate_project_revision_id)
+    project_id = Column(String, default=generate_project_id, nullable=False)  # User-facing, consistent across versions
+    organization_id = Column(String, nullable=False)
+    # The workflow run or task run id that this project is generated
+    run_id = Column(String, nullable=True)
+    version = Column(Integer, default=1, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class ProjectFileModel(Base):
+    __tablename__ = "project_files"
+    __table_args__ = (
+        Index("file_project_path_index", "project_revision_id", "file_path"),
+        UniqueConstraint("project_revision_id", "file_path", name="unique_project_file_path"),
+    )
+
+    file_id = Column(String, primary_key=True, default=generate_project_file_id)
+    project_revision_id = Column(String, nullable=False)
+    project_id = Column(String, nullable=False)
+    organization_id = Column(String, nullable=False)
+
+    file_path = Column(String, nullable=False)  # e.g., "src/utils.py"
+    file_name = Column(String, nullable=False)  # e.g., "utils.py"
+    file_type = Column(String, nullable=False)  # "file" or "directory"
+
+    # File content and metadata
+    content_hash = Column(String, nullable=True)  # SHA-256 hash for deduplication
+    file_size = Column(Integer, nullable=True)  # Size in bytes
+    mime_type = Column(String, nullable=True)  # e.g., "text/python"
+    encoding = Column(String, default="utf-8", nullable=True)
+
+    # Storage reference (could be S3 key, artifact_id, etc.)
+    artifact_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)

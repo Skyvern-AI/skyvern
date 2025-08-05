@@ -15,6 +15,8 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    ProjectFileModel,
+    ProjectModel,
     StepModel,
     TaskModel,
     WorkflowModel,
@@ -24,6 +26,8 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
 )
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -46,6 +50,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.projects import Project, ProjectFile
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.actions.actions import (
     Action,
@@ -187,14 +192,18 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
     )
 
 
-def convert_to_organization_auth_token(
+async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel,
 ) -> OrganizationAuthToken:
+    token = org_auth_token.token
+    if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
+        token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
+
     return OrganizationAuthToken(
         id=org_auth_token.id,
         organization_id=org_auth_token.organization_id,
         token_type=OrganizationAuthTokenType(org_auth_token.token_type),
-        token=org_auth_token.token,
+        token=token,
         valid=org_auth_token.valid,
         created_at=org_auth_token.created_at,
         modified_at=org_auth_token.modified_at,
@@ -490,6 +499,38 @@ def convert_to_workflow_run_block(
         block.include_action_history_in_verification = task.include_action_history_in_verification
 
     return block
+
+
+def convert_to_project(project_model: ProjectModel) -> Project:
+    return Project(
+        project_revision_id=project_model.project_revision_id,
+        project_id=project_model.project_id,
+        organization_id=project_model.organization_id,
+        run_id=project_model.run_id,
+        version=project_model.version,
+        created_at=project_model.created_at,
+        modified_at=project_model.modified_at,
+        deleted_at=project_model.deleted_at,
+    )
+
+
+def convert_to_project_file(project_file_model: ProjectFileModel) -> ProjectFile:
+    return ProjectFile(
+        file_id=project_file_model.file_id,
+        project_revision_id=project_file_model.project_revision_id,
+        project_id=project_file_model.project_id,
+        organization_id=project_file_model.organization_id,
+        file_path=project_file_model.file_path,
+        file_name=project_file_model.file_name,
+        file_type=project_file_model.file_type,
+        content_hash=project_file_model.content_hash,
+        file_size=project_file_model.file_size,
+        mime_type=project_file_model.mime_type,
+        encoding=project_file_model.encoding,
+        artifact_id=project_file_model.artifact_id,
+        created_at=project_file_model.created_at,
+        modified_at=project_file_model.modified_at,
+    )
 
 
 def hydrate_action(action_model: ActionModel) -> Action:

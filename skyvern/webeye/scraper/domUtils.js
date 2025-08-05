@@ -2579,8 +2579,10 @@ async function stopGlobalIncrementalObserver() {
   window.globalObserverForDOMIncrement.disconnect();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   while (
+    window.globalParsedElementCounter &&
+    window.globalOneTimeIncrementElements &&
     (await window.globalParsedElementCounter.get()) <
-    window.globalOneTimeIncrementElements.length
+      window.globalOneTimeIncrementElements.length
   ) {
     await asyncSleepFor(100);
   }

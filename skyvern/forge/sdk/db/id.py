@@ -45,6 +45,9 @@ ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
+PROJECT_FILE_PREFIX = "pf"
+PROJECT_REVISION_PREFIX = "pv"
+PROJECT_PREFIX = "p"
 STEP_PREFIX = "stp"
 TASK_GENERATION_PREFIX = "tg"
 TASK_PREFIX = "tsk"
@@ -203,6 +206,22 @@ def generate_organization_bitwarden_collection_id() -> str:
     return f"{ORGANIZATION_BITWARDEN_COLLECTION_PREFIX}_{int_id}"
 
 
+def generate_project_id() -> str:
+    int_id = generate_id()
+    return f"{PROJECT_PREFIX}_{int_id}"
+
+
+def generate_project_revision_id() -> str:
+    int_id = generate_id()
+    return f"{PROJECT_REVISION_PREFIX}_{int_id}"
+
+
+def generate_project_file_id() -> str:
+    int_id = generate_id()
+    return f"{PROJECT_FILE_PREFIX}_{int_id}"
+
+
+############# Helper functions below ##############
 def generate_id() -> int:
     """
     generate a 64-bit int ID

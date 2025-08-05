@@ -718,9 +718,9 @@ class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
         super().__init__(f"Browser session {browser_session_id} is already occupied")
 
 
-class MissingBrowserSessionError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} does not exist.")
+class BrowserSessionNotRenewable(SkyvernException):
+    def __init__(self, reason: str, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")
 
 
 class MissingBrowserAddressError(SkyvernException):
@@ -744,3 +744,8 @@ class APIKeyNotFound(SkyvernHTTPException):
 class ElementOutOfCurrentViewport(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Element {element_id} is out of current viewport")
+
+
+class ProjectNotFound(SkyvernHTTPException):
+    def __init__(self, project_id: str) -> None:
+        super().__init__(f"Project {project_id} not found")

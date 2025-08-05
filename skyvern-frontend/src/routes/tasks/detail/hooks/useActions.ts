@@ -118,7 +118,9 @@ function useActions({ id }: Props): {
             confidence: action.confidence_float ?? undefined,
             input: action.response ?? "",
             type: action.action_type,
-            success: action.status === Status.Completed,
+            success:
+              action.status === Status.Completed ||
+              action.status === Status.Skipped,
             stepId: action.step_id ?? "",
             index: action.action_order ?? 0,
           };

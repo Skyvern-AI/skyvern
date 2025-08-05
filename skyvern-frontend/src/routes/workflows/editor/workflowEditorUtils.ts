@@ -2242,6 +2242,7 @@ export {
   getLabelForWorkflowParameterType,
   maxNestingLevel,
   getWorkflowSettings,
+  getOrderedChildrenBlocks,
   getOutputParameterKey,
   getPreviousNodeIds,
   getUniqueLabelForExistingNode,

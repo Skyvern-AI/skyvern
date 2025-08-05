@@ -49,6 +49,9 @@ class ArtifactType(StrEnum):
     TRACE = "trace"
     HAR = "har"
 
+    # Project files
+    PROJECT_FILE = "project_file"
+
 
 class Artifact(BaseModel):
     created_at: datetime = Field(
