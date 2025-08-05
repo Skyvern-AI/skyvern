@@ -489,6 +489,9 @@ def convert_to_workflow_run_block(
         modified_at=workflow_run_block_model.modified_at,
     )
     if task:
+        if task.finished_at and task.started_at:
+            duration = task.finished_at - task.started_at
+            block.duration = duration.total_seconds()
         block.url = task.url
         block.navigation_goal = task.navigation_goal
         block.navigation_payload = task.navigation_payload
