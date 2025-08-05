@@ -25,6 +25,7 @@ export const Status = {
   Queued: "queued",
   TimedOut: "timed_out",
   Canceled: "canceled",
+  Skipped: "skipped",
 } as const;
 
 export type Status = (typeof Status)[keyof typeof Status];
@@ -104,6 +105,7 @@ export type Task = {
   title: string | null;
   url: string;
   webhook_callback_url: string | null;
+  webhook_failure_reason: string | null;
   navigation_goal: string | null;
   data_extraction_goal: string | null;
   navigation_payload: Record<string, unknown> | string | null;
@@ -122,6 +124,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   failure_reason: string | null;
+  webhook_failure_reason: string | null;
   errors: Array<Record<string, unknown>>;
   max_steps_per_run: number | null;
   task_v2: TaskV2 | null;
@@ -302,6 +305,7 @@ export type WorkflowRunStatusApiResponse = {
   recording_url: string | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
+  webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
@@ -348,6 +352,7 @@ export type TaskV2 = {
   output: Record<string, unknown> | null;
   summary: string | null;
   webhook_callback_url: string | null;
+  webhook_failure_reason: string | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
   proxy_location: ProxyLocation | null;

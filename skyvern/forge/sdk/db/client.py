@@ -29,6 +29,8 @@ from skyvern.forge.sdk.db.models import (
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
+    ProjectFileModel,
+    ProjectModel,
     StepModel,
     TaskGenerationModel,
     TaskModel,
@@ -52,6 +54,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
+    convert_to_project,
+    convert_to_project_file,
     convert_to_step,
     convert_to_task,
     convert_to_workflow,
@@ -96,6 +100,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.projects import Project, ProjectFile
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
@@ -1309,6 +1314,8 @@ class AgentDB:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        use_cache: bool = False,
+        cache_project_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1326,6 +1333,8 @@ class AgentDB:
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
+                use_cache=use_cache,
+                cache_project_id=cache_project_id,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1504,6 +1513,8 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
+        use_cache: bool | None = None,
+        cache_project_id: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1513,14 +1524,18 @@ class AgentDB:
                 if organization_id:
                     get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
                 if workflow := (await session.scalars(get_workflow_query)).first():
-                    if title:
+                    if title is not None:
                         workflow.title = title
-                    if description:
+                    if description is not None:
                         workflow.description = description
-                    if workflow_definition:
+                    if workflow_definition is not None:
                         workflow.workflow_definition = workflow_definition
-                    if version:
+                    if version is not None:
                         workflow.version = version
+                    if use_cache is not None:
+                        workflow.use_cache = use_cache
+                    if cache_project_id is not None:
+                        workflow.cache_project_id = cache_project_id
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -2987,8 +3002,7 @@ class AgentDB:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
         except NotFoundError:
-            LOG.error("NotFoundError", exc_info=True)
-            raise
+            return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -3026,7 +3040,9 @@ class AgentDB:
     async def update_persistent_browser_session(
         self,
         browser_session_id: str,
-        timeout_minutes: int,
+        *,
+        status: str | None = None,
+        timeout_minutes: int | None = None,
         organization_id: str | None = None,
     ) -> PersistentBrowserSession:
         try:
@@ -3041,7 +3057,12 @@ class AgentDB:
                 ).first()
                 if not persistent_browser_session:
                     raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
-                persistent_browser_session.timeout_minutes = timeout_minutes
+
+                if status:
+                    persistent_browser_session.status = status
+                if timeout_minutes:
+                    persistent_browser_session.timeout_minutes = timeout_minutes
+
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -3481,3 +3502,200 @@ class AgentDB:
             await session.refresh(debug_session)
 
             return DebugSession.model_validate(debug_session)
+
+    async def create_project(
+        self,
+        organization_id: str,
+        run_id: str | None = None,
+        project_id: str | None = None,
+        version: int | None = None,
+    ) -> Project:
+        try:
+            async with self.Session() as session:
+                project = ProjectModel(
+                    organization_id=organization_id,
+                    run_id=run_id,
+                )
+                if project_id:
+                    project.project_id = project_id
+                if version:
+                    project.version = version
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+                return convert_to_project(project)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_project(
+        self,
+        project_revision_id: str,
+        organization_id: str,
+        artifact_id: str | None = None,
+        run_id: str | None = None,
+        version: int | None = None,
+    ) -> Project:
+        try:
+            async with self.Session() as session:
+                get_project_query = (
+                    select(ProjectModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(project_revision_id=project_revision_id)
+                )
+                if project := (await session.scalars(get_project_query)).first():
+                    if artifact_id:
+                        project.artifact_id = artifact_id
+                    if run_id:
+                        project.run_id = run_id
+                    if version:
+                        project.version = version
+                    await session.commit()
+                    await session.refresh(project)
+                    return convert_to_project(project)
+                else:
+                    raise NotFoundError("Project not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except NotFoundError:
+            LOG.error("No project found to update", project_revision_id=project_revision_id)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_projects(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[Project]:
+        try:
+            async with self.Session() as session:
+                # Calculate offset for pagination
+                offset = (page - 1) * page_size
+
+                # Subquery to get the latest version of each project
+                latest_versions_subquery = (
+                    select(ProjectModel.project_id, func.max(ProjectModel.version).label("latest_version"))
+                    .filter_by(organization_id=organization_id)
+                    .filter(ProjectModel.deleted_at.is_(None))
+                    .group_by(ProjectModel.project_id)
+                    .subquery()
+                )
+
+                # Main query to get projects with their latest versions
+                get_projects_query = (
+                    select(ProjectModel)
+                    .join(
+                        latest_versions_subquery,
+                        and_(
+                            ProjectModel.project_id == latest_versions_subquery.c.project_id,
+                            ProjectModel.version == latest_versions_subquery.c.latest_version,
+                        ),
+                    )
+                    .filter_by(organization_id=organization_id)
+                    .filter(ProjectModel.deleted_at.is_(None))
+                    .order_by(ProjectModel.created_at.desc())
+                    .limit(page_size)
+                    .offset(offset)
+                )
+                projects = (await session.scalars(get_projects_query)).all()
+                return [convert_to_project(project) for project in projects]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_project(
+        self,
+        project_id: str,
+        organization_id: str,
+        version: int | None = None,
+    ) -> Project | None:
+        """Get a specific project by ID and optionally by version."""
+        try:
+            async with self.Session() as session:
+                get_project_query = (
+                    select(ProjectModel)
+                    .filter_by(project_id=project_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(ProjectModel.deleted_at.is_(None))
+                )
+
+                if version is not None:
+                    get_project_query = get_project_query.filter_by(version=version)
+                else:
+                    # Get the latest version
+                    get_project_query = get_project_query.order_by(ProjectModel.version.desc()).limit(1)
+
+                if project := (await session.scalars(get_project_query)).first():
+                    return convert_to_project(project)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_project_revision(self, project_revision_id: str, organization_id: str) -> Project | None:
+        async with self.Session() as session:
+            project = (
+                await session.scalars(
+                    select(ProjectModel)
+                    .filter_by(project_revision_id=project_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return convert_to_project(project) if project else None
+
+    async def create_project_file(
+        self,
+        project_revision_id: str,
+        project_id: str,
+        organization_id: str,
+        file_path: str,
+        file_name: str,
+        file_type: str,
+        content_hash: str | None = None,
+        file_size: int | None = None,
+        mime_type: str | None = None,
+        encoding: str = "utf-8",
+        artifact_id: str | None = None,
+    ) -> None:
+        """Create a project file record."""
+        try:
+            async with self.Session() as session:
+                project_file = ProjectFileModel(
+                    project_revision_id=project_revision_id,
+                    project_id=project_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    content_hash=content_hash,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                    encoding=encoding,
+                    artifact_id=artifact_id,
+                )
+                session.add(project_file)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_project_files(self, project_revision_id: str, organization_id: str) -> list[ProjectFile]:
+        async with self.Session() as session:
+            project_files = (
+                await session.scalars(
+                    select(ProjectFileModel)
+                    .filter_by(project_revision_id=project_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).all()
+            return [convert_to_project_file(project_file) for project_file in project_files]
