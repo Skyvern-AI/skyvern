@@ -375,7 +375,7 @@ async def get_credentials(
 
 
 @base_router.get(
-    "/credentials/onepassword",
+    "/credentials/onepassword/get",
     response_model=CreateOnePasswordTokenResponse,
     summary="Get OnePassword service account token",
     description="Retrieves the current OnePassword service account token for the organization.",
@@ -385,7 +385,7 @@ async def get_credentials(
     },
 )
 @base_router.get(
-    "/credentials/onepassword/",
+    "/credentials/onepassword/get/",
     response_model=CreateOnePasswordTokenResponse,
     include_in_schema=False,
 )
@@ -400,7 +400,6 @@ async def get_onepassword_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.onepassword_service_account,
         )
-
         if not auth_token:
             raise HTTPException(
                 status_code=404,
@@ -425,7 +424,7 @@ async def get_onepassword_token(
 
 
 @base_router.post(
-    "/credentials/onepassword",
+    "/credentials/onepassword/create",
     response_model=CreateOnePasswordTokenResponse,
     summary="Create or update OnePassword service account token",
     description="Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
@@ -435,7 +434,7 @@ async def get_onepassword_token(
     },
 )
 @base_router.post(
-    "/credentials/onepassword/",
+    "/credentials/onepassword/create/",
     response_model=CreateOnePasswordTokenResponse,
     include_in_schema=False,
 )

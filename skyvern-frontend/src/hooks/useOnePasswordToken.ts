@@ -17,9 +17,9 @@ export function useOnePasswordToken() {
     useQuery<OnePasswordTokenApiResponse>({
       queryKey: ["onePasswordToken"],
       queryFn: async () => {
-        const client = await getClient(credentialGetter);
+        const client = await getClient(credentialGetter, "sans-api-v1");
         return await client
-          .get("/auth-tokens/onepassword")
+          .get("/credentials/onepassword/get")
           .then((response) => response.data.token)
           .catch(() => null);
       },
@@ -27,9 +27,9 @@ export function useOnePasswordToken() {
 
   const createOrUpdateTokenMutation = useMutation({
     mutationFn: async (data: CreateOnePasswordTokenRequest) => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       return await client
-        .post("/auth-tokens/onepassword", data)
+        .post("/credentials/onepassword/create", data)
         .then((response) => response.data as CreateOnePasswordTokenResponse);
     },
     onSuccess: () => {
