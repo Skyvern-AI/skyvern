@@ -1993,6 +1993,70 @@
         "x-fern-sdk-method-name": "deploy_project"
       }
     },
+    "/v1/projects/{project_id}/run": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Run project",
+        "description": "Run a project",
+        "operationId": "run_project_v1_projects__project_id__run_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the project",
+              "examples": [
+                "proj_abc123"
+              ],
+              "title": "Project Id"
+            },
+            "description": "The unique identifier of the project"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/run/tasks/login": {
       "post": {
         "tags": [
@@ -3769,7 +3833,7 @@
             "anyOf": [
               {
                 "items": {
-                  "$ref": "#/components/schemas/ProjectFile"
+                  "$ref": "#/components/schemas/ProjectFileCreate"
                 },
                 "type": "array"
               },
@@ -4047,7 +4111,7 @@
         "properties": {
           "files": {
             "items": {
-              "$ref": "#/components/schemas/ProjectFile"
+              "$ref": "#/components/schemas/ProjectFileCreate"
             },
             "type": "array",
             "title": "Files",
@@ -4932,7 +4996,8 @@
       "FileEncoding": {
         "type": "string",
         "enum": [
-          "base64"
+          "base64",
+          "utf-8"
         ],
         "title": "FileEncoding",
         "description": "Supported file content encodings."
@@ -7507,7 +7572,7 @@
         ],
         "title": "Project"
       },
-      "ProjectFile": {
+      "ProjectFileCreate": {
         "properties": {
           "path": {
             "type": "string",
@@ -7545,7 +7610,7 @@
           "path",
           "content"
         ],
-        "title": "ProjectFile",
+        "title": "ProjectFileCreate",
         "description": "Model representing a file in a project."
       },
       "ProxyLocation": {
