@@ -2811,6 +2811,7 @@ async def select_from_emerging_elements(
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
+        actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
@@ -2818,11 +2819,11 @@ async def select_from_emerging_elements(
         input_element = await dom_after_open.get_skyvern_element_by_id(element_id)
         await input_element.scroll_into_view()
         current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
-        if current_text == value:
+        if current_text == actual_value:
             return ActionSuccess()
 
         await input_element.input_clear()
-        await input_element.input_sequentially(value)
+        await input_element.input_sequentially(actual_value)
         return ActionSuccess()
 
     else:
@@ -2968,15 +2969,16 @@ async def select_from_dropdown(
             step_id=step.step_id,
         )
         try:
+            actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
             input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
             await input_element.scroll_into_view()
             current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
-            if current_text == value:
+            if current_text == actual_value:
                 single_select_result.action_result = ActionSuccess()
                 return single_select_result
 
             await input_element.input_clear()
-            await input_element.input_sequentially(value)
+            await input_element.input_sequentially(actual_value)
             single_select_result.action_result = ActionSuccess()
             return single_select_result
         except Exception as e:
@@ -3419,7 +3421,7 @@ async def normal_select(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
