@@ -89,6 +89,9 @@ function WorkflowRunTimelineBlockItem({
   const duration =
     block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
 
+  // NOTE(jdo): want to put this back; await for now
+  const showDuration = false as const;
+
   return (
     <div
       className={cn(
@@ -151,7 +154,7 @@ function WorkflowRunTimelineBlockItem({
                   </>
                 )}
               </div>
-              {duration && (
+              {duration && showDuration && (
                 <div className="pr-[5px] text-xs text-[#00ecff]">
                   {duration}
                 </div>
