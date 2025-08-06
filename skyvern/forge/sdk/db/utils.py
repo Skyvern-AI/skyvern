@@ -261,6 +261,8 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         deleted_at=workflow_model.deleted_at,
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
+        use_cache=workflow_model.use_cache,
+        cache_key=workflow_model.cache_key,
     )
 
 
