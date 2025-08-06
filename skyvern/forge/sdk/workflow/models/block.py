@@ -2371,7 +2371,7 @@ class FileParserBlock(Block):
     def _detect_file_type_from_url(self, file_url: str) -> FileType:
         """Detect file type based on file extension in the URL."""
         url_lower = file_url.lower()
-        if url_lower.endswith((".xlsx", ".xls")):
+        if url_lower.endswith((".xlsx", ".xls", ".xlsm")):
             return FileType.EXCEL
         elif url_lower.endswith(".pdf"):
             return FileType.PDF

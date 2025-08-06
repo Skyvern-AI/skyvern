@@ -190,6 +190,7 @@ class TestFileParserBlock:
         # Test Excel files
         assert file_parser_block._detect_file_type_from_url("https://example.com/data.xlsx") == FileType.EXCEL
         assert file_parser_block._detect_file_type_from_url("https://example.com/data.xls") == FileType.EXCEL
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xlsm") == FileType.EXCEL
 
         # Test PDF files
         assert file_parser_block._detect_file_type_from_url("https://example.com/document.pdf") == FileType.PDF
