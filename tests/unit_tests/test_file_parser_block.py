@@ -50,6 +50,16 @@ class TestFileParserBlock:
         yield temp_file
         os.unlink(temp_file)
 
+    @pytest.fixture
+    def tsv_file(self):
+        """Create a temporary TSV file for testing."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".tsv", delete=False) as f:
+            f.write("name\tage\tcity\nJohn\t30\tNew York\nJane\t25\tBoston")
+            temp_file = f.name
+
+        yield temp_file
+        os.unlink(temp_file)
+
     def test_file_type_enum_values(self):
         """Test that FileType enum has the expected values."""
         assert FileType.CSV == "csv"
@@ -102,6 +112,15 @@ class TestFileParserBlock:
         result = await file_parser_block._parse_excel_file(excel_file)
 
         expected = [{"name": "John", "age": 30, "city": "New York"}, {"name": "Jane", "age": 25, "city": "Boston"}]
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_parse_tsv_file(self, file_parser_block, tsv_file):
+        """Test TSV file parsing."""
+        result = await file_parser_block._parse_csv_file(tsv_file)
+
+        expected = [{"name": "John", "age": "30", "city": "New York"}, {"name": "Jane", "age": "25", "city": "Boston"}]
 
         assert result == expected
 
@@ -197,6 +216,7 @@ class TestFileParserBlock:
 
         # Test CSV files (default)
         assert file_parser_block._detect_file_type_from_url("https://example.com/data.csv") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.tsv") == FileType.CSV
         assert file_parser_block._detect_file_type_from_url("https://example.com/data.txt") == FileType.CSV
         assert file_parser_block._detect_file_type_from_url("https://example.com/data") == FileType.CSV
 

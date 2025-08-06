@@ -2375,6 +2375,8 @@ class FileParserBlock(Block):
             return FileType.EXCEL
         elif url_lower.endswith(".pdf"):
             return FileType.PDF
+        elif url_lower.endswith(".tsv"):
+            return FileType.CSV  # TSV files are handled by the CSV parser
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
 
@@ -2403,10 +2405,22 @@ class FileParserBlock(Block):
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
-        """Parse CSV file and return list of dictionaries."""
+        """Parse CSV/TSV file and return list of dictionaries."""
         parsed_data = []
         with open(file_path) as file:
-            reader = csv.DictReader(file)
+            # Try to detect the delimiter (comma for CSV, tab for TSV)
+            sample = file.read(1024)
+            file.seek(0)  # Reset file pointer
+
+            # Use csv.Sniffer to detect the delimiter
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+                delimiter = dialect.delimiter
+            except csv.Error:
+                # Default to comma if detection fails
+                delimiter = ","
+
+            reader = csv.DictReader(file, delimiter=delimiter)
             for row in reader:
                 parsed_data.append(row)
         return parsed_data
