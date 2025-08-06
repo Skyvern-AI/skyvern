@@ -1358,7 +1358,7 @@ class AgentDB:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         use_cache: bool = False,
-        cache_project_id: str | None = None,
+        cache_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1377,7 +1377,7 @@ class AgentDB:
                 is_saved_task=is_saved_task,
                 status=status,
                 use_cache=use_cache,
-                cache_project_id=cache_project_id,
+                cache_key=cache_key,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1557,7 +1557,7 @@ class AgentDB:
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
         use_cache: bool | None = None,
-        cache_project_id: str | None = None,
+        cache_key: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1577,8 +1577,8 @@ class AgentDB:
                         workflow.version = version
                     if use_cache is not None:
                         workflow.use_cache = use_cache
-                    if cache_project_id is not None:
-                        workflow.cache_project_id = cache_project_id
+                    if cache_key is not None:
+                        workflow.cache_key = cache_key
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
