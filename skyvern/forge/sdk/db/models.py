@@ -50,6 +50,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_id,
+    generate_workflow_script_id,
 )
 from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
@@ -827,4 +828,35 @@ class ProjectFileModel(Base):
     artifact_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowScriptModel(Base):
+    __tablename__ = "workflow_scripts"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_permanent_id",
+            "cache_key_value",
+            name="uc_workflow_permanent_id_cache_key_value",
+        ),
+        Index("idx_workflow_scripts_org_created", "organization_id", "created_at"),
+        Index("idx_workflow_scripts_workflow_permanent_id", "workflow_permanent_id"),
+    )
+
+    workflow_script_id = Column(String, primary_key=True, default=generate_workflow_script_id)
+    script_id = Column(String, nullable=False)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    workflow_id = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
+    cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
+    cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
     deleted_at = Column(DateTime, nullable=True)
