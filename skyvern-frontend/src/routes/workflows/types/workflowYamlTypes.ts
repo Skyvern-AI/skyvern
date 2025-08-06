@@ -14,6 +14,7 @@ export type WorkflowCreateYAMLRequest = {
   is_saved_task?: boolean;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
+  use_cache?: boolean;
 };
 
 export type WorkflowDefinitionYAML = {

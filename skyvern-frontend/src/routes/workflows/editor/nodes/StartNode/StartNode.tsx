@@ -22,6 +22,7 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
+import { OrgWalled } from "@/components/Orgwalled";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
@@ -59,6 +60,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       ? data.maxScreenshotScrolls
       : null,
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
+    useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
   });
 
   useEffect(() => {
@@ -131,11 +133,27 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         }}
                       />
                     </div>
+                    <OrgWalled>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Label>Use Script Cache</Label>
+                          <HelpTooltip content="Generate & use cached scripts for faster execution" />
+                          <Switch
+                            className="ml-auto"
+                            checked={inputs.useScriptCache}
+                            onCheckedChange={(value) => {
+                              handleChange("useScriptCache", value);
+                            }}
+                          />
+                        </div>
+                      </div>
+                    </OrgWalled>
                     <div className="space-y-2">
                       <div className="flex items-center gap-2">
                         <Label>Save &amp; Reuse Session</Label>
                         <HelpTooltip content="Persist session information across workflow runs" />
                         <Switch
+                          className="ml-auto"
                           checked={inputs.persistBrowserSession}
                           onCheckedChange={(value) => {
                             handleChange("persistBrowserSession", value);

@@ -24,7 +24,6 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
-import { useUser } from "@/hooks/useUser";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -44,9 +43,6 @@ function WorkflowDebugger() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
-  const user = useUser().get();
-  const email = user?.email;
-  const isSkyvernUser = email?.toLowerCase().endsWith("@skyvern.com") ?? false;
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const { data: workflow } = useWorkflowQuery({
@@ -157,6 +153,7 @@ function WorkflowDebugger() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
+    useScriptCache: workflow.use_cache,
   };
 
   const elements = getElements(
@@ -235,7 +232,7 @@ function WorkflowDebugger() {
           initialHeight={360}
           showMaximizeButton={true}
           showMinimizeButton={true}
-          showPowerButton={blockLabel === undefined && isSkyvernUser}
+          showPowerButton={blockLabel === undefined}
           showReloadButton={true}
           // --
           onCycle={handleOnCycle}

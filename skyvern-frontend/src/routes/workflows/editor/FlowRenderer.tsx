@@ -349,6 +349,7 @@ function FlowRenderer({
         max_screenshot_scrolls: data.settings.maxScreenshotScrolls,
         totp_verification_url: workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
+        use_cache: data.settings.useScriptCache,
         workflow_definition: {
           parameters: data.parameters,
           blocks: data.blocks,

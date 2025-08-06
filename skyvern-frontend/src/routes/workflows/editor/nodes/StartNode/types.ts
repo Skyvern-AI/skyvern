@@ -12,6 +12,7 @@ export type WorkflowStartNodeData = {
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
   editable: boolean;
+  useScriptCache: boolean;
 };
 
 export type OtherStartNodeData = {
