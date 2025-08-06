@@ -244,7 +244,6 @@ class FileParserBlockYAML(BlockYAML):
 
     file_url: str
     file_type: FileType
-    json_schema: dict[str, Any] | None = None
 
 
 class PDFParserBlockYAML(BlockYAML):
