@@ -1699,6 +1699,126 @@
         ]
       }
     },
+    "/v1/credentials/onepassword/get": {
+      "get": {
+        "tags": [
+          "Auth Tokens"
+        ],
+        "summary": "Get OnePassword service account token",
+        "description": "Retrieves the current OnePassword service account token for the organization.",
+        "operationId": "get_onepassword_token_v1_credentials_onepassword_get_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateOnePasswordTokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_onepassword_token"
+      }
+    },
+    "/v1/credentials/onepassword/create": {
+      "post": {
+        "tags": [
+          "Auth Tokens"
+        ],
+        "summary": "Create or update OnePassword service account token",
+        "description": "Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
+        "operationId": "update_onepassword_token_v1_credentials_onepassword_create_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOnePasswordTokenRequest",
+                "description": "The OnePassword token data",
+                "openapi_extra": {
+                  "x-fern-sdk-parameter-name": "data"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateOnePasswordTokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_onepassword_token"
+      }
+    },
     "/v1/projects": {
       "post": {
         "tags": [
@@ -1991,6 +2111,70 @@
           }
         },
         "x-fern-sdk-method-name": "deploy_project"
+      }
+    },
+    "/v1/projects/{project_id}/run": {
+      "post": {
+        "tags": [
+          "Projects"
+        ],
+        "summary": "Run project",
+        "description": "Run a project",
+        "operationId": "run_project_v1_projects__project_id__run_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the project",
+              "examples": [
+                "proj_abc123"
+              ],
+              "title": "Project Id"
+            },
+            "description": "The unique identifier of the project"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/run/tasks/login": {
@@ -3739,6 +3923,38 @@
         "title": "CreateCredentialRequest",
         "description": "Request model for creating a new credential."
       },
+      "CreateOnePasswordTokenRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token",
+            "description": "The 1Password service account token",
+            "examples": [
+              "op_1234567890abcdef"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "CreateOnePasswordTokenRequest",
+        "description": "Request model for creating or updating a 1Password service account token."
+      },
+      "CreateOnePasswordTokenResponse": {
+        "properties": {
+          "token": {
+            "$ref": "#/components/schemas/OrganizationAuthToken",
+            "description": "The created or updated 1Password service account token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "CreateOnePasswordTokenResponse",
+        "description": "Response model for 1Password token operations."
+      },
       "CreateProjectRequest": {
         "properties": {
           "workflow_id": {
@@ -3769,7 +3985,7 @@
             "anyOf": [
               {
                 "items": {
-                  "$ref": "#/components/schemas/ProjectFile"
+                  "$ref": "#/components/schemas/ProjectFileCreate"
                 },
                 "type": "array"
               },
@@ -4047,7 +4263,7 @@
         "properties": {
           "files": {
             "items": {
-              "$ref": "#/components/schemas/ProjectFile"
+              "$ref": "#/components/schemas/ProjectFileCreate"
             },
             "type": "array",
             "title": "Files",
@@ -4932,7 +5148,8 @@
       "FileEncoding": {
         "type": "string",
         "enum": [
-          "base64"
+          "base64",
+          "utf-8"
         ],
         "title": "FileEncoding",
         "description": "Supported file content encodings."
@@ -7214,6 +7431,58 @@
         ],
         "title": "OnePasswordCredentialParameterYAML"
       },
+      "OrganizationAuthToken": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "token_type": {
+            "$ref": "#/components/schemas/OrganizationAuthTokenType"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "valid": {
+            "type": "boolean",
+            "title": "Valid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "organization_id",
+          "token_type",
+          "token",
+          "valid",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "OrganizationAuthToken"
+      },
+      "OrganizationAuthTokenType": {
+        "type": "string",
+        "enum": [
+          "api",
+          "onepassword_service_account"
+        ],
+        "title": "OrganizationAuthTokenType"
+      },
       "OutputParameter": {
         "properties": {
           "parameter_type": {
@@ -7507,7 +7776,7 @@
         ],
         "title": "Project"
       },
-      "ProjectFile": {
+      "ProjectFileCreate": {
         "properties": {
           "path": {
             "type": "string",
@@ -7545,7 +7814,7 @@
           "path",
           "content"
         ],
-        "title": "ProjectFile",
+        "title": "ProjectFileCreate",
         "description": "Model representing a file in a project."
       },
       "ProxyLocation": {
