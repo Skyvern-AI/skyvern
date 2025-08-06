@@ -26,6 +26,8 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
 )
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -190,14 +192,18 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
     )
 
 
-def convert_to_organization_auth_token(
+async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel,
 ) -> OrganizationAuthToken:
+    token = org_auth_token.token
+    if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
+        token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
+
     return OrganizationAuthToken(
         id=org_auth_token.id,
         organization_id=org_auth_token.organization_id,
         token_type=OrganizationAuthTokenType(org_auth_token.token_type),
-        token=org_auth_token.token,
+        token=token,
         valid=org_auth_token.valid,
         created_at=org_auth_token.created_at,
         modified_at=org_auth_token.modified_at,
@@ -483,6 +489,9 @@ def convert_to_workflow_run_block(
         modified_at=workflow_run_block_model.modified_at,
     )
     if task:
+        if task.finished_at and task.started_at:
+            duration = task.finished_at - task.started_at
+            block.duration = duration.total_seconds()
         block.url = task.url
         block.navigation_goal = task.navigation_goal
         block.navigation_payload = task.navigation_payload

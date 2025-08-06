@@ -1086,8 +1086,21 @@ async def handle_input_text_action(
                 exc_info=True,
             )
 
+    # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
+    # we need find a better way to detect the attribute in the future
+    class_name: str | None = await skyvern_element.get_attr("class")
+    if class_name and "blinking-cursor" in class_name:
+        if is_totp_value:
+            text = generate_totp_value(task=task, parameter=action.text)
+        await skyvern_element.press_fill(text=text)
+        return [ActionSuccess()]
+
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
-    if not await skyvern_element.is_spinbtn_input():
+    # run `Locator.clear()` when:
+    # 1. the element is not a spin button
+    #   1.1. the element has a value attribute
+    #   1.2. the element is not common input tag
+    if not await skyvern_element.is_spinbtn_input() and (current_text or (tag_name not in COMMON_INPUT_TAGS)):
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
@@ -1095,17 +1108,7 @@ async def handle_input_text_action(
             return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-
-            # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
-            # we need find a better way to detect the attribute in the future
-            class_name: str | None = await skyvern_element.get_attr("class")
-            if not class_name or "blinking-cursor" not in class_name:
-                return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
-
-            if is_totp_value:
-                text = generate_totp_value(task=task, parameter=action.text)
-            await skyvern_element.press_fill(text=text)
-            return [ActionSuccess()]
+            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
     # wait 2s for blocking element to show up
     await asyncio.sleep(2)
@@ -2811,6 +2814,7 @@ async def select_from_emerging_elements(
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
+        actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
@@ -2818,11 +2822,11 @@ async def select_from_emerging_elements(
         input_element = await dom_after_open.get_skyvern_element_by_id(element_id)
         await input_element.scroll_into_view()
         current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
-        if current_text == value:
+        if current_text == actual_value:
             return ActionSuccess()
 
         await input_element.input_clear()
-        await input_element.input_sequentially(value)
+        await input_element.input_sequentially(actual_value)
         return ActionSuccess()
 
     else:
@@ -2968,15 +2972,16 @@ async def select_from_dropdown(
             step_id=step.step_id,
         )
         try:
+            actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
             input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
             await input_element.scroll_into_view()
             current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
-            if current_text == value:
+            if current_text == actual_value:
                 single_select_result.action_result = ActionSuccess()
                 return single_select_result
 
             await input_element.input_clear()
-            await input_element.input_sequentially(value)
+            await input_element.input_sequentially(actual_value)
             single_select_result.action_result = ActionSuccess()
             return single_select_result
         except Exception as e:
@@ -3419,7 +3424,7 @@ async def normal_select(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 

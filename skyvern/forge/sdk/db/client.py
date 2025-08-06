@@ -66,6 +66,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_parameter,
     hydrate_action,
 )
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -867,7 +869,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).first():
-                    return convert_to_organization_auth_token(token)
+                    return await convert_to_organization_auth_token(token)
                 else:
                     return None
         except SQLAlchemyError:
@@ -893,7 +895,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).all()
-                return [convert_to_organization_auth_token(token) for token in tokens]
+                return [await convert_to_organization_auth_token(token) for token in tokens]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -907,19 +909,27 @@ class AgentDB:
         token_type: OrganizationAuthTokenType,
         token: str,
         valid: bool | None = True,
+        encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken | None:
         try:
+            encrypted_token = ""
+            if encrypted_method is not None:
+                encrypted_token = await encryptor.encrypt(token, encrypted_method)
+
             async with self.Session() as session:
                 query = (
                     select(OrganizationAuthTokenModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(token_type=token_type)
-                    .filter_by(token=token)
                 )
+                if encrypted_token:
+                    query = query.filter_by(encrypted_token=encrypted_token)
+                else:
+                    query = query.filter_by(token=token)
                 if valid is not None:
                     query = query.filter_by(valid=valid)
                 if token_obj := (await session.scalars(query)).first():
-                    return convert_to_organization_auth_token(token_obj)
+                    return await convert_to_organization_auth_token(token_obj)
                 else:
                     return None
         except SQLAlchemyError:
@@ -934,18 +944,51 @@ class AgentDB:
         organization_id: str,
         token_type: OrganizationAuthTokenType,
         token: str,
+        encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken:
+        plaintext_token = token
+        encrypted_token = ""
+
+        if encrypted_method is not None:
+            encrypted_token = await encryptor.encrypt(token, encrypted_method)
+            plaintext_token = ""
+
         async with self.Session() as session:
             auth_token = OrganizationAuthTokenModel(
                 organization_id=organization_id,
                 token_type=token_type,
-                token=token,
+                token=plaintext_token,
+                encrypted_token=encrypted_token,
+                encrypted_method=encrypted_method.value if encrypted_method is not None else "",
             )
             session.add(auth_token)
             await session.commit()
             await session.refresh(auth_token)
 
-        return convert_to_organization_auth_token(auth_token)
+        return await convert_to_organization_auth_token(auth_token)
+
+    async def invalidate_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> None:
+        """Invalidate all existing tokens of a specific type for an organization."""
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    update(OrganizationAuthTokenModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(token_type=token_type)
+                    .filter_by(valid=True)
+                    .values(valid=False)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
 
     async def get_artifacts_for_task_v2(
         self,
@@ -1315,7 +1358,7 @@ class AgentDB:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         use_cache: bool = False,
-        cache_project_id: str | None = None,
+        cache_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1334,7 +1377,7 @@ class AgentDB:
                 is_saved_task=is_saved_task,
                 status=status,
                 use_cache=use_cache,
-                cache_project_id=cache_project_id,
+                cache_key=cache_key,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1514,7 +1557,7 @@ class AgentDB:
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
         use_cache: bool | None = None,
-        cache_project_id: str | None = None,
+        cache_key: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1534,8 +1577,8 @@ class AgentDB:
                         workflow.version = version
                     if use_cache is not None:
                         workflow.use_cache = use_cache
-                    if cache_project_id is not None:
-                        workflow.cache_project_id = cache_project_id
+                    if cache_key is not None:
+                        workflow.cache_key = cache_key
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)

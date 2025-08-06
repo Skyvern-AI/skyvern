@@ -167,7 +167,9 @@ class OrganizationAuthTokenModel(Base):
 
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
     token_type = Column(String, nullable=False)
-    token = Column(String, index=True, nullable=False)
+    token = Column(String, index=True, nullable=True)
+    encrypted_token = Column(String, index=True, nullable=True)
+    encrypted_method = Column(String, nullable=True)
     valid = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -237,7 +239,7 @@ class WorkflowModel(Base):
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     use_cache = Column(Boolean, default=False, nullable=False)
-    cache_project_id = Column(String, nullable=True)
+    cache_key = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
