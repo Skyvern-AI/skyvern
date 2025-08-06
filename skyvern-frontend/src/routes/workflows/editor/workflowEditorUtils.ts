@@ -698,6 +698,7 @@ function getElements(
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
       extraHttpHeaders: settings.extraHttpHeaders,
       editable,
+      useScriptCache: settings.useScriptCache,
     }),
   );
 
@@ -1400,6 +1401,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
+    useScriptCache: false,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1417,6 +1419,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       extraHttpHeaders: data.extraHttpHeaders,
+      useScriptCache: data.useScriptCache,
     };
   }
   return defaultSettings;
