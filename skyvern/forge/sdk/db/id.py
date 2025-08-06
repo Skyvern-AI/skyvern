@@ -59,6 +59,7 @@ WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
 WORKFLOW_PREFIX = "w"
 WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_RUN_PREFIX = "wr"
+WORKFLOW_SCRIPT_PREFIX = "ws"
 
 
 def generate_workflow_id() -> str:
@@ -79,6 +80,11 @@ def generate_workflow_run_block_id() -> str:
 def generate_workflow_run_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_RUN_PREFIX}_{int_id}"
+
+
+def generate_workflow_script_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_SCRIPT_PREFIX}_{int_id}"
 
 
 def generate_aws_secret_parameter_id() -> str:
