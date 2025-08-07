@@ -35,6 +35,7 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_script_block_id,
     generate_script_file_id,
     generate_script_id,
     generate_script_revision_id,
@@ -860,4 +861,25 @@ class WorkflowScriptModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class ScriptBlockModel(Base):
+    __tablename__ = "script_blocks"
+    __table_args__ = (
+        UniqueConstraint(
+            "script_revision_id",
+            "script_block_label",
+            name="uc_script_revision_id_script_block_label",
+        ),
+    )
+
+    script_block_id = Column(String, primary_key=True, default=generate_script_block_id)
+    script_id = Column(String, nullable=False)
+    script_revision_id = Column(String, nullable=False, index=True)
+    script_block_label = Column(String, nullable=False)
+    script_file_id = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
