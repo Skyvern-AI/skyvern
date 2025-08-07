@@ -502,6 +502,7 @@ export type WorkflowApiResponse = {
   modified_at: string;
   deleted_at: string | null;
   use_cache: boolean;
+  cache_key: string | null;
 };
 
 export type WorkflowSettings = {
@@ -512,6 +513,7 @@ export type WorkflowSettings = {
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
   useScriptCache: boolean;
+  scriptCacheKey: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

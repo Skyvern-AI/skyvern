@@ -59,6 +59,7 @@ function WorkflowEditor() {
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
     useScriptCache: workflow.use_cache,
+    scriptCacheKey: workflow.cache_key,
   };
 
   const elements = getElements(

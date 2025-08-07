@@ -15,6 +15,7 @@ export type WorkflowCreateYAMLRequest = {
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   use_cache?: boolean;
+  cache_key?: string | null;
 };
 
 export type WorkflowDefinitionYAML = {
