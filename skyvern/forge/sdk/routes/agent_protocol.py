@@ -2116,7 +2116,12 @@ async def new_debug_session(
 
         if debug_session:
             now = datetime.now(timezone.utc)
-            if now - debug_session.created_at < timedelta(seconds=30):
+            created_at_utc = (
+                debug_session.created_at.replace(tzinfo=timezone.utc)
+                if debug_session.created_at.tzinfo is None
+                else debug_session.created_at
+            )
+            if now - created_at_utc < timedelta(seconds=30):
                 LOG.info(
                     "Existing debug session is less than 30s old, returning it",
                     debug_session_id=debug_session.debug_session_id,
