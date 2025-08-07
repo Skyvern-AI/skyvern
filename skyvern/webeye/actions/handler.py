@@ -1964,8 +1964,10 @@ def generate_totp_value(task: Task, parameter: str) -> str:
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
     totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
     totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-    totp_secret_no_whitespace = "".join(totp_secret.split())
-    return pyotp.TOTP(totp_secret_no_whitespace).now()
+    if not totp_secret:
+        LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
+        return parameter
+    return pyotp.TOTP(totp_secret).now()
 
 
 async def chain_click(
