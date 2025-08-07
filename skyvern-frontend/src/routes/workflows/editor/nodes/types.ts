@@ -41,7 +41,7 @@ export const workflowBlockTitle: {
   file_url_parser: "File Parser",
   for_loop: "Loop",
   login: "Login",
-  navigation: "Navigation",
+  navigation: "Task",
   send_email: "Send Email",
   task: "Task",
   text_prompt: "Text Prompt",

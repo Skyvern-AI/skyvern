@@ -35,6 +35,7 @@ import {
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
+import { workflowBlockTitle } from "../types";
 
 interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
@@ -57,15 +58,6 @@ type Payload = Record<string, unknown> & {
   totp_url: string | null;
   webhook_url: string | null;
   workflow_id: string;
-};
-
-const blockTypeToTitle = (type: WorkflowBlockType): string => {
-  const parts = type.split("_");
-  const capCased = parts
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-
-  return `${capCased} Block`;
 };
 
 const getPayload = (opts: {
@@ -150,7 +142,7 @@ function NodeHeader({
     id: nodeId,
     initialValue: blockLabel,
   });
-  const blockTitle = blockTypeToTitle(type);
+  const blockTitle = workflowBlockTitle[type];
   const deleteNodeCallback = useDeleteNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
