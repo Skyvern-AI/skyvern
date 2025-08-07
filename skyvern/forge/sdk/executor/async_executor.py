@@ -12,7 +12,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.runs import RunEngine, RunType
-from skyvern.services import project_service, task_v2_service
+from skyvern.services import script_service, task_v2_service
 from skyvern.utils.files import initialize_skyvern_state_file
 
 LOG = structlog.get_logger()
@@ -62,10 +62,10 @@ class AsyncExecutor(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def execute_project(
+    async def execute_script(
         self,
         request: Request | None,
-        project_id: str,
+        script_id: str,
         organization_id: str,
         background_tasks: BackgroundTasks | None,
         **kwargs: dict,
@@ -209,18 +209,18 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 browser_session_id=browser_session_id,
             )
 
-    async def execute_project(
+    async def execute_script(
         self,
         request: Request | None,
-        project_id: str,
+        script_id: str,
         organization_id: str,
         background_tasks: BackgroundTasks | None,
         **kwargs: dict,
     ) -> None:
         if background_tasks:
             background_tasks.add_task(
-                project_service.execute_project,
-                project_id=project_id,
+                script_service.execute_script,
+                script_id=script_id,
                 organization_id=organization_id,
                 background_tasks=background_tasks,
             )

@@ -29,8 +29,8 @@ from skyvern.forge.sdk.db.models import (
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
-    ProjectFileModel,
-    ProjectModel,
+    ScriptFileModel,
+    ScriptModel,
     StepModel,
     TaskGenerationModel,
     TaskModel,
@@ -54,8 +54,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
-    convert_to_project,
-    convert_to_project_file,
+    convert_to_script,
+    convert_to_script_file,
     convert_to_step,
     convert_to_task,
     convert_to_workflow,
@@ -102,8 +102,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.projects import Project, ProjectFile
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
+from skyvern.schemas.scripts import Script, ScriptFile
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 
@@ -3546,134 +3546,134 @@ class AgentDB:
 
             return DebugSession.model_validate(debug_session)
 
-    async def create_project(
+    async def create_script(
         self,
         organization_id: str,
         run_id: str | None = None,
-        project_id: str | None = None,
+        script_id: str | None = None,
         version: int | None = None,
-    ) -> Project:
+    ) -> Script:
         try:
             async with self.Session() as session:
-                project = ProjectModel(
+                script = ScriptModel(
                     organization_id=organization_id,
                     run_id=run_id,
                 )
-                if project_id:
-                    project.project_id = project_id
+                if script_id:
+                    script.script_id = script_id
                 if version:
-                    project.version = version
-                session.add(project)
+                    script.version = version
+                session.add(script)
                 await session.commit()
-                await session.refresh(project)
-                return convert_to_project(project)
+                await session.refresh(script)
+                return convert_to_script(script)
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def update_project(
+    async def update_script(
         self,
-        project_revision_id: str,
+        script_revision_id: str,
         organization_id: str,
         artifact_id: str | None = None,
         run_id: str | None = None,
         version: int | None = None,
-    ) -> Project:
+    ) -> Script:
         try:
             async with self.Session() as session:
-                get_project_query = (
-                    select(ProjectModel)
+                get_script_query = (
+                    select(ScriptModel)
                     .filter_by(organization_id=organization_id)
-                    .filter_by(project_revision_id=project_revision_id)
+                    .filter_by(script_revision_id=script_revision_id)
                 )
-                if project := (await session.scalars(get_project_query)).first():
+                if script := (await session.scalars(get_script_query)).first():
                     if artifact_id:
-                        project.artifact_id = artifact_id
+                        script.artifact_id = artifact_id
                     if run_id:
-                        project.run_id = run_id
+                        script.run_id = run_id
                     if version:
-                        project.version = version
+                        script.version = version
                     await session.commit()
-                    await session.refresh(project)
-                    return convert_to_project(project)
+                    await session.refresh(script)
+                    return convert_to_script(script)
                 else:
-                    raise NotFoundError("Project not found")
+                    raise NotFoundError("Script not found")
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
         except NotFoundError:
-            LOG.error("No project found to update", project_revision_id=project_revision_id)
+            LOG.error("No script found to update", script_revision_id=script_revision_id)
             raise
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_projects(
+    async def get_scripts(
         self,
         organization_id: str,
         page: int = 1,
         page_size: int = 10,
-    ) -> list[Project]:
+    ) -> list[Script]:
         try:
             async with self.Session() as session:
                 # Calculate offset for pagination
                 offset = (page - 1) * page_size
 
-                # Subquery to get the latest version of each project
+                # Subquery to get the latest version of each script
                 latest_versions_subquery = (
-                    select(ProjectModel.project_id, func.max(ProjectModel.version).label("latest_version"))
+                    select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
                     .filter_by(organization_id=organization_id)
-                    .filter(ProjectModel.deleted_at.is_(None))
-                    .group_by(ProjectModel.project_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .group_by(ScriptModel.script_id)
                     .subquery()
                 )
 
-                # Main query to get projects with their latest versions
-                get_projects_query = (
-                    select(ProjectModel)
+                # Main query to get scripts with their latest versions
+                get_scripts_query = (
+                    select(ScriptModel)
                     .join(
                         latest_versions_subquery,
                         and_(
-                            ProjectModel.project_id == latest_versions_subquery.c.project_id,
-                            ProjectModel.version == latest_versions_subquery.c.latest_version,
+                            ScriptModel.script_id == latest_versions_subquery.c.script_id,
+                            ScriptModel.version == latest_versions_subquery.c.latest_version,
                         ),
                     )
                     .filter_by(organization_id=organization_id)
-                    .filter(ProjectModel.deleted_at.is_(None))
-                    .order_by(ProjectModel.created_at.desc())
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .order_by(ScriptModel.created_at.desc())
                     .limit(page_size)
                     .offset(offset)
                 )
-                projects = (await session.scalars(get_projects_query)).all()
-                return [convert_to_project(project) for project in projects]
+                scripts = (await session.scalars(get_scripts_query)).all()
+                return [convert_to_script(script) for script in scripts]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_project(
+    async def get_script(
         self,
-        project_id: str,
+        script_id: str,
         organization_id: str,
         version: int | None = None,
-    ) -> Project | None:
-        """Get a specific project by ID and optionally by version."""
+    ) -> Script | None:
+        """Get a specific script by ID and optionally by version."""
         try:
             async with self.Session() as session:
-                get_project_query = (
-                    select(ProjectModel)
-                    .filter_by(project_id=project_id)
+                get_script_query = (
+                    select(ScriptModel)
+                    .filter_by(script_id=script_id)
                     .filter_by(organization_id=organization_id)
-                    .filter(ProjectModel.deleted_at.is_(None))
+                    .filter(ScriptModel.deleted_at.is_(None))
                 )
 
                 if version is not None:
-                    get_project_query = get_project_query.filter_by(version=version)
+                    get_script_query = get_script_query.filter_by(version=version)
                 else:
                     # Get the latest version
-                    get_project_query = get_project_query.order_by(ProjectModel.version.desc()).limit(1)
+                    get_script_query = get_script_query.order_by(ScriptModel.version.desc()).limit(1)
 
-                if project := (await session.scalars(get_project_query)).first():
-                    return convert_to_project(project)
+                if script := (await session.scalars(get_script_query)).first():
+                    return convert_to_script(script)
                 return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -3682,21 +3682,21 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_project_revision(self, project_revision_id: str, organization_id: str) -> Project | None:
+    async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
         async with self.Session() as session:
-            project = (
+            script = (
                 await session.scalars(
-                    select(ProjectModel)
-                    .filter_by(project_revision_id=project_revision_id)
+                    select(ScriptModel)
+                    .filter_by(script_revision_id=script_revision_id)
                     .filter_by(organization_id=organization_id)
                 )
             ).first()
-            return convert_to_project(project) if project else None
+            return convert_to_script(script) if script else None
 
-    async def create_project_file(
+    async def create_script_file(
         self,
-        project_revision_id: str,
-        project_id: str,
+        script_revision_id: str,
+        script_id: str,
         organization_id: str,
         file_path: str,
         file_name: str,
@@ -3707,12 +3707,12 @@ class AgentDB:
         encoding: str = "utf-8",
         artifact_id: str | None = None,
     ) -> None:
-        """Create a project file record."""
+        """Create a script file record."""
         try:
             async with self.Session() as session:
-                project_file = ProjectFileModel(
-                    project_revision_id=project_revision_id,
-                    project_id=project_id,
+                script_file = ScriptFileModel(
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
                     organization_id=organization_id,
                     file_path=file_path,
                     file_name=file_name,
@@ -3723,7 +3723,7 @@ class AgentDB:
                     encoding=encoding,
                     artifact_id=artifact_id,
                 )
-                session.add(project_file)
+                session.add(script_file)
                 await session.commit()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -3732,13 +3732,13 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_project_files(self, project_revision_id: str, organization_id: str) -> list[ProjectFile]:
+    async def get_script_files(self, script_revision_id: str, organization_id: str) -> list[ScriptFile]:
         async with self.Session() as session:
-            project_files = (
+            script_files = (
                 await session.scalars(
-                    select(ProjectFileModel)
-                    .filter_by(project_revision_id=project_revision_id)
+                    select(ScriptFileModel)
+                    .filter_by(script_revision_id=script_revision_id)
                     .filter_by(organization_id=organization_id)
                 )
             ).all()
-            return [convert_to_project_file(project_file) for project_file in project_files]
+            return [convert_to_script_file(script_file) for script_file in script_files]

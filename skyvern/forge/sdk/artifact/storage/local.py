@@ -78,10 +78,10 @@ class LocalStorage(BaseStorage):
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
-    def build_project_file_uri(
-        self, *, organization_id: str, project_id: str, project_version: int, file_path: str
+    def build_script_file_uri(
+        self, *, organization_id: str, script_id: str, script_version: int, file_path: str
     ) -> str:
-        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/projects/{project_id}/{project_version}/{file_path}"
+        return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/scripts/{script_id}/{script_version}/{file_path}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         file_path = None
