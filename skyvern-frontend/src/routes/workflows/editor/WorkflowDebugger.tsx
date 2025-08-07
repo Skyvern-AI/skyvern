@@ -20,7 +20,6 @@ import {
   DialogTitle,
   DialogClose,
 } from "@/components/ui/dialog";
-import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
@@ -35,11 +34,16 @@ import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
 import { getInitialParameters } from "./utils";
 
+const Constants = {
+  NewBrowserCooldown: 30000,
+} as const;
+
 function WorkflowDebugger() {
   const { blockLabel, workflowPermanentId } = useParams();
   const [openDialogue, setOpenDialogue] = useState(false);
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
+  const [showPowerButton, setShowPowerButton] = useState(true);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
@@ -78,6 +82,19 @@ function WorkflowDebugger() {
     }
   });
 
+  const afterCycleBrowser = () => {
+    setOpenDialogue(false);
+    setShowPowerButton(false);
+
+    if (powerButtonTimeoutRef.current) {
+      clearTimeout(powerButtonTimeoutRef.current);
+    }
+
+    powerButtonTimeoutRef.current = setTimeout(() => {
+      setShowPowerButton(true);
+    }, Constants.NewBrowserCooldown);
+  };
+
   const cycleBrowser = useMutation({
     mutationFn: async (id: string) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
@@ -97,7 +114,7 @@ function WorkflowDebugger() {
         description: "Your browser has been cycled.",
       });
 
-      setOpenDialogue(false);
+      afterCycleBrowser();
     },
     onError: (error: AxiosError) => {
       toast({
@@ -105,11 +122,13 @@ function WorkflowDebugger() {
         title: "Failed to cycle browser",
         description: error.message,
       });
-      setOpenDialogue(false);
+
+      afterCycleBrowser();
     },
   });
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const powerButtonTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     if (
@@ -225,29 +244,32 @@ function WorkflowDebugger() {
         />
       </ReactFlowProvider>
 
-      {activeDebugSession && (
-        <FloatingWindow
-          title={browserTitle}
-          bounded={false}
-          initialWidth={512}
-          initialHeight={360}
-          showMaximizeButton={true}
-          showMinimizeButton={true}
-          showPowerButton={blockLabel === undefined}
-          showReloadButton={true}
-          // --
-          onCycle={handleOnCycle}
-        >
-          {activeDebugSession && activeDebugSession.browser_session_id ? (
-            <BrowserStream
-              interactive={interactor === "human"}
-              browserSessionId={activeDebugSession.browser_session_id}
-            />
-          ) : (
-            <Skeleton className="h-full w-full" />
-          )}
-        </FloatingWindow>
-      )}
+      <FloatingWindow
+        title={browserTitle}
+        bounded={false}
+        initialWidth={512}
+        initialHeight={360}
+        showMaximizeButton={true}
+        showMinimizeButton={true}
+        showPowerButton={blockLabel === undefined && showPowerButton}
+        showReloadButton={true}
+        // --
+        onCycle={handleOnCycle}
+      >
+        {activeDebugSession &&
+        activeDebugSession.browser_session_id &&
+        !cycleBrowser.isPending ? (
+          <BrowserStream
+            interactive={interactor === "human"}
+            browserSessionId={activeDebugSession.browser_session_id}
+          />
+        ) : (
+          <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
+            Connecting to your browser...
+            <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+          </div>
+        )}
+      </FloatingWindow>
     </div>
   );
 }
