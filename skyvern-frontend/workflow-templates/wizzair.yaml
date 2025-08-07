@@ -1,0 +1,37 @@
+title: Wizz Air Login Automation
+name: WizzAirLoginDemo
+description: Demonstrates logging into wizzair.com using email and password.
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      id: auth_wizzair_login
+      name: Authenticate Wizz Air User Login # This might be redundant if label serves the same purpose
+      label: Authenticate Wizz Air User Login # Added required label field
+      actions:
+        - type: NAVIGATE
+          description: Go to the Wizz Air login page.
+          url: https://wizzair.com/en-gb/auth/login # Adjust region if necessary
+
+        - type: TYPE
+          description: Enter the email address.
+          selector: 'input[data-testid="login-email-input"], input[name="email"], #email'
+          text: 'your-wizzair-email@example.com' # Replace with actual email or a secret
+          sensitive: false
+
+        - type: TYPE
+          description: Enter the password securely.
+          selector: 'input[data-testid="login-password-input"], input[name="password"], #password'
+          text: '{{secrets.WIZZAIR_LOGIN_PASSWORD}}' # Reference to a secret in Skyvern's vault
+          sensitive: true
+
+        - type: CLICK
+          description: Click the Sign In button.
+          selector: 'button[data-testid="login-submit-button"], button[type="submit"]:has-text("Sign in")'
+
+        - type: EXTRACT_DATA
+          description: Verify successful login by checking for a user-specific element on the dashboard.
+          data_points:
+            - name: user_profile_element
+              selector: '[data-testid="profile-avatar-button"], .user-menu__name, #header-profile-menu'
+              type: TEXT
