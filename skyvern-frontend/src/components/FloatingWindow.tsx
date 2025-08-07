@@ -18,7 +18,6 @@ import {
 import { flushSync } from "react-dom";
 import Draggable from "react-draggable";
 
-import { OrgWalled } from "./Orgwalled";
 import {
   Tooltip,
   TooltipContent,
@@ -628,11 +627,7 @@ function FloatingWindow({
                         onClick={toggleMaximized}
                       />
                     )}
-                    {showPowerButton && (
-                      <OrgWalled className="flex items-center justify-center">
-                        <PowerButton onClick={() => cycle()} />
-                      </OrgWalled>
-                    )}
+                    {showPowerButton && <PowerButton onClick={() => cycle()} />}
                   </div>
                   <div className="ml-auto">{title}</div>
                   {showReloadButton && (
