@@ -16,6 +16,7 @@ import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -89,6 +90,7 @@ import {
   descendants,
   generateNodeLabel,
   getAdditionalParametersForEmailBlock,
+  getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
   getWorkflowErrors,
@@ -268,11 +270,11 @@ function FlowRenderer({
   const queryClient = useQueryClient();
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
+  const { title, initializeTitle } = useWorkflowTitleStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const [parameters, setParameters] =
     useState<ParametersState>(initialParameters);
-  const [title, setTitle] = useState(initialTitle);
   const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
@@ -282,6 +284,11 @@ function FlowRenderer({
       setShouldConstrainPan(true);
     }
   }, [nodesInitialized]);
+
+  useEffect(() => {
+    initializeTitle(initialTitle);
+  }, [initialTitle, initializeTitle]);
+
   const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
   useShouldNotifyWhenClosingTab(hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
@@ -342,6 +349,7 @@ function FlowRenderer({
         max_screenshot_scrolls: data.settings.maxScreenshotScrolls,
         totp_verification_url: workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
+        use_cache: data.settings.useScriptCache,
         workflow_definition: {
           parameters: data.parameters,
           blocks: data.blocks,
@@ -397,10 +405,21 @@ function FlowRenderer({
   }, [nodesInitialized]);
 
   useEffect(() => {
-    const blocks = getWorkflowBlocks(nodes, edges);
-    const debuggable = blocks.filter((block) =>
+    const topLevelBlocks = getWorkflowBlocks(nodes, edges);
+    const debuggable = topLevelBlocks.filter((block) =>
       debuggableWorkflowBlockTypes.has(block.block_type),
     );
+
+    for (const node of nodes) {
+      const childBlocks = getOrderedChildrenBlocks(nodes, edges, node.id);
+
+      for (const child of childBlocks) {
+        if (debuggableWorkflowBlockTypes.has(child.block_type)) {
+          debuggable.push(child);
+        }
+      }
+    }
+
     setDebuggableBlockCount(debuggable.length);
   }, [nodes, edges]);
 
@@ -787,12 +806,7 @@ function FlowRenderer({
             <Panel position="top-center" className={cn("h-20")}>
               <WorkflowHeader
                 debuggableBlockCount={debuggableBlockCount}
-                title={title}
                 saving={saveWorkflowMutation.isPending}
-                onTitleChange={(newTitle) => {
-                  setTitle(newTitle);
-                  setHasChanges(true);
-                }}
                 parametersPanelOpen={
                   workflowPanelState.active &&
                   workflowPanelState.content === "parameters"

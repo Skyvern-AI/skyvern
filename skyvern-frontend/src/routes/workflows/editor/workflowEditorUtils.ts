@@ -56,7 +56,10 @@ import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
-import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
+import {
+  isFileParserNode,
+  fileParserNodeDefaultData,
+} from "./nodes/FileParserNode/types";
 import {
   isLoopNode,
   LoopNode,
@@ -468,6 +471,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+          jsonSchema: JSON.stringify(block.json_schema, null, 2),
         },
       };
     }
@@ -694,6 +698,7 @@ function getElements(
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
       extraHttpHeaders: settings.extraHttpHeaders,
       editable,
+      useScriptCache: settings.useScriptCache,
     }),
   );
 
@@ -1254,7 +1259,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: "csv",
+        file_type: "csv", // Backend will auto-detect based on file extension
+        json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
     case "textPrompt": {
@@ -1395,6 +1401,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
+    useScriptCache: false,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1412,6 +1419,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       extraHttpHeaders: data.extraHttpHeaders,
+      useScriptCache: data.useScriptCache,
     };
   }
   return defaultSettings;
@@ -2187,6 +2195,15 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  const fileParserNodes = nodes.filter(isFileParserNode);
+  fileParserNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.jsonSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+  });
+
   const waitNodes = nodes.filter(isWaitNode);
   waitNodes.forEach((node) => {
     const waitTimeString = node.data.waitInSeconds.trim();
@@ -2242,6 +2259,7 @@ export {
   getLabelForWorkflowParameterType,
   maxNestingLevel,
   getWorkflowSettings,
+  getOrderedChildrenBlocks,
   getOutputParameterKey,
   getPreviousNodeIds,
   getUniqueLabelForExistingNode,

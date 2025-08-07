@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import re
-import urllib.parse
 from enum import IntEnum, StrEnum
 from typing import Tuple
 
@@ -32,6 +31,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreditCardCredential,
     PasswordCredential,
 )
+from skyvern.forge.sdk.services.credentials import parse_totp_secret
 
 LOG = structlog.get_logger()
 BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
@@ -245,25 +245,7 @@ class BitwardenService:
             >>> BitwardenService.extract_totp_secret("otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB")
             "AAAAAABBBBBBB"
         """
-        if not totp_value:
-            return ""
-
-        # Handle TOTP URI format
-        if totp_value.startswith("otpauth://"):
-            try:
-                # Parse the URI to extract the secret
-                query = urllib.parse.urlparse(totp_value).query
-                params = dict(urllib.parse.parse_qsl(query))
-                return params.get("secret", "")
-            except Exception:
-                LOG.error(
-                    "Failed to parse TOTP URI",
-                    totp_value=totp_value,
-                    exc_info=True,
-                )
-                return ""
-
-        return totp_value
+        return parse_totp_secret(totp_value)
 
     @staticmethod
     async def _get_secret_value_from_url(

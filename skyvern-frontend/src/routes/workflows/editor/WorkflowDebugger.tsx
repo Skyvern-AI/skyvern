@@ -1,11 +1,28 @@
-import { ReactFlowProvider } from "@xyflow/react";
-import { useParams } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
+import { AxiosError } from "axios";
+import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useRef, useState } from "react";
+import { useParams } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ReactFlowProvider } from "@xyflow/react";
 
+import { getClient } from "@/api/AxiosClient";
+import { DebugSessionApiResponse } from "@/api/types";
+import { AnimatedWave } from "@/components/AnimatedWave";
 import { BrowserStream } from "@/components/BrowserStream";
 import { FloatingWindow } from "@/components/FloatingWindow";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogClose,
+} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { toast } from "@/components/ui/use-toast";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { useSidebarStore } from "@/store/SidebarStore";
@@ -19,7 +36,11 @@ import { getElements } from "./workflowEditorUtils";
 import { getInitialParameters } from "./utils";
 
 function WorkflowDebugger() {
-  const { workflowPermanentId } = useParams();
+  const { blockLabel, workflowPermanentId } = useParams();
+  const [openDialogue, setOpenDialogue] = useState(false);
+  const [activeDebugSession, setActiveDebugSession] =
+    useState<DebugSessionApiResponse | null>(null);
+  const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
 
@@ -41,6 +62,10 @@ function WorkflowDebugger() {
     (state) => state.setHasChanges,
   );
 
+  const handleOnCycle = () => {
+    setOpenDialogue(true);
+  };
+
   useMountEffect(() => {
     setCollapsed(true);
     setHasChanges(false);
@@ -51,6 +76,37 @@ function WorkflowDebugger() {
       });
       setShouldFetchDebugSession(true);
     }
+  });
+
+  const cycleBrowser = useMutation({
+    mutationFn: async (id: string) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client.post<DebugSessionApiResponse>(`/debug-session/${id}/new`);
+    },
+    onSuccess: (response) => {
+      const newDebugSession = response.data;
+      setActiveDebugSession(newDebugSession);
+
+      queryClient.invalidateQueries({
+        queryKey: ["debugSession", workflowPermanentId],
+      });
+
+      toast({
+        title: "Browser cycled",
+        variant: "success",
+        description: "Your browser has been cycled.",
+      });
+
+      setOpenDialogue(false);
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to cycle browser",
+        description: error.message,
+      });
+      setOpenDialogue(false);
+    },
   });
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -70,6 +126,10 @@ function WorkflowDebugger() {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
+      }
+
+      if (debugSession) {
+        setActiveDebugSession(debugSession);
       }
     }
 
@@ -93,6 +153,7 @@ function WorkflowDebugger() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
+    useScriptCache: workflow.use_cache,
   };
 
   const elements = getElements(
@@ -107,6 +168,52 @@ function WorkflowDebugger() {
 
   return (
     <div className="relative flex h-screen w-full">
+      <Dialog
+        open={openDialogue}
+        onOpenChange={(open) => {
+          if (!open && cycleBrowser.isPending) {
+            return;
+          }
+          setOpenDialogue(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Cycle (Get a new browser)</DialogTitle>
+            <DialogDescription>
+              <div className="pb-2 pt-4 text-sm text-slate-400">
+                {cycleBrowser.isPending ? (
+                  <>
+                    Cooking you up a fresh browser...
+                    <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                  </>
+                ) : (
+                  "Abandon this browser for a new one. Are you sure?"
+                )}
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {!cycleBrowser.isPending && (
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+            )}
+            <Button
+              variant="default"
+              onClick={() => {
+                cycleBrowser.mutate(workflowPermanentId!);
+              }}
+              disabled={cycleBrowser.isPending}
+            >
+              Yes, Continue{" "}
+              {cycleBrowser.isPending && (
+                <ReloadIcon className="ml-2 size-4 animate-spin" />
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <ReactFlowProvider>
         <FlowRenderer
           initialEdges={elements.edges}
@@ -117,7 +224,7 @@ function WorkflowDebugger() {
         />
       </ReactFlowProvider>
 
-      {debugSession && (
+      {activeDebugSession && (
         <FloatingWindow
           title={browserTitle}
           bounded={false}
@@ -125,12 +232,15 @@ function WorkflowDebugger() {
           initialHeight={360}
           showMaximizeButton={true}
           showMinimizeButton={true}
+          showPowerButton={blockLabel === undefined}
           showReloadButton={true}
+          // --
+          onCycle={handleOnCycle}
         >
-          {debugSession && debugSession.browser_session_id ? (
+          {activeDebugSession && activeDebugSession.browser_session_id ? (
             <BrowserStream
               interactive={interactor === "human"}
-              browserSessionId={debugSession.browser_session_id}
+              browserSessionId={activeDebugSession.browser_session_id}
             />
           ) : (
             <Skeleton className="h-full w-full" />

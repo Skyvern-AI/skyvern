@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
+    get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -330,12 +331,12 @@ class WorkflowService:
             )
             return workflow_run
 
-        all_blocks = workflow.workflow_definition.blocks
+        top_level_blocks = workflow.workflow_definition.blocks
+        all_blocks = get_all_blocks(top_level_blocks)
 
         if block_labels and len(block_labels):
             blocks: list[BlockTypeVar] = []
             all_labels = {block.label: block for block in all_blocks}
-
             for label in block_labels:
                 if label not in all_labels:
                     raise BlockNotFound(block_label=label)
@@ -350,7 +351,7 @@ class WorkflowService:
             )
 
         else:
-            blocks = all_blocks
+            blocks = top_level_blocks
 
         if not blocks:
             raise SkyvernException(f"No blocks found for the given block labels: {block_labels}")
@@ -634,6 +635,8 @@ class WorkflowService:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         extra_http_headers: dict[str, str] | None = None,
+        use_cache: bool = False,
+        cache_key: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -652,6 +655,8 @@ class WorkflowService:
             is_saved_task=is_saved_task,
             status=status,
             extra_http_headers=extra_http_headers,
+            use_cache=use_cache,
+            cache_key=cache_key,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -1533,6 +1538,8 @@ class WorkflowService:
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    use_cache=request.use_cache,
+                    cache_key=request.cache_key,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1550,6 +1557,8 @@ class WorkflowService:
                     extra_http_headers=request.extra_http_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    use_cache=request.use_cache,
+                    cache_key=request.cache_key,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id
@@ -1917,6 +1926,7 @@ class WorkflowService:
                 output_parameter=output_parameter,
                 file_url=block_yaml.file_url,
                 file_type=block_yaml.file_type,
+                json_schema=block_yaml.json_schema,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.PDF_PARSER:

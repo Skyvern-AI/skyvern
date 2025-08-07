@@ -78,6 +78,8 @@ lark = "^1.2.2"
 libcst = "^1.8.2"
 curlparser = "^0.1.0"
 lmnr = {extras = ["all"], version = "^0.7.0"}
+openpyxl = "^3.1.5"
+pandas = "^2.3.1"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
@@ -101,7 +103,6 @@ fpdf = "^1.7.2"
 pypdf = "^5.0.1"
 twine = "^6.1.0"
 build = "^1.2.2.post1"
-pandas = "^2.2.3"
 pre-commit = "^4.2.0"
 ruff = "^0.11.12"
 aiosqlite = "^0.21.0"

@@ -242,6 +242,7 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 ) : null}
               </div>
               <WorkflowBlockInputTextarea
+                canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
                   handleChange("url", value);

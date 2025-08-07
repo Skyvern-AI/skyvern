@@ -29,6 +29,8 @@ from skyvern.forge.sdk.db.models import (
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
+    ScriptFileModel,
+    ScriptModel,
     StepModel,
     TaskGenerationModel,
     TaskModel,
@@ -52,6 +54,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
+    convert_to_script,
+    convert_to_script_file,
     convert_to_step,
     convert_to_task,
     convert_to_workflow,
@@ -62,6 +66,8 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_parameter,
     hydrate_action,
 )
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -97,6 +103,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
+from skyvern.schemas.scripts import Script, ScriptFile
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 
@@ -862,7 +869,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).first():
-                    return convert_to_organization_auth_token(token)
+                    return await convert_to_organization_auth_token(token)
                 else:
                     return None
         except SQLAlchemyError:
@@ -888,7 +895,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).all()
-                return [convert_to_organization_auth_token(token) for token in tokens]
+                return [await convert_to_organization_auth_token(token) for token in tokens]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -902,19 +909,27 @@ class AgentDB:
         token_type: OrganizationAuthTokenType,
         token: str,
         valid: bool | None = True,
+        encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken | None:
         try:
+            encrypted_token = ""
+            if encrypted_method is not None:
+                encrypted_token = await encryptor.encrypt(token, encrypted_method)
+
             async with self.Session() as session:
                 query = (
                     select(OrganizationAuthTokenModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(token_type=token_type)
-                    .filter_by(token=token)
                 )
+                if encrypted_token:
+                    query = query.filter_by(encrypted_token=encrypted_token)
+                else:
+                    query = query.filter_by(token=token)
                 if valid is not None:
                     query = query.filter_by(valid=valid)
                 if token_obj := (await session.scalars(query)).first():
-                    return convert_to_organization_auth_token(token_obj)
+                    return await convert_to_organization_auth_token(token_obj)
                 else:
                     return None
         except SQLAlchemyError:
@@ -929,18 +944,51 @@ class AgentDB:
         organization_id: str,
         token_type: OrganizationAuthTokenType,
         token: str,
+        encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken:
+        plaintext_token = token
+        encrypted_token = ""
+
+        if encrypted_method is not None:
+            encrypted_token = await encryptor.encrypt(token, encrypted_method)
+            plaintext_token = ""
+
         async with self.Session() as session:
             auth_token = OrganizationAuthTokenModel(
                 organization_id=organization_id,
                 token_type=token_type,
-                token=token,
+                token=plaintext_token,
+                encrypted_token=encrypted_token,
+                encrypted_method=encrypted_method.value if encrypted_method is not None else "",
             )
             session.add(auth_token)
             await session.commit()
             await session.refresh(auth_token)
 
-        return convert_to_organization_auth_token(auth_token)
+        return await convert_to_organization_auth_token(auth_token)
+
+    async def invalidate_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> None:
+        """Invalidate all existing tokens of a specific type for an organization."""
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    update(OrganizationAuthTokenModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(token_type=token_type)
+                    .filter_by(valid=True)
+                    .values(valid=False)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
 
     async def get_artifacts_for_task_v2(
         self,
@@ -1309,6 +1357,8 @@ class AgentDB:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        use_cache: bool = False,
+        cache_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1326,6 +1376,8 @@ class AgentDB:
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
+                use_cache=use_cache,
+                cache_key=cache_key,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1504,6 +1556,8 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
+        use_cache: bool | None = None,
+        cache_key: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1513,14 +1567,18 @@ class AgentDB:
                 if organization_id:
                     get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
                 if workflow := (await session.scalars(get_workflow_query)).first():
-                    if title:
+                    if title is not None:
                         workflow.title = title
-                    if description:
+                    if description is not None:
                         workflow.description = description
-                    if workflow_definition:
+                    if workflow_definition is not None:
                         workflow.workflow_definition = workflow_definition
-                    if version:
+                    if version is not None:
                         workflow.version = version
+                    if use_cache is not None:
+                        workflow.use_cache = use_cache
+                    if cache_key is not None:
+                        workflow.cache_key = cache_key
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -2987,8 +3045,7 @@ class AgentDB:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
         except NotFoundError:
-            LOG.error("NotFoundError", exc_info=True)
-            raise
+            return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -3026,7 +3083,9 @@ class AgentDB:
     async def update_persistent_browser_session(
         self,
         browser_session_id: str,
-        timeout_minutes: int,
+        *,
+        status: str | None = None,
+        timeout_minutes: int | None = None,
         organization_id: str | None = None,
     ) -> PersistentBrowserSession:
         try:
@@ -3041,7 +3100,12 @@ class AgentDB:
                 ).first()
                 if not persistent_browser_session:
                     raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
-                persistent_browser_session.timeout_minutes = timeout_minutes
+
+                if status:
+                    persistent_browser_session.status = status
+                if timeout_minutes:
+                    persistent_browser_session.timeout_minutes = timeout_minutes
+
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -3417,6 +3481,9 @@ class AgentDB:
                     .filter_by(organization_id=organization_id)
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
                     .filter_by(user_id=user_id)
+                    .filter_by(deleted_at=None)
+                    .filter_by(status="created")
+                    .order_by(DebugSessionModel.created_at.desc())
                 )
             ).first()
 
@@ -3424,6 +3491,37 @@ class AgentDB:
                 return None
 
             return DebugSession.model_validate(debug_session)
+
+    async def complete_debug_sessions(
+        self,
+        *,
+        organization_id: str,
+        user_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+    ) -> list[DebugSession]:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(status="created")
+            )
+
+            if user_id:
+                query = query.filter_by(user_id=user_id)
+            if workflow_permanent_id:
+                query = query.filter_by(workflow_permanent_id=workflow_permanent_id)
+
+            models = (await session.scalars(query)).all()
+
+            for model in models:
+                model.status = "completed"
+
+            debug_sessions = [DebugSession.model_validate(model) for model in models]
+
+            await session.commit()
+
+            return debug_sessions
 
     async def create_debug_session(
         self,
@@ -3439,6 +3537,7 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 user_id=user_id,
                 browser_session_id=browser_session_id,
+                status="created",
             )
 
             session.add(debug_session)
@@ -3447,24 +3546,199 @@ class AgentDB:
 
             return DebugSession.model_validate(debug_session)
 
-    async def update_debug_session(
+    async def create_script(
         self,
-        *,
-        debug_session_id: str,
-        browser_session_id: str | None = None,
-    ) -> DebugSession:
+        organization_id: str,
+        run_id: str | None = None,
+        script_id: str | None = None,
+        version: int | None = None,
+    ) -> Script:
+        try:
+            async with self.Session() as session:
+                script = ScriptModel(
+                    organization_id=organization_id,
+                    run_id=run_id,
+                )
+                if script_id:
+                    script.script_id = script_id
+                if version:
+                    script.version = version
+                session.add(script)
+                await session.commit()
+                await session.refresh(script)
+                return convert_to_script(script)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_script(
+        self,
+        script_revision_id: str,
+        organization_id: str,
+        artifact_id: str | None = None,
+        run_id: str | None = None,
+        version: int | None = None,
+    ) -> Script:
+        try:
+            async with self.Session() as session:
+                get_script_query = (
+                    select(ScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(script_revision_id=script_revision_id)
+                )
+                if script := (await session.scalars(get_script_query)).first():
+                    if artifact_id:
+                        script.artifact_id = artifact_id
+                    if run_id:
+                        script.run_id = run_id
+                    if version:
+                        script.version = version
+                    await session.commit()
+                    await session.refresh(script)
+                    return convert_to_script(script)
+                else:
+                    raise NotFoundError("Script not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except NotFoundError:
+            LOG.error("No script found to update", script_revision_id=script_revision_id)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_scripts(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[Script]:
+        try:
+            async with self.Session() as session:
+                # Calculate offset for pagination
+                offset = (page - 1) * page_size
+
+                # Subquery to get the latest version of each script
+                latest_versions_subquery = (
+                    select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
+                    .filter_by(organization_id=organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .group_by(ScriptModel.script_id)
+                    .subquery()
+                )
+
+                # Main query to get scripts with their latest versions
+                get_scripts_query = (
+                    select(ScriptModel)
+                    .join(
+                        latest_versions_subquery,
+                        and_(
+                            ScriptModel.script_id == latest_versions_subquery.c.script_id,
+                            ScriptModel.version == latest_versions_subquery.c.latest_version,
+                        ),
+                    )
+                    .filter_by(organization_id=organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .order_by(ScriptModel.created_at.desc())
+                    .limit(page_size)
+                    .offset(offset)
+                )
+                scripts = (await session.scalars(get_scripts_query)).all()
+                return [convert_to_script(script) for script in scripts]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_script(
+        self,
+        script_id: str,
+        organization_id: str,
+        version: int | None = None,
+    ) -> Script | None:
+        """Get a specific script by ID and optionally by version."""
+        try:
+            async with self.Session() as session:
+                get_script_query = (
+                    select(ScriptModel)
+                    .filter_by(script_id=script_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                )
+
+                if version is not None:
+                    get_script_query = get_script_query.filter_by(version=version)
+                else:
+                    # Get the latest version
+                    get_script_query = get_script_query.order_by(ScriptModel.version.desc()).limit(1)
+
+                if script := (await session.scalars(get_script_query)).first():
+                    return convert_to_script(script)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
         async with self.Session() as session:
-            debug_session = (
-                await session.scalars(select(DebugSessionModel).filter_by(debug_session_id=debug_session_id))
+            script = (
+                await session.scalars(
+                    select(ScriptModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
             ).first()
+            return convert_to_script(script) if script else None
 
-            if not debug_session:
-                raise NotFoundError(f"Debug session {debug_session_id} not found")
+    async def create_script_file(
+        self,
+        script_revision_id: str,
+        script_id: str,
+        organization_id: str,
+        file_path: str,
+        file_name: str,
+        file_type: str,
+        content_hash: str | None = None,
+        file_size: int | None = None,
+        mime_type: str | None = None,
+        encoding: str = "utf-8",
+        artifact_id: str | None = None,
+    ) -> None:
+        """Create a script file record."""
+        try:
+            async with self.Session() as session:
+                script_file = ScriptFileModel(
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    content_hash=content_hash,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                    encoding=encoding,
+                    artifact_id=artifact_id,
+                )
+                session.add(script_file)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
 
-            if browser_session_id:
-                debug_session.browser_session_id = browser_session_id
-
-            await session.commit()
-            await session.refresh(debug_session)
-
-            return DebugSession.model_validate(debug_session)
+    async def get_script_files(self, script_revision_id: str, organization_id: str) -> list[ScriptFile]:
+        async with self.Session() as session:
+            script_files = (
+                await session.scalars(
+                    select(ScriptFileModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).all()
+            return [convert_to_script_file(script_file) for script_file in script_files]

@@ -119,6 +119,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
             </div>
 
             <WorkflowBlockInputTextarea
+              canWriteTitle={true}
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

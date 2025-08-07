@@ -14,11 +14,12 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants, parse_totp_secret
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -90,7 +91,9 @@ class WorkflowRunContext:
             elif isinstance(secrete_parameter, CredentialParameter):
                 await workflow_run_context.register_credential_parameter_value(secrete_parameter, organization)
             elif isinstance(secrete_parameter, OnePasswordCredentialParameter):
-                await workflow_run_context.register_onepassword_credential_parameter_value(secrete_parameter)
+                await workflow_run_context.register_onepassword_credential_parameter_value(
+                    secrete_parameter, organization
+                )
             elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
                     secrete_parameter, organization
@@ -313,10 +316,19 @@ class WorkflowRunContext:
             self.values[parameter.key] = random_secret_id
             self.parameters[parameter.key] = parameter
 
-    async def register_onepassword_credential_parameter_value(self, parameter: OnePasswordCredentialParameter) -> None:
+    async def register_onepassword_credential_parameter_value(
+        self, parameter: OnePasswordCredentialParameter, organization: Organization
+    ) -> None:
+        org_auth_token = await app.DATABASE.get_valid_org_auth_token(
+            organization.organization_id, OrganizationAuthTokenType.onepassword_service_account
+        )
         token = settings.OP_SERVICE_ACCOUNT_TOKEN
+        if org_auth_token:
+            token = org_auth_token.token
         if not token:
-            raise ValueError("OP_SERVICE_ACCOUNT_TOKEN environment variable not set")
+            raise ValueError(
+                "OP_SERVICE_ACCOUNT_TOKEN environment variable not set and no valid 1Password service account token found. Please go to the settings and add your 1Password service account token."
+            )
 
         client = await OnePasswordClient.authenticate(
             auth=token,
@@ -350,7 +362,7 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = field.value
+                self.secrets[totp_secret_value] = parse_totp_secret(field.value)
                 self.values[parameter.key]["totp"] = totp_secret_id
             else:
                 # this will be the username or password or other field

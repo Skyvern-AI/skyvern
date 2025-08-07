@@ -18,7 +18,15 @@ import {
 import { flushSync } from "react-dom";
 import Draggable from "react-draggable";
 
+import { OrgWalled } from "./Orgwalled";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
+import { PowerIcon } from "./icons/PowerIcon";
 
 type OS = "Windows" | "macOS" | "Linux" | "Unknown";
 
@@ -70,11 +78,41 @@ function WindowsButton(props: {
   );
 }
 
+function PowerButton(props: { onClick: () => void }) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            className="h-[1.2rem] w-[1.25rem] opacity-50 hover:opacity-100"
+            onClick={() => props.onClick()}
+          >
+            <PowerIcon />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Cycle (New Browser)</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 function ReloadButton(props: { isReloading: boolean; onClick: () => void }) {
   return (
-    <button onClick={() => props.onClick()}>
-      <ReloadIcon className={props.isReloading ? "animate-spin" : undefined} />
-    </button>
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            className="opacity-50 hover:opacity-100"
+            onClick={() => props.onClick()}
+          >
+            <ReloadIcon
+              className={props.isReloading ? "animate-spin" : undefined}
+            />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Reconnect</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -114,10 +152,12 @@ function FloatingWindow({
   showCloseButton,
   showMaximizeButton,
   showMinimizeButton,
+  showPowerButton,
   showReloadButton = false,
   title,
   zIndex,
   // --
+  onCycle,
   onInteract,
 }: {
   bounded?: boolean;
@@ -128,10 +168,12 @@ function FloatingWindow({
   showCloseButton?: boolean;
   showMaximizeButton?: boolean;
   showMinimizeButton?: boolean;
+  showPowerButton?: boolean;
   showReloadButton?: boolean;
   title: string;
   zIndex?: string;
   // --
+  onCycle?: () => void;
   onInteract?: () => void;
 }) {
   const [reloadKey, setReloadKey] = useState(0);
@@ -420,6 +462,10 @@ function FloatingWindow({
     }, 1000);
   };
 
+  const cycle = () => {
+    onCycle?.();
+  };
+
   /**
    * If maximized, need to retain max size during parent resizing.
    */
@@ -582,6 +628,11 @@ function FloatingWindow({
                         onClick={toggleMaximized}
                       />
                     )}
+                    {showPowerButton && (
+                      <OrgWalled className="flex items-center justify-center">
+                        <PowerButton onClick={() => cycle()} />
+                      </OrgWalled>
+                    )}
                   </div>
                   <div className="ml-auto">{title}</div>
                   {showReloadButton && (
@@ -601,6 +652,7 @@ function FloatingWindow({
                   )}
                   <div>{title}</div>
                   <div className="buttons-container ml-auto flex h-full items-center gap-2">
+                    {showPowerButton && <PowerButton onClick={() => cycle()} />}
                     {showMinimizeButton && (
                       <WindowsButton
                         onClick={toggleMinimized}

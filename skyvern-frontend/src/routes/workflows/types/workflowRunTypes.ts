@@ -50,6 +50,7 @@ export type WorkflowRunBlock = {
   wait_sec?: number | null;
   created_at: string;
   modified_at: string;
+  duration: number | null;
 
   // for loop block itself
   loop_values: Array<unknown> | null;

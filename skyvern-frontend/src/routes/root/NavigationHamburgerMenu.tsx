@@ -17,7 +17,7 @@ function NavigationHamburgerMenu() {
         <DrawerTrigger asChild>
           <HamburgerMenuIcon className="size-6 cursor-pointer" />
         </DrawerTrigger>
-        <DrawerContent className="bottom-2 left-2 top-2 mt-0 w-64 rounded border-0 px-6">
+        <DrawerContent className="bottom-2 left-2 top-2 mt-0 h-full w-64 rounded border-0">
           <VisuallyHidden.Root>
             <DrawerHeader>
               <DrawerTitle>Skyvern</DrawerTitle>
