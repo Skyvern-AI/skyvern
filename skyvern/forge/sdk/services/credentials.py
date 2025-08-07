@@ -21,10 +21,13 @@ def parse_totp_secret(totp_secret: str) -> str:
         return ""
 
     totp_secret_no_whitespace = "".join(totp_secret.split())
-    if len(totp_secret_no_whitespace) == 32:
+    try:
+        # to verify if it's a valid TOTP secret
+        pyotp.TOTP(totp_secret_no_whitespace).byte_secret()
         return totp_secret_no_whitespace
+    except Exception:
+        LOG.warning("It's not a valid TOTP secret, going to parse it from URI format", exc_info=True)
 
-    LOG.info("TOTP secret key is not 32 characters, try to parse it from URI format")
     try:
         totp_secret = pyotp.parse_uri(totp_secret_no_whitespace).secret
         totp_secret_no_whitespace = "".join(totp_secret.split())
