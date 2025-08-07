@@ -7,6 +7,7 @@ readme = "README.md"
 packages = [{ include = "skyvern" }, { include = "alembic" }]
 
 [tool.poetry.dependencies]
+azure-storage-blob = ">=12.26.0"
 python = ">=3.11,<3.14"
 python-dotenv = "^1.0.0"
 openai = ">=1.68.2"

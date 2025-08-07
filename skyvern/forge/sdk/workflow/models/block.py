@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from skyvern.config import settings
-from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, MAX_UPLOAD_FILE_COUNT
+from skyvern.constants import AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT, GET_DOWNLOADED_FILES_TIMEOUT, MAX_UPLOAD_FILE_COUNT
 from skyvern.exceptions import (
     ContextParameterValueNotFound,
     MissingBrowserState,
@@ -42,6 +42,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.api.azure import AsyncAzureClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -1871,6 +1872,9 @@ class FileUploadBlock(Block):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     region_name: str | None = None
+    azure_storage_account_name: str | None = None
+    azure_storage_account_key: str | None = None
+    azure_container_name: str | None = None
     path: str | None = None
 
     def get_all_parameters(
@@ -1892,6 +1896,15 @@ class FileUploadBlock(Block):
         if self.aws_secret_access_key and workflow_run_context.has_parameter(self.aws_secret_access_key):
             parameters.append(workflow_run_context.get_parameter(self.aws_secret_access_key))
 
+        if self.azure_storage_account_name and workflow_run_context.has_parameter(self.azure_storage_account_name):
+            parameters.append(workflow_run_context.get_parameter(self.azure_storage_account_name))
+
+        if self.azure_storage_account_key and workflow_run_context.has_parameter(self.azure_storage_account_key):
+            parameters.append(workflow_run_context.get_parameter(self.azure_storage_account_key))
+
+        if self.azure_container_name and workflow_run_context.has_parameter(self.azure_container_name):
+            parameters.append(workflow_run_context.get_parameter(self.azure_container_name))
+
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
@@ -1908,6 +1921,18 @@ class FileUploadBlock(Block):
         if self.aws_secret_access_key:
             self.aws_secret_access_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.aws_secret_access_key, workflow_run_context
+            )
+        if self.azure_storage_account_name:
+            self.azure_storage_account_name = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_storage_account_name, workflow_run_context
+            )
+        if self.azure_storage_account_key:
+            self.azure_storage_account_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_storage_account_key, workflow_run_context
+            )
+        if self.azure_container_name:
+            self.azure_container_name = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_container_name, workflow_run_context
             )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
@@ -1929,12 +1954,29 @@ class FileUploadBlock(Block):
         # get all parameters into a dictionary
         # data validate before uploading
         missing_parameters = []
-        if not self.s3_bucket:
-            missing_parameters.append("s3_bucket")
-        if not self.aws_access_key_id:
-            missing_parameters.append("aws_access_key_id")
-        if not self.aws_secret_access_key:
-            missing_parameters.append("aws_secret_access_key")
+        if self.storage_type == FileStorageType.S3:
+            if not self.s3_bucket:
+                missing_parameters.append("s3_bucket")
+            if not self.aws_access_key_id:
+                missing_parameters.append("aws_access_key_id")
+            if not self.aws_secret_access_key:
+                missing_parameters.append("aws_secret_access_key")
+        elif self.storage_type == FileStorageType.AZURE:
+            if not self.azure_storage_account_name:
+                missing_parameters.append("azure_storage_account_name")
+            if not self.azure_storage_account_key:
+                missing_parameters.append("azure_storage_account_key")
+            if not self.azure_container_name:
+                missing_parameters.append("azure_container_name")
+        else:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Unsupported storage type: {self.storage_type}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
         if missing_parameters:
             return await self.build_block_result(
@@ -1960,57 +2002,87 @@ class FileUploadBlock(Block):
 
         download_files_path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
 
-        s3_uris = []
+        uploaded_uris = []
         try:
             workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-            actual_aws_access_key_id = (
-                workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id) or self.aws_access_key_id
-            )
-            actual_aws_secret_access_key = (
-                workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
-                or self.aws_secret_access_key
-            )
-            client = AsyncAWSClient(
-                aws_access_key_id=actual_aws_access_key_id,
-                aws_secret_access_key=actual_aws_secret_access_key,
-                region_name=self.region_name,
-            )
-            # is the file path a file or a directory?
+            files_to_upload = []
             if os.path.isdir(download_files_path):
-                # get all files in the directory, if there are more than 25 files, we will not upload them
                 files = os.listdir(download_files_path)
-                if len(files) > MAX_UPLOAD_FILE_COUNT:
-                    raise ValueError("Too many files in the directory, not uploading")
+                max_file_count = (
+                    MAX_UPLOAD_FILE_COUNT
+                    if self.storage_type == FileStorageType.S3
+                    else AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT
+                )
+                if len(files) > max_file_count:
+                    raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
                 for file in files:
-                    # if the file is a directory, we will not upload it
                     if os.path.isdir(os.path.join(download_files_path, file)):
                         LOG.warning("FileUploadBlock: Skipping directory", file=file)
                         continue
-                    file_path = os.path.join(download_files_path, file)
-                    s3_uri = self._get_s3_uri(workflow_run_id, file_path)
-                    s3_uris.append(s3_uri)
-                    await client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
+                    files_to_upload.append(os.path.join(download_files_path, file))
             else:
-                s3_uri = self._get_s3_uri(workflow_run_id, download_files_path)
-                s3_uris.append(s3_uri)
-                await client.upload_file_from_path(uri=s3_uri, file_path=download_files_path, raise_exception=True)
+                files_to_upload.append(download_files_path)
+
+            if self.storage_type == FileStorageType.S3:
+                actual_aws_access_key_id = (
+                    workflow_run_context.get_original_secret_value_or_none(self.aws_access_key_id)
+                    or self.aws_access_key_id
+                )
+                actual_aws_secret_access_key = (
+                    workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
+                    or self.aws_secret_access_key
+                )
+                client = AsyncAWSClient(
+                    aws_access_key_id=actual_aws_access_key_id,
+                    aws_secret_access_key=actual_aws_secret_access_key,
+                    region_name=self.region_name,
+                )
+                for file_path in files_to_upload:
+                    s3_uri = self._get_s3_uri(workflow_run_id, file_path)
+                    uploaded_uris.append(s3_uri)
+                    await client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
+                LOG.info("FileUploadBlock: File(s) uploaded to S3", file_path=self.path)
+            elif self.storage_type == FileStorageType.AZURE:
+                actual_azure_storage_account_name = (
+                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_name)
+                    or self.azure_storage_account_name
+                )
+                actual_azure_storage_account_key = (
+                    workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
+                    or self.azure_storage_account_key
+                )
+                client = AsyncAzureClient(
+                    account_name=actual_azure_storage_account_name,
+                    account_key=actual_azure_storage_account_key,
+                )
+                for file_path in files_to_upload:
+                    blob_name = Path(file_path).name
+                    azure_uri = self._get_azure_blob_uri(workflow_run_id, file_path)
+                    uploaded_uris.append(azure_uri)
+                    await client.upload_file_from_path(
+                        container_name=self.azure_container_name, blob_name=blob_name, file_path=file_path
+                    )
+                LOG.info("FileUploadBlock: File(s) uploaded to Azure Blob Storage", file_path=self.path)
+            else:
+                # This case should ideally be caught by the initial validation
+                raise ValueError(f"Unsupported storage type: {self.storage_type}")
+
         except Exception as e:
-            LOG.exception("FileUploadBlock: Failed to upload file to S3", file_path=self.path)
+            LOG.exception("FileUploadBlock: Failed to upload file", file_path=self.path, storage_type=self.storage_type)
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Failed to upload file to S3: {str(e)}",
+                failure_reason=f"Failed to upload file to {self.storage_type}: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
 
-        LOG.info("FileUploadBlock: File(s) uploaded to S3", file_path=self.path)
-        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, s3_uris)
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
         return await self.build_block_result(
             success=True,
             failure_reason=None,
-            output_parameter_value=s3_uris,
+            output_parameter_value=uploaded_uris,
             status=BlockStatus.completed,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
