@@ -744,3 +744,8 @@ class ElementOutOfCurrentViewport(SkyvernException):
 class ScriptNotFound(SkyvernHTTPException):
     def __init__(self, script_id: str) -> None:
         super().__init__(f"Script {script_id} not found")
+
+
+class NoTOTPSecretFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No TOTP secret found")
