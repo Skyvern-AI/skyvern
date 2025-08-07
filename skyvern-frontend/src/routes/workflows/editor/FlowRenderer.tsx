@@ -350,6 +350,7 @@ function FlowRenderer({
         totp_verification_url: workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
         use_cache: data.settings.useScriptCache,
+        cache_key: data.settings.scriptCacheKey,
         workflow_definition: {
           parameters: data.parameters,
           blocks: data.blocks,

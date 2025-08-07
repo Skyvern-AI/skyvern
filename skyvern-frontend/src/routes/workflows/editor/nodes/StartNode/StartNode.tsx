@@ -61,6 +61,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       : null,
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
     useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
+    scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
   });
 
   useEffect(() => {
@@ -133,11 +134,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         }}
                       />
                     </div>
-                    <OrgWalled>
+                    <OrgWalled className="flex flex-col gap-4">
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
                           <Label>Use Script Cache</Label>
-                          <HelpTooltip content="Generate & use cached scripts for faster execution" />
+                          <HelpTooltip content="Generate & use cached scripts for faster execution." />
                           <Switch
                             className="ml-auto"
                             checked={inputs.useScriptCache}
@@ -146,6 +147,21 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                             }}
                           />
                         </div>
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex gap-2">
+                          <Label>Script Cache Key</Label>
+                          <HelpTooltip content="A templated name, comprised of one or more of your parameters, that defines the key for your script cache." />
+                        </div>
+                        <Input
+                          value={inputs.scriptCacheKey ?? ""}
+                          placeholder="my-{param1}-{param2}-key"
+                          onChange={(event) => {
+                            const value = (event.target.value ?? "").trim();
+                            const v = value.length ? value : null;
+                            handleChange("scriptCacheKey", v);
+                          }}
+                        />
                       </div>
                     </OrgWalled>
                     <div className="space-y-2">
