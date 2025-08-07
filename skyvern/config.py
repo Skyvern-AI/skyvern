@@ -215,6 +215,27 @@ class Settings(BaseSettings):
     AZURE_O3_API_BASE: str | None = None
     AZURE_O3_API_VERSION: str = "2025-01-01-preview"
 
+    # AZURE gpt-5
+    ENABLE_AZURE_GPT5: bool = False
+    AZURE_GPT5_DEPLOYMENT: str = "gpt-5"
+    AZURE_GPT5_API_KEY: str | None = None
+    AZURE_GPT5_API_BASE: str | None = None
+    AZURE_GPT5_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5 mini
+    ENABLE_AZURE_GPT5_MINI: bool = False
+    AZURE_GPT5_MINI_DEPLOYMENT: str = "gpt-5-mini"
+    AZURE_GPT5_MINI_API_KEY: str | None = None
+    AZURE_GPT5_MINI_API_BASE: str | None = None
+    AZURE_GPT5_MINI_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5 nano
+    ENABLE_AZURE_GPT5_NANO: bool = False
+    AZURE_GPT5_NANO_DEPLOYMENT: str = "gpt-5-nano"
+    AZURE_GPT5_NANO_API_KEY: str | None = None
+    AZURE_GPT5_NANO_API_BASE: str | None = None
+    AZURE_GPT5_NANO_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
 
