@@ -1902,8 +1902,8 @@ class FileUploadBlock(Block):
         if self.azure_storage_account_key and workflow_run_context.has_parameter(self.azure_storage_account_key):
             parameters.append(workflow_run_context.get_parameter(self.azure_storage_account_key))
 
-        if self.azure_container_name and workflow_run_context.has_parameter(self.azure_container_name):
-            parameters.append(workflow_run_context.get_parameter(self.azure_container_name))
+        if self.azure_blob_container_name and workflow_run_context.has_parameter(self.azure_blob_container_name):
+            parameters.append(workflow_run_context.get_parameter(self.azure_blob_container_name))
 
         return parameters
 
@@ -1930,9 +1930,9 @@ class FileUploadBlock(Block):
             self.azure_storage_account_key = self.format_block_parameter_template_from_workflow_run_context(
                 self.azure_storage_account_key, workflow_run_context
             )
-        if self.azure_container_name:
-            self.azure_container_name = self.format_block_parameter_template_from_workflow_run_context(
-                self.azure_container_name, workflow_run_context
+        if self.azure_blob_container_name:
+            self.azure_blob_container_name = self.format_block_parameter_template_from_workflow_run_context(
+                self.azure_blob_container_name, workflow_run_context
             )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
@@ -1940,6 +1940,10 @@ class FileUploadBlock(Block):
         if not self.path:
             return f"s3://{self.s3_bucket}/{s3_suffix}"
         return f"s3://{self.s3_bucket}/{self.path}/{s3_suffix}"
+
+    def _get_azure_blob_uri(self, workflow_run_id: str, file_path: str) -> str:
+        blob_name = Path(file_path).name
+        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{workflow_run_id}/{uuid.uuid4()}_{blob_name}"
 
     async def execute(
         self,
