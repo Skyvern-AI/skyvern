@@ -518,10 +518,13 @@ function convertToNode(
           ...commonData,
           path: block.path,
           storageType: block.storage_type,
-          s3Bucket: block.s3_bucket,
-          awsAccessKeyId: block.aws_access_key_id,
-          awsSecretAccessKey: block.aws_secret_access_key,
-          regionName: block.region_name,
+          s3Bucket: block.s3_bucket ?? "",
+          awsAccessKeyId: block.aws_access_key_id ?? "",
+          awsSecretAccessKey: block.aws_secret_access_key ?? "",
+          regionName: block.region_name ?? "",
+          azureStorageAccountName: block.azure_storage_account_name ?? "",
+          azureStorageAccountKey: block.azure_storage_account_key ?? "",
+          azureBlobContainerName: block.azure_blob_container_name ?? "",
         },
       };
     }
@@ -1243,10 +1246,10 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         block_type: "file_upload",
         path: node.data.path,
         storage_type: node.data.storageType,
-        s3_bucket: node.data.s3Bucket,
-        aws_access_key_id: node.data.awsAccessKeyId,
-        aws_secret_access_key: node.data.awsSecretAccessKey,
-        region_name: node.data.regionName,
+        s3_bucket: node.data.s3Bucket ?? "",
+        aws_access_key_id: node.data.awsAccessKeyId ?? "",
+        aws_secret_access_key: node.data.awsSecretAccessKey ?? "",
+        region_name: node.data.regionName ?? "",
       };
     }
     case "fileParser": {
@@ -2002,10 +2005,13 @@ function convertBlocksToBlockYAML(
           block_type: "file_upload",
           path: block.path,
           storage_type: block.storage_type,
-          s3_bucket: block.s3_bucket,
-          aws_access_key_id: block.aws_access_key_id,
-          aws_secret_access_key: block.aws_secret_access_key,
-          region_name: block.region_name,
+          s3_bucket: block.s3_bucket ?? "",
+          aws_access_key_id: block.aws_access_key_id ?? "",
+          aws_secret_access_key: block.aws_secret_access_key ?? "",
+          region_name: block.region_name ?? "",
+          azure_storage_account_name: block.azure_storage_account_name ?? "",
+          azure_storage_account_key: block.azure_storage_account_key ?? "",
+          azure_blob_container_name: block.azure_blob_container_name ?? "",
         };
         return blockYaml;
       }
