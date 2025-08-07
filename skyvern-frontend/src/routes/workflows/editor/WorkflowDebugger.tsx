@@ -186,6 +186,21 @@ function WorkflowDebugger() {
   const interactor = workflowRun && isFinalized === false ? "agent" : "human";
   const browserTitle = interactor === "agent" ? `Browser [🤖]` : `Browser [👤]`;
 
+  // ---start fya: https://github.com/frontyardart
+  const initialBrowserPosition = {
+    x: 600,
+    y: 132,
+  };
+
+  const windowWidth = window.innerWidth;
+  const rightPadding = 567;
+  const initialWidth = Math.max(
+    512,
+    windowWidth - initialBrowserPosition.x - rightPadding,
+  );
+  const initialHeight = (initialWidth / 16) * 9;
+  // ---end fya
+
   return (
     <div className="relative flex h-screen w-full">
       <Dialog
@@ -247,8 +262,9 @@ function WorkflowDebugger() {
       <FloatingWindow
         title={browserTitle}
         bounded={false}
-        initialWidth={512}
-        initialHeight={360}
+        initialPosition={initialBrowserPosition}
+        initialWidth={initialWidth}
+        initialHeight={initialHeight}
         showMaximizeButton={true}
         showMinimizeButton={true}
         showPowerButton={blockLabel === undefined && showPowerButton}
