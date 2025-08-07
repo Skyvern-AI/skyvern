@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Sequence
 
 import structlog
@@ -558,6 +558,9 @@ class AgentDB:
                 ).first():
                     if status is not None:
                         step.status = status
+
+                        if status.is_terminal() and step.finished_at is None:
+                            step.finished_at = datetime.now(timezone.utc)
                     if output is not None:
                         step.output = output.model_dump(exclude_none=True)
                     if is_last is not None:
