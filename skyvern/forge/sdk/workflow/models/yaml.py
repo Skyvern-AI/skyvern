@@ -220,7 +220,7 @@ class FileUploadBlockYAML(BlockYAML):
     region_name: str | None = None
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
-    azure_container_name: str | None = None
+    azure_blob_container_name: str | None = None
     path: str | None = None
 
 

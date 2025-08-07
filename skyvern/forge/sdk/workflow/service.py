@@ -1902,6 +1902,9 @@ class WorkflowService:
                 aws_access_key_id=block_yaml.aws_access_key_id,
                 aws_secret_access_key=block_yaml.aws_secret_access_key,
                 region_name=block_yaml.region_name,
+                azure_storage_account_name=block_yaml.azure_storage_account_name,
+                azure_storage_account_key=block_yaml.azure_storage_account_key,
+                azure_blob_container_name=block_yaml.azure_blob_container_name,
                 path=block_yaml.path,
                 continue_on_failure=block_yaml.continue_on_failure,
             )

@@ -1250,6 +1250,9 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         aws_access_key_id: node.data.awsAccessKeyId ?? "",
         aws_secret_access_key: node.data.awsSecretAccessKey ?? "",
         region_name: node.data.regionName ?? "",
+        azure_storage_account_name: node.data.azureStorageAccountName ?? "",
+        azure_storage_account_key: node.data.azureStorageAccountKey ?? "",
+        azure_blob_container_name: node.data.azureBlobContainerName ?? "",
       };
     }
     case "fileParser": {

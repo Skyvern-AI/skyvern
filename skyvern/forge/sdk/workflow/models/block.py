@@ -1874,7 +1874,7 @@ class FileUploadBlock(Block):
     region_name: str | None = None
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
-    azure_container_name: str | None = None
+    azure_blob_container_name: str | None = None
     path: str | None = None
 
     def get_all_parameters(
@@ -1962,12 +1962,12 @@ class FileUploadBlock(Block):
             if not self.aws_secret_access_key:
                 missing_parameters.append("aws_secret_access_key")
         elif self.storage_type == FileStorageType.AZURE:
-            if not self.azure_storage_account_name:
+            if not self.azure_storage_account_name or self.azure_storage_account_name == "":
                 missing_parameters.append("azure_storage_account_name")
-            if not self.azure_storage_account_key:
+            if not self.azure_storage_account_key or self.azure_storage_account_key == "":
                 missing_parameters.append("azure_storage_account_key")
-            if not self.azure_container_name:
-                missing_parameters.append("azure_container_name")
+            if not self.azure_blob_container_name or self.azure_blob_container_name == "":
+                missing_parameters.append("azure_blob_container_name")
         else:
             return await self.build_block_result(
                 success=False,
@@ -2060,7 +2060,7 @@ class FileUploadBlock(Block):
                     azure_uri = self._get_azure_blob_uri(workflow_run_id, file_path)
                     uploaded_uris.append(azure_uri)
                     await client.upload_file_from_path(
-                        container_name=self.azure_container_name, blob_name=blob_name, file_path=file_path
+                        container_name=self.azure_blob_container_name, blob_name=blob_name, file_path=file_path
                     )
                 LOG.info("FileUploadBlock: File(s) uploaded to Azure Blob Storage", file_path=self.path)
             else:
