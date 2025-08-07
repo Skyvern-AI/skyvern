@@ -35,9 +35,9 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
-    generate_project_file_id,
-    generate_project_id,
-    generate_project_revision_id,
+    generate_script_file_id,
+    generate_script_id,
+    generate_script_revision_id,
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
@@ -778,18 +778,18 @@ class DebugSessionModel(Base):
     status = Column(String, nullable=False, default="created")
 
 
-class ProjectModel(Base):
-    __tablename__ = "projects"
+class ScriptModel(Base):
+    __tablename__ = "scripts"
     __table_args__ = (
-        Index("project_org_created_at_index", "organization_id", "created_at"),
-        Index("project_org_run_id_index", "organization_id", "run_id"),
-        UniqueConstraint("organization_id", "project_id", "version", name="uc_org_project_version"),
+        Index("script_org_created_at_index", "organization_id", "created_at"),
+        Index("script_org_run_id_index", "organization_id", "run_id"),
+        UniqueConstraint("organization_id", "script_id", "version", name="uc_org_script_version"),
     )
 
-    project_revision_id = Column(String, primary_key=True, default=generate_project_revision_id)
-    project_id = Column(String, default=generate_project_id, nullable=False)  # User-facing, consistent across versions
+    script_revision_id = Column(String, primary_key=True, default=generate_script_revision_id)
+    script_id = Column(String, default=generate_script_id, nullable=False)  # User-facing, consistent across versions
     organization_id = Column(String, nullable=False)
-    # The workflow run or task run id that this project is generated
+    # The workflow run or task run id that this script is generated
     run_id = Column(String, nullable=True)
     version = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -802,16 +802,16 @@ class ProjectModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
-class ProjectFileModel(Base):
-    __tablename__ = "project_files"
+class ScriptFileModel(Base):
+    __tablename__ = "script_files"
     __table_args__ = (
-        Index("file_project_path_index", "project_revision_id", "file_path"),
-        UniqueConstraint("project_revision_id", "file_path", name="unique_project_file_path"),
+        Index("file_script_path_index", "script_revision_id", "file_path"),
+        UniqueConstraint("script_revision_id", "file_path", name="unique_script_file_path"),
     )
 
-    file_id = Column(String, primary_key=True, default=generate_project_file_id)
-    project_revision_id = Column(String, nullable=False)
-    project_id = Column(String, nullable=False)
+    file_id = Column(String, primary_key=True, default=generate_script_file_id)
+    script_revision_id = Column(String, nullable=False)
+    script_id = Column(String, nullable=False)
     organization_id = Column(String, nullable=False)
 
     file_path = Column(String, nullable=False)  # e.g., "src/utils.py"
