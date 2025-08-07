@@ -3492,6 +3492,28 @@ class AgentDB:
 
             return DebugSession.model_validate(debug_session)
 
+    async def get_latest_debug_session_for_user(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        workflow_permanent_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(status="created")
+                .filter_by(user_id=user_id)
+                .filter_by(workflow_permanent_id=workflow_permanent_id)
+                .order_by(DebugSessionModel.created_at.desc())
+            )
+
+            model = (await session.scalars(query)).first()
+
+            return DebugSession.model_validate(model) if model else None
+
     async def complete_debug_sessions(
         self,
         *,
