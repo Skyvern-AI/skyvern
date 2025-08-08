@@ -56,11 +56,6 @@ class TaskNotFound(SkyvernHTTPException):
         super().__init__(f"Task {task_id} not found", status_code=status.HTTP_404_NOT_FOUND)
 
 
-class ScriptNotFound(SkyvernException):
-    def __init__(self, script_name: str | None = None):
-        super().__init__(f"Script {script_name} not found. Has the script been registered?")
-
-
 class MissingElement(SkyvernException):
     def __init__(self, selector: str | None = None, element_id: str | None = None):
         super().__init__(
@@ -746,6 +741,11 @@ class ElementOutOfCurrentViewport(SkyvernException):
         super().__init__(f"Element {element_id} is out of current viewport")
 
 
-class ProjectNotFound(SkyvernHTTPException):
-    def __init__(self, project_id: str) -> None:
-        super().__init__(f"Project {project_id} not found")
+class ScriptNotFound(SkyvernHTTPException):
+    def __init__(self, script_id: str) -> None:
+        super().__init__(f"Script {script_id} not found")
+
+
+class NoTOTPSecretFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No TOTP secret found")

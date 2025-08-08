@@ -45,9 +45,9 @@ ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
-PROJECT_FILE_PREFIX = "pf"
-PROJECT_REVISION_PREFIX = "pv"
-PROJECT_PREFIX = "p"
+SCRIPT_FILE_PREFIX = "sf"
+SCRIPT_REVISION_PREFIX = "sr"
+SCRIPT_PREFIX = "s"
 STEP_PREFIX = "stp"
 TASK_GENERATION_PREFIX = "tg"
 TASK_PREFIX = "tsk"
@@ -59,6 +59,7 @@ WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
 WORKFLOW_PREFIX = "w"
 WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_RUN_PREFIX = "wr"
+WORKFLOW_SCRIPT_PREFIX = "ws"
 
 
 def generate_workflow_id() -> str:
@@ -79,6 +80,11 @@ def generate_workflow_run_block_id() -> str:
 def generate_workflow_run_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_RUN_PREFIX}_{int_id}"
+
+
+def generate_workflow_script_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_SCRIPT_PREFIX}_{int_id}"
 
 
 def generate_aws_secret_parameter_id() -> str:
@@ -206,19 +212,19 @@ def generate_organization_bitwarden_collection_id() -> str:
     return f"{ORGANIZATION_BITWARDEN_COLLECTION_PREFIX}_{int_id}"
 
 
-def generate_project_id() -> str:
+def generate_script_id() -> str:
     int_id = generate_id()
-    return f"{PROJECT_PREFIX}_{int_id}"
+    return f"{SCRIPT_PREFIX}_{int_id}"
 
 
-def generate_project_revision_id() -> str:
+def generate_script_revision_id() -> str:
     int_id = generate_id()
-    return f"{PROJECT_REVISION_PREFIX}_{int_id}"
+    return f"{SCRIPT_REVISION_PREFIX}_{int_id}"
 
 
-def generate_project_file_id() -> str:
+def generate_script_file_id() -> str:
     int_id = generate_id()
-    return f"{PROJECT_FILE_PREFIX}_{int_id}"
+    return f"{SCRIPT_FILE_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############

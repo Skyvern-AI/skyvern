@@ -49,8 +49,8 @@ class ArtifactType(StrEnum):
     TRACE = "trace"
     HAR = "har"
 
-    # Project files
-    PROJECT_FILE = "project_file"
+    # Script files
+    SCRIPT_FILE = "script_file"
 
 
 class Artifact(BaseModel):

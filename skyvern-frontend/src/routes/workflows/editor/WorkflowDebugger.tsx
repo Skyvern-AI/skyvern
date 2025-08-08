@@ -20,11 +20,9 @@ import {
   DialogTitle,
   DialogClose,
 } from "@/components/ui/dialog";
-import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
-import { useUser } from "@/hooks/useUser";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -36,17 +34,19 @@ import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
 import { getInitialParameters } from "./utils";
 
+const Constants = {
+  NewBrowserCooldown: 30000,
+} as const;
+
 function WorkflowDebugger() {
   const { blockLabel, workflowPermanentId } = useParams();
   const [openDialogue, setOpenDialogue] = useState(false);
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
+  const [showPowerButton, setShowPowerButton] = useState(true);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
-  const user = useUser().get();
-  const email = user?.email;
-  const isSkyvernUser = email?.toLowerCase().endsWith("@skyvern.com") ?? false;
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const { data: workflow } = useWorkflowQuery({
@@ -82,6 +82,19 @@ function WorkflowDebugger() {
     }
   });
 
+  const afterCycleBrowser = () => {
+    setOpenDialogue(false);
+    setShowPowerButton(false);
+
+    if (powerButtonTimeoutRef.current) {
+      clearTimeout(powerButtonTimeoutRef.current);
+    }
+
+    powerButtonTimeoutRef.current = setTimeout(() => {
+      setShowPowerButton(true);
+    }, Constants.NewBrowserCooldown);
+  };
+
   const cycleBrowser = useMutation({
     mutationFn: async (id: string) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
@@ -101,7 +114,7 @@ function WorkflowDebugger() {
         description: "Your browser has been cycled.",
       });
 
-      setOpenDialogue(false);
+      afterCycleBrowser();
     },
     onError: (error: AxiosError) => {
       toast({
@@ -109,11 +122,13 @@ function WorkflowDebugger() {
         title: "Failed to cycle browser",
         description: error.message,
       });
-      setOpenDialogue(false);
+
+      afterCycleBrowser();
     },
   });
 
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const powerButtonTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     if (
@@ -157,6 +172,8 @@ function WorkflowDebugger() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
+    useScriptCache: workflow.use_cache,
+    scriptCacheKey: workflow.cache_key,
   };
 
   const elements = getElements(
@@ -168,6 +185,21 @@ function WorkflowDebugger() {
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
   const interactor = workflowRun && isFinalized === false ? "agent" : "human";
   const browserTitle = interactor === "agent" ? `Browser [🤖]` : `Browser [👤]`;
+
+  // ---start fya: https://github.com/frontyardart
+  const initialBrowserPosition = {
+    x: 600,
+    y: 132,
+  };
+
+  const windowWidth = window.innerWidth;
+  const rightPadding = 567;
+  const initialWidth = Math.max(
+    512,
+    windowWidth - initialBrowserPosition.x - rightPadding,
+  );
+  const initialHeight = (initialWidth / 16) * 9;
+  // ---end fya
 
   return (
     <div className="relative flex h-screen w-full">
@@ -227,29 +259,33 @@ function WorkflowDebugger() {
         />
       </ReactFlowProvider>
 
-      {activeDebugSession && (
-        <FloatingWindow
-          title={browserTitle}
-          bounded={false}
-          initialWidth={512}
-          initialHeight={360}
-          showMaximizeButton={true}
-          showMinimizeButton={true}
-          showPowerButton={blockLabel === undefined && isSkyvernUser}
-          showReloadButton={true}
-          // --
-          onCycle={handleOnCycle}
-        >
-          {activeDebugSession && activeDebugSession.browser_session_id ? (
-            <BrowserStream
-              interactive={interactor === "human"}
-              browserSessionId={activeDebugSession.browser_session_id}
-            />
-          ) : (
-            <Skeleton className="h-full w-full" />
-          )}
-        </FloatingWindow>
-      )}
+      <FloatingWindow
+        title={browserTitle}
+        bounded={false}
+        initialPosition={initialBrowserPosition}
+        initialWidth={initialWidth}
+        initialHeight={initialHeight}
+        showMaximizeButton={true}
+        showMinimizeButton={true}
+        showPowerButton={blockLabel === undefined && showPowerButton}
+        showReloadButton={true}
+        // --
+        onCycle={handleOnCycle}
+      >
+        {activeDebugSession &&
+        activeDebugSession.browser_session_id &&
+        !cycleBrowser.isPending ? (
+          <BrowserStream
+            interactive={interactor === "human"}
+            browserSessionId={activeDebugSession.browser_session_id}
+          />
+        ) : (
+          <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
+            Connecting to your browser...
+            <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+          </div>
+        )}
+      </FloatingWindow>
     </div>
   );
 }

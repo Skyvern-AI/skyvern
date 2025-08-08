@@ -20,7 +20,7 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import OnePasswordConstants
+from skyvern.forge.sdk.services.credentials import OnePasswordConstants, parse_totp_secret
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -382,7 +382,7 @@ class WorkflowRunContext:
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = field.value
+                self.secrets[totp_secret_value] = parse_totp_secret(field.value)
                 self.values[parameter.key]["totp"] = totp_secret_id
             else:
                 # this will be the username or password or other field

@@ -82,8 +82,8 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    def build_project_file_uri(
-        self, *, organization_id: str, project_id: str, project_version: int, file_path: str
+    def build_script_file_uri(
+        self, *, organization_id: str, script_id: str, script_version: int, file_path: str
     ) -> str:
         pass
 

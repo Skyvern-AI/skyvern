@@ -357,7 +357,8 @@ export type SendEmailBlock = WorkflowBlockBase & {
 export type FileURLParserBlock = WorkflowBlockBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv";
+  file_type: "csv" | "excel" | "pdf";
+  json_schema: Record<string, unknown> | null;
 };
 
 export type ValidationBlock = WorkflowBlockBase & {
@@ -503,6 +504,8 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+  use_cache: boolean;
+  cache_key: string | null;
 };
 
 export type WorkflowSettings = {
@@ -512,6 +515,8 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
+  useScriptCache: boolean;
+  scriptCacheKey: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

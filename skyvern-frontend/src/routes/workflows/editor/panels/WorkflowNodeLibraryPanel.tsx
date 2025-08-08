@@ -162,30 +162,29 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "File Parser Block",
-    description: "Parse data from files",
+    description: "Parse PDFs, CSVs, and Excel files",
   },
-  {
-    nodeType: "pdfParser",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.PDFParser}
-        className="size-6"
-      />
-    ),
-    title: "PDF Parser Block",
-    description: "Extract data from PDF files",
-  },
-  {
-    nodeType: "upload",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.UploadToS3}
-        className="size-6"
-      />
-    ),
-    title: "Upload to S3 Block",
-    description: "Upload files to AWS S3",
-  },
+  // {
+  //   nodeType: "pdfParser",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.PDFParser}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "PDF Parser Block",
+  //   description: "Extract data from PDF files",
+  // },
+  //   nodeType: "upload",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.UploadToS3}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Upload to S3 Block",
+  //   description: "Upload files to AWS S3",
+  // },
   // {
   //   nodeType: "download",
   //   icon: (
