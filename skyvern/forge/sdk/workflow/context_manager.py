@@ -844,7 +844,7 @@ class WorkflowRunContext:
 
 class WorkflowContextManager:
     aws_client: AsyncAWSClient
-    azure_client: AsyncAzureClient
+    azure_client: AsyncAzureClient | None
     workflow_run_contexts: dict[str, WorkflowRunContext]
 
     parameters: dict[str, PARAMETER_TYPE]
