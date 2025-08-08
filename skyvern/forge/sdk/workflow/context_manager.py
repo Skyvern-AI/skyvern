@@ -853,10 +853,12 @@ class WorkflowContextManager:
 
     def __init__(self) -> None:
         self.aws_client = AsyncAWSClient()
-        self.azure_client = AsyncAzureClient(
-            account_name=settings.AZURE_STORAGE_ACCOUNT_NAME or "",
-            account_key=settings.AZURE_STORAGE_ACCOUNT_KEY or "",
-        )
+        self.azure_client = None
+        if settings.AZURE_STORAGE_ACCOUNT_NAME and settings.AZURE_STORAGE_ACCOUNT_KEY:
+            self.azure_client = AsyncAzureClient(
+                account_name=settings.AZURE_STORAGE_ACCOUNT_NAME,
+                account_key=settings.AZURE_STORAGE_ACCOUNT_KEY,
+            )
         self.workflow_run_contexts = {}
 
     def _validate_workflow_run_context(self, workflow_run_id: str) -> None:
