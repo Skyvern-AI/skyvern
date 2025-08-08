@@ -2040,7 +2040,7 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
                     or self.aws_secret_access_key
                 )
-                client = AsyncAWSClient(
+                aws_client = AsyncAWSClient(
                     aws_access_key_id=actual_aws_access_key_id,
                     aws_secret_access_key=actual_aws_secret_access_key,
                     region_name=self.region_name,
@@ -2048,7 +2048,7 @@ class FileUploadBlock(Block):
                 for file_path in files_to_upload:
                     s3_uri = self._get_s3_uri(workflow_run_id, file_path)
                     uploaded_uris.append(s3_uri)
-                    await client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
+                    await aws_client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
                 LOG.info("FileUploadBlock: File(s) uploaded to S3", file_path=self.path)
             elif self.storage_type == FileStorageType.AZURE:
                 actual_azure_storage_account_name = (
@@ -2059,16 +2059,16 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
                     or self.azure_storage_account_key
                 )
-                client = AsyncAzureClient(
-                    account_name=actual_azure_storage_account_name,
-                    account_key=actual_azure_storage_account_key,
+                azure_client = AsyncAzureClient(
+                    account_name=actual_azure_storage_account_name or "",
+                    account_key=actual_azure_storage_account_key or "",
                 )
                 for file_path in files_to_upload:
                     blob_name = Path(file_path).name
                     azure_uri = self._get_azure_blob_uri(workflow_run_id, file_path)
                     uploaded_uris.append(azure_uri)
-                    await client.upload_file_from_path(
-                        container_name=self.azure_blob_container_name, blob_name=blob_name, file_path=file_path
+                    await azure_client.upload_file_from_path(
+                        container_name=self.azure_blob_container_name or "", blob_name=blob_name, file_path=file_path
                     )
                 LOG.info("FileUploadBlock: File(s) uploaded to Azure Blob Storage", file_path=self.path)
             else:

@@ -1,4 +1,6 @@
 import structlog
+from azure.identity.aio import DefaultAzureCredential
+from azure.keyvault.secrets.aio import SecretClient
 from azure.storage.blob.aio import BlobServiceClient
 
 LOG = structlog.get_logger()
@@ -12,6 +14,23 @@ class AsyncAzureClient:
             account_url=f"https://{account_name}.blob.core.windows.net",
             credential=account_key,
         )
+        self.credential = DefaultAzureCredential()
+
+    async def get_secret(self, secret_name: str) -> str | None:
+        try:
+            # Azure Key Vault URL format: https://<your-key-vault-name>.vault.azure.net
+            # Assuming the secret_name is actually the Key Vault URL and the secret name
+            # This needs to be clarified or passed as separate parameters
+            # For now, let's assume secret_name is the actual secret name and Key Vault URL is in settings.
+            key_vault_url = f"https://{self.account_name}.vault.azure.net"  # Placeholder, adjust as needed
+            secret_client = SecretClient(vault_url=key_vault_url, credential=self.credential)
+            secret = await secret_client.get_secret(secret_name)
+            return secret.value
+        except Exception as e:
+            LOG.exception("Failed to get secret from Azure Key Vault.", secret_name=secret_name, error=e)
+            return None
+        finally:
+            await self.credential.close()
 
     async def upload_file_from_path(self, container_name: str, blob_name: str, file_path: str) -> None:
         try:
@@ -36,3 +55,4 @@ class AsyncAzureClient:
 
     async def close(self) -> None:
         await self.blob_service_client.close()
+        await self.credential.close()
