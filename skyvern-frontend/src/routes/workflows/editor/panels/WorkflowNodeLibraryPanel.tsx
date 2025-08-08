@@ -40,7 +40,7 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Task Block",
+    title: "Browser Task Block",
     description: "Take actions to achieve a task.",
   },
   {
@@ -51,7 +51,7 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Task v2 Block",
+    title: "Browser Task v2 Block",
     description: "Achieve complex tasks with deep thinking.",
   },
   {
@@ -62,7 +62,7 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Action Block",
+    title: "Browser Action Block",
     description: "Take a single action",
   },
   {
