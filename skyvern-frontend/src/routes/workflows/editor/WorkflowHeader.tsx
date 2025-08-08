@@ -145,17 +145,15 @@ function WorkflowHeader({
                 <ChevronDownIcon className="h-6 w-6" />
               )}
             </Button>
-            {!debugStore.isDebugMode && (
-              <Button
-                size="lg"
-                onClick={() => {
-                  navigate(`/workflows/${workflowPermanentId}/run`);
-                }}
-              >
-                <PlayIcon className="mr-2 h-6 w-6" />
-                Run
-              </Button>
-            )}
+            <Button
+              size="lg"
+              onClick={() => {
+                navigate(`/workflows/${workflowPermanentId}/run`);
+              }}
+            >
+              <PlayIcon className="mr-2 h-6 w-6" />
+              Run
+            </Button>
           </>
         )}
       </div>

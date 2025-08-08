@@ -93,9 +93,6 @@ export const helpTooltips = {
     aws_secret_access_key:
       "The AWS secret access key to use to upload the file to S3.",
     region_name: "The AWS region",
-    azure_storage_account_name: "The Azure Storage Account Name.",
-    azure_storage_account_key: "The Azure Storage Account Key.",
-    azure_blob_container_name: "The Azure Blob Container Name.",
   },
   download: {
     ...baseHelpTooltipContent,
