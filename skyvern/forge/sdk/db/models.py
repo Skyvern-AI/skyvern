@@ -5,7 +5,6 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
-    Enum,
     ForeignKey,
     Index,
     Integer,
@@ -18,7 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
     generate_ai_suggestion_id,
@@ -36,6 +35,10 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_script_block_id,
+    generate_script_file_id,
+    generate_script_id,
+    generate_script_revision_id,
     generate_step_id,
     generate_task_generation_id,
     generate_task_id,
@@ -48,6 +51,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
     generate_workflow_run_id,
+    generate_workflow_script_id,
 )
 from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
@@ -131,6 +135,7 @@ class StepModel(Base):
     reasoning_token_count = Column(Integer, default=0)
     cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
+    finished_at = Column(DateTime, nullable=True)
 
 
 class OrganizationModel(Base):
@@ -164,8 +169,10 @@ class OrganizationAuthTokenModel(Base):
     )
 
     organization_id = Column(String, ForeignKey("organizations.organization_id"), index=True, nullable=False)
-    token_type = Column(Enum(OrganizationAuthTokenType), nullable=False)
-    token = Column(String, index=True, nullable=False)
+    token_type = Column(String, nullable=False)
+    token = Column(String, index=True, nullable=True)
+    encrypted_token = Column(String, index=True, nullable=True)
+    encrypted_method = Column(String, nullable=True)
     valid = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -234,6 +241,8 @@ class WorkflowModel(Base):
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
+    use_cache = Column(Boolean, default=False, nullable=False)
+    cache_key = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -767,3 +776,110 @@ class DebugSessionModel(Base):
     user_id = Column(String, nullable=True)  # comes from identity vendor (Clerk at time of writing)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="created")
+
+
+class ScriptModel(Base):
+    __tablename__ = "scripts"
+    __table_args__ = (
+        Index("script_org_created_at_index", "organization_id", "created_at"),
+        Index("script_org_run_id_index", "organization_id", "run_id"),
+        UniqueConstraint("organization_id", "script_id", "version", name="uc_org_script_version"),
+    )
+
+    script_revision_id = Column(String, primary_key=True, default=generate_script_revision_id)
+    script_id = Column(String, default=generate_script_id, nullable=False)  # User-facing, consistent across versions
+    organization_id = Column(String, nullable=False)
+    # The workflow run or task run id that this script is generated
+    run_id = Column(String, nullable=True)
+    version = Column(Integer, default=1, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class ScriptFileModel(Base):
+    __tablename__ = "script_files"
+    __table_args__ = (
+        Index("file_script_path_index", "script_revision_id", "file_path"),
+        UniqueConstraint("script_revision_id", "file_path", name="unique_script_file_path"),
+    )
+
+    file_id = Column(String, primary_key=True, default=generate_script_file_id)
+    script_revision_id = Column(String, nullable=False)
+    script_id = Column(String, nullable=False)
+    organization_id = Column(String, nullable=False)
+
+    file_path = Column(String, nullable=False)  # e.g., "src/utils.py"
+    file_name = Column(String, nullable=False)  # e.g., "utils.py"
+    file_type = Column(String, nullable=False)  # "file" or "directory"
+
+    # File content and metadata
+    content_hash = Column(String, nullable=True)  # SHA-256 hash for deduplication
+    file_size = Column(Integer, nullable=True)  # Size in bytes
+    mime_type = Column(String, nullable=True)  # e.g., "text/python"
+    encoding = Column(String, default="utf-8", nullable=True)
+
+    # Storage reference (could be S3 key, artifact_id, etc.)
+    artifact_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowScriptModel(Base):
+    __tablename__ = "workflow_scripts"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_permanent_id",
+            "cache_key_value",
+            name="uc_workflow_permanent_id_cache_key_value",
+        ),
+        Index("idx_workflow_scripts_org_created", "organization_id", "created_at"),
+        Index("idx_workflow_scripts_workflow_permanent_id", "workflow_permanent_id"),
+    )
+
+    workflow_script_id = Column(String, primary_key=True, default=generate_workflow_script_id)
+    script_id = Column(String, nullable=False)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False)
+    workflow_id = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
+    cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
+    cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class ScriptBlockModel(Base):
+    __tablename__ = "script_blocks"
+    __table_args__ = (
+        UniqueConstraint(
+            "script_revision_id",
+            "script_block_label",
+            name="uc_script_revision_id_script_block_label",
+        ),
+    )
+
+    script_block_id = Column(String, primary_key=True, default=generate_script_block_id)
+    script_id = Column(String, nullable=False)
+    script_revision_id = Column(String, nullable=False, index=True)
+    script_block_label = Column(String, nullable=False)
+    script_file_id = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)

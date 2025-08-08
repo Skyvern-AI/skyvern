@@ -56,7 +56,10 @@ import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
-import { fileParserNodeDefaultData } from "./nodes/FileParserNode/types";
+import {
+  isFileParserNode,
+  fileParserNodeDefaultData,
+} from "./nodes/FileParserNode/types";
 import {
   isLoopNode,
   LoopNode,
@@ -468,6 +471,7 @@ function convertToNode(
         data: {
           ...commonData,
           fileUrl: block.file_url,
+          jsonSchema: JSON.stringify(block.json_schema, null, 2),
         },
       };
     }
@@ -518,10 +522,13 @@ function convertToNode(
           ...commonData,
           path: block.path,
           storageType: block.storage_type,
-          s3Bucket: block.s3_bucket,
-          awsAccessKeyId: block.aws_access_key_id,
-          awsSecretAccessKey: block.aws_secret_access_key,
-          regionName: block.region_name,
+          s3Bucket: block.s3_bucket ?? "",
+          awsAccessKeyId: block.aws_access_key_id ?? "",
+          awsSecretAccessKey: block.aws_secret_access_key ?? "",
+          regionName: block.region_name ?? "",
+          azureStorageAccountName: block.azure_storage_account_name ?? "",
+          azureStorageAccountKey: block.azure_storage_account_key ?? "",
+          azureBlobContainerName: block.azure_blob_container_name ?? "",
         },
       };
     }
@@ -694,6 +701,8 @@ function getElements(
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
       extraHttpHeaders: settings.extraHttpHeaders,
       editable,
+      useScriptCache: settings.useScriptCache,
+      scriptCacheKey: settings.scriptCacheKey,
     }),
   );
 
@@ -1243,10 +1252,13 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         block_type: "file_upload",
         path: node.data.path,
         storage_type: node.data.storageType,
-        s3_bucket: node.data.s3Bucket,
-        aws_access_key_id: node.data.awsAccessKeyId,
-        aws_secret_access_key: node.data.awsSecretAccessKey,
-        region_name: node.data.regionName,
+        s3_bucket: node.data.s3Bucket ?? "",
+        aws_access_key_id: node.data.awsAccessKeyId ?? "",
+        aws_secret_access_key: node.data.awsSecretAccessKey ?? "",
+        region_name: node.data.regionName ?? "",
+        azure_storage_account_name: node.data.azureStorageAccountName ?? "",
+        azure_storage_account_key: node.data.azureStorageAccountKey ?? "",
+        azure_blob_container_name: node.data.azureBlobContainerName ?? "",
       };
     }
     case "fileParser": {
@@ -1254,7 +1266,8 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         ...base,
         block_type: "file_url_parser",
         file_url: node.data.fileUrl,
-        file_type: "csv",
+        file_type: "csv", // Backend will auto-detect based on file extension
+        json_schema: JSONParseSafe(node.data.jsonSchema),
       };
     }
     case "textPrompt": {
@@ -1395,6 +1408,8 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
+    useScriptCache: false,
+    scriptCacheKey: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1412,6 +1427,8 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       extraHttpHeaders: data.extraHttpHeaders,
+      useScriptCache: data.useScriptCache,
+      scriptCacheKey: data.scriptCacheKey,
     };
   }
   return defaultSettings;
@@ -2002,10 +2019,13 @@ function convertBlocksToBlockYAML(
           block_type: "file_upload",
           path: block.path,
           storage_type: block.storage_type,
-          s3_bucket: block.s3_bucket,
-          aws_access_key_id: block.aws_access_key_id,
-          aws_secret_access_key: block.aws_secret_access_key,
-          region_name: block.region_name,
+          s3_bucket: block.s3_bucket ?? "",
+          aws_access_key_id: block.aws_access_key_id ?? "",
+          aws_secret_access_key: block.aws_secret_access_key ?? "",
+          region_name: block.region_name ?? "",
+          azure_storage_account_name: block.azure_storage_account_name ?? "",
+          azure_storage_account_key: block.azure_storage_account_key ?? "",
+          azure_blob_container_name: block.azure_blob_container_name ?? "",
         };
         return blockYaml;
       }
@@ -2187,6 +2207,15 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  const fileParserNodes = nodes.filter(isFileParserNode);
+  fileParserNodes.forEach((node) => {
+    try {
+      JSON.parse(node.data.jsonSchema);
+    } catch {
+      errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+    }
+  });
+
   const waitNodes = nodes.filter(isWaitNode);
   waitNodes.forEach((node) => {
     const waitTimeString = node.data.waitInSeconds.trim();
@@ -2242,6 +2271,7 @@ export {
   getLabelForWorkflowParameterType,
   maxNestingLevel,
   getWorkflowSettings,
+  getOrderedChildrenBlocks,
   getOutputParameterKey,
   getPreviousNodeIds,
   getUniqueLabelForExistingNode,

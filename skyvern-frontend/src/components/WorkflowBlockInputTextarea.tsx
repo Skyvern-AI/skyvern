@@ -3,23 +3,39 @@ import { cn } from "@/util/utils";
 import { AutoResizingTextarea } from "./AutoResizingTextarea/AutoResizingTextarea";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useRef, useState } from "react";
 
 type Props = Omit<
   React.ComponentProps<typeof AutoResizingTextarea>,
   "onChange"
 > & {
+  canWriteTitle?: boolean;
   onChange: (value: string) => void;
   nodeId: string;
 };
 
 function WorkflowBlockInputTextarea(props: Props) {
-  const { nodeId, onChange, ...textAreaProps } = props;
+  const { maybeAcceptTitle, maybeWriteTitle } = useWorkflowTitleStore();
+  const { nodeId, onChange, canWriteTitle = false, ...textAreaProps } = props;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
     start: number;
     end: number;
   } | null>(null);
+
+  const handleOnBlur = () => {
+    if (canWriteTitle) {
+      maybeAcceptTitle();
+    }
+  };
+
+  const handleOnChange = (value: string) => {
+    onChange(value);
+    if (canWriteTitle) {
+      maybeWriteTitle(value);
+    }
+  };
 
   const handleTextareaSelect = () => {
     if (textareaRef.current) {
@@ -39,7 +55,7 @@ function WorkflowBlockInputTextarea(props: Props) {
       const newValue =
         value.substring(0, start) + parameterText + value.substring(end);
 
-      onChange(newValue);
+      handleOnChange(newValue);
 
       setTimeout(() => {
         if (textareaRef.current) {
@@ -49,7 +65,7 @@ function WorkflowBlockInputTextarea(props: Props) {
         }
       }, 0);
     } else {
-      onChange(`${value}${parameterText}`);
+      handleOnChange(`${value}${parameterText}`);
     }
   };
 
@@ -58,8 +74,9 @@ function WorkflowBlockInputTextarea(props: Props) {
       <AutoResizingTextarea
         {...textAreaProps}
         ref={textareaRef}
+        onBlur={handleOnBlur}
         onChange={(event) => {
-          onChange(event.target.value);
+          handleOnChange(event.target.value);
           handleTextareaSelect();
         }}
         onClick={handleTextareaSelect}

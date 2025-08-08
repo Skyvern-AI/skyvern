@@ -56,11 +56,6 @@ class TaskNotFound(SkyvernHTTPException):
         super().__init__(f"Task {task_id} not found", status_code=status.HTTP_404_NOT_FOUND)
 
 
-class ScriptNotFound(SkyvernException):
-    def __init__(self, script_name: str | None = None):
-        super().__init__(f"Script {script_name} not found. Has the script been registered?")
-
-
 class MissingElement(SkyvernException):
     def __init__(self, selector: str | None = None, element_id: str | None = None):
         super().__init__(
@@ -718,9 +713,9 @@ class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
         super().__init__(f"Browser session {browser_session_id} is already occupied")
 
 
-class MissingBrowserSessionError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} does not exist.")
+class BrowserSessionNotRenewable(SkyvernException):
+    def __init__(self, reason: str, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")
 
 
 class MissingBrowserAddressError(SkyvernException):
@@ -744,3 +739,13 @@ class APIKeyNotFound(SkyvernHTTPException):
 class ElementOutOfCurrentViewport(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Element {element_id} is out of current viewport")
+
+
+class ScriptNotFound(SkyvernHTTPException):
+    def __init__(self, script_id: str) -> None:
+        super().__init__(f"Script {script_id} not found")
+
+
+class NoTOTPSecretFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No TOTP secret found")

@@ -218,6 +218,9 @@ class FileUploadBlockYAML(BlockYAML):
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     region_name: str | None = None
+    azure_storage_account_name: str | None = None
+    azure_storage_account_key: str | None = None
+    azure_blob_container_name: str | None = None
     path: str | None = None
 
 
@@ -244,6 +247,7 @@ class FileParserBlockYAML(BlockYAML):
 
     file_url: str
     file_type: FileType
+    json_schema: dict[str, Any] | None = None
 
 
 class PDFParserBlockYAML(BlockYAML):
@@ -443,3 +447,5 @@ class WorkflowCreateYAMLRequest(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
+    use_cache: bool = False
+    cache_key: str | None = None

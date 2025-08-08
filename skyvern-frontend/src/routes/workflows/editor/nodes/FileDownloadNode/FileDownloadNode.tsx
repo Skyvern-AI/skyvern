@@ -121,6 +121,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
               ) : null}
             </div>
             <WorkflowBlockInputTextarea
+              canWriteTitle={true}
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);

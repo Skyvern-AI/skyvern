@@ -11,7 +11,7 @@ R = TypeVar("R")
 
 class LaminarTrace(BaseTrace):
     def __init__(self, api_key: str) -> None:
-        Laminar.initialize(project_api_key=api_key, disabled_instruments={Instruments.SKYVERN})
+        Laminar.initialize(project_api_key=api_key, disabled_instruments={Instruments.SKYVERN, Instruments.PATCHRIGHT})
         litellm.callbacks.append(LaminarLiteLLMCallback())
 
     def traced(

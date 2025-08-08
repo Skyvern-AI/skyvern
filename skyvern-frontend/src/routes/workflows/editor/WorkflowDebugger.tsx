@@ -1,11 +1,27 @@
-import { ReactFlowProvider } from "@xyflow/react";
-import { useParams } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
+import { AxiosError } from "axios";
+import { ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useRef, useState } from "react";
+import { useParams } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ReactFlowProvider } from "@xyflow/react";
 
+import { getClient } from "@/api/AxiosClient";
+import { DebugSessionApiResponse } from "@/api/types";
+import { AnimatedWave } from "@/components/AnimatedWave";
 import { BrowserStream } from "@/components/BrowserStream";
 import { FloatingWindow } from "@/components/FloatingWindow";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogClose,
+} from "@/components/ui/dialog";
+import { toast } from "@/components/ui/use-toast";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { useSidebarStore } from "@/store/SidebarStore";
@@ -18,8 +34,17 @@ import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
 import { getInitialParameters } from "./utils";
 
+const Constants = {
+  NewBrowserCooldown: 30000,
+} as const;
+
 function WorkflowDebugger() {
-  const { workflowPermanentId } = useParams();
+  const { blockLabel, workflowPermanentId } = useParams();
+  const [openDialogue, setOpenDialogue] = useState(false);
+  const [activeDebugSession, setActiveDebugSession] =
+    useState<DebugSessionApiResponse | null>(null);
+  const [showPowerButton, setShowPowerButton] = useState(true);
+  const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
 
@@ -37,13 +62,15 @@ function WorkflowDebugger() {
     return state.setCollapsed;
   });
 
-  const setHasChanges = useWorkflowHasChangesStore(
-    (state) => state.setHasChanges,
-  );
+  const workflowChangesStore = useWorkflowHasChangesStore();
+
+  const handleOnCycle = () => {
+    setOpenDialogue(true);
+  };
 
   useMountEffect(() => {
     setCollapsed(true);
-    setHasChanges(false);
+    workflowChangesStore.setHasChanges(false);
 
     if (workflowPermanentId) {
       queryClient.removeQueries({
@@ -53,7 +80,53 @@ function WorkflowDebugger() {
     }
   });
 
+  const afterCycleBrowser = () => {
+    setOpenDialogue(false);
+    setShowPowerButton(false);
+
+    if (powerButtonTimeoutRef.current) {
+      clearTimeout(powerButtonTimeoutRef.current);
+    }
+
+    powerButtonTimeoutRef.current = setTimeout(() => {
+      setShowPowerButton(true);
+    }, Constants.NewBrowserCooldown);
+  };
+
+  const cycleBrowser = useMutation({
+    mutationFn: async (id: string) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client.post<DebugSessionApiResponse>(`/debug-session/${id}/new`);
+    },
+    onSuccess: (response) => {
+      const newDebugSession = response.data;
+      setActiveDebugSession(newDebugSession);
+
+      queryClient.invalidateQueries({
+        queryKey: ["debugSession", workflowPermanentId],
+      });
+
+      toast({
+        title: "Browser cycled",
+        variant: "success",
+        description: "Your browser has been cycled.",
+      });
+
+      afterCycleBrowser();
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to cycle browser",
+        description: error.message,
+      });
+
+      afterCycleBrowser();
+    },
+  });
+
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const powerButtonTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     if (
@@ -70,6 +143,10 @@ function WorkflowDebugger() {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
+      }
+
+      if (debugSession) {
+        setActiveDebugSession(debugSession);
       }
     }
 
@@ -93,6 +170,8 @@ function WorkflowDebugger() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
+    useScriptCache: workflow.use_cache,
+    scriptCacheKey: workflow.cache_key,
   };
 
   const elements = getElements(
@@ -105,8 +184,69 @@ function WorkflowDebugger() {
   const interactor = workflowRun && isFinalized === false ? "agent" : "human";
   const browserTitle = interactor === "agent" ? `Browser [🤖]` : `Browser [👤]`;
 
+  // ---start fya: https://github.com/frontyardart
+  const initialBrowserPosition = {
+    x: 600,
+    y: 132,
+  };
+
+  const windowWidth = window.innerWidth;
+  const rightPadding = 567;
+  const initialWidth = Math.max(
+    512,
+    windowWidth - initialBrowserPosition.x - rightPadding,
+  );
+  const initialHeight = (initialWidth / 16) * 9;
+  // ---end fya
+
   return (
     <div className="relative flex h-screen w-full">
+      <Dialog
+        open={openDialogue}
+        onOpenChange={(open) => {
+          if (!open && cycleBrowser.isPending) {
+            return;
+          }
+          setOpenDialogue(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Cycle (Get a new browser)</DialogTitle>
+            <DialogDescription>
+              <div className="pb-2 pt-4 text-sm text-slate-400">
+                {cycleBrowser.isPending ? (
+                  <>
+                    Cooking you up a fresh browser...
+                    <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                  </>
+                ) : (
+                  "Abandon this browser for a new one. Are you sure?"
+                )}
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {!cycleBrowser.isPending && (
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+            )}
+            <Button
+              variant="default"
+              onClick={() => {
+                cycleBrowser.mutate(workflowPermanentId!);
+              }}
+              disabled={cycleBrowser.isPending}
+            >
+              Yes, Continue{" "}
+              {cycleBrowser.isPending && (
+                <ReloadIcon className="ml-2 size-4 animate-spin" />
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <ReactFlowProvider>
         <FlowRenderer
           initialEdges={elements.edges}
@@ -117,26 +257,33 @@ function WorkflowDebugger() {
         />
       </ReactFlowProvider>
 
-      {debugSession && (
-        <FloatingWindow
-          title={browserTitle}
-          bounded={false}
-          initialWidth={512}
-          initialHeight={360}
-          showMaximizeButton={true}
-          showMinimizeButton={true}
-          showReloadButton={true}
-        >
-          {debugSession && debugSession.browser_session_id ? (
-            <BrowserStream
-              interactive={interactor === "human"}
-              browserSessionId={debugSession.browser_session_id}
-            />
-          ) : (
-            <Skeleton className="h-full w-full" />
-          )}
-        </FloatingWindow>
-      )}
+      <FloatingWindow
+        title={browserTitle}
+        bounded={false}
+        initialPosition={initialBrowserPosition}
+        initialWidth={initialWidth}
+        initialHeight={initialHeight}
+        showMaximizeButton={true}
+        showMinimizeButton={true}
+        showPowerButton={blockLabel === undefined && showPowerButton}
+        showReloadButton={true}
+        // --
+        onCycle={handleOnCycle}
+      >
+        {activeDebugSession &&
+        activeDebugSession.browser_session_id &&
+        !cycleBrowser.isPending ? (
+          <BrowserStream
+            interactive={interactor === "human"}
+            browserSessionId={activeDebugSession.browser_session_id}
+          />
+        ) : (
+          <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
+            Connecting to your browser...
+            <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+          </div>
+        )}
+      </FloatingWindow>
     </div>
   );
 }

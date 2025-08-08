@@ -16,9 +16,7 @@ function WorkflowEditor() {
   const setCollapsed = useSidebarStore((state) => {
     return state.setCollapsed;
   });
-  const setHasChanges = useWorkflowHasChangesStore(
-    (state) => state.setHasChanges,
-  );
+  const workflowChangesStore = useWorkflowHasChangesStore();
 
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -29,7 +27,7 @@ function WorkflowEditor() {
 
   useMountEffect(() => {
     setCollapsed(true);
-    setHasChanges(false);
+    workflowChangesStore.setHasChanges(false);
   });
 
   if (isLoading || isGlobalWorkflowsLoading) {
@@ -58,6 +56,8 @@ function WorkflowEditor() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
+    useScriptCache: workflow.use_cache,
+    scriptCacheKey: workflow.cache_key,
   };
 
   const elements = getElements(

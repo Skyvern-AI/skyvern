@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
 
+    # Azure Blob Storage settings
+    AZURE_STORAGE_ACCOUNT_NAME: str | None = None
+    AZURE_STORAGE_ACCOUNT_KEY: str | None = None
+
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
 
@@ -215,6 +219,27 @@ class Settings(BaseSettings):
     AZURE_O3_API_BASE: str | None = None
     AZURE_O3_API_VERSION: str = "2025-01-01-preview"
 
+    # AZURE gpt-5
+    ENABLE_AZURE_GPT5: bool = False
+    AZURE_GPT5_DEPLOYMENT: str = "gpt-5"
+    AZURE_GPT5_API_KEY: str | None = None
+    AZURE_GPT5_API_BASE: str | None = None
+    AZURE_GPT5_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5 mini
+    ENABLE_AZURE_GPT5_MINI: bool = False
+    AZURE_GPT5_MINI_DEPLOYMENT: str = "gpt-5-mini"
+    AZURE_GPT5_MINI_API_KEY: str | None = None
+    AZURE_GPT5_MINI_API_BASE: str | None = None
+    AZURE_GPT5_MINI_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5 nano
+    ENABLE_AZURE_GPT5_NANO: bool = False
+    AZURE_GPT5_NANO_DEPLOYMENT: str = "gpt-5-nano"
+    AZURE_GPT5_NANO_API_KEY: str | None = None
+    AZURE_GPT5_NANO_API_BASE: str | None = None
+    AZURE_GPT5_NANO_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
 
@@ -308,6 +333,10 @@ class Settings(BaseSettings):
     the `timeout_minutes` of the persistent browser session can be extended.
     Otherwise we'll consider the persistent browser session to be expired.
     """
+
+    ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
+    ENCRYPTOR_AES_SALT: str | None = None
+    ENCRYPTOR_AES_IV: str | None = None
 
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """

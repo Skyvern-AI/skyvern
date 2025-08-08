@@ -1,4 +1,3 @@
-import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -9,15 +8,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useOnChange } from "@/hooks/useOnChange";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import {
+  useWorkflowHasChangesStore,
+  useWorkflowSave,
+  type WorkflowSaveData,
+} from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Background,
   BackgroundVariant,
@@ -33,11 +35,9 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { AxiosError } from "axios";
 import { nanoid } from "nanoid";
-import { useEffect, useRef, useState } from "react";
-import { useBlocker, useParams } from "react-router-dom";
-import { stringify as convertToYAML } from "yaml";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useBlocker } from "react-router-dom";
 import {
   AWSSecretParameter,
   debuggableWorkflowBlockTypes,
@@ -45,18 +45,15 @@ import {
   WorkflowEditorParameterTypes,
   WorkflowParameterTypes,
   WorkflowParameterValueType,
-  WorkflowSettings,
 } from "../types/workflowTypes";
 import {
   BitwardenCreditCardDataParameterYAML,
   BitwardenLoginCredentialParameterYAML,
   BitwardenSensitiveInformationParameterYAML,
-  BlockYAML,
   ContextParameterYAML,
   CredentialParameterYAML,
   OnePasswordCredentialParameterYAML,
   ParameterYAML,
-  WorkflowCreateYAMLRequest,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
 import { WorkflowHeader } from "./WorkflowHeader";
@@ -89,6 +86,7 @@ import {
   descendants,
   generateNodeLabel,
   getAdditionalParametersForEmailBlock,
+  getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
   getWorkflowErrors,
@@ -263,16 +261,13 @@ function FlowRenderer({
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
-  const { workflowPermanentId } = useParams();
-  const credentialGetter = useCredentialGetter();
-  const queryClient = useQueryClient();
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
+  const { title, initializeTitle } = useWorkflowTitleStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const [parameters, setParameters] =
     useState<ParametersState>(initialParameters);
-  const [title, setTitle] = useState(initialTitle);
   const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
@@ -282,105 +277,21 @@ function FlowRenderer({
       setShouldConstrainPan(true);
     }
   }, [nodesInitialized]);
-  const { hasChanges, setHasChanges } = useWorkflowHasChangesStore();
-  useShouldNotifyWhenClosingTab(hasChanges);
+
+  useEffect(() => {
+    initializeTitle(initialTitle);
+  }, [initialTitle, initializeTitle]);
+
+  const workflowChangesStore = useWorkflowHasChangesStore();
+  const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
+  setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
+  const saveWorkflow = useWorkflowSave();
+  useShouldNotifyWhenClosingTab(workflowChangesStore.hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
-    return hasChanges && nextLocation.pathname !== currentLocation.pathname;
-  });
-
-  const saveWorkflowMutation = useMutation({
-    mutationFn: async (data: {
-      parameters: Array<ParameterYAML>;
-      blocks: Array<BlockYAML>;
-      title: string;
-      settings: WorkflowSettings;
-    }) => {
-      if (!workflowPermanentId) {
-        return;
-      }
-      const client = await getClient(credentialGetter);
-      const extraHttpHeaders: Record<string, string> = {};
-      if (data.settings.extraHttpHeaders) {
-        try {
-          const parsedHeaders = JSON.parse(data.settings.extraHttpHeaders);
-          if (
-            parsedHeaders &&
-            typeof parsedHeaders === "object" &&
-            !Array.isArray(parsedHeaders)
-          ) {
-            for (const [key, value] of Object.entries(parsedHeaders)) {
-              if (key && typeof key === "string") {
-                if (key in extraHttpHeaders) {
-                  toast({
-                    title: "Error",
-                    description: `Duplicate key '${key}' in extra http headers`,
-                    variant: "destructive",
-                  });
-                  continue;
-                }
-                extraHttpHeaders[key] = String(value);
-              }
-            }
-          }
-        } catch (error) {
-          toast({
-            title: "Error",
-            description: "Invalid JSON format in extra http headers",
-            variant: "destructive",
-          });
-          return;
-        }
-      }
-
-      const requestBody: WorkflowCreateYAMLRequest = {
-        title: data.title,
-        description: workflow.description,
-        proxy_location: data.settings.proxyLocation,
-        webhook_callback_url: data.settings.webhookCallbackUrl,
-        persist_browser_session: data.settings.persistBrowserSession,
-        model: data.settings.model,
-        max_screenshot_scrolls: data.settings.maxScreenshotScrolls,
-        totp_verification_url: workflow.totp_verification_url,
-        extra_http_headers: extraHttpHeaders,
-        workflow_definition: {
-          parameters: data.parameters,
-          blocks: data.blocks,
-        },
-        is_saved_task: workflow.is_saved_task,
-      };
-      const yaml = convertToYAML(requestBody);
-      return client.put<string, WorkflowApiResponse>(
-        `/workflows/${workflowPermanentId}`,
-        yaml,
-        {
-          headers: {
-            "Content-Type": "text/plain",
-          },
-        },
-      );
-    },
-    onSuccess: () => {
-      toast({
-        title: "Changes saved",
-        description: "Your changes have been saved",
-        variant: "success",
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["workflow", workflowPermanentId],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["workflows"],
-      });
-      setHasChanges(false);
-    },
-    onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
-      toast({
-        title: "Error",
-        description: detail ? detail : error.message,
-        variant: "destructive",
-      });
-    },
+    return (
+      workflowChangesStore.hasChanges &&
+      nextLocation.pathname !== currentLocation.pathname
+    );
   });
 
   function doLayout(nodes: Array<AppNode>, edges: Array<Edge>) {
@@ -397,14 +308,25 @@ function FlowRenderer({
   }, [nodesInitialized]);
 
   useEffect(() => {
-    const blocks = getWorkflowBlocks(nodes, edges);
-    const debuggable = blocks.filter((block) =>
+    const topLevelBlocks = getWorkflowBlocks(nodes, edges);
+    const debuggable = topLevelBlocks.filter((block) =>
       debuggableWorkflowBlockTypes.has(block.block_type),
     );
+
+    for (const node of nodes) {
+      const childBlocks = getOrderedChildrenBlocks(nodes, edges, node.id);
+
+      for (const child of childBlocks) {
+        if (debuggableWorkflowBlockTypes.has(child.block_type)) {
+          debuggable.push(child);
+        }
+      }
+    }
+
     setDebuggableBlockCount(debuggable.length);
   }, [nodes, edges]);
 
-  async function handleSave() {
+  const constructSaveData = useCallback((): WorkflowSaveData => {
     const blocks = getWorkflowBlocks(nodes, edges);
     const settings = getWorkflowSettings(nodes);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
@@ -427,7 +349,7 @@ function FlowRenderer({
       overallParameters,
     );
 
-    return saveWorkflowMutation.mutateAsync({
+    return {
       parameters: [
         ...echoParameters,
         ...parametersInYAMLConvertibleJSON,
@@ -436,7 +358,16 @@ function FlowRenderer({
       blocks,
       title,
       settings,
-    });
+      workflow,
+    };
+  }, [nodes, edges, parameters, title, workflow]);
+
+  useEffect(() => {
+    setGetSaveDataRef.current(constructSaveData);
+  }, [constructSaveData]);
+
+  async function handleSave() {
+    return await saveWorkflow.mutateAsync();
   }
 
   function addNode({
@@ -517,7 +448,7 @@ function FlowRenderer({
       ...nodes.slice(previousNodeIndex + 1),
     ];
 
-    setHasChanges(true);
+    workflowChangesStore.setHasChanges(true);
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
@@ -607,7 +538,8 @@ function FlowRenderer({
       }
       return node;
     });
-    setHasChanges(true);
+    workflowChangesStore.setHasChanges(true);
+
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
@@ -697,9 +629,9 @@ function FlowRenderer({
                   blocker.proceed?.();
                 });
               }}
-              disabled={saveWorkflowMutation.isPending}
+              disabled={workflowChangesStore.saveIsPending}
             >
-              {saveWorkflowMutation.isPending && (
+              {workflowChangesStore.saveIsPending && (
                 <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
               )}
               Save changes
@@ -743,7 +675,7 @@ function FlowRenderer({
                   );
                 })
               ) {
-                setHasChanges(true);
+                workflowChangesStore.setHasChanges(true);
               }
               onNodesChange(changes);
             }}
@@ -787,12 +719,7 @@ function FlowRenderer({
             <Panel position="top-center" className={cn("h-20")}>
               <WorkflowHeader
                 debuggableBlockCount={debuggableBlockCount}
-                title={title}
-                saving={saveWorkflowMutation.isPending}
-                onTitleChange={(newTitle) => {
-                  setTitle(newTitle);
-                  setHasChanges(true);
-                }}
+                saving={workflowChangesStore.saveIsPending}
                 parametersPanelOpen={
                   workflowPanelState.active &&
                   workflowPanelState.content === "parameters"

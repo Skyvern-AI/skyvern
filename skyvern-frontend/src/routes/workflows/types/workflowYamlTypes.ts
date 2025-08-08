@@ -14,6 +14,8 @@ export type WorkflowCreateYAMLRequest = {
   is_saved_task?: boolean;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
+  use_cache?: boolean;
+  cache_key?: string | null;
 };
 
 export type WorkflowDefinitionYAML = {
@@ -288,6 +290,9 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   region_name: string;
   aws_access_key_id: string;
   aws_secret_access_key: string;
+  azure_storage_account_name?: string | null;
+  azure_storage_account_key?: string | null;
+  azure_blob_container_name?: string | null;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {
@@ -308,7 +313,8 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv";
+  file_type: "csv" | "excel" | "pdf";
+  json_schema?: Record<string, unknown> | null;
 };
 
 export type ForLoopBlockYAML = BlockYAMLBase & {

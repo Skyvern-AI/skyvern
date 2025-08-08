@@ -818,6 +818,7 @@ async def run_task_v2_helper(
             task_v2 = await update_task_v2_status_to_workflow_run_status(
                 task_v2_id=task_v2_id,
                 workflow_run_status=workflow_run.status,
+                organization_id=organization_id,
             )
             break
         if block_result.success is True:
@@ -1503,7 +1504,7 @@ async def mark_task_v2_as_timed_out(
 async def update_task_v2_status_to_workflow_run_status(
     task_v2_id: str,
     workflow_run_status: WorkflowRunStatus,
-    organization_id: str | None = None,
+    organization_id: str,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.update_task_v2(
         task_v2_id,

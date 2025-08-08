@@ -138,6 +138,19 @@ function WorkflowRun() {
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
+  const webhookFailureReasonData =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
+
+  const webhookFailureReason = webhookFailureReasonData ? (
+    <div className="space-y-4">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {webhookFailureReasonData}
+      </div>
+    </div>
+  ) : null;
+
   const outputs = workflowRun?.outputs;
   const extractedInformation =
     typeof outputs === "object" &&
@@ -166,7 +179,10 @@ function WorkflowRun() {
 
   const showOutputSection =
     workflowRunIsFinalized &&
-    (hasSomeExtractedInformation || hasFileUrls || hasTaskv2Output) &&
+    (hasSomeExtractedInformation ||
+      hasFileUrls ||
+      hasTaskv2Output ||
+      webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
   return (
@@ -174,12 +190,15 @@ function WorkflowRun() {
       {!isEmbedded && (
         <header className="flex justify-between">
           <div className="space-y-3">
-            <div className="flex items-center gap-5">
+            <div className="mr-2 flex items-start gap-5">
               {title}
               {workflowRunIsLoading ? (
                 <Skeleton className="h-8 w-28" />
               ) : workflowRun ? (
-                <StatusBadge status={workflowRun?.status} />
+                <StatusBadge
+                  className="mt-[0.27rem]"
+                  status={workflowRun?.status}
+                />
               ) : null}
             </div>
             <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
@@ -308,6 +327,7 @@ function WorkflowRun() {
               </ScrollArea>
             </div>
           )}
+          {webhookFailureReason}
         </div>
       )}
       {workflowFailureReason}

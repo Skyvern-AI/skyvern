@@ -2,6 +2,7 @@ import { useSidebarStore } from "@/store/SidebarStore";
 import { cn } from "@/util/utils";
 import { NavLink, useMatches } from "react-router-dom";
 import { Badge } from "./ui/badge";
+import { useIsMobile } from "@/hooks/useIsMobile.ts";
 
 type Props = {
   title: string;
@@ -16,6 +17,7 @@ type Props = {
 };
 
 function NavLinkGroup({ title, links }: Props) {
+  const isMobile = useIsMobile();
   const { collapsed } = useSidebarStore();
   const matches = useMatches();
   const groupIsActive = matches.some((match) => {
@@ -32,6 +34,7 @@ function NavLinkGroup({ title, links }: Props) {
       <div
         className={cn("py-2 text-slate-400", {
           "text-primary": groupIsActive,
+          "mt-2 py-1 text-[0.8rem] font-medium uppercase": isMobile,
         })}
       >
         <div
@@ -42,7 +45,7 @@ function NavLinkGroup({ title, links }: Props) {
           {title}
         </div>
       </div>
-      <div className="space-y-2">
+      <div className="space-y-[1px]]">
         {links.map((link) => {
           return (
             <NavLink
@@ -53,6 +56,7 @@ function NavLinkGroup({ title, links }: Props) {
               className={({ isActive }) => {
                 return cn(
                   "block rounded-lg py-2 pl-3 text-slate-400 hover:bg-muted hover:text-primary",
+                  { "py-1 pl-0 text-[0.8rem]": isMobile },
                   {
                     "bg-muted": isActive,
                   },

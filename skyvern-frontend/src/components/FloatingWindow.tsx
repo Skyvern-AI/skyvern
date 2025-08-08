@@ -18,7 +18,14 @@ import {
 import { flushSync } from "react-dom";
 import Draggable from "react-draggable";
 
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
+import { PowerIcon } from "./icons/PowerIcon";
 
 type OS = "Windows" | "macOS" | "Linux" | "Unknown";
 
@@ -70,11 +77,41 @@ function WindowsButton(props: {
   );
 }
 
+function PowerButton(props: { onClick: () => void }) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            className="h-[1.2rem] w-[1.25rem] opacity-50 hover:opacity-100"
+            onClick={() => props.onClick()}
+          >
+            <PowerIcon />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Cycle (New Browser)</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 function ReloadButton(props: { isReloading: boolean; onClick: () => void }) {
   return (
-    <button onClick={() => props.onClick()}>
-      <ReloadIcon className={props.isReloading ? "animate-spin" : undefined} />
-    </button>
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            className="opacity-50 hover:opacity-100"
+            onClick={() => props.onClick()}
+          >
+            <ReloadIcon
+              className={props.isReloading ? "animate-spin" : undefined}
+            />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Reconnect</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -108,50 +145,56 @@ function getOs(): OS {
 function FloatingWindow({
   bounded,
   children,
+  initialPosition,
   initialWidth,
   initialHeight,
   maximized,
   showCloseButton,
   showMaximizeButton,
   showMinimizeButton,
+  showPowerButton,
   showReloadButton = false,
   title,
   zIndex,
   // --
+  onCycle,
   onInteract,
 }: {
   bounded?: boolean;
   children: React.ReactNode;
   initialHeight?: number;
+  initialPosition?: { x: number; y: number };
   initialWidth?: number;
   maximized?: boolean;
   showCloseButton?: boolean;
   showMaximizeButton?: boolean;
   showMinimizeButton?: boolean;
+  showPowerButton?: boolean;
   showReloadButton?: boolean;
   title: string;
   zIndex?: string;
   // --
+  onCycle?: () => void;
   onInteract?: () => void;
 }) {
   const [reloadKey, setReloadKey] = useState(0);
   const [isReloading, setIsReloading] = useState(false);
-  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [position, setPosition] = useState(initialPosition ?? { x: 0, y: 0 });
   const [size, setSize] = useState({
-    left: 0,
-    top: 0,
+    left: initialPosition?.x ?? 0,
+    top: initialPosition?.y ?? 0,
     height: initialHeight ?? Constants.MinHeight,
     width: initialWidth ?? Constants.MinWidth,
   });
   const [lastSize, setLastSize] = useState({
-    left: 0,
-    top: 0,
+    left: initialPosition?.x ?? 0,
+    top: initialPosition?.y ?? 0,
     height: initialHeight ?? Constants.MinHeight,
     width: initialWidth ?? Constants.MinWidth,
   });
   const [restoreSize, setRestoreSize] = useState({
-    left: 0,
-    top: 0,
+    left: initialPosition?.x ?? 0,
+    top: initialPosition?.y ?? 0,
     height: initialHeight ?? Constants.MinHeight,
     width: initialWidth ?? Constants.MinWidth,
   });
@@ -245,13 +288,13 @@ function FloatingWindow({
       return;
     }
     setSize({
-      left: 0,
-      top: 0,
+      left: initialPosition?.x ?? 0,
+      top: initialPosition?.y ?? 0,
       width: initialWidth,
       height: initialHeight,
     });
-    setPosition({ x: 0, y: 0 });
-  }, [initialWidth, initialHeight]);
+    setPosition({ x: initialPosition?.x ?? 0, y: initialPosition?.y ?? 0 });
+  }, [initialWidth, initialHeight, initialPosition]);
 
   /**
    * Forces the sizing to take place after the resize is complete.
@@ -420,6 +463,10 @@ function FloatingWindow({
     }, 1000);
   };
 
+  const cycle = () => {
+    onCycle?.();
+  };
+
   /**
    * If maximized, need to retain max size during parent resizing.
    */
@@ -582,6 +629,7 @@ function FloatingWindow({
                         onClick={toggleMaximized}
                       />
                     )}
+                    {showPowerButton && <PowerButton onClick={() => cycle()} />}
                   </div>
                   <div className="ml-auto">{title}</div>
                   {showReloadButton && (
@@ -601,6 +649,7 @@ function FloatingWindow({
                   )}
                   <div>{title}</div>
                   <div className="buttons-container ml-auto flex h-full items-center gap-2">
+                    {showPowerButton && <PowerButton onClick={() => cycle()} />}
                     {showMinimizeButton && (
                       <WindowsButton
                         onClick={toggleMinimized}

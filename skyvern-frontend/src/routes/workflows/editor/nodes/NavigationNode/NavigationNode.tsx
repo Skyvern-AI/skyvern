@@ -127,6 +127,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
             </div>
 
             <WorkflowBlockInputTextarea
+              canWriteTitle={true}
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);
@@ -138,7 +139,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
           </div>
           <div className="space-y-2">
             <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">Navigation Goal</Label>
+              <Label className="text-xs text-slate-300">Prompt</Label>
               <HelpTooltip
                 content={helpTooltips["navigation"]["navigationGoal"]}
               />

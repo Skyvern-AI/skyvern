@@ -15,6 +15,8 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    ScriptFileModel,
+    ScriptModel,
     StepModel,
     TaskModel,
     WorkflowModel,
@@ -24,6 +26,8 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
 )
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -47,6 +51,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.scripts import Script, ScriptFile
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
@@ -187,14 +192,18 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
     )
 
 
-def convert_to_organization_auth_token(
+async def convert_to_organization_auth_token(
     org_auth_token: OrganizationAuthTokenModel,
 ) -> OrganizationAuthToken:
+    token = org_auth_token.token
+    if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
+        token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
+
     return OrganizationAuthToken(
         id=org_auth_token.id,
         organization_id=org_auth_token.organization_id,
         token_type=OrganizationAuthTokenType(org_auth_token.token_type),
-        token=org_auth_token.token,
+        token=token,
         valid=org_auth_token.valid,
         created_at=org_auth_token.created_at,
         modified_at=org_auth_token.modified_at,
@@ -252,6 +261,8 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         deleted_at=workflow_model.deleted_at,
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
+        use_cache=workflow_model.use_cache,
+        cache_key=workflow_model.cache_key,
     )
 
 
@@ -480,6 +491,9 @@ def convert_to_workflow_run_block(
         modified_at=workflow_run_block_model.modified_at,
     )
     if task:
+        if task.finished_at and task.started_at:
+            duration = task.finished_at - task.started_at
+            block.duration = duration.total_seconds()
         block.url = task.url
         block.navigation_goal = task.navigation_goal
         block.navigation_payload = task.navigation_payload
@@ -490,6 +504,38 @@ def convert_to_workflow_run_block(
         block.include_action_history_in_verification = task.include_action_history_in_verification
 
     return block
+
+
+def convert_to_script(script_model: ScriptModel) -> Script:
+    return Script(
+        script_revision_id=script_model.script_revision_id,
+        script_id=script_model.script_id,
+        organization_id=script_model.organization_id,
+        run_id=script_model.run_id,
+        version=script_model.version,
+        created_at=script_model.created_at,
+        modified_at=script_model.modified_at,
+        deleted_at=script_model.deleted_at,
+    )
+
+
+def convert_to_script_file(script_file_model: ScriptFileModel) -> ScriptFile:
+    return ScriptFile(
+        file_id=script_file_model.file_id,
+        script_revision_id=script_file_model.script_revision_id,
+        script_id=script_file_model.script_id,
+        organization_id=script_file_model.organization_id,
+        file_path=script_file_model.file_path,
+        file_name=script_file_model.file_name,
+        file_type=script_file_model.file_type,
+        content_hash=script_file_model.content_hash,
+        file_size=script_file_model.file_size,
+        mime_type=script_file_model.mime_type,
+        encoding=script_file_model.encoding,
+        artifact_id=script_file_model.artifact_id,
+        created_at=script_file_model.created_at,
+        modified_at=script_file_model.modified_at,
+    )
 
 
 def hydrate_action(action_model: ActionModel) -> Action:

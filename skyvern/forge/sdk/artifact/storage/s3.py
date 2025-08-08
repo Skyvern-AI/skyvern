@@ -84,6 +84,22 @@ class S3Storage(BaseStorage):
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"{self._build_base_uri(organization_id)}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
+    def build_script_file_uri(
+        self, *, organization_id: str, script_id: str, script_version: int, file_path: str
+    ) -> str:
+        """Build the S3 URI for a script file.
+
+        Args:
+            organization_id: The organization ID
+            script_id: The script ID
+            script_version: The script version
+            file_path: The file path relative to script root
+
+        Returns:
+            The S3 URI for the script file
+        """
+        return f"{self._build_base_uri(organization_id)}/scripts/{script_id}/{script_version}/{file_path}"
+
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)
         tags = await self._get_tags_for_org(artifact.organization_id)

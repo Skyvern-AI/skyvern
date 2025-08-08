@@ -82,6 +82,12 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    def build_script_file_uri(
+        self, *, organization_id: str, script_id: str, script_version: int, file_path: str
+    ) -> str:
+        pass
+
+    @abstractmethod
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         pass
 
