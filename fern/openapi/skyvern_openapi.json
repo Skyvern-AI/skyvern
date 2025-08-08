@@ -1699,14 +1699,67 @@
         ]
       }
     },
-    "/v1/projects": {
+    "/v1/credentials/onepassword/get": {
+      "get": {
+        "tags": [
+          "Auth Tokens"
+        ],
+        "summary": "Get OnePassword service account token",
+        "description": "Retrieves the current OnePassword service account token for the organization.",
+        "operationId": "get_onepassword_token_v1_credentials_onepassword_get_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateOnePasswordTokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_onepassword_token"
+      }
+    },
+    "/v1/credentials/onepassword/create": {
       "post": {
         "tags": [
-          "Projects"
+          "Auth Tokens"
         ],
-        "summary": "Create project",
-        "description": "Create a new project with optional files and metadata",
-        "operationId": "create_project_v1_projects_post",
+        "summary": "Create or update OnePassword service account token",
+        "description": "Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
+        "operationId": "update_onepassword_token_v1_credentials_onepassword_create_post",
         "parameters": [
           {
             "name": "x-api-key",
@@ -1732,7 +1785,11 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/CreateProjectRequest"
+                "$ref": "#/components/schemas/CreateOnePasswordTokenRequest",
+                "description": "The OnePassword token data",
+                "openapi_extra": {
+                  "x-fern-sdk-parameter-name": "data"
+                }
               }
             }
           }
@@ -1743,7 +1800,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CreateProjectResponse"
+                  "$ref": "#/components/schemas/CreateOnePasswordTokenResponse"
                 }
               }
             }
@@ -1759,238 +1816,7 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "create_project"
-      },
-      "get": {
-        "tags": [
-          "Projects"
-        ],
-        "summary": "Get all projects",
-        "description": "Retrieves a paginated list of projects for the current organization",
-        "operationId": "get_projects_v1_projects_get",
-        "parameters": [
-          {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Page number for pagination",
-              "examples": [
-                1
-              ],
-              "default": 1,
-              "title": "Page"
-            },
-            "description": "Page number for pagination"
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Number of items per page",
-              "examples": [
-                10
-              ],
-              "default": 10,
-              "title": "Page Size"
-            },
-            "description": "Number of items per page"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Project"
-                  },
-                  "title": "Response Get Projects V1 Projects Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_projects"
-      }
-    },
-    "/v1/projects/{project_id}": {
-      "get": {
-        "tags": [
-          "Projects"
-        ],
-        "summary": "Get project by ID",
-        "description": "Retrieves a specific project by its ID",
-        "operationId": "get_project_v1_projects__project_id__get",
-        "parameters": [
-          {
-            "name": "project_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The unique identifier of the project",
-              "examples": [
-                "proj_abc123"
-              ],
-              "title": "Project Id"
-            },
-            "description": "The unique identifier of the project"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Project"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_project"
-      }
-    },
-    "/v1/projects/{project_id}/deploy": {
-      "post": {
-        "tags": [
-          "Projects"
-        ],
-        "summary": "Deploy project",
-        "description": "Deploy a project with updated files, creating a new version",
-        "operationId": "deploy_project_v1_projects__project_id__deploy_post",
-        "parameters": [
-          {
-            "name": "project_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The unique identifier of the project",
-              "examples": [
-                "proj_abc123"
-              ],
-              "title": "Project Id"
-            },
-            "description": "The unique identifier of the project"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DeployProjectRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CreateProjectResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "deploy_project"
+        "x-fern-sdk-method-name": "update_onepassword_token"
       }
     },
     "/v1/run/tasks/login": {
@@ -2072,6 +1898,364 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/scripts": {
+      "post": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Create script",
+        "description": "Create a new script with optional files and metadata",
+        "operationId": "create_script_v1_scripts_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateScriptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateScriptResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "create_script"
+      },
+      "get": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Get all scripts",
+        "description": "Retrieves a paginated list of scripts for the current organization",
+        "operationId": "get_scripts_v1_scripts_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number for pagination",
+              "examples": [
+                1
+              ],
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number for pagination"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of items per page",
+              "examples": [
+                10
+              ],
+              "default": 10,
+              "title": "Page Size"
+            },
+            "description": "Number of items per page"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Script"
+                  },
+                  "title": "Response Get Scripts V1 Scripts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_scripts"
+      }
+    },
+    "/v1/scripts/{script_id}": {
+      "get": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Get script by ID",
+        "description": "Retrieves a specific script by its ID",
+        "operationId": "get_script_v1_scripts__script_id__get",
+        "parameters": [
+          {
+            "name": "script_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the script",
+              "examples": [
+                "s_abc123"
+              ],
+              "title": "Script Id"
+            },
+            "description": "The unique identifier of the script"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Script"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_script"
+      }
+    },
+    "/v1/scripts/{script_id}/deploy": {
+      "post": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Deploy script",
+        "description": "Deploy a script with updated files, creating a new version",
+        "operationId": "deploy_script_v1_scripts__script_id__deploy_post",
+        "parameters": [
+          {
+            "name": "script_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the script",
+              "examples": [
+                "s_abc123"
+              ],
+              "title": "Script Id"
+            },
+            "description": "The unique identifier of the script"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeployScriptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateScriptResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "deploy_script"
+      }
+    },
+    "/v1/scripts/{script_id}/run": {
+      "post": {
+        "tags": [
+          "Scripts"
+        ],
+        "summary": "Run script",
+        "description": "Run a script",
+        "operationId": "run_script_v1_scripts__script_id__run_post",
+        "parameters": [
+          {
+            "name": "script_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The unique identifier of the script",
+              "examples": [
+                "s_abc123"
+              ],
+              "title": "Script Id"
+            },
+            "description": "The unique identifier of the script"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -2746,7 +2930,7 @@
           "html_action",
           "trace",
           "har",
-          "project_file"
+          "script_file"
         ],
         "title": "ArtifactType"
       },
@@ -3739,7 +3923,39 @@
         "title": "CreateCredentialRequest",
         "description": "Request model for creating a new credential."
       },
-      "CreateProjectRequest": {
+      "CreateOnePasswordTokenRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token",
+            "description": "The 1Password service account token",
+            "examples": [
+              "op_1234567890abcdef"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "CreateOnePasswordTokenRequest",
+        "description": "Request model for creating or updating a 1Password service account token."
+      },
+      "CreateOnePasswordTokenResponse": {
+        "properties": {
+          "token": {
+            "$ref": "#/components/schemas/OrganizationAuthToken",
+            "description": "The created or updated 1Password service account token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "CreateOnePasswordTokenResponse",
+        "description": "Response model for 1Password token operations."
+      },
+      "CreateScriptRequest": {
         "properties": {
           "workflow_id": {
             "anyOf": [
@@ -3769,7 +3985,7 @@
             "anyOf": [
               {
                 "items": {
-                  "$ref": "#/components/schemas/ProjectFile"
+                  "$ref": "#/components/schemas/ScriptFileCreate"
                 },
                 "type": "array"
               },
@@ -3778,7 +3994,7 @@
               }
             ],
             "title": "Files",
-            "description": "Array of files to include in the project",
+            "description": "Array of files to include in the script",
             "examples": [
               {
                 "content": "cHJpbnQoIkhlbGxvLCBXb3JsZCEiKQ==",
@@ -3796,22 +4012,22 @@
           }
         },
         "type": "object",
-        "title": "CreateProjectRequest"
+        "title": "CreateScriptRequest"
       },
-      "CreateProjectResponse": {
+      "CreateScriptResponse": {
         "properties": {
-          "project_id": {
+          "script_id": {
             "type": "string",
-            "title": "Project Id",
-            "description": "Unique project identifier",
+            "title": "Script Id",
+            "description": "Unique script identifier",
             "examples": [
-              "proj_abc123"
+              "s_abc123"
             ]
           },
           "version": {
             "type": "integer",
             "title": "Version",
-            "description": "Project version number",
+            "description": "Script version number",
             "examples": [
               1
             ]
@@ -3826,12 +4042,12 @@
               }
             ],
             "title": "Run Id",
-            "description": "ID of the workflow run or task run that generated this project"
+            "description": "ID of the workflow run or task run that generated this script"
           },
           "file_count": {
             "type": "integer",
             "title": "File Count",
-            "description": "Total number of files in the project"
+            "description": "Total number of files in the script"
           },
           "file_tree": {
             "additionalProperties": {
@@ -3845,18 +4061,18 @@
             "type": "string",
             "format": "date-time",
             "title": "Created At",
-            "description": "Timestamp when the project was created"
+            "description": "Timestamp when the script was created"
           }
         },
         "type": "object",
         "required": [
-          "project_id",
+          "script_id",
           "version",
           "file_count",
           "file_tree",
           "created_at"
         ],
-        "title": "CreateProjectResponse"
+        "title": "CreateScriptResponse"
       },
       "CredentialParameter": {
         "properties": {
@@ -4043,15 +4259,15 @@
         "title": "CreditCardCredentialResponse",
         "description": "Response model for credit card credentials, containing only the last four digits and brand."
       },
-      "DeployProjectRequest": {
+      "DeployScriptRequest": {
         "properties": {
           "files": {
             "items": {
-              "$ref": "#/components/schemas/ProjectFile"
+              "$ref": "#/components/schemas/ScriptFileCreate"
             },
             "type": "array",
             "title": "Files",
-            "description": "Array of files to include in the project",
+            "description": "Array of files to include in the script",
             "examples": [
               {
                 "content": "cHJpbnQoIkhlbGxvLCBXb3JsZCEiKQ==",
@@ -4066,8 +4282,8 @@
         "required": [
           "files"
         ],
-        "title": "DeployProjectRequest",
-        "description": "Request model for deploying a project with updated files."
+        "title": "DeployScriptRequest",
+        "description": "Request model for deploying a script with updated files."
       },
       "DownloadToS3Block": {
         "properties": {
@@ -4932,7 +5148,8 @@
       "FileEncoding": {
         "type": "string",
         "enum": [
-          "base64"
+          "base64",
+          "utf-8"
         ],
         "title": "FileEncoding",
         "description": "Supported file content encodings."
@@ -5087,6 +5304,18 @@
           },
           "file_type": {
             "$ref": "#/components/schemas/FileType"
+          },
+          "json_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Json Schema"
           }
         },
         "type": "object",
@@ -5133,6 +5362,18 @@
           },
           "file_type": {
             "$ref": "#/components/schemas/FileType"
+          },
+          "json_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Json Schema"
           }
         },
         "type": "object",
@@ -5153,7 +5394,9 @@
       "FileType": {
         "type": "string",
         "enum": [
-          "csv"
+          "csv",
+          "excel",
+          "pdf"
         ],
         "title": "FileType"
       },
@@ -7214,6 +7457,58 @@
         ],
         "title": "OnePasswordCredentialParameterYAML"
       },
+      "OrganizationAuthToken": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "token_type": {
+            "$ref": "#/components/schemas/OrganizationAuthTokenType"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "valid": {
+            "type": "boolean",
+            "title": "Valid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "organization_id",
+          "token_type",
+          "token",
+          "valid",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "OrganizationAuthToken"
+      },
+      "OrganizationAuthTokenType": {
+        "type": "string",
+        "enum": [
+          "api",
+          "onepassword_service_account"
+        ],
+        "title": "OrganizationAuthTokenType"
+      },
       "OutputParameter": {
         "properties": {
           "parameter_type": {
@@ -7363,7 +7658,8 @@
           "output_parameter",
           "file_url"
         ],
-        "title": "PDFParserBlock"
+        "title": "PDFParserBlock",
+        "description": "DEPRECATED: Use FileParserBlock with file_type=FileType.PDF instead.\nThis block will be removed in a future version."
       },
       "PDFParserBlockYAML": {
         "properties": {
@@ -7436,118 +7732,6 @@
         "title": "PasswordCredentialResponse",
         "description": "Response model for password credentials, containing only the username."
       },
-      "Project": {
-        "properties": {
-          "project_revision_id": {
-            "type": "string",
-            "title": "Project Revision Id",
-            "description": "Unique identifier for this specific project revision"
-          },
-          "project_id": {
-            "type": "string",
-            "title": "Project Id",
-            "description": "User-facing project identifier, consistent across versions"
-          },
-          "organization_id": {
-            "type": "string",
-            "title": "Organization Id",
-            "description": "ID of the organization that owns this project"
-          },
-          "run_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run Id",
-            "description": "ID of the workflow run or task run that generated this project"
-          },
-          "version": {
-            "type": "integer",
-            "title": "Version",
-            "description": "Version number of the project"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Created At",
-            "description": "Timestamp when the project was created"
-          },
-          "modified_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Modified At",
-            "description": "Timestamp when the project was last modified"
-          },
-          "deleted_at": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Deleted At",
-            "description": "Timestamp when the project was soft deleted"
-          }
-        },
-        "type": "object",
-        "required": [
-          "project_revision_id",
-          "project_id",
-          "organization_id",
-          "version",
-          "created_at",
-          "modified_at"
-        ],
-        "title": "Project"
-      },
-      "ProjectFile": {
-        "properties": {
-          "path": {
-            "type": "string",
-            "title": "Path",
-            "description": "File path relative to project root",
-            "examples": [
-              "src/main.py"
-            ]
-          },
-          "content": {
-            "type": "string",
-            "title": "Content",
-            "description": "Base64 encoded file content"
-          },
-          "encoding": {
-            "$ref": "#/components/schemas/FileEncoding",
-            "description": "Content encoding",
-            "default": "base64"
-          },
-          "mime_type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Mime Type",
-            "description": "MIME type (auto-detected if not provided)"
-          }
-        },
-        "type": "object",
-        "required": [
-          "path",
-          "content"
-        ],
-        "title": "ProjectFile",
-        "description": "Model representing a file in a project."
-      },
       "ProxyLocation": {
         "type": "string",
         "enum": [
@@ -7597,6 +7781,118 @@
           "canceled"
         ],
         "title": "RunStatus"
+      },
+      "Script": {
+        "properties": {
+          "script_revision_id": {
+            "type": "string",
+            "title": "Script Revision Id",
+            "description": "Unique identifier for this specific script revision"
+          },
+          "script_id": {
+            "type": "string",
+            "title": "Script Id",
+            "description": "User-facing script identifier, consistent across versions"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id",
+            "description": "ID of the organization that owns this script"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id",
+            "description": "ID of the workflow run or task run that generated this script"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "description": "Version number of the script"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Timestamp when the script was created"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At",
+            "description": "Timestamp when the script was last modified"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At",
+            "description": "Timestamp when the script was soft deleted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "script_revision_id",
+          "script_id",
+          "organization_id",
+          "version",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "Script"
+      },
+      "ScriptFileCreate": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "File path relative to script root",
+            "examples": [
+              "src/main.py"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "Base64 encoded file content"
+          },
+          "encoding": {
+            "$ref": "#/components/schemas/FileEncoding",
+            "description": "Content encoding",
+            "default": "base64"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type",
+            "description": "MIME type (auto-detected if not provided)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "title": "ScriptFileCreate",
+        "description": "Model representing a file in a script."
       },
       "SendEmailBlock": {
         "properties": {
@@ -10374,6 +10670,22 @@
             ],
             "title": "Extra Http Headers"
           },
+          "use_cache": {
+            "type": "boolean",
+            "title": "Use Cache",
+            "default": false
+          },
+          "cache_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Key"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -10530,7 +10842,7 @@
             "title": "Use Cache",
             "default": false
           },
-          "cache_project_id": {
+          "cache_key": {
             "anyOf": [
               {
                 "type": "string"
@@ -10539,7 +10851,7 @@
                 "type": "null"
               }
             ],
-            "title": "Cache Project Id"
+            "title": "Cache Key"
           }
         },
         "type": "object",
