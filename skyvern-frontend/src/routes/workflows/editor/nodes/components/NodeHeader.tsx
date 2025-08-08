@@ -21,6 +21,7 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
@@ -155,6 +156,7 @@ function NodeHeader({
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
   });
+  const saveWorkflow = useWorkflowSave();
 
   useEffect(() => {
     if (!workflowRun || !workflowPermanentId || !workflowRunId) {
@@ -190,6 +192,8 @@ function NodeHeader({
 
   const runBlock = useMutation({
     mutationFn: async () => {
+      await saveWorkflow.mutateAsync();
+
       if (!workflowPermanentId) {
         console.error("There is no workflowPermanentId");
         toast({

@@ -62,9 +62,7 @@ function WorkflowDebugger() {
     return state.setCollapsed;
   });
 
-  const setHasChanges = useWorkflowHasChangesStore(
-    (state) => state.setHasChanges,
-  );
+  const workflowChangesStore = useWorkflowHasChangesStore();
 
   const handleOnCycle = () => {
     setOpenDialogue(true);
@@ -72,7 +70,7 @@ function WorkflowDebugger() {
 
   useMountEffect(() => {
     setCollapsed(true);
-    setHasChanges(false);
+    workflowChangesStore.setHasChanges(false);
 
     if (workflowPermanentId) {
       queryClient.removeQueries({

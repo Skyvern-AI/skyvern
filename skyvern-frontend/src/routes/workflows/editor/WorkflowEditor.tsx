@@ -16,9 +16,7 @@ function WorkflowEditor() {
   const setCollapsed = useSidebarStore((state) => {
     return state.setCollapsed;
   });
-  const setHasChanges = useWorkflowHasChangesStore(
-    (state) => state.setHasChanges,
-  );
+  const workflowChangesStore = useWorkflowHasChangesStore();
 
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -29,7 +27,7 @@ function WorkflowEditor() {
 
   useMountEffect(() => {
     setCollapsed(true);
-    setHasChanges(false);
+    workflowChangesStore.setHasChanges(false);
   });
 
   if (isLoading || isGlobalWorkflowsLoading) {
