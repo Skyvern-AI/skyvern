@@ -331,11 +331,14 @@ export type UploadToS3Block = WorkflowBlockBase & {
 export type FileUploadBlock = WorkflowBlockBase & {
   block_type: "file_upload";
   path: string;
-  storage_type: string;
-  s3_bucket: string;
-  region_name: string;
-  aws_access_key_id: string;
-  aws_secret_access_key: string;
+  storage_type: "s3" | "azure";
+  s3_bucket: string | null;
+  region_name: string | null;
+  aws_access_key_id: string | null;
+  aws_secret_access_key: string | null;
+  azure_storage_account_name: string | null;
+  azure_storage_account_key: string | null;
+  azure_blob_container_name: string | null;
 };
 
 export type SendEmailBlock = WorkflowBlockBase & {

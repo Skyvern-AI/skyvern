@@ -7,6 +7,7 @@ readme = "README.md"
 packages = [{ include = "skyvern" }, { include = "alembic" }]
 
 [tool.poetry.dependencies]
+azure-storage-blob = ">=12.26.0"
 python = ">=3.11,<3.14"
 python-dotenv = "^1.0.0"
 openai = ">=1.68.2"
@@ -80,6 +81,8 @@ curlparser = "^0.1.0"
 lmnr = {extras = ["all"], version = "^0.7.0"}
 openpyxl = "^3.1.5"
 pandas = "^2.3.1"
+azure-identity = "^1.24.0"
+azure-keyvault = "^4.2.0"
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
