@@ -40,7 +40,7 @@ function WorkflowHeader({
   saving,
 }: Props) {
   const { title, setTitle } = useWorkflowTitleStore();
-  const { setHasChanges } = useWorkflowHasChangesStore();
+  const workflowChangesStore = useWorkflowHasChangesStore();
   const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
@@ -68,7 +68,7 @@ function WorkflowHeader({
           editable={true}
           onChange={(newTitle) => {
             setTitle(newTitle);
-            setHasChanges(true);
+            workflowChangesStore.setHasChanges(true);
           }}
           value={title}
           titleClassName="text-3xl"
