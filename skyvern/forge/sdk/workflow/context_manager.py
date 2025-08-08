@@ -249,6 +249,8 @@ class WorkflowRunContext:
             self.values[parameter.key] = {}
             credential_dict = credential_item.model_dump()
             for key, value in credential_dict.items():
+                if value is None:
+                    continue
                 random_secret_id = self.generate_random_secret_id()
                 secret_id = f"{random_secret_id}_{key}"
                 self.secrets[secret_id] = value
