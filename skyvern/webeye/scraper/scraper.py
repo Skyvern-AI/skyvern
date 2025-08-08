@@ -108,7 +108,7 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
         if not interactable:
             return ""
         else:
-            LOG.info("Element is interactable. Trimmed all attributes instead of dropping it", element=element)
+            LOG.debug("Element is interactable. Trimmed all attributes instead of dropping it", element=element)
             attributes = {}
 
     context = skyvern_context.ensure_context()
