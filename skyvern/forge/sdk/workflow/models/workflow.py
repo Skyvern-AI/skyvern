@@ -7,7 +7,9 @@ from typing_extensions import deprecated
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
-from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
+from skyvern.forge.sdk.workflow.exceptions import (
+    WorkflowDefinitionHasDuplicateBlockLabels,
+)
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.runs import ProxyLocation
@@ -169,6 +171,7 @@ class WorkflowRunResponseBase(BaseModel):
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None
+    steps_executed: int | None = None
     total_steps: int | None = None
     total_cost: float | None = None
     task_v2: TaskV2 | None = None

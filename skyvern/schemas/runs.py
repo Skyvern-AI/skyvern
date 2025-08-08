@@ -419,6 +419,11 @@ class WorkflowRunResponse(BaseRunResponse):
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
+    steps_executed: int | None = Field(
+        default=None,
+        description="Number of workflow steps (blocks) executed in this run",
+        examples=[7],
+    )
 
 
 RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discriminator="run_type")]
