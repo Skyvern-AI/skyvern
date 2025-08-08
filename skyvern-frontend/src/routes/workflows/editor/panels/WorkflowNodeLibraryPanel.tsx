@@ -40,8 +40,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Navigation Block",
-    description: "Navigate on the page",
+    title: "Browser Task Block",
+    description: "Take actions to achieve a task.",
   },
   {
     nodeType: "taskv2",
@@ -51,8 +51,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Navigation v2 Block",
-    description: "Navigate on the page with Skyvern 2.0",
+    title: "Browser Task v2 Block",
+    description: "Achieve complex tasks with deep thinking.",
   },
   {
     nodeType: "action",
@@ -62,7 +62,7 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Action Block",
+    title: "Browser Action Block",
     description: "Take a single action",
   },
   {
@@ -87,17 +87,17 @@ const nodeLibraryItems: Array<{
     title: "Validation Block",
     description: "Validate completion criteria",
   },
-  {
-    nodeType: "task",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Task}
-        className="size-6"
-      />
-    ),
-    title: "Task Block",
-    description: "Complete multi-step browser automation tasks",
-  },
+  // {
+  //   nodeType: "task",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.Task}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Task Block",
+  //   description: "Complete multi-step browser automation tasks",
+  // },
   {
     nodeType: "url",
     icon: (
