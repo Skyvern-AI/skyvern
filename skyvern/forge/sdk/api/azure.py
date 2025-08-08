@@ -26,7 +26,12 @@ class AsyncAzureClient:
                 await container_client.upload_blob(name=blob_name, data=data, overwrite=True)
             LOG.info("File uploaded to Azure Blob Storage", container_name=container_name, blob_name=blob_name)
         except Exception as e:
-            LOG.error("Failed to upload file to Azure Blob Storage", container_name=container_name, blob_name=blob_name, error=e)
+            LOG.error(
+                "Failed to upload file to Azure Blob Storage",
+                container_name=container_name,
+                blob_name=blob_name,
+                error=e,
+            )
             raise e
 
     async def close(self) -> None:
