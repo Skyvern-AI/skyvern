@@ -15,6 +15,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    ScriptBlockModel,
     ScriptFileModel,
     ScriptModel,
     StepModel,
@@ -51,7 +52,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation
-from skyvern.schemas.scripts import Script, ScriptFile
+from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
@@ -535,6 +536,20 @@ def convert_to_script_file(script_file_model: ScriptFileModel) -> ScriptFile:
         artifact_id=script_file_model.artifact_id,
         created_at=script_file_model.created_at,
         modified_at=script_file_model.modified_at,
+    )
+
+
+def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock:
+    return ScriptBlock(
+        script_block_id=script_block_model.script_block_id,
+        organization_id=script_block_model.organization_id,
+        script_id=script_block_model.script_id,
+        script_revision_id=script_block_model.script_revision_id,
+        script_block_label=script_block_model.script_block_label,
+        script_file_id=script_block_model.script_file_id,
+        created_at=script_block_model.created_at,
+        modified_at=script_block_model.modified_at,
+        deleted_at=script_block_model.deleted_at,
     )
 
 
