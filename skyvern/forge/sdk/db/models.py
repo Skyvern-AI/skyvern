@@ -875,6 +875,7 @@ class ScriptBlockModel(Base):
     )
 
     script_block_id = Column(String, primary_key=True, default=generate_script_block_id)
+    organization_id = Column(String, nullable=False)
     script_id = Column(String, nullable=False)
     script_revision_id = Column(String, nullable=False, index=True)
     script_block_label = Column(String, nullable=False)

@@ -125,3 +125,15 @@ class Script(BaseModel):
     created_at: datetime = Field(description="Timestamp when the script was created")
     modified_at: datetime = Field(description="Timestamp when the script was last modified")
     deleted_at: datetime | None = Field(default=None, description="Timestamp when the script was soft deleted")
+
+
+class ScriptBlock(BaseModel):
+    script_block_id: str
+    organization_id: str
+    script_id: str
+    script_revision_id: str
+    script_block_label: str
+    script_file_id: str
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None

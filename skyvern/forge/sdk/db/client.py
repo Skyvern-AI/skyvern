@@ -29,6 +29,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
+    ScriptBlockModel,
     ScriptFileModel,
     ScriptModel,
     StepModel,
@@ -55,6 +56,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_organization_auth_token,
     convert_to_output_parameter,
     convert_to_script,
+    convert_to_script_block,
     convert_to_script_file,
     convert_to_step,
     convert_to_task,
@@ -103,7 +105,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
-from skyvern.schemas.scripts import Script, ScriptFile
+from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 
@@ -3775,3 +3777,33 @@ class AgentDB:
                 )
             ).all()
             return [convert_to_script_file(script_file) for script_file in script_files]
+
+    async def get_script_block(
+        self,
+        script_block_id: str,
+        organization_id: str,
+    ) -> ScriptBlock | None:
+        async with self.Session() as session:
+            record = (
+                await session.scalars(
+                    select(ScriptBlockModel)
+                    .filter_by(script_block_id=script_block_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return convert_to_script_block(record) if record else None
+
+    async def get_script_blocks_by_script_revision_id(
+        self,
+        script_revision_id: str,
+        organization_id: str,
+    ) -> list[ScriptBlock]:
+        async with self.Session() as session:
+            records = (
+                await session.scalars(
+                    select(ScriptBlockModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).all()
+            return [convert_to_script_block(record) for record in records]
