@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import structlog
 
@@ -13,10 +13,10 @@ LOG = structlog.get_logger(__name__)
 @dataclass
 class CodeGenInput:
     file_name: str
-    workflow_run: Mapping[str, Any]
-    workflow: Mapping[str, Any]
-    workflow_blocks: Iterable[Mapping[str, Any]]
-    actions_by_task: Mapping[str, Iterable[Mapping[str, Any]]]
+    workflow_run: dict[str, Any]
+    workflow: dict[str, Any]
+    workflow_blocks: list[dict[str, Any]]
+    actions_by_task: dict[str, list[dict[str, Any]]]
 
 
 async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organization_id: str) -> CodeGenInput:
