@@ -45,6 +45,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
+    WorkflowScriptModel,
 )
 from skyvern.forge.sdk.db.utils import (
     _custom_json_serializer,
@@ -3807,3 +3808,83 @@ class AgentDB:
                 )
             ).all()
             return [convert_to_script_block(record) for record in records]
+
+    async def create_workflow_script(
+        self,
+        *,
+        organization_id: str,
+        script_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        cache_key_value: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        """Create a workflow->script cache mapping entry."""
+        try:
+            async with self.Session() as session:
+                record = WorkflowScriptModel(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_key_value=cache_key_value,
+                )
+                session.add(record)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_scripts_by_cache_key_value(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+    ) -> list[Script]:
+        """Get latest script versions linked to a workflow by a specific cache_key_value."""
+        try:
+            async with self.Session() as session:
+                # Subquery: script_ids associated with this workflow + cache_key_value
+                ws_script_ids_subquery = (
+                    select(WorkflowScriptModel.script_id)
+                    .where(WorkflowScriptModel.organization_id == organization_id)
+                    .where(WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowScriptModel.cache_key_value == cache_key_value)
+                    .where(WorkflowScriptModel.deleted_at.is_(None))
+                )
+
+                # Latest version per script_id within the org and not deleted
+                latest_versions_subquery = (
+                    select(
+                        ScriptModel.script_id,
+                        func.max(ScriptModel.version).label("latest_version"),
+                    )
+                    .where(ScriptModel.organization_id == organization_id)
+                    .where(ScriptModel.deleted_at.is_(None))
+                    .where(ScriptModel.script_id.in_(ws_script_ids_subquery))
+                    .group_by(ScriptModel.script_id)
+                    .subquery()
+                )
+
+                query = select(ScriptModel).join(
+                    latest_versions_subquery,
+                    (ScriptModel.script_id == latest_versions_subquery.c.script_id)
+                    & (ScriptModel.version == latest_versions_subquery.c.latest_version),
+                )
+                query = query.order_by(ScriptModel.created_at.desc())
+
+                scripts = (await session.scalars(query)).all()
+                return [convert_to_script(script) for script in scripts]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
