@@ -43,7 +43,7 @@ export const workflowBlockTitle: {
   login: "Login",
   navigation: "Browser Task",
   send_email: "Send Email",
-  task: "Browser Task (Deprecated)",
+  task: "Browser Task",
   text_prompt: "Text Prompt",
   upload_to_s3: "Upload To S3",
   file_upload: "Upload Files",
