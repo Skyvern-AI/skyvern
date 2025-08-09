@@ -129,6 +129,7 @@ def _make_decorator(block: dict[str, Any]) -> cst.Decorator:
         "file_download": "file_download_block",
         "send_email": "email_block",
         "wait": "wait_block",
+        "navigation": "navigation_block",
     }[bt]
 
     kwargs = []
