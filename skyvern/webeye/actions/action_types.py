@@ -23,7 +23,6 @@ class ActionType(StrEnum):
 
     SCROLL = "scroll"
     KEYPRESS = "keypress"
-    TYPE = "type"
     MOVE = "move"
     DRAG = "drag"
     LEFT_MOUSE = "left_mouse"

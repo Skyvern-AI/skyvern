@@ -1,7 +1,7 @@
-from skyvern.core.code_generations.skyvern_page import RunContext
+from skyvern.core.script_generations.skyvern_page import RunContext
 
 
-class CodeRunContextManager:
+class ScriptRunContextManager:
     """
     Manages the run context for code runs.
     """

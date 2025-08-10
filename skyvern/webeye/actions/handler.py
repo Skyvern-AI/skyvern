@@ -1804,55 +1804,7 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    updated_keys = []
-    for key in action.keys:
-        key_lower_case = key.lower()
-        if key_lower_case in ("enter", "return"):
-            updated_keys.append("Enter")
-        elif key_lower_case == "space":
-            updated_keys.append(" ")
-        elif key_lower_case == "ctrl":
-            updated_keys.append("Control")
-        elif key_lower_case == "backspace":
-            updated_keys.append("Backspace")
-        elif key_lower_case == "pagedown":
-            updated_keys.append("PageDown")
-        elif key_lower_case == "pageup":
-            updated_keys.append("PageUp")
-        elif key_lower_case == "tab":
-            updated_keys.append("Tab")
-        elif key_lower_case == "shift":
-            updated_keys.append("Shift")
-        elif key_lower_case in ("arrowleft", "left"):
-            updated_keys.append("ArrowLeft")
-        elif key_lower_case in ("arrowright", "right"):
-            updated_keys.append("ArrowRight")
-        elif key_lower_case in ("arrowup", "up"):
-            updated_keys.append("ArrowUp")
-        elif key_lower_case in ("arrowdown", "down"):
-            updated_keys.append("ArrowDown")
-        elif key_lower_case == "home":
-            updated_keys.append("Home")
-        elif key_lower_case == "end":
-            updated_keys.append("End")
-        elif key_lower_case == "delete":
-            updated_keys.append("Delete")
-        elif key_lower_case == "ecs":
-            updated_keys.append("Escape")
-        elif key_lower_case == "alt":
-            updated_keys.append("Alt")
-        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
-            # Handle function keys: f1 -> F1, f5 -> F5, etc.
-            updated_keys.append(key_lower_case.upper())
-        else:
-            updated_keys.append(key)
-    keypress_str = "+".join(updated_keys)
-    if action.hold:
-        await page.keyboard.down(keypress_str)
-        await asyncio.sleep(action.duration)
-        await page.keyboard.up(keypress_str)
-    else:
-        await page.keyboard.press(keypress_str)
+    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration)
     return [ActionSuccess()]
 
 
@@ -1876,13 +1828,7 @@ async def handle_drag_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if action.start_x and action.start_y:
-        await page.mouse.move(action.start_x, action.start_y)
-    await page.mouse.down()
-    for point in action.path:
-        x, y = point[0], point[1]
-        await page.mouse.move(x, y)
-    await page.mouse.up()
+    await handler_utils.drag(page, action.start_x, action.start_y, action.path)
     return [ActionSuccess()]
 
 
@@ -1913,12 +1859,7 @@ async def handle_left_mouse_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if action.x and action.y:
-        await page.mouse.move(action.x, action.y)
-    if action.direction == "down":
-        await page.mouse.down()
-    elif action.direction == "up":
-        await page.mouse.up()
+    await handler_utils.left_mouse(page, action.x, action.y, action.direction)
     return [ActionSuccess()]
 
 
