@@ -22,10 +22,14 @@ from enum import StrEnum
 from typing import Any
 
 import libcst as cst
+import structlog
 from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
 from skyvern.forge import app
 from skyvern.webeye.actions.action_types import ActionType
+
+LOG = structlog.get_logger(__name__)
+
 
 # --------------------------------------------------------------------- #
 # 1. helpers                                                            #
@@ -413,9 +417,6 @@ async def generate_workflow_script(
             script_id = script.script_id
             script_revision_id = script.script_revision_id
         except Exception as e:
-            import structlog
-
-            LOG = structlog.get_logger(__name__)
             LOG.error("Failed to create script", error=str(e), exc_info=True)
             # Continue without script creation if it fails
 
@@ -436,9 +437,6 @@ async def generate_workflow_script(
                     block_description=block_description,
                 )
             except Exception as e:
-                import structlog
-
-                LOG = structlog.get_logger(__name__)
                 LOG.error("Failed to create script block", error=str(e), exc_info=True)
                 # Continue without script block creation if it fails
 
@@ -505,9 +503,6 @@ async def generate_workflow_script(
                 artifact_id=artifact_id,
             )
         except Exception as e:
-            import structlog
-
-            LOG = structlog.get_logger(__name__)
             LOG.error("Failed to create main script file", error=str(e), exc_info=True)
             # Continue without main script file creation if it fails
 
@@ -588,9 +583,6 @@ async def create_script_block(
 
     except Exception as e:
         # Log error but don't fail the entire generation process
-        import structlog
-
-        LOG = structlog.get_logger(__name__)
         LOG.error("Failed to create script block", error=str(e), exc_info=True)
         # For now, just log the error and continue
         # In production, you might want to handle this differently
