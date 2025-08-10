@@ -63,7 +63,9 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                 LOG.warning(f"Task {block.task_id} not found")
                 continue
             block_dump.update(task.model_dump())
-            actions = await app.DATABASE.get_task_actions(task_id=block.task_id, organization_id=organization_id)
+            actions = await app.DATABASE.get_task_actions_hydrated(
+                task_id=block.task_id, organization_id=organization_id
+            )
             action_dumps = []
             for action in actions:
                 action_dump = action.model_dump()

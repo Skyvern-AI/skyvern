@@ -35,44 +35,12 @@ async def create_script(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CreateScriptResponse:
     """Create a new script with optional files and metadata."""
-    organization_id = current_org.organization_id
-    LOG.info(
-        "Creating script",
-        organization_id=organization_id,
-        file_count=len(data.files) if data.files else 0,
+    return await script_service.create_script(
+        organization_id=current_org.organization_id,
+        workflow_id=data.workflow_id,
+        run_id=data.run_id,
+        files=data.files,
     )
-    if data.run_id:
-        if not await app.DATABASE.get_run(run_id=data.run_id, organization_id=organization_id):
-            raise HTTPException(status_code=404, detail=f"Run_id {data.run_id} not found")
-    try:
-        # Create the script in the database
-        script = await app.DATABASE.create_script(
-            organization_id=organization_id,
-            run_id=data.run_id,
-        )
-        # Process files if provided
-        file_tree = {}
-        file_count = 0
-        if data.files:
-            file_tree = await script_service.build_file_tree(
-                data.files,
-                organization_id=organization_id,
-                script_id=script.script_id,
-                script_version=script.version,
-                script_revision_id=script.script_revision_id,
-            )
-            file_count = len(data.files)
-        return CreateScriptResponse(
-            script_id=script.script_id,
-            version=script.version,
-            run_id=script.run_id,
-            file_count=file_count,
-            created_at=script.created_at,
-            file_tree=file_tree,
-        )
-    except Exception as e:
-        LOG.error("Failed to create script", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to create script")
 
 
 @base_router.get(

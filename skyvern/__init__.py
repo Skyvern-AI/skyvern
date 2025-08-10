@@ -23,14 +23,16 @@ setup_logger()
 
 from skyvern.forge import app  # noqa: E402, F401
 from skyvern.library import Skyvern  # noqa: E402
-from skyvern.core.code_generations.skyvern_page import RunContext, SkyvernPage  # noqa: E402
-from skyvern.core.code_generations.run_initializer import setup  # noqa: E402
-from skyvern.core.code_generations.workflow_wrappers import (  # noqa: E402
-    workflow,  # noqa: E402
-    task_block,  # noqa: E402
-    file_download_block,  # noqa: E402
+from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage  # noqa: E402
+from skyvern.core.script_generations.run_initializer import setup  # noqa: E402
+from skyvern.core.script_generations.workflow_wrappers import (  # noqa: E402
     email_block,  # noqa: E402
+    file_download_block,  # noqa: E402
+    navigation_block,  # noqa: E402
+    task_block,  # noqa: E402
+    url_block,  # noqa: E402
     wait_block,  # noqa: E402
+    workflow,  # noqa: E402
 )  # noqa: E402
 
 
@@ -38,10 +40,12 @@ __all__ = [
     "Skyvern",
     "SkyvernPage",
     "RunContext",
-    "setup",
-    "workflow",
-    "task_block",
-    "file_download_block",
     "email_block",
+    "file_download_block",
+    "navigation_block",
+    "setup",
+    "task_block",
+    "url_block",
     "wait_block",
+    "workflow",
 ]

@@ -16,14 +16,20 @@ Path("workflow.py").write_text(src)
 
 from __future__ import annotations
 
+import hashlib
 import keyword
 from enum import StrEnum
 from typing import Any
 
 import libcst as cst
+import structlog
 from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
+from skyvern.forge import app
 from skyvern.webeye.actions.action_types import ActionType
+
+LOG = structlog.get_logger(__name__)
+
 
 # --------------------------------------------------------------------- #
 # 1. helpers                                                            #
@@ -45,6 +51,12 @@ ACTION_MAP = {
     "wait": "wait",
     "extract": "extract",
 }
+ACTIONS_WITH_XPATH = [
+    "click",
+    "input_text",
+    "upload_file",
+    "select_option",
+]
 
 INDENT = " " * 4
 
@@ -130,6 +142,12 @@ def _make_decorator(block: dict[str, Any]) -> cst.Decorator:
         "send_email": "email_block",
         "wait": "wait_block",
         "navigation": "navigation_block",
+        "for_loop": "for_loop_block",
+        "action": "action_block",
+        "extraction": "extraction_block",
+        "login": "login_block",
+        "text_prompt": "text_prompt_block",
+        "goto_url": "url_block",
     }[bt]
 
     kwargs = []
@@ -177,17 +195,28 @@ def _action_to_stmt(act: dict[str, Any]) -> cst.BaseStatement:
     """
     method = ACTION_MAP[act["action_type"]]
 
-    args = [
-        cst.Arg(keyword=cst.Name("xpath"), value=_value(act["xpath"])),
-        cst.Arg(
-            keyword=cst.Name("intention"),
-            value=_value(act.get("intention") or act.get("reasoning") or ""),
-        ),
-        cst.Arg(
-            keyword=cst.Name("data"),
-            value=cst.Attribute(value=cst.Name("context"), attr=cst.Name("parameters")),
-        ),
-    ]
+    args: list[cst.Arg] = []
+    if method == "input_text":
+        args.append(cst.Arg(keyword=cst.Name("text"), value=_value(act["text"])))
+    elif method == "select_option":
+        args.append(cst.Arg(keyword=cst.Name("option"), value=_value(act["option"]["value"])))
+    elif method == "wait":
+        args.append(cst.Arg(keyword=cst.Name("seconds"), value=_value(act["seconds"])))
+
+    args.extend(
+        [
+            cst.Arg(
+                keyword=cst.Name("intention"),
+                value=_value(act.get("intention") or act.get("reasoning") or ""),
+            ),
+            cst.Arg(
+                keyword=cst.Name("data"),
+                value=cst.Attribute(value=cst.Name("context"), attr=cst.Name("parameters")),
+            ),
+        ]
+    )
+    if method in ACTIONS_WITH_XPATH:
+        args.append(cst.Arg(keyword=cst.Name("xpath"), value=_value(act["xpath"])))
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("page"), attr=cst.Name(method)),
@@ -209,7 +238,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
         body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
 
     for act in actions:
-        if act["action_type"] in [ActionType.COMPLETE]:
+        if act["action_type"] in [ActionType.COMPLETE, ActionType.TERMINATE, ActionType.NULL_ACTION]:
             continue
         body_stmts.append(_action_to_stmt(act))
 
@@ -329,19 +358,22 @@ def _build_run_fn(task_titles: list[str], wf_req: dict[str, Any]) -> FunctionDef
 # --------------------------------------------------------------------- #
 
 
-def generate_workflow_script(
+async def generate_workflow_script(
     *,
     file_name: str,
     workflow_run_request: dict[str, Any],
     workflow: dict[str, Any],
     tasks: list[dict[str, Any]],
     actions_by_task: dict[str, list[dict[str, Any]]],
+    organization_id: str | None = None,
+    run_id: str | None = None,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
     """
     # --- imports --------------------------------------------------------
     imports: list[cst.BaseStatement] = [
+        cst.SimpleStatementLine([cst.Import(names=[cst.ImportAlias(cst.Name("asyncio"))])]),
         cst.SimpleStatementLine([cst.Import(names=[cst.ImportAlias(cst.Name("pydantic"))])]),
         cst.SimpleStatementLine(
             [
@@ -372,8 +404,43 @@ def generate_workflow_script(
     # --- blocks ---------------------------------------------------------
     block_fns = []
     length_of_tasks = len(tasks)
+
+    # Create script first if organization_id is provided
+    script_id = None
+    script_revision_id = None
+    if organization_id:
+        try:
+            script = await app.DATABASE.create_script(
+                organization_id=organization_id,
+                run_id=run_id,
+            )
+            script_id = script.script_id
+            script_revision_id = script.script_revision_id
+        except Exception as e:
+            LOG.error("Failed to create script", error=str(e), exc_info=True)
+            # Continue without script creation if it fails
+
     for idx, task in enumerate(tasks):
-        block_fns.append(_build_block_fn(task, actions_by_task.get(task.get("task_id", ""), [])))
+        block_fn_def = _build_block_fn(task, actions_by_task.get(task.get("task_id", ""), []))
+
+        # Create script block if we have script context
+        if script_id and script_revision_id and organization_id:
+            try:
+                block_name = task.get("title") or task.get("label") or task.get("task_id") or f"task_{idx}"
+                block_description = f"Generated block for task: {block_name}"
+                await create_script_block(
+                    block_fn_def=block_fn_def,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_name=block_name,
+                    block_description=block_description,
+                )
+            except Exception as e:
+                LOG.error("Failed to create script block", error=str(e), exc_info=True)
+                # Continue without script block creation if it fails
+
+        block_fns.append(block_fn_def)
         if idx < length_of_tasks - 1:
             block_fns.append(cst.EmptyLine())
             block_fns.append(cst.EmptyLine())
@@ -400,8 +467,122 @@ def generate_workflow_script(
             cst.EmptyLine(),
             cst.EmptyLine(),
             run_fn,
+            cst.EmptyLine(),
+            cst.EmptyLine(),
+            cst.parse_statement("if __name__ == '__main__':\n    asyncio.run(run_workflow())"),
         ]
     )
+
+    # Create main script file if we have script context
+    if script_id and script_revision_id and organization_id:
+        try:
+            main_script_code = module.code
+            main_file_name = "main.py"
+            main_file_path = main_file_name
+
+            # Create artifact and upload to S3
+            artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                organization_id=organization_id,
+                script_id=script_id,
+                script_version=1,  # Assuming version 1 for now
+                file_path=main_file_path,
+                data=main_script_code.encode("utf-8"),
+            )
+
+            # Create script file record for main file
+            await app.DATABASE.create_script_file(
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                file_path=main_file_path,
+                file_name=main_file_name,
+                file_type="file",
+                content_hash=f"sha256:{hashlib.sha256(main_script_code.encode('utf-8')).hexdigest()}",
+                file_size=len(main_script_code.encode("utf-8")),
+                mime_type="text/x-python",
+                artifact_id=artifact_id,
+            )
+        except Exception as e:
+            LOG.error("Failed to create main script file", error=str(e), exc_info=True)
+            # Continue without main script file creation if it fails
+
     with open(file_name, "w") as f:
         f.write(module.code)
     return module.code
+
+
+async def create_script_block(
+    block_fn_def: FunctionDef,
+    script_revision_id: str,
+    script_id: str,
+    organization_id: str,
+    block_name: str,
+    block_description: str | None = None,
+) -> None:
+    """
+    Create a script block in the database and save the block code to a script file.
+
+    Args:
+        block_fn_def: The LibCST function definition to save
+        script_revision_id: The script revision ID
+        script_id: The script ID
+        organization_id: The organization ID
+        block_name: Optional custom name for the block (defaults to function name)
+        block_description: Optional description for the block
+    """
+    try:
+        # Step 1: Transform the block function definition to a string
+        block_code = block_fn_def.code
+
+        # Step 2: Use the function name as block name if not provided
+        if not block_name:
+            block_name = block_fn_def.name.value
+
+        # Step 3: Create script block in database
+        script_block = await app.DATABASE.create_script_block(
+            script_revision_id=script_revision_id,
+            script_id=script_id,
+            organization_id=organization_id,
+            script_block_label=block_name,
+        )
+
+        # Step 4: Create script file for the block
+        # Generate a unique filename for the block
+        file_name = f"{block_name}.skyvern"
+        file_path = f"blocks/{script_block.script_block_id}/{file_name}"
+
+        # Create artifact and upload to S3
+        artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+            organization_id=organization_id,
+            script_id=script_id,
+            script_version=1,  # Assuming version 1 for now
+            file_path=file_path,
+            data=block_code.encode("utf-8"),
+        )
+
+        # Create script file record
+        script_file = await app.DATABASE.create_script_file(
+            script_revision_id=script_revision_id,
+            script_id=script_id,
+            organization_id=organization_id,
+            file_path=file_path,
+            file_name=file_name,
+            file_type="file",
+            content_hash=f"sha256:{hashlib.sha256(block_code.encode('utf-8')).hexdigest()}",
+            file_size=len(block_code.encode("utf-8")),
+            mime_type="text/x-python",
+            artifact_id=artifact_id,
+        )
+
+        # update script block with script file id
+        await app.DATABASE.update_script_block(
+            script_block_id=script_block.script_block_id,
+            organization_id=organization_id,
+            script_file_id=script_file.script_file_id,
+        )
+
+    except Exception as e:
+        # Log error but don't fail the entire generation process
+        LOG.error("Failed to create script block", error=str(e), exc_info=True)
+        # For now, just log the error and continue
+        # In production, you might want to handle this differently

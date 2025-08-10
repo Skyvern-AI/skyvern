@@ -11,8 +11,8 @@ from jinja2.sandbox import SandboxedEnvironment
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
-from skyvern.core.code_generations.generate_code import generate_workflow_script as generate_python_workflow_script
-from skyvern.core.code_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
+from skyvern.core.script_generations.generate_script import generate_workflow_script as generate_python_workflow_script
+from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.exceptions import (
     BlockNotFound,
     BrowserSessionNotFound,
@@ -2287,7 +2287,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow.organization_id,
             )
-            python_src = generate_python_workflow_script(
+            python_src = await generate_python_workflow_script(
                 file_name=codegen_input.file_name,
                 workflow_run_request=codegen_input.workflow_run,
                 workflow=codegen_input.workflow,

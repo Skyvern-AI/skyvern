@@ -5,11 +5,11 @@ import subprocess
 from datetime import datetime
 
 import structlog
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 from skyvern.exceptions import ScriptNotFound
 from skyvern.forge import app
-from skyvern.schemas.scripts import FileNode, ScriptFileCreate
+from skyvern.schemas.scripts import CreateScriptResponse, FileNode, ScriptFileCreate
 
 LOG = structlog.get_logger(__name__)
 
@@ -94,6 +94,52 @@ async def build_file_tree(
         )
 
     return file_tree
+
+
+async def create_script(
+    organization_id: str,
+    workflow_id: str | None = None,
+    run_id: str | None = None,
+    files: list[ScriptFileCreate] | None = None,
+) -> CreateScriptResponse:
+    LOG.info(
+        "Creating script",
+        organization_id=organization_id,
+        file_count=len(files) if files else 0,
+    )
+
+    try:
+        if run_id and not await app.DATABASE.get_run(run_id=run_id, organization_id=organization_id):
+            raise HTTPException(status_code=404, detail=f"Run_id {run_id} not found")
+
+        script = await app.DATABASE.create_script(
+            organization_id=organization_id,
+            run_id=run_id,
+        )
+
+        file_tree: dict[str, FileNode] = {}
+        file_count = 0
+        if files:
+            file_tree = await build_file_tree(
+                files,
+                organization_id=organization_id,
+                script_id=script.script_id,
+                script_version=script.version,
+                script_revision_id=script.script_revision_id,
+            )
+            file_count = len(files)
+
+        return CreateScriptResponse(
+            script_id=script.script_id,
+            version=script.version,
+            run_id=script.run_id,
+            file_count=file_count,
+            created_at=script.created_at,
+            file_tree=file_tree,
+        )
+    except Exception as e:
+        LOG.error("Failed to create script", error=str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create script")
 
 
 async def execute_script(
