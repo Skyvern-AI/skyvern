@@ -80,7 +80,7 @@ class Workflow(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
-    use_cache: bool = False
+    generate_script: bool = False
     cache_key: str | None = None
 
     created_at: datetime

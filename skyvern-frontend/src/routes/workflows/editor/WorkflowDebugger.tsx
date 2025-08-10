@@ -170,7 +170,7 @@ function WorkflowDebugger() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
-    useScriptCache: workflow.use_cache,
+    useScriptCache: workflow.generate_script,
     scriptCacheKey: workflow.cache_key,
   };
 

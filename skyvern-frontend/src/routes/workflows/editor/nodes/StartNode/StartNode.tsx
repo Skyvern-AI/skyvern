@@ -137,7 +137,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                     <OrgWalled className="flex flex-col gap-4">
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
-                          <Label>Use Script Cache</Label>
+                          <Label>Generate Script</Label>
                           <HelpTooltip content="Generate & use cached scripts for faster execution." />
                           <Switch
                             className="ml-auto"
@@ -150,8 +150,8 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                       </div>
                       <div className="space-y-2">
                         <div className="flex gap-2">
-                          <Label>Script Cache Key</Label>
-                          <HelpTooltip content="A templated name, comprised of one or more of your parameters, that defines the key for your script cache." />
+                          <Label>Script Key</Label>
+                          <HelpTooltip content="A constant string or templated name, comprised of one or more of your parameters. It's the uinique key for a workflow script." />
                         </div>
                         <Input
                           value={inputs.scriptCacheKey ?? ""}

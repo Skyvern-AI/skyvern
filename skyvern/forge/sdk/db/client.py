@@ -1363,7 +1363,7 @@ class AgentDB:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
-        use_cache: bool = False,
+        generate_script: bool = False,
         cache_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
@@ -1382,7 +1382,7 @@ class AgentDB:
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
-                use_cache=use_cache,
+                generate_script=generate_script,
                 cache_key=cache_key,
             )
             if workflow_permanent_id:
@@ -1562,7 +1562,7 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
-        use_cache: bool | None = None,
+        generate_script: bool | None = None,
         cache_key: str | None = None,
     ) -> Workflow:
         try:
@@ -1581,8 +1581,8 @@ class AgentDB:
                         workflow.workflow_definition = workflow_definition
                     if version is not None:
                         workflow.version = version
-                    if use_cache is not None:
-                        workflow.use_cache = use_cache
+                    if generate_script is not None:
+                        workflow.generate_script = generate_script
                     if cache_key is not None:
                         workflow.cache_key = cache_key
                     await session.commit()
