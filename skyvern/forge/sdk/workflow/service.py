@@ -621,8 +621,8 @@ class WorkflowService:
             organization_id=organization_id,
         )
 
-        # TODO: generate script for workflow if the workflow.use_cache is True AND there's no script cached for the workflow
-        if workflow.use_cache:
+        # TODO: generate script for workflow if the workflow.generate_script is True AND there's no script cached for the workflow
+        if workflow.generate_script:
             await self.generate_script_for_workflow(workflow=workflow, workflow_run=workflow_run)
 
         return workflow_run
@@ -645,7 +645,7 @@ class WorkflowService:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         extra_http_headers: dict[str, str] | None = None,
-        use_cache: bool = False,
+        generate_script: bool = False,
         cache_key: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
@@ -665,7 +665,7 @@ class WorkflowService:
             is_saved_task=is_saved_task,
             status=status,
             extra_http_headers=extra_http_headers,
-            use_cache=use_cache,
+            generate_script=generate_script,
             cache_key=cache_key,
         )
 
@@ -1548,7 +1548,7 @@ class WorkflowService:
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
-                    use_cache=request.use_cache,
+                    generate_script=request.generate_script,
                     cache_key=request.cache_key,
                 )
             else:
@@ -1567,7 +1567,7 @@ class WorkflowService:
                     extra_http_headers=request.extra_http_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
-                    use_cache=request.use_cache,
+                    generate_script=request.generate_script,
                     cache_key=request.cache_key,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process

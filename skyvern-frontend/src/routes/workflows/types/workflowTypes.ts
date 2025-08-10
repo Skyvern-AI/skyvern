@@ -504,7 +504,7 @@ export type WorkflowApiResponse = {
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  use_cache: boolean;
+  generate_script: boolean;
   cache_key: string | null;
 };
 
