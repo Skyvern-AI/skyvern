@@ -151,7 +151,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                       <div className="space-y-2">
                         <div className="flex gap-2">
                           <Label>Script Key</Label>
-                          <HelpTooltip content="A constant string or templated name, comprised of one or more of your parameters. It's the uinique key for a workflow script." />
+                          <HelpTooltip content="A constant string or templated name, comprised of one or more of your parameters. It's the unique key for a workflow script." />
                         </div>
                         <Input
                           value={inputs.scriptCacheKey ?? ""}
