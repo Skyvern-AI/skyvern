@@ -10525,9 +10525,9 @@
             "$ref": "#/components/schemas/WorkflowStatus",
             "default": "published"
           },
-          "generate_script": {
+          "use_cache": {
             "type": "boolean",
-            "title": "Generate Script",
+            "title": "Use Cache",
             "default": false
           },
           "cache_project_id": {

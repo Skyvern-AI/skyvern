@@ -621,7 +621,7 @@ class WorkflowService:
             organization_id=organization_id,
         )
 
-        # TODO: generate script for workflow if the workflow.generate_script is True AND there's no script cached for the workflow
+        # generate script for workflow if the workflow.generate_script is True AND there's no script cached for the workflow
         if workflow.generate_script:
             await self.generate_script_for_workflow(workflow=workflow, workflow_run=workflow_run)
 
@@ -2334,5 +2334,3 @@ class WorkflowService:
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
         )
-
-        return
