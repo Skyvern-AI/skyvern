@@ -137,3 +137,12 @@ class ScriptBlock(BaseModel):
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+
+
+class ScriptBlocksResponse(BaseModel):
+    blocks: dict[str, str]
+
+
+class ScriptBlocksRequest(BaseModel):
+    cache_key_value: str
+    cache_key: str | None = None

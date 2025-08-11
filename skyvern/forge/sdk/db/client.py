@@ -3819,6 +3819,24 @@ class AgentDB:
             ).all()
             return [convert_to_script_file(script_file) for script_file in script_files]
 
+    async def get_script_file_by_id(
+        self,
+        script_revision_id: str,
+        file_id: str,
+        organization_id: str,
+    ) -> ScriptFile | None:
+        async with self.Session() as session:
+            script_file = (
+                await session.scalars(
+                    select(ScriptFileModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(file_id=file_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+
+            return convert_to_script_file(script_file) if script_file else None
+
     async def get_script_block(
         self,
         script_block_id: str,
@@ -3887,6 +3905,7 @@ class AgentDB:
         organization_id: str,
         workflow_permanent_id: str,
         cache_key_value: str,
+        cache_key: str | None = None,
     ) -> list[Script]:
         """Get latest script versions linked to a workflow by a specific cache_key_value."""
         try:
@@ -3899,6 +3918,9 @@ class AgentDB:
                     .where(WorkflowScriptModel.cache_key_value == cache_key_value)
                     .where(WorkflowScriptModel.deleted_at.is_(None))
                 )
+
+                if cache_key:
+                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
 
                 # Latest version per script_id within the org and not deleted
                 latest_versions_subquery = (
