@@ -24,6 +24,8 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
+import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -47,9 +49,15 @@ function WorkflowDebugger() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
+  const blockScriptStore = useBlockScriptStore();
 
   const { data: workflowRun } = useWorkflowRunQuery();
+
   const { data: workflow } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+
+  const { data: blockScripts } = useBlockScriptsQuery({
     workflowPermanentId,
   });
 
@@ -79,6 +87,11 @@ function WorkflowDebugger() {
       setShouldFetchDebugSession(true);
     }
   });
+
+  useEffect(() => {
+    blockScriptStore.setScripts(blockScripts ?? {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blockScripts]);
 
   const afterCycleBrowser = () => {
     setOpenDialogue(false);

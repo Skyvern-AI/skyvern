@@ -1,4 +1,7 @@
+import { useEffect } from "react";
 import { useMountEffect } from "@/hooks/useMountEffect";
+import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useSidebarStore } from "@/store/SidebarStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { ReactFlowProvider } from "@xyflow/react";
@@ -17,6 +20,7 @@ function WorkflowEditor() {
     return state.setCollapsed;
   });
   const workflowChangesStore = useWorkflowHasChangesStore();
+  const blockScriptStore = useBlockScriptStore();
 
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -25,10 +29,19 @@ function WorkflowEditor() {
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
 
+  const { data: blockScripts } = useBlockScriptsQuery({
+    workflowPermanentId,
+  });
+
   useMountEffect(() => {
     setCollapsed(true);
     workflowChangesStore.setHasChanges(false);
   });
+
+  useEffect(() => {
+    blockScriptStore.setScripts(blockScripts ?? {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blockScripts]);
 
   if (isLoading || isGlobalWorkflowsLoading) {
     return (

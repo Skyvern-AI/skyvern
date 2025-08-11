@@ -7,6 +7,7 @@ export type NodeBaseData = {
   continueOnFailure: boolean;
   editable: boolean;
   model: WorkflowModel | null;
+  showCode?: boolean;
 };
 
 export const errorMappingExampleValue = {

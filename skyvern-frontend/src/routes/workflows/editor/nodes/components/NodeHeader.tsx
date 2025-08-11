@@ -12,6 +12,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
@@ -145,6 +146,7 @@ function NodeHeader({
   });
   const blockTitle = workflowBlockTitle[type];
   const deleteNodeCallback = useDeleteNodeCallback();
+  const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -411,6 +413,9 @@ function NodeHeader({
                   onDelete={() => {
                     deleteNodeCallback(nodeId);
                   }}
+                  onShowScript={() =>
+                    toggleScriptForNodeCallback({ id: nodeId, show: true })
+                  }
                 />
               </div>
             </div>
