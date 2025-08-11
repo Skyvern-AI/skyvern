@@ -367,6 +367,8 @@ async def generate_workflow_script(
     actions_by_task: dict[str, list[dict[str, Any]]],
     organization_id: str | None = None,
     run_id: str | None = None,
+    script_id: str | None = None,
+    script_revision_id: str | None = None,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
@@ -406,20 +408,6 @@ async def generate_workflow_script(
     length_of_tasks = len(tasks)
 
     # Create script first if organization_id is provided
-    script_id = None
-    script_revision_id = None
-    if organization_id:
-        try:
-            script = await app.DATABASE.create_script(
-                organization_id=organization_id,
-                run_id=run_id,
-            )
-            script_id = script.script_id
-            script_revision_id = script.script_revision_id
-        except Exception as e:
-            LOG.error("Failed to create script", error=str(e), exc_info=True)
-            # Continue without script creation if it fails
-
     for idx, task in enumerate(tasks):
         block_fn_def = _build_block_fn(task, actions_by_task.get(task.get("task_id", ""), []))
 
@@ -473,39 +461,6 @@ async def generate_workflow_script(
         ]
     )
 
-    # Create main script file if we have script context
-    if script_id and script_revision_id and organization_id:
-        try:
-            main_script_code = module.code
-            main_file_name = "main.py"
-            main_file_path = main_file_name
-
-            # Create artifact and upload to S3
-            artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
-                organization_id=organization_id,
-                script_id=script_id,
-                script_version=1,  # Assuming version 1 for now
-                file_path=main_file_path,
-                data=main_script_code.encode("utf-8"),
-            )
-
-            # Create script file record for main file
-            await app.DATABASE.create_script_file(
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                file_path=main_file_path,
-                file_name=main_file_name,
-                file_type="file",
-                content_hash=f"sha256:{hashlib.sha256(main_script_code.encode('utf-8')).hexdigest()}",
-                file_size=len(main_script_code.encode("utf-8")),
-                mime_type="text/x-python",
-                artifact_id=artifact_id,
-            )
-        except Exception as e:
-            LOG.error("Failed to create main script file", error=str(e), exc_info=True)
-            # Continue without main script file creation if it fails
-
     with open(file_name, "w") as f:
         f.write(module.code)
     return module.code
@@ -532,11 +487,9 @@ async def create_script_block(
     """
     try:
         # Step 1: Transform the block function definition to a string
-        block_code = block_fn_def.code
-
-        # Step 2: Use the function name as block name if not provided
-        if not block_name:
-            block_name = block_fn_def.name.value
+        # Create a temporary module to convert FunctionDef to source code
+        temp_module = cst.Module(body=[block_fn_def])
+        block_code = temp_module.code
 
         # Step 3: Create script block in database
         script_block = await app.DATABASE.create_script_block(
@@ -578,7 +531,7 @@ async def create_script_block(
         await app.DATABASE.update_script_block(
             script_block_id=script_block.script_block_id,
             organization_id=organization_id,
-            script_file_id=script_file.script_file_id,
+            script_file_id=script_file.file_id,
         )
 
     except Exception as e:

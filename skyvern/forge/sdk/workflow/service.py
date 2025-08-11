@@ -623,6 +623,12 @@ class WorkflowService:
 
         # generate script for workflow if the workflow.generate_script is True AND there's no script cached for the workflow
         if workflow.generate_script:
+            LOG.info(
+                "Generating script for workflow",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                workflow_name=workflow.title,
+            )
             await self.generate_script_for_workflow(workflow=workflow, workflow_run=workflow_run)
 
         return workflow_run
@@ -2278,11 +2284,24 @@ class WorkflowService:
                 "Found cached script for workflow",
                 workflow_id=workflow.workflow_id,
                 cache_key_value=rendered_cache_key_value,
+                workflow_run_id=workflow_run.workflow_run_id,
             )
             return
 
+        created_script = await app.DATABASE.create_script(
+            organization_id=workflow.organization_id,
+            run_id=workflow_run.workflow_run_id,
+        )
+
         # 3) Generate script code from workflow run
         try:
+            LOG.info(
+                "Generating script for workflow",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                workflow_name=workflow.title,
+                cache_key_value=rendered_cache_key_value,
+            )
             codegen_input = await transform_workflow_run_to_code_gen_input(
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow.organization_id,
@@ -2293,6 +2312,9 @@ class WorkflowService:
                 workflow=codegen_input.workflow,
                 tasks=codegen_input.workflow_blocks,
                 actions_by_task=codegen_input.actions_by_task,
+                organization_id=workflow.organization_id,
+                script_id=created_script.script_id,
+                script_revision_id=created_script.script_revision_id,
             )
         except Exception:
             LOG.error("Failed to generate workflow script source", exc_info=True)
@@ -2310,24 +2332,19 @@ class WorkflowService:
             )
         ]
 
-        created = await app.DATABASE.create_script(
-            organization_id=workflow.organization_id,
-            run_id=workflow_run.workflow_run_id,
-        )
-
         # Upload script file(s) as artifacts and create rows
         await script_service.build_file_tree(
             files=files,
             organization_id=workflow.organization_id,
-            script_id=created.script_id,
-            script_version=created.version,
-            script_revision_id=created.script_revision_id,
+            script_id=created_script.script_id,
+            script_version=created_script.version,
+            script_revision_id=created_script.script_revision_id,
         )
 
         # Record the workflow->script mapping for cache lookup
         await app.DATABASE.create_workflow_script(
             organization_id=workflow.organization_id,
-            script_id=created.script_id,
+            script_id=created_script.script_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key=cache_key or "",
             cache_key_value=rendered_cache_key_value,
