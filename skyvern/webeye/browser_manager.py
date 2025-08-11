@@ -92,7 +92,6 @@ class BrowserManager:
                     "Browser state not found in persistent sessions manager",
                     browser_session_id=browser_session_id,
                 )
-                raise MissingBrowserState(task_id=task.task_id)
             else:
                 if task.organization_id:
                     LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
@@ -113,6 +112,12 @@ class BrowserManager:
                 organization_id=task.organization_id,
                 extra_http_headers=task.extra_http_headers,
             )
+
+            if browser_session_id:
+                await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
+                    browser_session_id,
+                    browser_state,
+                )
 
         self.pages[task.task_id] = browser_state
         if task.workflow_run_id:
@@ -160,7 +165,6 @@ class BrowserManager:
                 LOG.warning(
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
                 )
-                raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
                 page = await browser_state.get_working_page()
@@ -182,6 +186,12 @@ class BrowserManager:
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
             )
+
+            if browser_session_id:
+                await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
+                    browser_session_id,
+                    browser_state,
+                )
 
         self.pages[workflow_run_id] = browser_state
         if parent_workflow_run_id:
