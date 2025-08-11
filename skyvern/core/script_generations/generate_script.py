@@ -502,7 +502,7 @@ async def create_script_block(
         # Step 4: Create script file for the block
         # Generate a unique filename for the block
         file_name = f"{block_name}.skyvern"
-        file_path = f"blocks/{script_block.script_block_id}/{file_name}"
+        file_path = f"blocks/{file_name}"
 
         # Create artifact and upload to S3
         artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
