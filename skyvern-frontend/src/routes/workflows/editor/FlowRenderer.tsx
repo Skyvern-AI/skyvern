@@ -10,7 +10,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { useOnChange } from "@/hooks/useOnChange";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
-import { DeleteNodeCallbackContext } from "@/store/DeleteNodeCallbackContext";
+import { BlockActionContext } from "@/store/BlockActionContext";
 import { useDebugStore } from "@/store/useDebugStore";
 import {
   useWorkflowHasChangesStore,
@@ -543,6 +543,37 @@ function FlowRenderer({
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
+  function toggleScript({
+    id,
+    label,
+    show,
+  }: {
+    id?: string;
+    label?: string;
+    show: boolean;
+  }) {
+    if (id) {
+      const node = nodes.find((node) => node.id === id);
+      if (!node || !isWorkflowBlockNode(node)) {
+        return;
+      }
+
+      node.data.showCode = show;
+    } else if (label) {
+      const node = nodes.find(
+        (node) => "label" in node.data && node.data.label === label,
+      );
+
+      if (!node || !isWorkflowBlockNode(node)) {
+        return;
+      }
+
+      node.data.showCode = show;
+    }
+
+    doLayout(nodes, edges);
+  }
+
   const editorElementRef = useRef<HTMLDivElement>(null);
 
   useAutoPan(editorElementRef, nodes);
@@ -642,7 +673,12 @@ function FlowRenderer({
       <WorkflowParametersStateContext.Provider
         value={[parameters, setParameters]}
       >
-        <DeleteNodeCallbackContext.Provider value={deleteNode}>
+        <BlockActionContext.Provider
+          value={{
+            deleteNodeCallback: deleteNode,
+            toggleScriptForNodeCallback: toggleScript,
+          }}
+        >
           <ReactFlow
             ref={editorElementRef}
             nodes={nodes}
@@ -772,7 +808,7 @@ function FlowRenderer({
               </Panel>
             )}
           </ReactFlow>
-        </DeleteNodeCallbackContext.Provider>
+        </BlockActionContext.Provider>
       </WorkflowParametersStateContext.Provider>
     </>
   );
