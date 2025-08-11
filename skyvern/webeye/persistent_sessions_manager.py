@@ -223,6 +223,10 @@ class PersistentSessionsManager:
         browser_session = self._browser_sessions.get(session_id)
         return browser_session.browser_state if browser_session else None
 
+    async def set_browser_state(self, session_id: str, browser_state: BrowserState) -> None:
+        browser_session = BrowserSession(browser_state=browser_state)
+        self._browser_sessions[session_id] = browser_session
+
     async def get_session(self, session_id: str, organization_id: str) -> PersistentBrowserSession | None:
         """Get a specific browser session by session ID."""
         return await self.database.get_persistent_browser_session(session_id, organization_id)
