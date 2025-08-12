@@ -1,12 +1,6 @@
 import { Textarea } from "@/components/ui/textarea";
 import type { ChangeEventHandler, HTMLAttributes } from "react";
-import {
-  forwardRef,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useCallback,
-} from "react";
+import { forwardRef, useEffect, useRef, useCallback } from "react";
 import { cn } from "@/util/utils";
 
 type Props = {
@@ -48,14 +42,6 @@ const AutoResizingTextarea = forwardRef<HTMLTextAreaElement, Props>(
         forwardedRef.current = element;
       }
     };
-
-    useLayoutEffect(() => {
-      const textareaElement = getTextarea();
-      if (!textareaElement) {
-        return;
-      }
-      textareaElement.style.height = `${textareaElement.scrollHeight + 2}px`;
-    }, [getTextarea]);
 
     useEffect(() => {
       const textareaElement = getTextarea();
