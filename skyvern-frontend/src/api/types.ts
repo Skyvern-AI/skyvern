@@ -386,6 +386,7 @@ export type Createv2TaskRequest = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
+  totp_type: "authenticator" | "email" | "text" | "none";
 };
 
 export type CreditCardCredentialApiResponse = {
@@ -422,6 +423,7 @@ export type PasswordCredential = {
   username: string;
   password: string;
   totp: string | null;
+  totp_type: "authenticator" | "email" | "text" | "none";
 };
 
 export type CreditCardCredential = {
