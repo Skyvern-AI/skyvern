@@ -715,14 +715,13 @@ function FlowRenderer({
                 workflowChangesStore.setHasChanges(true);
               }
 
-              // prevent cascading React updates
-              if (onNodesChangeTimeoutRef.current) {
-                clearTimeout(onNodesChangeTimeoutRef.current);
-              }
-
-              onNodesChangeTimeoutRef.current = setTimeout(() => {
+              // throttle onNodesChange to prevent cascading React updates
+              if (onNodesChangeTimeoutRef.current === null) {
                 onNodesChange(changes);
-              }, 0); // defer to next tick
+                onNodesChangeTimeoutRef.current = setTimeout(() => {
+                  onNodesChangeTimeoutRef.current = null;
+                }, 33); // ~30fps throttle
+              }
             }}
             onEdgesChange={onEdgesChange}
             nodeTypes={nodeTypes}
