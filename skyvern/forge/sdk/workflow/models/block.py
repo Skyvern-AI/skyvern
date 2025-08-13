@@ -2451,6 +2451,7 @@ class FileParserBlock(Block):
     def _detect_file_type_from_url(self, file_url: str) -> FileType:
         """Detect file type based on file extension in the URL."""
         url_parsed = urlparse(file_url)
+        # TODO: use filetype.guess(file_path) to make the detection more robust
         suffix = Path(url_parsed.path).suffix.lower()
         if suffix in (".xlsx", ".xls", ".xlsm"):
             return FileType.EXCEL
