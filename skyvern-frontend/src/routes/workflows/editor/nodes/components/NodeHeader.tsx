@@ -17,6 +17,7 @@ import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQu
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   debuggableWorkflowBlockTypes,
+  scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
   type WorkflowApiResponse,
 } from "@/routes/workflows/types/workflowTypes";
@@ -154,6 +155,7 @@ function NodeHeader({
   const queryClient = useQueryClient();
   const location = useLocation();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
+  const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -414,6 +416,7 @@ function NodeHeader({
                 })}
               >
                 <NodeActionMenu
+                  isScriptable={isScriptable}
                   onDelete={() => {
                     deleteNodeCallback(nodeId);
                   }}
