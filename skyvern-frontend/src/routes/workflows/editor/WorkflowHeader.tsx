@@ -29,6 +29,7 @@ type Props = {
   parametersPanelOpen: boolean;
   onParametersClick: () => void;
   onSave: () => void;
+  onRun?: () => void;
   saving: boolean;
 };
 
@@ -37,6 +38,7 @@ function WorkflowHeader({
   parametersPanelOpen,
   onParametersClick,
   onSave,
+  onRun,
   saving,
 }: Props) {
   const { title, setTitle } = useWorkflowTitleStore();
@@ -148,6 +150,7 @@ function WorkflowHeader({
             <Button
               size="lg"
               onClick={() => {
+                onRun?.();
                 navigate(`/workflows/${workflowPermanentId}/run`);
               }}
             >

@@ -7,9 +7,9 @@ import {
   MagnifyingGlassIcon,
 } from "@radix-ui/react-icons";
 import { WorkflowBlockTypes } from "../../types/workflowTypes";
-import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
+import { AddNodeProps } from "../Workspace";
 import { Input } from "@/components/ui/input";
 
 const enableCodeBlock =
@@ -243,11 +243,16 @@ const nodeLibraryItems: Array<{
 ];
 
 type Props = {
+  onMouseDownCapture?: () => void;
   onNodeClick: (props: AddNodeProps) => void;
   first?: boolean;
 };
 
-function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
+function WorkflowNodeLibraryPanel({
+  onMouseDownCapture,
+  onNodeClick,
+  first,
+}: Props) {
   const workflowPanelData = useWorkflowPanelStore(
     (state) => state.workflowPanelState.data,
   );
@@ -311,7 +316,10 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
   });
 
   return (
-    <div className="w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
+    <div
+      className="w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
+      onMouseDownCapture={() => onMouseDownCapture?.()}
+    >
       <div className="space-y-4">
         <header className="space-y-2">
           <div className="flex justify-between">

@@ -36,7 +36,11 @@ import { getLabelForWorkflowParameterType } from "../workflowEditorUtils";
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
 
-function WorkflowParametersPanel() {
+interface Props {
+  onMouseDownCapture?: () => void;
+}
+
+function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
   const setHasChanges = useWorkflowHasChangesStore(
     (state) => state.setHasChanges,
   );
@@ -56,7 +60,10 @@ function WorkflowParametersPanel() {
   const { setNodes } = useReactFlow();
 
   return (
-    <div className="relative w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
+    <div
+      className="relative z-10 w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
+      onMouseDownCapture={() => onMouseDownCapture?.()}
+    >
       <div className="space-y-4">
         <header>
           <h1 className="text-lg">Parameters</h1>

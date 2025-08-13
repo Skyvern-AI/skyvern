@@ -158,6 +158,8 @@ function FloatingWindow({
   zIndex,
   // --
   onCycle,
+  onFocus,
+  onBlur,
   onInteract,
 }: {
   bounded?: boolean;
@@ -172,9 +174,11 @@ function FloatingWindow({
   showPowerButton?: boolean;
   showReloadButton?: boolean;
   title: string;
-  zIndex?: string;
+  zIndex?: number;
   // --
   onCycle?: () => void;
+  onFocus?: () => void;
+  onBlur?: () => void;
   onInteract?: () => void;
 }) {
   const [reloadKey, setReloadKey] = useState(0);
@@ -217,6 +221,7 @@ function FloatingWindow({
       }
     | undefined
   >(undefined);
+  const hasInitialized = useRef(false);
 
   const os = getOs();
 
@@ -284,9 +289,10 @@ function FloatingWindow({
   );
 
   useEffect(() => {
-    if (!initialWidth || !initialHeight) {
+    if (hasInitialized.current || !initialWidth || !initialHeight) {
       return;
     }
+    hasInitialized.current = true;
     setSize({
       left: initialPosition?.x ?? 0,
       top: initialPosition?.y ?? 0,
@@ -533,6 +539,16 @@ function FloatingWindow({
           className={cn("border-2 border-gray-700", {
             "hover:border-slate-500": !isMaximized,
           })}
+          handleStyles={{
+            bottomLeft: {
+              width: "40px",
+              height: "40px",
+            },
+            bottomRight: {
+              width: "40px",
+              height: "40px",
+            },
+          }}
           minHeight={Constants.MinHeight}
           minWidth={Constants.MinWidth}
           // TODO: turn back on; turning off clears a resize bug atm
@@ -556,6 +572,7 @@ function FloatingWindow({
               return;
             }
 
+            onFocus?.();
             setIsMinimized(false);
             setIsResizing(true);
             setDragStartSize({ ...size, left: position.x, top: position.y });
@@ -565,6 +582,7 @@ function FloatingWindow({
               return;
             }
 
+            onFocus?.();
             onResize({ delta, direction, size });
           }}
           onResizeStop={() => {
@@ -581,7 +599,8 @@ function FloatingWindow({
           <div
             ref={resizableRef}
             key={reloadKey}
-            className="my-window"
+            className="my-window focus:outline-none"
+            tabIndex={-1}
             style={{
               pointerEvents: "auto",
               padding: "0px",
@@ -590,7 +609,12 @@ function FloatingWindow({
               display: "flex",
               flexDirection: "column",
             }}
-            onMouseDownCapture={() => onInteract?.()}
+            onFocus={onFocus}
+            onBlur={onBlur}
+            onMouseDownCapture={(e) => {
+              onInteract?.();
+              e.currentTarget.focus();
+            }}
             onDoubleClick={() => {
               toggleMaximized();
             }}
