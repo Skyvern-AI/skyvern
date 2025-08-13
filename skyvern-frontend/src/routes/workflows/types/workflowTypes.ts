@@ -228,6 +228,17 @@ export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "validation",
 ]);
 
+export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
+  "action",
+  "extraction",
+  "file_download",
+  "goto_url",
+  "login",
+  "navigation",
+  "task",
+  "validation",
+]);
+
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
 }): boolean {
