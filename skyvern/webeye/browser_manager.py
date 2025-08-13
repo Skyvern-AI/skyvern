@@ -30,6 +30,7 @@ class BrowserManager:
         url: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
     ) -> BrowserState:
@@ -44,6 +45,7 @@ class BrowserManager:
             url=url,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
+            script_id=script_id,
             organization_id=organization_id,
             extra_http_headers=extra_http_headers,
         )
@@ -377,3 +379,50 @@ class BrowserManager:
                 )
 
         return browser_state_to_close
+
+    async def get_or_create_for_script(
+        self,
+        script_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState:
+        browser_state = await self.get_for_script(script_id=script_id)
+        if browser_state:
+            return browser_state
+
+        if browser_session_id:
+            LOG.info(
+                "Getting browser state for script",
+                browser_session_id=browser_session_id,
+            )
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                browser_session_id, organization_id=script_id
+            )
+            if browser_state is None:
+                LOG.warning(
+                    "Browser state not found in persistent sessions manager",
+                    browser_session_id=browser_session_id,
+                )
+            else:
+                page = await browser_state.get_working_page()
+                if not page:
+                    LOG.warning("Browser state has no page to run the script", script_id=script_id)
+        proxy_location = ProxyLocation.RESIDENTIAL
+        if not browser_state:
+            browser_state = await self._create_browser_state(
+                proxy_location=proxy_location,
+                script_id=script_id,
+            )
+
+        if script_id:
+            self.pages[script_id] = browser_state
+        await browser_state.get_or_create_page(
+            proxy_location=proxy_location,
+            script_id=script_id,
+        )
+
+        return browser_state
+
+    async def get_for_script(self, script_id: str | None = None) -> BrowserState | None:
+        if script_id and script_id in self.pages:
+            return self.pages[script_id]
+        return None

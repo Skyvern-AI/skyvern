@@ -626,6 +626,7 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
     ) -> None:
@@ -772,6 +773,7 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
     ) -> Page:
@@ -785,6 +787,7 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
             )
@@ -800,6 +803,7 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
             )
@@ -814,6 +818,7 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
             )

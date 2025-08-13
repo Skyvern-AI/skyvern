@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Callable, Literal
 
 from playwright.async_api import Page
 
 from skyvern.config import settings
+from skyvern.forge import app
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
 
 class Driver(StrEnum):
@@ -45,15 +51,36 @@ class SkyvernPage:
 
     def __init__(
         self,
+        scraped_page: ScrapedPage,
         page: Page,
-        driver: Driver = Driver.PLAYWRIGHT,
         *,
         recorder: Callable[[ActionCall], None] | None = None,
         # generate_response: bool = False,
     ):
-        self.driver = driver
-        self.page = page  # e.g. Playwright's Page
+        self.scraped_page = scraped_page
+        self.page = page
         self._record = recorder or (lambda ac: None)
+
+    @classmethod
+    async def create(cls) -> SkyvernPage:
+        # set up skyvern context if not already set
+        current_skyvern_context = skyvern_context.current()
+        if not current_skyvern_context:
+            skyvern_context.set(skyvern_context.SkyvernContext())
+
+        # initialize browser state
+        browser_state = await app.BROWSER_MANAGER.get_or_create_for_script()
+        scraped_page = await scrape_website(
+            browser_state=browser_state,
+            url="",
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+            scrape_exclude=app.scrape_exclude,
+            max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
+            draw_boxes=True,
+            scroll=True,
+        )
+        page = await scraped_page._browser_state.must_get_working_page()
+        return cls(scraped_page=scraped_page, page=page)
 
     @staticmethod
     def action_wrap(
@@ -97,32 +124,47 @@ class SkyvernPage:
     ######### Public Interfaces #########
     @action_wrap(ActionType.CLICK)
     async def click(self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
-        # if self.generate_response:
-        #     # TODO: get element tree
-        #     # generate click action based on the current html
-        #     single_click_prompt = prompt_engine.load_prompt(
-        #         template="single-click-action",
-        #         navigation_goal=intention,
-        #         navigation_payload_str=data,
-        #         current_url=self.page.url,
-        #         elements=element_tree,
-        #         local_datetime=datetime.now(context.tz_info).isoformat(),
-        #         user_context=context.prompt,
-        #     )
-        #     json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
-        #         prompt=single_click_prompt,
-        #         prompt_name="single-click-action",
-        #         step=step,
-        #     )
-        #     click_actions = parse_actions(new_task, step.step_id, step.order, scraped_page, json_response["actions"])
-        #     if not click_actions:
-        #         raise CachedActionPlanError("No click actions to execute")
-        #     for click_action in click_actions:
-        #         await _handle_action(
-        #             click_action, step, new_task, scraped_page, current_page, detailed_output, browser_state, engine
-        #         )
+        """Click an element identified by ``xpath``.
 
-        locator = self.page.locator(f"xpath={xpath}")
+        When ``intention`` and ``data`` are provided a new click action is
+        generated via the ``single-click-action`` prompt.  The model returns a
+        fresh xpath based on the current DOM and the updated data for this run.
+        The browser then clicks the element using this newly generated xpath.
+
+        If the prompt generation or parsing fails for any reason we fall back to
+        clicking the originally supplied ``xpath``.
+        """
+
+        new_xpath = xpath
+
+        if intention and data:
+            try:
+                # Build the element tree of the current page for the prompt
+                context = skyvern_context.ensure_context()
+                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+                element_tree = refreshed_page.build_element_tree()
+                single_click_prompt = prompt_engine.load_prompt(
+                    template="single-click-action",
+                    navigation_goal=intention,
+                    navigation_payload_str=payload_str,
+                    current_url=self.page.url,
+                    elements=element_tree,
+                    local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+                    user_context=getattr(context, "prompt", None),
+                )
+                json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
+                    prompt=single_click_prompt,
+                    prompt_name="single-click-action",
+                )
+                actions = json_response.get("actions", [])
+                if actions:
+                    new_xpath = actions[0].get("xpath", xpath) or xpath
+            except Exception:
+                # If anything goes wrong, fall back to the original xpath
+                new_xpath = xpath
+
+        locator = self.page.locator(f"xpath={new_xpath}")
         await locator.click(timeout=5000)
 
     @action_wrap(ActionType.INPUT_TEXT)
