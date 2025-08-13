@@ -17,11 +17,13 @@ import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQu
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   debuggableWorkflowBlockTypes,
+  scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
   type WorkflowApiResponse,
 } from "@/routes/workflows/types/workflowTypes";
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import {
   useWorkflowSettingsStore,
@@ -135,6 +137,7 @@ function NodeHeader({
     workflowRunId,
   } = useParams();
   const debugStore = useDebugStore();
+  const { closeWorkflowPanel } = useWorkflowPanelStore();
   const thisBlockIsPlaying =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
   const anyBlockIsPlaying =
@@ -152,6 +155,7 @@ function NodeHeader({
   const queryClient = useQueryClient();
   const location = useLocation();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
+  const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -194,6 +198,8 @@ function NodeHeader({
 
   const runBlock = useMutation({
     mutationFn: async () => {
+      closeWorkflowPanel();
+
       await saveWorkflow.mutateAsync();
 
       if (!workflowPermanentId) {
@@ -410,6 +416,7 @@ function NodeHeader({
                 })}
               >
                 <NodeActionMenu
+                  isScriptable={isScriptable}
                   onDelete={() => {
                     deleteNodeCallback(nodeId);
                   }}
