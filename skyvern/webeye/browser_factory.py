@@ -642,6 +642,7 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
             )
