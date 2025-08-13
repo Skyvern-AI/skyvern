@@ -1,26 +1,15 @@
-import { useEffect } from "react";
-import { useMountEffect } from "@/hooks/useMountEffect";
-import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
-import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import { useSidebarStore } from "@/store/SidebarStore";
-import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useParams } from "react-router-dom";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
-import { FlowRenderer } from "./FlowRenderer";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { getInitialParameters } from "./utils";
+import { Workspace } from "./Workspace";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
-  const setCollapsed = useSidebarStore((state) => {
-    return state.setCollapsed;
-  });
-  const workflowChangesStore = useWorkflowHasChangesStore();
-  const blockScriptStore = useBlockScriptStore();
 
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
@@ -28,20 +17,6 @@ function WorkflowEditor() {
 
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
-
-  const { data: blockScripts } = useBlockScriptsQuery({
-    workflowPermanentId,
-  });
-
-  useMountEffect(() => {
-    setCollapsed(true);
-    workflowChangesStore.setHasChanges(false);
-  });
-
-  useEffect(() => {
-    blockScriptStore.setScripts(blockScripts ?? {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blockScripts]);
 
   if (isLoading || isGlobalWorkflowsLoading) {
     return (
@@ -82,11 +57,12 @@ function WorkflowEditor() {
   return (
     <div className="relative flex h-screen w-full">
       <ReactFlowProvider>
-        <FlowRenderer
+        <Workspace
           initialEdges={elements.edges}
           initialNodes={elements.nodes}
           initialParameters={getInitialParameters(workflow)}
           initialTitle={workflow.title}
+          showBrowser={false}
           workflow={workflow}
         />
       </ReactFlowProvider>

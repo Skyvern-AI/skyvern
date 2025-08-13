@@ -22,6 +22,7 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
 import {
   useWorkflowSettingsStore,
@@ -135,6 +136,7 @@ function NodeHeader({
     workflowRunId,
   } = useParams();
   const debugStore = useDebugStore();
+  const { closeWorkflowPanel } = useWorkflowPanelStore();
   const thisBlockIsPlaying =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
   const anyBlockIsPlaying =
@@ -194,6 +196,8 @@ function NodeHeader({
 
   const runBlock = useMutation({
     mutationFn: async () => {
+      closeWorkflowPanel();
+
       await saveWorkflow.mutateAsync();
 
       if (!workflowPermanentId) {

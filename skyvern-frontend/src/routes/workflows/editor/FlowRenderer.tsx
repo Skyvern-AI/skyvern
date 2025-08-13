@@ -7,7 +7,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { toast } from "@/components/ui/use-toast";
 import { useOnChange } from "@/hooks/useOnChange";
 import { useShouldNotifyWhenClosingTab } from "@/hooks/useShouldNotifyWhenClosingTab";
 import { BlockActionContext } from "@/store/BlockActionContext";
@@ -17,7 +16,6 @@ import {
   useWorkflowSave,
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
@@ -25,17 +23,15 @@ import {
   BackgroundVariant,
   Controls,
   Edge,
-  Panel,
   PanOnScrollMode,
   ReactFlow,
   Viewport,
-  useEdgesState,
   useNodesInitialized,
-  useNodesState,
   useReactFlow,
+  NodeChange,
+  EdgeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { nanoid } from "nanoid";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useBlocker } from "react-router-dom";
 import {
@@ -56,22 +52,13 @@ import {
   ParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
-import { WorkflowHeader } from "./WorkflowHeader";
-import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 import {
   BITWARDEN_CLIENT_ID_AWS_SECRET_KEY,
   BITWARDEN_CLIENT_SECRET_AWS_SECRET_KEY,
   BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
 } from "./constants";
 import { edgeTypes } from "./edges";
-import {
-  AppNode,
-  isWorkflowBlockNode,
-  nodeTypes,
-  WorkflowBlockNode,
-} from "./nodes";
-import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
-import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
+import { AppNode, isWorkflowBlockNode, nodeTypes } from "./nodes";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -81,22 +68,14 @@ import {
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
-  createNode,
-  defaultEdge,
   descendants,
-  generateNodeLabel,
   getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
   getWorkflowBlocks,
-  getWorkflowErrors,
   getWorkflowSettings,
   layout,
-  nodeAdderNode,
-  startNode,
 } from "./workflowEditorUtils";
-import { cn } from "@/util/utils";
-import { WorkflowDebuggerRun } from "@/routes/workflows/editor/WorkflowDebuggerRun";
 import { useAutoPan } from "./useAutoPan";
 
 function convertToParametersYAML(
@@ -237,38 +216,38 @@ function convertToParametersYAML(
 }
 
 type Props = {
+  nodes: Array<AppNode>;
+  edges: Array<Edge>;
+  setNodes: (nodes: Array<AppNode>) => void;
+  setEdges: (edges: Array<Edge>) => void;
+  onNodesChange: (changes: Array<NodeChange<AppNode>>) => void;
+  onEdgesChange: (changes: Array<EdgeChange>) => void;
   initialTitle: string;
-  initialNodes: Array<AppNode>;
-  initialEdges: Array<Edge>;
   initialParameters: ParametersState;
   workflow: WorkflowApiResponse;
-};
-
-export type AddNodeProps = {
-  nodeType: NonNullable<WorkflowBlockNode["type"]>;
-  previous: string | null;
-  next: string | null;
-  parent?: string;
-  connectingEdgeType: string;
+  onDebuggableBlockCountChange: (count: number) => void;
+  onMouseDownCapture?: () => void;
+  zIndex?: number;
 };
 
 function FlowRenderer({
+  nodes,
+  edges,
+  setNodes,
+  setEdges,
+  onNodesChange,
+  onEdgesChange,
   initialTitle,
-  initialEdges,
-  initialNodes,
   initialParameters,
   workflow,
+  onDebuggableBlockCountChange,
+  onMouseDownCapture,
+  zIndex,
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
-  const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
-    useWorkflowPanelStore();
   const { title, initializeTitle } = useWorkflowTitleStore();
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const [parameters, setParameters] =
-    useState<ParametersState>(initialParameters);
-  const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
+  const [parameters] = useState<ParametersState>(initialParameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -324,8 +303,8 @@ function FlowRenderer({
       }
     }
 
-    setDebuggableBlockCount(debuggable.length);
-  }, [nodes, edges]);
+    onDebuggableBlockCountChange(debuggable.length);
+  }, [nodes, edges, onDebuggableBlockCountChange]);
 
   const constructSaveData = useCallback((): WorkflowSaveData => {
     const blocks = getWorkflowBlocks(nodes, edges);
@@ -369,88 +348,6 @@ function FlowRenderer({
 
   async function handleSave() {
     return await saveWorkflow.mutateAsync();
-  }
-
-  function addNode({
-    nodeType,
-    previous,
-    next,
-    parent,
-    connectingEdgeType,
-  }: AddNodeProps) {
-    const newNodes: Array<AppNode> = [];
-    const newEdges: Array<Edge> = [];
-    const id = nanoid();
-    const existingLabels = nodes
-      .filter(isWorkflowBlockNode)
-      .map((node) => node.data.label);
-    const node = createNode(
-      { id, parentId: parent },
-      nodeType,
-      generateNodeLabel(existingLabels),
-    );
-    newNodes.push(node);
-    if (previous) {
-      const newEdge = {
-        id: nanoid(),
-        type: "edgeWithAddButton",
-        source: previous,
-        target: id,
-        style: {
-          strokeWidth: 2,
-        },
-      };
-      newEdges.push(newEdge);
-    }
-    if (next) {
-      const newEdge = {
-        id: nanoid(),
-        type: connectingEdgeType,
-        source: id,
-        target: next,
-        style: {
-          strokeWidth: 2,
-        },
-      };
-      newEdges.push(newEdge);
-    }
-
-    if (nodeType === "loop") {
-      // when loop node is first created it needs an adder node so nodes can be added inside the loop
-      const startNodeId = nanoid();
-      const adderNodeId = nanoid();
-      newNodes.push(
-        startNode(
-          startNodeId,
-          {
-            withWorkflowSettings: false,
-            editable: true,
-          },
-          id,
-        ),
-      );
-      newNodes.push(nodeAdderNode(adderNodeId, id));
-      newEdges.push(defaultEdge(startNodeId, adderNodeId));
-    }
-
-    const editedEdges = previous
-      ? edges.filter((edge) => edge.source !== previous)
-      : edges;
-
-    const previousNode = nodes.find((node) => node.id === previous);
-    const previousNodeIndex = previousNode
-      ? nodes.indexOf(previousNode)
-      : nodes.length - 1;
-
-    // creating some memory for no reason, maybe check it out later
-    const newNodesAfter = [
-      ...nodes.slice(0, previousNodeIndex + 1),
-      ...newNodes,
-      ...nodes.slice(previousNodeIndex + 1),
-    ];
-
-    workflowChangesStore.setHasChanges(true);
-    doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
   function deleteNode(id: string) {
@@ -629,7 +526,11 @@ function FlowRenderer({
   };
 
   return (
-    <>
+    <div
+      className="h-full w-full"
+      style={{ zIndex }}
+      onMouseDownCapture={() => onMouseDownCapture?.()}
+    >
       <Dialog
         open={blocker.state === "blocked"}
         onOpenChange={(open) => {
@@ -671,155 +572,83 @@ function FlowRenderer({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <WorkflowParametersStateContext.Provider
-        value={[parameters, setParameters]}
+      <BlockActionContext.Provider
+        value={{
+          deleteNodeCallback: deleteNode,
+          toggleScriptForNodeCallback: toggleScript,
+        }}
       >
-        <BlockActionContext.Provider
-          value={{
-            deleteNodeCallback: deleteNode,
-            toggleScriptForNodeCallback: toggleScript,
+        <ReactFlow
+          ref={editorElementRef}
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={(changes) => {
+            const dimensionChanges = changes.filter(
+              (change) => change.type === "dimensions",
+            );
+            const tempNodes = [...nodes];
+            dimensionChanges.forEach((change) => {
+              const node = tempNodes.find((node) => node.id === change.id);
+              if (node) {
+                if (node.measured?.width) {
+                  node.measured.width = change.dimensions?.width;
+                }
+                if (node.measured?.height) {
+                  node.measured.height = change.dimensions?.height;
+                }
+              }
+            });
+            if (dimensionChanges.length > 0) {
+              doLayout(tempNodes, edges);
+            }
+            if (
+              changes.some((change) => {
+                return (
+                  change.type === "add" ||
+                  change.type === "remove" ||
+                  change.type === "replace"
+                );
+              })
+            ) {
+              workflowChangesStore.setHasChanges(true);
+            }
+            // throttle onNodesChange to prevent cascading React updates
+            if (onNodesChangeTimeoutRef.current === null) {
+              onNodesChange(changes);
+              onNodesChangeTimeoutRef.current = setTimeout(() => {
+                onNodesChangeTimeoutRef.current = null;
+              }, 33); // ~30fps throttle
+            }
           }}
+          onEdgesChange={onEdgesChange}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          colorMode="dark"
+          fitView={true}
+          fitViewOptions={{
+            maxZoom: 1,
+          }}
+          deleteKeyCode={null}
+          onMove={(_, viewport) => {
+            if (debugStore.isDebugMode && shouldConstrainPan) {
+              constrainPan(viewport);
+            }
+          }}
+          maxZoom={debugStore.isDebugMode ? 1 : 2}
+          minZoom={debugStore.isDebugMode ? 1 : 0.5}
+          panOnDrag={true}
+          panOnScroll={true}
+          panOnScrollMode={PanOnScrollMode.Vertical}
+          zoomOnDoubleClick={!debugStore.isDebugMode}
+          zoomOnPinch={!debugStore.isDebugMode}
+          zoomOnScroll={!debugStore.isDebugMode}
         >
-          <ReactFlow
-            ref={editorElementRef}
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={(changes) => {
-              const dimensionChanges = changes.filter(
-                (change) => change.type === "dimensions",
-              );
-              const tempNodes = [...nodes];
-              dimensionChanges.forEach((change) => {
-                const node = tempNodes.find((node) => node.id === change.id);
-                if (node) {
-                  if (node.measured?.width) {
-                    node.measured.width = change.dimensions?.width;
-                  }
-                  if (node.measured?.height) {
-                    node.measured.height = change.dimensions?.height;
-                  }
-                }
-              });
-              if (dimensionChanges.length > 0) {
-                doLayout(tempNodes, edges);
-              }
-              if (
-                changes.some((change) => {
-                  return (
-                    change.type === "add" ||
-                    change.type === "remove" ||
-                    change.type === "replace"
-                  );
-                })
-              ) {
-                workflowChangesStore.setHasChanges(true);
-              }
-
-              // throttle onNodesChange to prevent cascading React updates
-              if (onNodesChangeTimeoutRef.current === null) {
-                onNodesChange(changes);
-                onNodesChangeTimeoutRef.current = setTimeout(() => {
-                  onNodesChangeTimeoutRef.current = null;
-                }, 33); // ~30fps throttle
-              }
-            }}
-            onEdgesChange={onEdgesChange}
-            nodeTypes={nodeTypes}
-            edgeTypes={edgeTypes}
-            colorMode="dark"
-            fitView={true}
-            fitViewOptions={{
-              maxZoom: 1,
-            }}
-            deleteKeyCode={null}
-            onMove={(_, viewport) => {
-              if (debugStore.isDebugMode && shouldConstrainPan) {
-                constrainPan(viewport);
-              }
-            }}
-            maxZoom={debugStore.isDebugMode ? 1 : 2}
-            minZoom={debugStore.isDebugMode ? 1 : 0.5}
-            panOnDrag={true}
-            panOnScroll={true}
-            panOnScrollMode={PanOnScrollMode.Vertical}
-            zoomOnDoubleClick={!debugStore.isDebugMode}
-            zoomOnPinch={!debugStore.isDebugMode}
-            zoomOnScroll={!debugStore.isDebugMode}
-          >
-            <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
-            <Controls position="bottom-left" />
-            {debugStore.isDebugMode && (
-              <Panel
-                position="top-right"
-                className="!bottom-[1rem] !right-[1.5rem] !top-0"
-              >
-                <div className="pointer-events-none absolute right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end">
-                  <div className="pointer-events-auto relative mt-[8.5rem] h-full w-full overflow-hidden rounded-xl border-2 border-slate-500">
-                    <WorkflowDebuggerRun />
-                  </div>
-                </div>
-              </Panel>
-            )}
-            <Panel position="top-center" className={cn("h-20")}>
-              <WorkflowHeader
-                debuggableBlockCount={debuggableBlockCount}
-                saving={workflowChangesStore.saveIsPending}
-                parametersPanelOpen={
-                  workflowPanelState.active &&
-                  workflowPanelState.content === "parameters"
-                }
-                onParametersClick={() => {
-                  if (
-                    workflowPanelState.active &&
-                    workflowPanelState.content === "parameters"
-                  ) {
-                    closeWorkflowPanel();
-                  } else {
-                    setWorkflowPanelState({
-                      active: true,
-                      content: "parameters",
-                    });
-                  }
-                }}
-                onSave={async () => {
-                  const errors = getWorkflowErrors(nodes);
-                  if (errors.length > 0) {
-                    toast({
-                      title: "Can not save workflow because of errors:",
-                      description: (
-                        <div className="space-y-2">
-                          {errors.map((error) => (
-                            <p key={error}>{error}</p>
-                          ))}
-                        </div>
-                      ),
-                      variant: "destructive",
-                    });
-                    return;
-                  }
-                  await handleSave();
-                }}
-              />
-            </Panel>
-            {workflowPanelState.active && (
-              <Panel position="top-right">
-                {workflowPanelState.content === "parameters" && (
-                  <WorkflowParametersPanel />
-                )}
-                {workflowPanelState.content === "nodeLibrary" && (
-                  <WorkflowNodeLibraryPanel
-                    onNodeClick={(props) => {
-                      addNode(props);
-                    }}
-                  />
-                )}
-              </Panel>
-            )}
-          </ReactFlow>
-        </BlockActionContext.Provider>
-      </WorkflowParametersStateContext.Provider>
-    </>
+          <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
+          <Controls position="bottom-left" />
+        </ReactFlow>
+      </BlockActionContext.Provider>
+    </div>
   );
 }
 
-export { FlowRenderer };
+export { FlowRenderer, type Props as FlowRendererProps };
