@@ -2450,12 +2450,13 @@ class FileParserBlock(Block):
 
     def _detect_file_type_from_url(self, file_url: str) -> FileType:
         """Detect file type based on file extension in the URL."""
-        url_lower = file_url.lower()
-        if url_lower.endswith((".xlsx", ".xls", ".xlsm")):
+        url_parsed = urlparse(file_url)
+        suffix = Path(url_parsed.path).suffix.lower()
+        if suffix in (".xlsx", ".xls", ".xlsm"):
             return FileType.EXCEL
-        elif url_lower.endswith(".pdf"):
+        elif suffix == ".pdf":
             return FileType.PDF
-        elif url_lower.endswith(".tsv"):
+        elif suffix == ".tsv":
             return FileType.CSV  # TSV files are handled by the CSV parser
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions

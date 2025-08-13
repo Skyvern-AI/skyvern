@@ -428,6 +428,10 @@ async def get_onepassword_token(
     response_model=CreateOnePasswordTokenResponse,
     summary="Create or update OnePassword service account token",
     description="Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
+    tags=["Auth Tokens"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_onepassword_token",
+    },
 )
 @base_router.post(
     "/credentials/onepassword/create/",
