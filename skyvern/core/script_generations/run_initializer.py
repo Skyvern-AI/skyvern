@@ -1,24 +1,9 @@
 from typing import Any
 
-from playwright.async_api import async_playwright
-
 from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage
-from skyvern.forge.sdk.core import skyvern_context
-from skyvern.webeye.browser_factory import BrowserContextFactory
 
 
-# TODO: find a better name for this function
 async def setup(parameters: dict[str, Any], generate_response: bool = False) -> tuple[SkyvernPage, RunContext]:
-    # set up skyvern context
-    skyvern_context.set(skyvern_context.SkyvernContext())
-    # start playwright
-    pw = await async_playwright().start()
-    (
-        browser_context,
-        _,
-        _,
-    ) = await BrowserContextFactory.create_browser_context(playwright=pw)
-    new_page = await browser_context.new_page()
-    # skyvern_page = SkyvernPage(page=new_page, generate_response=generate_response)
-    skyvern_page = SkyvernPage(page=new_page)
-    return skyvern_page, RunContext(parameters=parameters, page=skyvern_page)
+    skyvern_page = await SkyvernPage.create()
+    run_context = RunContext(parameters=parameters, page=skyvern_page)
+    return skyvern_page, run_context
