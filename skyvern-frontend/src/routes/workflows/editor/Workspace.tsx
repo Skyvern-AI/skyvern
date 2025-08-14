@@ -44,7 +44,6 @@ import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
-import { ParametersState } from "./types";
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import {
@@ -55,16 +54,12 @@ import {
   layout,
   startNode,
 } from "./workflowEditorUtils";
-import { WorkflowParametersStateContext } from "./WorkflowParametersStateContext";
 
 const Constants = {
   NewBrowserCooldown: 30000,
 } as const;
 
-type Props = Pick<
-  FlowRendererProps,
-  "initialTitle" | "initialParameters" | "workflow"
-> & {
+type Props = Pick<FlowRendererProps, "initialTitle" | "workflow"> & {
   initialNodes: Array<AppNode>;
   initialEdges: Array<Edge>;
   showBrowser?: boolean;
@@ -82,15 +77,12 @@ function Workspace({
   initialNodes,
   initialEdges,
   initialTitle,
-  initialParameters,
   showBrowser = false,
   workflow,
 }: Props) {
   const { blockLabel, workflowPermanentId } = useParams();
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
-  const [parameters, setParameters] =
-    useState<ParametersState>(initialParameters);
   const debugStore = useDebugStore();
   const [debuggableBlockCount, setDebuggableBlockCount] = useState(0);
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -335,208 +327,204 @@ function Workspace({
   }
 
   return (
-    <WorkflowParametersStateContext.Provider
-      value={[parameters, setParameters]}
-    >
-      <div className="relative h-full w-full">
-        <Dialog
-          open={openDialogue}
-          onOpenChange={(open) => {
-            if (!open && cycleBrowser.isPending) {
-              return;
-            }
-            setOpenDialogue(open);
-          }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Cycle (Get a new browser)</DialogTitle>
-              <DialogDescription>
-                <div className="pb-2 pt-4 text-sm text-slate-400">
-                  {cycleBrowser.isPending ? (
-                    <>
-                      Cooking you up a fresh browser...
-                      <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
-                    </>
-                  ) : (
-                    "Abandon this browser for a new one. Are you sure?"
-                  )}
-                </div>
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              {!cycleBrowser.isPending && (
-                <DialogClose asChild>
-                  <Button variant="secondary">Cancel</Button>
-                </DialogClose>
-              )}
-              <Button
-                variant="default"
-                onClick={() => {
-                  cycleBrowser.mutate(workflowPermanentId!);
-                }}
-                disabled={cycleBrowser.isPending}
-              >
-                Yes, Continue{" "}
-                {cycleBrowser.isPending && (
-                  <ReloadIcon className="ml-2 size-4 animate-spin" />
+    <div className="relative h-full w-full">
+      <Dialog
+        open={openDialogue}
+        onOpenChange={(open) => {
+          if (!open && cycleBrowser.isPending) {
+            return;
+          }
+          setOpenDialogue(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Cycle (Get a new browser)</DialogTitle>
+            <DialogDescription>
+              <div className="pb-2 pt-4 text-sm text-slate-400">
+                {cycleBrowser.isPending ? (
+                  <>
+                    Cooking you up a fresh browser...
+                    <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                  </>
+                ) : (
+                  "Abandon this browser for a new one. Are you sure?"
                 )}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {!cycleBrowser.isPending && (
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+            )}
+            <Button
+              variant="default"
+              onClick={() => {
+                cycleBrowser.mutate(workflowPermanentId!);
+              }}
+              disabled={cycleBrowser.isPending}
+            >
+              Yes, Continue{" "}
+              {cycleBrowser.isPending && (
+                <ReloadIcon className="ml-2 size-4 animate-spin" />
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
-        {/* header panel */}
-        <div
-          className="absolute left-6 right-6 top-8 h-20"
-          style={{ zIndex: rankedItems.header ?? 3 }}
-          onMouseDownCapture={() => {
-            promote("header");
-          }}
-        >
-          <WorkflowHeader
-            debuggableBlockCount={debuggableBlockCount}
-            saving={workflowChangesStore.saveIsPending}
-            parametersPanelOpen={
+      {/* header panel */}
+      <div
+        className="absolute left-6 right-6 top-8 h-20"
+        style={{ zIndex: rankedItems.header ?? 3 }}
+        onMouseDownCapture={() => {
+          promote("header");
+        }}
+      >
+        <WorkflowHeader
+          debuggableBlockCount={debuggableBlockCount}
+          saving={workflowChangesStore.saveIsPending}
+          parametersPanelOpen={
+            workflowPanelState.active &&
+            workflowPanelState.content === "parameters"
+          }
+          onParametersClick={() => {
+            if (
               workflowPanelState.active &&
               workflowPanelState.content === "parameters"
-            }
-            onParametersClick={() => {
-              if (
-                workflowPanelState.active &&
-                workflowPanelState.content === "parameters"
-              ) {
-                closeWorkflowPanel();
-                promote("header");
-              } else {
-                setWorkflowPanelState({
-                  active: true,
-                  content: "parameters",
-                });
-                promote("dropdown");
-              }
-            }}
-            onSave={async () => {
-              const errors = getWorkflowErrors(nodes);
-              if (errors.length > 0) {
-                toast({
-                  title: "Can not save workflow because of errors:",
-                  description: (
-                    <div className="space-y-2">
-                      {errors.map((error) => (
-                        <p key={error}>{error}</p>
-                      ))}
-                    </div>
-                  ),
-                  variant: "destructive",
-                });
-                return;
-              }
-              await saveWorkflow.mutateAsync();
-            }}
-            onRun={() => {
+            ) {
               closeWorkflowPanel();
               promote("header");
-            }}
-          />
-        </div>
-
-        {/* sub panels */}
-        {workflowPanelState.active && (
-          <div
-            className="absolute right-6 top-[7.75rem]"
-            style={{ zIndex: rankedItems.dropdown ?? 2 }}
-            onMouseDownCapture={() => {
+            } else {
+              setWorkflowPanelState({
+                active: true,
+                content: "parameters",
+              });
               promote("dropdown");
-            }}
-          >
-            {workflowPanelState.content === "parameters" && (
-              <WorkflowParametersPanel
-                onMouseDownCapture={() => {
-                  promote("dropdown");
-                }}
-              />
-            )}
-            {workflowPanelState.content === "nodeLibrary" && (
-              <WorkflowNodeLibraryPanel
-                onMouseDownCapture={() => {
-                  promote("dropdown");
-                }}
-                onNodeClick={(props) => {
-                  addNode(props);
-                }}
-              />
-            )}
-          </div>
-        )}
+            }
+          }}
+          onSave={async () => {
+            const errors = getWorkflowErrors(nodes);
+            if (errors.length > 0) {
+              toast({
+                title: "Can not save workflow because of errors:",
+                description: (
+                  <div className="space-y-2">
+                    {errors.map((error) => (
+                      <p key={error}>{error}</p>
+                    ))}
+                  </div>
+                ),
+                variant: "destructive",
+              });
+              return;
+            }
+            await saveWorkflow.mutateAsync();
+          }}
+          onRun={() => {
+            closeWorkflowPanel();
+            promote("header");
+          }}
+        />
+      </div>
 
-        {debugStore.isDebugMode && (
-          <div
-            className="absolute right-6 top-[8.5rem] h-[calc(100vh-9.5rem)]"
-            style={{ zIndex: rankedItems.history ?? 1 }}
-            onMouseDownCapture={() => {
-              closeWorkflowPanel();
-              promote("history");
-            }}
-          >
-            <div className="pointer-events-none absolute right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end">
-              <div className="pointer-events-auto relative h-full w-full overflow-hidden rounded-xl border-2 border-slate-500">
-                <WorkflowDebuggerRun />
-              </div>
+      {/* sub panels */}
+      {workflowPanelState.active && (
+        <div
+          className="absolute right-6 top-[7.75rem]"
+          style={{ zIndex: rankedItems.dropdown ?? 2 }}
+          onMouseDownCapture={() => {
+            promote("dropdown");
+          }}
+        >
+          {workflowPanelState.content === "parameters" && (
+            <WorkflowParametersPanel
+              onMouseDownCapture={() => {
+                promote("dropdown");
+              }}
+            />
+          )}
+          {workflowPanelState.content === "nodeLibrary" && (
+            <WorkflowNodeLibraryPanel
+              onMouseDownCapture={() => {
+                promote("dropdown");
+              }}
+              onNodeClick={(props) => {
+                addNode(props);
+              }}
+            />
+          )}
+        </div>
+      )}
+
+      {debugStore.isDebugMode && (
+        <div
+          className="absolute right-6 top-[8.5rem] h-[calc(100vh-9.5rem)]"
+          style={{ zIndex: rankedItems.history ?? 1 }}
+          onMouseDownCapture={() => {
+            closeWorkflowPanel();
+            promote("history");
+          }}
+        >
+          <div className="pointer-events-none absolute right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end">
+            <div className="pointer-events-auto relative h-full w-full overflow-hidden rounded-xl border-2 border-slate-500">
+              <WorkflowDebuggerRun />
             </div>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* infinite canvas */}
-        <FlowRenderer
-          nodes={nodes}
-          edges={edges}
-          setNodes={setNodes}
-          setEdges={setEdges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          initialTitle={initialTitle}
-          initialParameters={initialParameters}
-          workflow={workflow}
-          onDebuggableBlockCountChange={(c) => setDebuggableBlockCount(c)}
-          onMouseDownCapture={() => promote("infiniteCanvas")}
-          zIndex={rankedItems.infiniteCanvas}
-        />
+      {/* infinite canvas */}
+      <FlowRenderer
+        nodes={nodes}
+        edges={edges}
+        setNodes={setNodes}
+        setEdges={setEdges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        initialTitle={initialTitle}
+        // initialParameters={initialParameters}
+        workflow={workflow}
+        onDebuggableBlockCountChange={(c) => setDebuggableBlockCount(c)}
+        onMouseDownCapture={() => promote("infiniteCanvas")}
+        zIndex={rankedItems.infiniteCanvas}
+      />
 
-        {/* browser */}
-        {showBrowser && (
-          <FloatingWindow
-            title={browserTitle}
-            bounded={false}
-            initialPosition={initialBrowserPosition}
-            initialWidth={initialWidth}
-            initialHeight={initialHeight}
-            showMaximizeButton={true}
-            showMinimizeButton={true}
-            showPowerButton={blockLabel === undefined && showPowerButton}
-            showReloadButton={true}
-            zIndex={rankedItems.browserWindow ?? 4}
-            // --
-            onCycle={handleOnCycle}
-            onFocus={() => promote("browserWindow")}
-          >
-            {activeDebugSession &&
-            activeDebugSession.browser_session_id &&
-            !cycleBrowser.isPending ? (
-              <BrowserStream
-                interactive={interactor === "human"}
-                browserSessionId={activeDebugSession.browser_session_id}
-              />
-            ) : (
-              <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
-                Connecting to your browser...
-                <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
-              </div>
-            )}
-          </FloatingWindow>
-        )}
-      </div>
-    </WorkflowParametersStateContext.Provider>
+      {/* browser */}
+      {showBrowser && (
+        <FloatingWindow
+          title={browserTitle}
+          bounded={false}
+          initialPosition={initialBrowserPosition}
+          initialWidth={initialWidth}
+          initialHeight={initialHeight}
+          showMaximizeButton={true}
+          showMinimizeButton={true}
+          showPowerButton={blockLabel === undefined && showPowerButton}
+          showReloadButton={true}
+          zIndex={rankedItems.browserWindow ?? 4}
+          // --
+          onCycle={handleOnCycle}
+          onFocus={() => promote("browserWindow")}
+        >
+          {activeDebugSession &&
+          activeDebugSession.browser_session_id &&
+          !cycleBrowser.isPending ? (
+            <BrowserStream
+              interactive={interactor === "human"}
+              browserSessionId={activeDebugSession.browser_session_id}
+            />
+          ) : (
+            <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
+              Connecting to your browser...
+              <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+            </div>
+          )}
+        </FloatingWindow>
+      )}
+    </div>
   );
 }
 

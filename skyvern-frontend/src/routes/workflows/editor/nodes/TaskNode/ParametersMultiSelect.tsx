@@ -1,5 +1,5 @@
 import { MultiSelect } from "@/components/ui/multi-select";
-import { useWorkflowParametersState } from "../../useWorkflowParametersState";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { helpTooltips } from "../../helpContent";
 
@@ -14,7 +14,7 @@ function ParametersMultiSelect({
   parameters,
   onParametersChange,
 }: Props) {
-  const [workflowParameters] = useWorkflowParametersState();
+  const { parameters: workflowParameters } = useWorkflowParametersStore();
   const keys = workflowParameters
     .map((parameter) => parameter.key)
     .concat(availableOutputParameters);
