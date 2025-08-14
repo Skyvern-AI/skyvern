@@ -379,10 +379,7 @@ async def get_credentials(
     response_model=CreateOnePasswordTokenResponse,
     summary="Get OnePassword service account token",
     description="Retrieves the current OnePassword service account token for the organization.",
-    tags=["Auth Tokens"],
-    openapi_extra={
-        "x-fern-sdk-method-name": "get_onepassword_token",
-    },
+    include_in_schema=False,
 )
 @base_router.get(
     "/credentials/onepassword/get/",
@@ -428,6 +425,7 @@ async def get_onepassword_token(
     response_model=CreateOnePasswordTokenResponse,
     summary="Create or update OnePassword service account token",
     description="Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
+    include_in_schema=False,
 )
 @base_router.post(
     "/credentials/onepassword/create/",
@@ -435,11 +433,7 @@ async def get_onepassword_token(
     include_in_schema=False,
 )
 async def update_onepassword_token(
-    data: CreateOnePasswordTokenRequest = Body(
-        ...,
-        description="The OnePassword token data",
-        openapi_extra={"x-fern-sdk-parameter-name": "data"},
-    ),
+    data: CreateOnePasswordTokenRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CreateOnePasswordTokenResponse:
     """

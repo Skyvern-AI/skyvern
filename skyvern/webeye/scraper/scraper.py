@@ -322,16 +322,18 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
 
             self.economy_element_tree = economy_elements
 
-        final_element_tree = self.economy_element_tree[: int(len(self.economy_element_tree) * percent_to_keep)]
-        self.last_used_element_tree = final_element_tree
+        self.last_used_element_tree = self.economy_element_tree
 
         if fmt == ElementTreeFormat.JSON:
-            return json.dumps(final_element_tree)
+            element_str = json.dumps(self.economy_element_tree)
+            return element_str[: int(len(element_str) * percent_to_keep)]
 
         if fmt == ElementTreeFormat.HTML:
-            return "".join(
-                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs) for element in final_element_tree
+            element_str = "".join(
+                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
+                for element in self.economy_element_tree
             )
+            return element_str[: int(len(element_str) * percent_to_keep)]
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
@@ -405,6 +407,8 @@ async def scrape_website(
     draw_boxes: bool = True,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
+    support_empty_page: bool = False,
+    wait_seconds: float = 3,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -439,6 +443,8 @@ async def scrape_website(
             draw_boxes=draw_boxes,
             max_screenshot_number=max_screenshot_number,
             scroll=scroll,
+            support_empty_page=support_empty_page,
+            wait_seconds=wait_seconds,
         )
     except ScrapingFailedBlankPage:
         raise
@@ -517,6 +523,8 @@ async def scrape_web_unsafe(
     draw_boxes: bool = True,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
+    support_empty_page: bool = False,
+    wait_seconds: float = 3,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -538,11 +546,11 @@ async def scrape_web_unsafe(
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
     url = page.url
-    if url == "about:blank":
+    if url == "about:blank" and not support_empty_page:
         raise ScrapingFailedBlankPage()
 
-    LOG.info("Waiting for 3 seconds before scraping the website.")
-    await asyncio.sleep(3)
+    LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.")
+    await asyncio.sleep(wait_seconds)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
@@ -569,7 +577,7 @@ async def scrape_web_unsafe(
     )
 
     # if there are no elements, fail the scraping
-    if not elements:
+    if not elements and not support_empty_page:
         raise Exception("No elements found on the page")
 
     text_content = await get_frame_text(page.main_frame)

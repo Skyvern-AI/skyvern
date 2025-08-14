@@ -16,6 +16,7 @@ import {
   useWorkflowSave,
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
@@ -223,7 +224,7 @@ type Props = {
   onNodesChange: (changes: Array<NodeChange<AppNode>>) => void;
   onEdgesChange: (changes: Array<EdgeChange>) => void;
   initialTitle: string;
-  initialParameters: ParametersState;
+  // initialParameters: ParametersState;
   workflow: WorkflowApiResponse;
   onDebuggableBlockCountChange: (count: number) => void;
   onMouseDownCapture?: () => void;
@@ -238,7 +239,7 @@ function FlowRenderer({
   onNodesChange,
   onEdgesChange,
   initialTitle,
-  initialParameters,
+  // initialParameters,
   workflow,
   onDebuggableBlockCountChange,
   onMouseDownCapture,
@@ -247,7 +248,8 @@ function FlowRenderer({
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
   const { title, initializeTitle } = useWorkflowTitleStore();
-  const [parameters] = useState<ParametersState>(initialParameters);
+  // const [parameters] = useState<ParametersState>(initialParameters);
+  const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);

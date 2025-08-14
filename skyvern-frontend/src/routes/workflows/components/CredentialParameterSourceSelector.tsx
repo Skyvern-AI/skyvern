@@ -7,7 +7,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialsQuery } from "../hooks/useCredentialsQuery";
-import { useWorkflowParametersState } from "../editor/useWorkflowParametersState";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { WorkflowParameterValueType } from "../types/workflowTypes";
 import { PlusIcon } from "@radix-ui/react-icons";
 import {
@@ -24,7 +24,7 @@ type Props = {
 function CredentialParameterSourceSelector({ value, onChange }: Props) {
   const { data: credentials, isFetching } = useCredentialsQuery();
   const { setIsOpen, setType } = useCredentialModalState();
-  const [workflowParameters] = useWorkflowParametersState();
+  const { parameters: workflowParameters } = useWorkflowParametersStore();
   const workflowParametersOfTypeCredentialId = workflowParameters.filter(
     (parameter) =>
       parameter.parameterType === "workflow" &&

@@ -1,5 +1,5 @@
 import { useNodes } from "@xyflow/react";
-import { useWorkflowParametersState } from "../editor/useWorkflowParametersState";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { AppNode, isWorkflowBlockNode } from "../editor/nodes";
 import { getOutputParameterKey } from "../editor/workflowEditorUtils";
 import {
@@ -16,7 +16,7 @@ type Props = {
 };
 
 function SourceParameterKeySelector({ value, onChange }: Props) {
-  const [workflowParameters] = useWorkflowParametersState();
+  const { parameters: workflowParameters } = useWorkflowParametersStore();
   const nodes = useNodes<AppNode>();
   const contextParameterKeys = workflowParameters
     .filter((parameter) => parameter.parameterType !== "credential")

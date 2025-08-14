@@ -6,7 +6,7 @@ import {
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
 } from "../editor/workflowEditorUtils";
 import { useState } from "react";
-import { useWorkflowParametersState } from "../editor/useWorkflowParametersState";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 type Props = {
   id: string;
@@ -17,8 +17,10 @@ function useNodeLabelChangeHandler({ id, initialValue }: Props) {
   const [label, setLabel] = useState(initialValue);
   const nodes = useNodes<AppNode>();
   const { setNodes } = useReactFlow();
-  const [workflowParameters, setWorkflowParameters] =
-    useWorkflowParametersState();
+  const {
+    parameters: workflowParameters,
+    setParameters: setWorkflowParameters,
+  } = useWorkflowParametersStore();
 
   function handleLabelChange(value: string) {
     const existingLabels = nodes
