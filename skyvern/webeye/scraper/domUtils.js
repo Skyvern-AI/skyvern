@@ -1531,6 +1531,7 @@ async function buildTreeFromBody(
     window.GlobalSkyvernFrameIndex = frame_index;
   }
   const elementsAndResultArray = await buildElementTree(document.body, frame);
+  DomUtils.elementListCache = elementsAndResultArray[0];
   return elementsAndResultArray;
 }
 
@@ -1779,7 +1780,6 @@ async function buildElementTree(
     trimDuplicatedText(root);
   });
 
-  DomUtils.elementListCache = elements;
   return [elements, resultArray];
 }
 
