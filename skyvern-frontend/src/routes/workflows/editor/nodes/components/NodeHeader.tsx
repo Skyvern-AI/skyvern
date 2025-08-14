@@ -408,7 +408,7 @@ function NodeHeader({
               )}
             </button>
           )}
-          {disabled ? null : (
+          {disabled || debugStore.isDebugMode ? null : (
             <div>
               <div
                 className={cn("rounded p-1 hover:bg-muted", {

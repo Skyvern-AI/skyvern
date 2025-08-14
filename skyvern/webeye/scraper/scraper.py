@@ -414,7 +414,7 @@ async def scrape_website(
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
-    wait_seconds: float = 3,
+    wait_seconds: float = 0,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
