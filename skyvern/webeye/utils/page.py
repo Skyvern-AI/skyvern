@@ -122,11 +122,23 @@ async def _scrolling_screenshots_helper(
     positions: list[int] = []
     if await skyvern_page.is_window_scrollable():
         scroll_y_px_old = -30.0
+        _, initial_scroll_height = await skyvern_page.get_scroll_width_and_height()
         scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
         # Checking max number of screenshots to prevent infinite loop
         # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
         # page. If the difference is less than 25, we assume we have reached the end of the page.
         while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
+            # check if the scroll height changed, if so, rebuild the element tree
+            _, scroll_height = await skyvern_page.get_scroll_width_and_height()
+            if scroll_height != initial_scroll_height:
+                LOG.warning(
+                    "Scroll height changed, rebuild the element tree",
+                    scroll_height=scroll_height,
+                    initial_scroll_height=initial_scroll_height,
+                )
+                await skyvern_page.build_tree_from_body(frame_name=frame, frame_index=frame_index)
+                initial_scroll_height = scroll_height
+
             screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame, mode=mode)
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
@@ -345,6 +357,10 @@ class SkyvernFrame:
 
     async def get_scroll_x_y(self) -> tuple[int, int]:
         js_script = "() => getScrollXY()"
+        return await self.evaluate(frame=self.frame, expression=js_script)
+
+    async def get_scroll_width_and_height(self) -> tuple[int, int]:
+        js_script = "() => getScrollWidthAndHeight()"
         return await self.evaluate(frame=self.frame, expression=js_script)
 
     async def scroll_to_x_y(self, x: int, y: int) -> None:

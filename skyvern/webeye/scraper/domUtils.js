@@ -92,6 +92,7 @@ class Rect {
 }
 
 class DomUtils {
+  static elementListCache = [];
   static visibleClientRectCache = new WeakMap();
   //
   // Bounds the rect by the current viewport dimensions. If the rect is offscreen or has a height or
@@ -877,7 +878,7 @@ function isInteractable(element, hoverStylesMap) {
     return true;
   }
 
-  const className = element.className.toString();
+  const className = element.className?.toString() ?? "";
 
   if (tagName === "div" || tagName === "span") {
     if (hasAngularClickBinding(element)) {
@@ -1784,6 +1785,7 @@ async function buildElementTree(
     trimDuplicatedText(root);
   });
 
+  DomUtils.elementListCache = elements;
   return [elements, resultArray];
 }
 
@@ -1804,6 +1806,11 @@ async function buildElementsAndDrawBoundingBoxes(
   frame = "main.frame",
   frame_index = undefined,
 ) {
+  if (DomUtils.elementListCache.length > 0) {
+    drawBoundingBoxes(DomUtils.elementListCache);
+    return;
+  }
+  _jsConsoleWarn("no element list cache, drawBoundingBoxes from scratch");
   var elementsAndResultArray = await buildTreeFromBody(frame, frame_index);
   drawBoundingBoxes(elementsAndResultArray[0]);
 }
@@ -2063,6 +2070,13 @@ async function safeScrollToTop(
     await buildElementsAndDrawBoundingBoxes(frame, frame_index);
   }
   return window.scrollY;
+}
+
+function getScrollWidthAndHeight() {
+  return [
+    document.documentElement.scrollWidth,
+    document.documentElement.scrollHeight,
+  ];
 }
 
 function getScrollXY() {
