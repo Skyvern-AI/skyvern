@@ -1105,51 +1105,6 @@ function checkDisabledFromStyle(element) {
   return false;
 }
 
-// element should always be the parent of stopped_element
-function getElementContext(element, stopped_element) {
-  // dfs to collect the non unique_id context
-  let fullContext = new Array();
-
-  if (element === stopped_element) {
-    return fullContext;
-  }
-
-  // sometimes '*' shows as an after custom style
-  const afterCustomStyle = getElementComputedStyle(element, "::after");
-  if (afterCustomStyle) {
-    const afterCustom = afterCustomStyle
-      .getPropertyValue("content")
-      .replace(/"/g, "");
-    if (
-      afterCustom.toLowerCase().includes("*") ||
-      afterCustom.toLowerCase().includes("require")
-    ) {
-      fullContext.push(afterCustom);
-    }
-  }
-
-  if (element.childNodes.length === 0) {
-    return fullContext.join(";");
-  }
-  // if the element already has a context, then add it to the list first
-  for (var child of element.childNodes) {
-    let childContext = "";
-    if (child.nodeType === Node.TEXT_NODE && isElementVisible(element)) {
-      if (!element.hasAttribute("unique_id")) {
-        childContext = getElementText(child).trim();
-      }
-    } else if (child.nodeType === Node.ELEMENT_NODE) {
-      if (!child.hasAttribute("unique_id") && isElementVisible(child)) {
-        childContext = getElementContext(child, stopped_element);
-      }
-    }
-    if (childContext.length > 0) {
-      fullContext.push(childContext);
-    }
-  }
-  return fullContext.join(";");
-}
-
 function getVisibleText(element) {
   let visibleText = [];
 
@@ -1223,8 +1178,8 @@ function getElementContent(element, skipped_element = null) {
     nodeContent = cleanupText(nodeTextContentList.join(";"));
   }
   let finalTextContent = cleanupText(textContent);
-  // Currently we don't support too much context. Character limit is 1000 per element.
-  // we don't think element context has to be that big
+  // Currently we don't support too much content. Character limit is 1000 per element.
+  // we don't think element content has to be that big
   const charLimit = 5000;
   if (finalTextContent.length > charLimit) {
     if (nodeContent.length <= charLimit) {
@@ -1455,7 +1410,6 @@ async function buildElementTree(
   starter = document.body,
   frame,
   full_tree = false,
-  needContext = true,
   hoverStylesMap = undefined,
 ) {
   // Generate hover styles map at the start
@@ -1620,141 +1574,6 @@ async function buildElementTree(
     return;
   }
 
-  const getContextByParent = (element, ctx) => {
-    // for most elements, we're going 5 layers up to see if we can find "label" as a parent
-    // if found, most likely the context under label is relevant to this element
-    let targetParentElements = new Set(["label", "fieldset"]);
-
-    // look up for 5 levels to find the most contextual parent element
-    let targetContextualParent = null;
-    let currentEle = getDOMElementBySkyvenElement(element);
-    if (!currentEle) {
-      return ctx;
-    }
-    let parentEle = currentEle;
-    for (var i = 0; i < 5; i++) {
-      parentEle = parentEle.parentElement;
-      if (parentEle) {
-        if (
-          targetParentElements.has(parentEle.tagName.toLowerCase()) ||
-          (typeof parentEle.className === "string" &&
-            checkParentClass(parentEle.className.toLowerCase()))
-        ) {
-          targetContextualParent = parentEle;
-        }
-      } else {
-        break;
-      }
-    }
-    if (!targetContextualParent) {
-      return ctx;
-    }
-
-    let context = "";
-    var lowerCaseTagName = targetContextualParent.tagName.toLowerCase();
-    if (lowerCaseTagName === "fieldset") {
-      // fieldset is usually within a form or another element that contains the whole context
-      targetContextualParent = targetContextualParent.parentElement;
-      if (targetContextualParent) {
-        context = getElementContext(targetContextualParent, currentEle);
-      }
-    } else {
-      context = getElementContext(targetContextualParent, currentEle);
-    }
-    if (context.length > 0) {
-      ctx.push(context);
-    }
-    return ctx;
-  };
-
-  const getContextByLinked = (element, ctx) => {
-    let currentEle = getDOMElementBySkyvenElement(element);
-    if (!currentEle) {
-      return ctx;
-    }
-
-    const document = currentEle.getRootNode();
-    // check labels pointed to this element
-    // 1. element id -> labels pointed to this id
-    // 2. by attr "aria-labelledby" -> only one label with this id
-    let linkedElements = new Array();
-    const elementId = currentEle.getAttribute("id");
-    if (elementId) {
-      try {
-        linkedElements = [
-          ...document.querySelectorAll(`label[for="${elementId}"]`),
-        ];
-      } catch (e) {
-        _jsConsoleLog("failed to query labels: ", e);
-      }
-    }
-    const labelled = currentEle.getAttribute("aria-labelledby");
-    if (labelled) {
-      const label = document.getElementById(labelled);
-      if (label) {
-        linkedElements.push(label);
-      }
-    }
-    const described = currentEle.getAttribute("aria-describedby");
-    if (described) {
-      const describe = document.getElementById(described);
-      if (describe) {
-        linkedElements.push(describe);
-      }
-    }
-
-    const fullContext = new Array();
-    for (let i = 0; i < linkedElements.length; i++) {
-      const linked = linkedElements[i];
-      // if the element is a child of the label, we should stop to get context before the element
-      const content = getElementContent(linked, currentEle);
-      if (content) {
-        fullContext.push(content);
-      }
-    }
-
-    const context = fullContext.join(";");
-    if (context.length > 0) {
-      ctx.push(context);
-    }
-    return ctx;
-  };
-
-  const getContextByTable = (element, ctx) => {
-    // pass element's parent's context to the element for listed tags
-    let tagsWithDirectParentContext = new Set(["a"]);
-    // if the element is a child of a td, th, or tr, then pass the grandparent's context to the element
-    let parentTagsThatDelegateParentContext = new Set(["td", "th", "tr"]);
-    if (tagsWithDirectParentContext.has(element.tagName)) {
-      let curElement = getDOMElementBySkyvenElement(element);
-      if (!curElement) {
-        return ctx;
-      }
-      let parentElement = curElement.parentElement;
-      if (!parentElement) {
-        return ctx;
-      }
-      if (
-        parentTagsThatDelegateParentContext.has(
-          parentElement.tagName.toLowerCase(),
-        )
-      ) {
-        let grandParentElement = parentElement.parentElement;
-        if (grandParentElement) {
-          let context = getElementContext(grandParentElement, curElement);
-          if (context.length > 0) {
-            ctx.push(context);
-          }
-        }
-      }
-      let context = getElementContext(parentElement, curElement);
-      if (context.length > 0) {
-        ctx.push(context);
-      }
-    }
-    return ctx;
-  };
-
   const trimDuplicatedText = (element) => {
     if (element.children.length === 0 && !element.options) {
       return;
@@ -1778,26 +1597,6 @@ async function buildElementTree(
     element.text = element.text.replace(/;+/g, ";");
     // trimleft and trimright ";"
     element.text = element.text.replace(new RegExp(`^;+|;+$`, "g"), "");
-  };
-
-  const trimDuplicatedContext = (element) => {
-    if (element.children.length === 0) {
-      return;
-    }
-
-    // DFS to delete duplicated context
-    element.children.forEach((child) => {
-      trimDuplicatedContext(child);
-      if (element.context === child.context) {
-        delete child.context;
-      }
-      if (child.context) {
-        child.context = child.context.replace(element.text, "");
-        if (!child.context) {
-          delete child.context;
-        }
-      }
-    });
   };
 
   // some elements without children nodes should be removed out, such as <label>
@@ -1845,48 +1644,11 @@ async function buildElementTree(
         element,
       );
     }
-
-    let ctxList = [];
-    if (needContext) {
-      try {
-        ctxList = getContextByLinked(element, ctxList);
-      } catch (e) {
-        _jsConsoleError("failed to get context by linked: ", e);
-      }
-
-      try {
-        ctxList = getContextByParent(element, ctxList);
-      } catch (e) {
-        _jsConsoleError("failed to get context by parent: ", e);
-      }
-
-      try {
-        ctxList = getContextByTable(element, ctxList);
-      } catch (e) {
-        _jsConsoleError("failed to get context by table: ", e);
-      }
-      const context = ctxList.join(";");
-      if (context && context.length <= 5000) {
-        element.context = context;
-      }
-      // FIXME: skip <a> for now to prevent navigating to other page by mistake
-      if (element.tagName !== "a" && checkStringIncludeRequire(context)) {
-        if (
-          !element.attributes["required"] &&
-          !element.attributes["aria-required"]
-        ) {
-          element.attributes["required"] = true;
-        }
-      }
-    }
   }
 
   resultArray = removeOrphanNode(resultArray);
   resultArray.forEach((root) => {
     trimDuplicatedText(root);
-    if (needContext) {
-      trimDuplicatedContext(root);
-    }
   });
 
   return [elements, resultArray];
@@ -2411,7 +2173,6 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
           child,
           "",
           true,
-          false,
           window.globalHoverStylesMap,
         );
         if (newNodeTree.length > 0) {
