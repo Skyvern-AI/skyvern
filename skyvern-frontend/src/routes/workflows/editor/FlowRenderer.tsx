@@ -576,7 +576,13 @@ function FlowRenderer({
       </Dialog>
       <BlockActionContext.Provider
         value={{
-          deleteNodeCallback: deleteNode,
+          /**
+           * NOTE: defer deletion to next tick to allow React Flow's internal
+           * event handlers to complete; removes a console warning from the
+           * React Flow library
+           */
+          deleteNodeCallback: (id: string) =>
+            setTimeout(() => deleteNode(id), 0),
           toggleScriptForNodeCallback: toggleScript,
         }}
       >
