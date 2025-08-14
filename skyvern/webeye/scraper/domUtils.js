@@ -92,6 +92,7 @@ class Rect {
 }
 
 class DomUtils {
+  static visibleClientRectCache = new WeakMap();
   //
   // Bounds the rect by the current viewport dimensions. If the rect is offscreen or has a height or
   // width < 3 then null is returned instead of a rect.
@@ -113,7 +114,18 @@ class DomUtils {
     }
   }
 
+  // add cache to optimize performance
   static getVisibleClientRect(element, testChildren) {
+    // check cache
+    const cacheKey = `${testChildren}`;
+    if (DomUtils.visibleClientRectCache.has(element)) {
+      const elementCache = DomUtils.visibleClientRectCache.get(element);
+      if (elementCache.has(cacheKey)) {
+        _jsConsoleLog("hit cache to get the rect of element");
+        return elementCache.get(cacheKey);
+      }
+    }
+
     // Note: this call will be expensive if we modify the DOM in between calls.
     let clientRect;
     if (testChildren == null) testChildren = false;
@@ -137,6 +149,8 @@ class DomUtils {
       isInlineZeroHeight = () => isInlineZeroFontSize;
       return isInlineZeroFontSize;
     };
+
+    let result = null;
 
     for (clientRect of clientRects) {
       // If the link has zero dimensions, it may be wrapping visible but floated elements. Check for
@@ -172,8 +186,10 @@ class DomUtils {
             childClientRect.height < 3
           )
             continue;
-          return childClientRect;
+          result = childClientRect;
+          break;
         }
+        if (result) break;
       } else {
         clientRect = this.cropRectToVisible(clientRect);
 
@@ -192,11 +208,23 @@ class DomUtils {
         if (computedStyle.getPropertyValue("visibility") !== "visible")
           continue;
 
-        return clientRect;
+        result = clientRect;
+        break;
       }
     }
 
-    return null;
+    // cache result
+    if (!DomUtils.visibleClientRectCache.has(element)) {
+      DomUtils.visibleClientRectCache.set(element, new Map());
+    }
+    DomUtils.visibleClientRectCache.get(element).set(cacheKey, result);
+
+    return result;
+  }
+
+  // clear cache
+  static clearVisibleClientRectCache() {
+    DomUtils.visibleClientRectCache = new WeakMap();
   }
 
   static getViewportTopLeft() {
@@ -1453,7 +1481,6 @@ async function buildElementObject(
     text: getElementText(element),
     afterPseudoText: getPseudoContent(element, "::after"),
     children: [],
-    rect: DomUtils.getVisibleClientRect(element, true),
     // if purgeable is True, which means this element is only used for building the tree relationship
     purgeable: purgeable,
     // don't trim any attr of this element if keepAllAttr=True
@@ -1763,9 +1790,15 @@ async function buildElementTree(
 
 function drawBoundingBoxes(elements) {
   // draw a red border around the elements
+  DomUtils.clearVisibleClientRectCache();
+  elements.forEach((element) => {
+    const ele = getDOMElementBySkyvenElement(element);
+    element.rect = DomUtils.getVisibleClientRect(ele, true);
+  });
   var groups = groupElementsVisually(elements);
   var hintMarkers = createHintMarkersForGroups(groups);
   addHintMarkersToPage(hintMarkers);
+  DomUtils.clearVisibleClientRectCache();
 }
 
 async function buildElementsAndDrawBoundingBoxes(
