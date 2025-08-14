@@ -379,6 +379,7 @@ async def get_credentials(
     response_model=CreateOnePasswordTokenResponse,
     summary="Get OnePassword service account token",
     description="Retrieves the current OnePassword service account token for the organization.",
+    include_in_schema=False,
 )
 @base_router.get(
     "/credentials/onepassword/get/",
@@ -424,6 +425,7 @@ async def get_onepassword_token(
     response_model=CreateOnePasswordTokenResponse,
     summary="Create or update OnePassword service account token",
     description="Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
+    include_in_schema=False,
 )
 @base_router.post(
     "/credentials/onepassword/create/",
