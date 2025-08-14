@@ -13,7 +13,13 @@ from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, ScrapingFailedBlankPage, UnknownElementTreeFormat
+from skyvern.exceptions import (
+    FailedToTakeScreenshot,
+    NoElementFound,
+    ScrapingFailed,
+    ScrapingFailedBlankPage,
+    UnknownElementTreeFormat,
+)
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -408,7 +414,7 @@ async def scrape_website(
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
-    wait_seconds: float = 3,
+    wait_seconds: float = 0,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -524,7 +530,7 @@ async def scrape_web_unsafe(
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
     support_empty_page: bool = False,
-    wait_seconds: float = 3,
+    wait_seconds: float = 0,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -549,10 +555,22 @@ async def scrape_web_unsafe(
     if url == "about:blank" and not support_empty_page:
         raise ScrapingFailedBlankPage()
 
-    LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.")
-    await asyncio.sleep(wait_seconds)
+    try:
+        await page.wait_for_load_state("load", timeout=3000)
+        await SkyvernFrame.wait_for_animation_end(page)
+    except Exception:
+        LOG.warning("Failed to wait for load state, will continue scraping", exc_info=True)
+
+    if wait_seconds > 0:
+        LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
+        await asyncio.sleep(wait_seconds)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
+    if not elements and not support_empty_page:
+        LOG.warning("No elements found on the page, wait for 3 seconds and retry")
+        await asyncio.sleep(3)
+        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
+
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
     element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
 
@@ -576,9 +594,9 @@ async def scrape_web_unsafe(
         elements
     )
 
-    # if there are no elements, fail the scraping
+    # if there are no elements, fail the scraping unless support_empty_page is True
     if not elements and not support_empty_page:
-        raise Exception("No elements found on the page")
+        raise NoElementFound()
 
     text_content = await get_frame_text(page.main_frame)
 
