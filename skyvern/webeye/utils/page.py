@@ -161,8 +161,7 @@ async def _scrolling_screenshots_helper(
 
         if mode == ScreenshotMode.DETAILED:
             # wait until animation ends, which is triggered by scrolling
-            LOG.debug("Waiting for 2 seconds until animation ends.")
-            await asyncio.sleep(2)
+            await SkyvernFrame.wait_for_animation_end(skyvern_page.frame)
     else:
         if draw_boxes:
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
@@ -215,6 +214,21 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
 
 
 class SkyvernFrame:
+    @staticmethod
+    async def wait_for_animation_end(page: Page, timeout: float = 3000) -> None:
+        try:
+            await page.wait_for_function(
+                """
+                () => {
+                    const animations = document.getAnimations();
+                    return animations.every(a => a.playState === 'finished');
+                }
+            """,
+                timeout=timeout,
+            )
+        except Exception:
+            LOG.warning("Failed to wait for animation end, but continue", exc_info=True)
+
     @staticmethod
     async def evaluate(
         frame: Page | Frame,
