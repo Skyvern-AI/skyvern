@@ -7,6 +7,7 @@ import csv
 import json
 import os
 import random
+import re
 import smtplib
 import string
 import textwrap
@@ -1432,6 +1433,7 @@ class CodeBlock(Block):
             "set": set,
             "bool": bool,
             "asyncio": asyncio,
+            "re": re,
         }
 
     def generate_async_user_function(
