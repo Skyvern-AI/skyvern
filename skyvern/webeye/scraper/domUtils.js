@@ -1194,16 +1194,42 @@ const checkParentClass = (className) => {
 };
 
 function removeMultipleSpaces(str) {
-  if (!str) {
+  // Optimization: check for empty values early
+  if (!str || str.length === 0) {
     return str;
   }
+
+  // Optimization: check if contains multiple spaces to avoid unnecessary regex replacement
+  if (
+    str.indexOf("  ") === -1 &&
+    str.indexOf("\t") === -1 &&
+    str.indexOf("\n") === -1
+  ) {
+    return str;
+  }
+
   return str.replace(/\s+/g, " ");
 }
 
 function cleanupText(text) {
-  return removeMultipleSpaces(
-    text.replace("SVGs not supported by this browser.", ""),
-  ).trim();
+  // Optimization: check for empty values early to avoid unnecessary processing
+  if (!text || text.length === 0) {
+    return "";
+  }
+
+  // Optimization: use more efficient string replacement
+  let cleanedText = text;
+
+  // Remove specific SVG error message
+  if (cleanedText.includes("SVGs not supported by this browser.")) {
+    cleanedText = cleanedText.replace(
+      "SVGs not supported by this browser.",
+      "",
+    );
+  }
+
+  // Optimization: combine space processing and trim operations
+  return removeMultipleSpaces(cleanedText).trim();
 }
 
 const checkStringIncludeRequire = (str) => {
@@ -1269,62 +1295,29 @@ function getElementText(element) {
     return element.data.trim();
   }
 
-  let visibleText = [];
-  for (let i = 0; i < element.childNodes.length; i++) {
-    var node = element.childNodes[i];
-    let nodeText = "";
-    if (node.nodeType === Node.TEXT_NODE && (nodeText = node.data.trim())) {
-      visibleText.push(nodeText);
-    }
-  }
-  return visibleText.join(";");
-}
+  const childNodes = element.childNodes;
+  const childNodesLength = childNodes.length;
 
-function getElementContent(element, skipped_element = null) {
-  // DFS to get all the text content from all the nodes under the element
-  if (skipped_element && element === skipped_element) {
+  // If no child nodes, return empty string directly
+  if (childNodesLength === 0) {
     return "";
   }
 
-  let textContent = getElementText(element);
-  let nodeContent = "";
-  // if element has children, then build a list of text and join with a semicolon
-  if (element.childNodes.length > 0) {
-    let childTextContentList = new Array();
-    let nodeTextContentList = new Array();
-    for (var child of element.childNodes) {
-      let childText = "";
-      if (child.nodeType === Node.TEXT_NODE) {
-        childText = getElementText(child).trim();
-        if (childText.length > 0) {
-          nodeTextContentList.push(childText);
-        }
-      } else if (child.nodeType === Node.ELEMENT_NODE) {
-        // childText = child.textContent.trim();
-        childText = getElementContent(child, skipped_element);
-      } else {
-        _jsConsoleLog("Unhandled node type: ", child.nodeType);
+  const visibleText = [];
+  let hasText = false;
+
+  for (let i = 0; i < childNodesLength; i++) {
+    const node = childNodes[i];
+    if (node.nodeType === Node.TEXT_NODE) {
+      const nodeText = node.data.trim();
+      if (nodeText.length > 0) {
+        visibleText.push(nodeText);
+        hasText = true;
       }
-      if (childText.length > 0) {
-        childTextContentList.push(childText);
-      }
-    }
-    textContent = childTextContentList.join(";");
-    nodeContent = cleanupText(nodeTextContentList.join(";"));
-  }
-  let finalTextContent = cleanupText(textContent);
-  // Currently we don't support too much content. Character limit is 1000 per element.
-  // we don't think element content has to be that big
-  const charLimit = 5000;
-  if (finalTextContent.length > charLimit) {
-    if (nodeContent.length <= charLimit) {
-      finalTextContent = nodeContent;
-    } else {
-      finalTextContent = "";
     }
   }
 
-  return finalTextContent;
+  return hasText ? visibleText.join(";") : "";
 }
 
 function getSelectOptions(element) {
@@ -1537,7 +1530,8 @@ async function buildTreeFromBody(
   ) {
     window.GlobalSkyvernFrameIndex = frame_index;
   }
-  return await buildElementTree(document.body, frame);
+  const elementsAndResultArray = await buildElementTree(document.body, frame);
+  return elementsAndResultArray;
 }
 
 async function buildElementTree(
