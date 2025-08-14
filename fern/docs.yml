@@ -193,6 +193,7 @@ navigation:
           - section: Scripts
             contents:
               - POST /v1/scripts
+              - POST /v1/scripts/{script_id}/run
               - POST /v1/scripts/{script_id}/deploy
               - GET /v1/scripts/{script_id}
               - GET /v1/scripts
