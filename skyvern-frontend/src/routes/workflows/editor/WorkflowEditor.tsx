@@ -1,10 +1,12 @@
 import { ReactFlowProvider } from "@xyflow/react";
 import { useParams } from "react-router-dom";
+import { useEffect } from "react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { WorkflowSettings } from "../types/workflowTypes";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getInitialParameters } from "./utils";
 import { Workspace } from "./Workspace";
 
@@ -17,6 +19,17 @@ function WorkflowEditor() {
 
   const { data: globalWorkflows, isLoading: isGlobalWorkflowsLoading } =
     useGlobalWorkflowsQuery();
+
+  const setParameters = useWorkflowParametersStore(
+    (state) => state.setParameters,
+  );
+
+  useEffect(() => {
+    if (workflow) {
+      const initialParameters = getInitialParameters(workflow);
+      setParameters(initialParameters);
+    }
+  }, [workflow, setParameters]);
 
   if (isLoading || isGlobalWorkflowsLoading) {
     return (
@@ -60,7 +73,6 @@ function WorkflowEditor() {
         <Workspace
           initialEdges={elements.edges}
           initialNodes={elements.nodes}
-          initialParameters={getInitialParameters(workflow)}
           initialTitle={workflow.title}
           showBrowser={false}
           workflow={workflow}

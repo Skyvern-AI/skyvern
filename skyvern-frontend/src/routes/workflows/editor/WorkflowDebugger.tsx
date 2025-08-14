@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useParams } from "react-router-dom";
 import { ReactFlowProvider } from "@xyflow/react";
 
@@ -6,12 +7,24 @@ import { WorkflowSettings } from "../types/workflowTypes";
 import { getElements } from "./workflowEditorUtils";
 import { getInitialParameters } from "./utils";
 import { Workspace } from "./Workspace";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 function WorkflowDebugger() {
   const { workflowPermanentId } = useParams();
   const { data: workflow } = useWorkflowQuery({
     workflowPermanentId,
   });
+
+  const setParameters = useWorkflowParametersStore(
+    (state) => state.setParameters,
+  );
+
+  useEffect(() => {
+    if (workflow) {
+      const initialParameters = getInitialParameters(workflow);
+      setParameters(initialParameters);
+    }
+  }, [workflow, setParameters]);
 
   if (!workflow) {
     return null;
@@ -42,7 +55,6 @@ function WorkflowDebugger() {
         <Workspace
           initialEdges={elements.edges}
           initialNodes={elements.nodes}
-          initialParameters={getInitialParameters(workflow)}
           initialTitle={workflow.title}
           showBrowser={true}
           workflow={workflow}
