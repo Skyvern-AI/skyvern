@@ -225,6 +225,113 @@ class DomUtils {
   }
 }
 
+class QuadTreeNode {
+  constructor(bounds, maxElements = 10, maxDepth = 4) {
+    this.bounds = bounds; // {x, y, width, height}
+    this.maxElements = maxElements;
+    this.maxDepth = maxDepth;
+    this.elements = [];
+    this.children = null;
+    this.depth = 0;
+  }
+
+  insert(element) {
+    if (!this.contains(element.rect)) {
+      return false;
+    }
+
+    if (this.children === null && this.elements.length < this.maxElements) {
+      this.elements.push(element);
+      return true;
+    }
+
+    if (this.children === null) {
+      this.subdivide();
+    }
+
+    for (const child of this.children) {
+      if (child.insert(element)) {
+        return true;
+      }
+    }
+
+    this.elements.push(element);
+    return true;
+  }
+
+  subdivide() {
+    const x = this.bounds.x;
+    const y = this.bounds.y;
+    const w = this.bounds.width / 2;
+    const h = this.bounds.height / 2;
+
+    this.children = [
+      new QuadTreeNode(
+        { x, y, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+      new QuadTreeNode(
+        { x: x + w, y, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+      new QuadTreeNode(
+        { x, y: y + h, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+      new QuadTreeNode(
+        { x: x + w, y: y + h, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+    ];
+
+    for (const child of this.children) {
+      child.depth = this.depth + 1;
+    }
+  }
+
+  contains(rect) {
+    return (
+      rect.left >= this.bounds.x &&
+      rect.right <= this.bounds.x + this.bounds.width &&
+      rect.top >= this.bounds.y &&
+      rect.bottom <= this.bounds.y + this.bounds.height
+    );
+  }
+
+  query(rect) {
+    const result = [];
+    this.queryRecursive(rect, result);
+    return result;
+  }
+
+  queryRecursive(rect, result) {
+    if (!this.intersects(rect)) {
+      return;
+    }
+
+    result.push(...this.elements);
+
+    if (this.children) {
+      for (const child of this.children) {
+        child.queryRecursive(rect, result);
+      }
+    }
+  }
+
+  intersects(rect) {
+    return (
+      rect.left < this.bounds.x + this.bounds.width &&
+      rect.right > this.bounds.x &&
+      rect.top < this.bounds.y + this.bounds.height &&
+      rect.bottom > this.bounds.y
+    );
+  }
+}
+
 // from playwright
 function getElementComputedStyle(element, pseudo) {
   return element.ownerDocument && element.ownerDocument.defaultView
@@ -1686,37 +1793,86 @@ function getCaptchaSolves() {
 }
 
 function groupElementsVisually(elements) {
-  const groups = [];
-  // o n^2
-  // go through each hint and see if it overlaps with any other hints, if it does, add it to the group of the other hint
-  // *** if we start from the bigger elements (top -> bottom) we can avoid merging groups
-  for (const element of elements) {
-    if (!element.rect) {
-      continue;
-    }
-    const group = groups.find((group) => {
-      for (const groupElement of group.elements) {
-        if (Rect.intersects(groupElement.rect, element.rect)) {
-          return true;
-        }
-      }
-      return false;
-    });
-    if (group) {
-      group.elements.push(element);
-    } else {
-      groups.push({
-        elements: [element],
-      });
-    }
-  }
+  // Quadtree O(n log n)
+  const validElements = elements.filter((element) => element.rect);
 
-  // go through each group and create a rectangle that encompasses all the hints in the group
-  for (const group of groups) {
+  if (validElements.length === 0) return [];
+
+  // Calculate bounds
+  const bounds = calculateBounds(validElements);
+
+  // Create quadtree
+  const quadTree = new QuadTreeNode(bounds);
+  validElements.forEach((element) => quadTree.insert(element));
+
+  const groups = [];
+  const processed = new Set();
+
+  for (const element of validElements) {
+    if (processed.has(element)) continue;
+
+    const group = { elements: [element], rect: null };
+    processed.add(element);
+
+    // Find all elements overlapping with current element
+    const overlapping = findOverlappingElements(
+      element,
+      validElements,
+      quadTree,
+      processed,
+    );
+
+    for (const overlappingElement of overlapping) {
+      group.elements.push(overlappingElement);
+      processed.add(overlappingElement);
+    }
+
     group.rect = createRectangleForGroup(group);
+    groups.push(group);
   }
 
   return groups;
+}
+
+// Helper functions
+function calculateBounds(elements) {
+  const rects = elements.map((el) => el.rect);
+  const left = Math.min(...rects.map((r) => r.left));
+  const top = Math.min(...rects.map((r) => r.top));
+  const right = Math.max(...rects.map((r) => r.right));
+  const bottom = Math.max(...rects.map((r) => r.bottom));
+
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function findOverlappingElements(element, allElements, quadTree, processed) {
+  const result = [];
+  const queue = [element];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+
+    // Use quadtree to query nearby elements
+    const nearby = quadTree.query(current.rect);
+
+    for (const nearbyElement of nearby) {
+      if (
+        !processed.has(nearbyElement) &&
+        nearbyElement !== current &&
+        Rect.intersects(current.rect, nearbyElement.rect)
+      ) {
+        result.push(nearbyElement);
+        processed.add(nearbyElement);
+        queue.push(nearbyElement);
+      }
+    }
+  }
+  return result;
 }
 
 function createRectangleForGroup(group) {
