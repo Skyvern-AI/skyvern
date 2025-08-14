@@ -322,16 +322,18 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
 
             self.economy_element_tree = economy_elements
 
-        final_element_tree = self.economy_element_tree[: int(len(self.economy_element_tree) * percent_to_keep)]
-        self.last_used_element_tree = final_element_tree
+        self.last_used_element_tree = self.economy_element_tree
 
         if fmt == ElementTreeFormat.JSON:
-            return json.dumps(final_element_tree)
+            element_str = json.dumps(self.economy_element_tree)
+            return element_str[: int(len(element_str) * percent_to_keep)]
 
         if fmt == ElementTreeFormat.HTML:
-            return "".join(
-                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs) for element in final_element_tree
+            element_str = "".join(
+                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
+                for element in self.economy_element_tree
             )
+            return element_str[: int(len(element_str) * percent_to_keep)]
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
