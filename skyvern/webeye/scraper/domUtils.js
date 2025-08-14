@@ -115,7 +115,7 @@ class DomUtils {
   }
 
   // add cache to optimize performance
-  static getVisibleClientRect(element, testChildren) {
+  static getVisibleClientRect(element, testChildren = false) {
     // check cache
     const cacheKey = `${testChildren}`;
     if (DomUtils.visibleClientRectCache.has(element)) {
@@ -128,7 +128,6 @@ class DomUtils {
 
     // Note: this call will be expensive if we modify the DOM in between calls.
     let clientRect;
-    if (testChildren == null) testChildren = false;
     const clientRects = (() => {
       const result = [];
       for (clientRect of element.getClientRects()) {
@@ -1793,7 +1792,7 @@ function drawBoundingBoxes(elements) {
   DomUtils.clearVisibleClientRectCache();
   elements.forEach((element) => {
     const ele = getDOMElementBySkyvenElement(element);
-    element.rect = DomUtils.getVisibleClientRect(ele, true);
+    element.rect = ele ? DomUtils.getVisibleClientRect(ele, true) : null;
   });
   var groups = groupElementsVisually(elements);
   var hintMarkers = createHintMarkersForGroups(groups);
