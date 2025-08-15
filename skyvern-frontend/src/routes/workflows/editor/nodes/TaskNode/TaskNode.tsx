@@ -140,8 +140,8 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
           >
             <AccordionItem value="content">
               <AccordionTrigger>Content</AccordionTrigger>
-              <AccordionContent key={rerender.key} className="pl-[1.5rem] pr-1">
-                <div className="space-y-4">
+              <AccordionContent className="pl-[1.5rem] pr-1">
+                <div key={`${rerender.key}-content`} className="space-y-4">
                   <div className="space-y-2">
                     <div className="flex justify-between">
                       <div className="flex gap-2">
@@ -197,7 +197,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
             <AccordionItem value="extraction">
               <AccordionTrigger>Extraction</AccordionTrigger>
               <AccordionContent className="pl-[1.5rem] pr-1">
-                <div className="space-y-4">
+                <div key={`${rerender.key}-extraction`} className="space-y-4">
                   <div className="space-y-2">
                     <div className="flex gap-2">
                       <Label className="text-xs text-slate-300">
@@ -235,7 +235,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger>Advanced Settings</AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={`${rerender.key}-advanced`} className="space-y-4">
                   <div className="space-y-2">
                     <Label className="text-xs text-slate-300">
                       Complete if...
