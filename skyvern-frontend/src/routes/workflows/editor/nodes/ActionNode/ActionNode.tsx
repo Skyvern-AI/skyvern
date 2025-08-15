@@ -38,6 +38,8 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { cn } from "@/util/utils";
 import { useParams } from "react-router-dom";
 import { NodeHeader } from "../components/NodeHeader";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -67,8 +69,13 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   });
   const { blockLabel: urlBlockLabel } = useParams();
   const debugStore = useDebugStore();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const elideFromDebugging = debugStore.isDebugMode && !debuggable;
 
   const nodes = useNodes<AppNode>();
@@ -108,8 +115,9 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
           className={cn(
             "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
             {
-              "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-                thisBlockIsPlaying,
+              "pointer-events-none": thisBlockIsPlaying,
+              "bg-slate-950 outline outline-2 outline-slate-300":
+                thisBlockIsTargetted,
             },
           )}
         >

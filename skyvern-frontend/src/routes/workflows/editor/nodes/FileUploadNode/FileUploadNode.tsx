@@ -17,6 +17,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
   const { updateNodeData } = useReactFlow();
@@ -24,8 +26,13 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
   const debugStore = useDebugStore();
   const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const { blockLabel: urlBlockLabel } = useParams();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
 
   const [inputs, setInputs] = useState({
     storageType: data.storageType,
@@ -65,8 +72,9 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
         className={cn(
           "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
           {
-            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-              thisBlockIsPlaying,
+            "pointer-events-none": thisBlockIsPlaying,
+            "bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsTargetted,
           },
         )}
       >
