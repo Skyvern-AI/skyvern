@@ -40,6 +40,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
@@ -70,6 +71,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+  const rerender = useRerender({ prefix: "accordian" });
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
@@ -161,13 +163,17 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
             }}
           />
           <Separator />
-          <Accordion type="single" collapsible>
+          <Accordion
+            type="single"
+            collapsible
+            onValueChange={() => rerender.bump()}
+          >
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={rerender.key} className="space-y-4">
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"

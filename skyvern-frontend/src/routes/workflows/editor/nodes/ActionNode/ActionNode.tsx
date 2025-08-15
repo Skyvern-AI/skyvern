@@ -25,6 +25,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { AppNode } from "..";
@@ -77,6 +78,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const rerender = useRerender({ prefix: "accordian" });
 
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -189,6 +191,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
               "pointer-events-none opacity-50": thisBlockIsPlaying,
             })}
             type="single"
+            onValueChange={() => rerender.bump()}
             collapsible
           >
             <AccordionItem value="advanced" className="border-b-0">
@@ -196,7 +199,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={rerender.key} className="space-y-4">
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"

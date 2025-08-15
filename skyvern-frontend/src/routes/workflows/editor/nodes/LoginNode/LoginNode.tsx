@@ -41,6 +41,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
   const { updateNodeData } = useReactFlow();
@@ -73,6 +74,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
     model: data.model,
   });
 
+  const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
@@ -185,12 +187,16 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
             </div>
           </div>
           <Separator />
-          <Accordion type="single" collapsible>
+          <Accordion
+            type="single"
+            collapsible
+            onValueChange={() => rerender.bump()}
+          >
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings
               </AccordionTrigger>
-              <AccordionContent className="pl-6 pr-1 pt-1">
+              <AccordionContent key={rerender.key} className="pl-6 pr-1 pt-1">
                 <div className="space-y-4">
                   <div className="space-y-2">
                     <ModelSelector

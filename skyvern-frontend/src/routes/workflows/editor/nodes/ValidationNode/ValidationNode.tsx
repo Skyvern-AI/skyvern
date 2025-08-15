@@ -38,6 +38,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
   const { updateNodeData } = useReactFlow();
@@ -61,6 +62,8 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
     errorCodeMapping: data.errorCodeMapping,
     model: data.model,
   });
+
+  const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
@@ -143,13 +146,17 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
             />
           </div>
           <Separator />
-          <Accordion type="single" collapsible>
+          <Accordion
+            type="single"
+            collapsible
+            onValueChange={() => rerender.bump()}
+          >
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent>
-                <div className="ml-6 mt-4 space-y-4">
+                <div key={rerender.key} className="ml-6 mt-4 space-y-4">
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan mr-[1px] w-52 text-xs"
