@@ -832,7 +832,7 @@ async def get_run_artifacts(
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE}]}],
     },
     description="Retry sending the webhook for a run",
-    summary="Retry run webhook",
+    summary="Retry webhook",
 )
 @base_router.post("/runs/{run_id}/retry_webhook/", include_in_schema=False)
 async def retry_run_webhook(
