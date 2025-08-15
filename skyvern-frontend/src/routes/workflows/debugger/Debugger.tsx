@@ -4,12 +4,12 @@ import { ReactFlowProvider } from "@xyflow/react";
 
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
-import { getElements } from "./workflowEditorUtils";
-import { getInitialParameters } from "./utils";
-import { Workspace } from "./Workspace";
+import { getElements } from "@/routes/workflows/editor/workflowEditorUtils";
+import { getInitialParameters } from "@/routes/workflows/editor/utils";
+import { Workspace } from "@/routes/workflows/editor/Workspace";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
-function WorkflowDebugger() {
+function Debugger() {
   const { workflowPermanentId } = useParams();
   const { data: workflow } = useWorkflowQuery({
     workflowPermanentId,
@@ -64,4 +64,4 @@ function WorkflowDebugger() {
   );
 }
 
-export { WorkflowDebugger };
+export { Debugger };

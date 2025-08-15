@@ -25,7 +25,7 @@ type Props = {
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
 };
 
-function WorkflowDebuggerRunTimeline({
+function DebuggerRunTimeline({
   activeItem,
   onObserverThoughtCardSelected,
   onActionItemSelected,
@@ -126,4 +126,4 @@ function WorkflowDebuggerRunTimeline({
   );
 }
 
-export { WorkflowDebuggerRunTimeline };
+export { DebuggerRunTimeline };

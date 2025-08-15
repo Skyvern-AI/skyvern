@@ -15,17 +15,18 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useNavigate, useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { useCreateWorkflowMutation } from "../hooks/useCreateWorkflowMutation";
 import { convert } from "./workflowEditorUtils";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
 
 type Props = {
-  debuggableBlockCount: number;
   parametersPanelOpen: boolean;
   onParametersClick: () => void;
   onSave: () => void;
@@ -34,7 +35,6 @@ type Props = {
 };
 
 function WorkflowHeader({
-  debuggableBlockCount,
   parametersPanelOpen,
   onParametersClick,
   onSave,
@@ -43,13 +43,14 @@ function WorkflowHeader({
 }: Props) {
   const { title, setTitle } = useWorkflowTitleStore();
   const workflowChangesStore = useWorkflowHasChangesStore();
-  const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
+  const { workflowPermanentId } = useParams();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
   const createWorkflowMutation = useCreateWorkflowMutation();
+  const { data: workflowRun } = useWorkflowRunQuery();
   const debugStore = useDebugStore();
-  const anyBlockIsPlaying =
-    urlBlockLabel !== undefined && urlBlockLabel.length > 0;
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
 
   if (!globalWorkflows) {
     return null; // this should be loaded already by some other components
@@ -105,7 +106,7 @@ function WorkflowHeader({
             <Button
               size="lg"
               variant={debugStore.isDebugMode ? "default" : "tertiary"}
-              disabled={debuggableBlockCount === 0 || anyBlockIsPlaying}
+              disabled={workflowRunIsRunningOrQueued}
               onClick={() => {
                 if (debugStore.isDebugMode) {
                   navigate(`/workflows/${workflowPermanentId}/edit`);

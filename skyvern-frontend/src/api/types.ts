@@ -317,6 +317,7 @@ export type WorkflowRunStatusApiResponse = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
