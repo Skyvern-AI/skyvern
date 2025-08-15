@@ -161,7 +161,7 @@ async def _scrolling_screenshots_helper(
 
         if mode == ScreenshotMode.DETAILED:
             # wait until animation ends, which is triggered by scrolling
-            await SkyvernFrame.wait_for_animation_end(skyvern_page.frame)
+            await skyvern_page.safe_wait_for_animation_end()
     else:
         if draw_boxes:
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
@@ -214,21 +214,6 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
 
 
 class SkyvernFrame:
-    @staticmethod
-    async def wait_for_animation_end(page: Page, timeout: float = 3000) -> None:
-        try:
-            await page.wait_for_function(
-                """
-                () => {
-                    const animations = document.getAnimations();
-                    return animations.every(a => a.playState === 'finished');
-                }
-            """,
-                timeout=timeout,
-            )
-        except Exception:
-            LOG.warning("Failed to wait for animation end, but continue", exc_info=True)
-
     @staticmethod
     async def evaluate(
         frame: Page | Frame,
@@ -514,3 +499,23 @@ class SkyvernFrame:
         return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
+
+    async def safe_wait_for_animation_end(self, timeout_ms: float = 3000) -> None:
+        try:
+            async with asyncio.timeout(timeout_ms / 1000):
+                while True:
+                    try:
+                        is_finished = await self.evaluate(
+                            frame=self.frame,
+                            expression="() => isAnimationFinished()",
+                            timeout_ms=timeout_ms,
+                        )
+                        if is_finished:
+                            return
+                        await asyncio.sleep(0.1)
+                    except Exception:
+                        LOG.warning("Failed to wait for animation end, but ignore it", exc_info=True)
+                        return
+        except asyncio.TimeoutError:
+            LOG.debug("Timeout while waiting for animation end, but ignore it", exc_info=True)
+            return

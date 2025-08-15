@@ -2642,6 +2642,28 @@ async function getIncrementElements(wait_until_finished = true) {
   return [Array.from(idToElement.values()), cleanedTreeList];
 }
 
+function isAnimationFinished() {
+  const animations = document.getAnimations({ subtree: true });
+  const unfinishedAnimations = animations.filter(
+    (a) => a.playState !== "finished",
+  );
+  if (!unfinishedAnimations || unfinishedAnimations.length == 0) {
+    return true;
+  }
+  const unfinishedAnimationsWithoutBlocked = unfinishedAnimations.filter(
+    (a) => {
+      const element = a.effect?.target;
+      if (!element) {
+        _jsConsoleLog("Unfinished animation without element:", a);
+        return false;
+      }
+      const result = getBlockElementUniqueID(element);
+      return !result[1];
+    },
+  );
+  return unfinishedAnimationsWithoutBlocked.length === 0;
+}
+
 /**
 
 // How to run the code:
