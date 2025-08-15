@@ -557,7 +557,8 @@ async def scrape_web_unsafe(
 
     try:
         await page.wait_for_load_state("load", timeout=3000)
-        await SkyvernFrame.wait_for_animation_end(page)
+        skyvern_frame = await SkyvernFrame.create_instance(page)
+        await skyvern_frame.safe_wait_for_animation_end()
     except Exception:
         LOG.warning("Failed to wait for load state, will continue scraping", exc_info=True)
 
