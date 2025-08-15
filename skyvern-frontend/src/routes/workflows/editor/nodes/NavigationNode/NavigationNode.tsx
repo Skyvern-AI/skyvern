@@ -14,6 +14,7 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
@@ -58,6 +59,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const rerender = useRerender({ prefix: "accordian" });
   const [inputs, setInputs] = useState({
     allowDownloads: data.allowDownloads,
     cacheActions: data.cacheActions,
@@ -194,13 +196,14 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
             })}
             type="single"
             collapsible
+            onValueChange={() => rerender.bump()}
           >
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={rerender.key} className="space-y-4">
                   <div className="space-y-2">
                     <ParametersMultiSelect
                       availableOutputParameters={outputParameterKeys}

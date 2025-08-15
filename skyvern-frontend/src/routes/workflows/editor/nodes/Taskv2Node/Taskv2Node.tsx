@@ -21,6 +21,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
   const { debuggable, editable, label } = data;
@@ -36,6 +37,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const { updateNodeData } = useReactFlow();
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const rerender = useRerender({ prefix: "accordian" });
 
   const [inputs, setInputs] = useState({
     prompt: data.prompt,
@@ -122,12 +124,16 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
           </div>
         </div>
         <Separator />
-        <Accordion type="single" collapsible>
+        <Accordion
+          type="single"
+          collapsible
+          onValueChange={() => rerender.bump()}
+        >
           <AccordionItem value="advanced" className="border-b-0">
             <AccordionTrigger className="py-0">
               Advanced Settings
             </AccordionTrigger>
-            <AccordionContent className="pl-6 pr-1 pt-4">
+            <AccordionContent key={rerender.key} className="pl-6 pr-1 pt-4">
               <div className="space-y-4">
                 <ModelSelector
                   className="nopan w-52 text-xs"

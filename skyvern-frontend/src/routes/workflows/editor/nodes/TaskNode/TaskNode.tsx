@@ -42,6 +42,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
@@ -59,6 +60,8 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
+
+  const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
@@ -130,10 +133,14 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
             totpUrl={inputs.totpVerificationUrl}
             type={type}
           />
-          <Accordion type="multiple" defaultValue={["content", "extraction"]}>
+          <Accordion
+            type="multiple"
+            defaultValue={["content", "extraction"]}
+            onValueChange={() => rerender.bump()}
+          >
             <AccordionItem value="content">
               <AccordionTrigger>Content</AccordionTrigger>
-              <AccordionContent className="pl-[1.5rem] pr-1">
+              <AccordionContent key={rerender.key} className="pl-[1.5rem] pr-1">
                 <div className="space-y-4">
                   <div className="space-y-2">
                     <div className="flex justify-between">
