@@ -8,6 +8,7 @@ import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation } from "@/api/types";
 import { Timer } from "@/components/Timer";
 import { toast } from "@/components/ui/use-toast";
+import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
@@ -131,6 +132,7 @@ function NodeHeader({
   totpUrl,
   type,
 }: Props) {
+  const log = useLogging();
   const {
     blockLabel: urlBlockLabel,
     workflowPermanentId,
@@ -214,7 +216,7 @@ function NodeHeader({
       await saveWorkflow.mutateAsync();
 
       if (!workflowPermanentId) {
-        console.error("There is no workflowPermanentId");
+        log.error("Run block: there is no workflowPermanentId");
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -224,7 +226,7 @@ function NodeHeader({
       }
 
       if (!debugSession) {
-        console.error("There is no debug session, yet");
+        log.error("Run block: there is no debug session, yet");
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -263,6 +265,12 @@ function NodeHeader({
       });
 
       if (!body) {
+        log.error("Run block: could not construct run payload", {
+          workflowPermanentId,
+          blockLabel,
+          debugSessionId: debugSession.debug_session_id,
+          browserSessionId: debugSession.browser_session_id,
+        });
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -271,6 +279,13 @@ function NodeHeader({
         return;
       }
 
+      log.info("Run block: sending run payload", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession.debug_session_id,
+        browserSessionId: debugSession.browser_session_id,
+      });
+
       return await client.post<Payload, { data: { run_id: string } }>(
         "/run/workflows/blocks",
         body,
@@ -278,7 +293,12 @@ function NodeHeader({
     },
     onSuccess: (response) => {
       if (!response) {
-        console.error("No response");
+        log.error("Run block: no response", {
+          workflowPermanentId,
+          blockLabel,
+          debugSessionId: debugSession?.debug_session_id,
+          browserSessionId: debugSession?.browser_session_id,
+        });
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -286,6 +306,14 @@ function NodeHeader({
         });
         return;
       }
+
+      log.info("Run block: run started", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+        runId: response.data.run_id,
+      });
 
       toast({
         variant: "success",
@@ -299,6 +327,13 @@ function NodeHeader({
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
+      log.error("Run block: error", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+        error,
+      });
       toast({
         variant: "destructive",
         title: "Failed to start workflow block run",
@@ -310,7 +345,10 @@ function NodeHeader({
   const cancelBlock = useMutation({
     mutationFn: async () => {
       if (!debugSession) {
-        console.error("Missing debug session");
+        log.error("Cancel block: missing debug session", {
+          workflowPermanentId,
+          blockLabel,
+        });
         toast({
           variant: "destructive",
           title: "Failed to cancel workflow block run",
@@ -326,6 +364,12 @@ function NodeHeader({
         .then((response) => response.data);
     },
     onSuccess: () => {
+      log.info("Cancel block: canceled", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+      });
       toast({
         variant: "success",
         title: "Workflow Canceled",
@@ -333,6 +377,13 @@ function NodeHeader({
       });
     },
     onError: (error) => {
+      log.error("Cancel block: error", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+        error,
+      });
       toast({
         variant: "destructive",
         title: "Error",
