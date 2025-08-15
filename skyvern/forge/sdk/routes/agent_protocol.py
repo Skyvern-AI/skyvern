@@ -25,7 +25,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
-from skyvern.forge.sdk.routes.code_samples import (
+from skyvern.forge.sdk.routes.code_samples import (  # no code sample for payload generation yet
     CANCEL_RUN_CODE_SAMPLE,
     CREATE_WORKFLOW_CODE_SAMPLE,
     CREATE_WORKFLOW_CODE_SAMPLE_PYTHON,
@@ -842,6 +842,25 @@ async def retry_run_webhook(
 ) -> None:
     analytics.capture("skyvern-oss-agent-run-retry-webhook")
     await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
+
+@base_router.get(
+    "/runs/{run_id}/webhook_payload",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_webhook_payload",
+    },
+    description="Generate the webhook payload for a run and return it without sending",
+    summary="Generate webhook payload",
+)
+@base_router.get("/runs/{run_id}/webhook_payload/", include_in_schema=False)
+async def get_webhook_payload(
+    run_id: str = Path(..., description="The id of the task run or the workflow run.", examples=["tsk_123", "wr_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    analytics.capture("skyvern-oss-agent-run-generate-webhook-payload")
+    payload = await run_service.build_run_webhook_payload(run_id, organization_id=current_org.organization_id)
+    return ORJSONResponse(payload)
 
 
 @base_router.post(
