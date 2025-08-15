@@ -6,13 +6,13 @@ function DebuggerRun() {
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div
-      className="align-self-start max-h-[8rem] w-full overflow-y-auto rounded-md border border-red-600 p-4"
+      className="align-self-start h-[8rem] w-full overflow-y-auto rounded-md border border-red-600 p-4"
       style={{
         backgroundColor: "rgba(220, 38, 38, 0.10)",
         width: "calc(100% - 2rem)",
       }}
     >
-      <div className="font-bold">Workflow Failure Reason</div>
+      <div className="font-bold">Run Failure Reason</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
     </div>
   ) : null;
