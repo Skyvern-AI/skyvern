@@ -619,12 +619,13 @@ function FlowRenderer({
             ) {
               workflowChangesStore.setHasChanges(true);
             }
-            // throttle onNodesChange to prevent cascading React updates
+            // defer update to next tick to prevent max recursion errors;
+            // NOTE: deferring too long causes node updates to be skipped
             if (onNodesChangeTimeoutRef.current === null) {
               onNodesChange(changes);
               onNodesChangeTimeoutRef.current = setTimeout(() => {
                 onNodesChangeTimeoutRef.current = null;
-              }, 33); // ~30fps throttle
+              }, 0);
             }
           }}
           onEdgesChange={onEdgesChange}
