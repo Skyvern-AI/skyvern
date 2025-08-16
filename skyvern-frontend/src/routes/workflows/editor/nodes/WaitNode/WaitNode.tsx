@@ -6,7 +6,6 @@ import { helpTooltips } from "../../helpContent";
 import type { WaitNode } from "./types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Input } from "@/components/ui/input";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
@@ -15,9 +14,7 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 
 function WaitNode({ id, data, type }: NodeProps<WaitNode>) {
   const { updateNodeData } = useReactFlow();
-  const { debuggable, editable, label } = data;
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -66,7 +63,6 @@ function WaitNode({ id, data, type }: NodeProps<WaitNode>) {
       >
         <NodeHeader
           blockLabel={label}
-          disabled={elideFromDebugging}
           editable={editable}
           nodeId={id}
           totpIdentifier={null}

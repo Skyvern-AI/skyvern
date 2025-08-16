@@ -222,7 +222,7 @@ function WorkflowRun() {
               }
             />
             <Button asChild variant="secondary">
-              <Link to={`/workflows/${workflowPermanentId}/edit`}>
+              <Link to={`/workflows/${workflowPermanentId}/debug`}>
                 <Pencil2Icon className="mr-2 h-4 w-4" />
                 Edit
               </Link>

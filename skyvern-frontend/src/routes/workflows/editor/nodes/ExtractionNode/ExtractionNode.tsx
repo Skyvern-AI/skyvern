@@ -33,7 +33,6 @@ import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
-import { useDebugStore } from "@/store/useDebugStore";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
@@ -46,10 +45,8 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
-  const { debuggable, editable, label } = data;
+  const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -114,7 +111,6 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
         >
           <NodeHeader
             blockLabel={label}
-            disabled={elideFromDebugging}
             editable={editable}
             nodeId={id}
             totpIdentifier={null}

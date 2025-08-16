@@ -4,16 +4,13 @@ import { Label } from "@/components/ui/label";
 import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { type UploadNode } from "./types";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 function UploadNode({ id, data }: NodeProps<UploadNode>) {
-  const { debuggable, editable, label } = data;
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -49,7 +46,6 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
       >
         <NodeHeader
           blockLabel={label}
-          disabled={elideFromDebugging}
           editable={editable}
           nodeId={id}
           totpIdentifier={null}

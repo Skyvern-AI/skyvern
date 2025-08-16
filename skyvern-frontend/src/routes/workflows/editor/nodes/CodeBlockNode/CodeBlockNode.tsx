@@ -4,7 +4,6 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import type { CodeBlockNode } from "./types";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
@@ -13,9 +12,7 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { updateNodeData } = useReactFlow();
-  const { debuggable, editable, label } = data;
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -55,7 +52,6 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
       >
         <NodeHeader
           blockLabel={label}
-          disabled={elideFromDebugging}
           editable={editable}
           nodeId={id}
           totpIdentifier={null}

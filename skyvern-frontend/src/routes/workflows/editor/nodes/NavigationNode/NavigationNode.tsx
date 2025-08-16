@@ -36,7 +36,6 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { useParams } from "react-router-dom";
 import { NodeHeader } from "../components/NodeHeader";
@@ -45,11 +44,10 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 
 function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const { blockLabel: urlBlockLabel } = useParams();
-  const debugStore = useDebugStore();
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
-  const { editable, debuggable, label } = data;
+  const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -58,7 +56,6 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const rerender = useRerender({ prefix: "accordian" });
   const [inputs, setInputs] = useState({
     allowDownloads: data.allowDownloads,
@@ -125,7 +122,6 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
           <NodeHeader
             blockLabel={label}
             editable={editable}
-            disabled={elideFromDebugging}
             nodeId={id}
             totpIdentifier={inputs.totpIdentifier}
             totpUrl={inputs.totpVerificationUrl}

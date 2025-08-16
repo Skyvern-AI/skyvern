@@ -16,7 +16,6 @@ import { useState } from "react";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Checkbox } from "@/components/ui/checkbox";
 import { getLoopNodeWidth } from "../../workflowEditorUtils";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
@@ -30,9 +29,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   if (!node) {
     throw new Error("Node not found"); // not possible
   }
-  const { debuggable, editable, label } = data;
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -109,7 +106,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
           >
             <NodeHeader
               blockLabel={label}
-              disabled={elideFromDebugging}
               editable={editable}
               nodeId={id}
               totpIdentifier={null}

@@ -6,6 +6,7 @@
  * and `re-resizable`; but I don't want to do that until it's worth the effort.)
  */
 
+import { OpenInNewWindowIcon } from "@radix-ui/react-icons";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Resizable } from "re-resizable";
 import {
@@ -74,6 +75,27 @@ function WindowsButton(props: {
     >
       {props.children ?? null}
     </button>
+  );
+}
+
+/**
+ * Button to open browser in a new tab.
+ */
+function BreakoutButton(props: { onClick: () => void }) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            className="h-[1.2rem] w-[1.25rem] opacity-50 hover:opacity-100"
+            onClick={() => props.onClick()}
+          >
+            <OpenInNewWindowIcon />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Open In New Tab</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -149,6 +171,7 @@ function FloatingWindow({
   initialWidth,
   initialHeight,
   maximized,
+  showBreakoutButton,
   showCloseButton,
   showMaximizeButton,
   showMinimizeButton,
@@ -157,6 +180,7 @@ function FloatingWindow({
   title,
   zIndex,
   // --
+  onBreakout,
   onCycle,
   onFocus,
   onBlur,
@@ -168,6 +192,7 @@ function FloatingWindow({
   initialPosition?: { x: number; y: number };
   initialWidth?: number;
   maximized?: boolean;
+  showBreakoutButton?: boolean;
   showCloseButton?: boolean;
   showMaximizeButton?: boolean;
   showMinimizeButton?: boolean;
@@ -176,6 +201,7 @@ function FloatingWindow({
   title: string;
   zIndex?: number;
   // --
+  onBreakout?: () => void;
   onCycle?: () => void;
   onFocus?: () => void;
   onBlur?: () => void;
@@ -469,6 +495,10 @@ function FloatingWindow({
     }, 1000);
   };
 
+  const breakout = () => {
+    onBreakout?.();
+  };
+
   const cycle = () => {
     onCycle?.();
   };
@@ -536,8 +566,8 @@ function FloatingWindow({
             pointerEvents: "auto",
             overflow: "hidden",
           }}
-          className={cn("border-2 border-gray-700", {
-            "hover:border-slate-500": !isMaximized,
+          className={cn("rounded-xl border border-slate-700", {
+            "hover:border-slate-600": !isMaximized,
           })}
           handleStyles={{
             bottomLeft: {
@@ -621,7 +651,7 @@ function FloatingWindow({
           >
             <div
               className={cn(
-                "my-window-header flex h-[3rem] w-full cursor-move items-center justify-start gap-2 bg-[#131519] p-3",
+                "my-window-header flex h-[3rem] w-full cursor-move items-center justify-start gap-2 bg-slate-elevation3 p-3",
               )}
             >
               {os === "macOS" ? (
@@ -655,7 +685,12 @@ function FloatingWindow({
                     )}
                     {showPowerButton && <PowerButton onClick={() => cycle()} />}
                   </div>
-                  <div className="ml-auto">{title}</div>
+                  <div className="ml-auto flex items-center justify-start gap-2">
+                    {showBreakoutButton && (
+                      <BreakoutButton onClick={() => breakout()} />
+                    )}
+                    {title}
+                  </div>
                   {showReloadButton && (
                     <ReloadButton
                       isReloading={isReloading}
