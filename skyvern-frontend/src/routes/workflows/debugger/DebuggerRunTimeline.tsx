@@ -1,3 +1,4 @@
+import { useParams } from "react-router-dom";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsFinalized } from "@/routes/tasks/types";
@@ -17,6 +18,7 @@ import {
   WorkflowRunOverviewActiveElement,
 } from "@/routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunTimelineBlockItem } from "@/routes/workflows/workflowRun/WorkflowRunTimelineBlockItem";
+import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -25,12 +27,25 @@ type Props = {
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
 };
 
+function Step({ n, children }: { n: number; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-center gap-2">
+      <div className="flex h-[4rem] w-[4rem] items-center justify-center rounded-full bg-slate-elevation3 px-4 py-3 text-lg font-bold">
+        {n}
+      </div>
+      <div className="flex-1">{children}</div>
+    </div>
+  );
+}
+
 function DebuggerRunTimeline({
   activeItem,
   onObserverThoughtCardSelected,
   onActionItemSelected,
   onBlockItemSelected,
 }: Props) {
+  const { workflowPermanentId } = useParams();
+  const { data: workflow } = useWorkflowQuery({ workflowPermanentId }!);
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunQuery();
 
@@ -41,23 +56,61 @@ function DebuggerRunTimeline({
     return <Skeleton className="h-full w-full" />;
   }
 
+  const blocks = workflow?.workflow_definition.blocks ?? [];
+
+  const getStarted =
+    blocks.length === 0 ? (
+      <div>
+        Hi! 👋 To get started, add a block to your workflow. You can do that by
+        clicking the round plus button beneath the Start block, on the left
+      </div>
+    ) : null;
+
+  const runABlock = (
+    <div>
+      To run a single block, click the play button on that block. We'll run the
+      block in the browser, live!
+    </div>
+  );
+
+  const runWorkflow = (
+    <div>
+      To run your entire workflow, click the large Run button, top right.
+    </div>
+  );
+
+  const addBlocks = (
+    <div>
+      Not finished? Add a block to your workflow by clicking the round plus
+      button before or after any other block.
+    </div>
+  );
+
+  const removeBlocks = (
+    <div>
+      Too much? On the top right of each block is an ellipsis (...). Click that
+      and select "Delete" to remove the block.
+    </div>
+  );
+
+  const steps = [
+    getStarted,
+    runABlock,
+    runWorkflow,
+    getStarted === null ? addBlocks : null,
+    getStarted === null ? removeBlocks : null,
+  ].filter((step) => step);
+
   if (!workflowRun || !workflowRunTimeline) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center rounded-xl bg-[#020817] p-12">
-        <div className="flex h-full w-full flex-col items-center justify-center gap-4">
-          <div>
-            Hi! 👋 We're experimenting with a new feature called debugger.
-          </div>
-          <div>
-            This debugger allows you to see the state of your workflow in a live
-            browser.
-          </div>
-          <div>
-            You can run individual blocks, instead of the whole workflow.
-          </div>
-          <div>
-            To get started, press the play button on a block in your workflow.
-          </div>
+        <div className="flex h-full w-full flex-col items-center justify-around gap-4">
+          {getStarted === null && <div>This is going to be awesome! 🤗</div>}
+          {steps.map((step, index) => (
+            <Step key={index} n={index + 1}>
+              {step}
+            </Step>
+          ))}
         </div>
       </div>
     );

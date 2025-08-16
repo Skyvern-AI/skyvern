@@ -34,7 +34,6 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
-import { useDebugStore } from "@/store/useDebugStore";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { cn } from "@/util/utils";
 import { useParams } from "react-router-dom";
@@ -53,7 +52,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
-  const { editable, debuggable, label } = data;
+  const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
   const [inputs, setInputs] = useState({
     url: data.url,
@@ -69,7 +68,6 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
     engine: data.engine,
   });
   const { blockLabel: urlBlockLabel } = useParams();
-  const debugStore = useDebugStore();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -77,7 +75,6 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const rerender = useRerender({ prefix: "accordian" });
 
   const nodes = useNodes<AppNode>();
@@ -125,7 +122,6 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
         >
           <NodeHeader
             blockLabel={label}
-            disabled={elideFromDebugging}
             editable={editable}
             nodeId={id}
             totpIdentifier={inputs.totpIdentifier}

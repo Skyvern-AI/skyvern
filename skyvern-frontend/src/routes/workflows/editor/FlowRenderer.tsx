@@ -485,8 +485,7 @@ function FlowRenderer({
    * TODO(jdo): hack
    */
   const getXLock = () => {
-    const hasForLoopNode = nodes.some((node) => node.type === "loop");
-    return hasForLoopNode ? 24 : 104;
+    return 24;
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {

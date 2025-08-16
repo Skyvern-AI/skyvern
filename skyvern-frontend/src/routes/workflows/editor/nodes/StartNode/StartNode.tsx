@@ -148,21 +148,23 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           />
                         </div>
                       </div>
-                      <div className="space-y-2">
-                        <div className="flex gap-2">
-                          <Label>Script Key</Label>
-                          <HelpTooltip content="A constant string or templated name, comprised of one or more of your parameters. It's the unique key for a workflow script." />
+                      {inputs.useScriptCache && (
+                        <div className="space-y-2">
+                          <div className="flex gap-2">
+                            <Label>Script Key</Label>
+                            <HelpTooltip content="A constant string or templated name, comprised of one or more of your parameters. It's the unique key for a workflow script." />
+                          </div>
+                          <Input
+                            value={inputs.scriptCacheKey ?? ""}
+                            placeholder="my-{{param1}}-{{param2}}-key"
+                            onChange={(event) => {
+                              const value = (event.target.value ?? "").trim();
+                              const v = value.length ? value : null;
+                              handleChange("scriptCacheKey", v);
+                            }}
+                          />
                         </div>
-                        <Input
-                          value={inputs.scriptCacheKey ?? ""}
-                          placeholder="my-{param1}-{param2}-key"
-                          onChange={(event) => {
-                            const value = (event.target.value ?? "").trim();
-                            const v = value.length ? value : null;
-                            handleChange("scriptCacheKey", v);
-                          }}
-                        />
-                      </div>
+                      )}
                     </OrgWalled>
                     <div className="space-y-2">
                       <div className="flex items-center gap-2">
