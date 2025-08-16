@@ -477,6 +477,10 @@ class SkyvernFrame:
         js_script = "([element]) => getSelectOptions(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
 
+    async def get_element_dom_depth(self, element: ElementHandle) -> int:
+        js_script = "([element]) => getElementDomDepth(element)"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
+
     @TraceManager.traced_async()
     async def build_tree_from_body(
         self,
@@ -498,6 +502,19 @@ class SkyvernFrame:
         js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
         return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
+        )
+
+    @TraceManager.traced_async()
+    async def build_tree_from_element(
+        self,
+        starter: ElementHandle,
+        frame: str,
+        full_tree: bool = False,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+    ) -> tuple[list[dict], list[dict]]:
+        js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
+        return await self.evaluate(
+            frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
         )
 
     async def safe_wait_for_animation_end(self, timeout_ms: float = 3000) -> None:

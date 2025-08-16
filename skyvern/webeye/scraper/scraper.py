@@ -257,16 +257,16 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     elements: list[dict]
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
-    id_to_css_dict: dict[str, str]
-    id_to_element_hash: dict[str, str]
-    hash_to_element_ids: dict[str, list[str]]
+    id_to_css_dict: dict[str, str] = {}
+    id_to_element_hash: dict[str, str] = {}
+    hash_to_element_ids: dict[str, list[str]] = {}
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     economy_element_tree: list[dict] | None = None
     last_used_element_tree: list[dict] | None = None
-    screenshots: list[bytes]
-    url: str
-    html: str
+    screenshots: list[bytes] = []
+    url: str = ""
+    html: str = ""
     extracted_text: str | None = None
     window_dimension: dict[str, int] | None = None
     _browser_state: BrowserState = PrivateAttr()
