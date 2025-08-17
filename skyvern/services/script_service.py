@@ -1,14 +1,19 @@
+import asyncio
 import base64
 import hashlib
+import importlib.util
 import os
 import subprocess
 from datetime import datetime
+from typing import Any
 
 import structlog
 from fastapi import BackgroundTasks, HTTPException
 
+from skyvern.core.script_generations.script_run_context_manager import script_run_context_manager
 from skyvern.exceptions import ScriptNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.scripts import CreateScriptResponse, FileNode, ScriptFileCreate
 
 LOG = structlog.get_logger(__name__)
@@ -204,3 +209,101 @@ async def execute_script(
     if background_tasks:
         background_tasks.add_task(subprocess.run, ["python", f"{script.script_id}/main.py"])
     LOG.info("Script executed successfully", script_id=script_id)
+
+
+async def _run_cached_function(cache_key: str) -> None:
+    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    if cached_fn:
+        # TODO: handle exceptions here and fall back to AI run in case of error
+        run_context = script_run_context_manager.ensure_run_context()
+        await cached_fn(page=run_context.page, context=run_context)
+    else:
+        raise Exception(f"Cache key {cache_key} not found")
+
+
+async def run_task(
+    prompt: str,
+    url: str | None = None,
+    max_steps: int | None = None,
+    cache_key: str | None = None,
+) -> None:
+    if cache_key:
+        await _run_cached_function(cache_key)
+    else:
+        raise Exception("Cache key is required to run task block in a script")
+
+
+async def download(
+    prompt: str,
+    url: str | None = None,
+    max_steps: int | None = None,
+    cache_key: str | None = None,
+) -> None:
+    if cache_key:
+        await _run_cached_function(cache_key)
+    else:
+        raise Exception("Cache key is required to run task block in a script")
+
+
+async def action(
+    prompt: str,
+    url: str | None = None,
+    max_steps: int | None = None,
+    cache_key: str | None = None,
+) -> None:
+    if cache_key:
+        await _run_cached_function(cache_key)
+    else:
+        raise Exception("Cache key is required to run task block in a script")
+
+
+async def login(
+    prompt: str,
+    url: str | None = None,
+    max_steps: int | None = None,
+    cache_key: str | None = None,
+) -> None:
+    if cache_key:
+        await _run_cached_function(cache_key)
+    else:
+        raise Exception("Cache key is required to run task block in a script")
+
+
+async def extract(
+    prompt: str,
+    url: str | None = None,
+    max_steps: int | None = None,
+    cache_key: str | None = None,
+) -> None:
+    if cache_key:
+        await _run_cached_function(cache_key)
+    else:
+        raise Exception("Cache key is required to run task block in a script")
+
+
+async def wait(seconds: int) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def run_script(path: str, parameters: dict[str, Any] | None = None) -> None:
+    # register the script run
+    run_id = "123"
+    skyvern_context.set(skyvern_context.SkyvernContext(run_id=run_id))
+    # run the script as subprocess; pass the parameters and run_id to the script
+
+    # Dynamically import the script at the given path
+    spec = importlib.util.spec_from_file_location("user_script", path)
+    if not spec or not spec.loader:
+        raise Exception(f"Failed to import script from {path}")
+    user_script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(user_script)
+
+    # Call run_workflow from the imported module
+    if hasattr(user_script, "run_workflow"):
+        # If parameters is None, pass an empty dict
+        if parameters:
+            await user_script.run_workflow(parameters=parameters)
+        else:
+            await user_script.run_workflow()
+    else:
+        raise Exception(f"No 'run_workflow' function found in {path}")
