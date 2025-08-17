@@ -81,6 +81,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -92,6 +93,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -103,6 +105,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -591,6 +594,7 @@ if settings.ENABLE_AZURE_GPT5:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
 
@@ -615,6 +619,7 @@ if settings.ENABLE_AZURE_GPT5_MINI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
 
@@ -639,6 +644,7 @@ if settings.ENABLE_AZURE_GPT5_NANO:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
 

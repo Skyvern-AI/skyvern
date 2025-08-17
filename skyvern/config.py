@@ -141,6 +141,7 @@ class Settings(BaseSettings):
     ENABLE_OPENAI_COMPATIBLE: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
+    GPT5_REASONING_EFFORT: str | None = "minimal"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
