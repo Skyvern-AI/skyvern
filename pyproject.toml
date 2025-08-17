@@ -17,7 +17,7 @@ python-multipart = "^0.0.18"
 toml = "^0.10.2"
 jinja2 = "^3.1.2"
 uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = ">=1.73.6"
+litellm = ">=1.75.8"
 playwright = [
     {version = ">1.46.0", python = ">=3.12,<3.14"},
     {version = "=1.46.0", python = ">=3.11,<3.12"}
