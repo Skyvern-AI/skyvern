@@ -2310,7 +2310,7 @@ class WorkflowService:
                 file_name=codegen_input.file_name,
                 workflow_run_request=codegen_input.workflow_run,
                 workflow=codegen_input.workflow,
-                tasks=codegen_input.workflow_blocks,
+                blocks=codegen_input.workflow_blocks,
                 actions_by_task=codegen_input.actions_by_task,
                 organization_id=workflow.organization_id,
                 script_id=created_script.script_id,

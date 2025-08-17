@@ -63,11 +63,6 @@ class SkyvernPage:
 
     @classmethod
     async def create(cls) -> SkyvernPage:
-        # set up skyvern context if not already set
-        current_skyvern_context = skyvern_context.current()
-        if not current_skyvern_context:
-            skyvern_context.set(skyvern_context.SkyvernContext())
-
         # initialize browser state
         browser_state = await app.BROWSER_MANAGER.get_or_create_for_script()
         scraped_page = await scrape_website(
@@ -78,6 +73,7 @@ class SkyvernPage:
             max_screenshot_number=settings.MAX_NUM_SCREENSHOTS,
             draw_boxes=True,
             scroll=True,
+            support_empty_page=True,
         )
         page = await scraped_page._browser_state.must_get_working_page()
         return cls(scraped_page=scraped_page, page=page)
@@ -105,7 +101,9 @@ class SkyvernPage:
                 meta = ActionMetadata(intention, data)
                 call = ActionCall(action, args, kwargs, meta)
                 try:
-                    call.result = await fn(skyvern_page, *args, **kwargs)  # real driver call
+                    call.result = await fn(
+                        skyvern_page, *args, intention=intention, data=data, **kwargs
+                    )  # real driver call
                     return call.result
                 except Exception as e:
                     call.error = e
@@ -168,7 +166,7 @@ class SkyvernPage:
         await locator.click(timeout=5000)
 
     @action_wrap(ActionType.INPUT_TEXT)
-    async def input_text(
+    async def fill(
         self,
         xpath: str,
         text: str,
@@ -176,11 +174,60 @@ class SkyvernPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> None:
-        # if self.generate_response:
-        #     # TODO: regenerate text
-        #     pass
+        await self._input_text(xpath, text, intention, data, timeout)
+
+    @action_wrap(ActionType.INPUT_TEXT)
+    async def type(
+        self,
+        xpath: str,
+        text: str,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> None:
+        await self._input_text(xpath, text, intention, data, timeout)
+
+    async def _input_text(
+        self,
+        xpath: str,
+        text: str,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> None:
+        """Input text into an element identified by ``xpath``.
+
+        When ``intention`` and ``data`` are provided a new input text action is
+        generated via the `script-generation-input-text-generatiion` prompt.  The model returns a
+        fresh text based on the current DOM and the updated data for this run.
+        The browser then inputs the text using this newly generated text.
+
+        If the prompt generation or parsing fails for any reason we fall back to
+        inputting the originally supplied ``text``.
+        """
+        new_text = text
+
+        if intention and data:
+            try:
+                # Build the element tree of the current page for the prompt
+                skyvern_context.ensure_context()
+                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                script_generation_input_text_prompt = prompt_engine.load_prompt(
+                    template="script-generation-input-text-generatiion",
+                    intention=intention,
+                    data=payload_str,
+                )
+                json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    prompt=script_generation_input_text_prompt,
+                    prompt_name="script-generation-input-text-generatiion",
+                )
+                new_text = json_response.get("answer", text) or text
+            except Exception:
+                # If anything goes wrong, fall back to the original text
+                new_text = text
+
         locator = self.page.locator(f"xpath={xpath}")
-        await handler_utils.input_sequentially(locator, text, timeout=timeout)
+        await handler_utils.input_sequentially(locator, new_text, timeout=timeout)
 
     @action_wrap(ActionType.UPLOAD_FILE)
     async def upload_file(
@@ -306,10 +353,6 @@ class SkyvernPage:
 
 
 class RunContext:
-    """
-    Lives for one workflow run.
-    """
-
     def __init__(self, parameters: dict[str, Any], page: SkyvernPage) -> None:
         self.parameters = parameters
         self.page = page
