@@ -24,9 +24,11 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 LOG = structlog.get_logger()
 WINDOWS = os.name == "nt"
 
+
 def _safe_timestamp() -> str:
     ts = datetime.utcnow().isoformat()
     return ts.replace(":", "-") if WINDOWS else ts
+
 
 def _windows_safe_filename(name: str) -> str:
     if not WINDOWS:
@@ -34,6 +36,7 @@ def _windows_safe_filename(name: str) -> str:
     invalid = '<>:"/\\|?*'
     name = "".join("-" if ch in invalid else ch for ch in name)
     return name.rstrip(" .")
+
 
 class LocalStorage(BaseStorage):
     def __init__(self, artifact_path: str = settings.ARTIFACT_STORAGE_PATH) -> None:
