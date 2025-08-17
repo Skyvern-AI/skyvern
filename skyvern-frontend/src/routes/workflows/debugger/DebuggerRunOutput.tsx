@@ -12,12 +12,19 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import { Status } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { isTaskVariantBlock } from "../types/workflowTypes";
+import { useWebhookPayloadQuery } from "@/hooks/useWebhookPayloadQuery";
+import { useParams } from "react-router-dom";
 
 function DebuggerRunOutput() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
   const { data: workflowRun } = useWorkflowRunQuery();
+  const { workflowRunId } = useParams();
+  const { data: webhookPayload, isLoading: webhookPayloadIsLoading } = useWebhookPayloadQuery({
+    runId: workflowRunId,
+    enabled: !!workflowRunId,
+  });
 
   if (workflowRunTimelineIsLoading) {
     return <div>Loading...</div>;
@@ -168,6 +175,24 @@ function DebuggerRunOutput() {
           </div>
         </div>
       </div>
+      {webhookPayload && (
+        <div className="rounded bg-slate-elevation2 p-6">
+          <div className="space-y-4">
+            <h1 className="text-sm font-bold">Webhook Payload</h1>
+            {webhookPayloadIsLoading ? (
+              <div className="text-sm">Loading webhook payload...</div>
+            ) : (
+              <CodeEditor
+                language="json"
+                value={JSON.stringify(webhookPayload, null, 2)}
+                readOnly
+                minHeight="96px"
+                maxHeight="400px"
+              />
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
