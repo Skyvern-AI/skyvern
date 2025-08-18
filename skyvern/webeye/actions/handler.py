@@ -790,7 +790,10 @@ async def handle_click_to_download_file_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
-    download_dir = Path(get_download_dir(workflow_run_id=task.workflow_run_id, task_id=task.task_id))
+    context = skyvern_context.current()
+    download_dir = Path(
+        get_download_dir(run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id)
+    )
     list_files_before = list_files_in_directory(download_dir)
     LOG.info(
         "Number of files in download directory before click",

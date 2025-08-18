@@ -131,7 +131,9 @@ def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -
 
 def initialize_download_dir() -> str:
     context = ensure_context()
-    return get_download_dir(context.workflow_run_id, context.task_id)
+    return get_download_dir(
+        context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
+    )
 
 
 class BrowserContextCreator(Protocol):

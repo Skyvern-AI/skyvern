@@ -173,12 +173,12 @@ def unzip_files(zip_file_path: str, output_dir: str) -> None:
         zip_ref.extractall(output_dir)
 
 
-def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
-    return Path(get_download_dir(workflow_run_id=workflow_run_id, task_id=None))
+def get_path_for_workflow_download_directory(run_id: str | None) -> Path:
+    return Path(get_download_dir(run_id=run_id))
 
 
-def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
-    download_dir = f"{REPO_ROOT_DIR}/downloads/{workflow_run_id or task_id}"
+def get_download_dir(run_id: str | None) -> str:
+    download_dir = f"{REPO_ROOT_DIR}/downloads/{run_id}"
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
 

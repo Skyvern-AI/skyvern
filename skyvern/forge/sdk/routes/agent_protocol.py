@@ -1530,7 +1530,7 @@ async def get_workflow_run_with_workflow_id(
         organization_id=current_org.organization_id,
         include_cost=True,
     )
-    return_dict = workflow_run_status_response.model_dump()
+    return_dict = workflow_run_status_response.model_dump(by_alias=True)
 
     browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
@@ -1540,14 +1540,6 @@ async def get_workflow_run_with_workflow_id(
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
 
     return_dict["browser_session_id"] = browser_session_id or return_dict.get("browser_session_id")
-
-    task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
-        workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
-    )
-
-    if task_v2:
-        return_dict["task_v2"] = task_v2.model_dump(by_alias=True)
 
     return return_dict
 
