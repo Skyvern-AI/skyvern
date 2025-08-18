@@ -68,6 +68,7 @@ async def run_workflow(
     request_id: str | None = None,
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
+    block_labels: list[str] | None = None,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -88,6 +89,7 @@ async def run_workflow(
         max_steps_override=max_steps,
         browser_session_id=workflow_request.browser_session_id,
         api_key=api_key,
+        block_labels=block_labels,
     )
 
     return workflow_run

@@ -1,7 +1,8 @@
 import structlog
+from fastapi import BackgroundTasks, Request
 
-from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
 from skyvern.schemas.runs import WorkflowRunRequest
@@ -44,12 +45,15 @@ async def ensure_workflow_run(
 
 
 async def execute_blocks(
+    request: Request,
+    background_tasks: BackgroundTasks,
     api_key: str,
     block_labels: list[str],
+    workflow_id: str,
     workflow_run_id: str,
     organization: Organization,
     browser_session_id: str | None = None,
-) -> WorkflowRun:
+) -> None:
     """
     Runs one or more blocks of a workflow.
     """
@@ -61,12 +65,14 @@ async def execute_blocks(
         block_labels=block_labels,
     )
 
-    workflow_run = await app.WORKFLOW_SERVICE.execute_workflow(
-        workflow_run_id=workflow_run_id,
-        api_key=api_key,
+    await AsyncExecutorFactory.get_executor().execute_workflow(
+        request=request,
+        background_tasks=background_tasks,
         organization=organization,
-        block_labels=block_labels,
+        workflow_id=workflow_id,
+        workflow_run_id=workflow_run_id,
+        max_steps_override=None,
         browser_session_id=browser_session_id,
+        api_key=api_key,
+        block_labels=block_labels,
     )
-
-    return workflow_run

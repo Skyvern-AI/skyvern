@@ -850,6 +850,8 @@ async def retry_run_webhook(
     response_model=BlockRunResponse,
 )
 async def run_block(
+    request: Request,
+    background_tasks: BackgroundTasks,
     block_run_request: BlockRunRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
@@ -869,14 +871,15 @@ async def run_block(
 
     browser_session_id = block_run_request.browser_session_id
 
-    asyncio.create_task(
-        block_service.execute_blocks(
-            api_key=x_api_key or "",
-            block_labels=block_run_request.block_labels,
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization=organization,
-            browser_session_id=browser_session_id,
-        )
+    await block_service.execute_blocks(
+        request=request,
+        background_tasks=background_tasks,
+        api_key=x_api_key or "",
+        block_labels=block_run_request.block_labels,
+        workflow_id=block_run_request.workflow_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization=organization,
+        browser_session_id=browser_session_id,
     )
 
     return BlockRunResponse(

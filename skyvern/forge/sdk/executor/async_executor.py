@@ -38,13 +38,14 @@ class AsyncExecutor(abc.ABC):
     async def execute_workflow(
         self,
         request: Request | None,
-        background_tasks: BackgroundTasks,
+        background_tasks: BackgroundTasks | None,
         organization: Organization,
         workflow_id: str,
         workflow_run_id: str,
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
+        block_labels: list[str] | None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -147,24 +148,29 @@ class BackgroundTaskExecutor(AsyncExecutor):
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
+        block_labels: list[str] | None,
         **kwargs: dict,
     ) -> None:
-        LOG.info(
-            "Executing workflow using background task executor",
-            workflow_run_id=workflow_run_id,
-        )
-
         if background_tasks:
+            LOG.info(
+                "Executing workflow using background task executor",
+                workflow_run_id=workflow_run_id,
+            )
+
             await initialize_skyvern_state_file(
                 workflow_run_id=workflow_run_id, organization_id=organization.organization_id
             )
+
             background_tasks.add_task(
                 app.WORKFLOW_SERVICE.execute_workflow,
                 workflow_run_id=workflow_run_id,
                 api_key=api_key,
                 organization=organization,
                 browser_session_id=browser_session_id,
+                block_labels=block_labels,
             )
+        else:
+            LOG.warning("Background tasks not enabled, skipping workflow execution")
 
     async def execute_task_v2(
         self,
