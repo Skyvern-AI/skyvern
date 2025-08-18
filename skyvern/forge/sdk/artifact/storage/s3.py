@@ -195,14 +195,14 @@ class S3Storage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
-    async def save_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> None:
-        download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
+    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
+        download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         sc = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
-        base_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
+        base_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
+        )
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -225,10 +225,8 @@ class S3Storage(BaseStorage):
                 tags=tags,
             )
 
-    async def get_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[FileInfo]:
-        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
+    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
             return []

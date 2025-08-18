@@ -1155,6 +1155,11 @@ class WorkflowService:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
 
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+
+        task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
         screenshot_artifacts = []
         screenshot_urls: list[str] | None = None
@@ -1184,15 +1189,22 @@ class WorkflowService:
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
-        downloaded_files: list[FileInfo] | None = None
+        downloaded_files: list[FileInfo] = []
         downloaded_file_urls: list[str] | None = None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                context = skyvern_context.current()
                 downloaded_files = await app.STORAGE.get_downloaded_files(
                     organization_id=workflow_run.organization_id,
-                    task_id=None,
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
                 )
+                if task_v2:
+                    task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
+                        organization_id=workflow_run.organization_id,
+                        run_id=task_v2.observer_cruise_id,
+                    )
+                    if task_v2_downloaded_files:
+                        downloaded_files.extend(task_v2_downloaded_files)
                 if downloaded_files:
                     downloaded_file_urls = [file_info.url for file_info in downloaded_files]
         except asyncio.TimeoutError:
@@ -1267,6 +1279,7 @@ class WorkflowService:
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+            task_v2=task_v2,
         )
 
     async def clean_up_workflow(
@@ -1304,8 +1317,10 @@ class WorkflowService:
 
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                context = skyvern_context.current()
                 await app.STORAGE.save_downloaded_files(
-                    workflow_run.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                    organization_id=workflow_run.organization_id,
+                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(

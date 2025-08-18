@@ -739,8 +739,9 @@ class BaseTaskBlock(Block):
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_files = await app.STORAGE.get_downloaded_files(
                             organization_id=workflow_run.organization_id,
-                            task_id=updated_task.task_id,
-                            workflow_run_id=workflow_run_id,
+                            run_id=current_context.run_id
+                            if current_context and current_context.run_id
+                            else workflow_run_id or updated_task.task_id,
                         )
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
@@ -798,8 +799,9 @@ class BaseTaskBlock(Block):
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_files = await app.STORAGE.get_downloaded_files(
                             organization_id=workflow_run.organization_id,
-                            task_id=updated_task.task_id,
-                            workflow_run_id=workflow_run_id,
+                            run_id=current_context.run_id
+                            if current_context and current_context.run_id
+                            else workflow_run_id or updated_task.task_id,
                         )
 
                 except asyncio.TimeoutError:
@@ -1816,7 +1818,12 @@ class UploadToS3Block(Block):
                 self.path = file_path_parameter_value
         # if the path is WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY, use the download directory for the workflow run
         elif self.path == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
-            self.path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
+            context = skyvern_context.current()
+            self.path = str(
+                get_path_for_workflow_download_directory(
+                    context.run_id if context and context.run_id else workflow_run_id
+                ).absolute()
+            )
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
@@ -2011,7 +2018,12 @@ class FileUploadBlock(Block):
                 organization_id=organization_id,
             )
 
-        download_files_path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
+        context = skyvern_context.current()
+        download_files_path = str(
+            get_path_for_workflow_download_directory(
+                context.run_id if context and context.run_id else workflow_run_id
+            ).absolute()
+        )
 
         uploaded_uris = []
         try:
@@ -2197,7 +2209,12 @@ class SendEmailBlock(Block):
 
             if path == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
                 # if the path is WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY, use download directory for the workflow run
-                path = str(get_path_for_workflow_download_directory(workflow_run_id).absolute())
+                context = skyvern_context.current()
+                path = str(
+                    get_path_for_workflow_download_directory(
+                        context.run_id if context and context.run_id else workflow_run_id
+                    ).absolute()
+                )
                 LOG.info(
                     "SendEmailBlock: Using download directory for the workflow run",
                     workflow_run_id=workflow_run_id,
