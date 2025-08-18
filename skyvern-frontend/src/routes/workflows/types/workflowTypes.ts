@@ -216,17 +216,10 @@ export const WorkflowBlockTypes = {
   HttpRequest: "http_request",
 } as const;
 
-export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
-  "action",
-  "extraction",
-  "goto_url",
-  "login",
-  "navigation",
-  "task",
-  "task_v2",
-  "text_prompt",
-  "validation",
-]);
+// all of them
+export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set(
+  Object.values(WorkflowBlockTypes),
+);
 
 export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "action",
