@@ -29,8 +29,11 @@ type Props = {
 
 function Step({ n, children }: { n: number; children: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-center gap-2">
-      <div className="flex h-[4rem] w-[4rem] items-center justify-center rounded-full bg-slate-elevation3 px-4 py-3 text-lg font-bold">
+    <div className="relative flex items-center justify-center gap-2 rounded-lg border border-slate-600 p-4">
+      <div className="absolute right-[-1.22rem] top-[-1.22rem] flex h-[3rem] w-[3rem] items-center justify-center rounded-full border border-slate-600 bg-slate-elevation3 px-4 py-3 text-xl font-bold">
+        {n}
+      </div>
+      <div className="absolute right-[-1.25rem] top-[-1.25rem] flex h-[3rem] w-[3rem] items-center justify-center rounded-full bg-slate-elevation3 px-4 py-3 text-xl font-bold text-slate-100">
         {n}
       </div>
       <div className="flex-1">{children}</div>
@@ -68,14 +71,22 @@ function DebuggerRunTimeline({
 
   const runABlock = (
     <div>
-      To run a single block, click the play button on that block. We'll run the
-      block in the browser, live!
+      To run a single block, click the play button on that block. Skyvern will
+      run the block in the browser, live!
     </div>
   );
 
-  const runWorkflow = (
+  const adjustBrowser = (
     <div>
-      To run your entire workflow, click the large Run button, top right.
+      Need to adjust the browser to test your block again? You can click around
+      in the browser to bring Skyvern to any page (manually!)
+    </div>
+  );
+
+  const parameters = (
+    <div>
+      Want Skyvern to do different things based on your inputs? Use Parameters
+      to specify them and reference them using <code>{"{{ }}"}</code> syntax!
     </div>
   );
 
@@ -86,26 +97,21 @@ function DebuggerRunTimeline({
     </div>
   );
 
-  const removeBlocks = (
-    <div>
-      Too much? On the top right of each block is an ellipsis (...). Click that
-      and select "Delete" to remove the block.
-    </div>
-  );
-
   const steps = [
     getStarted,
     runABlock,
-    runWorkflow,
+    adjustBrowser,
+    getStarted === null ? parameters : null,
     getStarted === null ? addBlocks : null,
-    getStarted === null ? removeBlocks : null,
   ].filter((step) => step);
 
   if (!workflowRun || !workflowRunTimeline) {
     return (
-      <div className="flex h-full w-full flex-col items-center justify-center rounded-xl bg-[#020817] p-12">
+      <div className="flex h-full w-full flex-col items-center justify-center overflow-y-auto rounded-xl bg-[#020817] p-8 text-slate-300">
         <div className="flex h-full w-full flex-col items-center justify-around gap-4">
-          {getStarted === null && <div>This is going to be awesome! 🤗</div>}
+          <div className="text-center text-xl">
+            Build & Debug Complex Browser Automations
+          </div>
           {steps.map((step, index) => (
             <Step key={index} n={index + 1}>
               {step}
