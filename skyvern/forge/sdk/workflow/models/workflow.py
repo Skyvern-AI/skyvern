@@ -11,6 +11,7 @@ from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicate
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
 
 
@@ -54,12 +55,6 @@ class WorkflowDefinition(BaseModel):
 
         if duplicate_labels:
             raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
-
-
-class WorkflowStatus(StrEnum):
-    published = "published"
-    draft = "draft"
-    auto_generated = "auto_generated"
 
 
 class Workflow(BaseModel):

@@ -13,10 +13,8 @@ import string
 import textwrap
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Literal, Union
 from urllib.parse import quote, urlparse
@@ -75,7 +73,6 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoIterableValueFound,
     NoValidEmailRecipient,
 )
-from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -85,6 +82,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
 )
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -98,38 +96,6 @@ def _generate_random_string(length: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
-class BlockType(StrEnum):
-    TASK = "task"
-    TaskV2 = "task_v2"
-    FOR_LOOP = "for_loop"
-    CODE = "code"
-    TEXT_PROMPT = "text_prompt"
-    DOWNLOAD_TO_S3 = "download_to_s3"
-    UPLOAD_TO_S3 = "upload_to_s3"
-    FILE_UPLOAD = "file_upload"
-    SEND_EMAIL = "send_email"
-    FILE_URL_PARSER = "file_url_parser"
-    VALIDATION = "validation"
-    ACTION = "action"
-    NAVIGATION = "navigation"
-    EXTRACTION = "extraction"
-    LOGIN = "login"
-    WAIT = "wait"
-    FILE_DOWNLOAD = "file_download"
-    GOTO_URL = "goto_url"
-    PDF_PARSER = "pdf_parser"
-    HTTP_REQUEST = "http_request"
-
-
-class BlockStatus(StrEnum):
-    running = "running"
-    completed = "completed"
-    failed = "failed"
-    terminated = "terminated"
-    canceled = "canceled"
-    timed_out = "timed_out"
-
-
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
 # import time so it is not recreated on each block execution.
 TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
@@ -139,16 +105,6 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.canceled: BlockStatus.canceled,
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
-
-
-@dataclass(frozen=True)
-class BlockResult:
-    success: bool
-    output_parameter: OutputParameter
-    output_parameter_value: dict[str, Any] | list | str | None = None
-    status: BlockStatus | None = None
-    failure_reason: str | None = None
-    workflow_run_block_id: str | None = None
 
 
 class Block(BaseModel, abc.ABC):
@@ -2438,12 +2394,6 @@ class SendEmailBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
-
-
-class FileType(StrEnum):
-    CSV = "csv"
-    EXCEL = "excel"
-    PDF = "pdf"
 
 
 class FileParserBlock(Block):

@@ -5,7 +5,7 @@ import structlog
 
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.forge import app
-from skyvern.forge.sdk.workflow.models.block import BlockType
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
 
 LOG = structlog.get_logger(__name__)
