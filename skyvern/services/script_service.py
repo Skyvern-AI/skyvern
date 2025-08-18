@@ -3,7 +3,6 @@ import base64
 import hashlib
 import importlib.util
 import os
-import subprocess
 from datetime import datetime
 from typing import Any
 
@@ -150,6 +149,8 @@ async def create_script(
 async def execute_script(
     script_id: str,
     organization_id: str,
+    parameters: dict[str, Any] | None = None,
+    workflow_run_id: str | None = None,
     background_tasks: BackgroundTasks | None = None,
 ) -> None:
     # TODO: assume the script only has one ScriptFile called main.py
@@ -207,7 +208,11 @@ async def execute_script(
 
     # step 4: execute the script
     if background_tasks:
-        background_tasks.add_task(subprocess.run, ["python", f"{script.script_id}/main.py"])
+        if workflow_run_id and not parameters:
+            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
+            parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+            LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
+        background_tasks.add_task(run_script, parameters=parameters)
     LOG.info("Script executed successfully", script_id=script_id)
 
 
