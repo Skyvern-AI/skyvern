@@ -3,7 +3,8 @@ from datetime import datetime
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
-from skyvern.forge.sdk.schemas.workflow_runs import BlockType, WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.schemas.workflows import BlockType
 
 # Constants
 TEST_ORGANIZATION_ID = "test-org-123"

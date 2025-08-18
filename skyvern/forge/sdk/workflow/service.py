@@ -45,8 +45,6 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
-    BlockStatus,
-    BlockType,
     BlockTypeVar,
     CodeBlock,
     DownloadToS3Block,
@@ -94,16 +92,18 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
-    WorkflowStatus,
-)
-from skyvern.forge.sdk.workflow.models.yaml import (
-    BLOCK_YAML_TYPES,
-    ForLoopBlockYAML,
-    WorkflowCreateYAMLRequest,
-    WorkflowDefinitionYAML,
 )
 from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.schemas.scripts import FileEncoding, ScriptFileCreate
+from skyvern.schemas.workflows import (
+    BLOCK_YAML_TYPES,
+    BlockStatus,
+    BlockType,
+    ForLoopBlockYAML,
+    WorkflowCreateYAMLRequest,
+    WorkflowDefinitionYAML,
+    WorkflowStatus,
+)
 from skyvern.services import script_service
 from skyvern.webeye.browser_factory import BrowserState
 
