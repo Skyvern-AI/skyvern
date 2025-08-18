@@ -1,4 +1,5 @@
 import abc
+from typing import Any
 
 import structlog
 from fastapi import BackgroundTasks, Request
@@ -67,7 +68,9 @@ class AsyncExecutor(abc.ABC):
         request: Request | None,
         script_id: str,
         organization_id: str,
-        background_tasks: BackgroundTasks | None,
+        parameters: dict[str, Any] | None = None,
+        workflow_run_id: str | None = None,
+        background_tasks: BackgroundTasks | None = None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -214,7 +217,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
         request: Request | None,
         script_id: str,
         organization_id: str,
-        background_tasks: BackgroundTasks | None,
+        parameters: dict[str, Any] | None = None,
+        workflow_run_id: str | None = None,
+        background_tasks: BackgroundTasks | None = None,
         **kwargs: dict,
     ) -> None:
         if background_tasks:
@@ -222,5 +227,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 script_service.execute_script,
                 script_id=script_id,
                 organization_id=organization_id,
+                parameters=parameters,
+                workflow_run_id=workflow_run_id,
                 background_tasks=background_tasks,
             )

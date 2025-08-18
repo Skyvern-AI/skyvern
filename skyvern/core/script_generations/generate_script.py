@@ -37,7 +37,7 @@ LOG = structlog.get_logger(__name__)
 
 ACTION_MAP = {
     "click": "click",
-    "input_text": "input_text",
+    "input_text": "fill",
     "upload_file": "upload_file",
     "select_option": "select_option",
     "goto": "goto",
@@ -54,6 +54,8 @@ ACTION_MAP = {
 ACTIONS_WITH_XPATH = [
     "click",
     "input_text",
+    "type",
+    "fill",
     "upload_file",
     "select_option",
 ]
@@ -170,7 +172,7 @@ def _action_to_stmt(act: dict[str, Any]) -> cst.BaseStatement:
             )
         )
 
-    if method == "input_text":
+    if method in ["type", "fill"]:
         args.append(
             cst.Arg(
                 keyword=cst.Name("text"),
@@ -197,6 +199,17 @@ def _action_to_stmt(act: dict[str, Any]) -> cst.BaseStatement:
             cst.Arg(
                 keyword=cst.Name("seconds"),
                 value=_value(act["seconds"]),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    elif method == "extract":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("data_extraction_goal"),
+                value=_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -416,14 +429,6 @@ def _build_action_statement(block_title: str, block: dict[str, Any]) -> cst.Simp
     """Build a skyvern.action statement."""
     args = [
         cst.Arg(
-            keyword=cst.Name("title"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
             keyword=cst.Name("prompt"),
             value=_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
@@ -434,6 +439,14 @@ def _build_action_statement(block_title: str, block: dict[str, Any]) -> cst.Simp
         cst.Arg(
             keyword=cst.Name("max_steps"),
             value=_value(block.get("max_steps_per_run", 30)),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("cache_key"),
+            value=_value(block_title),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -485,6 +498,14 @@ def _build_login_statement(block_title: str, block: dict[str, Any]) -> cst.Simpl
             value=_value(block.get("webhook_callback_url", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("cache_key"),
+            value=_value(block_title),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
             ),
             comma=cst.Comma(),
         ),
@@ -506,16 +527,16 @@ def _build_extract_statement(block_title: str, block: dict[str, Any]) -> cst.Sim
     """Build a skyvern.extract statement."""
     args = [
         cst.Arg(
-            keyword=cst.Name("title"),
-            value=_value(block_title),
+            keyword=cst.Name("prompt"),
+            value=_value(block.get("data_extraction_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
         cst.Arg(
-            keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            keyword=cst.Name("cache_key"),
+            value=_value(block_title),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -539,14 +560,6 @@ def _build_navigate_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     """Build a skyvern.navigate statement."""
     args = [
         cst.Arg(
-            keyword=cst.Name("title"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
             keyword=cst.Name("prompt"),
             value=_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
@@ -565,6 +578,14 @@ def _build_navigate_statement(block_title: str, block: dict[str, Any]) -> cst.Si
         cst.Arg(
             keyword=cst.Name("max_steps"),
             value=_value(block.get("max_steps_per_run", 30)),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("cache_key"),
+            value=_value(block_title),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -694,14 +715,6 @@ def _build_wait_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
 def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.for_loop statement."""
     args = [
-        cst.Arg(
-            keyword=cst.Name("title"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
         cst.Arg(
             keyword=cst.Name("prompt"),
             value=_value(block.get("navigation_goal", "")),
