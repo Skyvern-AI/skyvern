@@ -1,9 +1,10 @@
 import abc
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from skyvern.config import settings
+from skyvern.forge.sdk.workflow.exceptions import InvalidParameterKey
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileType
 from skyvern.forge.sdk.workflow.models.constants import FileStorageType
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
@@ -15,6 +16,13 @@ class ParameterYAML(BaseModel, abc.ABC):
     parameter_type: ParameterType
     key: str
     description: str | None = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, key: str) -> str:
+        if key and key[0].isdigit():
+            raise InvalidParameterKey(key)
+        return key
 
 
 class AWSSecretParameterYAML(ParameterYAML):
