@@ -333,6 +333,7 @@ function NodeHeader({
         debugSessionId: debugSession?.debug_session_id,
         browserSessionId: debugSession?.browser_session_id,
         error,
+        detail,
       });
       toast({
         variant: "destructive",
@@ -376,18 +377,20 @@ function NodeHeader({
         description: "The workflow has been successfully canceled.",
       });
     },
-    onError: (error) => {
+    onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
       log.error("Cancel block: error", {
         workflowPermanentId,
         blockLabel,
         debugSessionId: debugSession?.debug_session_id,
         browserSessionId: debugSession?.browser_session_id,
         error,
+        detail,
       });
       toast({
         variant: "destructive",
         title: "Error",
-        description: error.message,
+        description: detail ?? error.message,
       });
     },
   });
