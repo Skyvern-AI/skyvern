@@ -94,7 +94,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
-from skyvern.schemas.scripts import FileEncoding, ScriptFileCreate
+from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate
 from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     BlockStatus,
@@ -276,6 +276,24 @@ class WorkflowService:
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+
+        # Check if there's a related workflow script that should be used instead
+        workflow_script = await self._get_workflow_script(workflow, workflow_run)
+        if workflow_script is not None:
+            LOG.info(
+                "Found related workflow script, running script instead of workflow",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                organization_id=organization_id,
+                workflow_script_id=workflow_script.script_id,
+            )
+            return await self._execute_workflow_script(
+                script_id=workflow_script.script_id,
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                organization=organization,
+            )
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
@@ -2268,6 +2286,109 @@ class WorkflowService:
                 break
 
         return result
+
+    async def _get_workflow_script(self, workflow: Workflow, workflow_run: WorkflowRun) -> Script | None:
+        """
+        Check if there's a related workflow script that should be used instead of running the workflow.
+        Returns True if a script should be used, False otherwise.
+        """
+        if not workflow.generate_script:
+            return None
+        # Only check for scripts if the workflow has a cache_key
+        cache_key = workflow.cache_key or ""
+
+        try:
+            # Render the cache_key_value from workflow run parameters (same logic as generate_script_for_workflow)
+            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                workflow_run_id=workflow_run.workflow_run_id
+            )
+            parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+
+            jinja_sandbox_env = SandboxedEnvironment()
+            rendered_cache_key_value = jinja_sandbox_env.from_string(cache_key).render(parameters)
+
+            # Check if there are existing cached scripts for this workflow + cache_key_value
+            existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+                organization_id=workflow.organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                cache_key_value=rendered_cache_key_value,
+            )
+
+            if existing_scripts:
+                LOG.info(
+                    "Found cached script for workflow",
+                    workflow_id=workflow.workflow_id,
+                    cache_key_value=rendered_cache_key_value,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    script_count=len(existing_scripts),
+                )
+                return existing_scripts[0]
+
+            return None
+
+        except Exception as e:
+            LOG.warning(
+                "Failed to check for workflow script, proceeding with normal workflow execution",
+                workflow_id=workflow.workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                error=str(e),
+                exc_info=True,
+            )
+            return None
+
+    async def _execute_workflow_script(
+        self, script_id: str, workflow: Workflow, workflow_run: WorkflowRun, api_key: str, organization: Organization
+    ) -> WorkflowRun:
+        """
+        Execute the related workflow script instead of running the workflow blocks.
+        """
+
+        try:
+            # Set workflow run status to running
+            workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
+
+            # Render the cache_key_value to find the right script
+            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                workflow_run_id=workflow_run.workflow_run_id
+            )
+            parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+
+            # Execute the script using script_service
+            await script_service.execute_script(
+                script_id=script_id,
+                organization_id=organization.organization_id,
+                parameters=parameters,
+                workflow_run_id=workflow_run.workflow_run_id,
+                background_tasks=None,  # Execute synchronously
+            )
+
+            # Mark workflow run as completed
+            workflow_run = await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+
+            LOG.info(
+                "Successfully executed workflow script",
+                workflow_run_id=workflow_run.workflow_run_id,
+                script_id=script_id,
+                organization_id=organization.organization_id,
+            )
+
+            return workflow_run
+
+        except Exception as e:
+            LOG.error(
+                "Failed to execute workflow script, marking workflow run as failed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                error=str(e),
+                exc_info=True,
+            )
+
+            # Mark workflow run as failed
+            failure_reason = f"Failed to execute workflow script: {str(e)}"
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+            )
+
+            return workflow_run
 
     async def generate_script_for_workflow(
         self,

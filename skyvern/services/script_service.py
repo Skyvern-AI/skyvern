@@ -9,10 +9,13 @@ from typing import Any
 import structlog
 from fastapi import BackgroundTasks, HTTPException
 
+from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.script_run_context_manager import script_run_context_manager
-from skyvern.exceptions import ScriptNotFound
+from skyvern.exceptions import ScriptNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.schemas.scripts import CreateScriptResponse, FileNode, ScriptFileCreate
 
 LOG = structlog.get_logger(__name__)
@@ -158,6 +161,7 @@ async def execute_script(
     # step 2: get the script files
     # step 3: copy the script files to the local directory
     # step 4: execute the script
+    # step 5: TODO: close all the browser instances
 
     # step 1: get the script revision
     script = await app.DATABASE.get_script(
@@ -207,13 +211,142 @@ async def execute_script(
                 f.write(file_content)
 
     # step 4: execute the script
+    if workflow_run_id and not parameters:
+        parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
+        parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+        LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
+
     if background_tasks:
-        if workflow_run_id and not parameters:
-            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
-            parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
-            LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
-        background_tasks.add_task(run_script, parameters=parameters)
+        # Execute asynchronously in background
+        background_tasks.add_task(
+            run_script, parameters=parameters, organization_id=organization_id, workflow_run_id=workflow_run_id
+        )
+    else:
+        # Execute synchronously
+        script_path = os.path.join(script.script_id, "main.py")
+        if os.path.exists(script_path):
+            await run_script(
+                script_path, parameters=parameters, organization_id=organization_id, workflow_run_id=workflow_run_id
+            )
+        else:
+            LOG.error("Script main.py not found", script_path=script_path, script_id=script_id)
+            raise Exception(f"Script main.py not found at {script_path}")
+
     LOG.info("Script executed successfully", script_id=script_id)
+
+
+async def _create_workflow_block_run_and_task(
+    block_type: BlockType,
+    prompt: str | None = None,
+    url: str | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Create a workflow block run and optionally a task if workflow_run_id is available in context.
+    Returns (workflow_run_block_id, task_id) tuple.
+    """
+    context = skyvern_context.ensure_context()
+    workflow_run_id = context.workflow_run_id
+    organization_id = context.organization_id
+    if not context or not workflow_run_id or not organization_id:
+        return None, None
+
+    try:
+        # Create workflow run block with appropriate parameters based on block type
+        # TODO: support engine in the future
+        engine = None
+        workflow_run_block = await app.DATABASE.create_workflow_run_block(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            block_type=block_type,
+            engine=engine,
+        )
+
+        workflow_run_block_id = workflow_run_block.workflow_run_block_id
+        task_id = None
+        step_id = None
+
+        # Create task for task-based blocks
+        if block_type in SCRIPT_TASK_BLOCKS:
+            # Create task
+            task = await app.DATABASE.create_task(
+                # fix HACK: changed the type of url to str | None to support None url. url is not used in the script right now.
+                url=url or "",
+                title=f"Script {block_type.value} task",
+                navigation_goal=prompt,
+                data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
+                navigation_payload={},
+                status="running",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+            )
+
+            task_id = task.task_id
+
+            # create a single step for the task
+            step = await app.DATABASE.create_step(
+                task_id=task_id,
+                order=0,
+                retry_index=0,
+                organization_id=organization_id,
+            )
+            step_id = step.step_id
+
+            # Update workflow run block with task_id
+            await app.DATABASE.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                task_id=task_id,
+                organization_id=organization_id,
+            )
+
+        context.step_id = step_id
+        context.task_id = task_id
+
+        return workflow_run_block_id, task_id
+
+    except Exception as e:
+        LOG.warning(
+            "Failed to create workflow block run and task",
+            error=str(e),
+            block_type=block_type,
+            workflow_run_id=context.workflow_run_id,
+            exc_info=True,
+        )
+        return None, None
+
+
+async def _update_workflow_block_status(
+    workflow_run_block_id: str,
+    status: BlockStatus,
+    task_id: str | None = None,
+    task_status: TaskStatus = TaskStatus.completed,
+    failure_reason: str | None = None,
+) -> None:
+    """Update the status of a workflow run block."""
+    try:
+        context = skyvern_context.current()
+        if not context or not context.organization_id:
+            return
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=context.organization_id if context else None,
+            status=status,
+            failure_reason=failure_reason,
+        )
+        if task_id:
+            await app.DATABASE.update_task(
+                task_id=task_id,
+                organization_id=context.organization_id,
+                status=task_status,
+                failure_reason=failure_reason,
+            )
+    except Exception as e:
+        LOG.warning(
+            "Failed to update workflow block status",
+            workflow_run_block_id=workflow_run_block_id,
+            status=status,
+            error=str(e),
+            exc_info=True,
+        )
 
 
 async def _run_cached_function(cache_key: str) -> None:
@@ -232,9 +365,41 @@ async def run_task(
     max_steps: int | None = None,
     cache_key: str | None = None,
 ) -> None:
+    # Auto-create workflow block run and task if workflow_run_id is available
+    workflow_run_block_id, task_id = await _create_workflow_block_run_and_task(
+        block_type=BlockType.TASK,
+        prompt=prompt,
+        url=url,
+    )
+
     if cache_key:
-        await _run_cached_function(cache_key)
+        try:
+            await _run_cached_function(cache_key)
+
+            # Update block status to completed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+
+        except Exception as e:
+            # Update block status to failed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=str(e),
+                )
+            raise
     else:
+        if workflow_run_block_id:
+            await _update_workflow_block_status(
+                workflow_run_block_id,
+                BlockStatus.failed,
+                task_id=task_id,
+                task_status=TaskStatus.failed,
+                failure_reason="Cache key is required",
+            )
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -244,9 +409,41 @@ async def download(
     max_steps: int | None = None,
     cache_key: str | None = None,
 ) -> None:
+    # Auto-create workflow block run and task if workflow_run_id is available
+    workflow_run_block_id, task_id = await _create_workflow_block_run_and_task(
+        block_type=BlockType.FILE_DOWNLOAD,
+        prompt=prompt,
+        url=url,
+    )
+
     if cache_key:
-        await _run_cached_function(cache_key)
+        try:
+            await _run_cached_function(cache_key)
+
+            # Update block status to completed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+
+        except Exception as e:
+            # Update block status to failed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=str(e),
+                )
+            raise
     else:
+        if workflow_run_block_id:
+            await _update_workflow_block_status(
+                workflow_run_block_id,
+                BlockStatus.failed,
+                task_id=task_id,
+                task_status=TaskStatus.failed,
+                failure_reason="Cache key is required",
+            )
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -256,9 +453,41 @@ async def action(
     max_steps: int | None = None,
     cache_key: str | None = None,
 ) -> None:
+    # Auto-create workflow block run and task if workflow_run_id is available
+    workflow_run_block_id, task_id = await _create_workflow_block_run_and_task(
+        block_type=BlockType.ACTION,
+        prompt=prompt,
+        url=url,
+    )
+
     if cache_key:
-        await _run_cached_function(cache_key)
+        try:
+            await _run_cached_function(cache_key)
+
+            # Update block status to completed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+
+        except Exception as e:
+            # Update block status to failed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=str(e),
+                )
+            raise
     else:
+        if workflow_run_block_id:
+            await _update_workflow_block_status(
+                workflow_run_block_id,
+                BlockStatus.failed,
+                task_id=task_id,
+                task_status=TaskStatus.failed,
+                failure_reason="Cache key is required",
+            )
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -268,9 +497,41 @@ async def login(
     max_steps: int | None = None,
     cache_key: str | None = None,
 ) -> None:
+    # Auto-create workflow block run and task if workflow_run_id is available
+    workflow_run_block_id, task_id = await _create_workflow_block_run_and_task(
+        block_type=BlockType.LOGIN,
+        prompt=prompt,
+        url=url,
+    )
+
     if cache_key:
-        await _run_cached_function(cache_key)
+        try:
+            await _run_cached_function(cache_key)
+
+            # Update block status to completed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+
+        except Exception as e:
+            # Update block status to failed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=str(e),
+                )
+            raise
     else:
+        if workflow_run_block_id:
+            await _update_workflow_block_status(
+                workflow_run_block_id,
+                BlockStatus.failed,
+                task_id=task_id,
+                task_status=TaskStatus.failed,
+                failure_reason="Cache key is required",
+            )
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -280,22 +541,83 @@ async def extract(
     max_steps: int | None = None,
     cache_key: str | None = None,
 ) -> None:
+    # Auto-create workflow block run and task if workflow_run_id is available
+    workflow_run_block_id, task_id = await _create_workflow_block_run_and_task(
+        block_type=BlockType.EXTRACTION,
+        prompt=prompt,
+        url=url,
+    )
+
     if cache_key:
-        await _run_cached_function(cache_key)
+        try:
+            await _run_cached_function(cache_key)
+
+            # Update block status to completed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+
+        except Exception as e:
+            # Update block status to failed if workflow block was created
+            if workflow_run_block_id:
+                await _update_workflow_block_status(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=str(e),
+                )
+            raise
     else:
+        if workflow_run_block_id:
+            await _update_workflow_block_status(
+                workflow_run_block_id,
+                BlockStatus.failed,
+                task_id=task_id,
+                task_status=TaskStatus.failed,
+                failure_reason="Cache key is required",
+            )
         raise Exception("Cache key is required to run task block in a script")
 
 
 async def wait(seconds: int) -> None:
-    await asyncio.sleep(seconds)
+    # Auto-create workflow block run if workflow_run_id is available (wait block doesn't create tasks)
+    workflow_run_block_id, _ = await _create_workflow_block_run_and_task(block_type=BlockType.WAIT)
+
+    try:
+        await asyncio.sleep(seconds)
+
+        # Update block status to completed if workflow block was created
+        if workflow_run_block_id:
+            await _update_workflow_block_status(workflow_run_block_id, BlockStatus.completed)
+
+    except Exception as e:
+        # Update block status to failed if workflow block was created
+        if workflow_run_block_id:
+            await _update_workflow_block_status(workflow_run_block_id, BlockStatus.failed, failure_reason=str(e))
+        raise
 
 
-async def run_script(path: str, parameters: dict[str, Any] | None = None) -> None:
+async def run_script(
+    path: str,
+    parameters: dict[str, Any] | None = None,
+    organization_id: str | None = None,
+    workflow_run_id: str | None = None,
+) -> None:
     # register the script run
-    run_id = "123"
-    skyvern_context.set(skyvern_context.SkyvernContext(run_id=run_id))
-    # run the script as subprocess; pass the parameters and run_id to the script
+    context = skyvern_context.current()
+    if not context:
+        context = skyvern_context.ensure_context()
+        skyvern_context.set(skyvern_context.SkyvernContext())
+    if workflow_run_id and organization_id:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        if not workflow_run:
+            raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+        context.workflow_run_id = workflow_run_id
+        context.organization_id = organization_id
 
+    # run the script as subprocess; pass the parameters and run_id to the script
     # Dynamically import the script at the given path
     spec = importlib.util.spec_from_file_location("user_script", path)
     if not spec or not spec.loader:

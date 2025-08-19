@@ -872,6 +872,12 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
+
+            # Update context with step_id for auto action/screenshot creation
+            context = skyvern_context.current()
+            if context:
+                context.step_id = step.step_id
+
             step = await self.update_step(step=step, status=StepStatus.running)
             await app.AGENT_FUNCTION.prepare_step_execution(
                 organization=organization, task=task, step=step, browser_state=browser_state

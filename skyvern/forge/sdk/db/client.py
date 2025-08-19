@@ -139,11 +139,12 @@ class AgentDB:
         self,
         url: str,
         title: str | None,
-        complete_criterion: str | None,
-        terminate_criterion: str | None,
         navigation_goal: str | None,
         data_extraction_goal: str | None,
         navigation_payload: dict[str, Any] | list | str | None,
+        status: str = "created",
+        complete_criterion: str | None = None,
+        terminate_criterion: str | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -166,7 +167,7 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 new_task = TaskModel(
-                    status="created",
+                    status=status,
                     task_type=task_type,
                     url=url,
                     title=title,
