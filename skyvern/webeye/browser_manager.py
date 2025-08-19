@@ -423,6 +423,6 @@ class BrowserManager:
         return browser_state
 
     def get_for_script(self, script_id: str | None = None) -> BrowserState | None:
-        if script_id and script_id in self.pages:
-            return self.pages[script_id]
-        return None
+        if not script_id:
+            return None
+        return self.pages.get(script_id)
