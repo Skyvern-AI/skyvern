@@ -376,7 +376,9 @@ class ForgeAgent:
         try:
             if task.workflow_run_id:
                 list_files_before = list_files_in_directory(
-                    get_path_for_workflow_download_directory(task.workflow_run_id)
+                    get_path_for_workflow_download_directory(
+                        context.run_id if context and context.run_id else task.workflow_run_id
+                    )
                 )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await app.AGENT_FUNCTION.validate_step_execution(task, step)
@@ -457,7 +459,9 @@ class ForgeAgent:
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
-                workflow_download_directory = get_path_for_workflow_download_directory(task.workflow_run_id)
+                workflow_download_directory = get_path_for_workflow_download_directory(
+                    context.run_id if context and context.run_id else task.workflow_run_id
+                )
 
                 downloading_files: list[Path] = list_downloading_files_in_directory(workflow_download_directory)
                 if len(downloading_files) > 0:
@@ -2219,8 +2223,10 @@ class ForgeAgent:
         if task.organization_id:
             try:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                    context = skyvern_context.current()
                     await app.STORAGE.save_downloaded_files(
-                        task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
+                        organization_id=task.organization_id,
+                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
@@ -2391,8 +2397,10 @@ class ForgeAgent:
         if task.organization_id:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    context = skyvern_context.current()
                     downloaded_files = await app.STORAGE.get_downloaded_files(
-                        organization_id=task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
+                        organization_id=task.organization_id,
+                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(

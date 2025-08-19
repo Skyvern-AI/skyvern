@@ -1,4 +1,5 @@
 import { SaveIcon } from "@/components/icons/SaveIcon";
+import { BrowserIcon } from "@/components/icons/BrowserIcon";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -10,7 +11,6 @@ import {
   ChevronDownIcon,
   ChevronUpIcon,
   CopyIcon,
-  Crosshair1Icon,
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
@@ -103,21 +103,36 @@ function WorkflowHeader({
           </Button>
         ) : (
           <>
-            <Button
-              size="lg"
-              variant={debugStore.isDebugMode ? "default" : "tertiary"}
-              disabled={workflowRunIsRunningOrQueued}
-              onClick={() => {
-                if (debugStore.isDebugMode) {
-                  navigate(`/workflows/${workflowPermanentId}/edit`);
-                } else {
-                  navigate(`/workflows/${workflowPermanentId}/debug`);
-                }
-              }}
-            >
-              <Crosshair1Icon className="mr-2 h-6 w-6" />
-              {debugStore.isDebugMode ? "End Debugging" : "Start Debugging"}
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant={debugStore.isDebugMode ? "default" : "tertiary"}
+                    className="size-10"
+                    disabled={workflowRunIsRunningOrQueued}
+                    onClick={() => {
+                      if (debugStore.isDebugMode) {
+                        navigate(`/workflows/${workflowPermanentId}/edit`);
+                      } else {
+                        navigate(`/workflows/${workflowPermanentId}/debug`);
+                      }
+                    }}
+                  >
+                    {debugStore.isDebugMode ? (
+                      <BrowserIcon className="h-6 w-6" />
+                    ) : (
+                      <BrowserIcon className="h-6 w-6" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {debugStore.isDebugMode
+                    ? "Turn off Browser"
+                    : "Turn on Browser"}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>

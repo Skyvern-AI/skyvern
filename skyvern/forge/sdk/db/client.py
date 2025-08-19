@@ -85,7 +85,6 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, Tho
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenCreditCardDataParameter,
@@ -103,10 +102,10 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
-    WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.models import AgentStepOutput
 

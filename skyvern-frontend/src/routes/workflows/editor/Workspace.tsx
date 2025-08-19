@@ -114,8 +114,10 @@ function Workspace({
   ]);
 
   // ---start fya: https://github.com/frontyardart
+  const hasForLoopNode = nodes.some((node) => node.type === "loop");
+
   const initialBrowserPosition = {
-    x: 600,
+    x: hasForLoopNode ? 600 : 520,
     y: 132,
   };
 
@@ -142,6 +144,18 @@ function Workspace({
   });
 
   const workflowChangesStore = useWorkflowHasChangesStore();
+
+  /**
+   * Open a new tab (not window) with the browser session URL.
+   */
+  const handleOnBreakout = () => {
+    if (activeDebugSession) {
+      const pbsId = activeDebugSession.browser_session_id;
+      if (pbsId) {
+        window.open(`${location.origin}/browser-session/${pbsId}`, "_blank");
+      }
+    }
+  };
 
   const handleOnCycle = () => {
     setOpenDialogue(true);
@@ -435,8 +449,14 @@ function Workspace({
       {/* sub panels */}
       {workflowPanelState.active && (
         <div
-          className="absolute right-6 top-[7.75rem]"
-          style={{ zIndex: rankedItems.dropdown ?? 2 }}
+          className="absolute right-6 top-[8.5rem]"
+          style={{
+            height:
+              workflowPanelState.content === "nodeLibrary"
+                ? "calc(100vh - 9.5rem)"
+                : "unset",
+            zIndex: rankedItems.dropdown ?? 2,
+          }}
           onMouseDownCapture={() => {
             promote("dropdown");
           }}
@@ -471,7 +491,7 @@ function Workspace({
           }}
         >
           <div className="pointer-events-none absolute right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end bg-slate-900">
-            <div className="pointer-events-auto relative flex h-full w-full flex-col items-start overflow-hidden rounded-xl border-2 border-slate-500">
+            <div className="pointer-events-auto relative flex h-full w-full flex-col items-start overflow-hidden rounded-xl border border-slate-700">
               {workflowRunId && (
                 <SwitchBar
                   className="m-2 border-none"
@@ -530,12 +550,14 @@ function Workspace({
           initialPosition={initialBrowserPosition}
           initialWidth={initialWidth}
           initialHeight={initialHeight}
+          showBreakoutButton={activeDebugSession !== null}
           showMaximizeButton={true}
           showMinimizeButton={true}
           showPowerButton={blockLabel === undefined && showPowerButton}
           showReloadButton={true}
           zIndex={rankedItems.browserWindow ?? 4}
           // --
+          onBreakout={handleOnBreakout}
           onCycle={handleOnCycle}
           onFocus={() => promote("browserWindow")}
         >
@@ -543,8 +565,9 @@ function Workspace({
           activeDebugSession.browser_session_id &&
           !cycleBrowser.isPending ? (
             <BrowserStream
-              interactive={interactor === "human"}
+              interactive={false}
               browserSessionId={activeDebugSession.browser_session_id}
+              showControlButtons={true}
             />
           ) : (
             <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">

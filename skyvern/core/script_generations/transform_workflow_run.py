@@ -3,8 +3,9 @@ from typing import Any
 
 import structlog
 
+from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.forge import app
-from skyvern.forge.sdk.workflow.models.block import BlockType
+from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
 
 LOG = structlog.get_logger(__name__)
@@ -53,11 +54,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         block_dump = block.model_dump()
         if block.block_type == BlockType.TaskV2:
             raise ValueError("TaskV2 blocks are not supported yet")
-        if (
-            block.block_type
-            in [BlockType.TASK, BlockType.ACTION, BlockType.EXTRACTION, BlockType.LOGIN, BlockType.NAVIGATION]
-            and block.task_id
-        ):
+        if block.block_type in SCRIPT_TASK_BLOCKS and block.task_id:
             task = await app.DATABASE.get_task(task_id=block.task_id, organization_id=organization_id)
             if not task:
                 LOG.warning(f"Task {block.task_id} not found")

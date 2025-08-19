@@ -40,3 +40,6 @@ SCROLL_AMOUNT_MULTIPLIER = 100
 # Text input constants
 TEXT_INPUT_DELAY = 10  # 10ms between each character input
 TEXT_PRESS_MAX_LENGTH = 20
+
+# Script generation constants
+DEFAULT_SCRIPT_RUN_ID = "default"

@@ -741,7 +741,8 @@ async def handle_sequential_click_for_dropdown(
             reasoning=action.reasoning, intention=action.intention, element_id=action.element_id
         ),
         step=step,
-        scraped_page=scraped_page,
+        element_tree_builder=scraped_page,
+        skyvern_element=anchor_element,
     )
 
     if dropdown_select_context.is_date_related:
@@ -789,7 +790,10 @@ async def handle_click_to_download_file_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
-    download_dir = Path(get_download_dir(workflow_run_id=task.workflow_run_id, task_id=task.task_id))
+    context = skyvern_context.current()
+    download_dir = Path(
+        get_download_dir(run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id)
+    )
     list_files_before = list_files_in_directory(download_dir)
     LOG.info(
         "Number of files in download directory before click",
@@ -934,7 +938,8 @@ async def handle_input_text_action(
 
     input_or_select_context = await _get_input_or_select_context(
         action=action,
-        scraped_page=scraped_page,
+        element_tree_builder=scraped_page,
+        skyvern_element=skyvern_element,
         step=step,
     )
 
@@ -969,7 +974,17 @@ async def handle_input_text_action(
                 action=action,
             )
 
-        await asyncio.sleep(5)
+        try:
+            await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info(
+                "Timeout to wait for the frame to load, ignore the timeout and continue to execute the action",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=skyvern_element.get_id(),
+                action=action,
+            )
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
@@ -1110,8 +1125,19 @@ async def handle_input_text_action(
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
             return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
-    # wait 2s for blocking element to show up
-    await asyncio.sleep(2)
+    # wait for blocking element to show up
+    try:
+        await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+        await skyvern_frame.safe_wait_for_animation_end()
+    except Exception:
+        LOG.info(
+            "Timeout to wait for the frame to load, ignore the timeout and continue to execute the action",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+            action=action,
+        )
+
     try:
         blocking_element, exist = await skyvern_element.find_blocking_element(
             dom=dom, incremental_page=incremental_scraped
@@ -1538,7 +1564,7 @@ async def handle_select_option_action(
             )
 
         input_or_select_context = await _get_input_or_select_context(
-            action=action, scraped_page=scraped_page, step=step
+            action=action, element_tree_builder=scraped_page, step=step, skyvern_element=skyvern_element
         )
 
         if len(incremental_element) == 0:
@@ -2149,7 +2175,15 @@ async def choose_auto_completion_dropdown(
     try:
         await skyvern_element.press_fill(text)
         # wait for new elemnts to load
-        await asyncio.sleep(5)
+        try:
+            await asyncio.sleep(0.5)
+            await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.warning(
+                "Failed to wait for load state or animation end after input the value, will continue to get incremental element tree",
+                exc_info=True,
+            )
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -3332,26 +3366,9 @@ async def normal_select(
     action_result: List[ActionResult] = []
     is_success = False
     locator = skyvern_element.get_locator()
-
-    prompt = load_prompt_with_elements(
-        element_tree_builder=builder,
-        prompt_engine=prompt_engine,
-        template_name="parse-input-or-select-context",
-        action_reasoning=action.reasoning,
-        element_id=action.element_id,
+    input_or_select_context = await _get_input_or_select_context(
+        action=action, element_tree_builder=builder, step=step, skyvern_element=skyvern_element
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
-        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
-    )
-    json_response["intention"] = action.intention
-    input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
-        "Parsed input/select context",
-        context=input_or_select_context,
-        task_id=task.task_id,
-        step_id=step.step_id,
-    )
-
     await skyvern_element.refresh_select_options()
     options_html = skyvern_element.build_HTML()
     field_information = (
@@ -3694,10 +3711,46 @@ class AbstractActionForContextParse(BaseModel):
 
 
 async def _get_input_or_select_context(
-    action: InputTextAction | SelectOptionAction | AbstractActionForContextParse, scraped_page: ScrapedPage, step: Step
+    action: InputTextAction | SelectOptionAction | AbstractActionForContextParse,
+    skyvern_element: SkyvernElement,
+    element_tree_builder: ElementTreeBuilder,
+    step: Step,
+    ancestor_depth: int = 5,
 ) -> InputOrSelectContext:
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+    try:
+        depth = await skyvern_frame.get_element_dom_depth(await skyvern_element.get_element_handler())
+    except Exception:
+        LOG.warning("Failed to get element depth, using the original element tree", exc_info=True)
+        depth = 0
+
+    if depth > ancestor_depth:
+        # use ancestor to build the context
+        path = "/".join([".."] * ancestor_depth)
+        locator = skyvern_element.get_locator().locator(path)
+        try:
+            element_handle = await locator.element_handle(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            if element_handle is not None:
+                elements, element_tree = await skyvern_frame.build_tree_from_element(
+                    starter=element_handle,
+                    frame=skyvern_element.get_frame_id(),
+                )
+                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory()
+                element_tree = await clean_up_func(skyvern_element.get_frame(), "", copy.deepcopy(element_tree))
+                element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
+                element_tree_builder = ScrapedPage(
+                    elements=elements,
+                    element_tree=element_tree,
+                    element_tree_trimmed=element_tree_trimmed,
+                    _browser_state=None,
+                    _clean_up_func=None,
+                    _scrape_exclude=None,
+                )
+        except Exception:
+            LOG.warning("Failed to get sub element tree, using the original element tree", exc_info=True, path=path)
+
     prompt = load_prompt_with_elements(
-        element_tree_builder=scraped_page,
+        element_tree_builder=element_tree_builder,
         prompt_engine=prompt_engine,
         template_name="parse-input-or-select-context",
         action_reasoning=action.reasoning,

@@ -257,16 +257,16 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     elements: list[dict]
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
-    id_to_css_dict: dict[str, str]
-    id_to_element_hash: dict[str, str]
-    hash_to_element_ids: dict[str, list[str]]
+    id_to_css_dict: dict[str, str] = {}
+    id_to_element_hash: dict[str, str] = {}
+    hash_to_element_ids: dict[str, list[str]] = {}
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     economy_element_tree: list[dict] | None = None
     last_used_element_tree: list[dict] | None = None
-    screenshots: list[bytes]
-    url: str
-    html: str
+    screenshots: list[bytes] = []
+    url: str = ""
+    html: str = ""
     extracted_text: str | None = None
     window_dimension: dict[str, int] | None = None
     _browser_state: BrowserState = PrivateAttr()
@@ -689,6 +689,16 @@ async def add_frame_interactable_elements(
         return elements, element_tree
 
     skyvern_frame = await SkyvernFrame.create_instance(frame)
+    try:
+        await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+        await skyvern_frame.safe_wait_for_animation_end()
+    except Exception:
+        LOG.warning(
+            "Failed to wait for load state or animation end for the frame, will continue scraping",
+            frame_id=unique_id,
+            exc_info=True,
+        )
+
     frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
         frame_name=unique_id, frame_index=frame_index
     )

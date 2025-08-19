@@ -207,15 +207,11 @@ class LocalStorage(BaseStorage):
             return None
         return str(stored_folder_path)
 
-    async def save_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> None:
+    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         pass
 
-    async def get_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[FileInfo]:
-        download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
+    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        download_dir = get_download_dir(run_id=run_id)
         file_infos: list[FileInfo] = []
         files_and_folders = os.listdir(download_dir)
         for file_or_folder in files_and_folders:

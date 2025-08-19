@@ -317,10 +317,10 @@ function WorkflowNodeLibraryPanel({
 
   return (
     <div
-      className="w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
+      className="h-full w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
-      <div className="space-y-4">
+      <div className="flex h-full flex-col space-y-4">
         <header className="space-y-2">
           <div className="flex justify-between">
             <h1 className="text-lg">Block Library</h1>
@@ -355,8 +355,8 @@ function WorkflowNodeLibraryPanel({
             tabIndex={0}
           />
         </div>
-        <ScrollArea>
-          <ScrollAreaViewport className="max-h-[28rem]">
+        <ScrollArea className="h-full flex-1">
+          <ScrollAreaViewport className="h-full">
             <div className="space-y-2">
               {filteredItems.length > 0 ? (
                 filteredItems.map((item) => (
