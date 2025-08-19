@@ -4,7 +4,7 @@ import { AutoResizingTextarea } from "./AutoResizingTextarea/AutoResizingTextare
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Props = Omit<
   React.ComponentProps<typeof AutoResizingTextarea>,
@@ -18,22 +18,23 @@ type Props = Omit<
 function WorkflowBlockInputTextarea(props: Props) {
   const { maybeAcceptTitle, maybeWriteTitle } = useWorkflowTitleStore();
   const { nodeId, onChange, canWriteTitle = false, ...textAreaProps } = props;
+  const [internalValue, setInternalValue] = useState(props.value ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
     start: number;
     end: number;
   } | null>(null);
 
-  const handleOnBlur = () => {
+  useEffect(() => {
+    setInternalValue(props.value ?? "");
+  }, [props.value]);
+
+  const doOnChange = (value: string) => {
+    onChange(value);
+    maybeWriteTitle(value);
+
     if (canWriteTitle) {
       maybeAcceptTitle();
-    }
-  };
-
-  const handleOnChange = (value: string) => {
-    onChange(value);
-    if (canWriteTitle) {
-      maybeWriteTitle(value);
     }
   };
 
@@ -55,7 +56,7 @@ function WorkflowBlockInputTextarea(props: Props) {
       const newValue =
         value.substring(0, start) + parameterText + value.substring(end);
 
-      handleOnChange(newValue);
+      doOnChange(newValue);
 
       setTimeout(() => {
         if (textareaRef.current) {
@@ -65,7 +66,7 @@ function WorkflowBlockInputTextarea(props: Props) {
         }
       }, 0);
     } else {
-      handleOnChange(`${value}${parameterText}`);
+      doOnChange(`${value}${parameterText}`);
     }
   };
 
@@ -73,10 +74,13 @@ function WorkflowBlockInputTextarea(props: Props) {
     <div className="relative">
       <AutoResizingTextarea
         {...textAreaProps}
+        value={internalValue}
         ref={textareaRef}
-        onBlur={handleOnBlur}
+        onBlur={(event) => {
+          doOnChange(event.target.value);
+        }}
         onChange={(event) => {
-          handleOnChange(event.target.value);
+          setInternalValue(event.target.value);
           handleTextareaSelect();
         }}
         onClick={handleTextareaSelect}
