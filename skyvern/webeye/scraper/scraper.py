@@ -689,6 +689,16 @@ async def add_frame_interactable_elements(
         return elements, element_tree
 
     skyvern_frame = await SkyvernFrame.create_instance(frame)
+    try:
+        await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+        await skyvern_frame.safe_wait_for_animation_end()
+    except Exception:
+        LOG.warning(
+            "Failed to wait for load state or animation end for the frame, will continue scraping",
+            frame_id=unique_id,
+            exc_info=True,
+        )
+
     frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
         frame_name=unique_id, frame_index=frame_index
     )
