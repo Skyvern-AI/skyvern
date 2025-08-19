@@ -31,9 +31,9 @@ function WorkflowBlockInputTextarea(props: Props) {
 
   const doOnChange = (value: string) => {
     onChange(value);
-    maybeWriteTitle(value);
 
     if (canWriteTitle) {
+      maybeWriteTitle(value);
       maybeAcceptTitle();
     }
   };
