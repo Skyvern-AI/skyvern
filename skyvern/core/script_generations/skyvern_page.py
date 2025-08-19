@@ -10,6 +10,7 @@ from typing import Any, Callable, Literal
 from playwright.async_api import Page
 
 from skyvern.config import settings
+from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file
@@ -17,7 +18,8 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
 
@@ -64,9 +66,42 @@ class SkyvernPage:
         self._record = recorder or (lambda ac: None)
 
     @classmethod
+    async def _get_or_create_browser_state(cls) -> BrowserState:
+        context = skyvern_context.current()
+        if context and context.workflow_run_id and context.organization_id:
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=context.workflow_run_id, organization_id=context.organization_id
+            )
+            if workflow_run:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run, browser_session_id=None
+                )
+            else:
+                raise WorkflowRunNotFound(workflow_run_id=context.workflow_run_id)
+        else:
+            browser_state = await app.BROWSER_MANAGER.get_or_create_for_script()
+        return browser_state
+
+    @classmethod
+    async def _get_browser_state(cls) -> BrowserState | None:
+        context = skyvern_context.current()
+        if context and context.workflow_run_id and context.organization_id:
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=context.workflow_run_id, organization_id=context.organization_id
+            )
+            if workflow_run:
+                browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=context.workflow_run_id)
+            else:
+                raise WorkflowRunNotFound(workflow_run_id=context.workflow_run_id)
+        else:
+            browser_state = app.BROWSER_MANAGER.get_for_script()
+        return browser_state
+
+    @classmethod
     async def create(cls) -> SkyvernPage:
         # initialize browser state
-        browser_state = await app.BROWSER_MANAGER.get_or_create_for_script()
+        # TODO: add workflow_run_id or eventually script_id/script_run_id
+        browser_state = await cls._get_or_create_browser_state()
         scraped_page = await scrape_website(
             browser_state=browser_state,
             url="",
@@ -102,10 +137,7 @@ class SkyvernPage:
                 meta = ActionMetadata(intention, data)
                 call = ActionCall(action, args, kwargs, meta)
 
-                # Auto-create action before execution
-                action_record = await skyvern_page._create_action_before_execution(
-                    action_type=action, intention=intention, data=data
-                )
+                action_status = ActionStatus.completed
 
                 try:
                     call.result = await fn(
@@ -117,16 +149,23 @@ class SkyvernPage:
                     return call.result
                 except Exception as e:
                     call.error = e
-
+                    action_status = ActionStatus.failed
                     # Note: Action status would be updated to failed here if update method existed
 
                     # LLM fallback hook could go here ...
                     raise
                 finally:
                     skyvern_page._record(call)
+                    # Auto-create action before execution
+                    await skyvern_page._create_action_before_execution(
+                        action_type=action,
+                        intention=intention,
+                        status=action_status,
+                        data=data,
+                    )
 
                     # Auto-create screenshot artifact after execution
-                    await skyvern_page._create_screenshot_after_execution(action_record)
+                    await skyvern_page._create_screenshot_after_execution()
 
             return wrapper
 
@@ -136,7 +175,11 @@ class SkyvernPage:
         await self.page.goto(url)
 
     async def _create_action_before_execution(
-        self, action_type: ActionType, intention: str = "", data: str | dict[str, Any] = ""
+        self,
+        action_type: ActionType,
+        intention: str = "",
+        status: ActionStatus = ActionStatus.pending,
+        data: str | dict[str, Any] = "",
     ) -> Action | None:
         """Create an action record in the database before execution if task_id and step_id are available."""
         try:
@@ -144,9 +187,10 @@ class SkyvernPage:
             if not context or not context.task_id or not context.step_id:
                 return None
 
-            # Create action record
+            # Create action record. TODO: store more action fields
             action = Action(
                 action_type=action_type,
+                status=status,
                 organization_id=context.organization_id,
                 workflow_run_id=context.workflow_run_id,
                 task_id=context.task_id,
@@ -164,7 +208,8 @@ class SkyvernPage:
             # If action creation fails, don't block the actual action execution
             return None
 
-    async def _create_screenshot_after_execution(self, action_record: Action | None = None) -> None:
+    @classmethod
+    async def _create_screenshot_after_execution(cls) -> None:
         """Create a screenshot artifact after action execution if task_id and step_id are available."""
         try:
             context = skyvern_context.ensure_context()
@@ -172,17 +217,11 @@ class SkyvernPage:
                 return
 
             # Get browser state and take screenshot
-            browser_state = await app.BROWSER_MANAGER.get_for_script()
+            browser_state = await cls._get_browser_state()
             if not browser_state:
                 return
 
-            screenshot = await browser_state.take_fullpage_screenshot(
-                use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PLAYWRIGHT_FULLPAGE",
-                    context.workflow_run_id or context.task_id,
-                    properties={"organization_id": context.organization_id},
-                )
-            )
+            screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
 
             if screenshot:
                 # Create a minimal Step object for artifact creation

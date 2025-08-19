@@ -385,7 +385,7 @@ class BrowserManager:
         script_id: str | None = None,
         browser_session_id: str | None = None,
     ) -> BrowserState:
-        browser_state = await self.get_for_script(script_id=script_id)
+        browser_state = self.get_for_script(script_id=script_id)
         if browser_state:
             return browser_state
 
@@ -422,7 +422,7 @@ class BrowserManager:
 
         return browser_state
 
-    async def get_for_script(self, script_id: str | None = None) -> BrowserState | None:
+    def get_for_script(self, script_id: str | None = None) -> BrowserState | None:
         if script_id and script_id in self.pages:
             return self.pages[script_id]
         return None
