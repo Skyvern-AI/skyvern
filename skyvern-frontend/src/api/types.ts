@@ -147,6 +147,7 @@ export type CreateTaskRequest = {
   application?: string | null;
   include_action_history_in_verification?: boolean | null;
   max_screenshot_scrolls?: number | null;
+  cdp_address?: string | null;
 };
 
 export type User = {

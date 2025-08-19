@@ -155,6 +155,7 @@ function PromptBox() {
     ProxyLocation.Residential,
   );
   const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
+  const [cdpAddress, setCdpAddress] = useState<string | null>(null);
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
@@ -175,6 +176,7 @@ function PromptBox() {
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
           browser_session_id: browserSessionId,
+          cdp_address: cdpAddress,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
           max_screenshot_scrolls: maxScreenshotScrolls,
@@ -409,6 +411,21 @@ function PromptBox() {
                       placeholder="pbs_xxx"
                       onChange={(event) => {
                         setBrowserSessionId(event.target.value);
+                      }}
+                    />
+                  </div>
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">CDP Address</div>
+                      <div className="text-xs text-slate-400">
+                        The address of the CDP server to use for the task run.
+                      </div>
+                    </div>
+                    <Input
+                      value={cdpAddress ?? ""}
+                      placeholder="http://127.0.0.1:9222"
+                      onChange={(event) => {
+                        setCdpAddress(event.target.value);
                       }}
                     />
                   </div>

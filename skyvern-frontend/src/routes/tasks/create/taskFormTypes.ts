@@ -13,6 +13,7 @@ const createNewTaskFormSchemaBase = z.object({
   extraHttpHeaders: z.string().or(z.null()),
   maxStepsOverride: z.number().or(z.null()).optional(),
   totpIdentifier: z.string().or(z.null()),
+  cdpAddress: z.string().or(z.null()),
   errorCodeMapping: z.string().or(z.null()),
   proxyLocation: z.nativeEnum(ProxyLocation).or(z.null()),
   includeActionHistoryInVerification: z.boolean().or(z.null()).default(false),
