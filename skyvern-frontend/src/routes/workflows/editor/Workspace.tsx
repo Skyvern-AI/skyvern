@@ -565,8 +565,9 @@ function Workspace({
           activeDebugSession.browser_session_id &&
           !cycleBrowser.isPending ? (
             <BrowserStream
-              interactive={interactor === "human"}
+              interactive={false}
               browserSessionId={activeDebugSession.browser_session_id}
+              showControlButtons={true}
             />
           ) : (
             <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">

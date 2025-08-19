@@ -362,7 +362,7 @@ function BrowserStream({
                 size="sm"
               >
                 <ExitIcon className="mr-2 h-4 w-4" />
-                cede control
+                stop controlling
               </Button>
             </div>
           )}
