@@ -974,7 +974,17 @@ async def handle_input_text_action(
                 action=action,
             )
 
-        await asyncio.sleep(5)
+        try:
+            await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info(
+                "Timeout to wait for the frame to load, ignore the timeout and continue to execute the action",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                element_id=skyvern_element.get_id(),
+                action=action,
+            )
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
@@ -1115,8 +1125,19 @@ async def handle_input_text_action(
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
             return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
-    # wait 2s for blocking element to show up
-    await asyncio.sleep(2)
+    # wait for blocking element to show up
+    try:
+        await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+        await skyvern_frame.safe_wait_for_animation_end()
+    except Exception:
+        LOG.info(
+            "Timeout to wait for the frame to load, ignore the timeout and continue to execute the action",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+            action=action,
+        )
+
     try:
         blocking_element, exist = await skyvern_element.find_blocking_element(
             dom=dom, incremental_page=incremental_scraped
@@ -2154,7 +2175,15 @@ async def choose_auto_completion_dropdown(
     try:
         await skyvern_element.press_fill(text)
         # wait for new elemnts to load
-        await asyncio.sleep(5)
+        try:
+            await asyncio.sleep(0.5)
+            await skyvern_frame.get_frame().wait_for_load_state("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.warning(
+                "Failed to wait for load state or animation end after input the value, will continue to get incremental element tree",
+                exc_info=True,
+            )
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]

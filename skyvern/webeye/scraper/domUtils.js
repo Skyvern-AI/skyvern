@@ -2650,18 +2650,7 @@ function isAnimationFinished() {
   if (!unfinishedAnimations || unfinishedAnimations.length == 0) {
     return true;
   }
-  const unfinishedAnimationsWithoutBlocked = unfinishedAnimations.filter(
-    (a) => {
-      const element = a.effect?.target;
-      if (!element) {
-        _jsConsoleLog("Unfinished animation without element:", a);
-        return false;
-      }
-      const result = getBlockElementUniqueID(element);
-      return !result[1];
-    },
-  );
-  return unfinishedAnimationsWithoutBlocked.length === 0;
+  return false;
 }
 
 /**
