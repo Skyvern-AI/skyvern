@@ -777,7 +777,10 @@ def _build_goto_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
 
 def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> FunctionDef:
     body = [
-        cst.parse_statement("page, context = await skyvern.setup(parameters.model_dump())"),
+        cst.parse_statement(
+            "parameters = parameters.model_dump() if isinstance(parameters, WorkflowParameters) else parameters"
+        ),
+        cst.parse_statement("page, context = await skyvern.setup(parameters)"),
     ]
 
     for block in blocks:
