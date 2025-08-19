@@ -22,6 +22,20 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger()
+WINDOWS = os.name == "nt"
+
+
+def _safe_timestamp() -> str:
+    ts = datetime.utcnow().isoformat()
+    return ts.replace(":", "-") if WINDOWS else ts
+
+
+def _windows_safe_filename(name: str) -> str:
+    if not WINDOWS:
+        return name
+    invalid = '<>:"/\\|?*'
+    name = "".join("-" if ch in invalid else ch for ch in name)
+    return name.rstrip(" .")
 
 
 class LocalStorage(BaseStorage):
@@ -30,6 +44,9 @@ class LocalStorage(BaseStorage):
 
     def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        if WINDOWS:
+            ts = _safe_timestamp()
+            return f"file://{self.artifact_path}/{organization_id}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{ts}_{artifact_id}_{artifact_type}.{file_ext}"
         return f"file://{self.artifact_path}/{organization_id}/{step.task_id}/{step.order:02d}_{step.retry_index}_{step.step_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     async def retrieve_global_workflows(self) -> list[str]:
@@ -47,18 +64,27 @@ class LocalStorage(BaseStorage):
         self, *, organization_id: str, log_entity_type: LogEntityType, log_entity_id: str, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        if WINDOWS:
+            ts = _safe_timestamp()
+            return f"file://{self.artifact_path}/logs/{log_entity_type}/{log_entity_id}/{ts}_{artifact_type}.{file_ext}"
         return f"file://{self.artifact_path}/logs/{log_entity_type}/{log_entity_id}/{datetime.utcnow().isoformat()}_{artifact_type}.{file_ext}"
 
     def build_thought_uri(
         self, *, organization_id: str, artifact_id: str, thought: Thought, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        if WINDOWS:
+            ts = _safe_timestamp()
+            return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/tasks/{thought.observer_cruise_id}/{thought.observer_thought_id}/{ts}_{artifact_id}_{artifact_type}.{file_ext}"
         return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/tasks/{thought.observer_cruise_id}/{thought.observer_thought_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_task_v2_uri(
         self, *, organization_id: str, artifact_id: str, task_v2: TaskV2, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        if WINDOWS:
+            ts = _safe_timestamp()
+            return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{ts}_{artifact_id}_{artifact_type}.{file_ext}"
         return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/observers/{task_v2.observer_cruise_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_workflow_run_block_uri(
@@ -70,12 +96,18 @@ class LocalStorage(BaseStorage):
         artifact_type: ArtifactType,
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        if WINDOWS:
+            ts = _safe_timestamp()
+            return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{ts}_{artifact_id}_{artifact_type}.{file_ext}"
         return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/workflow_runs/{workflow_run_block.workflow_run_id}/{workflow_run_block.workflow_run_block_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_ai_suggestion_uri(
         self, *, organization_id: str, artifact_id: str, ai_suggestion: AISuggestion, artifact_type: ArtifactType
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
+        if WINDOWS:
+            ts = _safe_timestamp()
+            return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{ts}_{artifact_id}_{artifact_type}.{file_ext}"
         return f"file://{self.artifact_path}/{settings.ENV}/{organization_id}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
     def build_script_file_uri(
@@ -87,6 +119,8 @@ class LocalStorage(BaseStorage):
         file_path = None
         try:
             file_path = Path(parse_uri_to_path(artifact.uri))
+            if WINDOWS:
+                file_path = file_path.with_name(_windows_safe_filename(file_path.name))
             self._create_directories_if_not_exists(file_path)
             with open(file_path, "wb") as f:
                 f.write(data)
@@ -101,6 +135,8 @@ class LocalStorage(BaseStorage):
         file_path = None
         try:
             file_path = Path(parse_uri_to_path(artifact.uri))
+            if WINDOWS:
+                file_path = file_path.with_name(_windows_safe_filename(file_path.name))
             self._create_directories_if_not_exists(file_path)
             Path(path).replace(file_path)
         except Exception:
