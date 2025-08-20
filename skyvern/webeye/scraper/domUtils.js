@@ -835,6 +835,9 @@ function isInteractable(element, hoverStylesMap) {
   }
 
   const tagName = element.tagName.toLowerCase();
+  if (tagName === "html") {
+    return false;
+  }
 
   if (tagName === "iframe") {
     return false;
@@ -1530,13 +1533,16 @@ async function buildTreeFromBody(
   ) {
     window.GlobalSkyvernFrameIndex = frame_index;
   }
-  const elementsAndResultArray = await buildElementTree(document.body, frame);
+  const elementsAndResultArray = await buildElementTree(
+    document.documentElement,
+    frame,
+  );
   DomUtils.elementListCache = elementsAndResultArray[0];
   return elementsAndResultArray;
 }
 
 async function buildElementTree(
-  starter = document.body,
+  starter = document.documentElement,
   frame,
   full_tree = false,
   hoverStylesMap = undefined,
@@ -1570,13 +1576,17 @@ async function buildElementTree(
       return;
     }
 
+    if (tagName === "head") {
+      return;
+    }
+
     // skip processing option element as they are already added to the select.options
     if (tagName === "option") {
       return;
     }
 
     let current_xpath = null;
-    if (parent_xpath) {
+    if (parent_xpath !== null) {
       // ignore the namespace, otherwise the xpath sometimes won't find anything, specially for SVG elements
       current_xpath =
         parent_xpath +
@@ -1753,8 +1763,8 @@ async function buildElementTree(
   };
 
   let current_xpath = null;
-  if (starter === document.body) {
-    current_xpath = "/html[1]";
+  if (starter === document.documentElement) {
+    current_xpath = "";
   }
 
   // setup before parsing the dom
