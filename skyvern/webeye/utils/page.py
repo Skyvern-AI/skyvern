@@ -517,22 +517,23 @@ class SkyvernFrame:
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
         )
 
-    async def safe_wait_for_animation_end(self, timeout_ms: float = 3000) -> None:
+    async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
         try:
-            async with asyncio.timeout(timeout_ms / 1000):
-                while True:
-                    try:
-                        is_finished = await self.evaluate(
-                            frame=self.frame,
-                            expression="() => isAnimationFinished()",
-                            timeout_ms=timeout_ms,
-                        )
-                        if is_finished:
-                            return
-                        await asyncio.sleep(0.1)
-                    except Exception:
-                        LOG.warning("Failed to wait for animation end, but ignore it", exc_info=True)
-                        return
-        except asyncio.TimeoutError:
-            LOG.debug("Timeout while waiting for animation end, but ignore it", exc_info=True)
+            await asyncio.sleep(before_wait_sec)
+            await self.frame.wait_for_load_state("load", timeout=timeout_ms)
+            await self.wait_for_animation_end(timeout_ms=timeout_ms)
+        except Exception:
+            LOG.info("Failed to wait for animation end, but ignore it", exc_info=True)
             return
+
+    async def wait_for_animation_end(self, timeout_ms: float = 3000) -> None:
+        async with asyncio.timeout(timeout_ms / 1000):
+            while True:
+                is_finished = await self.evaluate(
+                    frame=self.frame,
+                    expression="() => isAnimationFinished()",
+                    timeout_ms=timeout_ms,
+                )
+                if is_finished:
+                    return
+                await asyncio.sleep(0.1)
