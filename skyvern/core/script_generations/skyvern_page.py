@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Callable, Literal
 
@@ -16,6 +16,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
@@ -156,7 +157,7 @@ class SkyvernPage:
                     raise
                 finally:
                     skyvern_page._record(call)
-                    # Auto-create action before execution
+                    # Auto-create action after execution
                     await skyvern_page._create_action_before_execution(
                         action_type=action,
                         intention=intention,
@@ -418,10 +419,43 @@ class SkyvernPage:
 
     @action_wrap(ActionType.EXTRACT)
     async def extract(
-        self, data_extraction_goal: str, intention: str | None = None, data: str | dict[str, Any] | None = None
-    ) -> None:
-        # TODO: extract the data
-        return
+        self,
+        data_extraction_goal: str,
+        data_schema: dict[str, Any] | list | str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> dict[str, Any] | list | str | None:
+        scraped_page_refreshed = await self.scraped_page.refresh()
+        context = skyvern_context.current()
+        tz_info = datetime.now(tz=timezone.utc).tzinfo
+        if context and context.tz_info:
+            tz_info = context.tz_info
+        extract_information_prompt = load_prompt_with_elements(
+            element_tree_builder=scraped_page_refreshed,
+            prompt_engine=prompt_engine,
+            template_name="extract-information",
+            html_need_skyvern_attrs=False,
+            data_extraction_goal=data_extraction_goal,
+            extracted_information_schema=data_schema,
+            current_url=scraped_page_refreshed.url,
+            extracted_text=scraped_page_refreshed.extracted_text,
+            error_code_mapping_str=(json.dumps(error_code_mapping) if error_code_mapping else None),
+            local_datetime=datetime.now(tz_info).isoformat(),
+        )
+        step = None
+        if context and context.organization_id and context.task_id and context.step_id:
+            step = await app.DATABASE.get_step(
+                task_id=context.task_id, step_id=context.step_id, organization_id=context.organization_id
+            )
+
+        result = await app.EXTRACTION_LLM_API_HANDLER(
+            prompt=extract_information_prompt,
+            step=step,
+            screenshots=scraped_page_refreshed.screenshots,
+            prompt_name="extract-information",
+        )
+        return result
 
     @action_wrap(ActionType.VERIFICATION_CODE)
     async def verification_code(
