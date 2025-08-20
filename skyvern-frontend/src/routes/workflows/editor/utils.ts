@@ -97,4 +97,36 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
     .filter(Boolean) as ParametersState;
 };
 
-export { getInitialParameters };
+/**
+ * Attempt to construct a valid cache key value from the workflow parameters.
+ */
+const constructCacheKeyValue = (
+  cacheKey: string,
+  workflow: WorkflowApiResponse,
+) => {
+  const workflowParameters = getInitialParameters(workflow)
+    .filter((p) => p.parameterType === "workflow")
+    .reduce(
+      (acc, parameter) => {
+        acc[parameter.key] = parameter.defaultValue;
+        return acc;
+      },
+      {} as Record<string, unknown>,
+    );
+
+  for (const [name, value] of Object.entries(workflowParameters)) {
+    if (value === null || value === undefined || value === "") {
+      continue;
+    }
+
+    cacheKey = cacheKey.replace(`{{${name}}}`, value.toString());
+  }
+
+  if (cacheKey.includes("{") || cacheKey.includes("}")) {
+    return "";
+  }
+
+  return cacheKey;
+};
+
+export { constructCacheKeyValue, getInitialParameters };

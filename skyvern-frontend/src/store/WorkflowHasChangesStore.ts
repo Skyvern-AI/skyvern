@@ -152,6 +152,10 @@ const useWorkflowSave = () => {
         queryKey: ["workflows"],
       });
 
+      queryClient.invalidateQueries({
+        queryKey: ["block-scripts", saveData.workflow.workflow_permanent_id],
+      });
+
       setHasChanges(false);
     },
     onError: (error: AxiosError) => {
