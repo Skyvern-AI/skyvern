@@ -57,6 +57,7 @@ import {
   layout,
   startNode,
 } from "./workflowEditorUtils";
+import { constructCacheKeyValue } from "./utils";
 
 const Constants = {
   NewBrowserCooldown: 30000,
@@ -130,7 +131,13 @@ function Workspace({
   const initialHeight = (initialWidth / 16) * 9;
   // ---end fya
 
+  const cacheKey = workflow?.cache_key ?? "";
+  const cacheKeyValue =
+    cacheKey === "" ? "" : constructCacheKeyValue(cacheKey, workflow);
+
   const { data: blockScripts } = useBlockScriptsQuery({
+    cacheKey,
+    cacheKeyValue,
     workflowPermanentId,
   });
 

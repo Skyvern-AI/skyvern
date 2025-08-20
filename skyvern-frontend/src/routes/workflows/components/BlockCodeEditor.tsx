@@ -1,14 +1,18 @@
 import { ExitIcon } from "@radix-ui/react-icons";
+import { useParams } from "react-router-dom";
 import { Handle } from "@xyflow/react";
 import { Position } from "@xyflow/react";
 
+import { KeyIcon } from "@/components/icons/KeyIcon";
 import { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { cn } from "@/util/utils";
 
 import { CodeEditor } from "./CodeEditor";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
+import { constructCacheKeyValue } from "../editor/utils";
 
 function BlockCodeEditor({
   blockLabel,
@@ -21,8 +25,19 @@ function BlockCodeEditor({
   script: string | undefined;
   onClick?: (e: React.MouseEvent) => void;
 }) {
+  const { workflowPermanentId } = useParams();
   const blockTitle = workflowBlockTitle[blockType];
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
+
+  const { data: workflow } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+  const cacheKey = workflow?.cache_key ?? "";
+  const cacheKeyValue = workflow
+    ? cacheKey === ""
+      ? ""
+      : constructCacheKeyValue(cacheKey, workflow)
+    : "";
 
   return (
     <div className="h-full">
@@ -47,7 +62,7 @@ function BlockCodeEditor({
           onClick?.(e);
         }}
       >
-        <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
+        <header className="relative !mt-0 flex h-[2.75rem] justify-between gap-2">
           <div className="flex w-full gap-2">
             <div className="relative flex h-[2.75rem] w-[2.75rem] items-center justify-center overflow-hidden rounded border border-slate-600">
               <WorkflowBlockIcon
@@ -58,21 +73,29 @@ function BlockCodeEditor({
                 <span className="text-xs font-bold text-black">code</span>
               </div>
             </div>
-            <div className="flex flex-col gap-1">
+            <div className="flex w-full flex-col gap-1">
               {blockLabel}
-              <span className="text-xs text-slate-400">{blockTitle}</span>
+              <div className="flex w-full items-center justify-center gap-1">
+                <span className="text-xs text-slate-400">{blockTitle}</span>
+                <div className="ml-auto scale-[60%] opacity-50">
+                  <KeyIcon />
+                </div>
+                <span className="text-xs text-slate-400">
+                  {cacheKeyValue === "" ? "(none)" : cacheKeyValue}
+                </span>
+              </div>
             </div>
-            <div className="ml-auto flex w-[2.75rem] items-center justify-center rounded hover:bg-slate-800">
-              <ExitIcon
-                onClick={() => {
-                  toggleScriptForNodeCallback({
-                    label: blockLabel,
-                    show: false,
-                  });
-                }}
-                className="size-5 cursor-pointer"
-              />
-            </div>
+          </div>
+          <div className="absolute right-[-0.5rem] top-0 flex h-[2rem] w-[2rem] items-center justify-center rounded hover:bg-slate-800">
+            <ExitIcon
+              onClick={() => {
+                toggleScriptForNodeCallback({
+                  label: blockLabel,
+                  show: false,
+                });
+              }}
+              className="size-5 cursor-pointer"
+            />
           </div>
         </header>
         {script ? (
