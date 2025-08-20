@@ -15,6 +15,7 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useNavigate, useParams } from "react-router-dom";
+import { useUser } from "@/hooks/useUser";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
@@ -51,6 +52,7 @@ function WorkflowHeader({
   const debugStore = useDebugStore();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
+  const user = useUser().get();
 
   if (!globalWorkflows) {
     return null; // this should be loaded already by some other components
@@ -103,36 +105,38 @@ function WorkflowHeader({
           </Button>
         ) : (
           <>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    size="icon"
-                    variant={debugStore.isDebugMode ? "default" : "tertiary"}
-                    className="size-10"
-                    disabled={workflowRunIsRunningOrQueued}
-                    onClick={() => {
-                      if (debugStore.isDebugMode) {
-                        navigate(`/workflows/${workflowPermanentId}/edit`);
-                      } else {
-                        navigate(`/workflows/${workflowPermanentId}/debug`);
-                      }
-                    }}
-                  >
-                    {debugStore.isDebugMode ? (
-                      <BrowserIcon className="h-6 w-6" />
-                    ) : (
-                      <BrowserIcon className="h-6 w-6" />
-                    )}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {debugStore.isDebugMode
-                    ? "Turn off Browser"
-                    : "Turn on Browser"}
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            {user && (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="icon"
+                      variant={debugStore.isDebugMode ? "default" : "tertiary"}
+                      className="size-10"
+                      disabled={workflowRunIsRunningOrQueued}
+                      onClick={() => {
+                        if (debugStore.isDebugMode) {
+                          navigate(`/workflows/${workflowPermanentId}/edit`);
+                        } else {
+                          navigate(`/workflows/${workflowPermanentId}/debug`);
+                        }
+                      }}
+                    >
+                      {debugStore.isDebugMode ? (
+                        <BrowserIcon className="h-6 w-6" />
+                      ) : (
+                        <BrowserIcon className="h-6 w-6" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {debugStore.isDebugMode
+                      ? "Turn off Browser"
+                      : "Turn on Browser"}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>

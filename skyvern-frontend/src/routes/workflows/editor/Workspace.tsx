@@ -36,7 +36,6 @@ import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { DebuggerRunOutput } from "@/routes/workflows/debugger/DebuggerRunOutput";
 import { DebuggerPostRunParameters } from "@/routes/workflows/debugger/DebuggerPostRunParameters";
-import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   useWorkflowHasChangesStore,
@@ -88,7 +87,6 @@ function Workspace({
   const [content, setContent] = useState("actions");
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
-  const debugStore = useDebugStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const saveWorkflow = useWorkflowSave();
@@ -488,7 +486,7 @@ function Workspace({
         </div>
       )}
 
-      {debugStore.isDebugMode && (
+      {showBrowser && (
         <div
           className="absolute right-6 top-[8.5rem] h-[calc(100vh-9.5rem)]"
           style={{ zIndex: rankedItems.history ?? 1 }}
