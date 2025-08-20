@@ -1537,8 +1537,16 @@ async def handle_select_option_action(
         await skyvern_element.scroll_into_view()
 
         await skyvern_element.click(page=page, dom=dom, timeout=timeout)
-        # wait 5s for options to load
-        await asyncio.sleep(5)
+        # wait for options to load
+        await asyncio.sleep(0.5)
+        try:
+            await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info(
+                "Failed to wait for the frame to load, ignore the timeout and continue to get incremental element tree",
+                exc_info=True,
+            )
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
@@ -1555,8 +1563,16 @@ async def handle_select_option_action(
             )
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
-            # wait 5s for options to load
-            await asyncio.sleep(5)
+            # wait for options to load
+            await asyncio.sleep(0.5)
+            try:
+                await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+                await skyvern_frame.safe_wait_for_animation_end()
+            except Exception:
+                LOG.info(
+                    "Failed to wait for the frame to load, ignore the timeout and continue to get incremental element tree",
+                    exc_info=True,
+                )
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
                     task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -1652,7 +1668,16 @@ async def handle_select_option_action(
             )
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
-        await asyncio.sleep(5)
+
+        try:
+            await asyncio.sleep(0.5)
+            await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info(
+                "Failed to wait for the frame to load, ignore the exception and continue",
+                exc_info=True,
+            )
         is_open = True
 
         result = await select_from_dropdown_by_value(
@@ -2583,7 +2608,15 @@ async def sequentially_select_from_dropdown(
         select_history.append(single_select_result)
         values.append(single_select_result.value)
         # wait 1s until DOM finished updating
-        await asyncio.sleep(1)
+        try:
+            await asyncio.sleep(0.5)
+            await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info(
+                "Failed to wait for the animation to end, ignore the exception and continue",
+                exc_info=True,
+            )
 
         if await single_select_result.is_done():
             return single_select_result
@@ -2603,8 +2636,16 @@ async def sequentially_select_from_dropdown(
             task_id=task.task_id,
             step_id=step.step_id,
         )
-        # wait for 3s to load new options
-        await asyncio.sleep(3)
+        # wait to load new options
+        try:
+            await asyncio.sleep(0.5)
+            await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info(
+                "Failed to wait for the animation to end, ignore the exception and continue",
+                exc_info=True,
+            )
 
         check_filter_funcs.append(
             check_disappeared_element_id_in_incremental_factory(incremental_scraped=incremental_scraped)
@@ -3315,13 +3356,29 @@ async def scroll_down_to_load_all_options(
         else:
             await skyvern_frame.scroll_to_element_bottom(dropdown_menu_element_handle, page_by_page)
             # wait until animation ends, otherwise the scroll operation could be overwritten
-            await asyncio.sleep(2)
+            try:
+                await asyncio.sleep(0.5)
+                await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+                await skyvern_frame.safe_wait_for_animation_end()
+            except Exception:
+                LOG.info(
+                    "Failed to wait for the animation to end, ignore the exception and continue",
+                    exc_info=True,
+                )
 
         # scroll a little back and scroll down to trigger the loading
         await page.mouse.wheel(0, -1e-5)
         await page.mouse.wheel(0, 1e-5)
         # wait for while to load new options
-        await asyncio.sleep(10)
+        try:
+            await asyncio.sleep(0.5)
+            await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info(
+                "Failed to wait for the animation to end, ignore the exception and continue",
+                exc_info=True,
+            )
 
         current_num = await incremental_scraped.get_incremental_elements_num()
         LOG.info(
@@ -3346,7 +3403,15 @@ async def scroll_down_to_load_all_options(
         await page.mouse.wheel(0, -scroll_pace)
     else:
         await skyvern_frame.scroll_to_element_top(dropdown_menu_element_handle)
-    await asyncio.sleep(5)
+    try:
+        await asyncio.sleep(0.5)
+        await skyvern_frame.get_frame().wait_for_event("load", timeout=3000)
+        await skyvern_frame.safe_wait_for_animation_end()
+    except Exception:
+        LOG.info(
+            "Failed to wait for the animation to end, ignore the exception and continue",
+            exc_info=True,
+        )
 
 
 async def normal_select(
