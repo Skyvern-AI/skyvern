@@ -151,11 +151,15 @@ def _make_decorator(block_label: str, block: dict[str, Any]) -> cst.Decorator:
     )
 
 
-def _action_to_stmt(act: dict[str, Any]) -> cst.BaseStatement:
+def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
     """
     Turn one Action dict into:
 
         await page.<method>(xpath=..., intention=..., data=context.parameters)
+
+    Or if assign_to_output is True for extract actions:
+
+        output = await page.extract(...)
     """
     method = ACTION_MAP[act["action_type"]]
 
@@ -248,13 +252,23 @@ def _action_to_stmt(act: dict[str, Any]) -> cst.BaseStatement:
     # await page.method(...)
     await_expr = cst.Await(call)
 
-    # Wrap in a statement line:  await ...
-    return cst.SimpleStatementLine([cst.Expr(await_expr)])
+    # If this is an extract action and we want to assign to output
+    if assign_to_output and method == "extract":
+        # output = await page.extract(...)
+        assign = cst.Assign(
+            targets=[cst.AssignTarget(cst.Name("output"))],
+            value=await_expr,
+        )
+        return cst.SimpleStatementLine([assign])
+    else:
+        # Wrap in a statement line:  await ...
+        return cst.SimpleStatementLine([cst.Expr(await_expr)])
 
 
 def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> FunctionDef:
     name = block.get("label") or _safe_name(block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     body_stmts: list[cst.BaseStatement] = []
+    is_extraction_block = block.get("block_type") == "extraction"
 
     if block.get("url"):
         body_stmts.append(cst.parse_statement(f"await page.goto({repr(block['url'])})"))
@@ -262,9 +276,19 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
     for act in actions:
         if act["action_type"] in [ActionType.COMPLETE, ActionType.TERMINATE, ActionType.NULL_ACTION]:
             continue
-        body_stmts.append(_action_to_stmt(act))
 
-    if not body_stmts:
+        # For extraction blocks, assign extract action results to output variable
+        assign_to_output = is_extraction_block and act["action_type"] == "extract"
+        body_stmts.append(_action_to_stmt(act, assign_to_output=assign_to_output))
+
+    # For extraction blocks, add return output statement if we have actions
+    if is_extraction_block and any(
+        act["action_type"] == "extract"
+        for act in actions
+        if act["action_type"] not in [ActionType.COMPLETE, ActionType.TERMINATE, ActionType.NULL_ACTION]
+    ):
+        body_stmts.append(cst.parse_statement("return output"))
+    elif not body_stmts:
         body_stmts.append(cst.parse_statement("return None"))
 
     return FunctionDef(

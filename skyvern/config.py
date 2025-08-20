@@ -121,6 +121,7 @@ class Settings(BaseSettings):
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
     SINGLE_INPUT_AGENT_LLM_KEY: str | None = None
     PROMPT_BLOCK_LLM_KEY: str | None = None
+    EXTRACTION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
