@@ -16,6 +16,7 @@ from skyvern.schemas.scripts import (
     Script,
     ScriptBlocksRequest,
     ScriptBlocksResponse,
+    ScriptCacheKeyValuesResponse,
 )
 from skyvern.services import script_service
 
@@ -419,3 +420,102 @@ async def get_workflow_script_blocks(
             continue
 
     return ScriptBlocksResponse(blocks=result)
+
+
+@base_router.get(
+    "/scripts/{workflow_permanent_id}/{cache_key}/values",
+    include_in_schema=False,
+    response_model=ScriptCacheKeyValuesResponse,
+)
+async def get_workflow_cache_key_values(
+    workflow_permanent_id: str,
+    cache_key: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(
+        1,
+        ge=1,
+        description="Page number for pagination",
+        examples=[1],
+    ),
+    page_size: int = Query(
+        100,
+        ge=1,
+        description="Number of items per page",
+        examples=[100],
+    ),
+    filter: str | None = Query(
+        None,
+        description="Filter values by a substring",
+        examples=["value1", "value2"],
+    ),
+) -> ScriptCacheKeyValuesResponse:
+    # TODO(jdo): concurrent-ize
+
+    values = await app.DATABASE.get_workflow_cache_key_values(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key=cache_key,
+        page=page,
+        page_size=page_size,
+        filter=filter,
+    )
+
+    total_count = await app.DATABASE.get_workflow_cache_key_count(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key=cache_key,
+    )
+
+    filtered_count = await app.DATABASE.get_workflow_cache_key_count(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key=cache_key,
+        filter=filter,
+    )
+
+    return ScriptCacheKeyValuesResponse(
+        filtered_count=filtered_count,
+        page=page,
+        page_size=page_size,
+        total_count=total_count,
+        values=values,
+    )
+
+
+@base_router.delete(
+    "/scripts/{workflow_permanent_id}/value/{cache_key_value}",
+    include_in_schema=False,
+)
+async def delete_workflow_cache_key_value(
+    workflow_permanent_id: str,
+    cache_key_value: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, str]:
+    """Delete a specific cache key value for a workflow."""
+    LOG.info(
+        "Deleting workflow cache key value",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+    )
+
+    # Verify workflow exists
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    # Delete the cache key value
+    deleted = await app.DATABASE.delete_workflow_cache_key_value(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+    )
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Cache key value not found")
+
+    return {"message": "Cache key value deleted successfully"}

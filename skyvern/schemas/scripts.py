@@ -139,6 +139,14 @@ class ScriptBlock(BaseModel):
     deleted_at: datetime | None = None
 
 
+class ScriptCacheKeyValuesResponse(BaseModel):
+    filtered_count: int
+    page: int
+    page_size: int
+    total_count: int
+    values: list[str]
+
+
 class ScriptBlocksResponse(BaseModel):
     blocks: dict[str, str]
 
