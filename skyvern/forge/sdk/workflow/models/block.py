@@ -6,10 +6,8 @@ import asyncio
 import csv
 import json
 import os
-import random
 import re
 import smtplib
-import string
 import textwrap
 import uuid
 from collections import defaultdict
@@ -83,17 +81,13 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
-
-
-def _generate_random_string(length: int = 8) -> str:
-    """Generate a random string for unique identifiers."""
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
@@ -991,7 +985,7 @@ class ForLoopBlock(Block):
 
                     # Update the loop variable reference to point to the extracted loop values
                     # We'll use a temporary key that we can reference
-                    temp_key = f"extracted_loop_values_{_generate_random_string()}"
+                    temp_key = f"extracted_loop_values_{generate_random_string()}"
                     workflow_run_context.set_value(temp_key, loop_values)
                     self.loop_variable_reference = temp_key
 
@@ -1119,7 +1113,7 @@ class ForLoopBlock(Block):
 
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
-            key=f"natural_lang_extraction_{_generate_random_string()}",
+            key=f"natural_lang_extraction_{generate_random_string()}",
             workflow_id=self.output_parameter.workflow_id,
             created_at=datetime.now(),
             modified_at=datetime.now(),
@@ -1128,7 +1122,7 @@ class ForLoopBlock(Block):
         )
 
         return ExtractionBlock(
-            label=f"natural_lang_extraction_{_generate_random_string()}",
+            label=f"natural_lang_extraction_{generate_random_string()}",
             data_extraction_goal=extraction_goal,
             data_schema=data_schema,
             output_parameter=output_param,
