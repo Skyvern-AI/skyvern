@@ -82,7 +82,7 @@ type RunWorkflowRequestBody = {
   browser_session_id: string | null;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
-  cdp_address?: string | null;
+  browser_address?: string | null;
 };
 
 function getRunWorkflowRequestBody(
@@ -110,7 +110,7 @@ function getRunWorkflowRequestBody(
     data: parsedParameters,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
-    cdp_address: cdpAddress,
+    browser_address: cdpAddress,
   };
 
   if (maxScreenshotScrolls) {
@@ -444,10 +444,10 @@ function RunWorkflowForm({
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          CDP Address
+                          Browser Address
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          The address of the CDP server to use for the workflow
+                          The address of the Browser server to use for the workflow
                           run.
                         </h2>
                       </div>

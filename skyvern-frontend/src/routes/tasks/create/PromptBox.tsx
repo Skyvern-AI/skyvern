@@ -176,7 +176,7 @@ function PromptBox() {
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
           browser_session_id: browserSessionId,
-          cdp_address: cdpAddress,
+          browser_address: cdpAddress,
           totp_identifier: totpIdentifier,
           publish_workflow: publishWorkflow,
           max_screenshot_scrolls: maxScreenshotScrolls,
@@ -416,9 +416,9 @@ function PromptBox() {
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
-                      <div className="text-sm">CDP Address</div>
+                      <div className="text-sm">Browser Address</div>
                       <div className="text-xs text-slate-400">
-                        The address of the CDP server to use for the task run.
+                        The address of the Browser server to use for the task run.
                       </div>
                     </div>
                     <Input

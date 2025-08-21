@@ -90,7 +90,7 @@ function createTaskRequestObject(
     extracted_information_schema: extractedInformationSchema,
     extra_http_headers: extraHttpHeaders,
     totp_identifier: transform(formValues.totpIdentifier),
-    cdp_address: transform(formValues.cdpAddress),
+    browser_address: transform(formValues.cdpAddress),
     error_code_mapping: errorCodeMapping,
     max_screenshot_scrolls: formValues.maxScreenshotScrolls,
     include_action_history_in_verification:
@@ -705,9 +705,9 @@ function CreateNewTaskForm({ initialValues }: Props) {
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">CDP Address</h1>
+                            <h1 className="text-lg">Browser Address</h1>
                             <h2 className="text-base text-slate-400">
-                              The address of the CDP server to use for the task
+                              The address of the Browser server to use for the task
                               run.
                             </h2>
                           </div>
