@@ -2,7 +2,7 @@ import { AxiosError } from "axios";
 import { useEffect, useRef, useState } from "react";
 import { nanoid } from "nanoid";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useEdgesState, useNodesState, Edge } from "@xyflow/react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
@@ -13,6 +13,7 @@ import { useMountEffect } from "@/hooks/useMountEffect";
 import { useRanker } from "../hooks/useRanker";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useSidebarStore } from "@/store/SidebarStore";
 
@@ -46,6 +47,7 @@ import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
+import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import {
@@ -84,7 +86,13 @@ function Workspace({
   workflow,
 }: Props) {
   const { blockLabel, workflowPermanentId, workflowRunId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const cacheKeyValueParam = searchParams.get("cache-key-value");
   const [content, setContent] = useState("actions");
+  const [cacheKeyValueFilter, setCacheKeyValueFilter] = useState<string | null>(
+    null,
+  );
+  const [page, setPage] = useState(1);
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -96,7 +104,15 @@ function Workspace({
   const interactor = workflowRun && isFinalized === false ? "agent" : "human";
   const browserTitle = interactor === "agent" ? `Browser [🤖]` : `Browser [👤]`;
 
-  const [openDialogue, setOpenDialogue] = useState(false);
+  const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
+    useState(false);
+  const [toDeleteCacheKeyValue, setToDeleteCacheKeyValue] = useState<
+    string | null
+  >(null);
+  const [
+    openConfirmCacheKeyValueDeleteDialogue,
+    setOpenConfirmCacheKeyValueDeleteDialogue,
+  ] = useState(false);
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
   const [showPowerButton, setShowPowerButton] = useState(true);
@@ -130,14 +146,43 @@ function Workspace({
   // ---end fya
 
   const cacheKey = workflow?.cache_key ?? "";
-  const cacheKeyValue =
-    cacheKey === "" ? "" : constructCacheKeyValue(cacheKey, workflow);
+
+  const [cacheKeyValue, setCacheKeyValue] = useState(
+    cacheKey === ""
+      ? ""
+      : cacheKeyValueParam
+        ? cacheKeyValueParam
+        : constructCacheKeyValue(cacheKey, workflow),
+  );
+
+  useEffect(() => {
+    if (cacheKeyValue === "") {
+      setSearchParams((prev) => {
+        const newParams = new URLSearchParams(prev);
+        newParams.delete("cache-key-value");
+        return newParams;
+      });
+    } else {
+      setSearchParams({
+        "cache-key-value": `${cacheKeyValue}`,
+      });
+    }
+  }, [cacheKeyValue, setSearchParams]);
 
   const { data: blockScripts } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
     workflowPermanentId,
   });
+
+  const { data: cacheKeyValues, isLoading: cacheKeyValuesLoading } =
+    useCacheKeyValuesQuery({
+      cacheKey,
+      debounceMs: 100,
+      filter: cacheKeyValueFilter || undefined,
+      page,
+      workflowPermanentId,
+    });
 
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -163,7 +208,7 @@ function Workspace({
   };
 
   const handleOnCycle = () => {
-    setOpenDialogue(true);
+    setOpenCycleBrowserDialogue(true);
   };
 
   useMountEffect(() => {
@@ -175,7 +220,27 @@ function Workspace({
         queryKey: ["debugSession", workflowPermanentId],
       });
       setShouldFetchDebugSession(true);
+
+      queryClient.invalidateQueries({
+        queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
+      });
     }
+
+    closeWorkflowPanel();
+  });
+
+  useMountEffect(() => {
+    const closePanelsWhenEscapeIsPressed = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        closeWorkflowPanel();
+      }
+    };
+
+    document.addEventListener("keydown", closePanelsWhenEscapeIsPressed);
+
+    return () => {
+      document.removeEventListener("keydown", closePanelsWhenEscapeIsPressed);
+    };
   });
 
   useEffect(() => {
@@ -184,7 +249,7 @@ function Workspace({
   }, [blockScripts]);
 
   const afterCycleBrowser = () => {
-    setOpenDialogue(false);
+    setOpenCycleBrowserDialogue(false);
     setShowPowerButton(false);
 
     if (powerButtonTimeoutRef.current) {
@@ -225,6 +290,38 @@ function Workspace({
       });
 
       afterCycleBrowser();
+    },
+  });
+
+  const deleteCacheKeyValue = useMutation({
+    mutationFn: async ({
+      workflowPermanentId,
+      cacheKeyValue,
+    }: {
+      workflowPermanentId: string;
+      cacheKeyValue: string;
+    }) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const encodedCacheKeyValue = encodeURIComponent(cacheKeyValue);
+      return client.delete(
+        `/scripts/${workflowPermanentId}/value/${encodedCacheKeyValue}`,
+      );
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
+      });
+      setToDeleteCacheKeyValue(null);
+      setOpenConfirmCacheKeyValueDeleteDialogue(false);
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to delete cache key value",
+        description: error.message,
+      });
+      setToDeleteCacheKeyValue(null);
+      setOpenConfirmCacheKeyValueDeleteDialogue(false);
     },
   });
 
@@ -348,15 +445,35 @@ function Workspace({
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
   }
 
+  function openCacheKeyValuesPanel() {
+    setWorkflowPanelState({
+      active: true,
+      content: "cacheKeyValues",
+    });
+    promote("dropdown");
+  }
+
+  function toggleCacheKeyValuesPanel() {
+    if (
+      workflowPanelState.active &&
+      workflowPanelState.content === "cacheKeyValues"
+    ) {
+      closeWorkflowPanel();
+      promote("header");
+    } else {
+      openCacheKeyValuesPanel();
+    }
+  }
+
   return (
     <div className="relative h-full w-full">
       <Dialog
-        open={openDialogue}
+        open={openCycleBrowserDialogue}
         onOpenChange={(open) => {
           if (!open && cycleBrowser.isPending) {
             return;
           }
-          setOpenDialogue(open);
+          setOpenCycleBrowserDialogue(open);
         }}
       >
         <DialogContent>
@@ -397,6 +514,63 @@ function Workspace({
         </DialogContent>
       </Dialog>
 
+      <Dialog
+        open={openConfirmCacheKeyValueDeleteDialogue}
+        onOpenChange={(open) => {
+          if (!open && deleteCacheKeyValue.isPending) {
+            return;
+          }
+          setOpenConfirmCacheKeyValueDeleteDialogue(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete A Script Key Value</DialogTitle>
+            <DialogDescription>
+              <div className="w-full pb-2 pt-4 text-sm text-slate-400">
+                {deleteCacheKeyValue.isPending ? (
+                  "Deleting script key value..."
+                ) : (
+                  <div className="flex w-full flex-col gap-2">
+                    <div className="w-full">
+                      Are you sure you want to delete this script key value?
+                    </div>
+                    <div
+                      className="max-w-[29rem] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-slate-400"
+                      title={toDeleteCacheKeyValue ?? undefined}
+                    >
+                      {toDeleteCacheKeyValue}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {!deleteCacheKeyValue.isPending && (
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+            )}
+            <Button
+              variant="default"
+              onClick={() => {
+                deleteCacheKeyValue.mutate({
+                  workflowPermanentId: workflowPermanentId!,
+                  cacheKeyValue: toDeleteCacheKeyValue!,
+                });
+              }}
+              disabled={deleteCacheKeyValue.isPending}
+            >
+              Yes, Continue{" "}
+              {deleteCacheKeyValue.isPending && (
+                <ReloadIcon className="ml-2 size-4 animate-spin" />
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* header panel */}
       <div
         className="absolute left-6 right-6 top-8 h-20"
@@ -406,11 +580,42 @@ function Workspace({
         }}
       >
         <WorkflowHeader
+          cacheKeyValue={cacheKeyValue}
+          cacheKeyValues={cacheKeyValues}
           saving={workflowChangesStore.saveIsPending}
+          cacheKeyValuesPanelOpen={
+            workflowPanelState.active &&
+            workflowPanelState.content === "cacheKeyValues"
+          }
           parametersPanelOpen={
             workflowPanelState.active &&
             workflowPanelState.content === "parameters"
           }
+          workflow={workflow}
+          onCacheKeyValueAccept={(v) => {
+            setCacheKeyValue(v ?? "");
+            setCacheKeyValueFilter("");
+            closeWorkflowPanel();
+          }}
+          onCacheKeyValuesBlurred={(v) => {
+            setCacheKeyValue(v ?? "");
+          }}
+          onCacheKeyValuesKeydown={(e) => {
+            if (e.key === "Enter") {
+              toggleCacheKeyValuesPanel();
+              return;
+            }
+
+            if (e.key !== "Tab") {
+              openCacheKeyValuesPanel();
+            }
+          }}
+          onCacheKeyValuesFilter={(v) => {
+            setCacheKeyValueFilter(v);
+          }}
+          onCacheKeyValuesClick={() => {
+            toggleCacheKeyValuesPanel();
+          }}
           onParametersClick={() => {
             if (
               workflowPanelState.active &&
@@ -443,6 +648,12 @@ function Workspace({
               return;
             }
             await saveWorkflow.mutateAsync();
+
+            queryClient.invalidateQueries({
+              queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
+            });
+
+            setCacheKeyValueFilter("");
           }}
           onRun={() => {
             closeWorkflowPanel();
@@ -466,6 +677,28 @@ function Workspace({
             promote("dropdown");
           }}
         >
+          {workflowPanelState.content === "cacheKeyValues" && (
+            <WorkflowCacheKeyValuesPanel
+              cacheKeyValues={cacheKeyValues}
+              pending={cacheKeyValuesLoading}
+              scriptKey={workflow.cache_key ?? "<none>"}
+              onDelete={(cacheKeyValue) => {
+                setToDeleteCacheKeyValue(cacheKeyValue);
+                setOpenConfirmCacheKeyValueDeleteDialogue(true);
+              }}
+              onMouseDownCapture={() => {
+                promote("dropdown");
+              }}
+              onPaginate={(page) => {
+                setPage(page);
+              }}
+              onSelect={(cacheKeyValue) => {
+                setCacheKeyValue(cacheKeyValue);
+                setCacheKeyValueFilter("");
+                closeWorkflowPanel();
+              }}
+            />
+          )}
           {workflowPanelState.content === "parameters" && (
             <WorkflowParametersPanel
               onMouseDownCapture={() => {
@@ -541,7 +774,6 @@ function Workspace({
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         initialTitle={initialTitle}
-        // initialParameters={initialParameters}
         workflow={workflow}
         onMouseDownCapture={() => promote("infiniteCanvas")}
         zIndex={rankedItems.infiniteCanvas}

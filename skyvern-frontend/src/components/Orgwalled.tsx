@@ -28,7 +28,7 @@ function OrgWalled({
         <TooltipTrigger asChild>
           <div
             className={cn(
-              "relative rounded-md border-2 border-dashed border-yellow-400 p-2",
+              "relative rounded-md border-2 border-dashed border-yellow-400 p-2 transition-all duration-100 ease-linear hover:border-transparent hover:p-0",
               className,
             )}
           >
