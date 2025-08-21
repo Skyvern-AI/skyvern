@@ -25,6 +25,7 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    browser_address: str | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -120,6 +121,7 @@ class WorkflowRun(BaseModel):
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
+    browser_address: str | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -170,3 +172,4 @@ class WorkflowRunResponseBase(BaseModel):
     workflow_title: str | None = None
     browser_session_id: str | None = None
     max_screenshot_scrolls: int | None = None
+    browser_address: str | None = None

@@ -106,6 +106,7 @@ class TaskModel(Base):
         index=True,
     )
     model = Column(JSON, nullable=True)
+    browser_address = Column(String, nullable=True)
 
 
 class StepModel(Base):
@@ -278,6 +279,7 @@ class WorkflowRunModel(Base):
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    browser_address = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -659,6 +661,7 @@ class TaskV2Model(Base):
     max_steps = Column(Integer, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    browser_address = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)

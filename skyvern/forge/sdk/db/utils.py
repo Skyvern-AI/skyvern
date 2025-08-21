@@ -152,6 +152,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         finished_at=task_obj.finished_at,
         max_screenshot_scrolls=task_obj.max_screenshot_scrolling_times,
         browser_session_id=task_obj.browser_session_id,
+        browser_address=task_obj.browser_address,
     )
     return task
 
@@ -300,6 +301,7 @@ def convert_to_workflow_run(
         workflow_title=workflow_title,
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
         extra_http_headers=workflow_run_model.extra_http_headers,
+        browser_address=workflow_run_model.browser_address,
     )
 
 

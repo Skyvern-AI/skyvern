@@ -90,9 +90,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
         **kwargs: dict,
     ) -> None:
         LOG.info("Executing task using background task executor", task_id=task_id)
-
-        close_browser_on_completion = browser_session_id is None
-
         organization = await app.DATABASE.get_organization(organization_id)
         if organization is None:
             raise OrganizationNotFound(organization_id)
@@ -109,6 +106,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
             status=TaskStatus.running,
             organization_id=organization_id,
         )
+
+        close_browser_on_completion = browser_session_id is None and not task.browser_address
+
         run_obj = await app.DATABASE.get_run(run_id=task_id, organization_id=organization_id)
         engine = RunEngine.skyvern_v1
         if run_obj and run_obj.task_run_type == RunType.openai_cua:

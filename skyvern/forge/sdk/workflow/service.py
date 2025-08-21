@@ -276,6 +276,7 @@ class WorkflowService:
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
         # Check if there's a related workflow script that should be used instead
         workflow_script = await self._get_workflow_script(workflow, workflow_run)
@@ -352,7 +353,7 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 api_key=api_key,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return workflow_run
 
@@ -404,7 +405,7 @@ class WorkflowService:
                             workflow_run=workflow_run,
                             api_key=api_key,
                             need_call_webhook=True,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -422,7 +423,7 @@ class WorkflowService:
                             workflow_run=workflow_run,
                             api_key=api_key,
                             need_call_webhook=True,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -464,7 +465,7 @@ class WorkflowService:
                         workflow_run=workflow_run,
                         api_key=api_key,
                         need_call_webhook=False,
-                        close_browser_on_completion=browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return workflow_run
@@ -489,7 +490,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -525,7 +526,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -561,7 +562,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -599,7 +600,7 @@ class WorkflowService:
                     workflow_run=workflow_run,
                     api_key=api_key,
                     browser_session_id=browser_session_id,
-                    close_browser_on_completion=browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                 )
                 return workflow_run
 
@@ -626,7 +627,7 @@ class WorkflowService:
             workflow_run=workflow_run,
             api_key=api_key,
             browser_session_id=browser_session_id,
-            close_browser_on_completion=browser_session_id is None,
+            close_browser_on_completion=close_browser_on_completion,
         )
 
         # Track workflow run duration when completed
@@ -869,6 +870,7 @@ class WorkflowService:
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             extra_http_headers=workflow_request.extra_http_headers,
+            browser_address=workflow_request.browser_address,
         )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str) -> WorkflowRun:
@@ -1299,6 +1301,7 @@ class WorkflowService:
             browser_session_id=workflow_run.browser_session_id,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             task_v2=task_v2,
+            browser_address=workflow_run.browser_address,
         )
 
     async def clean_up_workflow(
@@ -1313,10 +1316,13 @@ class WorkflowService:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
         all_workflow_task_ids = [task.task_id for task in tasks]
+        close_browser_on_completion = (
+            close_browser_on_completion and browser_session_id is None and not workflow_run.browser_address
+        )
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
-            close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+            close_browser_on_completion=close_browser_on_completion,
             browser_session_id=browser_session_id,
             organization_id=workflow_run.organization_id,
         )

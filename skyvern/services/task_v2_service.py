@@ -164,6 +164,7 @@ async def initialize_task_v2(
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    browser_address: str | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -177,6 +178,7 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        browser_address=browser_address,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -230,6 +232,7 @@ async def initialize_task_v2(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
@@ -368,7 +371,7 @@ async def run_task_v2(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=browser_session_id is None,
+                close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
                 need_call_webhook=False,
             )
         else:
