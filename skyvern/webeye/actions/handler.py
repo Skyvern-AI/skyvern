@@ -1190,13 +1190,22 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if tag_name == InteractiveElement.INPUT and await skyvern_element.get_attr("type") == "date":
-            text = await check_date_format(
-                value=text,
-                action=action,
-                skyvern_element=skyvern_element,
-                task=task,
-                step=step,
-            )
+            try:
+                text = await check_date_format(
+                    value=text,
+                    action=action,
+                    skyvern_element=skyvern_element,
+                    task=task,
+                    step=step,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to check the date format, using the original text to fill in the date input",
+                    text=text,
+                    action=action,
+                    exc_info=True,
+                )
+
             await skyvern_element.input_fill(text=text)
             return [ActionSuccess()]
 
