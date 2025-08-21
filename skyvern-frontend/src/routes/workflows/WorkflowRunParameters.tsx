@@ -84,6 +84,7 @@ function WorkflowRunParameters() {
             maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
           extraHttpHeaders:
             extraHttpHeaders ?? workflow.extra_http_headers ?? null,
+          cdpAddress: null,
         }}
       />
     </div>

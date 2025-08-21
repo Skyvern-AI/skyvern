@@ -48,6 +48,7 @@ function RetryTask() {
           extraHttpHeaders: task.request.extra_http_headers
             ? JSON.stringify(task.request.extra_http_headers)
             : null,
+          cdpAddress: task.request.browser_address ?? null,
         }}
       />
     </div>

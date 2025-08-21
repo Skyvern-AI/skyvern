@@ -64,6 +64,7 @@ function CreateNewTaskFormPage() {
             includeActionHistoryInVerification: null,
             maxScreenshotScrolls: null,
             extraHttpHeaders: null,
+            cdpAddress: null,
           }}
         />
       </div>
@@ -137,6 +138,7 @@ function CreateNewTaskFormPage() {
           extraHttpHeaders: data.extra_http_headers
             ? JSON.stringify(data.extra_http_headers)
             : null,
+          cdpAddress: null,
         }}
       />
     </div>
