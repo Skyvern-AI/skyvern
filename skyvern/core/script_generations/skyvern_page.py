@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -328,29 +329,8 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         inputting the originally supplied ``text``.
         """
-        new_text = text
-
-        if intention and data:
-            try:
-                # Build the element tree of the current page for the prompt
-                skyvern_context.ensure_context()
-                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
-                script_generation_input_text_prompt = prompt_engine.load_prompt(
-                    template="script-generation-input-text-generatiion",
-                    intention=intention,
-                    data=payload_str,
-                )
-                json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
-                    prompt=script_generation_input_text_prompt,
-                    prompt_name="script-generation-input-text-generatiion",
-                )
-                new_text = json_response.get("answer", text) or text
-            except Exception:
-                # If anything goes wrong, fall back to the original text
-                new_text = text
-
         locator = self.page.locator(f"xpath={xpath}")
-        await handler_utils.input_sequentially(locator, new_text, timeout=timeout)
+        await handler_utils.input_sequentially(locator, text, timeout=timeout)
 
     @action_wrap(ActionType.UPLOAD_FILE)
     async def upload_file(
@@ -420,8 +400,8 @@ class SkyvernPage:
     @action_wrap(ActionType.EXTRACT)
     async def extract(
         self,
-        data_extraction_goal: str,
-        data_schema: dict[str, Any] | list | str | None = None,
+        prompt: str,
+        schema: dict[str, Any] | list | str | None = None,
         error_code_mapping: dict[str, str] | None = None,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
@@ -436,8 +416,8 @@ class SkyvernPage:
             prompt_engine=prompt_engine,
             template_name="extract-information",
             html_need_skyvern_attrs=False,
-            data_extraction_goal=data_extraction_goal,
-            extracted_information_schema=data_schema,
+            data_extraction_goal=prompt,
+            extracted_information_schema=schema,
             current_url=scraped_page_refreshed.url,
             extracted_text=scraped_page_refreshed.extracted_text,
             error_code_mapping_str=(json.dumps(error_code_mapping) if error_code_mapping else None),
@@ -509,8 +489,14 @@ class SkyvernPage:
 
 
 class RunContext:
-    def __init__(self, parameters: dict[str, Any], page: SkyvernPage) -> None:
-        self.parameters = parameters
+    def __init__(
+        self, parameters: dict[str, Any], page: SkyvernPage, generated_parameters: dict[str, Any] | None = None
+    ) -> None:
+        self.original_parameters = parameters
+        self.generated_parameters = generated_parameters
+        self.parameters = copy.deepcopy(parameters)
+        # if generated_parameters:
+        #     self.parameters.update(generated_parameters)
         self.page = page
         self.trace: list[ActionCall] = []
         self.prompt: str | None = None
