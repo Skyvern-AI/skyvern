@@ -418,7 +418,8 @@ function PromptBox() {
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Browser Address</div>
                       <div className="text-xs text-slate-400">
-                        The address of the Browser server to use for the task run.
+                        The address of the Browser server to use for the task
+                        run.
                       </div>
                     </div>
                     <Input
