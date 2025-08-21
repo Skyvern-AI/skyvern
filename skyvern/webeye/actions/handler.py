@@ -73,7 +73,11 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.services.task_v1_service import is_cua_task
-from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
+from skyvern.utils.prompt_engine import (
+    CheckDateFormatResponse,
+    CheckPhoneNumberFormatResponse,
+    load_prompt_with_elements,
+)
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -293,6 +297,43 @@ async def check_phone_number_format(
         recommended_phone_number=check_phone_number_format_response.recommended_phone_number,
     )
     return check_phone_number_format_response.recommended_phone_number
+
+
+async def check_date_format(
+    value: str,
+    action: actions.InputTextAction,
+    skyvern_element: SkyvernElement,
+    task: Task,
+    step: Step,
+) -> str:
+    # check the date format
+    LOG.info(
+        "Input is a date input, trigger date format checking",
+        action=action,
+        element_id=skyvern_element.get_id(),
+    )
+
+    prompt = prompt_engine.load_prompt(
+        template="check-date-format",
+        current_value=value,
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+
+    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="check-date-format")
+
+    check_date_format_response = CheckDateFormatResponse.model_validate(json_response)
+    if check_date_format_response.is_current_format_correct or not check_date_format_response.recommended_date:
+        return value
+
+    LOG.info(
+        "The current date format is incorrect, using the recommended date",
+        action=action,
+        element_id=skyvern_element.get_id(),
+        recommended_date=check_date_format_response.recommended_date,
+    )
+    return check_date_format_response.recommended_date
 
 
 class AutoCompletionResult(BaseModel):
@@ -1146,6 +1187,17 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if len(text) == 0:
+            return [ActionSuccess()]
+
+        if tag_name == InteractiveElement.INPUT and await skyvern_element.get_attr("type") == "date":
+            text = await check_date_format(
+                value=text,
+                action=action,
+                skyvern_element=skyvern_element,
+                task=task,
+                step=step,
+            )
+            await skyvern_element.input_fill(text=text)
             return [ActionSuccess()]
 
         if not await skyvern_element.is_raw_input():
