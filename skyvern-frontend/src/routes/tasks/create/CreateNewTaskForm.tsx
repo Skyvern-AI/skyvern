@@ -707,8 +707,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                           <div className="w-72">
                             <h1 className="text-lg">Browser Address</h1>
                             <h2 className="text-base text-slate-400">
-                              The address of the Browser server to use for the task
-                              run.
+                              The address of the Browser server to use for the task run.
                             </h2>
                           </div>
                         </FormLabel>

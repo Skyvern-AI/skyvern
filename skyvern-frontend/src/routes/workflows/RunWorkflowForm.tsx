@@ -447,8 +447,7 @@ function RunWorkflowForm({
                           Browser Address
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          The address of the Browser server to use for the workflow
-                          run.
+                          The address of the Browser server to use for the workflow run.
                         </h2>
                       </div>
                     </FormLabel>
