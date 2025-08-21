@@ -1,18 +1,16 @@
 import { ExitIcon } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { Handle } from "@xyflow/react";
 import { Position } from "@xyflow/react";
 
 import { KeyIcon } from "@/components/icons/KeyIcon";
 import { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
-import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { cn } from "@/util/utils";
 
 import { CodeEditor } from "./CodeEditor";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
-import { constructCacheKeyValue } from "../editor/utils";
 
 function BlockCodeEditor({
   blockLabel,
@@ -25,19 +23,11 @@ function BlockCodeEditor({
   script: string | undefined;
   onClick?: (e: React.MouseEvent) => void;
 }) {
-  const { workflowPermanentId } = useParams();
+  const [searchParams] = useSearchParams();
   const blockTitle = workflowBlockTitle[blockType];
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
 
-  const { data: workflow } = useWorkflowQuery({
-    workflowPermanentId,
-  });
-  const cacheKey = workflow?.cache_key ?? "";
-  const cacheKeyValue = workflow
-    ? cacheKey === ""
-      ? ""
-      : constructCacheKeyValue(cacheKey, workflow)
-    : "";
+  const cacheKeyValue = searchParams.get("cache-key-value");
 
   return (
     <div className="h-full">
@@ -81,7 +71,9 @@ function BlockCodeEditor({
                   <KeyIcon />
                 </div>
                 <span className="text-xs text-slate-400">
-                  {cacheKeyValue === "" ? "(none)" : cacheKeyValue}
+                  {cacheKeyValue === "" || !cacheKeyValue
+                    ? "(none)"
+                    : cacheKeyValue}
                 </span>
               </div>
             </div>
