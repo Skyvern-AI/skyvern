@@ -3961,3 +3961,141 @@ class AgentDB:
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def get_workflow_cache_key_count(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        filter: str | None = None,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key=cache_key)
+                    .filter_by(deleted_at=None)
+                )
+
+                if filter:
+                    query = query.filter(WorkflowScriptModel.cache_key_value.contains(filter))
+
+                return (await session.execute(query)).scalar_one()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_cache_key_values(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        page: int = 1,
+        page_size: int = 100,
+        filter: str | None = None,
+    ) -> list[str]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel.cache_key_value)
+                    .order_by(WorkflowScriptModel.cache_key_value.asc())
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key=cache_key)
+                    .filter_by(deleted_at=None)
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+
+                if filter:
+                    query = query.filter(WorkflowScriptModel.cache_key_value.contains(filter))
+
+                return (await session.scalars(query)).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def create_workflow_cache_key_value(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        cache_key_value: str,
+        script_id: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> str:
+        """
+        Insert a new cache key value for a workflow.
+
+        Returns the workflow_script_id of the created record.
+        """
+        try:
+            async with self.Session() as session:
+                workflow_script = WorkflowScriptModel(
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_key_value=cache_key_value,
+                )
+
+                session.add(workflow_script)
+                await session.commit()
+                await session.refresh(workflow_script)
+
+                return workflow_script.workflow_script_id
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def delete_workflow_cache_key_value(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+    ) -> bool:
+        """
+        Soft delete workflow cache key values by setting deleted_at timestamp.
+
+        Returns True if any records were deleted, False otherwise.
+        """
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        and_(
+                            WorkflowScriptModel.organization_id == organization_id,
+                            WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                            WorkflowScriptModel.cache_key_value == cache_key_value,
+                            WorkflowScriptModel.deleted_at.is_(None),
+                        )
+                    )
+                    .values(deleted_at=datetime.now(timezone.utc))
+                )
+
+                result = await session.execute(stmt)
+                await session.commit()
+
+                return result.rowcount > 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
