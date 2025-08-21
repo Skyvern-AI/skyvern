@@ -163,6 +163,7 @@ class AgentDB:
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_session_id: str | None = None,
+        browser_address: str | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -193,6 +194,7 @@ class AgentDB:
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
                     browser_session_id=browser_session_id,
+                    browser_address=browser_address,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -1632,6 +1634,7 @@ class AgentDB:
         parent_workflow_run_id: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1648,6 +1651,7 @@ class AgentDB:
                     parent_workflow_run_id=parent_workflow_run_id,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
+                    browser_address=browser_address,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -2607,6 +2611,7 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2625,6 +2630,7 @@ class AgentDB:
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
             session.add(new_task_v2)
             await session.commit()

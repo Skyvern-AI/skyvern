@@ -173,6 +173,7 @@ async def run_task(
             model=run_request.model,
             max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             extra_http_headers=run_request.extra_http_headers,
+            browser_address=run_request.browser_address,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -231,6 +232,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
                 extra_http_headers=run_request.extra_http_headers,
+                browser_address=run_request.browser_address,
             )
         except MissingBrowserAddressError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -330,6 +332,7 @@ async def run_workflow(
         browser_session_id=workflow_run_request.browser_session_id,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
+        browser_address=workflow_run_request.browser_address,
     )
 
     try:
@@ -1914,6 +1917,7 @@ async def run_task_v2(
             max_screenshot_scrolling_times=data.max_screenshot_scrolls,
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
+            browser_address=data.browser_address,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

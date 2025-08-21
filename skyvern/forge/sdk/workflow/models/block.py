@@ -640,13 +640,14 @@ class BaseTaskBlock(Block):
             try:
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
+                close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
                 await app.agent.execute_step(
                     organization=organization,
                     task=task,
                     step=step,
                     task_block=self,
                     browser_session_id=browser_session_id,
-                    close_browser_on_completion=browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     complete_verification=self.complete_verification,
                     engine=self.engine,
                 )
@@ -800,7 +801,9 @@ class BaseTaskBlock(Block):
 
 
 class TaskBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.TASK] = BlockType.TASK
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.TASK] = BlockType.TASK  # type: ignore
 
 
 class LoopBlockExecutedResult(BaseModel):
@@ -844,7 +847,9 @@ class LoopBlockExecutedResult(BaseModel):
 
 
 class ForLoopBlock(Block):
-    block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
 
     loop_blocks: list[BlockTypeVar]
     loop_over: PARAMETER_TYPE | None = None
@@ -1361,7 +1366,9 @@ class ForLoopBlock(Block):
 
 
 class CodeBlock(Block):
-    block_type: Literal[BlockType.CODE] = BlockType.CODE
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.CODE] = BlockType.CODE  # type: ignore
 
     code: str
     parameters: list[PARAMETER_TYPE] = []
@@ -1534,7 +1541,9 @@ DEFAULT_TEXT_PROMPT_LLM_KEY = settings.PROMPT_BLOCK_LLM_KEY or settings.LLM_KEY
 
 
 class TextPromptBlock(Block):
-    block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT  # type: ignore
 
     llm_key: str = DEFAULT_TEXT_PROMPT_LLM_KEY
     prompt: str
@@ -1640,7 +1649,9 @@ class TextPromptBlock(Block):
 
 
 class DownloadToS3Block(Block):
-    block_type: Literal[BlockType.DOWNLOAD_TO_S3] = BlockType.DOWNLOAD_TO_S3
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.DOWNLOAD_TO_S3] = BlockType.DOWNLOAD_TO_S3  # type: ignore
 
     url: str
 
@@ -1726,7 +1737,9 @@ class DownloadToS3Block(Block):
 
 
 class UploadToS3Block(Block):
-    block_type: Literal[BlockType.UPLOAD_TO_S3] = BlockType.UPLOAD_TO_S3
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.UPLOAD_TO_S3] = BlockType.UPLOAD_TO_S3  # type: ignore
 
     # TODO (kerem): A directory upload is supported but we should also support a list of files
     path: str | None = None
@@ -1835,7 +1848,9 @@ class UploadToS3Block(Block):
 
 
 class FileUploadBlock(Block):
-    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
 
     storage_type: FileStorageType = FileStorageType.S3
     s3_bucket: str | None = None
@@ -2069,7 +2084,9 @@ class FileUploadBlock(Block):
 
 
 class SendEmailBlock(Block):
-    block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL  # type: ignore
 
     smtp_host: AWSSecretParameter
     smtp_port: AWSSecretParameter
@@ -2397,7 +2414,9 @@ class SendEmailBlock(Block):
 
 
 class FileParserBlock(Block):
-    block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
 
     file_url: str
     file_type: FileType
@@ -2672,7 +2691,9 @@ class PDFParserBlock(Block):
     This block will be removed in a future version.
     """
 
-    block_type: Literal[BlockType.PDF_PARSER] = BlockType.PDF_PARSER
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.PDF_PARSER] = BlockType.PDF_PARSER  # type: ignore
 
     file_url: str
     json_schema: dict[str, Any] | None = None
@@ -2778,7 +2799,9 @@ class PDFParserBlock(Block):
 
 
 class WaitBlock(Block):
-    block_type: Literal[BlockType.WAIT] = BlockType.WAIT
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.WAIT] = BlockType.WAIT  # type: ignore
 
     wait_sec: int
     parameters: list[PARAMETER_TYPE] = []
@@ -2823,7 +2846,9 @@ class WaitBlock(Block):
 
 
 class ValidationBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
     def get_all_parameters(
         self,
@@ -2860,36 +2885,50 @@ class ValidationBlock(BaseTaskBlock):
 
 
 class ActionBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.ACTION] = BlockType.ACTION
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
 
 
 class NavigationBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION  # type: ignore
 
     navigation_goal: str
 
 
 class ExtractionBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
 
     data_extraction_goal: str
 
 
 class LoginBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore
 
 
 class FileDownloadBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
 
 class UrlBlock(BaseTaskBlock):
-    block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL  # type: ignore
     url: str
 
 
 class TaskV2Block(Block):
-    block_type: Literal[BlockType.TaskV2] = BlockType.TaskV2
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.TaskV2] = BlockType.TaskV2  # type: ignore
     prompt: str
     url: str | None = None
     totp_verification_url: str | None = None
@@ -3047,7 +3086,9 @@ class TaskV2Block(Block):
 
 
 class HttpRequestBlock(Block):
-    block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST  # type: ignore
 
     # Individual HTTP parameters
     method: str = "GET"

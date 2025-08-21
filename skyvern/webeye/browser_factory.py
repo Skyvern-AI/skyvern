@@ -631,6 +631,7 @@ class BrowserState:
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
@@ -647,6 +648,7 @@ class BrowserState:
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -654,9 +656,13 @@ class BrowserState:
             LOG.info("browser context is created")
 
         if await self.get_working_page() is None:
-            page = await self.browser_context.new_page()
-            await self.set_working_page(page, 0)
-            await self._close_all_other_pages()
+            if browser_address and len(self.browser_context.pages) > 0:
+                page = self.browser_context.pages[0]
+                await self.set_working_page(page, 0)
+            else:
+                page = await self.browser_context.new_page()
+                await self.set_working_page(page, 0)
+                await self._close_all_other_pages()
 
             if url:
                 await self.navigate_to_url(page=page, url=url)
@@ -779,6 +785,7 @@ class BrowserState:
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -793,6 +800,7 @@ class BrowserState:
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
         except Exception as e:
             error_message = str(e)
@@ -809,6 +817,7 @@ class BrowserState:
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
         page = await self.__assert_page()
 
@@ -824,6 +833,7 @@ class BrowserState:
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
             page = await self.__assert_page()
         return page
