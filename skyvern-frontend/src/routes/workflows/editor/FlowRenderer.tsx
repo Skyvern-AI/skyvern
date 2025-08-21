@@ -78,6 +78,7 @@ import {
   layout,
 } from "./workflowEditorUtils";
 import { useAutoPan } from "./useAutoPan";
+import { useUser } from "@/hooks/useUser";
 
 const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -249,12 +250,14 @@ function FlowRenderer({
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
+  const user = useUser().get();
   const { title, initializeTitle } = useWorkflowTitleStore();
   // const [parameters] = useState<ParametersState>(initialParameters);
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const flowIsConstrained = debugStore.isDebugMode && Boolean(user);
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -491,7 +494,12 @@ function FlowRenderer({
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {
+    if (!user) {
+      return;
+    }
+
     const xLock = getXLock();
+
     if (newValue) {
       const currentY = reactFlowInstance.getViewport().y;
       reactFlowInstance.setViewport({ x: xLock, y: currentY, zoom: zoomLock });
@@ -647,18 +655,18 @@ function FlowRenderer({
           }}
           deleteKeyCode={null}
           onMove={(_, viewport) => {
-            if (debugStore.isDebugMode && shouldConstrainPan) {
+            if (flowIsConstrained && shouldConstrainPan) {
               constrainPan(viewport);
             }
           }}
-          maxZoom={debugStore.isDebugMode ? 1 : 2}
-          minZoom={debugStore.isDebugMode ? 1 : 0.5}
+          maxZoom={flowIsConstrained ? 1 : 2}
+          minZoom={flowIsConstrained ? 1 : 0.5}
           panOnDrag={true}
           panOnScroll={true}
           panOnScrollMode={PanOnScrollMode.Vertical}
-          zoomOnDoubleClick={!debugStore.isDebugMode}
-          zoomOnPinch={!debugStore.isDebugMode}
-          zoomOnScroll={!debugStore.isDebugMode}
+          zoomOnDoubleClick={!flowIsConstrained}
+          zoomOnPinch={!flowIsConstrained}
+          zoomOnScroll={!flowIsConstrained}
         >
           <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
           <Controls position="bottom-left" />
