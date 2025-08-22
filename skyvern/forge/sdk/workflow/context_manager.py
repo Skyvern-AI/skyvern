@@ -416,9 +416,9 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id:
+        if not client_id and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret:
+        if not client_secret and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
@@ -519,9 +519,9 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id:
+        if not client_id and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret:
+        if not client_secret and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
@@ -586,9 +586,9 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id:
+        if not client_id and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret:
+        if not client_secret and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
