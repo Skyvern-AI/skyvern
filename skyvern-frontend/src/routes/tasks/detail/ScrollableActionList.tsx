@@ -8,6 +8,7 @@ import {
   CheckCircledIcon,
   CrossCircledIcon,
   DotFilledIcon,
+  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { ReactNode, useRef } from "react";
@@ -80,6 +81,11 @@ function ScrollableActionList({
               </div>
               <div className="flex items-center gap-2">
                 <ActionTypePill actionType={action.type} />
+                {action.created_by === "script" && (
+                  <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
+                    <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                  </div>
+                )}
                 {action.success ? (
                   <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
                     <CheckCircledIcon className="h-4 w-4 text-success" />

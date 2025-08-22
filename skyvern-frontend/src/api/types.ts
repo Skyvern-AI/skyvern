@@ -252,6 +252,7 @@ export type ActionApiResponse = {
   text: string | null;
   option: Option | null;
   file_url: string | null;
+  created_by: string | null;
 };
 
 export type Action = {
@@ -262,6 +263,7 @@ export type Action = {
   success: boolean;
   stepId: string;
   index: number;
+  created_by: string | null;
 };
 
 export type EvalKind = "workflow" | "task";
@@ -357,6 +359,7 @@ export type ActionsApiResponse = {
   reasoning: string | null;
   intention: string | null;
   response: string | null;
+  created_by: string | null;
 };
 
 export type TaskV2 = {
