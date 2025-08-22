@@ -681,7 +681,7 @@ function Workspace({
             <WorkflowCacheKeyValuesPanel
               cacheKeyValues={cacheKeyValues}
               pending={cacheKeyValuesLoading}
-              scriptKey={workflow.cache_key ?? "<none>"}
+              scriptKey={workflow.cache_key ?? "default"}
               onDelete={(cacheKeyValue) => {
                 setToDeleteCacheKeyValue(cacheKeyValue);
                 setOpenConfirmCacheKeyValueDeleteDialogue(true);
