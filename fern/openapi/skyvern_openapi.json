@@ -9004,6 +9004,22 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot."
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The CDP address for the task.",
+            "examples": [
+              "http://127.0.0.1:9222",
+              "ws://127.0.0.1:9222/devtools/browser/1234567890"
+            ]
           }
         },
         "type": "object",
@@ -11485,6 +11501,22 @@
             ],
             "title": "Extra Http Headers",
             "description": "The extra HTTP headers for the requests in browser."
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The CDP address for the workflow run.",
+            "examples": [
+              "http://127.0.0.1:9222",
+              "ws://127.0.0.1:9222/devtools/browser/1234567890"
+            ]
           }
         },
         "type": "object",
