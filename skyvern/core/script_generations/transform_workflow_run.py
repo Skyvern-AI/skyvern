@@ -40,36 +40,72 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         raise ValueError(f"Workflow {run_request.workflow_id} not found")
     workflow_json = workflow.model_dump()
 
-    # get the tasks
-    ## first, get all the workflow run blocks
+    # get the original workflow definition blocks (with templated information)
+    workflow_definition_blocks = workflow.workflow_definition.blocks
+
+    # get workflow run blocks for task execution data
     workflow_run_blocks = await app.DATABASE.get_workflow_run_blocks(
         workflow_run_id=workflow_run_id, organization_id=organization_id
     )
     workflow_run_blocks.sort(key=lambda x: x.created_at)
+
+    # Create mapping from definition blocks by label for quick lookup
+    definition_blocks_by_label = {block.label: block for block in workflow_definition_blocks if block.label}
+
     workflow_block_dump = []
-    # Hydrate blocks with task data
-    # TODO: support task v2
     actions_by_task = {}
-    for block in workflow_run_blocks:
-        block_dump = block.model_dump()
-        if block.block_type == BlockType.TaskV2:
+
+    # Loop through workflow run blocks and match to original definition blocks by label
+    for run_block in workflow_run_blocks:
+        if run_block.block_type == BlockType.TaskV2:
             raise ValueError("TaskV2 blocks are not supported yet")
-        if block.block_type in SCRIPT_TASK_BLOCKS and block.task_id:
-            task = await app.DATABASE.get_task(task_id=block.task_id, organization_id=organization_id)
-            if not task:
-                LOG.warning(f"Task {block.task_id} not found")
-                continue
-            block_dump.update(task.model_dump())
-            actions = await app.DATABASE.get_task_actions_hydrated(
-                task_id=block.task_id, organization_id=organization_id
-            )
-            action_dumps = []
-            for action in actions:
-                action_dump = action.model_dump()
-                action_dump["xpath"] = action.get_xpath()
-                action_dumps.append(action_dump)
-            actions_by_task[block.task_id] = action_dumps
-        workflow_block_dump.append(block_dump)
+
+        # Find corresponding definition block by label to get templated information
+        definition_block = definition_blocks_by_label.get(run_block.label) if run_block.label else None
+
+        if definition_block:
+            # Start with the original templated definition block
+            final_dump = definition_block.model_dump()
+        else:
+            # Fallback to run block data if no matching definition block found
+            final_dump = run_block.model_dump()
+            LOG.warning(f"No matching definition block found for run block with label: {run_block.label}")
+
+        # For task blocks, add execution data while preserving templated information
+        if run_block.block_type in SCRIPT_TASK_BLOCKS and run_block.task_id:
+            task = await app.DATABASE.get_task(task_id=run_block.task_id, organization_id=organization_id)
+            if task:
+                # Add task execution data but preserve original templated fields
+                task_dump = task.model_dump()
+                # Update with execution data, but keep templated values from definition
+                if definition_block:
+                    final_dump.update({k: v for k, v in task_dump.items() if k not in final_dump})
+                else:
+                    final_dump.update(task_dump)
+
+                # Add run block execution metadata
+                final_dump.update(
+                    {
+                        "task_id": run_block.task_id,
+                        "status": run_block.status,
+                        "output": run_block.output,
+                    }
+                )
+
+                # Get task actions
+                actions = await app.DATABASE.get_task_actions_hydrated(
+                    task_id=run_block.task_id, organization_id=organization_id
+                )
+                action_dumps = []
+                for action in actions:
+                    action_dump = action.model_dump()
+                    action_dump["xpath"] = action.get_xpath()
+                    action_dumps.append(action_dump)
+                actions_by_task[run_block.task_id] = action_dumps
+            else:
+                LOG.warning(f"Task {run_block.task_id} not found")
+
+        workflow_block_dump.append(final_dump)
 
     return CodeGenInput(
         file_name=f"{workflow_run_id}.py",

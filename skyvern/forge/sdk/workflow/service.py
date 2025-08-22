@@ -277,24 +277,7 @@ class WorkflowService:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
-
-        # Check if there's a related workflow script that should be used instead
-        workflow_script = await self._get_workflow_script(workflow, workflow_run)
-        if workflow_script is not None:
-            LOG.info(
-                "Found related workflow script, running script instead of workflow",
-                workflow_run_id=workflow_run_id,
-                workflow_id=workflow.workflow_id,
-                organization_id=organization_id,
-                workflow_script_id=workflow_script.script_id,
-            )
-            return await self._execute_workflow_script(
-                script_id=workflow_script.script_id,
-                workflow=workflow,
-                workflow_run=workflow_run,
-                api_key=api_key,
-                organization=organization,
-            )
+        skyvern_context.current()
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
@@ -356,6 +339,24 @@ class WorkflowService:
                 close_browser_on_completion=close_browser_on_completion,
             )
             return workflow_run
+
+        # Check if there's a related workflow script that should be used instead
+        workflow_script = await self._get_workflow_script(workflow, workflow_run)
+        if workflow_script is not None:
+            LOG.info(
+                "Found related workflow script, running script instead of workflow",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                organization_id=organization_id,
+                workflow_script_id=workflow_script.script_id,
+            )
+            return await self._execute_workflow_script(
+                script_id=workflow_script.script_id,
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                organization=organization,
+            )
 
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
@@ -2350,9 +2351,6 @@ class WorkflowService:
         """
 
         try:
-            # Set workflow run status to running
-            workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-
             # Render the cache_key_value to find the right script
             parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
                 workflow_run_id=workflow_run.workflow_run_id
@@ -2402,7 +2400,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
     ) -> None:
         cache_key = workflow.cache_key
-        rendered_cache_key_value = ""
+        rendered_cache_key_value = "default"
         # 1) Build cache_key_value from workflow run parameters via jinja
         if cache_key:
             parameter_tuples = await app.DATABASE.get_workflow_run_parameters(

@@ -35,6 +35,7 @@ from skyvern.services.script_service import (  # noqa: E402
     extract,  # noqa: E402
     generate_text,  # noqa: E402
     login,  # noqa: E402
+    render_template,  # noqa: E402
     run_script,  # noqa: E402
     run_task,  # noqa: E402
     wait,  # noqa: E402
@@ -51,6 +52,7 @@ __all__ = [
     "extract",
     "generate_text",
     "login",
+    "render_template",
     "run_script",
     "run_task",
     "setup",
