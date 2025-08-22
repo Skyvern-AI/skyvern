@@ -9,7 +9,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
-from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
@@ -82,6 +82,12 @@ class Workflow(BaseModel):
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+
+    def get_output_parameter(self, label: str) -> OutputParameter | None:
+        for block in self.workflow_definition.blocks:
+            if block.label == label:
+                return block.output_parameter
+        return None
 
 
 class WorkflowRunStatus(StrEnum):
