@@ -12,6 +12,7 @@ import { ProxyLocation } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -23,6 +24,7 @@ import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { OrgWalled } from "@/components/Orgwalled";
+import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
@@ -149,21 +151,16 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         </div>
                       </div>
                       {inputs.useScriptCache && (
-                        <div className="space-y-2">
-                          <div className="flex gap-2">
-                            <Label>Script Key</Label>
-                            <HelpTooltip content="A constant string or templated name, comprised of one or more of your parameters. It's the unique key for a workflow script." />
-                          </div>
-                          <Input
-                            value={inputs.scriptCacheKey ?? ""}
-                            placeholder="my-{{param1}}-{{param2}}-key"
-                            onChange={(event) => {
-                              const value = (event.target.value ?? "").trim();
-                              const v = value.length ? value : null;
-                              handleChange("scriptCacheKey", v);
-                            }}
-                          />
-                        </div>
+                        <WorkflowBlockInputTextarea
+                          nodeId={id}
+                          onChange={(value) => {
+                            const v = value.length ? value : null;
+                            handleChange("scriptCacheKey", v);
+                          }}
+                          value={inputs.scriptCacheKey ?? ""}
+                          placeholder={placeholders["scripts"]["scriptKey"]}
+                          className="nopan text-xs"
+                        />
                       )}
                     </OrgWalled>
                     <div className="space-y-2">
