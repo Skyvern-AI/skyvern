@@ -523,7 +523,7 @@ class SkyvernFrame:
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
         except Exception:
-            LOG.info("Failed to wait for animation end, but ignore it", exc_info=True)
+            LOG.debug("Failed to wait for animation end, but ignore it", exc_info=True)
             return
 
     async def wait_for_animation_end(self, timeout_ms: float = 3000) -> None:
