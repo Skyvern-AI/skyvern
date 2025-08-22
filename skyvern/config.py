@@ -282,6 +282,7 @@ class Settings(BaseSettings):
     BITWARDEN_CLIENT_ID: str | None = None
     BITWARDEN_CLIENT_SECRET: str | None = None
     BITWARDEN_MASTER_PASSWORD: str | None = None
+    BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Skyvern Auth Bitwarden Settings
