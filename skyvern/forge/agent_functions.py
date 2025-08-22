@@ -232,7 +232,8 @@ async def _convert_svg_to_string(
         for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
             try:
                 async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                    assert app.SVG_CSS_CONVERTER_LLM_API_HANDLER is not None
+                    if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                        raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
                     json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
                         prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
                     )
@@ -391,7 +392,8 @@ async def _convert_css_shape_to_string(
             for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                        assert app.SVG_CSS_CONVERTER_LLM_API_HANDLER is not None
+                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                            raise Exception("To enable css shape conversion, please set the Secondary LLM key")
                         json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
                             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
                         )
