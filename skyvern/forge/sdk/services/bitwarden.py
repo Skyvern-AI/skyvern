@@ -184,8 +184,8 @@ class BitwardenService:
 
     @staticmethod
     async def get_secret_value_from_url(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -249,8 +249,8 @@ class BitwardenService:
 
     @staticmethod
     async def _get_secret_value_from_url(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -382,8 +382,8 @@ class BitwardenService:
 
     @staticmethod
     async def get_sensitive_information_from_identity(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -438,8 +438,8 @@ class BitwardenService:
 
     @staticmethod
     async def _get_sensitive_information_from_identity(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         collection_id: str,
         identity_key: str,
@@ -516,15 +516,18 @@ class BitwardenService:
             await BitwardenService.logout()
 
     @staticmethod
-    async def login(client_id: str, client_secret: str) -> None:
+    async def login(client_id: str | None, client_secret: str | None) -> None:
         """
         Log in to the Bitwarden CLI.
         """
         env = {
-            "BW_CLIENTID": client_id,
-            "BW_CLIENTSECRET": client_secret,
+            "BW_CLIENTID": client_id or "",
+            "BW_CLIENTSECRET": client_secret or "",
         }
-        login_command = ["bw", "login", "--apikey"]
+        if settings.BITWARDEN_EMAIL and settings.BITWARDEN_MASTER_PASSWORD:
+            login_command = ["bw", "login", settings.BITWARDEN_EMAIL, settings.BITWARDEN_MASTER_PASSWORD]
+        else:
+            login_command = ["bw", "login", "--apikey"]
         login_result = await BitwardenService.run_command(login_command, env)
 
         # Validate the login result
@@ -588,8 +591,8 @@ class BitwardenService:
 
     @staticmethod
     async def _get_credit_card_data(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -664,8 +667,8 @@ class BitwardenService:
 
     @staticmethod
     async def get_credit_card_data(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
