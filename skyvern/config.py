@@ -273,6 +273,11 @@ class Settings(BaseSettings):
     GROQ_MODEL: str | None = None
     GROQ_API_BASE: str = "https://api.groq.com/openai/v1"
 
+    # MOONSHOT AI
+    ENABLE_MOONSHOT: bool = False
+    MOONSHOT_API_KEY: str | None = None
+    MOONSHOT_API_BASE: str = "https://api.moonshot.cn/v1"
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
