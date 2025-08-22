@@ -102,11 +102,24 @@ def _value(value: Any) -> cst.BaseExpression:
     return cst.SimpleString(repr(str(value)))
 
 
+def _prompt_value(prompt_text: str) -> cst.BaseExpression:
+    """Create a prompt value with template rendering logic if needed."""
+    if "{{" in prompt_text and "}}" in prompt_text:
+        # Generate code for: render_template(prompt_text)
+        return cst.Call(
+            func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("render_template")),
+            args=[cst.Arg(value=_value(prompt_text))],
+        )
+    else:
+        # Return the prompt as a simple string value
+        return _value(prompt_text)
+
+
 def _generate_text_call(text_value: str, intention: str, parameter_key: str) -> cst.BaseExpression:
     """Create a generate_text function call CST expression."""
     return cst.Await(
         expression=cst.Call(
-            func=cst.Name("generate_text"),
+            func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("generate_text")),
             whitespace_before_args=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
@@ -433,7 +446,7 @@ def _build_run_task_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            value=_prompt_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -474,7 +487,7 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            value=_prompt_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -523,7 +536,7 @@ def _build_action_statement(block_title: str, block: dict[str, Any]) -> cst.Simp
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            value=_prompt_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -572,7 +585,7 @@ def _build_login_statement(block_title: str, block: dict[str, Any]) -> cst.Simpl
         ),
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            value=_prompt_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -654,7 +667,7 @@ def _build_navigate_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            value=_prompt_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -760,7 +773,7 @@ def _build_validate_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            value=_prompt_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -810,7 +823,7 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
+            value=_prompt_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1065,7 +1078,6 @@ async def generate_workflow_script(
                     names=[
                         cst.ImportAlias(cst.Name("RunContext")),
                         cst.ImportAlias(cst.Name("SkyvernPage")),
-                        cst.ImportAlias(cst.Name("generate_text")),
                     ],
                 )
             ]

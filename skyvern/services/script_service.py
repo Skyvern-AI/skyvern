@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import structlog
 from fastapi import BackgroundTasks, HTTPException
+from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
@@ -19,10 +20,11 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
-from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.schemas.scripts import CreateScriptResponse, FileNode, ScriptFileCreate
+from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger(__name__)
+jinja_sandbox_env = SandboxedEnvironment()
 
 
 async def build_file_tree(
@@ -320,20 +322,34 @@ async def _create_workflow_block_run_and_task(
 
 async def _record_output_parameter_value(
     workflow_run_id: str,
+    workflow_id: str,
+    organization_id: str,
     output: dict[str, Any] | list | str | None,
+    label: str | None = None,
 ) -> None:
+    if not label:
+        return
     # TODO support this in the future
-    # workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    # await workflow_run_context.register_output_parameter_value_post_execution(
-    #     parameter=self.output_parameter,
-    #     value=value,
-    # )
-    # await app.DATABASE.create_or_update_workflow_run_output_parameter(
-    #     workflow_run_id=workflow_run_id,
-    #     output_parameter_id=self.output_parameter.output_parameter_id,
-    #     value=value,
-    # )
-    return
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    # get the workflow
+    workflow = await app.DATABASE.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+    if not workflow:
+        return
+
+    # get the output_paramter
+    output_parameter = workflow.get_output_parameter(label)
+    if not output_parameter:
+        return
+
+    await workflow_run_context.register_output_parameter_value_post_execution(
+        parameter=output_parameter,
+        value=output,
+    )
+    await app.DATABASE.create_or_update_workflow_run_output_parameter(
+        workflow_run_id=workflow_run_id,
+        output_parameter_id=output_parameter.output_parameter_id,
+        value=output,
+    )
 
 
 async def _update_workflow_block(
@@ -341,13 +357,14 @@ async def _update_workflow_block(
     status: BlockStatus,
     task_id: str | None = None,
     task_status: TaskStatus = TaskStatus.completed,
+    label: str | None = None,
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
 ) -> None:
     """Update the status of a workflow run block."""
     try:
         context = skyvern_context.current()
-        if not context or not context.organization_id or not context.workflow_run_id:
+        if not context or not context.organization_id or not context.workflow_run_id or not context.workflow_id:
             return
         final_output = output
         if task_id:
@@ -385,7 +402,13 @@ async def _update_workflow_block(
                 status=status,
                 failure_reason=failure_reason,
             )
-        await _record_output_parameter_value(context.workflow_run_id, final_output)
+        await _record_output_parameter_value(
+            context.workflow_run_id,
+            context.workflow_id,
+            context.organization_id,
+            final_output,
+            label,
+        )
 
     except Exception as e:
         LOG.warning(
@@ -429,7 +452,9 @@ async def run_task(
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
-                await _update_workflow_block(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+                await _update_workflow_block(
+                    workflow_run_block_id, BlockStatus.completed, task_id=task_id, label=cache_key
+                )
 
         except Exception as e:
             # TODO: fallback to AI run in case of error
@@ -440,6 +465,7 @@ async def run_task(
                     BlockStatus.failed,
                     task_id=task_id,
                     task_status=TaskStatus.failed,
+                    label=cache_key,
                     failure_reason=str(e),
                 )
             raise
@@ -481,7 +507,9 @@ async def download(
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
-                await _update_workflow_block(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+                await _update_workflow_block(
+                    workflow_run_block_id, BlockStatus.completed, task_id=task_id, label=cache_key
+                )
 
         except Exception as e:
             # Update block status to failed if workflow block was created
@@ -491,6 +519,7 @@ async def download(
                     BlockStatus.failed,
                     task_id=task_id,
                     task_status=TaskStatus.failed,
+                    label=cache_key,
                     failure_reason=str(e),
                 )
             raise
@@ -531,7 +560,9 @@ async def action(
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
-                await _update_workflow_block(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+                await _update_workflow_block(
+                    workflow_run_block_id, BlockStatus.completed, task_id=task_id, label=cache_key
+                )
 
         except Exception as e:
             # Update block status to failed if workflow block was created
@@ -541,6 +572,7 @@ async def action(
                     BlockStatus.failed,
                     task_id=task_id,
                     task_status=TaskStatus.failed,
+                    label=cache_key,
                     failure_reason=str(e),
                 )
             raise
@@ -581,7 +613,9 @@ async def login(
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
-                await _update_workflow_block(workflow_run_block_id, BlockStatus.completed, task_id=task_id)
+                await _update_workflow_block(
+                    workflow_run_block_id, BlockStatus.completed, task_id=task_id, label=cache_key
+                )
 
         except Exception as e:
             # Update block status to failed if workflow block was created
@@ -591,6 +625,7 @@ async def login(
                     BlockStatus.failed,
                     task_id=task_id,
                     task_status=TaskStatus.failed,
+                    label=cache_key,
                     failure_reason=str(e),
                 )
             raise
@@ -637,6 +672,7 @@ async def extract(
                     BlockStatus.completed,
                     task_id=task_id,
                     output=output,
+                    label=cache_key,
                 )
             return output
         except Exception as e:
@@ -649,6 +685,7 @@ async def extract(
                     task_status=TaskStatus.failed,
                     failure_reason=str(e),
                     output=output,
+                    label=cache_key,
                 )
             raise
         finally:
@@ -752,3 +789,20 @@ async def generate_text(
             # If anything goes wrong, fall back to the original text
             pass
     return new_text
+
+
+def render_template(template: str, data: dict[str, Any] | None = None) -> str:
+    """
+    Refer to  Block.format_block_parameter_template_from_workflow_run_context
+
+    TODO: complete this function so that block code shares the same template rendering logic
+    """
+    template_data = data or {}
+    jinja_template = jinja_sandbox_env.from_string(template)
+    context = skyvern_context.current()
+    if context and context.workflow_run_id:
+        workflow_run_id = context.workflow_run_id
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        template_data.update(workflow_run_context.values)
+
+    return jinja_template.render(template_data)
