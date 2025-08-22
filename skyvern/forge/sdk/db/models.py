@@ -583,6 +583,7 @@ class ActionModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    created_by = Column(String, nullable=True)
 
 
 class WorkflowRunBlockModel(Base):
