@@ -9,8 +9,9 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
-from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
 
 
@@ -24,6 +25,7 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    browser_address: str | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -56,12 +58,6 @@ class WorkflowDefinition(BaseModel):
             raise WorkflowDefinitionHasDuplicateBlockLabels(duplicate_labels)
 
 
-class WorkflowStatus(StrEnum):
-    published = "published"
-    draft = "draft"
-    auto_generated = "auto_generated"
-
-
 class Workflow(BaseModel):
     workflow_id: str
     organization_id: str
@@ -80,12 +76,18 @@ class Workflow(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
-    use_cache: bool = False
+    generate_script: bool = False
     cache_key: str | None = None
 
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
+
+    def get_output_parameter(self, label: str) -> OutputParameter | None:
+        for block in self.workflow_definition.blocks:
+            if block.label == label:
+                return block.output_parameter
+        return None
 
 
 class WorkflowRunStatus(StrEnum):
@@ -125,6 +127,7 @@ class WorkflowRun(BaseModel):
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
+    browser_address: str | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -175,3 +178,4 @@ class WorkflowRunResponseBase(BaseModel):
     workflow_title: str | None = None
     browser_session_id: str | None = None
     max_screenshot_scrolls: int | None = None
+    browser_address: str | None = None

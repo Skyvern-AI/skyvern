@@ -7,9 +7,9 @@ import {
   MagnifyingGlassIcon,
 } from "@radix-ui/react-icons";
 import { WorkflowBlockTypes } from "../../types/workflowTypes";
-import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
+import { AddNodeProps } from "../Workspace";
 import { Input } from "@/components/ui/input";
 
 const enableCodeBlock =
@@ -40,8 +40,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Navigation Block",
-    description: "Navigate on the page",
+    title: "Browser Task Block",
+    description: "Take actions to achieve a task.",
   },
   {
     nodeType: "taskv2",
@@ -51,8 +51,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Navigation v2 Block",
-    description: "Navigate on the page with Skyvern 2.0",
+    title: "Browser Task v2 Block",
+    description: "Achieve complex tasks with deep thinking.",
   },
   {
     nodeType: "action",
@@ -62,7 +62,7 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Action Block",
+    title: "Browser Action Block",
     description: "Take a single action",
   },
   {
@@ -87,17 +87,17 @@ const nodeLibraryItems: Array<{
     title: "Validation Block",
     description: "Validate completion criteria",
   },
-  {
-    nodeType: "task",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Task}
-        className="size-6"
-      />
-    ),
-    title: "Task Block",
-    description: "Complete multi-step browser automation tasks",
-  },
+  // {
+  //   nodeType: "task",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.Task}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Task Block",
+  //   description: "Complete multi-step browser automation tasks",
+  // },
   {
     nodeType: "url",
     icon: (
@@ -243,11 +243,16 @@ const nodeLibraryItems: Array<{
 ];
 
 type Props = {
+  onMouseDownCapture?: () => void;
   onNodeClick: (props: AddNodeProps) => void;
   first?: boolean;
 };
 
-function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
+function WorkflowNodeLibraryPanel({
+  onMouseDownCapture,
+  onNodeClick,
+  first,
+}: Props) {
   const workflowPanelData = useWorkflowPanelStore(
     (state) => state.workflowPanelState.data,
   );
@@ -311,8 +316,11 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
   });
 
   return (
-    <div className="w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
-      <div className="space-y-4">
+    <div
+      className="h-full w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
+      onMouseDownCapture={() => onMouseDownCapture?.()}
+    >
+      <div className="flex h-full flex-col space-y-4">
         <header className="space-y-2">
           <div className="flex justify-between">
             <h1 className="text-lg">Block Library</h1>
@@ -347,8 +355,8 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
             tabIndex={0}
           />
         </div>
-        <ScrollArea>
-          <ScrollAreaViewport className="max-h-[28rem]">
+        <ScrollArea className="h-full flex-1">
+          <ScrollAreaViewport className="h-full">
             <div className="space-y-2">
               {filteredItems.length > 0 ? (
                 filteredItems.map((item) => (

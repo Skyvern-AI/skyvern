@@ -1,6 +1,4 @@
 import json
-import os
-import random
 import string
 from datetime import UTC, datetime
 from typing import Any
@@ -32,8 +30,6 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Stat
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import (
-    BlockResult,
-    BlockStatus,
     BlockTypeVar,
     ExtractionBlock,
     ForLoopBlock,
@@ -42,16 +38,13 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
-from skyvern.forge.sdk.workflow.models.workflow import (
-    Workflow,
-    WorkflowRequestBody,
-    WorkflowRun,
-    WorkflowRunStatus,
-    WorkflowStatus,
-)
-from skyvern.forge.sdk.workflow.models.yaml import (
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
+    BlockResult,
+    BlockStatus,
     ContextParameterYAML,
     ExtractionBlockYAML,
     ForLoopBlockYAML,
@@ -60,9 +53,10 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     UrlBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
 from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.strings import generate_random_string
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -169,6 +163,7 @@ async def initialize_task_v2(
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    browser_address: str | None = None,
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
@@ -182,6 +177,7 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        browser_address=browser_address,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -235,6 +231,7 @@ async def initialize_task_v2(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
@@ -373,7 +370,7 @@ async def run_task_v2(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=browser_session_id is None,
+                close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
                 need_call_webhook=False,
             )
         else:
@@ -1047,7 +1044,7 @@ async def _generate_loop_task(
                 artifact_type=ArtifactType.SCREENSHOT_LLM,
                 data=screenshot,
             )
-    loop_random_string = _generate_random_string()
+    loop_random_string = generate_random_string()
     label = f"extraction_task_for_loop_{loop_random_string}"
     loop_values_key = f"loop_values_{loop_random_string}"
     extraction_block_yaml = ExtractionBlockYAML(
@@ -1147,7 +1144,7 @@ async def _generate_loop_task(
     )
     app.WORKFLOW_CONTEXT_MANAGER.add_context_parameter(workflow_run_id, url_value_context_parameter)
 
-    task_in_loop_label = f"task_in_loop_{_generate_random_string()}"
+    task_in_loop_label = f"task_in_loop_{generate_random_string()}"
     context = skyvern_context.ensure_context()
     task_in_loop_metadata_prompt = prompt_engine.load_prompt(
         "task_v2_generate_task_block",
@@ -1217,7 +1214,7 @@ async def _generate_loop_task(
 
     # use the output parameter of the extraction block to create the for loop block
     for_loop_yaml = ForLoopBlockYAML(
-        label=f"loop_{_generate_random_string()}",
+        label=f"loop_{generate_random_string()}",
         loop_over_parameter_key=loop_for_context_parameter.key,
         loop_blocks=[block_yaml],
     )
@@ -1275,7 +1272,7 @@ async def _generate_extraction_task(
 
     # create OutputParameter for the data_extraction block
     data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
-    label = f"data_extraction_{_generate_random_string()}"
+    label = f"data_extraction_{generate_random_string()}"
     url: str | None = None
     if not task_history:
         # data extraction is the very first block
@@ -1314,7 +1311,7 @@ async def _generate_navigation_task(
     totp_identifier: str | None = None,
 ) -> tuple[NavigationBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
     LOG.info("Generating navigation task", navigation_goal=navigation_goal, original_url=original_url)
-    label = f"navigation_{_generate_random_string()}"
+    label = f"navigation_{generate_random_string()}"
     navigation_block_yaml = NavigationBlockYAML(
         label=label,
         url=original_url,
@@ -1348,7 +1345,7 @@ async def _generate_goto_url_task(
 ) -> tuple[UrlBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
     LOG.info("Generating goto url task", url=url)
     # create OutputParameter for the data_extraction block
-    label = f"goto_url_{_generate_random_string()}"
+    label = f"goto_url_{generate_random_string()}"
 
     url_block_yaml = UrlBlockYAML(
         label=label,
@@ -1368,12 +1365,6 @@ async def _generate_goto_url_task(
         [url_block_yaml],
         [],
     )
-
-
-def _generate_random_string(length: int = 5) -> str:
-    # Use the current timestamp as the seed
-    random.seed(os.urandom(16))
-    return "".join(random.choices(RANDOM_STRING_POOL, k=length))
 
 
 async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:

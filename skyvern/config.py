@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
 
+    # Azure Blob Storage settings
+    AZURE_STORAGE_ACCOUNT_NAME: str | None = None
+    AZURE_STORAGE_ACCOUNT_KEY: str | None = None
+
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
 
@@ -115,7 +119,9 @@ class Settings(BaseSettings):
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
+    SINGLE_INPUT_AGENT_LLM_KEY: str | None = None
     PROMPT_BLOCK_LLM_KEY: str | None = None
+    EXTRACTION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -136,6 +142,7 @@ class Settings(BaseSettings):
     ENABLE_OPENAI_COMPATIBLE: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
+    GPT5_REASONING_EFFORT: str | None = "medium"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
@@ -215,6 +222,27 @@ class Settings(BaseSettings):
     AZURE_O3_API_BASE: str | None = None
     AZURE_O3_API_VERSION: str = "2025-01-01-preview"
 
+    # AZURE gpt-5
+    ENABLE_AZURE_GPT5: bool = False
+    AZURE_GPT5_DEPLOYMENT: str = "gpt-5"
+    AZURE_GPT5_API_KEY: str | None = None
+    AZURE_GPT5_API_BASE: str | None = None
+    AZURE_GPT5_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5 mini
+    ENABLE_AZURE_GPT5_MINI: bool = False
+    AZURE_GPT5_MINI_DEPLOYMENT: str = "gpt-5-mini"
+    AZURE_GPT5_MINI_API_KEY: str | None = None
+    AZURE_GPT5_MINI_API_BASE: str | None = None
+    AZURE_GPT5_MINI_API_VERSION: str = "2025-04-01-preview"
+
+    # AZURE gpt-5 nano
+    ENABLE_AZURE_GPT5_NANO: bool = False
+    AZURE_GPT5_NANO_DEPLOYMENT: str = "gpt-5-nano"
+    AZURE_GPT5_NANO_API_KEY: str | None = None
+    AZURE_GPT5_NANO_API_BASE: str | None = None
+    AZURE_GPT5_NANO_API_VERSION: str = "2025-04-01-preview"
+
     # GEMINI
     GEMINI_API_KEY: str | None = None
 
@@ -254,6 +282,7 @@ class Settings(BaseSettings):
     BITWARDEN_CLIENT_ID: str | None = None
     BITWARDEN_CLIENT_SECRET: str | None = None
     BITWARDEN_MASTER_PASSWORD: str | None = None
+    BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Skyvern Auth Bitwarden Settings
@@ -327,6 +356,7 @@ class Settings(BaseSettings):
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
+                "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
@@ -354,6 +384,7 @@ class Settings(BaseSettings):
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
+                "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",

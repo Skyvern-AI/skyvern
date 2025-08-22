@@ -5,11 +5,14 @@ import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowT
 export type FileUploadNodeData = NodeBaseData & {
   path: string;
   editable: boolean;
-  storageType: string;
-  s3Bucket: string;
-  awsAccessKeyId: string;
-  awsSecretAccessKey: string;
-  regionName: string;
+  storageType: "s3" | "azure";
+  s3Bucket: string | null;
+  awsAccessKeyId: string | null;
+  awsSecretAccessKey: string | null;
+  regionName: string | null;
+  azureStorageAccountName: string | null;
+  azureStorageAccountKey: string | null;
+  azureBlobContainerName: string | null;
 };
 
 export type FileUploadNode = Node<FileUploadNodeData, "fileUpload">;
@@ -20,10 +23,13 @@ export const fileUploadNodeDefaultData: FileUploadNodeData = {
   storageType: "s3",
   label: "",
   path: "",
-  s3Bucket: "",
-  awsAccessKeyId: "",
-  awsSecretAccessKey: "",
-  regionName: "",
+  s3Bucket: null,
+  awsAccessKeyId: null,
+  awsSecretAccessKey: null,
+  regionName: null,
+  azureStorageAccountName: null,
+  azureStorageAccountKey: null,
+  azureBlobContainerName: null,
   continueOnFailure: false,
   model: null,
 } as const;

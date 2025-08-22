@@ -73,6 +73,42 @@ class LLMConfigRegistry:
 
 if settings.ENABLE_OPENAI:
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5",
+        LLMConfig(
+            "gpt-5-2025-08-07",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_MINI",
+        LLMConfig(
+            "gpt-5-mini-2025-08-07",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_NANO",
+        LLMConfig(
+            "gpt-5-nano-2025-08-07",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -537,6 +573,80 @@ if settings.ENABLE_AZURE_GPT4_1_NANO:
         ),
     )
 
+if settings.ENABLE_AZURE_GPT5:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_DEPLOYMENT",
+                "AZURE_GPT5_API_KEY",
+                "AZURE_GPT5_API_BASE",
+                "AZURE_GPT5_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_API_BASE,
+                api_key=settings.AZURE_GPT5_API_KEY,
+                api_version=settings.AZURE_GPT5_API_VERSION,
+                model_info={"model_name": "azure/gpt-5"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_MINI:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_MINI",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_MINI_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_MINI_DEPLOYMENT",
+                "AZURE_GPT5_MINI_API_KEY",
+                "AZURE_GPT5_MINI_API_BASE",
+                "AZURE_GPT5_MINI_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_MINI_API_BASE,
+                api_key=settings.AZURE_GPT5_MINI_API_KEY,
+                api_version=settings.AZURE_GPT5_MINI_API_VERSION,
+                model_info={"model_name": "azure/gpt-5-mini"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_NANO:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_NANO",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_NANO_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_NANO_DEPLOYMENT",
+                "AZURE_GPT5_NANO_API_KEY",
+                "AZURE_GPT5_NANO_API_BASE",
+                "AZURE_GPT5_NANO_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_NANO_API_BASE,
+                api_key=settings.AZURE_GPT5_NANO_API_KEY,
+                api_version=settings.AZURE_GPT5_NANO_API_VERSION,
+                model_info={"model_name": "azure/gpt-5-nano"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
 
 if settings.ENABLE_AZURE_O4_MINI:
     LLMConfigRegistry.register_config(

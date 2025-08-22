@@ -14,7 +14,8 @@ export type WorkflowCreateYAMLRequest = {
   is_saved_task?: boolean;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
-  use_cache?: boolean;
+  generate_script?: boolean;
+  cache_key?: string | null;
 };
 
 export type WorkflowDefinitionYAML = {
@@ -289,6 +290,9 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   region_name: string;
   aws_access_key_id: string;
   aws_secret_access_key: string;
+  azure_storage_account_name?: string | null;
+  azure_storage_account_key?: string | null;
+  azure_blob_container_name?: string | null;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {

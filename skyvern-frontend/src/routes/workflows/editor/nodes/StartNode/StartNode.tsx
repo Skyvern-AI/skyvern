@@ -12,6 +12,7 @@ import { ProxyLocation } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -23,6 +24,7 @@ import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { OrgWalled } from "@/components/Orgwalled";
+import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
@@ -61,6 +63,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       : null,
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
     useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
+    scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
   });
 
   useEffect(() => {
@@ -133,11 +136,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         }}
                       />
                     </div>
-                    <OrgWalled>
+                    <OrgWalled className="flex flex-col gap-4">
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
-                          <Label>Use Script Cache</Label>
-                          <HelpTooltip content="Generate & use cached scripts for faster execution" />
+                          <Label>Generate Script</Label>
+                          <HelpTooltip content="Generate & use cached scripts for faster execution." />
                           <Switch
                             className="ml-auto"
                             checked={inputs.useScriptCache}
@@ -147,6 +150,18 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           />
                         </div>
                       </div>
+                      {inputs.useScriptCache && (
+                        <WorkflowBlockInputTextarea
+                          nodeId={id}
+                          onChange={(value) => {
+                            const v = value.length ? value : null;
+                            handleChange("scriptCacheKey", v);
+                          }}
+                          value={inputs.scriptCacheKey ?? ""}
+                          placeholder={placeholders["scripts"]["scriptKey"]}
+                          className="nopan text-xs"
+                        />
+                      )}
                     </OrgWalled>
                     <div className="space-y-2">
                       <div className="flex items-center gap-2">

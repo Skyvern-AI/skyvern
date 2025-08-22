@@ -147,6 +147,7 @@ export type CreateTaskRequest = {
   application?: string | null;
   include_action_history_in_verification?: boolean | null;
   max_screenshot_scrolls?: number | null;
+  browser_address?: string | null;
 };
 
 export type User = {
@@ -251,6 +252,7 @@ export type ActionApiResponse = {
   text: string | null;
   option: Option | null;
   file_url: string | null;
+  created_by: string | null;
 };
 
 export type Action = {
@@ -261,6 +263,7 @@ export type Action = {
   success: boolean;
   stepId: string;
   index: number;
+  created_by: string | null;
 };
 
 export type EvalKind = "workflow" | "task";
@@ -317,6 +320,7 @@ export type WorkflowRunStatusApiResponse = {
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
   created_at: string;
+  finished_at: string;
   modified_at: string;
   parameters: Record<string, unknown>;
   screenshot_urls: Array<string> | null;
@@ -355,6 +359,7 @@ export type ActionsApiResponse = {
   reasoning: string | null;
   intention: string | null;
   response: string | null;
+  created_by: string | null;
 };
 
 export type TaskV2 = {

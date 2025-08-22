@@ -5,8 +5,6 @@ from urllib.parse import unquote
 import pyotp
 import structlog
 
-from skyvern.exceptions import NoTOTPSecretFound
-
 LOG = structlog.get_logger()
 
 
@@ -36,7 +34,7 @@ def parse_totp_secret(totp_secret: str) -> str:
         LOG.warning("Failed to parse TOTP secret key from URI format, going to extract secret by regex", exc_info=True)
         m = re.search(r"(?i)(?:^|[?&])secret=([^&#]+)", unquote(totp_secret_no_whitespace))
         if m is None:
-            raise NoTOTPSecretFound()
+            return totp_secret_no_whitespace
         totp_secret = m.group(1)
         totp_secret_no_whitespace = "".join(totp_secret.split())
         return totp_secret_no_whitespace

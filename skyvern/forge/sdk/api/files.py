@@ -64,6 +64,11 @@ def extract_google_drive_file_id(url: str) -> str | None:
     return None
 
 
+def is_valid_mime_type(file_path: str) -> bool:
+    mime_type, _ = mimetypes.guess_type(file_path)
+    return mime_type is not None
+
+
 async def download_file(url: str, max_size_mb: int | None = None) -> str:
     try:
         # Check if URL is a Google Drive link
@@ -122,7 +127,7 @@ async def download_file(url: str, max_size_mb: int | None = None) -> str:
                     LOG.info("No file name retrieved from HTTP headers, using the file name from the URL")
                     file_name = os.path.basename(a.path)
 
-                if not Path(file_name).suffix and file_suffix:
+                if not is_valid_mime_type(file_name) and file_suffix:
                     LOG.info("No file extension detected, adding the extension from HTTP headers")
                     file_name = file_name + file_suffix
 
@@ -168,12 +173,12 @@ def unzip_files(zip_file_path: str, output_dir: str) -> None:
         zip_ref.extractall(output_dir)
 
 
-def get_path_for_workflow_download_directory(workflow_run_id: str) -> Path:
-    return Path(get_download_dir(workflow_run_id=workflow_run_id, task_id=None))
+def get_path_for_workflow_download_directory(run_id: str | None) -> Path:
+    return Path(get_download_dir(run_id=run_id))
 
 
-def get_download_dir(workflow_run_id: str | None, task_id: str | None) -> str:
-    download_dir = f"{REPO_ROOT_DIR}/downloads/{workflow_run_id or task_id}"
+def get_download_dir(run_id: str | None) -> str:
+    download_dir = f"{REPO_ROOT_DIR}/downloads/{run_id}"
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
 

@@ -90,6 +90,7 @@ function createTaskRequestObject(
     extracted_information_schema: extractedInformationSchema,
     extra_http_headers: extraHttpHeaders,
     totp_identifier: transform(formValues.totpIdentifier),
+    browser_address: transform(formValues.cdpAddress),
     error_code_mapping: errorCodeMapping,
     max_screenshot_scrolls: formValues.maxScreenshotScrolls,
     include_action_history_in_verification:
@@ -127,6 +128,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
       maxStepsOverride: initialValues.maxStepsOverride ?? null,
       proxyLocation: initialValues.proxyLocation ?? ProxyLocation.Residential,
       maxScreenshotScrolls: initialValues.maxScreenshotScrolls ?? null,
+      cdpAddress: initialValues.cdpAddress ?? null,
     },
   });
   const { errors } = useFormState({ control: form.control });
@@ -686,6 +688,35 @@ function CreateNewTaskForm({ initialValues }: Props) {
                             <Input
                               {...field}
                               placeholder="Add an ID that links your TOTP to the task"
+                              value={field.value === null ? "" : field.value}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </div>
+                      </div>
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="cdpAddress"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-16">
+                        <FormLabel>
+                          <div className="w-72">
+                            <h1 className="text-lg">Browser Address</h1>
+                            <h2 className="text-base text-slate-400">
+                              The address of the Browser server to use for the
+                              task run.
+                            </h2>
+                          </div>
+                        </FormLabel>
+                        <div className="w-full">
+                          <FormControl>
+                            <Input
+                              {...field}
+                              placeholder="http://127.0.0.1:9222"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>

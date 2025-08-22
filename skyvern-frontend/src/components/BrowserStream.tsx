@@ -8,7 +8,7 @@ import type {
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { AnimatedWave } from "@/components/AnimatedWave";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
@@ -21,6 +21,7 @@ import {
 } from "@/util/env";
 import { cn } from "@/util/utils";
 
+import { RotateThrough } from "./RotateThrough";
 import "./browser-stream.css";
 
 interface CommandTakeControl {
@@ -361,15 +362,25 @@ function BrowserStream({
                 size="sm"
               >
                 <ExitIcon className="mr-2 h-4 w-4" />
-                cede control
+                stop controlling
               </Button>
             </div>
           )}
         </div>
       )}
       {!isVncConnected && (
-        <div className="absolute left-0 top-0 flex h-full w-full items-center justify-center bg-black">
-          <Skeleton className="aspect-[16/9] h-auto max-h-full w-full max-w-full rounded-lg object-cover" />
+        <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
+          <RotateThrough interval={7 * 1000}>
+            <span>Hm, working on the connection...</span>
+            <span>Hang tight, we're almost there...</span>
+            <span>Just a moment...</span>
+            <span>Backpropagating...</span>
+            <span>Attention is all I need...</span>
+            <span>Consulting the manual...</span>
+            <span>Looking for the bat phone...</span>
+            <span>Where's Shu?...</span>
+          </RotateThrough>
+          <AnimatedWave text=".‧₊˚ ⋅ ? ✨ ?★ ‧₊˚ ⋅" />
         </div>
       )}
     </div>

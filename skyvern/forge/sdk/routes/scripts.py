@@ -9,7 +9,15 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
-from skyvern.schemas.scripts import CreateScriptRequest, CreateScriptResponse, DeployScriptRequest, Script
+from skyvern.schemas.scripts import (
+    CreateScriptRequest,
+    CreateScriptResponse,
+    DeployScriptRequest,
+    Script,
+    ScriptBlocksRequest,
+    ScriptBlocksResponse,
+    ScriptCacheKeyValuesResponse,
+)
 from skyvern.services import script_service
 
 LOG = structlog.get_logger()
@@ -35,44 +43,12 @@ async def create_script(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CreateScriptResponse:
     """Create a new script with optional files and metadata."""
-    organization_id = current_org.organization_id
-    LOG.info(
-        "Creating script",
-        organization_id=organization_id,
-        file_count=len(data.files) if data.files else 0,
+    return await script_service.create_script(
+        organization_id=current_org.organization_id,
+        workflow_id=data.workflow_id,
+        run_id=data.run_id,
+        files=data.files,
     )
-    if data.run_id:
-        if not await app.DATABASE.get_run(run_id=data.run_id, organization_id=organization_id):
-            raise HTTPException(status_code=404, detail=f"Run_id {data.run_id} not found")
-    try:
-        # Create the script in the database
-        script = await app.DATABASE.create_script(
-            organization_id=organization_id,
-            run_id=data.run_id,
-        )
-        # Process files if provided
-        file_tree = {}
-        file_count = 0
-        if data.files:
-            file_tree = await script_service.build_file_tree(
-                data.files,
-                organization_id=organization_id,
-                script_id=script.script_id,
-                script_version=script.version,
-                script_revision_id=script.script_revision_id,
-            )
-            file_count = len(data.files)
-        return CreateScriptResponse(
-            script_id=script.script_id,
-            version=script.version,
-            run_id=script.run_id,
-            file_count=file_count,
-            created_at=script.created_at,
-            file_tree=file_tree,
-        )
-    except Exception as e:
-        LOG.error("Failed to create script", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to create script")
 
 
 @base_router.get(
@@ -293,3 +269,253 @@ async def run_script(
         organization_id=current_org.organization_id,
         background_tasks=background_tasks,
     )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/blocks",
+    include_in_schema=False,
+    response_model=ScriptBlocksResponse,
+)
+async def get_workflow_script_blocks(
+    workflow_permanent_id: str,
+    block_script_request: ScriptBlocksRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ScriptBlocksResponse:
+    empty = ScriptBlocksResponse(blocks={})
+    cache_key_value = block_script_request.cache_key_value
+
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    cache_key = block_script_request.cache_key or workflow.cache_key or ""
+
+    scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+        cache_key=cache_key,
+    )
+
+    if not scripts:
+        LOG.info(
+            "No scripts found for workflow",
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+            cache_key_value=cache_key_value,
+            cache_key=cache_key,
+        )
+        return empty
+
+    first_script = scripts[0]
+
+    script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+        script_revision_id=first_script.script_revision_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not script_blocks:
+        LOG.info(
+            "No script block found for workflow",
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+            script_revision_id=first_script.script_revision_id,
+        )
+        return empty
+
+    result: dict[str, str] = {}
+
+    # TODO(jdo): make concurrent to speed up
+    for script_block in script_blocks:
+        script_file_id = script_block.script_file_id
+
+        if not script_file_id:
+            LOG.info(
+                "No script file ID found for script block",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+                script_revision_id=first_script.script_revision_id,
+                block_label=script_block.script_block_label,
+            )
+            continue
+
+        script_file = await app.DATABASE.get_script_file_by_id(
+            script_revision_id=first_script.script_revision_id,
+            file_id=script_file_id,
+            organization_id=current_org.organization_id,
+        )
+
+        if not script_file:
+            LOG.info(
+                "No script file found for script block",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+                script_revision_id=first_script.script_revision_id,
+                block_label=script_block.script_block_label,
+                script_file_id=script_file_id,
+            )
+            continue
+
+        artifact_id = script_file.artifact_id
+
+        if not artifact_id:
+            LOG.info(
+                "No artifact ID found for script file",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+                script_revision_id=first_script.script_revision_id,
+                block_label=script_block.script_block_label,
+                script_file_id=script_file_id,
+            )
+            continue
+
+        artifact = await app.DATABASE.get_artifact_by_id(
+            artifact_id,
+            current_org.organization_id,
+        )
+
+        if not artifact:
+            LOG.error(
+                "No artifact found for script file",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+                script_revision_id=first_script.script_revision_id,
+                block_label=script_block.script_block_label,
+                script_file_id=script_file_id,
+                artifact_id=artifact_id,
+            )
+            continue
+
+        data = await app.STORAGE.retrieve_artifact(artifact)
+
+        if not data:
+            LOG.error(
+                "No data found for artifact",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+                block_label=script_block.script_block_label,
+                script_revision_id=script_block.script_revision_id,
+                file_id=script_file_id,
+                artifact_id=artifact_id,
+            )
+            continue
+
+        try:
+            decoded_data = data.decode("utf-8")
+            result[script_block.script_block_label] = decoded_data
+        except UnicodeDecodeError:
+            LOG.error(
+                "File content is not valid UTF-8 text",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=current_org.organization_id,
+                block_label=script_block.script_block_label,
+                script_revision_id=script_block.script_revision_id,
+                file_id=script_file_id,
+                artifact_id=artifact_id,
+            )
+            continue
+
+    return ScriptBlocksResponse(blocks=result)
+
+
+@base_router.get(
+    "/scripts/{workflow_permanent_id}/{cache_key}/values",
+    include_in_schema=False,
+    response_model=ScriptCacheKeyValuesResponse,
+)
+async def get_workflow_cache_key_values(
+    workflow_permanent_id: str,
+    cache_key: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(
+        1,
+        ge=1,
+        description="Page number for pagination",
+        examples=[1],
+    ),
+    page_size: int = Query(
+        100,
+        ge=1,
+        description="Number of items per page",
+        examples=[100],
+    ),
+    filter: str | None = Query(
+        None,
+        description="Filter values by a substring",
+        examples=["value1", "value2"],
+    ),
+) -> ScriptCacheKeyValuesResponse:
+    # TODO(jdo): concurrent-ize
+
+    values = await app.DATABASE.get_workflow_cache_key_values(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key=cache_key,
+        page=page,
+        page_size=page_size,
+        filter=filter,
+    )
+
+    total_count = await app.DATABASE.get_workflow_cache_key_count(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key=cache_key,
+    )
+
+    filtered_count = await app.DATABASE.get_workflow_cache_key_count(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key=cache_key,
+        filter=filter,
+    )
+
+    return ScriptCacheKeyValuesResponse(
+        filtered_count=filtered_count,
+        page=page,
+        page_size=page_size,
+        total_count=total_count,
+        values=values,
+    )
+
+
+@base_router.delete(
+    "/scripts/{workflow_permanent_id}/value/{cache_key_value}",
+    include_in_schema=False,
+)
+async def delete_workflow_cache_key_value(
+    workflow_permanent_id: str,
+    cache_key_value: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, str]:
+    """Delete a specific cache key value for a workflow."""
+    LOG.info(
+        "Deleting workflow cache key value",
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+    )
+
+    # Verify workflow exists
+    workflow = await app.DATABASE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    # Delete the cache key value
+    deleted = await app.DATABASE.delete_workflow_cache_key_value(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        cache_key_value=cache_key_value,
+    )
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Cache key value not found")
+
+    return {"message": "Cache key value deleted successfully"}

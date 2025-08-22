@@ -125,3 +125,32 @@ class Script(BaseModel):
     created_at: datetime = Field(description="Timestamp when the script was created")
     modified_at: datetime = Field(description="Timestamp when the script was last modified")
     deleted_at: datetime | None = Field(default=None, description="Timestamp when the script was soft deleted")
+
+
+class ScriptBlock(BaseModel):
+    script_block_id: str
+    organization_id: str
+    script_id: str
+    script_revision_id: str
+    script_block_label: str
+    script_file_id: str | None = None
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
+class ScriptCacheKeyValuesResponse(BaseModel):
+    filtered_count: int
+    page: int
+    page_size: int
+    total_count: int
+    values: list[str]
+
+
+class ScriptBlocksResponse(BaseModel):
+    blocks: dict[str, str]
+
+
+class ScriptBlocksRequest(BaseModel):
+    cache_key_value: str
+    cache_key: str | None = None

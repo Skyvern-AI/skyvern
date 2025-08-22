@@ -15,6 +15,7 @@ from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
     OutputParameterModel,
+    ScriptBlockModel,
     ScriptFileModel,
     ScriptModel,
     StepModel,
@@ -32,7 +33,6 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -51,7 +51,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation
-from skyvern.schemas.scripts import Script, ScriptFile
+from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
@@ -151,6 +152,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         finished_at=task_obj.finished_at,
         max_screenshot_scrolls=task_obj.max_screenshot_scrolling_times,
         browser_session_id=task_obj.browser_session_id,
+        browser_address=task_obj.browser_address,
     )
     return task
 
@@ -261,7 +263,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         deleted_at=workflow_model.deleted_at,
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
-        use_cache=workflow_model.use_cache,
+        generate_script=workflow_model.generate_script,
         cache_key=workflow_model.cache_key,
     )
 
@@ -299,6 +301,7 @@ def convert_to_workflow_run(
         workflow_title=workflow_title,
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
         extra_http_headers=workflow_run_model.extra_http_headers,
+        browser_address=workflow_run_model.browser_address,
     )
 
 
@@ -535,6 +538,20 @@ def convert_to_script_file(script_file_model: ScriptFileModel) -> ScriptFile:
         artifact_id=script_file_model.artifact_id,
         created_at=script_file_model.created_at,
         modified_at=script_file_model.modified_at,
+    )
+
+
+def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock:
+    return ScriptBlock(
+        script_block_id=script_block_model.script_block_id,
+        organization_id=script_block_model.organization_id,
+        script_id=script_block_model.script_id,
+        script_revision_id=script_block_model.script_revision_id,
+        script_block_label=script_block_model.script_block_label,
+        script_file_id=script_block_model.script_file_id,
+        created_at=script_block_model.created_at,
+        modified_at=script_block_model.modified_at,
+        deleted_at=script_block_model.deleted_at,
     )
 
 

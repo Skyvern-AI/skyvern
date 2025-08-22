@@ -749,3 +749,8 @@ class ScriptNotFound(SkyvernHTTPException):
 class NoTOTPSecretFound(SkyvernException):
     def __init__(self) -> None:
         super().__init__("No TOTP secret found")
+
+
+class NoElementFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No element found.")

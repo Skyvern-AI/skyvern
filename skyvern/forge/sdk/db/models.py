@@ -35,6 +35,7 @@ from skyvern.forge.sdk.db.id import (
     generate_organization_bitwarden_collection_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
+    generate_script_block_id,
     generate_script_file_id,
     generate_script_id,
     generate_script_revision_id,
@@ -105,6 +106,7 @@ class TaskModel(Base):
         index=True,
     )
     model = Column(JSON, nullable=True)
+    browser_address = Column(String, nullable=True)
 
 
 class StepModel(Base):
@@ -134,6 +136,7 @@ class StepModel(Base):
     reasoning_token_count = Column(Integer, default=0)
     cached_token_count = Column(Integer, default=0)
     step_cost = Column(Numeric, default=0)
+    finished_at = Column(DateTime, nullable=True)
 
 
 class OrganizationModel(Base):
@@ -239,7 +242,7 @@ class WorkflowModel(Base):
     persist_browser_session = Column(Boolean, default=False, nullable=False)
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
-    use_cache = Column(Boolean, default=False, nullable=False)
+    generate_script = Column(Boolean, default=False, nullable=False)
     cache_key = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -276,6 +279,7 @@ class WorkflowRunModel(Base):
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    browser_address = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -579,6 +583,7 @@ class ActionModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    created_by = Column(String, nullable=True)
 
 
 class WorkflowRunBlockModel(Base):
@@ -657,6 +662,7 @@ class TaskV2Model(Base):
     max_steps = Column(Integer, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    browser_address = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -859,4 +865,26 @@ class WorkflowScriptModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class ScriptBlockModel(Base):
+    __tablename__ = "script_blocks"
+    __table_args__ = (
+        UniqueConstraint(
+            "script_revision_id",
+            "script_block_label",
+            name="uc_script_revision_id_script_block_label",
+        ),
+    )
+
+    script_block_id = Column(String, primary_key=True, default=generate_script_block_id)
+    organization_id = Column(String, nullable=False)
+    script_id = Column(String, nullable=False)
+    script_revision_id = Column(String, nullable=False, index=True)
+    script_block_label = Column(String, nullable=False)
+    script_file_id = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)

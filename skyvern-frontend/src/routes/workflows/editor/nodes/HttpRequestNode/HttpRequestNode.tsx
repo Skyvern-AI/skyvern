@@ -43,6 +43,7 @@ import { CodeIcon, PlusIcon, MagicWandIcon } from "@radix-ui/react-icons";
 import { CurlImportDialog } from "./CurlImportDialog";
 import { QuickHeadersDialog } from "./QuickHeadersDialog";
 import { MethodBadge, UrlValidator, RequestPreview } from "./HttpUtils";
+import { useRerender } from "@/hooks/useRerender";
 
 const httpMethods = [
   "GET",
@@ -83,6 +84,7 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
   });
   const deleteNodeCallback = useDeleteNodeCallback();
 
+  const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
@@ -319,12 +321,16 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
 
         <Separator />
 
-        <Accordion type="single" collapsible>
+        <Accordion
+          type="single"
+          collapsible
+          onValueChange={() => rerender.bump()}
+        >
           <AccordionItem value="advanced" className="border-b-0">
             <AccordionTrigger className="py-0">
               Advanced Settings
             </AccordionTrigger>
-            <AccordionContent className="pl-6 pr-1 pt-1">
+            <AccordionContent key={rerender.key} className="pl-6 pr-1 pt-1">
               <div className="space-y-4">
                 <ParametersMultiSelect
                   availableOutputParameters={outputParameterKeys}

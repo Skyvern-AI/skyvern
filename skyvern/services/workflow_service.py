@@ -68,6 +68,7 @@ async def run_workflow(
     request_id: str | None = None,
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
+    block_labels: list[str] | None = None,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -88,6 +89,7 @@ async def run_workflow(
         max_steps_override=max_steps,
         browser_session_id=workflow_request.browser_session_id,
         api_key=api_key,
+        block_labels=block_labels,
     )
 
     return workflow_run
@@ -128,6 +130,7 @@ async def get_workflow_run_response(
             totp_url=workflow_run.totp_verification_url or None,
             totp_identifier=workflow_run.totp_identifier,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+            browser_address=workflow_run.browser_address,
             # TODO: add browser session id
         ),
     )

@@ -187,6 +187,7 @@ class ForgeAgent:
             model=task_block.model,
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             extra_http_headers=workflow_run.extra_http_headers,
+            browser_address=workflow_run.browser_address,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -255,6 +256,7 @@ class ForgeAgent:
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolls,
             extra_http_headers=task_request.extra_http_headers,
             browser_session_id=task_request.browser_session_id,
+            browser_address=task_request.browser_address,
         )
         LOG.info(
             "Created new task",
@@ -291,6 +293,10 @@ class ForgeAgent:
         # 2. It will significantly slow down CUA tasks
         if engine in CUA_ENGINES:
             complete_verification = False
+
+        close_browser_on_completion = (
+            close_browser_on_completion and browser_session_id is None and not task.browser_address
+        )
 
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -352,7 +358,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=True,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, None, None
 
@@ -376,7 +382,9 @@ class ForgeAgent:
         try:
             if task.workflow_run_id:
                 list_files_before = list_files_in_directory(
-                    get_path_for_workflow_download_directory(task.workflow_run_id)
+                    get_path_for_workflow_download_directory(
+                        context.run_id if context and context.run_id else task.workflow_run_id
+                    )
                 )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await app.AGENT_FUNCTION.validate_step_execution(task, step)
@@ -408,7 +416,7 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     need_call_webhook=True,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
                 return step, detailed_output, None
@@ -457,7 +465,9 @@ class ForgeAgent:
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
-                workflow_download_directory = get_path_for_workflow_download_directory(task.workflow_run_id)
+                workflow_download_directory = get_path_for_workflow_download_directory(
+                    context.run_id if context and context.run_id else task.workflow_run_id
+                )
 
                 downloading_files: list[Path] = list_downloading_files_in_directory(workflow_download_directory)
                 if len(downloading_files) > 0:
@@ -513,7 +523,7 @@ class ForgeAgent:
                         task=completed_task,
                         last_step=last_step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
@@ -530,7 +540,7 @@ class ForgeAgent:
                         task=task,
                         last_step=step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return step, detailed_output, None
@@ -553,7 +563,7 @@ class ForgeAgent:
                         task=task,
                         last_step=last_step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
@@ -638,7 +648,7 @@ class ForgeAgent:
                 task=task,
                 last_step=step,
                 api_key=api_key,
-                close_browser_on_completion=browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
@@ -655,7 +665,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
             else:
@@ -690,7 +700,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     need_final_screenshot=False,
                     browser_session_id=browser_session_id,
                 )
@@ -712,7 +722,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
         except InvalidTaskStatusTransition:
@@ -728,7 +738,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
         except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
@@ -746,7 +756,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
         except ScrapingFailed as sfe:
@@ -767,7 +777,7 @@ class ForgeAgent:
                 task=task,
                 last_step=step,
                 api_key=api_key,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
@@ -788,7 +798,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
             else:
@@ -868,6 +878,12 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
+
+            # Update context with step_id for auto action/screenshot creation
+            context = skyvern_context.current()
+            if context:
+                context.step_id = step.step_id
+
             step = await self.update_step(step=step, status=StepStatus.running)
             await app.AGENT_FUNCTION.prepare_step_execution(
                 organization=organization, task=task, step=step, browser_state=browser_state
@@ -2219,8 +2235,10 @@ class ForgeAgent:
         if task.organization_id:
             try:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                    context = skyvern_context.current()
                     await app.STORAGE.save_downloaded_files(
-                        task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
+                        organization_id=task.organization_id,
+                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
@@ -2391,8 +2409,10 @@ class ForgeAgent:
         if task.organization_id:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    context = skyvern_context.current()
                     downloaded_files = await app.STORAGE.get_downloaded_files(
-                        organization_id=task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
+                        organization_id=task.organization_id,
+                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(

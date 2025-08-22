@@ -122,11 +122,23 @@ async def _scrolling_screenshots_helper(
     positions: list[int] = []
     if await skyvern_page.is_window_scrollable():
         scroll_y_px_old = -30.0
+        _, initial_scroll_height = await skyvern_page.get_scroll_width_and_height()
         scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
         # Checking max number of screenshots to prevent infinite loop
         # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
         # page. If the difference is less than 25, we assume we have reached the end of the page.
         while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
+            # check if the scroll height changed, if so, rebuild the element tree
+            _, scroll_height = await skyvern_page.get_scroll_width_and_height()
+            if scroll_height != initial_scroll_height:
+                LOG.warning(
+                    "Scroll height changed, rebuild the element tree",
+                    scroll_height=scroll_height,
+                    initial_scroll_height=initial_scroll_height,
+                )
+                await skyvern_page.build_tree_from_body(frame_name=frame, frame_index=frame_index)
+                initial_scroll_height = scroll_height
+
             screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame, mode=mode)
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
@@ -149,8 +161,7 @@ async def _scrolling_screenshots_helper(
 
         if mode == ScreenshotMode.DETAILED:
             # wait until animation ends, which is triggered by scrolling
-            LOG.debug("Waiting for 2 seconds until animation ends.")
-            await asyncio.sleep(2)
+            await skyvern_page.safe_wait_for_animation_end()
     else:
         if draw_boxes:
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
@@ -347,6 +358,10 @@ class SkyvernFrame:
         js_script = "() => getScrollXY()"
         return await self.evaluate(frame=self.frame, expression=js_script)
 
+    async def get_scroll_width_and_height(self) -> tuple[int, int]:
+        js_script = "() => getScrollWidthAndHeight()"
+        return await self.evaluate(frame=self.frame, expression=js_script)
+
     async def scroll_to_x_y(self, x: int, y: int) -> None:
         js_script = "([x, y]) => scrollToXY(x, y)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[x, y])
@@ -462,6 +477,10 @@ class SkyvernFrame:
         js_script = "([element]) => getSelectOptions(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
 
+    async def get_element_dom_depth(self, element: ElementHandle) -> int:
+        js_script = "([element]) => getElementDomDepth(element)"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
+
     @TraceManager.traced_async()
     async def build_tree_from_body(
         self,
@@ -484,3 +503,37 @@ class SkyvernFrame:
         return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
         )
+
+    @TraceManager.traced_async()
+    async def build_tree_from_element(
+        self,
+        starter: ElementHandle,
+        frame: str,
+        full_tree: bool = False,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+    ) -> tuple[list[dict], list[dict]]:
+        js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
+        return await self.evaluate(
+            frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
+        )
+
+    async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
+        try:
+            await asyncio.sleep(before_wait_sec)
+            await self.frame.wait_for_load_state("load", timeout=timeout_ms)
+            await self.wait_for_animation_end(timeout_ms=timeout_ms)
+        except Exception:
+            LOG.info("Failed to wait for animation end, but ignore it", exc_info=True)
+            return
+
+    async def wait_for_animation_end(self, timeout_ms: float = 3000) -> None:
+        async with asyncio.timeout(timeout_ms / 1000):
+            while True:
+                is_finished = await self.evaluate(
+                    frame=self.frame,
+                    expression="() => isAnimationFinished()",
+                    timeout_ms=timeout_ms,
+                )
+                if is_finished:
+                    return
+                await asyncio.sleep(0.1)

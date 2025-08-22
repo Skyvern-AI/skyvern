@@ -23,14 +23,22 @@ setup_logger()
 
 from skyvern.forge import app  # noqa: E402, F401
 from skyvern.library import Skyvern  # noqa: E402
-from skyvern.core.code_generations.skyvern_page import RunContext, SkyvernPage  # noqa: E402
-from skyvern.core.code_generations.run_initializer import setup  # noqa: E402
-from skyvern.core.code_generations.workflow_wrappers import (  # noqa: E402
+from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage  # noqa: E402
+from skyvern.core.script_generations.run_initializer import setup  # noqa: E402
+from skyvern.core.script_generations.workflow_wrappers import (  # noqa: E402
+    cached,  # noqa: E402
     workflow,  # noqa: E402
-    task_block,  # noqa: E402
-    file_download_block,  # noqa: E402
-    email_block,  # noqa: E402
-    wait_block,  # noqa: E402
+)  # noqa: E402
+from skyvern.services.script_service import (  # noqa: E402
+    action,  # noqa: E402
+    download,  # noqa: E402
+    extract,  # noqa: E402
+    generate_text,  # noqa: E402
+    login,  # noqa: E402
+    render_template,  # noqa: E402
+    run_script,  # noqa: E402
+    run_task,  # noqa: E402
+    wait,  # noqa: E402
 )  # noqa: E402
 
 
@@ -38,10 +46,16 @@ __all__ = [
     "Skyvern",
     "SkyvernPage",
     "RunContext",
+    "action",
+    "cached",
+    "download",
+    "extract",
+    "generate_text",
+    "login",
+    "render_template",
+    "run_script",
+    "run_task",
     "setup",
+    "wait",
     "workflow",
-    "task_block",
-    "file_download_block",
-    "email_block",
-    "wait_block",
 ]

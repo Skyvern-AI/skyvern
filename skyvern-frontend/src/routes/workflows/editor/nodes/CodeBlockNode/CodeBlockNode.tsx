@@ -4,19 +4,23 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import type { CodeBlockNode } from "./types";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { updateNodeData } = useReactFlow();
-  const { debuggable, editable, label } = data;
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const [inputs, setInputs] = useState({
     code: data.code,
     parameterKeys: data.parameterKeys,
@@ -40,14 +44,14 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
         className={cn(
           "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
           {
-            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-              thisBlockIsPlaying,
+            "pointer-events-none": thisBlockIsPlaying,
+            "bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsTargetted,
           },
         )}
       >
         <NodeHeader
           blockLabel={label}
-          disabled={elideFromDebugging}
           editable={editable}
           nodeId={id}
           totpIdentifier={null}

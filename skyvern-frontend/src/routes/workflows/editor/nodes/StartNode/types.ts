@@ -13,6 +13,7 @@ export type WorkflowStartNodeData = {
   extraHttpHeaders: string | null;
   editable: boolean;
   useScriptCache: boolean;
+  scriptCacheKey: string | null;
 };
 
 export type OtherStartNodeData = {

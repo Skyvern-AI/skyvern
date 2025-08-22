@@ -48,6 +48,7 @@ PERSISTENT_BROWSER_SESSION_ID = "pbs"
 SCRIPT_FILE_PREFIX = "sf"
 SCRIPT_REVISION_PREFIX = "sr"
 SCRIPT_PREFIX = "s"
+SCRIPT_BLOCK_PREFIX = "sb"
 STEP_PREFIX = "stp"
 TASK_GENERATION_PREFIX = "tg"
 TASK_PREFIX = "tsk"
@@ -225,6 +226,11 @@ def generate_script_revision_id() -> str:
 def generate_script_file_id() -> str:
     int_id = generate_id()
     return f"{SCRIPT_FILE_PREFIX}_{int_id}"
+
+
+def generate_script_block_id() -> str:
+    int_id = generate_id()
+    return f"{SCRIPT_BLOCK_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############
