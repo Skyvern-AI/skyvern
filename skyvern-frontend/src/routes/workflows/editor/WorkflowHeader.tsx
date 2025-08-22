@@ -181,7 +181,7 @@ function WorkflowHeader({
                   }
                   onCacheKeyValuesKeydown(e);
                 }}
-                placeholder="Script Key"
+                placeholder="Script Key Value"
                 value={chosenCacheKeyValue ?? undefined}
                 onBlur={(e) => {
                   onCacheKeyValuesBlurred(e.target.value);

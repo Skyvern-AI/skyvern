@@ -50,10 +50,10 @@ function WorkflowCacheKeyValuesPanel({
             <code className="font-mono text-xs text-slate-200">
               {scriptKey}
             </code>
-            , search for a cached value to see scripts for. For this script key
+            , search for scripts using a script key value. For this script key
             there {totalCount === 1 ? "is" : "are"}{" "}
             <span className="font-bold text-slate-200">{totalCount}</span>{" "}
-            cached {totalCount === 1 ? "value" : "values"}
+            script key {totalCount === 1 ? "value" : "values"}
             {filteredCount !== totalCount && (
               <>
                 {" "}
@@ -140,7 +140,7 @@ function WorkflowCacheKeyValuesPanel({
               </PaginationItem>
               <PaginationItem>
                 <div className="text-sm font-bold">
-                  {displayPage} of {totalPages}
+                  {displayPage} of {isNaN(totalPages) ? 0 : totalPages}
                 </div>
               </PaginationItem>
               <PaginationItem>

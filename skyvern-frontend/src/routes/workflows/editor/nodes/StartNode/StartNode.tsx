@@ -151,16 +151,21 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         </div>
                       </div>
                       {inputs.useScriptCache && (
-                        <WorkflowBlockInputTextarea
-                          nodeId={id}
-                          onChange={(value) => {
-                            const v = value.length ? value : null;
-                            handleChange("scriptCacheKey", v);
-                          }}
-                          value={inputs.scriptCacheKey ?? ""}
-                          placeholder={placeholders["scripts"]["scriptKey"]}
-                          className="nopan text-xs"
-                        />
+                        <div className="space-y-2">
+                          <div className="flex gap-2">
+                            <Label>Script Key (optional)</Label>
+                          </div>
+                          <WorkflowBlockInputTextarea
+                            nodeId={id}
+                            onChange={(value) => {
+                              const v = value.length ? value : null;
+                              handleChange("scriptCacheKey", v);
+                            }}
+                            value={inputs.scriptCacheKey ?? ""}
+                            placeholder={placeholders["scripts"]["scriptKey"]}
+                            className="nopan text-xs"
+                          />
+                        </div>
                       )}
                     </OrgWalled>
                     <div className="space-y-2">
