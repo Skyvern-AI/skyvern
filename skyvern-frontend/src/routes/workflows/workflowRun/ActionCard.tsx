@@ -50,12 +50,10 @@ function ActionCard({ action, onClick, active, index }: Props) {
             {success ? (
               <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
                 <CheckCircledIcon className="h-4 w-4 text-success" />
-                <span className="text-xs">Success</span>
               </div>
             ) : (
               <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
                 <CrossCircledIcon className="h-4 w-4 text-destructive" />
-                <span className="text-xs">Fail</span>
               </div>
             )}
           </div>
