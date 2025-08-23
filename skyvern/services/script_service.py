@@ -250,11 +250,11 @@ async def _create_workflow_block_run_and_task(
     Create a workflow block run and optionally a task if workflow_run_id is available in context.
     Returns (workflow_run_block_id, task_id) tuple.
     """
-    context = skyvern_context.ensure_context()
+    context = skyvern_context.current()
+    if not context or not context.workflow_run_id or not context.organization_id:
+        return None, None
     workflow_run_id = context.workflow_run_id
     organization_id = context.organization_id
-    if not context or not workflow_run_id or not organization_id:
-        return None, None
 
     try:
         # Create workflow run block with appropriate parameters based on block type

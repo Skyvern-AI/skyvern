@@ -617,6 +617,10 @@ class WorkflowService:
                 WorkflowRunStatus.timed_out,
             ):
                 workflow_run = await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+                # generate script for workflow if the workflow.generate_script is True AND there's no script cached for the workflow
+                # only generate script if the workflow run is completed
+                if workflow.generate_script:
+                    await self.generate_script_for_workflow(workflow=workflow, workflow_run=workflow_run)
             else:
                 LOG.info(
                     "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
@@ -641,16 +645,6 @@ class WorkflowService:
             workflow_run_status=WorkflowRunStatus.completed,
             organization_id=organization_id,
         )
-
-        # generate script for workflow if the workflow.generate_script is True AND there's no script cached for the workflow
-        if workflow.generate_script:
-            LOG.info(
-                "Generating script for workflow",
-                workflow_run_id=workflow_run_id,
-                workflow_id=workflow.workflow_id,
-                workflow_name=workflow.title,
-            )
-            await self.generate_script_for_workflow(workflow=workflow, workflow_run=workflow_run)
 
         return workflow_run
 
@@ -2349,6 +2343,7 @@ class WorkflowService:
         """
         Execute the related workflow script instead of running the workflow blocks.
         """
+        LOG.info("Start to execute workflow script", workflow_run_id=workflow_run.workflow_run_id)
 
         try:
             # Render the cache_key_value to find the right script
@@ -2400,7 +2395,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
     ) -> None:
         cache_key = workflow.cache_key
-        rendered_cache_key_value = "default"
+        rendered_cache_key_value = ""
         # 1) Build cache_key_value from workflow run parameters via jinja
         if cache_key:
             parameter_tuples = await app.DATABASE.get_workflow_run_parameters(

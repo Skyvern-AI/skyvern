@@ -3930,7 +3930,7 @@ class AgentDB:
                     .where(WorkflowScriptModel.deleted_at.is_(None))
                 )
 
-                if cache_key:
+                if cache_key is not None:
                     ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
 
                 # Latest version per script_id within the org and not deleted
