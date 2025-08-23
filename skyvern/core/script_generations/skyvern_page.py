@@ -329,6 +329,11 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         inputting the originally supplied ``text``.
         """
+        # format the text with the actual value of the parameter if it's a secret when running a workflow
+        context = skyvern_context.current()
+        if context and context.workflow_run_id:
+            text = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, text)
+
         locator = self.page.locator(f"xpath={xpath}")
         await handler_utils.input_sequentially(locator, text, timeout=timeout)
 
@@ -500,3 +505,16 @@ class RunContext:
         self.page = page
         self.trace: list[ActionCall] = []
         self.prompt: str | None = None
+
+
+async def _get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
+    """
+    Get the actual value of a parameter if it's a secret. If it's not a secret, return the parameter value as is.
+
+    Just return the parameter value if the task isn't a workflow's task.
+
+    This is only used for InputTextAction, UploadFileAction, and ClickAction (if it has a file_url).
+    """
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    return secret_value if secret_value is not None else parameter
