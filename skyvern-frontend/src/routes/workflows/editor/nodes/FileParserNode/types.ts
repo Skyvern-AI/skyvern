@@ -1,11 +1,12 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
 import { AppNode } from "..";
-import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
+import { debuggableWorkflowBlockTypes, WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 
 export type FileParserNodeData = NodeBaseData & {
   fileUrl: string;
   jsonSchema: string;
+  model: WorkflowModel | null;
 };
 
 export type FileParserNode = Node<FileParserNodeData, "fileParser">;
