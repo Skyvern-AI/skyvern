@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: skyvern
+    env: docker
+    plan: free
+    autoDeploy: true
