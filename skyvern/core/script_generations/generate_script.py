@@ -1097,10 +1097,12 @@ async def generate_workflow_script(
         # Create script block if we have script context
         if script_id and script_revision_id and organization_id:
             try:
-                block_name = task.get("title") or task.get("label") or task.get("task_id") or f"task_{idx}"
+                block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
                 block_description = f"Generated block for task: {block_name}"
+                temp_module = cst.Module(body=[block_fn_def])
+                block_code = temp_module.code
                 await create_script_block(
-                    block_fn_def=block_fn_def,
+                    block_code=block_code,
                     script_revision_id=script_revision_id,
                     script_id=script_id,
                     organization_id=organization_id,
@@ -1119,8 +1121,9 @@ async def generate_workflow_script(
     # --- runner ---------------------------------------------------------
     run_fn = _build_run_fn(blocks, workflow_run_request)
 
-    # Build module body with optional generated model class
-    module_body = [
+    # --- create __start_block__ -----------------------------------------
+    # Build the __start_block__ content that combines imports, model classes, and run function
+    start_block_body = [
         *imports,
         cst.EmptyLine(),
         cst.EmptyLine(),
@@ -1131,7 +1134,7 @@ async def generate_workflow_script(
 
     # Add generated model class if available
     if generated_model_cls:
-        module_body.extend(
+        start_block_body.extend(
             [
                 generated_model_cls,
                 cst.EmptyLine(),
@@ -1139,18 +1142,42 @@ async def generate_workflow_script(
             ]
         )
 
-    # Continue with the rest of the module
-    module_body.extend(
+    # Add run function to start block
+    start_block_body.extend(
         [
-            *block_fns,
-            cst.EmptyLine(),
-            cst.EmptyLine(),
             run_fn,
             cst.EmptyLine(),
             cst.EmptyLine(),
-            cst.parse_statement("if __name__ == '__main__':\n    asyncio.run(run_workflow())"),
         ]
     )
+
+    # Create script block for __start_block__ if we have script context
+    if script_id and script_revision_id and organization_id:
+        try:
+            # Create a temporary module to convert the start block content to a function
+            start_block_module = cst.Module(body=start_block_body)
+            start_block_code = start_block_module.code
+
+            await create_script_block(
+                block_code=start_block_code,
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                block_name=settings.WORKFLOW_START_BLOCK_LABEL,
+                block_description="Start block containing imports, model classes, and run function",
+            )
+        except Exception as e:
+            LOG.error("Failed to create __start_block__", error=str(e), exc_info=True)
+            # Continue without script block creation if it fails
+
+    # Build module body with the start block content and other blocks
+    module_body = [
+        *start_block_body,
+        *block_fns,
+        cst.EmptyLine(),
+        cst.EmptyLine(),
+        cst.parse_statement("if __name__ == '__main__':\n    asyncio.run(run_workflow())"),
+    ]
 
     module = cst.Module(body=module_body)
 
@@ -1160,7 +1187,7 @@ async def generate_workflow_script(
 
 
 async def create_script_block(
-    block_fn_def: FunctionDef,
+    block_code: str,
     script_revision_id: str,
     script_id: str,
     organization_id: str,
@@ -1171,7 +1198,7 @@ async def create_script_block(
     Create a script block in the database and save the block code to a script file.
 
     Args:
-        block_fn_def: The LibCST function definition to save
+        block_code: The code to save
         script_revision_id: The script revision ID
         script_id: The script ID
         organization_id: The organization ID
@@ -1179,11 +1206,6 @@ async def create_script_block(
         block_description: Optional description for the block
     """
     try:
-        # Step 1: Transform the block function definition to a string
-        # Create a temporary module to convert FunctionDef to source code
-        temp_module = cst.Module(body=[block_fn_def])
-        block_code = temp_module.code
-
         # Step 3: Create script block in database
         script_block = await app.DATABASE.create_script_block(
             script_revision_id=script_revision_id,
