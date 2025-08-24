@@ -4,3 +4,15 @@ services:
     env: docker
     plan: free
     autoDeploy: true
+    envVars:
+      - key: DATABASE_STRING
+        sync: false   # tu définis la vraie valeur dans le dashboard Render
+
+  - type: web
+    name: skyvern-ui
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_STRING
+        sync: false   # pareil, définie dans le dashboard si nécessaire
