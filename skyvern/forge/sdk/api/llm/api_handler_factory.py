@@ -198,6 +198,13 @@ class LLMAPIHandlerFactory:
                 thought=thought,
                 ai_suggestion=ai_suggestion,
             )
+            prompt_tokens = 0
+            completion_tokens = 0
+            reasoning_tokens = 0
+            cached_tokens = 0
+            completion_token_detail = None
+            cached_token_detail = None
+            llm_cost = 0
             if step or thought:
                 try:
                     # FIXME: volcengine doesn't support litellm cost calculation.
