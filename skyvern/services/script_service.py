@@ -599,6 +599,7 @@ async def run_task(
                 )
 
         except Exception as e:
+            LOG.exception("Failed to run task block. Falling back to AI run.")
             await _fallback_to_ai_run(
                 cache_key=cache_key,
                 prompt=prompt,
@@ -656,6 +657,7 @@ async def download(
                 )
 
         except Exception as e:
+            LOG.exception("Failed to run download block. Falling back to AI run.")
             await _fallback_to_ai_run(
                 cache_key=cache_key,
                 prompt=prompt,
@@ -713,6 +715,7 @@ async def action(
                 )
 
         except Exception as e:
+            LOG.exception("Failed to run action block. Falling back to AI run.")
             await _fallback_to_ai_run(
                 cache_key=cache_key,
                 prompt=prompt,
@@ -769,6 +772,7 @@ async def login(
                 )
 
         except Exception as e:
+            LOG.exception("Failed to run login block. Falling back to AI run.")
             await _fallback_to_ai_run(
                 cache_key=cache_key,
                 prompt=prompt,
@@ -941,8 +945,7 @@ async def generate_text(
             )
             new_text = json_response.get("answer", new_text)
         except Exception:
-            # If anything goes wrong, fall back to the original text
-            pass
+            LOG.exception("Failed to generate text for script")
     return new_text
 
 
