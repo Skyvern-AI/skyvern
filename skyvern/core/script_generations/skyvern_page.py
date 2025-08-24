@@ -173,8 +173,8 @@ class SkyvernPage:
 
         return decorator
 
-    async def goto(self, url: str) -> None:
-        await self.page.goto(url)
+    async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
+        await self.page.goto(url, timeout=timeout)
 
     async def _create_action_before_execution(
         self,
@@ -445,7 +445,8 @@ class SkyvernPage:
     @action_wrap(ActionType.VERIFICATION_CODE)
     async def verification_code(
         self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None
-    ) -> None: ...
+    ) -> None:
+        return
 
     @action_wrap(ActionType.SCROLL)
     async def scroll(
