@@ -76,6 +76,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service
 from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.image_resizer import Resolution
@@ -95,7 +96,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
-from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
+from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
     parse_anthropic_actions,
@@ -461,7 +462,7 @@ class ForgeAgent:
                 llm_caller=llm_caller,
             )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
-            task = await self.update_task_errors_from_detailed_output(task, detailed_output)
+            task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
