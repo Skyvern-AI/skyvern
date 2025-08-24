@@ -105,9 +105,9 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
 
@@ -213,6 +213,7 @@ class AgentDB:
         order: int,
         retry_index: int,
         organization_id: str | None = None,
+        status: StepStatus = StepStatus.created,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -220,7 +221,7 @@ class AgentDB:
                     task_id=task_id,
                     order=order,
                     retry_index=retry_index,
-                    status="created",
+                    status=status,
                     organization_id=organization_id,
                 )
                 session.add(new_step)
