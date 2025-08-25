@@ -15,7 +15,7 @@ type Props = {
   statusFilters?: Array<Status>;
 } & UseQueryOptions;
 
-function useRunsQuery({ page = 1, pageSize = 5, statusFilters }: Props) {
+function useRunsQuery({ page = 1, pageSize = 10, statusFilters }: Props) {
   const credentialGetter = useCredentialGetter();
   return useQuery<Array<Task | WorkflowRunApiResponse>>({
     queryKey: ["runs", { statusFilters }, page, pageSize],
