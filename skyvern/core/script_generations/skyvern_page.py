@@ -20,7 +20,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
@@ -164,6 +164,7 @@ class SkyvernPage:
                         intention=intention,
                         status=action_status,
                         data=data,
+                        kwargs=kwargs,
                     )
 
                     # Auto-create screenshot artifact after execution
@@ -174,7 +175,10 @@ class SkyvernPage:
         return decorator
 
     async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
-        await self.page.goto(url, timeout=timeout)
+        await self.page.goto(
+            url,
+            timeout=timeout,
+        )
 
     async def _create_action_before_execution(
         self,
@@ -182,6 +186,7 @@ class SkyvernPage:
         intention: str = "",
         status: ActionStatus = ActionStatus.pending,
         data: str | dict[str, Any] = "",
+        kwargs: dict[str, Any] | None = None,
     ) -> Action | None:
         """Create an action record in the database before execution if task_id and step_id are available."""
         try:
@@ -190,7 +195,20 @@ class SkyvernPage:
                 return None
 
             # Create action record. TODO: store more action fields
+            kwargs = kwargs or {}
+            text = kwargs.get("text")
+            option_value = kwargs.get("option")
+            select_option = SelectOption(value=option_value) if option_value else None
+            response: str | None = kwargs.get("response")
+            if not response:
+                if action_type == ActionType.INPUT_TEXT:
+                    response = text
+                elif action_type == ActionType.SELECT_OPTION:
+                    if select_option:
+                        response = select_option.value
+
             action = Action(
+                element_id="",
                 action_type=action_type,
                 status=status,
                 organization_id=context.organization_id,
@@ -201,6 +219,9 @@ class SkyvernPage:
                 action_order=0,  # Will be updated by the system if needed
                 intention=intention,
                 reasoning=f"Auto-generated action for {action_type.value}",
+                text=text,
+                option=select_option,
+                response=response,
             )
 
             created_action = await app.DATABASE.create_action(action)
