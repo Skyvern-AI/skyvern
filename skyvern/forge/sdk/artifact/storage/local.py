@@ -172,9 +172,14 @@ class LocalStorage(BaseStorage):
     async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:
         # make the directory if it doesn't exist
         Path(f"{get_skyvern_temp_dir()}/{organization_id}").mkdir(parents=True, exist_ok=True)
-        file_path = Path(f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}")
+        base_dir = Path(get_skyvern_temp_dir()) / organization_id
+        file_path = base_dir / file_name
+        normalized_path = file_path.resolve()
+        if not normalized_path.is_relative_to(base_dir.resolve()):
+            LOG.warning("Attempted access to an invalid file path", file_path=file_path)
+            return None
         try:
-            with open(file_path, "rb") as f:
+            with open(normalized_path, "rb") as f:
                 return f.read()
         except Exception:
             return None
