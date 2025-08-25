@@ -459,7 +459,7 @@ function FlowRenderer({
   }) {
     if (id) {
       const node = nodes.find((node) => node.id === id);
-      if (!node || !isWorkflowBlockNode(node)) {
+      if (!node) {
         return;
       }
 
@@ -469,7 +469,7 @@ function FlowRenderer({
         (node) => "label" in node.data && node.data.label === label,
       );
 
-      if (!node || !isWorkflowBlockNode(node)) {
+      if (!node) {
         return;
       }
 
