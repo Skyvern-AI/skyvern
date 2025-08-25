@@ -1,0 +1,242 @@
+---
+title: Workflow Blocks
+description: 'Individual Blocks within Skyvern'
+---
+
+
+## TaskBlock
+
+The magic block. Skyvern navigates through the websites to take actions and/or extract information.
+
+Example block:
+```
+- block_type: task
+      label: login
+      parameter_keys:
+        - credentials
+      url: website_url
+      navigation_goal: >-
+        If you're not on the login page, navigate to login page and login using
+        the credentials given. First, take actions on promotional popups or cookie prompts that could prevent taking other action on the web page. If you fail to login to find the login page or can't login after several trials, terminate. If login is
+        completed, you're successful. 
+      data_extraction_goal: >-
+        Extract anything for the sake of this demo
+      error_code_mapping:
+        stuck_with_popups: terminate and return this error if you can't close popups after several tries and can't take the necessary actions on the website because there is a blocking popup on the page
+        failed_to_login: terminate and return this error if you fail logging in to the page
+```
+Inputs: 
+
+1. **URL *(often required):*** Skyvern Agent’s starting point. Ideally the website you’d like to automate.
+    - In the workflows interface, if this input is left blank it will continue where the previous node left off. The idea of a navigation goal is to set or reset where the agent starts off.
+    - If you’re logging in to a site using the first task block, you would want to leave URL blank for the second block so that it can continue after logging in
+2. **Navigation Goal *(often required):*** details where Skyvern is going and what Skyvern is doing. Clear Navigation Goals will be a single goal, broken down into steps. Avoid supplying multiple goals. You need to specify when the goal is complete, using “COMPLETE”, or when to abandon that goal, using “TERMINATE”
+    - The navigation goal is not used to load the URL. Asking Skyvern to “go to website A” in this field will not have the intended effect
+    - Terminations result in Skyvern explaining why it stopped navigating
+    - This field can be omitted if you only want Skyvern to extract data without navigating anywhere else
+3. **Data Extraction Goal *(optional):*** aside from where Skyvern is going and what Skyvern is doing, is there anything that Skyvern is extracting and returning back? A good data extraction goal is specific about what Skyvern is returning to the user
+    - Note that data extractions only happen after Skyvern is finished navigating
+4. **Extracted Information Schema *(optional):*** if you have a data extraction goal, some users need it formatted in a certain way for internal purposes. Navigation payload accepts JSON formatted specifications for how the data should be returned
+5. **Max Steps Override *(optional):*** some users want to cap cost through the number of steps the task can take
+6. **Max Retries *(optional):*** the number of times a step can be retried if it fails
+7. **Complete on Download *(optional):*** Allows Skyvern to complete the task after a file has been downloaded
+8. **File Suffix *(optional):*** an identifier attached to the downloaded file
+9. **TOTP URL and TOTP Identifier *(optional):*** if you have an internal system where you can store the 2FA TOTP code, this URL calls on this storage space. The identifier allows you to link the code to the task, this is critical if you are running multiple tasks concurrently. [Contact us](https://meetings.hubspot.com/skyvern/demo?uuid=7c83865f-1a92-4c44-9e52-1ba0dbc04f7a) if you would like to set up 2FA retreival in your workflows.
+10. **Parameters *(optional):*** parameters are self-defined placeholders that are specified run-to-run. They can either be workflow parameters, passed in via an API call, or output parameters, extracted from a previous task block. If specified, they are used by Skyvern to assist in the navigation, to fill out forms or further influence what actions to take on a website.
+
+
+## ForLoopBlock
+Iterate over something such as a CSV or the output of a previous block. The blocks nested under `loop_blocks` are the blocks that will be repeated for each entry in the
+
+```
+- block_type: for_loop
+      label: iterate_over_order_ids
+      loop_over_parameter_key: order_ids
+      continue_on_failure: true
+      loop_blocks:
+        - block_type: task
+          label: download_invoice_for_order
+          complete_on_download: true
+          continue_on_failure: true
+          parameter_keys:
+            - order_id
+          url: order_history_url
+          navigation_goal: >-
+            Download the invoice of the order with the given order ID. 
+            Make sure to download the invoice for the given order id. 
+            If the element tree doesn't have a matching order id, check the screenshots. 
+            Complete if you have successfully downloaded the invoice according to action history, if you were able to download it, you'll see download_triggered=True for the last step. 
+            If you don't see a way to download an invoice, navigate to the order page if possible. 
+            If there's no way to download an invoice terminate. 
+            If the text suggests printing, you can assume you can download it. 
+            Return click action with download=True if you want to trigger a download.
+          error_code_mapping:
+            not_possible_to_download_invoice: return this error if the website doesn't allow downloading/viewing invoices
+            cant_solve_captcha: return this error if captcha isn't solved after multiple retries
+```
+Inputs: 
+
+1. **Loop Value *(required):*** This is the value that the loop will iterate over. For instance, if you have for every invoice ID, do X, invoice ID would be the value for this input.
+    * Please [contact us](https://meetings.hubspot.com/skyvern/demo?uuid=7c83865f-1a92-4c44-9e52-1ba0dbc04f7a) if you would like to add a loop block. Since we’re in beta, the loop value needs to be parameterized from the backend.
+  2. **Another block nested within the loop (required)**
+
+
+## CodeBlock
+This block executes user-defined Python code within our execution environment. It’s able to take parameters as input and transform them based on a certain specification.
+
+In addition to running simple code snippets, CodeBlock allows you to:
+- execute asynchronous code
+- control your browser page inside Skyvern
+
+**Example Block**
+
+```json
+- block_type: code
+  label: calculate_percentage_diff
+  parameter_keys:
+    - alibaba_price
+    - amazon_price
+  code: |
+    if amazon_price["unitPrice"] and alibaba_price["unitPrice"]:
+        result = 1.0 * (alibaba_price["unitPrice"] - amazon_price["unitPrice"]) / amazon_price["unitPrice"]
+    else:
+        result = None
+  output_parameter_key: price_diff_percentage
+```
+
+**Example Block with Browser Control**
+
+```json
+- block_type: code
+  label: get_tab_details
+  code: |
+    print("Getting tab details")
+    result = {
+        "url": skyvern_page.url,
+        "title": await skyvern_page.title()
+    }
+    print("Got details:", result)
+    print("Now I want to see a cat")
+    await skyvern_page.goto("https://cataas.com/cat")
+```
+Inputs: 
+
+1. **Code *(required):*** Insert your custom Python code so that you can define your own custom block.
+
+
+## TextPromptBlock
+
+Do a custom OpenAI query as a part of your workflow
+
+```
+- block_type: text_prompt
+  label: generate_new_title
+  parameter_keys:
+    - alibaba_title
+    - amazon_title
+  llm_key: OPENAI_GPT4O
+  prompt: >
+    You're given two e-commerce product titles. Use both and generate a
+    better one.
+
+      Title 1: {{ alibaba_title }}
+      Title 2: {{ amazon_title }}
+  output_parameter_key: new_title
+```
+
+Inputs: 
+
+1. **Prompt *(required):*** Write a natural language prompt to be sent to the LLM to generate a text response
+2. **JSON Schema *(optional):*** Craft a JSON input that structures the LLM output for use in another programming task
+
+## FileUploadBlock
+
+Persists files inside custom destinations.
+Supported integrations:
+- AWS S3
+
+```
+- block_type: file_upload
+  label: upload_downloaded_files_to_s3
+  storage_type: s3
+  aws_access_key_id: YOUR_AWS_ACCESS_KEY_ID
+  aws_secret_access_key: YOUR_AWS_SECRET_ACCESS_KEY
+  s3_bucket: YOUR_S3_BUCKET
+  region_name: us-east-1
+```
+
+### How to set up FileUploadBlock with AWS
+- Step 1. Create your bucket. (let’s say `YOUR-BUCKET-NAME` is the name)
+- Step 2. Create a limited IAM policy that only has GetObject and PutObject permissions to this s3 bucket, named `skyvern-s3-access-policy` (any name works):
+    ```json
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "SkyvernS3Access",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:PutObject",
+                    "s3:GetObject"
+                ],
+                "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*"
+            }
+        ]
+    }
+    ```
+- Step 3. Create an AWS IAM user for skyvern
+    - Go to https://us-east-1.console.aws.amazon.com/iam/home
+    - click "Create User" → do not check "Provide user access to the AWS Management Console" → input user name → click "Next"
+    - At the the "Set Permissions" page, click "Attach policies directly" → pick the `skyvern-s3-access-policy` created in the previous step → click "Next" → click "Create user"
+    - After the user is created, go to the new IAM user page → go to the "Security credentials" tab → click "create access key" → on the "Access key best practices & alternatives" page, click "Application running on an AWS compute service" → click "Next" → click "Create access key" → you will see the "Access Key" and the "Secret access key" at the end of user creation.
+- Step 4. Create a FileUploadBlock
+    - Place this block after the file download has completed.
+    - Copy the "Access Key" to the "AWS Access Key ID" field of the File Upload Block and "Secret access key".
+    - Copy the "Access Key" to the "AWS Secret Access Key" field in the File Upload Block.
+    - Add your s3 bucket name.    
+    - Add your AWS region.
+
+
+## SendEmailBlock
+
+Sends an email with some data
+
+```
+- block_type: send_email
+  label: send_email
+  smtp_host_secret_parameter_key: smtp_host
+  smtp_port_secret_parameter_key: smtp_port
+  smtp_username_secret_parameter_key: smtp_username
+  smtp_password_secret_parameter_key: smtp_password
+  sender: hello@skyvern.com
+  recipients:
+    - founders@skyvern.com
+  subject: Skyvern - Downloaded Invoices Demo
+  body: website_url
+  file_attachments:
+    - SKYVERN_DOWNLOAD_DIRECTORY
+```
+
+Inputs:
+
+1. **Recipients *(required):*** a list of people who will receive the email separated by commas
+2. **Subject/Body *(optional):*** the header and body of an email
+3. **File attachments *(optional):*** since we’re still in beta, you will need to [contact us](https://meetings.hubspot.com/skyvern/demo?uuid=7c83865f-1a92-4c44-9e52-1ba0dbc04f7a) to upload attachments to the email
+
+## FileParserBlock
+
+Downloads and parses a file to be used within other workflow blocks.
+
+**Supported types:** CSV
+
+```
+- block_type: file_url_parser
+  label: csv_parser
+  file_type: csv
+  file_url: <csv_file_url>
+```
+
+Inputs: 
+
+1. **File URL *(required):*** This block allows you to use a CSV within your workflow. 
+    * Since we’re still in beta, you will need to [contact us](https://meetings.hubspot.com/skyvern/demo?uuid=7c83865f-1a92-4c44-9e52-1ba0dbc04f7a) to load a value into this block
