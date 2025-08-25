@@ -1982,6 +1982,7 @@ class WorkflowService:
                 file_type=block_yaml.file_type,
                 json_schema=block_yaml.json_schema,
                 continue_on_failure=block_yaml.continue_on_failure,
+                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.PDF_PARSER:
             return PDFParserBlock(
