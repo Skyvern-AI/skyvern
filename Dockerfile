@@ -1,18 +1,8 @@
-FROM python:3.11 AS requirements-stage
-# Run `skyvern init llm` before building to generate the .env file
-
-WORKDIR /tmp
-RUN pip install poetry
-RUN poetry self add poetry-plugin-export
-COPY ./pyproject.toml /tmp/pyproject.toml
-COPY ./poetry.lock /tmp/poetry.lock
-RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
-
 FROM python:3.11-slim-bookworm
 WORKDIR /app
-COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+RUN pip install --no-cache-dir uv
+COPY . /app
+RUN uv pip install --no-cache-dir -e .
 RUN playwright install-deps
 RUN playwright install
 RUN apt-get install -y xauth x11-apps netpbm gpg ca-certificates && apt-get clean
@@ -35,8 +25,6 @@ RUN cat /tmp/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodeso
 RUN npm install -g @bitwarden/cli@2024.9.0
 # checking bw version also initializes the bw config
 RUN bw --version
-
-COPY . /app
 
 ENV PYTHONPATH="/app"
 ENV VIDEO_PATH=/data/videos
