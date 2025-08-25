@@ -245,6 +245,7 @@ class Settings(BaseSettings):
 
     # GEMINI
     GEMINI_API_KEY: str | None = None
+    GEMINI_REASONING_EFFORT: str | None = None
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None
