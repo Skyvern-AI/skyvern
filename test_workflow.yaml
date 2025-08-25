@@ -1,5 +1,5 @@
 
-workflow_id: ""
+workflow_id: "cli-test-workflow"
 title: "CLI Test Workflow"
 description: "Testing the new skyvern run workflow command"
 

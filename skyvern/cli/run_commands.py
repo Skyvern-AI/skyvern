@@ -189,6 +189,9 @@ def run_workflow(
     ),
     title: Optional[str] = typer.Option(None, "--title", help="Title for the workflow run"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override the workflow max steps"),
+    proxy_location: Optional[str] = typer.Option(
+        None, "--proxy-location", help="Proxy location for the workflow execution"
+    ),
 ) -> None:
     """
     Execute a workflow programmatically.
@@ -268,6 +271,8 @@ def run_workflow(
             payload["title"] = title
         if max_steps is not None:
             payload["max_steps_override"] = max_steps
+        if proxy_location is not None:
+            payload["proxy_location"] = proxy_location
 
         try:
             # Make API call
