@@ -10,16 +10,24 @@ import { DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { OrgWalled } from "@/components/Orgwalled";
 
 type Props = {
+  isDeletable?: boolean;
   isScriptable?: boolean;
-  onDelete: () => void;
+  showScriptText?: string;
+  onDelete?: () => void;
   onShowScript?: () => void;
 };
 
 function NodeActionMenu({
+  isDeletable = true,
   isScriptable = false,
+  showScriptText,
   onDelete,
   onShowScript,
 }: Props) {
+  if (!isDeletable && !isScriptable) {
+    return null;
+  }
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -28,13 +36,15 @@ function NodeActionMenu({
       <DropdownMenuContent>
         <DropdownMenuLabel>Block Actions</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuItem
-          onSelect={() => {
-            onDelete();
-          }}
-        >
-          Delete Block
-        </DropdownMenuItem>
+        {isDeletable && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onDelete?.();
+            }}
+          >
+            Delete Block
+          </DropdownMenuItem>
+        )}
         {isScriptable && (
           <OrgWalled className="p-0">
             {onShowScript && (
@@ -43,7 +53,7 @@ function NodeActionMenu({
                   onShowScript();
                 }}
               >
-                Show Script
+                {showScriptText ?? "Show Script"}
               </DropdownMenuItem>
             )}
           </OrgWalled>

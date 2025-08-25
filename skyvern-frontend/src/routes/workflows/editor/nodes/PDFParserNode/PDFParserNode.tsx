@@ -13,6 +13,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -28,6 +29,7 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
   const [inputs, setInputs] = useState({
     fileUrl: data.fileUrl,
     jsonSchema: data.jsonSchema,
+    model: data.model,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -101,6 +103,13 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
               handleChange("jsonSchema", value);
             }}
             suggestionContext={{}}
+          />
+          <ModelSelector
+            className="nopan w-52 text-xs"
+            value={inputs.model}
+            onChange={(value) => {
+              handleChange("model", value);
+            }}
           />
         </div>
       </div>
