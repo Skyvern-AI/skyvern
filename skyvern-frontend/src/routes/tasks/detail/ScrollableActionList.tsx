@@ -4,12 +4,7 @@ import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { cn } from "@/util/utils";
-import {
-  CheckCircledIcon,
-  CrossCircledIcon,
-  DotFilledIcon,
-  LightningBoltIcon,
-} from "@radix-ui/react-icons";
+import { DotFilledIcon, CodeIcon } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { ReactNode, useRef } from "react";
 import { ActionTypePill } from "./ActionTypePill";
@@ -75,7 +70,7 @@ function ScrollableActionList({
           }}
         >
           <div className="flex-1 space-y-2 p-4 pl-5">
-            <div className="flex justify-between">
+            <div className="flex justify-start gap-2">
               <div className="flex items-center gap-2">
                 <span>#{i + 1}</span>
               </div>
@@ -83,16 +78,7 @@ function ScrollableActionList({
                 <ActionTypePill actionType={action.type} />
                 {action.created_by === "script" && (
                   <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                    <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-                  </div>
-                )}
-                {action.success ? (
-                  <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                    <CheckCircledIcon className="h-4 w-4 text-success" />
-                  </div>
-                ) : (
-                  <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                    <CrossCircledIcon className="h-4 w-4 text-destructive" />
+                    <CodeIcon className="h-4 w-4" />
                   </div>
                 )}
               </div>
