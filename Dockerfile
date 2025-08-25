@@ -2,20 +2,18 @@ FROM python:3.11 AS requirements-stage
 # Run `skyvern init llm` before building to generate the .env file
 
 WORKDIR /tmp
-RUN pip install poetry
-RUN poetry self add poetry-plugin-export
+RUN pip --no-cache-dir install poetry==2.1.3 && \
+    poetry self add poetry-plugin-export
 COPY ./pyproject.toml /tmp/pyproject.toml
 COPY ./poetry.lock /tmp/poetry.lock
 RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
 
 FROM python:3.11-slim-bookworm
 WORKDIR /app
-COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
-RUN playwright install-deps
-RUN playwright install
-RUN apt-get install -y xauth x11-apps netpbm gpg ca-certificates && apt-get clean
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    apt-get install -y xauth x11-apps netpbm gpg ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* 
 
 COPY .nvmrc /app/.nvmrc
 COPY nodesource-repo.gpg.key /tmp/nodesource-repo.gpg.key
@@ -28,13 +26,16 @@ RUN cat /tmp/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodeso
     rm -rf /var/lib/apt/lists/* && \
     rm /tmp/nodesource-repo.gpg.key && \
     # confirm installation
-    npm -v && node -v
+    npm -v && node -v && \
+    # install bitwarden cli
+    npm install -g @bitwarden/cli@2024.9.0 && \
+    # checking bw version also initializes the bw config
+    bw --version
 
-
-# install bitwarden cli
-RUN npm install -g @bitwarden/cli@2024.9.0
-# checking bw version also initializes the bw config
-RUN bw --version
+COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    # Playwright is installed via requirements.txt(see pyproject.toml) but we need to install the browser dependencies separately
+    playwright install-deps && playwright install
 
 COPY . /app
 
