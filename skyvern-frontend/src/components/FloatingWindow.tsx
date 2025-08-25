@@ -31,7 +31,6 @@ import { PowerIcon } from "./icons/PowerIcon";
 type OS = "Windows" | "macOS" | "Linux" | "Unknown";
 
 const Constants = {
-  HandleSize: "40px",
   MinHeight: 52,
   MinWidth: 256,
 } as const;
@@ -181,14 +180,11 @@ function FloatingWindow({
   title,
   zIndex,
   // --
-  onBlur,
   onBreakout,
   onCycle,
   onFocus,
+  onBlur,
   onInteract,
-  onMinimize,
-  onMaximize,
-  onRestore,
 }: {
   bounded?: boolean;
   children: React.ReactNode;
@@ -205,14 +201,11 @@ function FloatingWindow({
   title: string;
   zIndex?: number;
   // --
-  onBlur?: () => void;
   onBreakout?: () => void;
   onCycle?: () => void;
   onFocus?: () => void;
+  onBlur?: () => void;
   onInteract?: () => void;
-  onMinimize?: () => void;
-  onMaximize?: () => void;
-  onRestore?: () => void;
 }) {
   const [reloadKey, setReloadKey] = useState(0);
   const [isReloading, setIsReloading] = useState(false);
@@ -431,8 +424,6 @@ function FloatingWindow({
     });
 
     setPosition({ x: 0, y: 0 });
-
-    onMaximize?.();
   };
 
   const minimize = () => {
@@ -468,8 +459,6 @@ function FloatingWindow({
     });
 
     setPosition({ x: left, y: top });
-
-    onMinimize?.();
   };
 
   const restore = () => {
@@ -491,8 +480,6 @@ function FloatingWindow({
 
     setIsMaximized(false);
     setIsMinimized(false);
-
-    onRestore?.();
   };
 
   const reload = () => {
@@ -584,14 +571,12 @@ function FloatingWindow({
           })}
           handleStyles={{
             bottomLeft: {
-              width: isMinimized || isMaximized ? "0px" : Constants.HandleSize,
-              height: isMinimized || isMaximized ? "0px" : Constants.HandleSize,
-              zIndex: 20,
+              width: "40px",
+              height: "40px",
             },
             bottomRight: {
-              width: isMinimized || isMaximized ? "0px" : Constants.HandleSize,
-              height: isMinimized || isMaximized ? "0px" : Constants.HandleSize,
-              zIndex: 20,
+              width: "40px",
+              height: "40px",
             },
           }}
           minHeight={Constants.MinHeight}
