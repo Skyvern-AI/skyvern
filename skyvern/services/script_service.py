@@ -946,6 +946,7 @@ async def generate_text(
             new_text = json_response.get("answer", new_text)
         except Exception:
             LOG.exception("Failed to generate text for script")
+            raise
     return new_text
 
 
