@@ -26,12 +26,12 @@ import { KeyValueInput } from "@/components/KeyValueInput";
 import { OrgWalled } from "@/components/Orgwalled";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { NodeActionMenu } from "@/routes/workflows/editor/nodes/NodeActionMenu";
+import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import {
   scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
 } from "@/routes/workflows/types/workflowTypes";
-// import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
@@ -42,7 +42,6 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
   const credentialGetter = useCredentialGetter();
   const { updateNodeData } = useReactFlow();
-  // const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const reactFlowInstance = useReactFlow();
 
   const { data: availableModels } = useQuery<ModelsResponse>({
@@ -83,6 +82,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
   const blockScriptStore = useBlockScriptStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
+  const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -109,37 +109,31 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
   }
 
   function showAllScripts() {
-    reactFlowInstance.setNodes((nodes) => {
-      return nodes.map((node) => {
-        if (nodeIsFlippable(node)) {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              showCode: true,
-            },
-          };
-        }
-        return node;
-      });
-    });
+    for (const node of reactFlowInstance.getNodes()) {
+      const label = node.data.label;
+
+      label &&
+        nodeIsFlippable(node) &&
+        typeof label === "string" &&
+        toggleScriptForNodeCallback({
+          label,
+          show: true,
+        });
+    }
   }
 
   function hideAllScripts() {
-    reactFlowInstance.setNodes((nodes) => {
-      return nodes.map((node) => {
-        if (nodeIsFlippable(node)) {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              showCode: false,
-            },
-          };
-        }
-        return node;
-      });
-    });
+    for (const node of reactFlowInstance.getNodes()) {
+      const label = node.data.label;
+
+      label &&
+        nodeIsFlippable(node) &&
+        typeof label === "string" &&
+        toggleScriptForNodeCallback({
+          label,
+          show: false,
+        });
+    }
   }
 
   if (data.withWorkflowSettings) {
@@ -158,7 +152,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                 <div>
                   <div className="rounded p-1 hover:bg-muted">
                     <NodeActionMenu
-                      isDeleteable={false}
+                      isDeletable={false}
                       isScriptable={true}
                       showScriptText="Show All Scripts"
                       onShowScript={showAllScripts}
