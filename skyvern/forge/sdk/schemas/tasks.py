@@ -38,6 +38,10 @@ class TaskBase(BaseModel):
         description="The URL to call when the task is completed.",
         examples=["https://my-webhook.com"],
     )
+    webhook_failure_reason: str | None = Field(
+        default=None,
+        description="The reason for the webhook failure.",
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     navigation_goal: str | None = Field(
@@ -73,6 +77,9 @@ class TaskBase(BaseModel):
         default=None,
         description="The requested schema of the extracted information.",
     )
+    extra_http_headers: dict[str, str] | None = Field(
+        None, description="The extra HTTP headers for the requests in browser."
+    )
     complete_criterion: str | None = Field(
         default=None, description="Criterion to complete", examples=["Complete if 'hello world' shows up on the page"]
     )
@@ -95,6 +102,16 @@ class TaskBase(BaseModel):
         default=False,
         description="Whether to include the action history when verifying the task is complete",
         examples=[True, False],
+    )
+    max_screenshot_scrolls: int | None = Field(
+        default=None,
+        description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
+        examples=[10],
+    )
+    browser_address: str | None = Field(
+        default=None,
+        description="The CDP address for the task.",
+        examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
 
 
@@ -231,14 +248,18 @@ class Task(TaskBase):
         None,
         description="The reason for the task failure.",
     )
-    organization_id: str | None = None
+    organization_id: str
     workflow_run_id: str | None = None
     workflow_permanent_id: str | None = None
+    browser_session_id: str | None = None
     order: int | None = None
     retry: int | None = None
     max_steps_per_run: int | None = None
     errors: list[dict[str, Any]] = []
     model: dict[str, Any] | None = None
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
     @property
     def llm_key(self) -> str | None:
@@ -297,8 +318,12 @@ class Task(TaskBase):
             status=self.status,
             created_at=self.created_at,
             modified_at=self.modified_at,
+            queued_at=self.queued_at,
+            started_at=self.started_at,
+            finished_at=self.finished_at,
             extracted_information=self.extracted_information,
             failure_reason=failure_reason or self.failure_reason,
+            webhook_failure_reason=self.webhook_failure_reason,
             action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
@@ -308,6 +333,7 @@ class Task(TaskBase):
             errors=self.errors,
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
+            max_screenshot_scrolls=self.max_screenshot_scrolls,
         )
 
 
@@ -325,9 +351,14 @@ class TaskResponse(BaseModel):
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     failure_reason: str | None = None
+    webhook_failure_reason: str | None = None
     errors: list[dict[str, Any]] = []
     max_steps_per_run: int | None = None
     workflow_run_id: str | None = None
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    max_screenshot_scrolls: int | None = None
 
 
 class TaskOutput(BaseModel):

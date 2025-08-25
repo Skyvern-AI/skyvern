@@ -1,21 +1,17 @@
 # yaml-language-server: $schema=https://schema.buildwithfern.dev/generators-yml.json
-
 auth-schemes:
   ApiKeyScheme:
     header: x-api-key
     type: string
     name: x-api-key
-    
-api: 
+api:
   auth: ApiKeyScheme
   specs:
     - openapi: openapi/skyvern_openapi.json
       origin: https://api.skyvern.com/openapi.json
       overrides: openapi/overrides.yml
-      settings: 
+      settings:
         title-as-schema-name: false
-      
-
 groups:
   python-sdk:
     generators:

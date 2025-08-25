@@ -1,10 +1,15 @@
 import { DiscordLogoIcon } from "@radix-ui/react-icons";
 import GitHubButton from "react-github-btn";
-import { Link, useMatch } from "react-router-dom";
+import { Link, useMatch, useSearchParams } from "react-router-dom";
 import { NavigationHamburgerMenu } from "./NavigationHamburgerMenu";
 
 function Header() {
-  const match = useMatch("/workflows/:workflowPermanentId/edit");
+  const [searchParams] = useSearchParams();
+  const embed = searchParams.get("embed");
+  const match =
+    useMatch("/workflows/:workflowPermanentId/edit") ||
+    location.pathname.includes("debug") ||
+    embed === "true";
 
   if (match) {
     return null;

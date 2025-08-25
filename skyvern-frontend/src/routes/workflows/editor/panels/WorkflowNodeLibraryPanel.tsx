@@ -1,10 +1,16 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
+import { useState, useRef, useEffect } from "react";
+import {
+  Cross2Icon,
+  PlusIcon,
+  MagnifyingGlassIcon,
+} from "@radix-ui/react-icons";
 import { WorkflowBlockTypes } from "../../types/workflowTypes";
-import { AddNodeProps } from "../FlowRenderer";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
+import { AddNodeProps } from "../Workspace";
+import { Input } from "@/components/ui/input";
 
 const enableCodeBlock =
   import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
@@ -34,8 +40,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Navigation Block",
-    description: "Navigate on the page",
+    title: "Browser Task Block",
+    description: "Take actions to achieve a task.",
   },
   {
     nodeType: "taskv2",
@@ -45,8 +51,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Navigation v2 Block",
-    description: "Navigate on the page with Skyvern 2.0",
+    title: "Browser Task v2 Block",
+    description: "Achieve complex tasks with deep thinking.",
   },
   {
     nodeType: "action",
@@ -56,7 +62,7 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Action Block",
+    title: "Browser Action Block",
     description: "Take a single action",
   },
   {
@@ -68,7 +74,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Extraction Block",
-    description: "Extract data from the page",
+    description: "Extract data from a webpage",
   },
   {
     nodeType: "validation",
@@ -79,20 +85,19 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Validation Block",
-    description: "Validate the state of the workflow or terminate",
+    description: "Validate completion criteria",
   },
-  {
-    nodeType: "task",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.Task}
-        className="size-6"
-      />
-    ),
-    title: "Task Block",
-    description: "Takes actions or extracts information",
-  },
-
+  // {
+  //   nodeType: "task",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.Task}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Task Block",
+  //   description: "Complete multi-step browser automation tasks",
+  // },
   {
     nodeType: "url",
     icon: (
@@ -102,7 +107,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Go to URL Block",
-    description: "Navigates to a URL",
+    description: "Navigate to a specific URL",
   },
   {
     nodeType: "textPrompt",
@@ -113,7 +118,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Text Prompt Block",
-    description: "Generates AI response",
+    description: "Process text with LLM",
   },
   {
     nodeType: "sendEmail",
@@ -124,7 +129,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Send Email Block",
-    description: "Sends an email",
+    description: "Send email notifications",
   },
   {
     nodeType: "loop",
@@ -134,8 +139,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "For Loop Block",
-    description: "Repeats nested elements",
+    title: "Loop Block",
+    description: "Repeat blocks for each item",
   },
   {
     nodeType: "codeBlock",
@@ -146,7 +151,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Code Block",
-    description: "Executes Python code",
+    description: "Execute custom Python code",
   },
   {
     nodeType: "fileParser",
@@ -157,20 +162,29 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "File Parser Block",
-    description: "Downloads and parses a file",
+    description: "Parse PDFs, CSVs, and Excel files",
   },
-  {
-    nodeType: "pdfParser",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.PDFParser}
-        className="size-6"
-      />
-    ),
-    title: "PDF Parser Block",
-    description: "Downloads and parses a PDF file with an optional data schema",
-  },
-  // disabled
+  // {
+  //   nodeType: "pdfParser",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.PDFParser}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "PDF Parser Block",
+  //   description: "Extract data from PDF files",
+  // },
+  //   nodeType: "upload",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.UploadToS3}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Upload to S3 Block",
+  //   description: "Upload files to AWS S3",
+  // },
   // {
   //   nodeType: "download",
   //   icon: (
@@ -179,8 +193,8 @@ const nodeLibraryItems: Array<{
   //       className="size-6"
   //     />
   //   ),
-  //   title: "Download Block",
-  //   description: "Downloads a file from S3",
+  //   title: "Download from S3 Block",
+  //   description: "Download files from AWS S3",
   // },
   {
     nodeType: "fileUpload",
@@ -190,8 +204,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "File Upload Block",
-    description: "Uploads downloaded files to where you want.",
+    title: "Cloud Storage Block",
+    description: "Upload files to storage",
   },
   {
     nodeType: "fileDownload",
@@ -202,7 +216,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "File Download Block",
-    description: "Download a file",
+    description: "Download files from a website",
   },
   {
     nodeType: "wait",
@@ -213,26 +227,100 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Wait Block",
-    description: "Wait for some time",
+    description: "Wait for a specified amount of time",
+  },
+  {
+    nodeType: "http_request",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.HttpRequest}
+        className="size-6"
+      />
+    ),
+    title: "HTTP Request Block",
+    description: "Make HTTP API calls",
   },
 ];
 
 type Props = {
+  onMouseDownCapture?: () => void;
   onNodeClick: (props: AddNodeProps) => void;
   first?: boolean;
 };
 
-function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
+function WorkflowNodeLibraryPanel({
+  onMouseDownCapture,
+  onNodeClick,
+  first,
+}: Props) {
   const workflowPanelData = useWorkflowPanelStore(
     (state) => state.workflowPanelState.data,
+  );
+  const workflowPanelActive = useWorkflowPanelStore(
+    (state) => state.workflowPanelState.active,
   );
   const closeWorkflowPanel = useWorkflowPanelStore(
     (state) => state.closeWorkflowPanel,
   );
+  const [search, setSearch] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    // Focus the input when the panel becomes active
+    if (workflowPanelActive && inputRef.current) {
+      // Use multiple approaches to ensure focus works
+      const focusInput = () => {
+        if (inputRef.current) {
+          inputRef.current.focus();
+          inputRef.current.select(); // Also select any existing text
+        }
+      };
+
+      // Try immediate focus
+      focusInput();
+
+      // Also try with a small delay for animations/transitions
+      const timeoutId = setTimeout(() => {
+        focusInput();
+      }, 100);
+
+      // And try with a longer delay as backup
+      const backupTimeoutId = setTimeout(() => {
+        focusInput();
+      }, 300);
+
+      return () => {
+        clearTimeout(timeoutId);
+        clearTimeout(backupTimeoutId);
+      };
+    }
+  }, [workflowPanelActive]);
+
+  const filteredItems = nodeLibraryItems.filter((item) => {
+    if (workflowPanelData?.disableLoop && item.nodeType === "loop") {
+      return false;
+    }
+    if (!enableCodeBlock && item.nodeType === "codeBlock") {
+      return false;
+    }
+
+    const term = search.toLowerCase();
+    if (!term) {
+      return true;
+    }
+
+    return (
+      item.nodeType.toLowerCase().includes(term) ||
+      item.title.toLowerCase().includes(term)
+    );
+  });
 
   return (
-    <div className="w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
-      <div className="space-y-4">
+    <div
+      className="h-full w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
+      onMouseDownCapture={() => onMouseDownCapture?.()}
+    >
+      <div className="flex h-full flex-col space-y-4">
         <header className="space-y-2">
           <div className="flex justify-between">
             <h1 className="text-lg">Block Library</h1>
@@ -247,24 +335,31 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
           </div>
           <span className="text-sm text-slate-400">
             {first
-              ? "Click on the node type to add your first block"
-              : "Click on the node type you want to add"}
+              ? "Click on the block type to add your first block"
+              : "Click on the block type you want to add"}
           </span>
         </header>
-        <ScrollArea>
-          <ScrollAreaViewport className="max-h-[28rem]">
+        <div className="relative">
+          <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
+            <MagnifyingGlassIcon className="size-5" />
+          </div>
+          <Input
+            value={search}
+            onChange={(event) => {
+              setSearch(event.target.value);
+            }}
+            placeholder="Search blocks..."
+            className="pl-9"
+            ref={inputRef}
+            autoFocus
+            tabIndex={0}
+          />
+        </div>
+        <ScrollArea className="h-full flex-1">
+          <ScrollAreaViewport className="h-full">
             <div className="space-y-2">
-              {nodeLibraryItems.map((item) => {
-                if (
-                  workflowPanelData?.disableLoop &&
-                  item.nodeType === "loop"
-                ) {
-                  return null;
-                }
-                if (!enableCodeBlock && item.nodeType === "codeBlock") {
-                  return null;
-                }
-                return (
+              {filteredItems.length > 0 ? (
+                filteredItems.map((item) => (
                   <div
                     key={item.nodeType}
                     className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
@@ -296,8 +391,12 @@ function WorkflowNodeLibraryPanel({ onNodeClick, first }: Props) {
                     </div>
                     <PlusIcon className="size-6 shrink-0" />
                   </div>
-                );
-              })}
+                ))
+              ) : (
+                <div className="p-4 text-center text-sm text-slate-400">
+                  No results found
+                </div>
+              )}
             </div>
           </ScrollAreaViewport>
         </ScrollArea>

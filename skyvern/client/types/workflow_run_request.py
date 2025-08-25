@@ -40,6 +40,7 @@ class WorkflowRunRequest(UniversalBaseModel):
     - RESIDENTIAL_NZ: New Zealand
     - RESIDENTIAL_ZA: South Africa
     - RESIDENTIAL_AR: Argentina
+    - RESIDENTIAL_AU: Australia
     - RESIDENTIAL_ISP: ISP proxy
     - US-CA: California
     - US-NY: New York
@@ -69,6 +70,16 @@ class WorkflowRunRequest(UniversalBaseModel):
     browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
     """
     ID of a Skyvern browser session to reuse, having it continue from the current screen state
+    """
+
+    max_screenshot_scrolls: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
+    """
+
+    extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
+    """
+    The extra HTTP headers for the requests in browser.
     """
 
     if IS_PYDANTIC_V2:

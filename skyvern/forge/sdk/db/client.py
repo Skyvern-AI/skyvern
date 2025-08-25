@@ -1,11 +1,11 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, pool, select, tuple_, update
+from sqlalchemy import and_, asc, delete, distinct, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from skyvern.config import settings
 from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
@@ -22,11 +22,16 @@ from skyvern.forge.sdk.db.models import (
     BitwardenSensitiveInformationParameterModel,
     CredentialModel,
     CredentialParameterModel,
+    DebugSessionModel,
+    OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
     OrganizationModel,
     OutputParameterModel,
     PersistentBrowserSessionModel,
+    ScriptBlockModel,
+    ScriptFileModel,
+    ScriptModel,
     StepModel,
     TaskGenerationModel,
     TaskModel,
@@ -40,6 +45,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
     WorkflowRunParameterModel,
+    WorkflowScriptModel,
 )
 from skyvern.forge.sdk.db.utils import (
     _custom_json_serializer,
@@ -50,6 +56,9 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_organization,
     convert_to_organization_auth_token,
     convert_to_output_parameter,
+    convert_to_script,
+    convert_to_script_block,
+    convert_to_script_file,
     convert_to_step,
     convert_to_task,
     convert_to_workflow,
@@ -58,11 +67,15 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_block,
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
+    hydrate_action,
 )
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -72,13 +85,13 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, Tho
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -89,11 +102,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
-    WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunType
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
+from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.steps import AgentStepOutput
+from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
 
@@ -106,14 +120,18 @@ elif "postgresql+asyncpg" in settings.DATABASE_STRING:
 
 
 class AgentDB:
-    def __init__(self, database_string: str, debug_enabled: bool = False) -> None:
+    def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
         super().__init__()
         self.debug_enabled = debug_enabled
-        self.engine = create_async_engine(
-            database_string,
-            json_serializer=_custom_json_serializer,
-            connect_args=DB_CONNECT_ARGS,
-            poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
+        self.engine = (
+            create_async_engine(
+                database_string,
+                json_serializer=_custom_json_serializer,
+                connect_args=DB_CONNECT_ARGS,
+                poolclass=pool.NullPool if settings.DISABLE_CONNECTION_POOL else None,
+            )
+            if db_engine is None
+            else db_engine
         )
         self.Session = async_sessionmaker(bind=self.engine)
 
@@ -121,11 +139,12 @@ class AgentDB:
         self,
         url: str,
         title: str | None,
-        complete_criterion: str | None,
-        terminate_criterion: str | None,
         navigation_goal: str | None,
         data_extraction_goal: str | None,
         navigation_payload: dict[str, Any] | list | str | None,
+        status: str = "created",
+        complete_criterion: str | None = None,
+        terminate_criterion: str | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -141,11 +160,15 @@ class AgentDB:
         application: str | None = None,
         include_action_history_in_verification: bool | None = None,
         model: dict[str, Any] | None = None,
+        max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        browser_session_id: str | None = None,
+        browser_address: str | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
                 new_task = TaskModel(
-                    status="created",
+                    status=status,
                     task_type=task_type,
                     url=url,
                     title=title,
@@ -168,6 +191,10 @@ class AgentDB:
                     application=application,
                     include_action_history_in_verification=include_action_history_in_verification,
                     model=model,
+                    max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                    extra_http_headers=extra_http_headers,
+                    browser_session_id=browser_session_id,
+                    browser_address=browser_address,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -186,6 +213,7 @@ class AgentDB:
         order: int,
         retry_index: int,
         organization_id: str | None = None,
+        status: StepStatus = StepStatus.created,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -193,7 +221,7 @@ class AgentDB:
                     task_id=task_id,
                     order=order,
                     retry_index=retry_index,
-                    status="created",
+                    status=status,
                     organization_id=organization_id,
                 )
                 session.add(new_step)
@@ -212,14 +240,15 @@ class AgentDB:
         artifact_id: str,
         artifact_type: str,
         uri: str,
+        organization_id: str,
         step_id: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         task_v2_id: str | None = None,
+        run_id: str | None = None,
         thought_id: str | None = None,
         ai_suggestion_id: str | None = None,
-        organization_id: str | None = None,
     ) -> Artifact:
         try:
             async with self.Session() as session:
@@ -233,6 +262,7 @@ class AgentDB:
                     workflow_run_block_id=workflow_run_block_id,
                     observer_cruise_id=task_v2_id,
                     observer_thought_id=thought_id,
+                    run_id=run_id,
                     ai_suggestion_id=ai_suggestion_id,
                     organization_id=organization_id,
                 )
@@ -312,7 +342,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_task_steps(self, task_id: str, organization_id: str | None = None) -> list[Step]:
+    async def get_task_steps(self, task_id: str, organization_id: str) -> list[Step]:
         try:
             async with self.Session() as session:
                 if steps := (
@@ -351,8 +381,9 @@ class AgentDB:
 
     async def get_total_unique_step_order_count_by_task_ids(
         self,
+        *,
         task_ids: list[str],
-        organization_id: str | None = None,
+        organization_id: str,
     ) -> int:
         """
         Get the total count of unique (step.task_id, step.order) pairs of StepModel for the given task ids
@@ -413,6 +444,26 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_task_actions_hydrated(self, task_id: str, organization_id: str | None = None) -> list[Action]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(ActionModel)
+                    .filter(ActionModel.organization_id == organization_id)
+                    .filter(ActionModel.task_id == task_id)
+                    .order_by(ActionModel.created_at)
+                )
+
+                actions = (await session.scalars(query)).all()
+                return [hydrate_action(action) for action in actions]
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def get_tasks_actions(self, task_ids: list[str], organization_id: str | None = None) -> list[Action]:
         try:
             async with self.Session() as session:
@@ -423,7 +474,7 @@ class AgentDB:
                     .order_by(ActionModel.created_at.desc())
                 )
                 actions = (await session.scalars(query)).all()
-                return [Action.model_validate(action) for action in actions]
+                return [hydrate_action(action, empty_element_id=True) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -513,6 +564,9 @@ class AgentDB:
                 ).first():
                     if status is not None:
                         step.status = status
+
+                        if status.is_terminal() and step.finished_at is None:
+                            step.finished_at = datetime.now(timezone.utc)
                     if output is not None:
                         step.output = output.model_dump(exclude_none=True)
                     if is_last is not None:
@@ -576,6 +630,7 @@ class AgentDB:
         task_id: str,
         status: TaskStatus | None = None,
         extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
         failure_reason: str | None = None,
         errors: list[dict[str, Any]] | None = None,
         max_steps_per_run: int | None = None,
@@ -587,6 +642,7 @@ class AgentDB:
             and failure_reason is None
             and errors is None
             and max_steps_per_run is None
+            and webhook_failure_reason is None
         ):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
@@ -600,6 +656,12 @@ class AgentDB:
                 ).first():
                     if status is not None:
                         task.status = status
+                        if status == TaskStatus.queued and task.queued_at is None:
+                            task.queued_at = datetime.utcnow()
+                        if status == TaskStatus.running and task.started_at is None:
+                            task.started_at = datetime.utcnow()
+                        if status.is_final() and task.finished_at is None:
+                            task.finished_at = datetime.utcnow()
                     if extracted_information is not None:
                         task.extracted_information = extracted_information
                     if failure_reason is not None:
@@ -608,6 +670,8 @@ class AgentDB:
                         task.errors = errors
                     if max_steps_per_run is not None:
                         task.max_steps_per_run = max_steps_per_run
+                    if webhook_failure_reason is not None:
+                        task.webhook_failure_reason = webhook_failure_reason
                     await session.commit()
                     updated_task = await self.get_task(task_id, organization_id=organization_id)
                     if not updated_task:
@@ -814,7 +878,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).first():
-                    return convert_to_organization_auth_token(token)
+                    return await convert_to_organization_auth_token(token)
                 else:
                     return None
         except SQLAlchemyError:
@@ -840,7 +904,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).all()
-                return [convert_to_organization_auth_token(token) for token in tokens]
+                return [await convert_to_organization_auth_token(token) for token in tokens]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -854,19 +918,27 @@ class AgentDB:
         token_type: OrganizationAuthTokenType,
         token: str,
         valid: bool | None = True,
+        encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken | None:
         try:
+            encrypted_token = ""
+            if encrypted_method is not None:
+                encrypted_token = await encryptor.encrypt(token, encrypted_method)
+
             async with self.Session() as session:
                 query = (
                     select(OrganizationAuthTokenModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(token_type=token_type)
-                    .filter_by(token=token)
                 )
+                if encrypted_token:
+                    query = query.filter_by(encrypted_token=encrypted_token)
+                else:
+                    query = query.filter_by(token=token)
                 if valid is not None:
                     query = query.filter_by(valid=valid)
                 if token_obj := (await session.scalars(query)).first():
-                    return convert_to_organization_auth_token(token_obj)
+                    return await convert_to_organization_auth_token(token_obj)
                 else:
                     return None
         except SQLAlchemyError:
@@ -881,18 +953,51 @@ class AgentDB:
         organization_id: str,
         token_type: OrganizationAuthTokenType,
         token: str,
+        encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken:
+        plaintext_token = token
+        encrypted_token = ""
+
+        if encrypted_method is not None:
+            encrypted_token = await encryptor.encrypt(token, encrypted_method)
+            plaintext_token = ""
+
         async with self.Session() as session:
             auth_token = OrganizationAuthTokenModel(
                 organization_id=organization_id,
                 token_type=token_type,
-                token=token,
+                token=plaintext_token,
+                encrypted_token=encrypted_token,
+                encrypted_method=encrypted_method.value if encrypted_method is not None else "",
             )
             session.add(auth_token)
             await session.commit()
             await session.refresh(auth_token)
 
-        return convert_to_organization_auth_token(auth_token)
+        return await convert_to_organization_auth_token(auth_token)
+
+    async def invalidate_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+    ) -> None:
+        """Invalidate all existing tokens of a specific type for an organization."""
+        try:
+            async with self.Session() as session:
+                await session.execute(
+                    update(OrganizationAuthTokenModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(token_type=token_type)
+                    .filter_by(valid=True)
+                    .values(valid=False)
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
 
     async def get_artifacts_for_task_v2(
         self,
@@ -949,6 +1054,71 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_artifacts_for_run(
+        self,
+        run_id: str,
+        organization_id: str,
+        artifact_types: list[ArtifactType] | None = None,
+        group_by_type: bool = False,
+        sort_by: str = "created_at",
+    ) -> dict[ArtifactType, list[Artifact]] | list[Artifact]:
+        """Return artifacts associated with a run.
+
+        Args:
+            run_id: The ID of the run to get artifacts for
+            organization_id: The ID of the organization that owns the run
+            artifact_types: Optional list of artifact types to filter by
+            group_by_type: If True, returns a dictionary mapping artifact types to lists of artifacts.
+                         If False, returns a flat list of artifacts. Defaults to False.
+            sort_by: Field to sort artifacts by. Must be one of: 'created_at', 'step_id', 'task_id'.
+                   Defaults to 'created_at'.
+
+        Returns:
+            If group_by_type is True, returns a dictionary mapping artifact types to lists of artifacts.
+            If group_by_type is False, returns a list of artifacts sorted by the specified field.
+
+        Raises:
+            ValueError: If sort_by is not one of the allowed values
+        """
+        allowed_sort_fields = {"created_at", "step_id", "task_id"}
+        if sort_by not in allowed_sort_fields:
+            raise ValueError(f"sort_by must be one of {allowed_sort_fields}")
+        run = await self.get_run(run_id, organization_id=organization_id)
+        if not run:
+            return []
+
+        async with self.Session() as session:
+            query = select(ArtifactModel).filter_by(organization_id=organization_id)
+
+            query = query.filter_by(run_id=run.run_id)
+
+            if artifact_types:
+                query = query.filter(ArtifactModel.artifact_type.in_(artifact_types))
+
+            # Apply sorting
+            if sort_by == "created_at":
+                query = query.order_by(ArtifactModel.created_at)
+            elif sort_by == "step_id":
+                query = query.order_by(ArtifactModel.step_id, ArtifactModel.created_at)
+            elif sort_by == "task_id":
+                query = query.order_by(ArtifactModel.task_id, ArtifactModel.created_at)
+
+            # Execute query and convert to Artifact objects
+            artifacts = [
+                convert_to_artifact(artifact, self.debug_enabled) for artifact in (await session.scalars(query)).all()
+            ]
+
+            # Group artifacts by type if requested
+            if group_by_type:
+                result: dict[ArtifactType, list[Artifact]] = {}
+                for artifact in artifacts:
+                    if artifact.artifact_type not in result:
+                        result[artifact.artifact_type] = []
+                    result[artifact.artifact_type].append(artifact)
+                return result
+
+            return artifacts
+
     async def get_artifact_by_id(
         self,
         artifact_id: str,
@@ -975,6 +1145,8 @@ class AgentDB:
 
     async def get_artifacts_by_entity_id(
         self,
+        *,
+        organization_id: str | None,
         artifact_type: ArtifactType | None = None,
         task_id: str | None = None,
         step_id: str | None = None,
@@ -982,10 +1154,10 @@ class AgentDB:
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
-        organization_id: str | None = None,
     ) -> list[Artifact]:
         try:
             async with self.Session() as session:
+                # Build base query
                 query = select(ArtifactModel)
 
                 if artifact_type is not None:
@@ -1002,14 +1174,17 @@ class AgentDB:
                     query = query.filter_by(observer_thought_id=thought_id)
                 if task_v2_id is not None:
                     query = query.filter_by(observer_cruise_id=task_v2_id)
+                # Handle backward compatibility where old artifact rows were stored with organization_id NULL
                 if organization_id is not None:
-                    query = query.filter_by(organization_id=organization_id)
+                    query = query.filter(
+                        or_(ArtifactModel.organization_id == organization_id, ArtifactModel.organization_id.is_(None))
+                    )
 
                 query = query.order_by(ArtifactModel.created_at.desc())
-                if artifacts := (await session.scalars(query)).all():
-                    return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
-                else:
-                    return []
+
+                artifacts = (await session.scalars(query)).all()
+                LOG.debug("Artifacts fetched", count=len(artifacts))
+                return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1019,16 +1194,18 @@ class AgentDB:
 
     async def get_artifact_by_entity_id(
         self,
+        *,
         artifact_type: ArtifactType,
+        organization_id: str,
         task_id: str | None = None,
         step_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
         thought_id: str | None = None,
         task_v2_id: str | None = None,
-        organization_id: str | None = None,
     ) -> Artifact | None:
         artifacts = await self.get_artifacts_by_entity_id(
+            organization_id=organization_id,
             artifact_type=artifact_type,
             task_id=task_id,
             step_id=step_id,
@@ -1036,7 +1213,6 @@ class AgentDB:
             workflow_run_block_id=workflow_run_block_id,
             thought_id=thought_id,
             task_v2_id=task_v2_id,
-            organization_id=organization_id,
         )
         return artifacts[0] if artifacts else None
 
@@ -1180,6 +1356,8 @@ class AgentDB:
         description: str | None = None,
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
+        max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
@@ -1188,6 +1366,8 @@ class AgentDB:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        generate_script: bool = False,
+        cache_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1199,10 +1379,14 @@ class AgentDB:
                 webhook_callback_url=webhook_callback_url,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                extra_http_headers=extra_http_headers,
                 persist_browser_session=persist_browser_session,
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
+                generate_script=generate_script,
+                cache_key=cache_key,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1381,6 +1565,8 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
+        generate_script: bool | None = None,
+        cache_key: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1390,14 +1576,18 @@ class AgentDB:
                 if organization_id:
                     get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
                 if workflow := (await session.scalars(get_workflow_query)).first():
-                    if title:
+                    if title is not None:
                         workflow.title = title
-                    if description:
+                    if description is not None:
                         workflow.description = description
-                    if workflow_definition:
+                    if workflow_definition is not None:
                         workflow.workflow_definition = workflow_definition
-                    if version:
+                    if version is not None:
                         workflow.version = version
+                    if generate_script is not None:
+                        workflow.generate_script = generate_script
+                    if cache_key is not None:
+                        workflow.cache_key = cache_key
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -1437,11 +1627,15 @@ class AgentDB:
         workflow_permanent_id: str,
         workflow_id: str,
         organization_id: str,
+        browser_session_id: str | None = None,
         proxy_location: ProxyLocation | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         parent_workflow_run_id: str | None = None,
+        max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1449,12 +1643,16 @@ class AgentDB:
                     workflow_permanent_id=workflow_permanent_id,
                     workflow_id=workflow_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                     proxy_location=proxy_location,
                     status="created",
                     webhook_callback_url=webhook_callback_url,
                     totp_verification_url=totp_verification_url,
                     totp_identifier=totp_identifier,
                     parent_workflow_run_id=parent_workflow_run_id,
+                    max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                    extra_http_headers=extra_http_headers,
+                    browser_address=browser_address,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1465,15 +1663,29 @@ class AgentDB:
             raise
 
     async def update_workflow_run(
-        self, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus | None = None,
+        failure_reason: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
                 await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
             ).first()
             if workflow_run:
-                workflow_run.status = status
-                workflow_run.failure_reason = failure_reason
+                if status:
+                    workflow_run.status = status
+                if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
+                    workflow_run.queued_at = datetime.utcnow()
+                if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
+                    workflow_run.started_at = datetime.utcnow()
+                if status and status.is_final() and workflow_run.finished_at is None:
+                    workflow_run.finished_at = datetime.utcnow()
+                if failure_reason:
+                    workflow_run.failure_reason = failure_reason
+                if webhook_failure_reason is not None:
+                    workflow_run.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -1867,6 +2079,32 @@ class AgentDB:
                 deleted_at=credential_parameter.deleted_at,
             )
 
+    async def create_onepassword_credential_parameter(
+        self, workflow_id: str, key: str, vault_id: str, item_id: str, description: str | None = None
+    ) -> OnePasswordCredentialParameter:
+        async with self.Session() as session:
+            parameter = OnePasswordCredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                vault_id=vault_id,
+                item_id=item_id,
+            )
+            session.add(parameter)
+            await session.commit()
+            await session.refresh(parameter)
+            return OnePasswordCredentialParameter(
+                onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_id=parameter.vault_id,
+                item_id=parameter.item_id,
+                created_at=parameter.created_at,
+                modified_at=parameter.modified_at,
+                deleted_at=parameter.deleted_at,
+            )
+
     async def get_workflow_run_output_parameters(self, workflow_run_id: str) -> list[WorkflowRunOutputParameter]:
         try:
             async with self.Session() as session:
@@ -2171,15 +2409,20 @@ class AgentDB:
         - organization_id
         - totp_identifier
         2. make sure created_at is within the valid lifespan
-        3. sort by created_at desc
+        3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
         """
+        all_null = and_(
+            TOTPCodeModel.task_id.is_(None),
+            TOTPCodeModel.workflow_id.is_(None),
+            TOTPCodeModel.workflow_run_id.is_(None),
+        )
         async with self.Session() as session:
             query = (
                 select(TOTPCodeModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(totp_identifier=totp_identifier)
                 .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-                .order_by(TOTPCodeModel.created_at.desc())
+                .order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             )
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
@@ -2335,9 +2578,10 @@ class AgentDB:
 
     async def get_thoughts(
         self,
+        *,
         task_v2_id: str,
-        thought_types: list[ThoughtType] | None = None,
-        organization_id: str | None = None,
+        thought_types: list[ThoughtType],
+        organization_id: str,
     ) -> list[Thought]:
         async with self.Session() as session:
             query = (
@@ -2366,6 +2610,9 @@ class AgentDB:
         extracted_information_schema: dict | list | str | None = None,
         error_code_mapping: dict | None = None,
         model: dict[str, Any] | None = None,
+        max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2382,6 +2629,9 @@ class AgentDB:
                 error_code_mapping=error_code_mapping,
                 organization_id=organization_id,
                 model=model,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
             session.add(new_task_v2)
             await session.commit()
@@ -2505,6 +2755,7 @@ class AgentDB:
         summary: str | None = None,
         output: dict[str, Any] | None = None,
         organization_id: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             task_v2 = (
@@ -2517,6 +2768,12 @@ class AgentDB:
             if task_v2:
                 if status:
                     task_v2.status = status
+                    if status == TaskV2Status.queued and task_v2.queued_at is None:
+                        task_v2.queued_at = datetime.utcnow()
+                    if status == TaskV2Status.running and task_v2.started_at is None:
+                        task_v2.started_at = datetime.utcnow()
+                    if status.is_final() and task_v2.finished_at is None:
+                        task_v2.finished_at = datetime.utcnow()
                 if workflow_run_id:
                     task_v2.workflow_run_id = workflow_run_id
                 if workflow_id:
@@ -2531,6 +2788,8 @@ class AgentDB:
                     task_v2.summary = summary
                 if output:
                     task_v2.output = output
+                if webhook_failure_reason is not None:
+                    task_v2.webhook_failure_reason = webhook_failure_reason
                 await session.commit()
                 await session.refresh(task_v2)
                 return TaskV2.model_validate(task_v2)
@@ -2547,6 +2806,7 @@ class AgentDB:
         status: BlockStatus = BlockStatus.running,
         output: dict | list | str | None = None,
         continue_on_failure: bool = False,
+        engine: RunEngine | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
@@ -2559,6 +2819,7 @@ class AgentDB:
                 status=status,
                 output=output,
                 continue_on_failure=continue_on_failure,
+                engine=engine,
             )
             session.add(new_workflow_run_block)
             await session.commit()
@@ -2599,6 +2860,15 @@ class AgentDB:
         wait_sec: int | None = None,
         description: str | None = None,
         block_workflow_run_id: str | None = None,
+        engine: str | None = None,
+        # HTTP request block parameters
+        http_request_method: str | None = None,
+        http_request_url: str | None = None,
+        http_request_headers: dict[str, str] | None = None,
+        http_request_body: dict[str, Any] | None = None,
+        http_request_parameters: dict[str, Any] | None = None,
+        http_request_timeout: int | None = None,
+        http_request_follow_redirects: bool | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2639,6 +2909,23 @@ class AgentDB:
                     workflow_run_block.description = description
                 if block_workflow_run_id:
                     workflow_run_block.block_workflow_run_id = block_workflow_run_id
+                if engine:
+                    workflow_run_block.engine = engine
+                # HTTP request block fields
+                if http_request_method:
+                    workflow_run_block.http_request_method = http_request_method
+                if http_request_url:
+                    workflow_run_block.http_request_url = http_request_url
+                if http_request_headers:
+                    workflow_run_block.http_request_headers = http_request_headers
+                if http_request_body:
+                    workflow_run_block.http_request_body = http_request_body
+                if http_request_parameters:
+                    workflow_run_block.http_request_parameters = http_request_parameters
+                if http_request_timeout:
+                    workflow_run_block.http_request_timeout = http_request_timeout
+                if http_request_follow_redirects is not None:
+                    workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
@@ -2670,6 +2957,25 @@ class AgentDB:
                 return convert_to_workflow_run_block(workflow_run_block, task=task)
             raise NotFoundError(f"WorkflowRunBlock {workflow_run_block_id} not found")
 
+    async def get_workflow_run_block_by_task_id(
+        self,
+        task_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRunBlock:
+        async with self.Session() as session:
+            workflow_run_block = (
+                await session.scalars(
+                    select(WorkflowRunBlockModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run_block:
+                task = None
+                task_id = workflow_run_block.task_id
+                if task_id:
+                    task = await self.get_task(task_id, organization_id=organization_id)
+                return convert_to_workflow_run_block(workflow_run_block, task=task)
+            raise NotFoundError(f"WorkflowRunBlock not found by {task_id}")
+
     async def get_workflow_run_blocks(
         self,
         workflow_run_id: str,
@@ -2691,7 +2997,11 @@ class AgentDB:
                 for workflow_run_block in workflow_run_blocks
             ]
 
-    async def get_active_persistent_browser_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
+    async def get_active_persistent_browser_sessions(
+        self,
+        organization_id: str,
+        active_hours: int = 24,
+    ) -> list[PersistentBrowserSession]:
         """Get all active persistent browser sessions for an organization."""
         try:
             async with self.Session() as session:
@@ -2699,6 +3009,10 @@ class AgentDB:
                     select(PersistentBrowserSessionModel)
                     .filter_by(organization_id=organization_id)
                     .filter_by(deleted_at=None)
+                    .filter_by(completed_at=None)
+                    .filter(
+                        PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=active_hours)
+                    )
                 )
                 sessions = result.scalars().all()
                 return [PersistentBrowserSession.model_validate(session) for session in sessions]
@@ -2757,8 +3071,7 @@ class AgentDB:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 raise NotFoundError(f"PersistentBrowserSession {session_id} not found")
         except NotFoundError:
-            LOG.error("NotFoundError", exc_info=True)
-            raise
+            return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -2772,7 +3085,7 @@ class AgentDB:
         runnable_type: str | None = None,
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
-    ) -> PersistentBrowserSessionModel:
+    ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         try:
             async with self.Session() as session:
@@ -2793,10 +3106,51 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def update_persistent_browser_session(
+        self,
+        browser_session_id: str,
+        *,
+        status: str | None = None,
+        timeout_minutes: int | None = None,
+        organization_id: str | None = None,
+    ) -> PersistentBrowserSession:
+        try:
+            async with self.Session() as session:
+                persistent_browser_session = (
+                    await session.scalars(
+                        select(PersistentBrowserSessionModel)
+                        .filter_by(persistent_browser_session_id=browser_session_id)
+                        .filter_by(organization_id=organization_id)
+                        .filter_by(deleted_at=None)
+                    )
+                ).first()
+                if not persistent_browser_session:
+                    raise NotFoundError(f"PersistentBrowserSession {browser_session_id} not found")
+
+                if status:
+                    persistent_browser_session.status = status
+                if timeout_minutes:
+                    persistent_browser_session.timeout_minutes = timeout_minutes
+
+                await session.commit()
+                await session.refresh(persistent_browser_session)
+                return PersistentBrowserSession.model_validate(persistent_browser_session)
+        except NotFoundError:
+            LOG.error("NotFoundError", exc_info=True)
+            raise
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
     async def set_persistent_browser_session_browser_address(
         self,
         browser_session_id: str,
         browser_address: str,
+        ip_address: str,
+        ecs_task_arn: str | None,
         organization_id: str | None = None,
     ) -> None:
         """Set the browser address for a persistent browser session."""
@@ -2812,6 +3166,8 @@ class AgentDB:
                 ).first()
                 if persistent_browser_session:
                     persistent_browser_session.browser_address = browser_address
+                    persistent_browser_session.ip_address = ip_address
+                    persistent_browser_session.ecs_task_arn = ecs_task_arn
                     # once the address is set, the session is started
                     persistent_browser_session.started_at = datetime.utcnow()
                     await session.commit()
@@ -3136,3 +3492,611 @@ class AgentDB:
                 query = query.filter_by(organization_id=organization_id)
             task_run = (await session.scalars(query)).first()
             return Run.model_validate(task_run) if task_run else None
+
+    async def get_debug_session(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        workflow_permanent_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            debug_session = (
+                await session.scalars(
+                    select(DebugSessionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(user_id=user_id)
+                    .filter_by(deleted_at=None)
+                    .filter_by(status="created")
+                    .order_by(DebugSessionModel.created_at.desc())
+                )
+            ).first()
+
+            if not debug_session:
+                return None
+
+            return DebugSession.model_validate(debug_session)
+
+    async def get_latest_debug_session_for_user(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        workflow_permanent_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(status="created")
+                .filter_by(user_id=user_id)
+                .filter_by(workflow_permanent_id=workflow_permanent_id)
+                .order_by(DebugSessionModel.created_at.desc())
+            )
+
+            model = (await session.scalars(query)).first()
+
+            return DebugSession.model_validate(model) if model else None
+
+    async def complete_debug_sessions(
+        self,
+        *,
+        organization_id: str,
+        user_id: str | None = None,
+        workflow_permanent_id: str | None = None,
+    ) -> list[DebugSession]:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(status="created")
+            )
+
+            if user_id:
+                query = query.filter_by(user_id=user_id)
+            if workflow_permanent_id:
+                query = query.filter_by(workflow_permanent_id=workflow_permanent_id)
+
+            models = (await session.scalars(query)).all()
+
+            for model in models:
+                model.status = "completed"
+
+            debug_sessions = [DebugSession.model_validate(model) for model in models]
+
+            await session.commit()
+
+            return debug_sessions
+
+    async def create_debug_session(
+        self,
+        *,
+        browser_session_id: str,
+        organization_id: str,
+        user_id: str,
+        workflow_permanent_id: str,
+    ) -> DebugSession:
+        async with self.Session() as session:
+            debug_session = DebugSessionModel(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                user_id=user_id,
+                browser_session_id=browser_session_id,
+                status="created",
+            )
+
+            session.add(debug_session)
+            await session.commit()
+            await session.refresh(debug_session)
+
+            return DebugSession.model_validate(debug_session)
+
+    async def create_script(
+        self,
+        organization_id: str,
+        run_id: str | None = None,
+        script_id: str | None = None,
+        version: int | None = None,
+    ) -> Script:
+        try:
+            async with self.Session() as session:
+                script = ScriptModel(
+                    organization_id=organization_id,
+                    run_id=run_id,
+                )
+                if script_id:
+                    script.script_id = script_id
+                if version:
+                    script.version = version
+                session.add(script)
+                await session.commit()
+                await session.refresh(script)
+                return convert_to_script(script)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def update_script(
+        self,
+        script_revision_id: str,
+        organization_id: str,
+        artifact_id: str | None = None,
+        run_id: str | None = None,
+        version: int | None = None,
+    ) -> Script:
+        try:
+            async with self.Session() as session:
+                get_script_query = (
+                    select(ScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(script_revision_id=script_revision_id)
+                )
+                if script := (await session.scalars(get_script_query)).first():
+                    if artifact_id:
+                        script.artifact_id = artifact_id
+                    if run_id:
+                        script.run_id = run_id
+                    if version:
+                        script.version = version
+                    await session.commit()
+                    await session.refresh(script)
+                    return convert_to_script(script)
+                else:
+                    raise NotFoundError("Script not found")
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except NotFoundError:
+            LOG.error("No script found to update", script_revision_id=script_revision_id)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_scripts(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[Script]:
+        try:
+            async with self.Session() as session:
+                # Calculate offset for pagination
+                offset = (page - 1) * page_size
+
+                # Subquery to get the latest version of each script
+                latest_versions_subquery = (
+                    select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
+                    .filter_by(organization_id=organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .group_by(ScriptModel.script_id)
+                    .subquery()
+                )
+
+                # Main query to get scripts with their latest versions
+                get_scripts_query = (
+                    select(ScriptModel)
+                    .join(
+                        latest_versions_subquery,
+                        and_(
+                            ScriptModel.script_id == latest_versions_subquery.c.script_id,
+                            ScriptModel.version == latest_versions_subquery.c.latest_version,
+                        ),
+                    )
+                    .filter_by(organization_id=organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                    .order_by(ScriptModel.created_at.desc())
+                    .limit(page_size)
+                    .offset(offset)
+                )
+                scripts = (await session.scalars(get_scripts_query)).all()
+                return [convert_to_script(script) for script in scripts]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_script(
+        self,
+        script_id: str,
+        organization_id: str,
+        version: int | None = None,
+    ) -> Script | None:
+        """Get a specific script by ID and optionally by version."""
+        try:
+            async with self.Session() as session:
+                get_script_query = (
+                    select(ScriptModel)
+                    .filter_by(script_id=script_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(ScriptModel.deleted_at.is_(None))
+                )
+
+                if version is not None:
+                    get_script_query = get_script_query.filter_by(version=version)
+                else:
+                    # Get the latest version
+                    get_script_query = get_script_query.order_by(ScriptModel.version.desc()).limit(1)
+
+                if script := (await session.scalars(get_script_query)).first():
+                    return convert_to_script(script)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_script_revision(self, script_revision_id: str, organization_id: str) -> Script | None:
+        async with self.Session() as session:
+            script = (
+                await session.scalars(
+                    select(ScriptModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return convert_to_script(script) if script else None
+
+    async def create_script_file(
+        self,
+        script_revision_id: str,
+        script_id: str,
+        organization_id: str,
+        file_path: str,
+        file_name: str,
+        file_type: str,
+        content_hash: str | None = None,
+        file_size: int | None = None,
+        mime_type: str | None = None,
+        encoding: str = "utf-8",
+        artifact_id: str | None = None,
+    ) -> ScriptFile:
+        """Create a script file."""
+        async with self.Session() as session:
+            script_file = ScriptFileModel(
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                file_path=file_path,
+                file_name=file_name,
+                file_type=file_type,
+                content_hash=content_hash,
+                file_size=file_size,
+                mime_type=mime_type,
+                encoding=encoding,
+                artifact_id=artifact_id,
+            )
+            session.add(script_file)
+            await session.commit()
+            await session.refresh(script_file)
+            return convert_to_script_file(script_file)
+
+    async def create_script_block(
+        self,
+        script_revision_id: str,
+        script_id: str,
+        organization_id: str,
+        script_block_label: str,
+        script_file_id: str | None = None,
+    ) -> ScriptBlock:
+        """Create a script block."""
+        async with self.Session() as session:
+            script_block = ScriptBlockModel(
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                script_block_label=script_block_label,
+                script_file_id=script_file_id,
+            )
+            session.add(script_block)
+            await session.commit()
+            await session.refresh(script_block)
+            return convert_to_script_block(script_block)
+
+    async def update_script_block(
+        self,
+        script_block_id: str,
+        organization_id: str,
+        script_file_id: str | None = None,
+    ) -> ScriptBlock:
+        async with self.Session() as session:
+            script_block = (
+                await session.scalars(
+                    select(ScriptBlockModel)
+                    .filter_by(script_block_id=script_block_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if script_block:
+                if script_file_id:
+                    script_block.script_file_id = script_file_id
+                await session.commit()
+                await session.refresh(script_block)
+                return convert_to_script_block(script_block)
+            else:
+                raise NotFoundError("Script block not found")
+
+    async def get_script_files(self, script_revision_id: str, organization_id: str) -> list[ScriptFile]:
+        async with self.Session() as session:
+            script_files = (
+                await session.scalars(
+                    select(ScriptFileModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).all()
+            return [convert_to_script_file(script_file) for script_file in script_files]
+
+    async def get_script_file_by_id(
+        self,
+        script_revision_id: str,
+        file_id: str,
+        organization_id: str,
+    ) -> ScriptFile | None:
+        async with self.Session() as session:
+            script_file = (
+                await session.scalars(
+                    select(ScriptFileModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(file_id=file_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+
+            return convert_to_script_file(script_file) if script_file else None
+
+    async def get_script_block(
+        self,
+        script_block_id: str,
+        organization_id: str,
+    ) -> ScriptBlock | None:
+        async with self.Session() as session:
+            record = (
+                await session.scalars(
+                    select(ScriptBlockModel)
+                    .filter_by(script_block_id=script_block_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return convert_to_script_block(record) if record else None
+
+    async def get_script_blocks_by_script_revision_id(
+        self,
+        script_revision_id: str,
+        organization_id: str,
+    ) -> list[ScriptBlock]:
+        async with self.Session() as session:
+            records = (
+                await session.scalars(
+                    select(ScriptBlockModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).all()
+            return [convert_to_script_block(record) for record in records]
+
+    async def create_workflow_script(
+        self,
+        *,
+        organization_id: str,
+        script_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        cache_key_value: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        """Create a workflow->script cache mapping entry."""
+        try:
+            async with self.Session() as session:
+                record = WorkflowScriptModel(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_key_value=cache_key_value,
+                )
+                session.add(record)
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_scripts_by_cache_key_value(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+        cache_key: str | None = None,
+    ) -> list[Script]:
+        """Get latest script versions linked to a workflow by a specific cache_key_value."""
+        try:
+            async with self.Session() as session:
+                # Subquery: script_ids associated with this workflow + cache_key_value
+                ws_script_ids_subquery = (
+                    select(WorkflowScriptModel.script_id)
+                    .where(WorkflowScriptModel.organization_id == organization_id)
+                    .where(WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowScriptModel.cache_key_value == cache_key_value)
+                    .where(WorkflowScriptModel.deleted_at.is_(None))
+                )
+
+                if cache_key is not None:
+                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
+
+                # Latest version per script_id within the org and not deleted
+                latest_versions_subquery = (
+                    select(
+                        ScriptModel.script_id,
+                        func.max(ScriptModel.version).label("latest_version"),
+                    )
+                    .where(ScriptModel.organization_id == organization_id)
+                    .where(ScriptModel.deleted_at.is_(None))
+                    .where(ScriptModel.script_id.in_(ws_script_ids_subquery))
+                    .group_by(ScriptModel.script_id)
+                    .subquery()
+                )
+
+                query = select(ScriptModel).join(
+                    latest_versions_subquery,
+                    (ScriptModel.script_id == latest_versions_subquery.c.script_id)
+                    & (ScriptModel.version == latest_versions_subquery.c.latest_version),
+                )
+                query = query.order_by(ScriptModel.created_at.desc())
+
+                scripts = (await session.scalars(query)).all()
+                return [convert_to_script(script) for script in scripts]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_cache_key_count(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        filter: str | None = None,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key=cache_key)
+                    .filter_by(deleted_at=None)
+                )
+
+                if filter:
+                    query = query.filter(WorkflowScriptModel.cache_key_value.contains(filter))
+
+                return (await session.execute(query)).scalar_one()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_cache_key_values(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        page: int = 1,
+        page_size: int = 100,
+        filter: str | None = None,
+    ) -> list[str]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel.cache_key_value)
+                    .order_by(WorkflowScriptModel.cache_key_value.asc())
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key=cache_key)
+                    .filter_by(deleted_at=None)
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+
+                if filter:
+                    query = query.filter(WorkflowScriptModel.cache_key_value.contains(filter))
+
+                return (await session.scalars(query)).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def create_workflow_cache_key_value(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        cache_key_value: str,
+        script_id: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> str:
+        """
+        Insert a new cache key value for a workflow.
+
+        Returns the workflow_script_id of the created record.
+        """
+        try:
+            async with self.Session() as session:
+                workflow_script = WorkflowScriptModel(
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_key_value=cache_key_value,
+                )
+
+                session.add(workflow_script)
+                await session.commit()
+                await session.refresh(workflow_script)
+
+                return workflow_script.workflow_script_id
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def delete_workflow_cache_key_value(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+    ) -> bool:
+        """
+        Soft delete workflow cache key values by setting deleted_at timestamp.
+
+        Returns True if any records were deleted, False otherwise.
+        """
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        and_(
+                            WorkflowScriptModel.organization_id == organization_id,
+                            WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                            WorkflowScriptModel.cache_key_value == cache_key_value,
+                            WorkflowScriptModel.deleted_at.is_(None),
+                        )
+                    )
+                    .values(deleted_at=datetime.now(timezone.utc))
+                )
+
+                result = await session.execute(stmt)
+                await session.commit()
+
+                return result.rowcount > 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise

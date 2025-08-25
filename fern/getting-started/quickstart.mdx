@@ -27,13 +27,13 @@ pip install skyvern
 Get your API key from [Skyvern Cloud](https://app.skyvern.com/settings). Send the task to Skyvern Cloud:
 ```python
 from skyvern import Skyvern
+import asyncio
 
 skyvern = Skyvern(api_key="YOUR API KEY")
 # OR pass the base_url to use any Skyvern service
 # skyvern = Skyvern(base_url="http://localhost:8000", api_key="YOUR API KEY")
 
-task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-print(task)
+asyncio.run(skyvern.run_task(prompt="Find the top post on hackernews today"))
 ```
 More API & SDK information can be found in the [API Reference](/api-reference) section.
 
@@ -48,14 +48,12 @@ You can also run browser tasks locally with Python code, with a little bit of se
 2. **Run Task In Python Code**
         ```python
         from skyvern import Skyvern
+        import asyncio
         
-        skyvern = Skyvern()
+        skyvern = Skyvern()        
         
-        task = await skyvern.run_task(
-            prompt="Find the top post on hackernews today",
-        )
-        print(task.model_dump())
-        ```
+        asyncio.run(skyvern.run_task(prompt="Find the top post on hackernews today"))
+	    ```
         A local browser will pop up. Skyvern will start executing the task in the browser and close the browser when the task is done.
 
 <CardGroup cols={2}>

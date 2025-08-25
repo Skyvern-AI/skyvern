@@ -1,7 +1,7 @@
-import datetime
-import os
-import uuid
+import asyncio
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import partial
 from typing import Annotated, Any
 
 import structlog
@@ -12,15 +12,17 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
+from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -38,12 +40,14 @@ from skyvern.forge.sdk.routes.code_samples import (
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
+from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
     Organization,
     OrganizationUpdate,
 )
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
@@ -64,7 +68,6 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidTemplateWorkflowPermanentId,
     WorkflowParameterMissingRequiredValue,
 )
-from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -72,12 +75,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
-    WorkflowStatus,
 )
-from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.runs import (
     CUA_ENGINES,
+    BlockRunRequest,
+    BlockRunResponse,
     RunEngine,
     RunResponse,
     RunType,
@@ -86,8 +89,8 @@ from skyvern.schemas.runs import (
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
-from skyvern.schemas.workflows import WorkflowRequest
-from skyvern.services import run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
+from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -102,7 +105,6 @@ class AISuggestionType(str, Enum):
     "/run/tasks",
     tags=["Agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task",
         "x-fern-examples": [
             {
@@ -169,6 +171,9 @@ async def run_task(
             totp_identifier=run_request.totp_identifier,
             include_action_history_in_verification=run_request.include_action_history_in_verification,
             model=run_request.model,
+            max_screenshot_scrolls=run_request.max_screenshot_scrolls,
+            extra_http_headers=run_request.extra_http_headers,
+            browser_address=run_request.browser_address,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,
@@ -206,6 +211,7 @@ async def run_task(
                 data_extraction_schema=task_v1_response.extracted_information_schema,
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
+                max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
     if run_request.engine == RunEngine.skyvern_v2:
@@ -224,7 +230,12 @@ async def run_task(
                 error_code_mapping=run_request.error_code_mapping,
                 create_task_run=True,
                 model=run_request.model,
+                max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
+                extra_http_headers=run_request.extra_http_headers,
+                browser_address=run_request.browser_address,
             )
+        except MissingBrowserAddressError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except LLMProviderError:
             LOG.error("LLM failure to initialize task v2", exc_info=True)
             raise HTTPException(
@@ -264,6 +275,7 @@ async def run_task(
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
+                max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
     LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
@@ -274,7 +286,6 @@ async def run_task(
     "/run/workflows",
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
             {
@@ -317,21 +328,28 @@ async def run_workflow(
         proxy_location=workflow_run_request.proxy_location,
         webhook_callback_url=workflow_run_request.webhook_url,
         totp_identifier=workflow_run_request.totp_identifier,
-        totp_url=workflow_run_request.totp_url,
+        totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
+        max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
+        extra_http_headers=workflow_run_request.extra_http_headers,
+        browser_address=workflow_run_request.browser_address,
     )
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=legacy_workflow_request,
-        template=template,
-        version=None,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=legacy_workflow_request,
+            template=template,
+            version=None,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -355,7 +373,6 @@ async def run_workflow(
     description="Get run information (task run, workflow run)",
     summary="Get a run by id",
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_run",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
     },
@@ -388,7 +405,6 @@ async def get_run(
     "/runs/{run_id}/cancel",
     tags=["Agent", "Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE}]}],
     },
@@ -413,7 +429,6 @@ async def cancel_run(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "create_workflow",
     },
     response_model=Workflow,
@@ -458,7 +473,6 @@ async def create_workflow_legacy(
     response_model=Workflow,
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [
             {
@@ -517,7 +531,6 @@ async def create_workflow(
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
             "required": True,
         },
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
     },
     response_model=Workflow,
@@ -572,7 +585,6 @@ async def update_workflow_legacy(
     response_model=Workflow,
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "update_workflow",
         "x-fern-examples": [
             {
@@ -643,7 +655,6 @@ async def update_workflow(
     "/workflows/{workflow_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
     },
 )
@@ -652,7 +663,6 @@ async def update_workflow(
     "/workflows/{workflow_id}/delete",
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
     },
@@ -671,12 +681,64 @@ async def delete_workflow(
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
 
 
+@legacy_base_router.post(
+    "/utilities/curl-to-http",
+    tags=["Utilities"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "convert_curl_to_http",
+    },
+    description="Convert a curl command to HTTP request parameters",
+    summary="Convert curl to HTTP parameters",
+    responses={
+        200: {"description": "Successfully converted curl command"},
+        400: {"description": "Invalid curl command"},
+    },
+)
+@legacy_base_router.post("/utilities/curl-to-http/", include_in_schema=False)
+async def convert_curl_to_http(
+    request: dict[str, str],
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, Any]:
+    """
+    Convert a curl command to HTTP request parameters.
+
+    This endpoint is useful for converting curl commands to the format
+    needed by the HTTP Request workflow block.
+
+    Request body should contain:
+    - curl_command: The curl command string to convert
+
+    Returns:
+    - method: HTTP method
+    - url: The URL
+    - headers: Dict of headers
+    - body: Request body as dict
+    - timeout: Default timeout
+    - follow_redirects: Default follow redirects setting
+    """
+    curl_command = request.get("curl_command")
+    if not curl_command:
+        raise HTTPException(status_code=400, detail="curl_command is required in the request body")
+
+    try:
+        result = curl_to_http_request_block_params(curl_command)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        LOG.error(
+            "Failed to convert curl command",
+            error=str(e),
+            organization_id=current_org.organization_id,
+        )
+        raise HTTPException(status_code=400, detail=f"Failed to convert curl command: {str(e)}")
+
+
 @base_router.get(
     "/artifacts/{artifact_id}",
     tags=["Artifacts"],
     response_model=Artifact,
     openapi_extra={
-        "x-fern-sdk-group-name": "artifacts",
         "x-fern-sdk-method-name": "get_artifact",
     },
     description="Get an artifact",
@@ -713,11 +775,59 @@ async def get_artifact(
     return artifact
 
 
+@base_router.get(
+    "/runs/{run_id}/artifacts",
+    tags=["Artifacts"],
+    response_model=list[Artifact],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_run_artifacts",
+    },
+    description="Get artifacts for a run",
+    summary="Get artifacts for a run",
+)
+@base_router.get("/runs/{run_id}/artifacts/", response_model=list[Artifact], include_in_schema=False)
+async def get_run_artifacts(
+    run_id: str = Path(..., description="The id of the task run or the workflow run."),
+    artifact_type: Annotated[list[ArtifactType] | None, Query()] = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    analytics.capture("skyvern-oss-run-artifacts-get")
+    # Get artifacts as a list (not grouped by type)
+    artifacts = await app.DATABASE.get_artifacts_for_run(
+        run_id=run_id,
+        organization_id=current_org.organization_id,
+        artifact_types=artifact_type,
+        group_by_type=False,  # This ensures we get a list, not a dict
+    )
+
+    # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
+    artifacts_list = artifacts if isinstance(artifacts, list) else []
+
+    if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
+        # Get signed URLs for all artifacts
+        signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts_list)
+
+        if signed_urls and len(signed_urls) == len(artifacts_list):
+            for i, artifact in enumerate(artifacts_list):
+                if hasattr(artifact, "signed_url"):
+                    artifact.signed_url = signed_urls[i]
+        elif signed_urls:
+            LOG.warning(
+                "Mismatch between artifacts and signed URLs count",
+                artifacts_count=len(artifacts_list),
+                urls_count=len(signed_urls),
+                run_id=run_id,
+            )
+        else:
+            LOG.warning("Failed to get signed urls for artifacts", run_id=run_id)
+
+    return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
+
+
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
     tags=["Agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE}]}],
     },
@@ -734,12 +844,65 @@ async def retry_run_webhook(
     await run_service.retry_run_webhook(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
 
 
+@base_router.post(
+    "/run/workflows/blocks",
+    include_in_schema=False,
+    response_model=BlockRunResponse,
+)
+async def run_block(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    block_run_request: BlockRunRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> BlockRunResponse:
+    """
+    Kick off the execution of one or more blocks in a workflow. Returns the
+    workflow_run_id.
+    """
+
+    workflow_run = await block_service.ensure_workflow_run(
+        organization=organization,
+        template=template,
+        workflow_permanent_id=block_run_request.workflow_id,
+        workflow_run_request=block_run_request,
+    )
+
+    browser_session_id = block_run_request.browser_session_id
+
+    await block_service.execute_blocks(
+        request=request,
+        background_tasks=background_tasks,
+        api_key=x_api_key or "",
+        block_labels=block_run_request.block_labels,
+        workflow_id=block_run_request.workflow_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization=organization,
+        browser_session_id=browser_session_id,
+    )
+
+    return BlockRunResponse(
+        block_labels=block_run_request.block_labels,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        status=str(workflow_run.status),
+        output=None,
+        failure_reason=workflow_run.failure_reason,
+        created_at=workflow_run.created_at,
+        modified_at=workflow_run.modified_at,
+        run_request=block_run_request,
+        downloaded_files=None,
+        recording_url=None,
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+    )
+
+
 ################# Legacy Endpoints #################
 @legacy_base_router.post(
     "/webhook",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "webhook",
     },
     include_in_schema=False,
@@ -785,7 +948,6 @@ async def webhook(
     "/heartbeat",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "heartbeat",
     },
 )
@@ -800,9 +962,7 @@ async def heartbeat() -> Response:
 @legacy_base_router.get(
     "/models",
     tags=["agent"],
-    openapi_extra={
-        "x-fern-sdk-group-name": "agent",
-    },
+    openapi_extra={},
 )
 @legacy_base_router.get("/models/", include_in_schema=False)
 async def models() -> ModelsResponse:
@@ -820,7 +980,6 @@ async def models() -> ModelsResponse:
     tags=["agent"],
     response_model=CreateTaskResponse,
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task_v1",
     },
 )
@@ -857,7 +1016,6 @@ async def run_task_v1(
     tags=["agent"],
     response_model=TaskResponse,
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_task_v1",
     },
 )
@@ -874,7 +1032,6 @@ async def get_task_v1(
     "/tasks/{task_id}/cancel",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_task",
     },
 )
@@ -898,11 +1055,44 @@ async def cancel_task(
     await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=x_api_key)
 
 
+async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api_key: str | None = None) -> None:
+    workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+
+    if not workflow_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run not found {workflow_run_id}",
+        )
+
+    if workflow_run.browser_session_id:
+        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(workflow_run.browser_session_id, organization_id)
+
+    # get all the child workflow runs and cancel them
+    child_workflow_runs = await app.DATABASE.get_workflow_runs_by_parent_workflow_run_id(
+        parent_workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+
+    for child_workflow_run in child_workflow_runs:
+        if child_workflow_run.status not in [
+            WorkflowRunStatus.running,
+            WorkflowRunStatus.created,
+            WorkflowRunStatus.queued,
+        ]:
+            continue
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
+
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
+
+
 @legacy_base_router.post(
     "/workflows/runs/{workflow_run_id}/cancel",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "cancel_workflow_run",
     },
 )
@@ -912,30 +1102,24 @@ async def cancel_workflow_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
-    workflow_run = await app.DATABASE.get_workflow_run(
-        workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
-    )
-    if not workflow_run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Workflow run not found {workflow_run_id}",
-        )
-    # get all the child workflow runs and cancel them
-    child_workflow_runs = await app.DATABASE.get_workflow_runs_by_parent_workflow_run_id(
-        parent_workflow_run_id=workflow_run_id,
-        organization_id=current_org.organization_id,
-    )
-    for child_workflow_run in child_workflow_runs:
-        if child_workflow_run.status not in [
-            WorkflowRunStatus.running,
-            WorkflowRunStatus.created,
-            WorkflowRunStatus.queued,
-        ]:
-            continue
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
-    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
+    await _cancel_workflow_run(workflow_run_id, current_org.organization_id, x_api_key)
+
+
+@legacy_base_router.post(
+    "/runs/{browser_session_id}/workflow_run/{workflow_run_id}/cancel/",
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "cancel_workflow_run",
+    },
+)
+@legacy_base_router.post("/runs/{browser_session_id}/workflow_run/{workflow_run_id}/cancel/", include_in_schema=False)
+async def cancel_persistent_browser_session_workflow_run(
+    workflow_run_id: str,
+    browser_session_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> None:
+    await _cancel_workflow_run(workflow_run_id, current_org.organization_id, x_api_key)
 
 
 @legacy_base_router.post(
@@ -943,7 +1127,6 @@ async def cancel_workflow_run(
     tags=["agent"],
     response_model=TaskResponse,
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "retry_webhook",
     },
 )
@@ -981,7 +1164,6 @@ async def retry_webhook(
     tags=["agent"],
     response_model=list[Task],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_tasks",
     },
 )
@@ -1038,7 +1220,6 @@ async def get_tasks(
     tags=["agent"],
     response_model=list[WorkflowRun | Task],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_runs",
     },
 )
@@ -1068,7 +1249,6 @@ async def get_runs(
     tags=["agent"],
     response_model=list[Step],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_steps",
     },
 )
@@ -1096,7 +1276,6 @@ async def get_steps(
     tags=["agent"],
     response_model=list[Artifact],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_artifacts",
     },
 )
@@ -1132,13 +1311,10 @@ async def get_artifacts(
         )
 
     analytics.capture("skyvern-oss-agent-entity-artifacts-get")
-
     params = {
-        "organization_id": current_org.organization_id,
         entity_type_to_param[entity_type]: entity_id,
     }
-
-    artifacts = await app.DATABASE.get_artifacts_by_entity_id(**params)  # type: ignore
+    artifacts = await app.DATABASE.get_artifacts_by_entity_id(organization_id=current_org.organization_id, **params)  # type: ignore
 
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
         signed_urls = await app.ARTIFACT_MANAGER.get_share_links(artifacts)
@@ -1160,7 +1336,6 @@ async def get_artifacts(
     tags=["agent"],
     response_model=list[Artifact],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_step_artifacts",
     },
 )
@@ -1205,7 +1380,6 @@ async def get_step_artifacts(
     response_model=list[Action],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_actions",
     },
 )
@@ -1228,7 +1402,6 @@ async def get_actions(
     response_model=RunWorkflowResponse,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_workflow_legacy",
     },
 )
@@ -1257,18 +1430,21 @@ async def run_workflow_legacy(
         browser_session_id=workflow_request.browser_session_id,
     )
 
-    workflow_run = await workflow_service.run_workflow(
-        workflow_id=workflow_id,
-        organization=current_org,
-        workflow_request=workflow_request,
-        template=template,
-        version=version,
-        max_steps=x_max_steps_override,
-        api_key=x_api_key,
-        request_id=request_id,
-        request=request,
-        background_tasks=background_tasks,
-    )
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=workflow_id,
+            organization=current_org,
+            workflow_request=workflow_request,
+            template=template,
+            version=version,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=request_id,
+            request=request,
+            background_tasks=background_tasks,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return RunWorkflowResponse(
         workflow_id=workflow_id,
@@ -1281,7 +1457,6 @@ async def run_workflow_legacy(
     response_model=list[WorkflowRun],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_runs",
     },
 )
@@ -1310,7 +1485,6 @@ async def get_workflow_runs(
     response_model=list[WorkflowRun],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_runs_by_id",
     },
 )
@@ -1340,7 +1514,6 @@ async def get_workflow_runs_by_id(
     "/workflows/{workflow_id}/runs/{workflow_run_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_run_with_workflow_id",
     },
 )
@@ -1360,13 +1533,17 @@ async def get_workflow_run_with_workflow_id(
         organization_id=current_org.organization_id,
         include_cost=True,
     )
-    return_dict = workflow_run_status_response.model_dump()
-    task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
-        workflow_run_id=workflow_run_id,
+    return_dict = workflow_run_status_response.model_dump(by_alias=True)
+
+    browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+        runnable_id=workflow_run_id,
         organization_id=current_org.organization_id,
     )
-    if task_v2:
-        return_dict["task_v2"] = task_v2.model_dump(by_alias=True)
+
+    browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
+
+    return_dict["browser_session_id"] = browser_session_id or return_dict.get("browser_session_id")
+
     return return_dict
 
 
@@ -1374,7 +1551,6 @@ async def get_workflow_run_with_workflow_id(
     "/workflows/{workflow_id}/runs/{workflow_run_id}/timeline",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_run_timeline",
     },
 )
@@ -1396,7 +1572,6 @@ async def get_workflow_run_timeline(
     response_model=WorkflowRunResponseBase,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_run",
     },
 )
@@ -1421,7 +1596,6 @@ async def get_workflow_run(
     response_model=list[Workflow],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflows",
     },
 )
@@ -1435,7 +1609,6 @@ async def get_workflow_run(
     response_model=list[Workflow],
     tags=["Workflows"],
     openapi_extra={
-        "x-fern-sdk-group-name": "workflows",
         "x-fern-sdk-method-name": "get_workflows",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_WORKFLOWS_CODE_SAMPLE}]}],
     },
@@ -1490,7 +1663,6 @@ async def get_workflows(
     response_model=list[Workflow],
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow_templates",
     },
 )
@@ -1518,7 +1690,6 @@ async def get_workflow_templates() -> list[Workflow]:
     response_model=Workflow,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_workflow",
     },
 )
@@ -1546,7 +1717,6 @@ async def get_workflow(
     include_in_schema=False,
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "suggest",
     },
 )
@@ -1583,7 +1753,6 @@ async def suggest(
     "/generate/task",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "generate_task",
     },
 )
@@ -1603,7 +1772,6 @@ async def generate_task(
     "/organizations",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "update_organization",
     },
 )
@@ -1625,7 +1793,6 @@ async def update_organization(
     "/organizations",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "get_organizations",
     },
 )
@@ -1643,7 +1810,6 @@ async def get_organizations(
     "/organizations/{organization_id}/apikeys/",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "get_api_keys",
     },
 )
@@ -1684,7 +1850,6 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
     "/upload_file",
     tags=["server"],
     openapi_extra={
-        "x-fern-sdk-group-name": "server",
         "x-fern-sdk-method-name": "upload_file",
     },
 )
@@ -1696,36 +1861,12 @@ async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Response:
-    bucket = app.SETTINGS_MANAGER.AWS_S3_BUCKET_UPLOADS
-    todays_date = datetime.datetime.now().strftime("%Y-%m-%d")
-
-    # First try uploading with original filename
-    try:
-        sanitized_filename = os.path.basename(file.filename)  # Remove any path components
-        s3_uri = (
-            f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{sanitized_filename}"
-        )
-        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
-    except Exception:
-        LOG.error("Failed to upload file to S3", exc_info=True)
-        uploaded_s3_uri = None
-
-    # If upload fails, try again with UUID prefix
-    if not uploaded_s3_uri:
-        uuid_prefixed_filename = f"{str(uuid.uuid4())}_{file.filename}"
-        s3_uri = f"s3://{bucket}/{app.SETTINGS_MANAGER.ENV}/{current_org.organization_id}/{todays_date}/{uuid_prefixed_filename}"
-        file.file.seek(0)  # Reset file pointer
-        uploaded_s3_uri = await aws_client.upload_file_stream(s3_uri, file.file)
-
-    if not uploaded_s3_uri:
+    uris = await app.STORAGE.save_legacy_file(
+        organization_id=current_org.organization_id, filename=file.filename, fileObj=file.file
+    )
+    if not uris:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
-
-    # Generate a presigned URL for the uploaded file
-    presigned_urls = await aws_client.create_presigned_urls([uploaded_s3_uri])
-    if not presigned_urls:
-        raise HTTPException(status_code=500, detail="Failed to generate presigned URL.")
-
-    presigned_url = presigned_urls[0]
+    presigned_url, uploaded_s3_uri = uris
     return ORJSONResponse(
         content={"s3_uri": uploaded_s3_uri, "presigned_url": presigned_url},
         status_code=200,
@@ -1737,7 +1878,6 @@ async def upload_file(
     "/tasks",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "run_task_v2",
     },
 )
@@ -1774,7 +1914,13 @@ async def run_task_v2(
             create_task_run=True,
             extracted_information_schema=data.extracted_information_schema,
             error_code_mapping=data.error_code_mapping,
+            max_screenshot_scrolling_times=data.max_screenshot_scrolls,
+            browser_session_id=data.browser_session_id,
+            extra_http_headers=data.extra_http_headers,
+            browser_address=data.browser_address,
         )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except LLMProviderError:
         LOG.error("LLM failure to initialize task v2", exc_info=True)
         raise HTTPException(
@@ -1796,7 +1942,6 @@ async def run_task_v2(
     "/tasks/{task_id}",
     tags=["agent"],
     openapi_extra={
-        "x-fern-sdk-group-name": "agent",
         "x-fern-sdk-method-name": "get_task_v2",
     },
 )
@@ -1861,3 +2006,220 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         final_workflow_run_block_timeline.extend(thought_timeline)
     final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
     return final_workflow_run_block_timeline
+
+
+@base_router.get(
+    "/debug-session/{workflow_permanent_id}",
+    include_in_schema=False,
+)
+async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+) -> DebugSession:
+    """
+    `current_user_id` is a unique identifier for a user, but does not map to an
+    entity in the database (at time of writing)
+
+    If the debug session does not exist, a new one will be created.
+
+    In addition, the timeout for the debug session's browser session will be
+    extended to 4 hours from the time of the request. If the browser session
+    cannot be renewed, a new one will be created and assigned to the debug
+    session. The browser_session that could not be renewed will be closed.
+    """
+
+    debug_session = await app.DATABASE.get_debug_session(
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    if not debug_session:
+        LOG.info(
+            "Existing debug session not found, created a new one, along with a new browser session",
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
+        return await new_debug_session(
+            workflow_permanent_id,
+            current_org,
+            current_user_id,
+        )
+
+    LOG.info(
+        "Existing debug session found",
+        debug_session_id=debug_session.debug_session_id,
+        browser_session_id=debug_session.browser_session_id,
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    try:
+        await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
+            debug_session.browser_session_id,
+            current_org.organization_id,
+        )
+        return debug_session
+    except BrowserSessionNotRenewable as ex:
+        LOG.info(
+            "Browser session was non-renewable; creating a new debug session",
+            ex=str(ex),
+            debug_session_id=debug_session.debug_session_id,
+            browser_session_id=debug_session.browser_session_id,
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            user_id=current_user_id,
+        )
+
+        return await new_debug_session(
+            workflow_permanent_id,
+            current_org,
+            current_user_id,
+        )
+
+
+@base_router.post(
+    "/debug-session/{workflow_permanent_id}/new",
+    include_in_schema=False,
+)
+async def new_debug_session(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+) -> DebugSession:
+    """
+    Create a new debug session, along with a new browser session. If any
+    existing debug sessions are found, "complete" them. Then close the browser
+    sessions associated with those completed debug sessions.
+
+    Return the new debug session.
+
+    CAVEAT: if an existing debug session for this user is <30s old, then we
+    return that instead. This is to curtail damage from browser session
+    spamming.
+    """
+
+    if current_user_id:
+        debug_session = await app.DATABASE.get_latest_debug_session_for_user(
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
+        if debug_session:
+            now = datetime.now(timezone.utc)
+            created_at_utc = (
+                debug_session.created_at.replace(tzinfo=timezone.utc)
+                if debug_session.created_at.tzinfo is None
+                else debug_session.created_at
+            )
+            if now - created_at_utc < timedelta(seconds=30):
+                LOG.info(
+                    "Existing debug session is less than 30s old, returning it",
+                    debug_session_id=debug_session.debug_session_id,
+                    browser_session_id=debug_session.browser_session_id,
+                    organization_id=current_org.organization_id,
+                    user_id=current_user_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
+                return debug_session
+
+    completed_debug_sessions = await app.DATABASE.complete_debug_sessions(
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    LOG.info(
+        f"Completed {len(completed_debug_sessions)} pre-existing debug session(s)",
+        num_completed_debug_sessions=len(completed_debug_sessions),
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    if completed_debug_sessions:
+        closeable_browser_sessions: list[PersistentBrowserSession] = []
+
+        for debug_session in completed_debug_sessions:
+            try:
+                browser_session = await app.DATABASE.get_persistent_browser_session(
+                    debug_session.browser_session_id,
+                    current_org.organization_id,
+                )
+            except NotFoundError:
+                browser_session = None
+
+            if browser_session and browser_session.completed_at is None:
+                closeable_browser_sessions.append(browser_session)
+
+        LOG.info(
+            f"Closing browser {len(closeable_browser_sessions)} browser session(s)",
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
+        def handle_close_browser_session_error(
+            browser_session_id: str,
+            organization_id: str,
+            task: asyncio.Task,
+        ) -> None:
+            if task.exception():
+                LOG.error(
+                    f"Failed to close session: {task.exception()}",
+                    browser_session_id=browser_session_id,
+                    organization_id=organization_id,
+                )
+
+        for browser_session in closeable_browser_sessions:
+            LOG.info(
+                "Closing existing browser session for debug session",
+                browser_session_id=browser_session.persistent_browser_session_id,
+                organization_id=current_org.organization_id,
+            )
+
+            # NOTE(jdo): these may fail to actually close on infra, but the user
+            # wants (and should get) a new session regardless - so we will just
+            # log the error and continue
+            task = asyncio.create_task(
+                app.PERSISTENT_SESSIONS_MANAGER.close_session(
+                    current_org.organization_id,
+                    browser_session.persistent_browser_session_id,
+                )
+            )
+
+            task.add_done_callback(
+                partial(
+                    handle_close_browser_session_error,
+                    browser_session.persistent_browser_session_id,
+                    current_org.organization_id,
+                )
+            )
+
+    new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+        organization_id=current_org.organization_id,
+        timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+    )
+
+    debug_session = await app.DATABASE.create_debug_session(
+        browser_session_id=new_browser_session.persistent_browser_session_id,
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    LOG.info(
+        "Created new debug session",
+        debug_session_id=debug_session.debug_session_id,
+        browser_session_id=new_browser_session.persistent_browser_session_id,
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+    return debug_session

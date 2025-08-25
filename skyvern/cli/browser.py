@@ -1,5 +1,6 @@
 import os
 import subprocess
+from typing import Optional
 from urllib.parse import urlparse
 
 import requests  # type: ignore
@@ -26,7 +27,7 @@ def get_default_chrome_location(host_system: str) -> str:
     return "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
 
 
-def setup_browser_config() -> tuple[str, str | None, str | None]:
+def setup_browser_config() -> tuple[str, Optional[str], Optional[str]]:
     """Configure browser settings for Skyvern."""
     console.print(Panel("\n[bold blue]Configuring web browser for scraping...[/bold blue]", border_style="cyan"))
     browser_types = ["chromium-headless", "chromium-headful", "cdp-connect"]

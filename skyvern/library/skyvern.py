@@ -11,6 +11,7 @@ from skyvern.client.core.pydantic_utilities import parse_obj_as
 from skyvern.client.environment import SkyvernEnvironment
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
+from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security, skyvern_context
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskReques
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
+from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine, RunStatus, RunType
 from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.utils import migrate_db
@@ -45,6 +47,7 @@ class Skyvern(AsyncSkyvern):
         super().__init__(
             base_url=base_url,
             api_key=api_key,
+            x_api_key=api_key,
             environment=environment,
             timeout=timeout,
             follow_redirects=follow_redirects,
@@ -136,11 +139,14 @@ class Skyvern(AsyncSkyvern):
             organization_id=organization.organization_id,
         )
         try:
+            context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+            current_run_id = context.run_id if context and context.run_id else task.task_id
             skyvern_context.set(
                 SkyvernContext(
                     organization_id=organization.organization_id,
                     organization_name=organization.organization_name,
                     task_id=task.task_id,
+                    run_id=current_run_id,
                     max_steps_override=max_steps,
                 )
             )
@@ -335,6 +341,7 @@ class Skyvern(AsyncSkyvern):
                     proxy_location=proxy_location,
                     totp_identifier=totp_identifier,
                     totp_verification_url=totp_url,
+                    browser_session_id=browser_session_id,
                 )
 
                 created_task = await app.agent.create_task(task_request, organization.organization_id)
@@ -405,7 +412,94 @@ class Skyvern(AsyncSkyvern):
                     if RunStatus(task_run.status).is_final():
                         break
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
-        return TaskRunResponse.model_validate(task_run.dict())
+        return TaskRunResponse.model_validate(task_run.model_dump())
+
+    async def run_workflow(
+        self,
+        workflow_id: str,
+        parameters: dict[str, Any] | None = None,
+        template: bool | None = None,
+        title: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        webhook_url: str | None = None,
+        totp_url: str | None = None,
+        totp_identifier: str | None = None,
+        browser_session_id: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> WorkflowRunResponse:
+        if not self._api_key:
+            raise ValueError(
+                "Local mode is not supported for run_workflow. Please instantiate Skyvern with an API key like this: Skyvern(api_key='your-api-key')"
+            )
+        workflow_run = await super().run_workflow(
+            workflow_id=workflow_id,
+            parameters=parameters,
+            template=template,
+            title=title,
+            proxy_location=proxy_location,
+            webhook_url=webhook_url,
+            totp_url=totp_url,
+            totp_identifier=totp_identifier,
+            browser_session_id=browser_session_id,
+        )
+        if wait_for_completion:
+            async with asyncio.timeout(timeout):
+                while True:
+                    workflow_run = await super().get_run(workflow_run.run_id)
+                    if RunStatus(workflow_run.status).is_final():
+                        break
+                    await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
+        return WorkflowRunResponse.model_validate(workflow_run.model_dump())
+
+    async def login(
+        self,
+        credential_type: CredentialType,
+        *,
+        url: str | None = None,
+        credential_id: str | None = None,
+        bitwarden_collection_id: str | None = None,
+        bitwarden_item_id: str | None = None,
+        onepassword_vault_id: str | None = None,
+        onepassword_item_id: str | None = None,
+        prompt: str | None = None,
+        webhook_url: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        browser_session_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        wait_for_completion: bool = False,
+        timeout: float = DEFAULT_AGENT_TIMEOUT,
+    ) -> None:
+        if not self._api_key:
+            raise ValueError(
+                "Local mode is not supported for login. Please instantiate Skyvern with an API key like this: Skyvern(api_key='your-api-key')"
+            )
+        workflow_run = await super().login(
+            credential_type=credential_type,
+            url=url,
+            credential_id=credential_id,
+            bitwarden_collection_id=bitwarden_collection_id,
+            bitwarden_item_id=bitwarden_item_id,
+            onepassword_vault_id=onepassword_vault_id,
+            onepassword_item_id=onepassword_item_id,
+            prompt=prompt,
+            webhook_url=webhook_url,
+            proxy_location=proxy_location,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+            browser_session_id=browser_session_id,
+            extra_http_headers=extra_http_headers,
+        )
+        if wait_for_completion:
+            async with asyncio.timeout(timeout):
+                while True:
+                    workflow_run = await super().get_run(workflow_run.run_id)
+                    if RunStatus(workflow_run.status).is_final():
+                        break
+                    await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
+        return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
 
 def from_run_to_task_run_response(run_obj: GetRunResponse) -> TaskRunResponse:

@@ -1,28 +1,44 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips } from "../../helpContent";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type FileParserNode } from "./types";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
+import { cn } from "@/util/utils";
+import { NodeHeader } from "../components/NodeHeader";
+import { useParams } from "react-router-dom";
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
+import { dataSchemaExampleForFileExtraction } from "../types";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData } = useReactFlow();
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const { editable, label } = data;
+  const { blockLabel: urlBlockLabel } = useParams();
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const [inputs, setInputs] = useState({
     fileUrl: data.fileUrl,
+    jsonSchema: data.jsonSchema,
+    model: data.model,
   });
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+
+  function handleChange(key: string, value: unknown) {
+    if (!data.editable) {
+      return;
+    }
+    setInputs({ ...inputs, [key]: value });
+    updateNodeData(id, { [key]: value });
+  }
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
@@ -40,32 +56,24 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <div className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.FileURLParser}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={data.editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">File Parser Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </div>
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none": thisBlockIsPlaying,
+            "bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsTargetted,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={null}
+          totpUrl={null}
+          type="file_url_parser" // sic: the naming is not consistent
+        />
         <div className="space-y-4">
           <div className="space-y-2">
             <div className="flex justify-between">
@@ -84,15 +92,26 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
               nodeId={id}
               value={inputs.fileUrl}
               onChange={(value) => {
-                if (!data.editable) {
-                  return;
-                }
-                setInputs({ ...inputs, fileUrl: value });
-                updateNodeData(id, { fileUrl: value });
+                handleChange("fileUrl", value);
               }}
               className="nopan text-xs"
             />
           </div>
+          <WorkflowDataSchemaInputGroup
+            exampleValue={dataSchemaExampleForFileExtraction}
+            value={inputs.jsonSchema}
+            onChange={(value) => {
+              handleChange("jsonSchema", value);
+            }}
+            suggestionContext={{}}
+          />
+          <ModelSelector
+            className="nopan w-52 text-xs"
+            value={inputs.model}
+            onChange={(value) => {
+              handleChange("model", value);
+            }}
+          />
         </div>
       </div>
     </div>

@@ -12,18 +12,18 @@ from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, Workflo
 LOG = structlog.get_logger(__name__)
 
 
-async def run_workflow(
+async def prepare_workflow(
     workflow_id: str,
     organization: Organization,
     workflow_request: WorkflowRequestBody,  # this is the deprecated workflow request body
     template: bool = False,
     version: int | None = None,
     max_steps: int | None = None,
-    api_key: str | None = None,
     request_id: str | None = None,
-    request: Request | None = None,
-    background_tasks: BackgroundTasks | None = None,
 ) -> WorkflowRun:
+    """
+    Prepare a workflow to be run.
+    """
     if template:
         if workflow_id not in await app.STORAGE.retrieve_global_workflows():
             raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_id)
@@ -37,19 +37,49 @@ async def run_workflow(
         max_steps_override=max_steps,
         is_template_workflow=template,
     )
+
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_id,
         organization_id=None if template else organization.organization_id,
         version=version,
     )
+
     await app.DATABASE.create_task_run(
         task_run_type=RunType.workflow_run,
         organization_id=organization.organization_id,
         run_id=workflow_run.workflow_run_id,
         title=workflow.title,
     )
+
     if max_steps:
         LOG.info("Overriding max steps per run", max_steps_override=max_steps)
+
+    return workflow_run
+
+
+async def run_workflow(
+    workflow_id: str,
+    organization: Organization,
+    workflow_request: WorkflowRequestBody,  # this is the deprecated workflow request body
+    template: bool = False,
+    version: int | None = None,
+    max_steps: int | None = None,
+    api_key: str | None = None,
+    request_id: str | None = None,
+    request: Request | None = None,
+    background_tasks: BackgroundTasks | None = None,
+    block_labels: list[str] | None = None,
+) -> WorkflowRun:
+    workflow_run = await prepare_workflow(
+        workflow_id=workflow_id,
+        organization=organization,
+        workflow_request=workflow_request,
+        template=template,
+        version=version,
+        max_steps=max_steps,
+        request_id=request_id,
+    )
+
     await AsyncExecutorFactory.get_executor().execute_workflow(
         request=request,
         background_tasks=background_tasks,
@@ -59,7 +89,9 @@ async def run_workflow(
         max_steps_override=max_steps,
         browser_session_id=workflow_request.browser_session_id,
         api_key=api_key,
+        block_labels=block_labels,
     )
+
     return workflow_run
 
 
@@ -83,6 +115,9 @@ async def get_workflow_run_response(
         recording_url=workflow_run_resp.recording_url,
         screenshot_urls=workflow_run_resp.screenshot_urls,
         failure_reason=workflow_run_resp.failure_reason,
+        queued_at=workflow_run.queued_at,
+        started_at=workflow_run.started_at,
+        finished_at=workflow_run.finished_at,
         app_url=app_url,
         created_at=workflow_run.created_at,
         modified_at=workflow_run.modified_at,
@@ -94,6 +129,8 @@ async def get_workflow_run_response(
             webhook_url=workflow_run.webhook_callback_url or None,
             totp_url=workflow_run.totp_verification_url or None,
             totp_identifier=workflow_run.totp_identifier,
+            max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+            browser_address=workflow_run.browser_address,
             # TODO: add browser session id
         ),
     )

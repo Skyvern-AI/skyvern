@@ -35,7 +35,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
-from skyvern.webeye.utils.page import SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
 
@@ -131,7 +131,9 @@ def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -
 
 def initialize_download_dir() -> str:
     context = ensure_context()
-    return get_download_dir(context.workflow_run_id, context.task_id)
+    return get_download_dir(
+        context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
+    )
 
 
 class BrowserContextCreator(Protocol):
@@ -162,7 +164,7 @@ class BrowserContextFactory:
         preference_template = f"{SKYVERN_DIR}/webeye/chromium_preferences.json"
 
         preference_file_content = ""
-        with open(preference_template, "r") as f:
+        with open(preference_template) as f:
             preference_file_content = f.read()
             preference_file_content = preference_file_content.replace("MASK_SAVEFILE_DEFAULT_DIRECTORY", download_dir)
             preference_file_content = preference_file_content.replace("MASK_DOWNLOAD_DEFAULT_DIRECTORY", download_dir)
@@ -170,7 +172,11 @@ class BrowserContextFactory:
             f.write(preference_file_content)
 
     @staticmethod
-    def build_browser_args(proxy_location: ProxyLocation | None = None, cdp_port: int | None = None) -> dict[str, Any]:
+    def build_browser_args(
+        proxy_location: ProxyLocation | None = None,
+        cdp_port: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
         har_dir = (
             f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
@@ -214,6 +220,7 @@ class BrowserContextFactory:
                 "width": settings.BROWSER_WIDTH,
                 "height": settings.BROWSER_HEIGHT,
             },
+            "extra_http_headers": extra_http_headers,
         }
 
         if settings.ENABLE_PROXY:
@@ -281,7 +288,7 @@ class BrowserContextFactory:
 class VideoArtifact(BaseModel):
     video_path: str | None = None
     video_artifact_id: str | None = None
-    video_data: bytes = bytes()
+    video_data: bytes = b""
 
 
 class BrowserArtifacts(BaseModel):
@@ -385,7 +392,7 @@ def _is_port_in_use(port: int) -> bool:
         try:
             s.bind(("localhost", port))
             return False
-        except socket.error:
+        except OSError:
             return True
 
 
@@ -405,7 +412,10 @@ def _is_chrome_running() -> bool:
 
 
 async def _create_headless_chromium(
-    playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
+    playwright: Playwright,
+    proxy_location: ProxyLocation | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
@@ -414,7 +424,9 @@ async def _create_headless_chromium(
         download_dir=download_dir,
     )
     cdp_port: int | None = _get_cdp_port(kwargs)
-    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
+    browser_args = BrowserContextFactory.build_browser_args(
+        proxy_location=proxy_location, cdp_port=cdp_port, extra_http_headers=extra_http_headers
+    )
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
@@ -428,7 +440,10 @@ async def _create_headless_chromium(
 
 
 async def _create_headful_chromium(
-    playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
+    playwright: Playwright,
+    proxy_location: ProxyLocation | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
@@ -437,7 +452,9 @@ async def _create_headful_chromium(
         download_dir=download_dir,
     )
     cdp_port: int | None = _get_cdp_port(kwargs)
-    browser_args = BrowserContextFactory.build_browser_args(proxy_location=proxy_location, cdp_port=cdp_port)
+    browser_args = BrowserContextFactory.build_browser_args(
+        proxy_location=proxy_location, cdp_port=cdp_port, extra_http_headers=extra_http_headers
+    )
     browser_args.update(
         {
             "user_data_dir": user_data_dir,
@@ -479,7 +496,10 @@ def is_valid_chromium_user_data_dir(directory: str) -> bool:
 
 
 async def _create_cdp_connection_browser(
-    playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict
+    playwright: Playwright,
+    proxy_location: ProxyLocation | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
@@ -528,7 +548,7 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
-    browser_args = BrowserContextFactory.build_browser_args()
+    browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
@@ -549,6 +569,7 @@ async def _create_cdp_connection_browser(
         browser_context = await browser.new_context(
             record_video_dir=browser_args["record_video_dir"],
             viewport=browser_args["viewport"],
+            extra_http_headers=browser_args["extra_http_headers"],
         )
     LOG.info(
         "Launched browser CDP connection",
@@ -607,7 +628,10 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        script_id: str | None = None,
         organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
@@ -621,7 +645,10 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -629,9 +656,13 @@ class BrowserState:
             LOG.info("browser context is created")
 
         if await self.get_working_page() is None:
-            page = await self.browser_context.new_page()
-            await self.set_working_page(page, 0)
-            await self._close_all_other_pages()
+            if browser_address and len(self.browser_context.pages) > 0:
+                page = self.browser_context.pages[0]
+                await self.set_working_page(page, 0)
+            else:
+                page = await self.browser_context.new_page()
+                await self.set_working_page(page, 0)
+                await self._close_all_other_pages()
 
             if url:
                 await self.navigate_to_url(page=page, url=url)
@@ -751,7 +782,10 @@ class BrowserState:
         proxy_location: ProxyLocation | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
+        script_id: str | None = None,
         organization_id: str | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -763,7 +797,10 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
         except Exception as e:
             error_message = str(e)
@@ -777,7 +814,10 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
         page = await self.__assert_page()
 
@@ -790,7 +830,10 @@ class BrowserState:
                 proxy_location=proxy_location,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
+                script_id=script_id,
                 organization_id=organization_id,
+                extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
             page = await self.__assert_page()
         return page
@@ -865,6 +908,30 @@ class BrowserState:
         except asyncio.TimeoutError:
             LOG.error("Timeout to close playwright, might leave the broswer opening forever")
 
-    async def take_screenshot(self, full_page: bool = False, file_path: str | None = None) -> bytes:
+    async def take_fullpage_screenshot(
+        self,
+        file_path: str | None = None,
+        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
+    ) -> bytes:
         page = await self.__assert_page()
-        return await SkyvernFrame.take_screenshot(page=page, full_page=full_page, file_path=file_path)
+        return await SkyvernFrame.take_scrolling_screenshot(
+            page=page,
+            file_path=file_path,
+            mode=ScreenshotMode.LITE,
+            use_playwright_fullpage=use_playwright_fullpage,
+        )
+
+    async def take_post_action_screenshot(
+        self,
+        scrolling_number: int,
+        file_path: str | None = None,
+        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
+    ) -> bytes:
+        page = await self.__assert_page()
+        return await SkyvernFrame.take_scrolling_screenshot(
+            page=page,
+            file_path=file_path,
+            mode=ScreenshotMode.LITE,
+            scrolling_number=scrolling_number,
+            use_playwright_fullpage=use_playwright_fullpage,
+        )

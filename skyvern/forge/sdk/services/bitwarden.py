@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import re
-import urllib.parse
 from enum import IntEnum, StrEnum
 from typing import Tuple
 
@@ -32,6 +31,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreditCardCredential,
     PasswordCredential,
 )
+from skyvern.forge.sdk.services.credentials import parse_totp_secret
 
 LOG = structlog.get_logger()
 BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
@@ -184,8 +184,8 @@ class BitwardenService:
 
     @staticmethod
     async def get_secret_value_from_url(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -245,30 +245,12 @@ class BitwardenService:
             >>> BitwardenService.extract_totp_secret("otpauth://totp/user@domain.com?secret=AAAAAABBBBBBB")
             "AAAAAABBBBBBB"
         """
-        if not totp_value:
-            return ""
-
-        # Handle TOTP URI format
-        if totp_value.startswith("otpauth://"):
-            try:
-                # Parse the URI to extract the secret
-                query = urllib.parse.urlparse(totp_value).query
-                params = dict(urllib.parse.parse_qsl(query))
-                return params.get("secret", "")
-            except Exception:
-                LOG.error(
-                    "Failed to parse TOTP URI",
-                    totp_value=totp_value,
-                    exc_info=True,
-                )
-                return ""
-
-        return totp_value
+        return parse_totp_secret(totp_value)
 
     @staticmethod
     async def _get_secret_value_from_url(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -400,8 +382,8 @@ class BitwardenService:
 
     @staticmethod
     async def get_sensitive_information_from_identity(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -456,8 +438,8 @@ class BitwardenService:
 
     @staticmethod
     async def _get_sensitive_information_from_identity(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         collection_id: str,
         identity_key: str,
@@ -534,15 +516,18 @@ class BitwardenService:
             await BitwardenService.logout()
 
     @staticmethod
-    async def login(client_id: str, client_secret: str) -> None:
+    async def login(client_id: str | None, client_secret: str | None) -> None:
         """
         Log in to the Bitwarden CLI.
         """
         env = {
-            "BW_CLIENTID": client_id,
-            "BW_CLIENTSECRET": client_secret,
+            "BW_CLIENTID": client_id or "",
+            "BW_CLIENTSECRET": client_secret or "",
         }
-        login_command = ["bw", "login", "--apikey"]
+        if settings.BITWARDEN_EMAIL and settings.BITWARDEN_MASTER_PASSWORD:
+            login_command = ["bw", "login", settings.BITWARDEN_EMAIL, settings.BITWARDEN_MASTER_PASSWORD]
+        else:
+            login_command = ["bw", "login", "--apikey"]
         login_result = await BitwardenService.run_command(login_command, env)
 
         # Validate the login result
@@ -606,8 +591,8 @@ class BitwardenService:
 
     @staticmethod
     async def _get_credit_card_data(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,
@@ -682,8 +667,8 @@ class BitwardenService:
 
     @staticmethod
     async def get_credit_card_data(
-        client_id: str,
-        client_secret: str,
+        client_id: str | None,
+        client_secret: str | None,
         master_password: str,
         bw_organization_id: str | None,
         bw_collection_ids: list[str] | None,

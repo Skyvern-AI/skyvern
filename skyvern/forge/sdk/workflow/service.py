@@ -1,16 +1,23 @@
 import asyncio
+import base64
 import json
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import structlog
+from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.core.script_generations.generate_script import generate_workflow_script as generate_python_workflow_script
+from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.exceptions import (
+    BlockNotFound,
+    BrowserSessionNotFound,
     FailedToSendWebhook,
+    InvalidCredentialId,
     MissingValueForParameter,
     SkyvernException,
     WorkflowNotFound,
@@ -27,6 +34,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -37,8 +45,6 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
-    BlockStatus,
-    BlockType,
     BlockTypeVar,
     CodeBlock,
     DownloadToS3Block,
@@ -47,6 +53,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     FileParserBlock,
     FileUploadBlock,
     ForLoopBlock,
+    HttpRequestBlock,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
@@ -58,6 +65,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
     ValidationBlock,
     WaitBlock,
+    get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -68,6 +76,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenSensitiveInformationParameter,
     ContextParameter,
     CredentialParameter,
+    OnePasswordCredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,
@@ -83,21 +92,49 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
-    WorkflowStatus,
 )
-from skyvern.forge.sdk.workflow.models.yaml import (
+from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate
+from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
+    BlockStatus,
+    BlockType,
     ForLoopBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.services import script_service
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
 
 
 class WorkflowService:
+    @staticmethod
+    def _collect_extracted_information(value: Any) -> list[Any]:
+        """Recursively collect extracted_information values from nested outputs."""
+        results: list[Any] = []
+        if isinstance(value, dict):
+            if "extracted_information" in value and value["extracted_information"] is not None:
+                extracted = value["extracted_information"]
+                if isinstance(extracted, list):
+                    results.extend(extracted)
+                else:
+                    results.append(extracted)
+            else:
+                for v in value.values():
+                    results.extend(WorkflowService._collect_extracted_information(v))
+        elif isinstance(value, list):
+            for item in value:
+                results.extend(WorkflowService._collect_extracted_information(item))
+        return results
+
+    async def _validate_credential_id(self, credential_id: str, organization: Organization) -> None:
+        credential = await app.DATABASE.get_credential(credential_id, organization_id=organization.organization_id)
+        if credential is None:
+            raise InvalidCredentialId(credential_id)
+
     async def setup_workflow_run(
         self,
         request_id: str | None,
@@ -149,7 +186,10 @@ class WorkflowService:
             organization_id=workflow.organization_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
         )
+        context: skyvern_context.SkyvernContext | None = skyvern_context.current()
+        current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
         skyvern_context.set(
             SkyvernContext(
                 organization_id=organization.organization_id,
@@ -157,7 +197,10 @@ class WorkflowService:
                 request_id=request_id,
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
+                run_id=current_run_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
                 max_steps_override=max_steps_override,
+                max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
             )
         )
 
@@ -167,12 +210,16 @@ class WorkflowService:
             for workflow_parameter in all_workflow_parameters:
                 if workflow_request.data and workflow_parameter.key in workflow_request.data:
                     request_body_value = workflow_request.data[workflow_parameter.key]
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                        await self._validate_credential_id(str(request_body_value), organization)
                     await self.create_workflow_run_parameter(
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_parameter=workflow_parameter,
                         value=request_body_value,
                     )
                 elif workflow_parameter.default_value is not None:
+                    if workflow_parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
+                        await self._validate_credential_id(str(workflow_parameter.default_value), organization)
                     await self.create_workflow_run_parameter(
                         workflow_run_id=workflow_run.workflow_run_id,
                         workflow_parameter=workflow_parameter,
@@ -199,13 +246,23 @@ class WorkflowService:
             )
             raise e
 
+        if workflow_request.browser_session_id:
+            await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                browser_session_id=workflow_request.browser_session_id,
+                runnable_type="workflow_run",
+                runnable_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+            )
+
         return workflow_run
 
+    @TraceManager.traced_async(ignore_inputs=["organization", "api_key"])
     async def execute_workflow(
         self,
         workflow_run_id: str,
         api_key: str,
         organization: Organization,
+        block_labels: list[str] | None = None,
         browser_session_id: str | None = None,
     ) -> WorkflowRun:
         """Execute a workflow."""
@@ -215,9 +272,12 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            block_labels=block_labels,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
+        skyvern_context.current()
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
@@ -239,6 +299,7 @@ class WorkflowService:
                     BitwardenLoginCredentialParameter,
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
+                    OnePasswordCredentialParameter,
                     CredentialParameter,
                 ),
             )
@@ -275,12 +336,54 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 api_key=api_key,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return workflow_run
 
+        # Check if there's a related workflow script that should be used instead
+        workflow_script = await self._get_workflow_script(workflow, workflow_run)
+        if workflow_script is not None:
+            LOG.info(
+                "Found related workflow script, running script instead of workflow",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                organization_id=organization_id,
+                workflow_script_id=workflow_script.script_id,
+            )
+            return await self._execute_workflow_script(
+                script_id=workflow_script.script_id,
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                organization=organization,
+            )
+
+        top_level_blocks = workflow.workflow_definition.blocks
+        all_blocks = get_all_blocks(top_level_blocks)
+
+        if block_labels and len(block_labels):
+            blocks: list[BlockTypeVar] = []
+            all_labels = {block.label: block for block in all_blocks}
+            for label in block_labels:
+                if label not in all_labels:
+                    raise BlockNotFound(block_label=label)
+
+                blocks.append(all_labels[label])
+
+            LOG.info(
+                "Executing workflow blocks via whitelist",
+                workflow_run_id=workflow_run.workflow_run_id,
+                block_cnt=len(blocks),
+                block_labels=block_labels,
+            )
+
+        else:
+            blocks = top_level_blocks
+
+        if not blocks:
+            raise SkyvernException(f"No blocks found for the given block labels: {block_labels}")
+
         # Execute workflow blocks
-        blocks = workflow.workflow_definition.blocks
         blocks_cnt = len(blocks)
         block_result = None
         for block_idx, block in enumerate(blocks):
@@ -303,7 +406,7 @@ class WorkflowService:
                             workflow_run=workflow_run,
                             api_key=api_key,
                             need_call_webhook=True,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -321,7 +424,7 @@ class WorkflowService:
                             workflow_run=workflow_run,
                             api_key=api_key,
                             need_call_webhook=True,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -363,7 +466,7 @@ class WorkflowService:
                         workflow_run=workflow_run,
                         api_key=api_key,
                         need_call_webhook=False,
-                        close_browser_on_completion=browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return workflow_run
@@ -388,7 +491,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -424,7 +527,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -460,7 +563,7 @@ class WorkflowService:
                             workflow=workflow,
                             workflow_run=workflow_run,
                             api_key=api_key,
-                            close_browser_on_completion=browser_session_id is None,
+                            close_browser_on_completion=close_browser_on_completion,
                             browser_session_id=browser_session_id,
                         )
                         return workflow_run
@@ -498,7 +601,7 @@ class WorkflowService:
                     workflow_run=workflow_run,
                     api_key=api_key,
                     browser_session_id=browser_session_id,
-                    close_browser_on_completion=browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                 )
                 return workflow_run
 
@@ -514,6 +617,10 @@ class WorkflowService:
                 WorkflowRunStatus.timed_out,
             ):
                 workflow_run = await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+                # generate script for workflow if the workflow.generate_script is True AND there's no script cached for the workflow
+                # only generate script if the workflow run is completed
+                if workflow.generate_script:
+                    await self.generate_script_for_workflow(workflow=workflow, workflow_run=workflow_run)
             else:
                 LOG.info(
                     "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
@@ -525,7 +632,7 @@ class WorkflowService:
             workflow_run=workflow_run,
             api_key=api_key,
             browser_session_id=browser_session_id,
-            close_browser_on_completion=browser_session_id is None,
+            close_browser_on_completion=close_browser_on_completion,
         )
 
         # Track workflow run duration when completed
@@ -548,6 +655,7 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition,
         description: str | None = None,
         proxy_location: ProxyLocation | None = None,
+        max_screenshot_scrolling_times: int | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -557,6 +665,9 @@ class WorkflowService:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
+        extra_http_headers: dict[str, str] | None = None,
+        generate_script: bool = False,
+        cache_key: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -565,6 +676,7 @@ class WorkflowService:
             description=description,
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
@@ -573,6 +685,9 @@ class WorkflowService:
             version=version,
             is_saved_task=is_saved_task,
             status=status,
+            extra_http_headers=extra_http_headers,
+            generate_script=generate_script,
+            cache_key=cache_key,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -729,15 +844,28 @@ class WorkflowService:
         organization_id: str,
         parent_workflow_run_id: str | None = None,
     ) -> WorkflowRun:
+        # validate the browser session id
+        if workflow_request.browser_session_id:
+            browser_session = await app.DATABASE.get_persistent_browser_session(
+                session_id=workflow_request.browser_session_id,
+                organization_id=organization_id,
+            )
+            if not browser_session:
+                raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
+
         return await app.DATABASE.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
             organization_id=organization_id,
+            browser_session_id=workflow_request.browser_session_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
             totp_identifier=workflow_request.totp_identifier,
             parent_workflow_run_id=parent_workflow_run_id,
+            max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+            extra_http_headers=workflow_request.extra_http_headers,
+            browser_address=workflow_request.browser_address,
         )
 
     async def mark_workflow_run_as_completed(self, workflow_run_id: str) -> WorkflowRun:
@@ -880,6 +1008,22 @@ class WorkflowService:
             workflow_id=workflow_id,
             key=key,
             credential_id=credential_id,
+            description=description,
+        )
+
+    async def create_onepassword_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        vault_id: str,
+        item_id: str,
+        description: str | None = None,
+    ) -> OnePasswordCredentialParameter:
+        return await app.DATABASE.create_onepassword_credential_parameter(
+            workflow_id=workflow_id,
+            key=key,
+            vault_id=vault_id,
+            item_id=item_id,
             description=description,
         )
 
@@ -1027,6 +1171,11 @@ class WorkflowService:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
 
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+
+        task_v2 = await app.DATABASE.get_task_v2_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
         screenshot_artifacts = []
         screenshot_urls: list[str] | None = None
@@ -1056,15 +1205,22 @@ class WorkflowService:
         if recording_artifact:
             recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
-        downloaded_files: list[FileInfo] | None = None
+        downloaded_files: list[FileInfo] = []
         downloaded_file_urls: list[str] | None = None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                context = skyvern_context.current()
                 downloaded_files = await app.STORAGE.get_downloaded_files(
                     organization_id=workflow_run.organization_id,
-                    task_id=None,
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
                 )
+                if task_v2:
+                    task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
+                        organization_id=workflow_run.organization_id,
+                        run_id=task_v2.observer_cruise_id,
+                    )
+                    if task_v2_downloaded_files:
+                        downloaded_files.extend(task_v2_downloaded_files)
                 if downloaded_files:
                     downloaded_file_urls = [file_info.url for file_info in downloaded_files]
         except asyncio.TimeoutError:
@@ -1091,14 +1247,10 @@ class WorkflowService:
         EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
-            extracted_information = {
-                output_parameter.key: output.value[EXTRACTED_INFORMATION_KEY]
-                for output_parameter, output in output_parameter_tuples
-                if output.value is not None
-                and isinstance(output.value, dict)
-                and EXTRACTED_INFORMATION_KEY in output.value
-                and output.value[EXTRACTED_INFORMATION_KEY] is not None
-            }
+            extracted_information: list[Any] = []
+            for _, output in output_parameter_tuples:
+                if output.value is not None:
+                    extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
         total_steps = None
@@ -1123,8 +1275,13 @@ class WorkflowService:
             failure_reason=workflow_run.failure_reason,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
+            webhook_failure_reason=workflow_run.webhook_failure_reason,
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
+            extra_http_headers=workflow_run.extra_http_headers,
+            queued_at=workflow_run.queued_at,
+            started_at=workflow_run.started_at,
+            finished_at=workflow_run.finished_at,
             created_at=workflow_run.created_at,
             modified_at=workflow_run.modified_at,
             parameters=parameters_with_value,
@@ -1136,6 +1293,10 @@ class WorkflowService:
             total_steps=total_steps,
             total_cost=total_cost,
             workflow_title=workflow.title,
+            browser_session_id=workflow_run.browser_session_id,
+            max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+            task_v2=task_v2,
+            browser_address=workflow_run.browser_address,
         )
 
     async def clean_up_workflow(
@@ -1150,10 +1311,13 @@ class WorkflowService:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
         all_workflow_task_ids = [task.task_id for task in tasks]
+        close_browser_on_completion = (
+            close_browser_on_completion and browser_session_id is None and not workflow_run.browser_address
+        )
         browser_state = await app.BROWSER_MANAGER.cleanup_for_workflow_run(
             workflow_run.workflow_run_id,
             all_workflow_task_ids,
-            close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+            close_browser_on_completion=close_browser_on_completion,
             browser_session_id=browser_session_id,
             organization_id=workflow_run.organization_id,
         )
@@ -1173,8 +1337,10 @@ class WorkflowService:
 
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                context = skyvern_context.current()
                 await app.STORAGE.save_downloaded_files(
-                    workflow_run.organization_id, task_id=None, workflow_run_id=workflow_run.workflow_run_id
+                    organization_id=workflow_run.organization_id,
+                    run_id=context.run_id if context and context.run_id else workflow_run.workflow_run_id,
                 )
         except asyncio.TimeoutError:
             LOG.warning(
@@ -1281,6 +1447,10 @@ class WorkflowService:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
+                await app.DATABASE.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_failure_reason="",
+                )
             else:
                 LOG.info(
                     "Webhook failed",
@@ -1290,6 +1460,10 @@ class WorkflowService:
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
+                )
+                await app.DATABASE.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
                 )
         except Exception as e:
             raise FailedToSendWebhook(
@@ -1409,10 +1583,14 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+                    extra_http_headers=request.extra_http_headers,
                     workflow_permanent_id=workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    generate_script=request.generate_script,
+                    cache_key=request.cache_key,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1426,8 +1604,12 @@ class WorkflowService:
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
                     model=request.model,
+                    max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+                    extra_http_headers=request.extra_http_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
+                    generate_script=request.generate_script,
+                    cache_key=request.cache_key,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id
@@ -1486,6 +1668,14 @@ class WorkflowService:
                         key=parameter.key,
                         description=parameter.description,
                         credential_id=parameter.credential_id,
+                    )
+                elif parameter.parameter_type == ParameterType.ONEPASSWORD:
+                    parameters[parameter.key] = await self.create_onepassword_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        vault_id=parameter.vault_id,
+                        item_id=parameter.item_id,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:
@@ -1763,6 +1953,9 @@ class WorkflowService:
                 aws_access_key_id=block_yaml.aws_access_key_id,
                 aws_secret_access_key=block_yaml.aws_secret_access_key,
                 region_name=block_yaml.region_name,
+                azure_storage_account_name=block_yaml.azure_storage_account_name,
+                azure_storage_account_key=block_yaml.azure_storage_account_key,
+                azure_blob_container_name=block_yaml.azure_blob_container_name,
                 path=block_yaml.path,
                 continue_on_failure=block_yaml.continue_on_failure,
             )
@@ -1787,7 +1980,9 @@ class WorkflowService:
                 output_parameter=output_parameter,
                 file_url=block_yaml.file_url,
                 file_type=block_yaml.file_type,
+                json_schema=block_yaml.json_schema,
                 continue_on_failure=block_yaml.continue_on_failure,
+                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.PDF_PARSER:
             return PDFParserBlock(
@@ -1984,6 +2179,24 @@ class WorkflowService:
                 model=block_yaml.model,
                 output_parameter=output_parameter,
             )
+        elif block_yaml.block_type == BlockType.HTTP_REQUEST:
+            http_request_block_parameters = (
+                [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
+                if block_yaml.parameter_keys
+                else []
+            )
+            return HttpRequestBlock(
+                label=block_yaml.label,
+                method=block_yaml.method,
+                url=block_yaml.url,
+                headers=block_yaml.headers,
+                body=block_yaml.body,
+                timeout=block_yaml.timeout,
+                follow_redirects=block_yaml.follow_redirects,
+                parameters=http_request_block_parameters,
+                output_parameter=output_parameter,
+                continue_on_failure=block_yaml.continue_on_failure,
+            )
         elif block_yaml.block_type == BlockType.GOTO_URL:
             return UrlBlock(
                 label=block_yaml.label,
@@ -1999,6 +2212,8 @@ class WorkflowService:
         organization: Organization,
         title: str,
         proxy_location: ProxyLocation | None = None,
+        max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
         """
@@ -2013,6 +2228,8 @@ class WorkflowService:
             ),
             proxy_location=proxy_location,
             status=status,
+            max_screenshot_scrolls=max_screenshot_scrolling_times,
+            extra_http_headers=extra_http_headers,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
@@ -2071,3 +2288,203 @@ class WorkflowService:
                 break
 
         return result
+
+    async def _get_workflow_script(self, workflow: Workflow, workflow_run: WorkflowRun) -> Script | None:
+        """
+        Check if there's a related workflow script that should be used instead of running the workflow.
+        Returns True if a script should be used, False otherwise.
+        """
+        if not workflow.generate_script:
+            return None
+        # Only check for scripts if the workflow has a cache_key
+        cache_key = workflow.cache_key or ""
+
+        try:
+            # Render the cache_key_value from workflow run parameters (same logic as generate_script_for_workflow)
+            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                workflow_run_id=workflow_run.workflow_run_id
+            )
+            parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+
+            jinja_sandbox_env = SandboxedEnvironment()
+            rendered_cache_key_value = jinja_sandbox_env.from_string(cache_key).render(parameters)
+
+            # Check if there are existing cached scripts for this workflow + cache_key_value
+            existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+                organization_id=workflow.organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                cache_key_value=rendered_cache_key_value,
+            )
+
+            if existing_scripts:
+                LOG.info(
+                    "Found cached script for workflow",
+                    workflow_id=workflow.workflow_id,
+                    cache_key_value=rendered_cache_key_value,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    script_count=len(existing_scripts),
+                )
+                return existing_scripts[0]
+
+            return None
+
+        except Exception as e:
+            LOG.warning(
+                "Failed to check for workflow script, proceeding with normal workflow execution",
+                workflow_id=workflow.workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                error=str(e),
+                exc_info=True,
+            )
+            return None
+
+    async def _execute_workflow_script(
+        self, script_id: str, workflow: Workflow, workflow_run: WorkflowRun, api_key: str, organization: Organization
+    ) -> WorkflowRun:
+        """
+        Execute the related workflow script instead of running the workflow blocks.
+        """
+        LOG.info("Start to execute workflow script", workflow_run_id=workflow_run.workflow_run_id)
+
+        try:
+            # Render the cache_key_value to find the right script
+            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                workflow_run_id=workflow_run.workflow_run_id
+            )
+            parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+
+            # Execute the script using script_service
+            await script_service.execute_script(
+                script_id=script_id,
+                organization_id=organization.organization_id,
+                parameters=parameters,
+                workflow_run_id=workflow_run.workflow_run_id,
+                background_tasks=None,  # Execute synchronously
+            )
+
+            # Mark workflow run as completed
+            workflow_run = await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
+
+            LOG.info(
+                "Successfully executed workflow script",
+                workflow_run_id=workflow_run.workflow_run_id,
+                script_id=script_id,
+                organization_id=organization.organization_id,
+            )
+
+            return workflow_run
+
+        except Exception as e:
+            LOG.error(
+                "Failed to execute workflow script, marking workflow run as failed",
+                workflow_run_id=workflow_run.workflow_run_id,
+                error=str(e),
+                exc_info=True,
+            )
+
+            # Mark workflow run as failed
+            failure_reason = f"Failed to execute workflow script: {str(e)}"
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+            )
+
+            return workflow_run
+
+    async def generate_script_for_workflow(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> None:
+        cache_key = workflow.cache_key
+        rendered_cache_key_value = ""
+        # 1) Build cache_key_value from workflow run parameters via jinja
+        if cache_key:
+            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                workflow_run_id=workflow_run.workflow_run_id
+            )
+            parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+            jinja_sandbox_env = SandboxedEnvironment()
+            try:
+                rendered_cache_key_value = jinja_sandbox_env.from_string(cache_key).render(parameters)
+            except Exception:
+                LOG.warning("Failed to render cache key; skip script generation", exc_info=True)
+                return
+
+        # 2) Check existing cached scripts for this workflow + cache_key_value
+        existing_scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
+            organization_id=workflow.organization_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            cache_key_value=rendered_cache_key_value,
+        )
+        if existing_scripts:
+            LOG.info(
+                "Found cached script for workflow",
+                workflow_id=workflow.workflow_id,
+                cache_key_value=rendered_cache_key_value,
+                workflow_run_id=workflow_run.workflow_run_id,
+            )
+            return
+
+        created_script = await app.DATABASE.create_script(
+            organization_id=workflow.organization_id,
+            run_id=workflow_run.workflow_run_id,
+        )
+
+        # 3) Generate script code from workflow run
+        try:
+            LOG.info(
+                "Generating script for workflow",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                workflow_name=workflow.title,
+                cache_key_value=rendered_cache_key_value,
+            )
+            codegen_input = await transform_workflow_run_to_code_gen_input(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow.organization_id,
+            )
+            python_src = await generate_python_workflow_script(
+                file_name=codegen_input.file_name,
+                workflow_run_request=codegen_input.workflow_run,
+                workflow=codegen_input.workflow,
+                blocks=codegen_input.workflow_blocks,
+                actions_by_task=codegen_input.actions_by_task,
+                organization_id=workflow.organization_id,
+                script_id=created_script.script_id,
+                script_revision_id=created_script.script_revision_id,
+            )
+        except Exception:
+            LOG.error("Failed to generate workflow script source", exc_info=True)
+            return
+
+        # 4) Persist script and files, then record mapping
+        content_bytes = python_src.encode("utf-8")
+        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+        files = [
+            ScriptFileCreate(
+                path="main.py",
+                content=content_b64,
+                encoding=FileEncoding.BASE64,
+                mime_type="text/x-python",
+            )
+        ]
+
+        # Upload script file(s) as artifacts and create rows
+        await script_service.build_file_tree(
+            files=files,
+            organization_id=workflow.organization_id,
+            script_id=created_script.script_id,
+            script_version=created_script.version,
+            script_revision_id=created_script.script_revision_id,
+        )
+
+        # Record the workflow->script mapping for cache lookup
+        await app.DATABASE.create_workflow_script(
+            organization_id=workflow.organization_id,
+            script_id=created_script.script_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            cache_key=cache_key or "",
+            cache_key_value=rendered_cache_key_value,
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )

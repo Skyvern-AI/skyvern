@@ -2,7 +2,7 @@ instances:
   - url: https://skyvern.docs.buildwithfern.com
     custom-domain: https://docs.skyvern.com
 title: Skyvern
-favicon: images/skyvern_favicon.png
+favicon: images/skyvern_favicon_small.png
 logo:
   light: images/skyvern_logo_blackbg.png
   dark: images/skyvern_logo.png
@@ -36,7 +36,7 @@ tabs:
   home:
     display-name: Home
     icon: home
-  api: 
+  api:
     display-name: API Reference
     icon: code
   blog:
@@ -44,7 +44,7 @@ tabs:
     icon: newspaper
     href: https://blog.skyvern.com
   community:
-    display-name: Community 
+    display-name: Community
     icon: fa-brands fa-discord
     href: https://discord.gg/m6FmQV7nU3
   github:
@@ -62,100 +62,146 @@ tabs:
 navigation:
   - tab: home
     layout:
-    - section: Getting Started
-      contents:
-        - page: Introduction
-          path: introduction.mdx
-        - page: Quickstart
-          path: getting-started/quickstart.mdx
-        - page: Skyvern In Action
-          path: getting-started/skyvern-in-action.mdx
-        - page: Task Prompting Guide
-          path: getting-started/prompting-guide.mdx
-    - section: Tasks
-      contents:
-        - page: Run Tasks
-          path: running-tasks/run-tasks.mdx
-        - page: Visualizing Results
-          path: running-tasks/visualizing-results.mdx
-        - page: Cancel Task Runs
-          path: running-tasks/cancel-runs.mdx
-        - page: Webhooks FAQ
-          path: running-tasks/webhooks-faq.mdx
-        - page: Advanced Settings for tasks
-          hidden: true
-          path: running-tasks/advanced-features.mdx
-        - page: Legacy Task APIs
-          hidden: true
-          path: running-tasks/api-spec.mdx
-    - section: Workflows
-      contents:
-        - page: Manage Workflows
-          path: workflows/manage-workflows.mdx
-        - page: Workflow Blocks
-          path: workflows/workflow-blocks-details.mdx
-        - page: Workflow Parameters
-          path: workflows/workflow-parameters.mdx
-        - page: Run Workflows
-          path: workflows/run-workflows.mdx
-        - page: Consistency and Reliability
-          path: workflows/consistent-workflows.mdx
-        - page: Running Workflows
-          path: workflows/running-workflows.mdx
-          hidden: true
-        - page: Introduction
-          path: workflows/introduction.mdx
-          hidden: true
-        - page: Workflow Blocks
-          path: workflows/workflow-blocks.mdx
-          hidden: true
-        - page: Creating Workflows
-          path: workflows/creating-workflows.mdx
-          hidden: true
-        - page: Getting Existing Workflows
-          path: workflows/getting-workflows.mdx
-          hidden: true
-        - page: What the heck is a parameter?
-          path: workflows/what-is-a-parameter.mdx
-          hidden: true
-    - section: Credentials
-      contents:
-        - page: Overview
-          path: credentials/introduction.mdx
-        - page: Password Management
-          path: credentials/passwords.mdx
-        - page: Credit Card Management
-          path: credentials/credit-cards.mdx
-        - page: 2FA Support (TOTP)
-          path: credentials/totp.mdx
-        - page: Bitwarden
-          path: credentials/bitwarden.mdx
-    - section: Browser Sessions (Beta)
-      contents:
-        - page: Introduction
-          path: browser-sessions/introduction.mdx
-    - section: Integrations
-      contents:
-        - page: Skyvern MCP
-          path: integrations/mcp.mdx
-        - page: Zapier
-          path: integrations/zapier.mdx
-        - page: Make
-          path: integrations/make.com.mdx
-        - page: N8N
-          path: integrations/n8n.mdx
-        - page: Workato
-          path: integrations/workato.mdx
+      - section: Getting Started
+        contents:
+          - page: Introduction
+            path: introduction.mdx
+          - page: Quickstart
+            path: getting-started/quickstart.mdx
+          - page: Skyvern In Action
+            path: getting-started/skyvern-in-action.mdx
+          - page: Prompting and Troubleshooting Guide
+            path: getting-started/prompting-guide.mdx
+      - section: Tasks
+        contents:
+          - page: Run Tasks
+            path: running-tasks/run-tasks.mdx
+          - page: Visualizing Results
+            path: running-tasks/visualizing-results.mdx
+          - page: Cancel Task Runs
+            path: running-tasks/cancel-runs.mdx
+          - page: Webhooks FAQ
+            path: running-tasks/webhooks-faq.mdx
+          - page: Advanced Settings for tasks
+            hidden: true
+            path: running-tasks/advanced-features.mdx
+          - page: Legacy Task APIs
+            hidden: true
+            path: running-tasks/api-spec.mdx
+      - section: Workflows
+        contents:
+          - page: Manage Workflows
+            path: workflows/manage-workflows.mdx
+          - page: Workflow Blocks
+            path: workflows/workflow-blocks-details.mdx
+          - page: Workflow Parameters
+            path: workflows/workflow-parameters.mdx
+          - page: Run Workflows
+            path: workflows/run-workflows.mdx
+          - page: Consistency and Reliability
+            path: workflows/consistent-workflows.mdx
+          - page: Running Workflows
+            path: workflows/running-workflows.mdx
+            hidden: true
+          - page: Introduction
+            path: workflows/introduction.mdx
+            hidden: true
+          - page: Workflow Blocks
+            path: workflows/workflow-blocks.mdx
+            hidden: true
+          - page: Creating Workflows
+            path: workflows/creating-workflows.mdx
+            hidden: true
+          - page: Getting Existing Workflows
+            path: workflows/getting-workflows.mdx
+            hidden: true
+          - page: What the heck is a parameter?
+            path: workflows/what-is-a-parameter.mdx
+            hidden: true
+      - section: Credentials
+        contents:
+          - page: Overview
+            path: credentials/introduction.mdx
+          - page: Password Management
+            path: credentials/passwords.mdx
+          - page: Credit Card Management
+            path: credentials/credit-cards.mdx
+          - page: 2FA Support (TOTP)
+            path: credentials/totp.mdx
+          - page: Bitwarden
+            path: credentials/bitwarden.mdx
+      - section: Browser Sessions (Beta)
+        contents:
+          - page: Introduction
+            path: browser-sessions/introduction.mdx
+      - section: Observability
+        contents:
+          - page: Overview
+            path: observability/overview.mdx
+      - section: Integrations
+        contents:
+          - page: Skyvern MCP
+            path: integrations/mcp.mdx
+          - page: Zapier
+            path: integrations/zapier.mdx
+          - page: Make
+            path: integrations/make.com.mdx
+          - page: N8N
+            path: integrations/n8n.mdx
+          - page: Workato
+            path: integrations/workato.mdx
   - tab: api
     layout:
       - api: API Reference
         snippets:
           python: skyvern
+        layout:
+          - section: Agent
+            contents:
+              - POST /v1/run/tasks
+              - GET /v1/runs/{run_id}
+              - POST /v1/runs/{run_id}/cancel
+              - POST /v1/runs/{run_id}/retry_webhook
+              - POST /v1/run/tasks/login
+          - section: Workflows
+            contents:
+              - POST /v1/run/workflows
+              - GET /v1/runs/{run_id}
+              - POST /v1/runs/{run_id}/cancel
+              - POST /v1/runs/{run_id}/retry_webhook
+              - GET /v1/workflows
+              - POST /v1/workflows
+              - POST /v1/workflows/{workflow_id}
+              - POST /v1/workflows/{workflow_id}/delete
+          - section: Browser Sessions
+            contents:
+              - POST /v1/browser_sessions
+              - GET /v1/browser_sessions/{browser_session_id}
+              - POST /v1/browser_sessions/{browser_session_id}/close
+              - GET /v1/browser_sessions
+          - section: Credentials
+            contents:
+              - POST /v1/credentials
+              - GET /v1/credentials/{credential_id}
+              - POST /v1/credentials/{credential_id}/delete
+              - GET /v1/credentials
+              - POST /v1/credentials/totp
+          - section: Artifacts
+            contents:
+              - GET /v1/artifacts/{artifact_id}
+              - GET /v1/runs/{run_id}/artifacts
+          - section: Scripts
+            hidden: true
+            contents:
+              - POST /v1/scripts
+              - POST /v1/scripts/{script_id}/run
+              - POST /v1/scripts/{script_id}/deploy
+              - GET /v1/scripts/{script_id}
+              - GET /v1/scripts
   - tab: blog
   - tab: community
   - tab: github
   - tab: cloud
   - tab: demo
-
-experimental: 
+experimental:
   openapi-parser-v3: true

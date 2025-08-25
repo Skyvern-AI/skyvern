@@ -7,7 +7,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.task_v2 import Thought
-from skyvern.forge.sdk.workflow.models.block import BlockType
+from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.actions import Action
 
 
@@ -15,7 +16,7 @@ class WorkflowRunBlock(BaseModel):
     workflow_run_block_id: str
     block_workflow_run_id: str | None = None
     workflow_run_id: str
-    organization_id: str | None = None
+    organization_id: str
     description: str | None = None
     parent_workflow_run_block_id: str | None = None
     block_type: BlockType
@@ -24,6 +25,7 @@ class WorkflowRunBlock(BaseModel):
     output: dict | list | str | None = None
     continue_on_failure: bool = False
     failure_reason: str | None = None
+    engine: RunEngine | None = None
     task_id: str | None = None
     url: str | None = None
     navigation_goal: str | None = None
@@ -36,6 +38,7 @@ class WorkflowRunBlock(BaseModel):
     created_at: datetime
     modified_at: datetime
     include_action_history_in_verification: bool | None = False
+    duration: float | None = None
 
     # for loop block
     loop_values: list[Any] | None = None

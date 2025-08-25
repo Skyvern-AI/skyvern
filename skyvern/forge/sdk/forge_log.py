@@ -31,6 +31,8 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
             event_dict["organization_name"] = context.organization_name
         if context.task_id:
             event_dict["task_id"] = context.task_id
+        if context.run_id:
+            event_dict["run_id"] = context.run_id
         if context.workflow_id:
             event_dict["workflow_id"] = context.workflow_id
         if context.workflow_run_id:
@@ -79,12 +81,43 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
     return event_dict
 
 
+def add_filename_section(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """
+    Add a fixed-width, bracketed filename:lineno section after the log level for console logs.
+    """
+    filename = event_dict.get("filename", "")
+    lineno = event_dict.get("lineno", "")
+    padded = f"[{filename:<30}:{lineno:<4}]" if filename else "[unknown        ]"
+    event_dict["file"] = padded
+    event_dict.pop("filename", None)
+    event_dict.pop("lineno", None)
+    return event_dict
+
+
+class CustomConsoleRenderer(structlog.dev.ConsoleRenderer):
+    """
+    Show the bracketed filename:lineno section after the log level for console logs, and
+    colorize it.
+    """
+
+    def __call__(self, logger: logging.Logger, name: str, event_dict: EventDict) -> str:
+        file_section = event_dict.pop("file", "")
+        file_section_colored = f"\x1b[90m{file_section}\x1b[0m" if file_section else ""
+        rendered = super().__call__(logger, name, event_dict)
+        first_bracket = rendered.find("]")
+
+        if first_bracket != -1:
+            return rendered[: first_bracket + 1] + f" {file_section_colored}" + rendered[first_bracket + 1 :]
+        else:
+            return f"{file_section_colored} {rendered}"
+
+
 def setup_logger() -> None:
     """
     Setup the logger with the specified format
     """
     # logging.config.dictConfig(logging_config)
-    renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else structlog.dev.ConsoleRenderer()
+    renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else CustomConsoleRenderer()
     additional_processors = (
         [
             structlog.processors.EventRenamer("msg"),
@@ -100,7 +133,15 @@ def setup_logger() -> None:
             ),
         ]
         if settings.JSON_LOGGING
-        else []
+        else [
+            structlog.processors.CallsiteParameterAdder(
+                {
+                    structlog.processors.CallsiteParameter.FILENAME,
+                    structlog.processors.CallsiteParameter.LINENO,
+                }
+            ),
+            add_filename_section,
+        ]
     )
     LOG_LEVEL_VAL = LOGGING_LEVEL_MAP.get(settings.LOG_LEVEL, logging.INFO)
 

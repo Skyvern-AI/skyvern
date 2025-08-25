@@ -56,11 +56,6 @@ class TaskNotFound(SkyvernHTTPException):
         super().__init__(f"Task {task_id} not found", status_code=status.HTTP_404_NOT_FOUND)
 
 
-class ScriptNotFound(SkyvernException):
-    def __init__(self, script_name: str | None = None):
-        super().__init__(f"Script {script_name} not found. Has the script been registered?")
-
-
 class MissingElement(SkyvernException):
     def __init__(self, selector: str | None = None, element_id: str | None = None):
         super().__init__(
@@ -128,6 +123,11 @@ class UnknownBlockType(SkyvernException):
         super().__init__(f"Unknown block type {block_type}")
 
 
+class BlockNotFound(SkyvernException):
+    def __init__(self, block_label: str) -> None:
+        super().__init__(f"Block {block_label} not found")
+
+
 class WorkflowNotFound(SkyvernHTTPException):
     def __init__(
         self,
@@ -159,6 +159,14 @@ class MissingValueForParameter(SkyvernHTTPException):
     def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str) -> None:
         super().__init__(
             f"Missing value for parameter {parameter_key} in workflow run {workflow_run_id} of workflow {workflow_id}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class InvalidCredentialId(SkyvernHTTPException):
+    def __init__(self, credential_id: str) -> None:
+        super().__init__(
+            f"Invalid credential ID: {credential_id}. Failed to resolve to a valid credential.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -251,8 +259,14 @@ class EmptyScrapePage(SkyvernException):
 
 
 class ScrapingFailed(SkyvernException):
-    def __init__(self) -> None:
+    def __init__(self, *, reason: str | None = None) -> None:
+        self.reason = reason
         super().__init__("Scraping failed.")
+
+
+class ScrapingFailedBlankPage(ScrapingFailed):
+    def __init__(self) -> None:
+        super().__init__(reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.")
 
 
 class WorkflowRunContextNotInitialized(SkyvernException):
@@ -453,6 +467,11 @@ class FailToSelectByLabel(SkyvernException):
 class FailToSelectByIndex(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(f"Failed to select by index. element_id={element_id}")
+
+
+class EmptyDomOrHtmlTree(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Empty dom or html tree")
 
 
 class OptionIndexOutOfBound(SkyvernException):
@@ -687,3 +706,51 @@ class SkyvernContextWindowExceededError(SkyvernException):
 class LLMCallerNotFoundError(SkyvernException):
     def __init__(self, uid: str) -> None:
         super().__init__(f"LLM caller for {uid} is not found")
+
+
+class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is already occupied")
+
+
+class BrowserSessionNotRenewable(SkyvernException):
+    def __init__(self, reason: str, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")
+
+
+class MissingBrowserAddressError(SkyvernException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} does not have an address.")
+
+
+class BrowserSessionNotFound(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} does not exist or is not live.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class APIKeyNotFound(SkyvernHTTPException):
+    def __init__(self, organization_id: str) -> None:
+        super().__init__(f"No valid API key token found for organization {organization_id}")
+
+
+class ElementOutOfCurrentViewport(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Element {element_id} is out of current viewport")
+
+
+class ScriptNotFound(SkyvernHTTPException):
+    def __init__(self, script_id: str) -> None:
+        super().__init__(f"Script {script_id} not found")
+
+
+class NoTOTPSecretFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No TOTP secret found")
+
+
+class NoElementFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No element found.")

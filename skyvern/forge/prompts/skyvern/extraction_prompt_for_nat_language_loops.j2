@@ -1,0 +1,12 @@
+Analyze the current webpage and extract information based on this request: {{ natural_language_prompt }}
+
+You need to identify what values should be iterated over (loop_values). Each value should be the primary data that will be used in each loop iteration.
+
+For example:
+- If the request is "go to each product page", extract product URLs as strings
+- If the request is "extract the authors of the top 4 posts", extract author names as strings
+- If the request is "summarize the text of each article", extract article URLs as strings
+- If the request is "download each file", extract file URLs as strings
+- If the request is "check if these articles are AI-related", extract article titles as strings
+
+Return the results in the specified schema format with loop_values containing an array of strings, where each string is the primary value to be used in the loop iteration. 

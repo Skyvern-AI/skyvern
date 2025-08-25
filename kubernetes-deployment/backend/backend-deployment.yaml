@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skyvern-backend
+  namespace: skyvern
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: skyvern-backend
+  template:
+    metadata:
+      labels:
+        app: skyvern-backend
+    spec:
+      containers:
+        - name: skyvern-backend
+          image: public.ecr.aws/skyvern/skyvern:latest
+          ports:
+            - containerPort: 8000
+            - containerPort: 9222
+          envFrom:
+            - secretRef:
+                name: skyvern-backend-env
+          volumeMounts:
+            - name: artifacts
+              mountPath: /data/artifacts
+            - name: videos
+              mountPath: /data/videos
+            - name: har
+              mountPath: /data/har
+            - name: log
+              mountPath: /data/log
+            - name: streamlit
+              mountPath: /app/.streamlit
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/app/.streamlit/secrets.toml"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        - name: artifacts
+          hostPath:
+            path: /data/artifacts
+            type: DirectoryOrCreate
+        - name: videos
+          hostPath:
+            path: /data/videos
+            type: DirectoryOrCreate
+        - name: har
+          hostPath:
+            path: /data/har
+            type: DirectoryOrCreate
+        - name: log
+          hostPath:
+            path: /data/log
+            type: DirectoryOrCreate
+        - name: streamlit
+          hostPath:
+            path: /app/.streamlit
+            type: DirectoryOrCreate

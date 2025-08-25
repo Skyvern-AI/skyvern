@@ -20,6 +20,7 @@ type Props = {
   value: string;
   onChange?: (value: string) => void;
   language?: "python" | "json" | "html";
+  lineWrap?: boolean;
   readOnly?: boolean;
   minHeight?: string;
   maxHeight?: string;
@@ -33,13 +34,14 @@ function CodeEditor({
   minHeight,
   maxHeight,
   language,
+  lineWrap = true,
   className,
   readOnly = false,
   fontSize = 12,
 }: Props) {
   const extensions = language
-    ? [getLanguageExtension(language), EditorView.lineWrapping]
-    : [EditorView.lineWrapping];
+    ? [getLanguageExtension(language), lineWrap ? EditorView.lineWrapping : []]
+    : [lineWrap ? EditorView.lineWrapping : []];
 
   return (
     <CodeMirror

@@ -25,6 +25,7 @@ Available geotargeting options:
 - RESIDENTIAL_NZ: New Zealand
 - RESIDENTIAL_ZA: South Africa
 - RESIDENTIAL_AR: Argentina
+- RESIDENTIAL_AU: Australia
 - RESIDENTIAL_ISP: ISP proxy
 - US-CA: California
 - US-NY: New York
@@ -47,7 +48,7 @@ Maximum number of steps the task can take. Task will fail if it exceeds this num
 """
 
 WEBHOOK_URL_DOC_STRING = """
-URL to send task status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
+After a run is finished, send an update to this URL. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
 """
 
 TOTP_IDENTIFIER_DOC_STRING = """

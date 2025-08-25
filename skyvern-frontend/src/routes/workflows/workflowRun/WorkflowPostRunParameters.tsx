@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
 import { SendEmailBlockParameters } from "./blockInfo/SendEmailBlockInfo";
 import { ProxyLocation } from "@/api/types";
+import { KeyValueInput } from "@/components/KeyValueInput";
 
 function WorkflowPostRunParameters() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
@@ -53,6 +54,10 @@ function WorkflowPostRunParameters() {
   const proxyLocation = isTaskV2
     ? workflowRun.task_v2?.proxy_location
     : workflowRun.proxy_location;
+
+  const extraHttpHeaders = isTaskV2
+    ? workflowRun.task_v2?.extra_http_headers
+    : workflowRun.extra_http_headers;
 
   return (
     <div className="space-y-5">
@@ -146,6 +151,20 @@ function WorkflowPostRunParameters() {
                 // TODO
               }}
             />
+          </div>
+          <div className="flex gap-16">
+            <div className="w-80">
+              <h1 className="text-lg">Extra HTTP Headers</h1>
+            </div>
+            <div className="w-full">
+              <KeyValueInput
+                value={
+                  extraHttpHeaders ? JSON.stringify(extraHttpHeaders) : null
+                }
+                readOnly={true}
+                onChange={() => {}}
+              />
+            </div>
           </div>
         </div>
       </div>

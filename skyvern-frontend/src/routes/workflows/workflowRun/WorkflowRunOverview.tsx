@@ -1,8 +1,10 @@
 import { ActionsApiResponse } from "@/api/types";
+import { BrowserStream } from "@/components/BrowserStream";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useParams } from "react-router-dom";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
   isAction,
@@ -17,6 +19,8 @@ import { WorkflowRunStream } from "./WorkflowRunStream";
 import { useSearchParams } from "react-router-dom";
 import { findActiveItem } from "./workflowTimelineUtils";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -33,11 +37,32 @@ export type WorkflowRunOverviewActiveElement =
 function WorkflowRunOverview() {
   const [searchParams] = useSearchParams();
   const active = searchParams.get("active");
+  const { workflowPermanentId } = useParams<{
+    workflowPermanentId: string;
+  }>();
+  const queryClient = useQueryClient();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
+
+  const invalidateQueries = useCallback(() => {
+    if (workflowRun) {
+      queryClient.invalidateQueries({
+        queryKey: [
+          "workflowRun",
+          workflowPermanentId,
+          workflowRun.workflow_run_id,
+        ],
+      });
+      queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
+      queryClient.invalidateQueries({
+        queryKey: ["workflowTasks", workflowRun.workflow_run_id],
+      });
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+    }
+  }, [queryClient, workflowPermanentId, workflowRun]);
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
     return (
@@ -62,9 +87,18 @@ function WorkflowRunOverview() {
     workflowRunIsFinalized,
   );
 
+  const streamingComponent = workflowRun.browser_session_id ? (
+    <BrowserStream
+      workflow={{ run: workflowRun }}
+      onClose={() => invalidateQueries()}
+    />
+  ) : (
+    <WorkflowRunStream />
+  );
+
   return (
-    <AspectRatio ratio={16 / 9} className="overflow-y-hidden">
-      {selection === "stream" && <WorkflowRunStream />}
+    <AspectRatio ratio={16 / 9}>
+      {selection === "stream" && streamingComponent}
       {selection !== "stream" && isAction(selection) && (
         <ActionScreenshot
           index={selection.action_order ?? 0}

@@ -17,17 +17,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
 import {
-  CopyIcon,
   FileIcon,
   Pencil2Icon,
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import fetchToCurl from "fetch-to-curl";
 import { Link, Outlet, useParams, useSearchParams } from "react-router-dom";
 import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
@@ -39,9 +36,13 @@ import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
 import { cn } from "@/util/utils";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { type ApiCommandOptions } from "@/util/apiCommands";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const embed = searchParams.get("embed");
+  const isEmbedded = embed === "true";
   const active = searchParams.get("active");
   const { workflowRunId, workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
@@ -101,6 +102,7 @@ function WorkflowRun() {
   const parameters = workflowRun?.parameters ?? {};
   const proxyLocation =
     workflowRun?.proxy_location ?? ProxyLocation.Residential;
+  const maxScreenshotScrolls = workflowRun?.max_screenshot_scrolls ?? null;
 
   const title = workflowIsLoading ? (
     <Skeleton className="h-9 w-48" />
@@ -136,6 +138,19 @@ function WorkflowRun() {
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
 
+  const webhookFailureReasonData =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
+
+  const webhookFailureReason = webhookFailureReasonData ? (
+    <div className="space-y-4">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {webhookFailureReasonData}
+      </div>
+    </div>
+  ) : null;
+
   const outputs = workflowRun?.outputs;
   const extractedInformation =
     typeof outputs === "object" &&
@@ -164,111 +179,105 @@ function WorkflowRun() {
 
   const showOutputSection =
     workflowRunIsFinalized &&
-    (hasSomeExtractedInformation || hasFileUrls || hasTaskv2Output) &&
+    (hasSomeExtractedInformation ||
+      hasFileUrls ||
+      hasTaskv2Output ||
+      webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
   return (
     <div className="space-y-8">
-      <header className="flex justify-between">
-        <div className="space-y-3">
-          <div className="flex items-center gap-5">
-            {title}
-            {workflowRunIsLoading ? (
-              <Skeleton className="h-8 w-28" />
-            ) : workflowRun ? (
-              <StatusBadge status={workflowRun?.status} />
-            ) : null}
+      {!isEmbedded && (
+        <header className="flex justify-between">
+          <div className="space-y-3">
+            <div className="mr-2 flex items-start gap-5">
+              {title}
+              {workflowRunIsLoading ? (
+                <Skeleton className="h-8 w-28" />
+              ) : workflowRun ? (
+                <StatusBadge
+                  className="mt-[0.27rem]"
+                  status={workflowRun?.status}
+                />
+              ) : null}
+            </div>
+            <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
           </div>
-          <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
-        </div>
 
-        <div className="flex gap-2">
-          <Button
-            variant="secondary"
-            onClick={() => {
-              if (!workflowRun) {
-                return;
+          <div className="flex gap-2">
+            <CopyApiCommandDropdown
+              getOptions={() =>
+                ({
+                  method: "POST",
+                  url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
+                  body: {
+                    data: workflowRun?.parameters,
+                    proxy_location: "RESIDENTIAL",
+                  },
+                  headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": apiCredential ?? "<your-api-key>",
+                  },
+                }) satisfies ApiCommandOptions
               }
-              const curl = fetchToCurl({
-                method: "POST",
-                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                body: {
-                  data: workflowRun?.parameters,
-                  proxy_location: "RESIDENTIAL",
-                },
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
-              });
-              copyText(curl).then(() => {
-                toast({
-                  variant: "success",
-                  title: "Copied to Clipboard",
-                  description:
-                    "The cURL command has been copied to your clipboard.",
-                });
-              });
-            }}
-          >
-            <CopyIcon className="mr-2 h-4 w-4" />
-            cURL
-          </Button>
-          <Button asChild variant="secondary">
-            <Link to={`/workflows/${workflowPermanentId}/edit`}>
-              <Pencil2Icon className="mr-2 h-4 w-4" />
-              Edit
-            </Link>
-          </Button>
-          {workflowRunIsRunningOrQueued && (
-            <Dialog>
-              <DialogTrigger asChild>
-                <Button variant="destructive">Cancel</Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Are you sure?</DialogTitle>
-                  <DialogDescription>
-                    Are you sure you want to cancel this workflow run?
-                  </DialogDescription>
-                </DialogHeader>
-                <DialogFooter>
-                  <DialogClose asChild>
-                    <Button variant="secondary">Back</Button>
-                  </DialogClose>
-                  <Button
-                    variant="destructive"
-                    onClick={() => {
-                      cancelWorkflowMutation.mutate();
-                    }}
-                    disabled={cancelWorkflowMutation.isPending}
-                  >
-                    {cancelWorkflowMutation.isPending && (
-                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                    )}
-                    Cancel Workflow Run
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-          )}
-          {workflowRunIsFinalized && !isTaskv2Run && (
-            <Button asChild>
-              <Link
-                to={`/workflows/${workflowPermanentId}/run`}
-                state={{
-                  data: parameters,
-                  proxyLocation,
-                  webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
-                }}
-              >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                Rerun
+            />
+            <Button asChild variant="secondary">
+              <Link to={`/workflows/${workflowPermanentId}/debug`}>
+                <Pencil2Icon className="mr-2 h-4 w-4" />
+                Edit
               </Link>
             </Button>
-          )}
-        </div>
-      </header>
+            {workflowRunIsRunningOrQueued && (
+              <Dialog>
+                <DialogTrigger asChild>
+                  <Button variant="destructive">Cancel</Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Are you sure?</DialogTitle>
+                    <DialogDescription>
+                      Are you sure you want to cancel this workflow run?
+                    </DialogDescription>
+                  </DialogHeader>
+                  <DialogFooter>
+                    <DialogClose asChild>
+                      <Button variant="secondary">Back</Button>
+                    </DialogClose>
+                    <Button
+                      variant="destructive"
+                      onClick={() => {
+                        cancelWorkflowMutation.mutate();
+                      }}
+                      disabled={cancelWorkflowMutation.isPending}
+                    >
+                      {cancelWorkflowMutation.isPending && (
+                        <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                      )}
+                      Cancel Workflow Run
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+            )}
+            {workflowRunIsFinalized && !isTaskv2Run && (
+              <Button asChild>
+                <Link
+                  to={`/workflows/${workflowPermanentId}/run`}
+                  state={{
+                    data: parameters,
+                    proxyLocation,
+                    webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
+                    maxScreenshotScrolls,
+                  }}
+                >
+                  <PlayIcon className="mr-2 h-4 w-4" />
+                  Rerun
+                </Link>
+              </Button>
+            )}
+          </div>
+        </header>
+      )}
       {showOutputSection && (
         <div
           className={cn("grid gap-4 rounded-lg bg-slate-elevation1 p-4", {
@@ -318,29 +327,32 @@ function WorkflowRun() {
               </ScrollArea>
             </div>
           )}
+          {webhookFailureReason}
         </div>
       )}
       {workflowFailureReason}
-      <SwitchBarNavigation
-        options={[
-          {
-            label: "Overview",
-            to: "overview",
-          },
-          {
-            label: "Output",
-            to: "output",
-          },
-          {
-            label: "Parameters",
-            to: "parameters",
-          },
-          {
-            label: "Recording",
-            to: "recording",
-          },
-        ]}
-      />
+      {!isEmbedded && (
+        <SwitchBarNavigation
+          options={[
+            {
+              label: "Overview",
+              to: "overview",
+            },
+            {
+              label: "Output",
+              to: "output",
+            },
+            {
+              label: "Parameters",
+              to: "parameters",
+            },
+            {
+              label: "Recording",
+              to: "recording",
+            },
+          ]}
+        />
+      )}
       <div className="flex h-[42rem] gap-6">
         <div className="w-2/3">
           <Outlet />

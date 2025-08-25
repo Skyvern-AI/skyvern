@@ -1,5 +1,5 @@
 default_language_version:
-  python: python3.11
+  python: python3
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -13,9 +13,17 @@ repos:
       - id: check-symlinks
       - id: debug-statements
       - id: detect-private-key
+  - repo: local
+    hooks:
+      - id: check-python-version
+        name: Check Python Version (3.11-3.13)
+        entry: python -c "import sys; assert (3,11) <= sys.version_info[:2] <= (3,13), f'Python {sys.version_info[:2]} not supported. Use Python 3.11-3.13'"
+        language: system
+        pass_filenames: false
+        always_run: true
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.9.1
+    rev: v0.12.1
     hooks:
       # Run the linter.
       - id: ruff
@@ -30,13 +38,12 @@ repos:
     rev: 6.0.1
     hooks:
       - id: isort
-        language_version: python3.11
+        language_version: python3
         exclude: |
           (?x)(
             ^skyvern/client/.*|
             ^skyvern/__init__.py
           )
-
   - repo: https://github.com/pre-commit/pygrep-hooks
     rev: v1.10.0
     hooks:
@@ -44,18 +51,25 @@ repos:
       - id: python-check-mock-methods
       - id: python-no-log-warn
       - id: python-use-type-annotations
-
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.20.0
+    hooks:
+      - id: pyupgrade
+        exclude: |
+          (?x)(
+          ^skyvern/client/.*
+          )
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.14.1
+    rev: v1.16.1
     hooks:
       - id: mypy
-        args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs, --python-version=3.11]
+        args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs]
         additional_dependencies:
           - requests
           - types-requests
           - types-cachetools
           - alembic
-          - "sqlalchemy[mypy]"
+          - 'sqlalchemy[mypy]'
           - types-PyYAML
           - types-aiofiles
         exclude: |
@@ -65,7 +79,6 @@ repos:
             ^alembic.*|
             ^skyvern/client/.*
           )
-
   - repo: https://github.com/PyCQA/autoflake
     rev: v2.3.1
     hooks:
@@ -73,20 +86,20 @@ repos:
         name: autoflake
         entry: autoflake --in-place --remove-all-unused-imports --recursive --ignore-init-module-imports
         language: python
-        types: [ python ]
+        types: [python]
         exclude: |
           (?x)(
             ^skyvern/client/.*
           )
-      # Mono repo has bronken this TODO: fix
-      # - id: pytest-check
-      #   name: pytest-check
-      #   entry: pytest
-      #   language: system
-      #   pass_filenames: false
-      #   always_run: true
+        # Mono repo has bronken this TODO: fix
+        # - id: pytest-check
+        #   name: pytest-check
+        #   entry: pytest
+        #   language: system
+        #   pass_filenames: false
+        #   always_run: true
   - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: "v4.0.0-alpha.8" # Use the sha or tag you want to point at
+    rev: 'v4.0.0-alpha.8' # Use the sha or tag you want to point at
     hooks:
       - id: prettier
         types: [javascript]
@@ -96,4 +109,12 @@ repos:
         name: Alembic Check
         entry: ./run_alembic_check.sh
         language: script
-        stages: [ manual ]
+        stages: [manual]
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+  - repo: https://github.com/google/yamlfmt
+    rev: v0.17.2
+    hooks:
+      - id: yamlfmt

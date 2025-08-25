@@ -15,6 +15,8 @@ from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace.lmnr import LaminarTrace
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
@@ -46,25 +48,44 @@ ANTHROPIC_CLIENT = AsyncAnthropic(api_key=SettingsManager.get_settings().ANTHROP
 if SettingsManager.get_settings().ENABLE_BEDROCK_ANTHROPIC:
     ANTHROPIC_CLIENT = AsyncAnthropicBedrock()
 
+# Add UI-TARS client setup
+UI_TARS_CLIENT = None
+if SettingsManager.get_settings().ENABLE_VOLCENGINE:
+    UI_TARS_CLIENT = AsyncOpenAI(
+        api_key=SettingsManager.get_settings().VOLCENGINE_API_KEY,
+        base_url=SettingsManager.get_settings().VOLCENGINE_API_BASE,
+    )
+
 SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
     SETTINGS_MANAGER.SECONDARY_LLM_KEY if SETTINGS_MANAGER.SECONDARY_LLM_KEY else SETTINGS_MANAGER.LLM_KEY
 )
-SELECT_AGENT_LLM_API_HANDLER = (
-    LLMAPIHandlerFactory.get_llm_api_handler(SETTINGS_MANAGER.SELECT_AGENT_LLM_KEY)
-    if SETTINGS_MANAGER.SELECT_AGENT_LLM_KEY
-    else SECONDARY_LLM_API_HANDLER
+SELECT_AGENT_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
+    SETTINGS_MANAGER.SELECT_AGENT_LLM_KEY or SETTINGS_MANAGER.SECONDARY_LLM_KEY or SETTINGS_MANAGER.LLM_KEY
 )
-SINGLE_CLICK_AGENT_LLM_API_HANDLER = (
-    LLMAPIHandlerFactory.get_llm_api_handler(SETTINGS_MANAGER.SINGLE_CLICK_AGENT_LLM_KEY)
-    if SETTINGS_MANAGER.SINGLE_CLICK_AGENT_LLM_KEY
-    else SECONDARY_LLM_API_HANDLER
+SINGLE_CLICK_AGENT_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
+    SETTINGS_MANAGER.SINGLE_CLICK_AGENT_LLM_KEY or SETTINGS_MANAGER.SECONDARY_LLM_KEY or SETTINGS_MANAGER.LLM_KEY
 )
+SINGLE_INPUT_AGENT_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
+    SETTINGS_MANAGER.SINGLE_INPUT_AGENT_LLM_KEY or SETTINGS_MANAGER.SECONDARY_LLM_KEY or SETTINGS_MANAGER.LLM_KEY
+)
+EXTRACTION_LLM_API_HANDLER = (
+    LLMAPIHandlerFactory.get_llm_api_handler(SETTINGS_MANAGER.EXTRACTION_LLM_KEY)
+    if SETTINGS_MANAGER.EXTRACTION_LLM_KEY
+    else LLM_API_HANDLER
+)
+SVG_CSS_CONVERTER_LLM_API_HANDLER = SECONDARY_LLM_API_HANDLER if SETTINGS_MANAGER.SECONDARY_LLM_KEY else None
+
 WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()
 PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=DATABASE)
 scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
+authenticate_user_function: Callable[[str], Awaitable[str | None]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
 
 agent = ForgeAgent()
+
+if SettingsManager.get_settings().TRACE_ENABLED:
+    if SettingsManager.get_settings().TRACE_PROVIDER == "lmnr":
+        TraceManager.set_trace_provider(LaminarTrace(api_key=SettingsManager.get_settings().TRACE_PROVIDER_API_KEY))

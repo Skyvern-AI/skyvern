@@ -24,11 +24,11 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { copyText } from "@/util/copyText";
 import { apiBaseUrl } from "@/util/env";
-import { CopyIcon, PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { type ApiCommandOptions } from "@/util/apiCommands";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import fetchToCurl from "fetch-to-curl";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { statusIsFinalized } from "../types";
 import { useTaskQuery } from "./hooks/useTaskQuery";
@@ -167,6 +167,15 @@ function TaskDetails() {
     </div>
   ) : null;
 
+  const webhookFailureReason = task?.webhook_failure_reason ? (
+    <div className="space-y-1">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {task.webhook_failure_reason}
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div className="flex flex-col gap-8">
       <header className="space-y-3">
@@ -180,13 +189,19 @@ function TaskDetails() {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              variant="secondary"
-              onClick={() => {
+            <CopyApiCommandDropdown
+              getOptions={() => {
                 if (!task) {
-                  return;
+                  return {
+                    method: "GET",
+                    url: "",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "x-api-key": "",
+                    },
+                  } satisfies ApiCommandOptions;
                 }
-                const curl = fetchToCurl({
+                return {
                   method: "POST",
                   url: `${apiBaseUrl}/tasks`,
                   body: createTaskRequestObject(task),
@@ -194,20 +209,9 @@ function TaskDetails() {
                     "Content-Type": "application/json",
                     "x-api-key": apiCredential ?? "<your-api-key>",
                   },
-                });
-                copyText(curl).then(() => {
-                  toast({
-                    variant: "success",
-                    title: "Copied to Clipboard",
-                    description:
-                      "The cURL command has been copied to your clipboard.",
-                  });
-                });
+                } satisfies ApiCommandOptions;
               }}
-            >
-              <CopyIcon className="mr-2 h-4 w-4" />
-              cURL
-            </Button>
+            />
             {taskIsRunningOrQueued && (
               <Dialog>
                 <DialogTrigger asChild>
@@ -272,6 +276,7 @@ function TaskDetails() {
         <>
           {extractedInformation}
           {failureReason}
+          {webhookFailureReason}
         </>
       )}
       <SwitchBarNavigation

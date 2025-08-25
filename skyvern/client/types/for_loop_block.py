@@ -15,6 +15,7 @@ class ForLoopBlock(UniversalBaseModel):
     label: str
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
     loop_variable_reference: typing.Optional[str] = None

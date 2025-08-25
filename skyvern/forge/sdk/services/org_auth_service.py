@@ -86,6 +86,44 @@ async def _authenticate_helper(authorization: str) -> Organization:
     return organization
 
 
+async def get_current_user_id(
+    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+) -> str:
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    return await _authenticate_user_helper(authorization)
+
+
+async def get_current_user_id_with_authentication(
+    authorization: Annotated[str | None, Header()] = None,
+) -> str:
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    return await _authenticate_user_helper(authorization)
+
+
+async def _authenticate_user_helper(authorization: str) -> str:
+    token = authorization.split(" ")[1]
+    if not app.authenticate_user_function:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid user authentication method",
+        )
+    user_id = await app.authenticate_user_function(token)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid credentials",
+        )
+    return user_id
+
+
 @cached(cache=TTLCache(maxsize=CACHE_SIZE, ttl=AUTHENTICATION_TTL))
 async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
     """
@@ -112,6 +150,7 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
 
     organization = await db.get_organization(organization_id=api_key_data.sub)
     if not organization:
+        LOG.warning("Organization not found", organization_id=api_key_data.sub, **payload)
         raise HTTPException(status_code=404, detail="Organization not found")
 
     # check if the token exists in the database

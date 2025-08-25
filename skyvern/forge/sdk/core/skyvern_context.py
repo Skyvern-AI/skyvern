@@ -11,6 +11,7 @@ class SkyvernContext:
     organization_id: str | None = None
     organization_name: str | None = None
     task_id: str | None = None
+    step_id: str | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
@@ -18,14 +19,19 @@ class SkyvernContext:
     max_steps_override: int | None = None
     browser_session_id: str | None = None
     tz_info: ZoneInfo | None = None
+    run_id: str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
+    dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
+    max_screenshot_scrolls: int | None = None
+    script_id: str | None = None
+    script_revision_id: str | None = None
 
     def __repr__(self) -> str:
-        return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override})"
+        return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"
 
     def __str__(self) -> str:
         return self.__repr__()
