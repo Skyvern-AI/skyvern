@@ -1,3 +1,5 @@
+import json
+
 from fastapi import HTTPException, status
 
 from skyvern.config import settings
@@ -5,7 +7,16 @@ from skyvern.exceptions import TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import (  # local import to avoid cycles
+    RunEngine,
+    RunResponse,
+    RunStatus,
+    RunType,
+    TaskRunRequest,
+    TaskRunResponse,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+)
 from skyvern.services import task_v1_service, task_v2_service, workflow_service
 
 
@@ -181,3 +192,102 @@ async def retry_run_webhook(run_id: str, organization_id: str | None = None, api
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid run type to retry webhook: {run.task_run_type}",
         )
+
+
+async def build_run_webhook_payload(run_id: str, organization_id: str | None = None) -> dict:
+    """Build the webhook payload for a run without sending it.
+
+    Returns a dict representing the JSON body that would have been sent to the webhook.
+    """
+    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run not found {run_id}",
+        )
+
+    # Task V1 and CUA engines share the same payload construction path
+    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
+        task = await app.DATABASE.get_task(run_id, organization_id=organization_id)
+        if not task:
+            raise TaskNotFound(task_id=run_id)
+        latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
+
+        # Build the task response (includes artifacts like screenshots, recording, downloaded files)
+        task_response = await app.agent.build_task_response(task=task, last_step=latest_step)
+
+        # Build the new RunResponse for backward compatibility and merge
+        payload_json = task_response.model_dump_json(exclude={"request"})
+        payload_dict = json.loads(payload_json)
+
+        run_response = await get_run_response(run_id=task.task_id, organization_id=task.organization_id)
+        if run_response is not None:
+            task_run_response_json = run_response.model_dump_json(exclude={"run_request"})
+            payload_dict.update(json.loads(task_run_response_json))
+
+        return payload_dict
+
+    # Task V2 payload
+    if run.task_run_type == RunType.task_v2:
+        task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
+        if not task_v2:
+            raise TaskNotFound(task_id=run_id)
+
+        task_run_response = await task_v2_service.build_task_v2_run_response(task_v2)
+        task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
+        payload_json = task_v2.model_dump_json(by_alias=True)
+        payload_dict = json.loads(payload_json)
+        payload_dict.update(json.loads(task_run_response_json))
+        return payload_dict
+
+    # Workflow run payload
+    if run.task_run_type == RunType.workflow_run:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=run_id,
+            organization_id=organization_id,
+        )
+        if not workflow_run:
+            raise WorkflowRunNotFound(workflow_run_id=run_id)
+
+        # Build both the status response (legacy shape) and the new response, then merge
+        workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization_id,
+        )
+
+        app_url = (
+            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
+            f"{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
+        )
+        workflow_run_response = WorkflowRunResponse(
+            run_id=workflow_run.workflow_run_id,
+            run_type=RunType.workflow_run,
+            status=RunStatus(workflow_run_status_response.status),
+            output=workflow_run_status_response.outputs,
+            downloaded_files=workflow_run_status_response.downloaded_files,
+            recording_url=workflow_run_status_response.recording_url,
+            screenshot_urls=workflow_run_status_response.screenshot_urls,
+            failure_reason=workflow_run_status_response.failure_reason,
+            app_url=app_url,
+            created_at=workflow_run_status_response.created_at,
+            modified_at=workflow_run_status_response.modified_at,
+            run_request=WorkflowRunRequest(
+                workflow_id=workflow_run.workflow_permanent_id,
+                title=workflow_run_status_response.workflow_title,
+                parameters=workflow_run_status_response.parameters,
+                proxy_location=workflow_run.proxy_location,
+                webhook_url=workflow_run.webhook_callback_url or None,
+                totp_url=workflow_run.totp_verification_url or None,
+                totp_identifier=workflow_run.totp_identifier,
+            ),
+        )
+
+        payload_dict = json.loads(workflow_run_status_response.model_dump_json())
+        workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
+        payload_dict.update(workflow_run_response_dict)
+        return payload_dict
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Invalid run type to build webhook payload: {run.task_run_type}",
+    )
