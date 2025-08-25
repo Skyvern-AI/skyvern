@@ -57,9 +57,34 @@ class TaskRunResponse(UniversalBaseModel):
     Timestamp when this run was last modified
     """
 
+    queued_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
+    """
+    Timestamp when this run was queued
+    """
+
+    started_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
+    """
+    Timestamp when this run started execution
+    """
+
+    finished_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
+    """
+    Timestamp when this run finished
+    """
+
     app_url: typing.Optional[str] = pydantic.Field(default=None)
     """
     URL to the application UI where the run can be viewed
+    """
+
+    browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    ID of the Skyvern persistent browser session used for this run
+    """
+
+    max_screenshot_scrolls: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot
     """
 
     run_request: typing.Optional[TaskRunRequest] = pydantic.Field(default=None)

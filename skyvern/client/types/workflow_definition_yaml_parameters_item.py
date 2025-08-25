@@ -119,6 +119,23 @@ class WorkflowDefinitionYamlParametersItem_Credential(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class WorkflowDefinitionYamlParametersItem_Onepassword(UniversalBaseModel):
+    parameter_type: typing.Literal["onepassword"] = "onepassword"
+    key: str
+    description: typing.Optional[str] = None
+    vault_id: str
+    item_id: str
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class WorkflowDefinitionYamlParametersItem_Output(UniversalBaseModel):
     parameter_type: typing.Literal["output"] = "output"
     key: str
@@ -158,6 +175,7 @@ WorkflowDefinitionYamlParametersItem = typing.Union[
     WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation,
     WorkflowDefinitionYamlParametersItem_Context,
     WorkflowDefinitionYamlParametersItem_Credential,
+    WorkflowDefinitionYamlParametersItem_Onepassword,
     WorkflowDefinitionYamlParametersItem_Output,
     WorkflowDefinitionYamlParametersItem_Workflow,
 ]

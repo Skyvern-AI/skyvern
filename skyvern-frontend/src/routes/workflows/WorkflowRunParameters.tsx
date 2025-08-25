@@ -6,6 +6,7 @@ import { RunWorkflowForm } from "./RunWorkflowForm";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ProxyLocation } from "@/api/types";
+import { getInitialValues } from "./utils";
 
 function WorkflowRunParameters() {
   const credentialGetter = useCredentialGetter();
@@ -30,8 +31,8 @@ function WorkflowRunParameters() {
   const proxyLocation = location.state
     ? (location.state.proxyLocation as ProxyLocation)
     : null;
-  const maxScreenshotScrollingTimes =
-    location.state?.maxScreenshotScrollingTimes ?? null;
+
+  const maxScreenshotScrolls = location.state?.maxScreenshotScrolls ?? null;
 
   const webhookCallbackUrl = location.state
     ? (location.state.webhookCallbackUrl as string)
@@ -41,43 +42,7 @@ function WorkflowRunParameters() {
     ? (location.state.extraHttpHeaders as Record<string, string>)
     : null;
 
-  const initialValues = location.state?.data
-    ? location.state.data
-    : workflowParameters?.reduce(
-        (acc, curr) => {
-          if (curr.workflow_parameter_type === "json") {
-            if (typeof curr.default_value === "string") {
-              acc[curr.key] = curr.default_value;
-              return acc;
-            }
-            if (curr.default_value) {
-              acc[curr.key] = JSON.stringify(curr.default_value, null, 2);
-              return acc;
-            }
-          }
-          if (
-            curr.default_value &&
-            curr.workflow_parameter_type === "boolean"
-          ) {
-            acc[curr.key] = Boolean(curr.default_value);
-            return acc;
-          }
-          if (
-            curr.default_value === null &&
-            curr.workflow_parameter_type === "string"
-          ) {
-            acc[curr.key] = "";
-            return acc;
-          }
-          if (curr.default_value) {
-            acc[curr.key] = curr.default_value;
-            return acc;
-          }
-          acc[curr.key] = null;
-          return acc;
-        },
-        {} as Record<string, unknown>,
-      );
+  const initialValues = getInitialValues(location, workflowParameters ?? []);
 
   const header = (
     <header className="space-y-5">
@@ -115,12 +80,11 @@ function WorkflowRunParameters() {
             ProxyLocation.Residential,
           webhookCallbackUrl:
             webhookCallbackUrl ?? workflow.webhook_callback_url ?? "",
-          maxScreenshotScrollingTimes:
-            maxScreenshotScrollingTimes ??
-            workflow.max_screenshot_scrolling_times ??
-            null,
+          maxScreenshotScrolls:
+            maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
           extraHttpHeaders:
             extraHttpHeaders ?? workflow.extra_http_headers ?? null,
+          cdpAddress: null,
         }}
       />
     </div>

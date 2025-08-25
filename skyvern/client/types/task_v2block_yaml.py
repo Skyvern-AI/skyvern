@@ -9,6 +9,7 @@ import pydantic
 class TaskV2BlockYaml(UniversalBaseModel):
     label: str
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     prompt: str
     url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None

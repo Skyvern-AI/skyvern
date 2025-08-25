@@ -9,7 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import CloudContext from "@/store/CloudContext";
 import { useContext } from "react";
-import { useWorkflowParametersState } from "../../useWorkflowParametersState";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { PlusIcon } from "@radix-ui/react-icons";
 import {
@@ -30,8 +30,10 @@ type Props = {
 function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
   const { setIsOpen, setType } = useCredentialModalState();
   const nodes = useNodes<AppNode>();
-  const [workflowParameters, setWorkflowParameters] =
-    useWorkflowParametersState();
+  const {
+    parameters: workflowParameters,
+    setParameters: setWorkflowParameters,
+  } = useWorkflowParametersStore();
   const credentialParameters = workflowParameters.filter(
     (parameter) =>
       parameter.parameterType === "credential" ||
@@ -170,16 +172,14 @@ function LoginBlockCredentialSelector({ nodeId, value, onChange }: Props) {
       <CredentialsModal
         onCredentialCreated={(id) => {
           onChange?.(id);
-          setWorkflowParameters((prev) => {
-            return [
-              ...prev,
-              {
-                parameterType: "credential",
-                credentialId: id,
-                key: id,
-              },
-            ];
-          });
+          setWorkflowParameters([
+            ...workflowParameters,
+            {
+              parameterType: "credential",
+              credentialId: id,
+              key: id,
+            },
+          ]);
         }}
       />
     </>

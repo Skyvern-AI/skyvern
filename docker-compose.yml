@@ -108,7 +108,7 @@ services:
     # - GROQ_API_KEY=<your_groq_api_key>
     # - GROQ_MODEL=llama-3.1-8b-instant
 
-    # Maximum tokens to use: (only set for OpenRouter aand Ollama)
+    # Maximum tokens to use: (only set for OpenRouter and Ollama)
     # - LLM_CONFIG_MAX_TOKENS=128000
 
     # Bitwarden Settings

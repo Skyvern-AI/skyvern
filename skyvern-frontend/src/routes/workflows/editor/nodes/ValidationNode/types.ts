@@ -1,6 +1,6 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
-
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 export type ValidationNodeData = NodeBaseData & {
   completeCriterion: string;
   terminateCriterion: string;
@@ -11,6 +11,7 @@ export type ValidationNodeData = NodeBaseData & {
 export type ValidationNode = Node<ValidationNodeData, "validation">;
 
 export const validationNodeDefaultData: ValidationNodeData = {
+  debuggable: debuggableWorkflowBlockTypes.has("validation"),
   label: "",
   completeCriterion: "",
   terminateCriterion: "",

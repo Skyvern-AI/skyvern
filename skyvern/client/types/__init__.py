@@ -10,6 +10,7 @@ from .action_block_parameters_item import (
     ActionBlockParametersItem_BitwardenSensitiveInformation,
     ActionBlockParametersItem_Context,
     ActionBlockParametersItem_Credential,
+    ActionBlockParametersItem_Onepassword,
     ActionBlockParametersItem_Output,
     ActionBlockParametersItem_Workflow,
 )
@@ -34,6 +35,7 @@ from .code_block_parameters_item import (
     CodeBlockParametersItem_BitwardenSensitiveInformation,
     CodeBlockParametersItem_Context,
     CodeBlockParametersItem_Credential,
+    CodeBlockParametersItem_Onepassword,
     CodeBlockParametersItem_Output,
     CodeBlockParametersItem_Workflow,
 )
@@ -47,6 +49,7 @@ from .context_parameter_source import (
     ContextParameterSource_BitwardenSensitiveInformation,
     ContextParameterSource_Context,
     ContextParameterSource_Credential,
+    ContextParameterSource_Onepassword,
     ContextParameterSource_Output,
     ContextParameterSource_Workflow,
 )
@@ -57,7 +60,7 @@ from .credential_parameter import CredentialParameter
 from .credential_parameter_yaml import CredentialParameterYaml
 from .credential_response import CredentialResponse
 from .credential_response_credential import CredentialResponseCredential
-from .credential_type import CredentialType
+from .credential_type_output import CredentialTypeOutput
 from .credit_card_credential_response import CreditCardCredentialResponse
 from .download_to_s3block import DownloadToS3Block
 from .download_to_s3block_yaml import DownloadToS3BlockYaml
@@ -71,6 +74,7 @@ from .extraction_block_parameters_item import (
     ExtractionBlockParametersItem_BitwardenSensitiveInformation,
     ExtractionBlockParametersItem_Context,
     ExtractionBlockParametersItem_Credential,
+    ExtractionBlockParametersItem_Onepassword,
     ExtractionBlockParametersItem_Output,
     ExtractionBlockParametersItem_Workflow,
 )
@@ -86,6 +90,7 @@ from .file_download_block_parameters_item import (
     FileDownloadBlockParametersItem_BitwardenSensitiveInformation,
     FileDownloadBlockParametersItem_Context,
     FileDownloadBlockParametersItem_Credential,
+    FileDownloadBlockParametersItem_Onepassword,
     FileDownloadBlockParametersItem_Output,
     FileDownloadBlockParametersItem_Workflow,
 )
@@ -109,6 +114,7 @@ from .for_loop_block_loop_blocks_item import (
     ForLoopBlockLoopBlocksItem_FileUrlParser,
     ForLoopBlockLoopBlocksItem_ForLoop,
     ForLoopBlockLoopBlocksItem_GotoUrl,
+    ForLoopBlockLoopBlocksItem_HttpRequest,
     ForLoopBlockLoopBlocksItem_Login,
     ForLoopBlockLoopBlocksItem_Navigation,
     ForLoopBlockLoopBlocksItem_PdfParser,
@@ -128,6 +134,7 @@ from .for_loop_block_loop_over import (
     ForLoopBlockLoopOver_BitwardenSensitiveInformation,
     ForLoopBlockLoopOver_Context,
     ForLoopBlockLoopOver_Credential,
+    ForLoopBlockLoopOver_Onepassword,
     ForLoopBlockLoopOver_Output,
     ForLoopBlockLoopOver_Workflow,
 )
@@ -143,6 +150,7 @@ from .for_loop_block_yaml_loop_blocks_item import (
     ForLoopBlockYamlLoopBlocksItem_FileUrlParser,
     ForLoopBlockYamlLoopBlocksItem_ForLoop,
     ForLoopBlockYamlLoopBlocksItem_GotoUrl,
+    ForLoopBlockYamlLoopBlocksItem_HttpRequest,
     ForLoopBlockYamlLoopBlocksItem_Login,
     ForLoopBlockYamlLoopBlocksItem_Navigation,
     ForLoopBlockYamlLoopBlocksItem_PdfParser,
@@ -160,8 +168,23 @@ from .get_run_response import (
     GetRunResponse_OpenaiCua,
     GetRunResponse_TaskV1,
     GetRunResponse_TaskV2,
+    GetRunResponse_UiTars,
     GetRunResponse_WorkflowRun,
 )
+from .http_request_block import HttpRequestBlock
+from .http_request_block_parameters_item import (
+    HttpRequestBlockParametersItem,
+    HttpRequestBlockParametersItem_AwsSecret,
+    HttpRequestBlockParametersItem_BitwardenCreditCardData,
+    HttpRequestBlockParametersItem_BitwardenLoginCredential,
+    HttpRequestBlockParametersItem_BitwardenSensitiveInformation,
+    HttpRequestBlockParametersItem_Context,
+    HttpRequestBlockParametersItem_Credential,
+    HttpRequestBlockParametersItem_Onepassword,
+    HttpRequestBlockParametersItem_Output,
+    HttpRequestBlockParametersItem_Workflow,
+)
+from .http_request_block_yaml import HttpRequestBlockYaml
 from .http_validation_error import HttpValidationError
 from .login_block import LoginBlock
 from .login_block_data_schema import LoginBlockDataSchema
@@ -173,6 +196,7 @@ from .login_block_parameters_item import (
     LoginBlockParametersItem_BitwardenSensitiveInformation,
     LoginBlockParametersItem_Context,
     LoginBlockParametersItem_Credential,
+    LoginBlockParametersItem_Onepassword,
     LoginBlockParametersItem_Output,
     LoginBlockParametersItem_Workflow,
 )
@@ -187,12 +211,15 @@ from .navigation_block_parameters_item import (
     NavigationBlockParametersItem_BitwardenSensitiveInformation,
     NavigationBlockParametersItem_Context,
     NavigationBlockParametersItem_Credential,
+    NavigationBlockParametersItem_Onepassword,
     NavigationBlockParametersItem_Output,
     NavigationBlockParametersItem_Workflow,
 )
 from .navigation_block_yaml import NavigationBlockYaml
 from .non_empty_credit_card_credential import NonEmptyCreditCardCredential
 from .non_empty_password_credential import NonEmptyPasswordCredential
+from .one_password_credential_parameter import OnePasswordCredentialParameter
+from .one_password_credential_parameter_yaml import OnePasswordCredentialParameterYaml
 from .output_parameter import OutputParameter
 from .output_parameter_yaml import OutputParameterYaml
 from .password_credential_response import PasswordCredentialResponse
@@ -203,6 +230,8 @@ from .run_engine import RunEngine
 from .run_status import RunStatus
 from .send_email_block import SendEmailBlock
 from .send_email_block_yaml import SendEmailBlockYaml
+from .skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
+from .skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
 from .task_block import TaskBlock
 from .task_block_data_schema import TaskBlockDataSchema
 from .task_block_parameters_item import (
@@ -213,6 +242,7 @@ from .task_block_parameters_item import (
     TaskBlockParametersItem_BitwardenSensitiveInformation,
     TaskBlockParametersItem_Context,
     TaskBlockParametersItem_Credential,
+    TaskBlockParametersItem_Onepassword,
     TaskBlockParametersItem_Output,
     TaskBlockParametersItem_Workflow,
 )
@@ -233,6 +263,7 @@ from .text_prompt_block_parameters_item import (
     TextPromptBlockParametersItem_BitwardenSensitiveInformation,
     TextPromptBlockParametersItem_Context,
     TextPromptBlockParametersItem_Credential,
+    TextPromptBlockParametersItem_Onepassword,
     TextPromptBlockParametersItem_Output,
     TextPromptBlockParametersItem_Workflow,
 )
@@ -250,6 +281,7 @@ from .url_block_parameters_item import (
     UrlBlockParametersItem_BitwardenSensitiveInformation,
     UrlBlockParametersItem_Context,
     UrlBlockParametersItem_Credential,
+    UrlBlockParametersItem_Onepassword,
     UrlBlockParametersItem_Output,
     UrlBlockParametersItem_Workflow,
 )
@@ -264,6 +296,7 @@ from .validation_block_parameters_item import (
     ValidationBlockParametersItem_BitwardenSensitiveInformation,
     ValidationBlockParametersItem_Context,
     ValidationBlockParametersItem_Credential,
+    ValidationBlockParametersItem_Onepassword,
     ValidationBlockParametersItem_Output,
     ValidationBlockParametersItem_Workflow,
 )
@@ -279,6 +312,7 @@ from .wait_block_parameters_item import (
     WaitBlockParametersItem_BitwardenSensitiveInformation,
     WaitBlockParametersItem_Context,
     WaitBlockParametersItem_Credential,
+    WaitBlockParametersItem_Onepassword,
     WaitBlockParametersItem_Output,
     WaitBlockParametersItem_Workflow,
 )
@@ -297,6 +331,7 @@ from .workflow_definition_blocks_item import (
     WorkflowDefinitionBlocksItem_FileUrlParser,
     WorkflowDefinitionBlocksItem_ForLoop,
     WorkflowDefinitionBlocksItem_GotoUrl,
+    WorkflowDefinitionBlocksItem_HttpRequest,
     WorkflowDefinitionBlocksItem_Login,
     WorkflowDefinitionBlocksItem_Navigation,
     WorkflowDefinitionBlocksItem_PdfParser,
@@ -316,6 +351,7 @@ from .workflow_definition_parameters_item import (
     WorkflowDefinitionParametersItem_BitwardenSensitiveInformation,
     WorkflowDefinitionParametersItem_Context,
     WorkflowDefinitionParametersItem_Credential,
+    WorkflowDefinitionParametersItem_Onepassword,
     WorkflowDefinitionParametersItem_Output,
     WorkflowDefinitionParametersItem_Workflow,
 )
@@ -331,6 +367,7 @@ from .workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_FileUrlParser,
     WorkflowDefinitionYamlBlocksItem_ForLoop,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
+    WorkflowDefinitionYamlBlocksItem_HttpRequest,
     WorkflowDefinitionYamlBlocksItem_Login,
     WorkflowDefinitionYamlBlocksItem_Navigation,
     WorkflowDefinitionYamlBlocksItem_PdfParser,
@@ -350,6 +387,7 @@ from .workflow_definition_yaml_parameters_item import (
     WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation,
     WorkflowDefinitionYamlParametersItem_Context,
     WorkflowDefinitionYamlParametersItem_Credential,
+    WorkflowDefinitionYamlParametersItem_Onepassword,
     WorkflowDefinitionYamlParametersItem_Output,
     WorkflowDefinitionYamlParametersItem_Workflow,
 )
@@ -374,6 +412,7 @@ __all__ = [
     "ActionBlockParametersItem_BitwardenSensitiveInformation",
     "ActionBlockParametersItem_Context",
     "ActionBlockParametersItem_Credential",
+    "ActionBlockParametersItem_Onepassword",
     "ActionBlockParametersItem_Output",
     "ActionBlockParametersItem_Workflow",
     "ActionBlockYaml",
@@ -396,6 +435,7 @@ __all__ = [
     "CodeBlockParametersItem_BitwardenSensitiveInformation",
     "CodeBlockParametersItem_Context",
     "CodeBlockParametersItem_Credential",
+    "CodeBlockParametersItem_Onepassword",
     "CodeBlockParametersItem_Output",
     "CodeBlockParametersItem_Workflow",
     "CodeBlockYaml",
@@ -407,6 +447,7 @@ __all__ = [
     "ContextParameterSource_BitwardenSensitiveInformation",
     "ContextParameterSource_Context",
     "ContextParameterSource_Credential",
+    "ContextParameterSource_Onepassword",
     "ContextParameterSource_Output",
     "ContextParameterSource_Workflow",
     "ContextParameterValue",
@@ -416,7 +457,7 @@ __all__ = [
     "CredentialParameterYaml",
     "CredentialResponse",
     "CredentialResponseCredential",
-    "CredentialType",
+    "CredentialTypeOutput",
     "CreditCardCredentialResponse",
     "DownloadToS3Block",
     "DownloadToS3BlockYaml",
@@ -429,6 +470,7 @@ __all__ = [
     "ExtractionBlockParametersItem_BitwardenSensitiveInformation",
     "ExtractionBlockParametersItem_Context",
     "ExtractionBlockParametersItem_Credential",
+    "ExtractionBlockParametersItem_Onepassword",
     "ExtractionBlockParametersItem_Output",
     "ExtractionBlockParametersItem_Workflow",
     "ExtractionBlockYaml",
@@ -442,6 +484,7 @@ __all__ = [
     "FileDownloadBlockParametersItem_BitwardenSensitiveInformation",
     "FileDownloadBlockParametersItem_Context",
     "FileDownloadBlockParametersItem_Credential",
+    "FileDownloadBlockParametersItem_Onepassword",
     "FileDownloadBlockParametersItem_Output",
     "FileDownloadBlockParametersItem_Workflow",
     "FileDownloadBlockYaml",
@@ -463,6 +506,7 @@ __all__ = [
     "ForLoopBlockLoopBlocksItem_FileUrlParser",
     "ForLoopBlockLoopBlocksItem_ForLoop",
     "ForLoopBlockLoopBlocksItem_GotoUrl",
+    "ForLoopBlockLoopBlocksItem_HttpRequest",
     "ForLoopBlockLoopBlocksItem_Login",
     "ForLoopBlockLoopBlocksItem_Navigation",
     "ForLoopBlockLoopBlocksItem_PdfParser",
@@ -480,6 +524,7 @@ __all__ = [
     "ForLoopBlockLoopOver_BitwardenSensitiveInformation",
     "ForLoopBlockLoopOver_Context",
     "ForLoopBlockLoopOver_Credential",
+    "ForLoopBlockLoopOver_Onepassword",
     "ForLoopBlockLoopOver_Output",
     "ForLoopBlockLoopOver_Workflow",
     "ForLoopBlockYaml",
@@ -493,6 +538,7 @@ __all__ = [
     "ForLoopBlockYamlLoopBlocksItem_FileUrlParser",
     "ForLoopBlockYamlLoopBlocksItem_ForLoop",
     "ForLoopBlockYamlLoopBlocksItem_GotoUrl",
+    "ForLoopBlockYamlLoopBlocksItem_HttpRequest",
     "ForLoopBlockYamlLoopBlocksItem_Login",
     "ForLoopBlockYamlLoopBlocksItem_Navigation",
     "ForLoopBlockYamlLoopBlocksItem_PdfParser",
@@ -508,7 +554,20 @@ __all__ = [
     "GetRunResponse_OpenaiCua",
     "GetRunResponse_TaskV1",
     "GetRunResponse_TaskV2",
+    "GetRunResponse_UiTars",
     "GetRunResponse_WorkflowRun",
+    "HttpRequestBlock",
+    "HttpRequestBlockParametersItem",
+    "HttpRequestBlockParametersItem_AwsSecret",
+    "HttpRequestBlockParametersItem_BitwardenCreditCardData",
+    "HttpRequestBlockParametersItem_BitwardenLoginCredential",
+    "HttpRequestBlockParametersItem_BitwardenSensitiveInformation",
+    "HttpRequestBlockParametersItem_Context",
+    "HttpRequestBlockParametersItem_Credential",
+    "HttpRequestBlockParametersItem_Onepassword",
+    "HttpRequestBlockParametersItem_Output",
+    "HttpRequestBlockParametersItem_Workflow",
+    "HttpRequestBlockYaml",
     "HttpValidationError",
     "LoginBlock",
     "LoginBlockDataSchema",
@@ -519,6 +578,7 @@ __all__ = [
     "LoginBlockParametersItem_BitwardenSensitiveInformation",
     "LoginBlockParametersItem_Context",
     "LoginBlockParametersItem_Credential",
+    "LoginBlockParametersItem_Onepassword",
     "LoginBlockParametersItem_Output",
     "LoginBlockParametersItem_Workflow",
     "LoginBlockYaml",
@@ -531,11 +591,14 @@ __all__ = [
     "NavigationBlockParametersItem_BitwardenSensitiveInformation",
     "NavigationBlockParametersItem_Context",
     "NavigationBlockParametersItem_Credential",
+    "NavigationBlockParametersItem_Onepassword",
     "NavigationBlockParametersItem_Output",
     "NavigationBlockParametersItem_Workflow",
     "NavigationBlockYaml",
     "NonEmptyCreditCardCredential",
     "NonEmptyPasswordCredential",
+    "OnePasswordCredentialParameter",
+    "OnePasswordCredentialParameterYaml",
     "OutputParameter",
     "OutputParameterYaml",
     "PasswordCredentialResponse",
@@ -546,6 +609,8 @@ __all__ = [
     "RunStatus",
     "SendEmailBlock",
     "SendEmailBlockYaml",
+    "SkyvernForgeSdkSchemasCredentialsCredentialType",
+    "SkyvernSchemasRunBlocksCredentialType",
     "TaskBlock",
     "TaskBlockDataSchema",
     "TaskBlockParametersItem",
@@ -555,6 +620,7 @@ __all__ = [
     "TaskBlockParametersItem_BitwardenSensitiveInformation",
     "TaskBlockParametersItem_Context",
     "TaskBlockParametersItem_Credential",
+    "TaskBlockParametersItem_Onepassword",
     "TaskBlockParametersItem_Output",
     "TaskBlockParametersItem_Workflow",
     "TaskBlockYaml",
@@ -573,6 +639,7 @@ __all__ = [
     "TextPromptBlockParametersItem_BitwardenSensitiveInformation",
     "TextPromptBlockParametersItem_Context",
     "TextPromptBlockParametersItem_Credential",
+    "TextPromptBlockParametersItem_Onepassword",
     "TextPromptBlockParametersItem_Output",
     "TextPromptBlockParametersItem_Workflow",
     "TextPromptBlockYaml",
@@ -588,6 +655,7 @@ __all__ = [
     "UrlBlockParametersItem_BitwardenSensitiveInformation",
     "UrlBlockParametersItem_Context",
     "UrlBlockParametersItem_Credential",
+    "UrlBlockParametersItem_Onepassword",
     "UrlBlockParametersItem_Output",
     "UrlBlockParametersItem_Workflow",
     "UrlBlockYaml",
@@ -600,6 +668,7 @@ __all__ = [
     "ValidationBlockParametersItem_BitwardenSensitiveInformation",
     "ValidationBlockParametersItem_Context",
     "ValidationBlockParametersItem_Credential",
+    "ValidationBlockParametersItem_Onepassword",
     "ValidationBlockParametersItem_Output",
     "ValidationBlockParametersItem_Workflow",
     "ValidationBlockYaml",
@@ -613,6 +682,7 @@ __all__ = [
     "WaitBlockParametersItem_BitwardenSensitiveInformation",
     "WaitBlockParametersItem_Context",
     "WaitBlockParametersItem_Credential",
+    "WaitBlockParametersItem_Onepassword",
     "WaitBlockParametersItem_Output",
     "WaitBlockParametersItem_Workflow",
     "WaitBlockYaml",
@@ -629,6 +699,7 @@ __all__ = [
     "WorkflowDefinitionBlocksItem_FileUrlParser",
     "WorkflowDefinitionBlocksItem_ForLoop",
     "WorkflowDefinitionBlocksItem_GotoUrl",
+    "WorkflowDefinitionBlocksItem_HttpRequest",
     "WorkflowDefinitionBlocksItem_Login",
     "WorkflowDefinitionBlocksItem_Navigation",
     "WorkflowDefinitionBlocksItem_PdfParser",
@@ -646,6 +717,7 @@ __all__ = [
     "WorkflowDefinitionParametersItem_BitwardenSensitiveInformation",
     "WorkflowDefinitionParametersItem_Context",
     "WorkflowDefinitionParametersItem_Credential",
+    "WorkflowDefinitionParametersItem_Onepassword",
     "WorkflowDefinitionParametersItem_Output",
     "WorkflowDefinitionParametersItem_Workflow",
     "WorkflowDefinitionYaml",
@@ -659,6 +731,7 @@ __all__ = [
     "WorkflowDefinitionYamlBlocksItem_FileUrlParser",
     "WorkflowDefinitionYamlBlocksItem_ForLoop",
     "WorkflowDefinitionYamlBlocksItem_GotoUrl",
+    "WorkflowDefinitionYamlBlocksItem_HttpRequest",
     "WorkflowDefinitionYamlBlocksItem_Login",
     "WorkflowDefinitionYamlBlocksItem_Navigation",
     "WorkflowDefinitionYamlBlocksItem_PdfParser",
@@ -676,6 +749,7 @@ __all__ = [
     "WorkflowDefinitionYamlParametersItem_BitwardenSensitiveInformation",
     "WorkflowDefinitionYamlParametersItem_Context",
     "WorkflowDefinitionYamlParametersItem_Credential",
+    "WorkflowDefinitionYamlParametersItem_Onepassword",
     "WorkflowDefinitionYamlParametersItem_Output",
     "WorkflowDefinitionYamlParametersItem_Workflow",
     "WorkflowParameter",

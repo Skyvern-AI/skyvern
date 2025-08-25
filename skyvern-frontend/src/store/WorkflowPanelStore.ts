@@ -2,7 +2,7 @@ import { create } from "zustand";
 
 type WorkflowPanelState = {
   active: boolean;
-  content: "parameters" | "nodeLibrary";
+  content: "cacheKeyValues" | "parameters" | "nodeLibrary";
   data?: {
     previous?: string | null;
     next?: string | null;

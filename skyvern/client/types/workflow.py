@@ -26,7 +26,10 @@ class Workflow(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     persist_browser_session: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     status: typing.Optional[WorkflowStatus] = None
+    max_screenshot_scrolls: typing.Optional[int] = None
+    extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

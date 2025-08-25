@@ -1,6 +1,512 @@
+import abc
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Annotated, Any, Literal
+
 from pydantic import BaseModel, Field
 
-from skyvern.forge.sdk.workflow.models.yaml import WorkflowCreateYAMLRequest
+from skyvern.config import settings
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
+from skyvern.schemas.runs import ProxyLocation, RunEngine
+
+
+class WorkflowStatus(StrEnum):
+    published = "published"
+    draft = "draft"
+    auto_generated = "auto_generated"
+
+
+class BlockType(StrEnum):
+    TASK = "task"
+    TaskV2 = "task_v2"
+    FOR_LOOP = "for_loop"
+    CODE = "code"
+    TEXT_PROMPT = "text_prompt"
+    DOWNLOAD_TO_S3 = "download_to_s3"
+    UPLOAD_TO_S3 = "upload_to_s3"
+    FILE_UPLOAD = "file_upload"
+    SEND_EMAIL = "send_email"
+    FILE_URL_PARSER = "file_url_parser"
+    VALIDATION = "validation"
+    ACTION = "action"
+    NAVIGATION = "navigation"
+    EXTRACTION = "extraction"
+    LOGIN = "login"
+    WAIT = "wait"
+    FILE_DOWNLOAD = "file_download"
+    GOTO_URL = "goto_url"
+    PDF_PARSER = "pdf_parser"
+    HTTP_REQUEST = "http_request"
+
+
+class BlockStatus(StrEnum):
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+    terminated = "terminated"
+    canceled = "canceled"
+    timed_out = "timed_out"
+
+
+@dataclass(frozen=True)
+class BlockResult:
+    success: bool
+    output_parameter: OutputParameter
+    output_parameter_value: dict[str, Any] | list | str | None = None
+    status: BlockStatus | None = None
+    failure_reason: str | None = None
+    workflow_run_block_id: str | None = None
+
+
+class FileType(StrEnum):
+    CSV = "csv"
+    EXCEL = "excel"
+    PDF = "pdf"
+
+
+class FileStorageType(StrEnum):
+    S3 = "s3"
+    AZURE = "azure"
+
+
+class ParameterYAML(BaseModel, abc.ABC):
+    parameter_type: ParameterType
+    key: str
+    description: str | None = None
+
+
+class AWSSecretParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.AWS_SECRET] = ParameterType.AWS_SECRET  # type: ignore
+    aws_key: str
+
+
+class BitwardenLoginCredentialParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.BITWARDEN_LOGIN_CREDENTIAL] = ParameterType.BITWARDEN_LOGIN_CREDENTIAL  # type: ignore
+
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # parameter key for the url to request the login credentials from bitwarden
+    url_parameter_key: str | None = None
+    # bitwarden collection id to filter the login credentials from,
+    # if not provided, no filtering will be done
+    bitwarden_collection_id: str | None = None
+    # bitwarden item id to request the login credential
+    bitwarden_item_id: str | None = None
+
+
+class CredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.CREDENTIAL] = ParameterType.CREDENTIAL  # type: ignore
+    credential_id: str
+
+
+class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal["bitwarden_sensitive_information"] = ParameterType.BITWARDEN_SENSITIVE_INFORMATION  # type: ignore
+
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # bitwarden collection id to filter the Bitwarden Identity from
+    bitwarden_collection_id: str
+    # unique key to identify the Bitwarden Identity in the collection
+    # this has to be in the identity's name
+    bitwarden_identity_key: str
+    # fields to extract from the Bitwarden Identity. Custom fields are prioritized over default identity fields
+    bitwarden_identity_fields: list[str]
+
+
+class BitwardenCreditCardDataParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.BITWARDEN_CREDIT_CARD_DATA] = ParameterType.BITWARDEN_CREDIT_CARD_DATA  # type: ignore
+    # bitwarden cli required fields
+    bitwarden_client_id_aws_secret_key: str
+    bitwarden_client_secret_aws_secret_key: str
+    bitwarden_master_password_aws_secret_key: str
+    # bitwarden ids for the credit card item
+    bitwarden_collection_id: str
+    bitwarden_item_id: str
+
+
+class OnePasswordCredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.ONEPASSWORD] = ParameterType.ONEPASSWORD  # type: ignore
+    vault_id: str
+    item_id: str
+
+
+class WorkflowParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.WORKFLOW] = ParameterType.WORKFLOW  # type: ignore
+    workflow_parameter_type: WorkflowParameterType
+    default_value: str | int | float | bool | dict | list | None = None
+
+
+class ContextParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.CONTEXT] = ParameterType.CONTEXT  # type: ignore
+    source_parameter_key: str
+
+
+class OutputParameterYAML(ParameterYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    parameter_type: Literal[ParameterType.OUTPUT] = ParameterType.OUTPUT  # type: ignore
+
+
+class BlockYAML(BaseModel, abc.ABC):
+    block_type: BlockType
+    label: str
+    continue_on_failure: bool = False
+    model: dict[str, Any] | None = None
+
+
+class TaskBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.TASK] = BlockType.TASK  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
+    navigation_goal: str | None = None
+    data_extraction_goal: str | None = None
+    data_schema: dict[str, Any] | list | str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    complete_verification: bool = True
+    include_action_history_in_verification: bool = False
+
+
+class ForLoopBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
+
+    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    loop_over_parameter_key: str = ""
+    loop_variable_reference: str | None = None
+    complete_if_empty: bool = False
+
+
+class CodeBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.CODE] = BlockType.CODE  # type: ignore
+
+    code: str
+    parameter_keys: list[str] | None = None
+
+
+DEFAULT_TEXT_PROMPT_LLM_KEY = settings.SECONDARY_LLM_KEY or settings.LLM_KEY
+
+
+class TextPromptBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT  # type: ignore
+
+    llm_key: str = DEFAULT_TEXT_PROMPT_LLM_KEY
+    prompt: str
+    parameter_keys: list[str] | None = None
+    json_schema: dict[str, Any] | None = None
+
+
+class DownloadToS3BlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.DOWNLOAD_TO_S3] = BlockType.DOWNLOAD_TO_S3  # type: ignore
+
+    url: str
+
+
+class UploadToS3BlockYAML(BlockYAML):
+    block_type: Literal[BlockType.UPLOAD_TO_S3] = BlockType.UPLOAD_TO_S3  # type: ignore
+
+    path: str | None = None
+
+
+class FileUploadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_UPLOAD] = BlockType.FILE_UPLOAD  # type: ignore
+
+    storage_type: FileStorageType = FileStorageType.S3
+    s3_bucket: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    region_name: str | None = None
+    azure_storage_account_name: str | None = None
+    azure_storage_account_key: str | None = None
+    azure_blob_container_name: str | None = None
+    path: str | None = None
+
+
+class SendEmailBlockYAML(BlockYAML):
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    # This pattern already works in block.py but since the BlockType is not defined in this file, mypy is not able
+    # to infer the type of the parameter_type attribute.
+    block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL  # type: ignore
+
+    smtp_host_secret_parameter_key: str
+    smtp_port_secret_parameter_key: str
+    smtp_username_secret_parameter_key: str
+    smtp_password_secret_parameter_key: str
+    sender: str
+    recipients: list[str]
+    subject: str
+    body: str
+    file_attachments: list[str] | None = None
+
+
+class FileParserBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_URL_PARSER] = BlockType.FILE_URL_PARSER  # type: ignore
+
+    file_url: str
+    file_type: FileType
+    json_schema: dict[str, Any] | None = None
+
+
+class PDFParserBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.PDF_PARSER] = BlockType.PDF_PARSER  # type: ignore
+
+    file_url: str
+    json_schema: dict[str, Any] | None = None
+
+
+class ValidationBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
+
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    parameter_keys: list[str] | None = None
+
+
+class ActionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
+    navigation_goal: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
+class NavigationBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.NAVIGATION] = BlockType.NAVIGATION  # type: ignore
+
+    navigation_goal: str
+    url: str | None = None
+    title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    complete_on_download: bool = False
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    complete_verification: bool = True
+    include_action_history_in_verification: bool = False
+
+
+class ExtractionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.EXTRACTION] = BlockType.EXTRACTION  # type: ignore
+
+    data_extraction_goal: str
+    url: str | None = None
+    title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
+    data_schema: dict[str, Any] | list | str | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    cache_actions: bool = False
+
+
+class LoginBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore
+
+    url: str | None = None
+    title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
+    navigation_goal: str | None = None
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+    complete_criterion: str | None = None
+    terminate_criterion: str | None = None
+    complete_verification: bool = True
+
+
+class WaitBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WAIT] = BlockType.WAIT  # type: ignore
+    wait_sec: int = 0
+
+
+class FileDownloadBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
+
+    navigation_goal: str
+    url: str | None = None
+    title: str = ""
+    engine: RunEngine = RunEngine.skyvern_v1
+    error_code_mapping: dict[str, str] | None = None
+    max_retries: int = 0
+    max_steps_per_run: int | None = None
+    parameter_keys: list[str] | None = None
+    download_suffix: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    cache_actions: bool = False
+
+
+class UrlBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.GOTO_URL] = BlockType.GOTO_URL  # type: ignore
+    url: str
+
+
+class TaskV2BlockYAML(BlockYAML):
+    block_type: Literal[BlockType.TaskV2] = BlockType.TaskV2  # type: ignore
+    prompt: str
+    url: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
+    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+
+
+class HttpRequestBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.HTTP_REQUEST] = BlockType.HTTP_REQUEST  # type: ignore
+
+    # Individual HTTP parameters
+    method: str = "GET"
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    body: dict[str, Any] | None = None  # Changed to consistently be dict only
+    timeout: int = 30
+    follow_redirects: bool = True
+
+    # Parameter keys for templating
+    parameter_keys: list[str] | None = None
+
+
+PARAMETER_YAML_SUBCLASSES = (
+    AWSSecretParameterYAML
+    | BitwardenLoginCredentialParameterYAML
+    | BitwardenSensitiveInformationParameterYAML
+    | BitwardenCreditCardDataParameterYAML
+    | OnePasswordCredentialParameterYAML
+    | WorkflowParameterYAML
+    | ContextParameterYAML
+    | OutputParameterYAML
+    | CredentialParameterYAML
+)
+PARAMETER_YAML_TYPES = Annotated[PARAMETER_YAML_SUBCLASSES, Field(discriminator="parameter_type")]
+
+BLOCK_YAML_SUBCLASSES = (
+    TaskBlockYAML
+    | ForLoopBlockYAML
+    | CodeBlockYAML
+    | TextPromptBlockYAML
+    | DownloadToS3BlockYAML
+    | UploadToS3BlockYAML
+    | FileUploadBlockYAML
+    | SendEmailBlockYAML
+    | FileParserBlockYAML
+    | ValidationBlockYAML
+    | ActionBlockYAML
+    | NavigationBlockYAML
+    | ExtractionBlockYAML
+    | LoginBlockYAML
+    | WaitBlockYAML
+    | FileDownloadBlockYAML
+    | UrlBlockYAML
+    | PDFParserBlockYAML
+    | TaskV2BlockYAML
+    | HttpRequestBlockYAML
+)
+BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
+
+
+class WorkflowDefinitionYAML(BaseModel):
+    parameters: list[PARAMETER_YAML_TYPES]
+    blocks: list[BLOCK_YAML_TYPES]
+
+
+class WorkflowCreateYAMLRequest(BaseModel):
+    title: str
+    description: str | None = None
+    proxy_location: ProxyLocation | None = None
+    webhook_callback_url: str | None = None
+    totp_verification_url: str | None = None
+    totp_identifier: str | None = None
+    persist_browser_session: bool = False
+    model: dict[str, Any] | None = None
+    workflow_definition: WorkflowDefinitionYAML
+    is_saved_task: bool = False
+    max_screenshot_scrolls: int | None = None
+    extra_http_headers: dict[str, str] | None = None
+    status: WorkflowStatus = WorkflowStatus.published
+    generate_script: bool = False
+    cache_key: str | None = None
 
 
 class WorkflowRequest(BaseModel):

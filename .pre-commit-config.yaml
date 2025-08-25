@@ -23,7 +23,7 @@ repos:
         always_run: true
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.11.13
+    rev: v0.12.1
     hooks:
       # Run the linter.
       - id: ruff
@@ -57,11 +57,10 @@ repos:
       - id: pyupgrade
         exclude: |
           (?x)(
-            ^skyvern/client/.*|
-            ^skyvern/cli/.*
+          ^skyvern/client/.*
           )
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.16.0
+    rev: v1.16.1
     hooks:
       - id: mypy
         args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs]
@@ -116,6 +115,6 @@ repos:
     hooks:
       - id: shellcheck
   - repo: https://github.com/google/yamlfmt
-    rev: v0.17.0
+    rev: v0.17.2
     hooks:
       - id: yamlfmt

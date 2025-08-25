@@ -1,11 +1,10 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useState, useEffect } from "react";
 import { Cross2Icon } from "@radix-ui/react-icons";
 import "./workflow-block-input-set.css";
-import { useWorkflowParametersState } from "@/routes/workflows/editor/useWorkflowParametersState";
-
 type Props = {
   onChange: (parameterKeys: Set<string>) => void;
   nodeId: string;
@@ -16,7 +15,7 @@ function WorkflowBlockInputSet(props: Props) {
   const { nodeId, onChange, values } = props;
   const [parameterKeys, setParameterKeys] = useState<Set<string>>(values);
   const hasKeys = parameterKeys.size > 0;
-  const [workflowParameters] = useWorkflowParametersState();
+  const { parameters: workflowParameters } = useWorkflowParametersStore();
   const availableParameterKeys = new Set(
     workflowParameters.map((parameter) => parameter.key),
   );

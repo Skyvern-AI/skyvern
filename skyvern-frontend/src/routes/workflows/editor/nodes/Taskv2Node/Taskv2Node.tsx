@@ -9,29 +9,32 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
-import { NodeActionMenu } from "../NodeActionMenu";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { MAX_STEPS_DEFAULT, type Taskv2Node } from "./types";
 import { ModelSelector } from "@/components/ModelSelector";
+import { cn } from "@/util/utils";
+import { NodeHeader } from "../components/NodeHeader";
+import { useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
+  const { editable, label } = data;
+  const { blockLabel: urlBlockLabel } = useParams();
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const deleteNodeCallback = useDeleteNodeCallback();
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const rerender = useRerender({ prefix: "accordian" });
 
   const [inputs, setInputs] = useState({
     prompt: data.prompt,
@@ -64,34 +67,24 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <div className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.Taskv2}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">
-                Navigation v2 Block
-              </span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </div>
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none": thisBlockIsPlaying,
+            "bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsTargetted,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={inputs.totpIdentifier}
+          totpUrl={inputs.totpVerificationUrl}
+          type="task_v2" // sic: the naming is not consistent
+        />
         <div className="space-y-4">
           <div className="space-y-2">
             <div className="flex justify-between">
@@ -115,6 +108,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
           <div className="space-y-2">
             <Label className="text-xs text-slate-300">URL</Label>
             <WorkflowBlockInputTextarea
+              canWriteTitle={true}
               nodeId={id}
               onChange={(value) => {
                 handleChange("url", value);
@@ -126,12 +120,16 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
           </div>
         </div>
         <Separator />
-        <Accordion type="single" collapsible>
+        <Accordion
+          type="single"
+          collapsible
+          onValueChange={() => rerender.bump()}
+        >
           <AccordionItem value="advanced" className="border-b-0">
             <AccordionTrigger className="py-0">
               Advanced Settings
             </AccordionTrigger>
-            <AccordionContent className="pl-6 pr-1 pt-4">
+            <AccordionContent key={rerender.key} className="pl-6 pr-1 pt-4">
               <div className="space-y-4">
                 <ModelSelector
                   className="nopan w-52 text-xs"

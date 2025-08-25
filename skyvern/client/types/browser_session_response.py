@@ -37,6 +37,16 @@ class BrowserSessionResponse(UniversalBaseModel):
     Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes.
     """
 
+    browser_address: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Url for connecting to the browser
+    """
+
+    app_url: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Url for the browser session page
+    """
+
     started_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
     """
     Timestamp when the session was started

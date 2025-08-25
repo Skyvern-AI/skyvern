@@ -1,49 +1,36 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { useState } from "react";
-import { AppNode } from "..";
 import { helpTooltips } from "../../helpContent";
-import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
-import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { type TextPromptNode } from "./types";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { dataSchemaExampleValue } from "../types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { ModelSelector } from "@/components/ModelSelector";
+import { cn } from "@/util/utils";
+import { NodeHeader } from "../components/NodeHeader";
+import { useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const { editable, label } = data;
+  const { blockLabel: urlBlockLabel } = useParams();
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const [inputs, setInputs] = useState({
     prompt: data.prompt,
     jsonSchema: data.jsonSchema,
     model: data.model,
-  });
-
-  const nodes = useNodes<AppNode>();
-  const edges = useEdges();
-  const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
-
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -70,32 +57,24 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
         id="b"
         className="opacity-0"
       />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <div className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.TextPrompt}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={data.editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">Text Prompt Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </div>
+      <div
+        className={cn(
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          {
+            "pointer-events-none": thisBlockIsPlaying,
+            "bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsTargetted,
+          },
+        )}
+      >
+        <NodeHeader
+          blockLabel={label}
+          editable={editable}
+          nodeId={id}
+          totpIdentifier={null}
+          totpUrl={null}
+          type="text_prompt" // sic: the naming is not consistent
+        />
         <div className="space-y-2">
           <div className="flex justify-between">
             <div className="flex gap-2">
@@ -117,15 +96,6 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
             value={inputs.prompt}
             placeholder="What do you want to generate?"
             className="nopan text-xs"
-          />
-        </div>
-        <div className="space-y-2">
-          <ParametersMultiSelect
-            availableOutputParameters={outputParameterKeys}
-            parameters={data.parameterKeys}
-            onParametersChange={(parameterKeys) => {
-              updateNodeData(id, { parameterKeys });
-            }}
           />
         </div>
         <Separator />

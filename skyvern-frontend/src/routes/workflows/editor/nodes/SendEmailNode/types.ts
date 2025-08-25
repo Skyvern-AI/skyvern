@@ -8,6 +8,7 @@ import {
   SMTP_USERNAME_PARAMETER_KEY,
 } from "../../constants";
 import { NodeBaseData } from "../types";
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type SendEmailNodeData = NodeBaseData & {
   recipients: string;
@@ -24,6 +25,7 @@ export type SendEmailNodeData = NodeBaseData & {
 export type SendEmailNode = Node<SendEmailNodeData, "sendEmail">;
 
 export const sendEmailNodeDefaultData: SendEmailNodeData = {
+  debuggable: debuggableWorkflowBlockTypes.has("send_email"),
   recipients: "",
   subject: "",
   body: "",

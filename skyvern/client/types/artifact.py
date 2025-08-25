@@ -29,7 +29,7 @@ class Artifact(UniversalBaseModel):
     observer_thought_id: typing.Optional[str] = None
     ai_suggestion_id: typing.Optional[str] = None
     signed_url: typing.Optional[str] = None
-    organization_id: typing.Optional[str] = None
+    organization_id: str
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

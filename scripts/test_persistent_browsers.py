@@ -103,18 +103,6 @@ def close_all_sessions() -> None:
         print(f"Error closing sessions: {str(e)}")
 
 
-async def direct_get_network_info(session_id: str) -> None:
-    """Get network info directly from PersistentSessionsManager"""
-    try:
-        manager = app.PERSISTENT_SESSIONS_MANAGER
-        cdp_port, ip_address = await manager.get_network_info(session_id)
-        print("\nNetwork info:")
-        print(f"  CDP Port: {cdp_port}")
-        print(f"  IP Address: {ip_address}")
-    except Exception as e:
-        print(f"Error getting network info: {str(e)}")
-
-
 async def direct_list_sessions(organization_id: str) -> None:
     """List sessions directly from PersistentSessionsManager"""
     try:
@@ -143,11 +131,6 @@ async def handle_direct_command(cmd: str, args: list[str]) -> None:
     """Handle direct method calls"""
     if cmd == "help_direct":
         print_direct_help()
-    elif cmd == "direct_network":
-        if not args:
-            print("Error: session_id required")
-            return
-        await direct_get_network_info(args[0])
     elif cmd == "direct_list":
         if not args:
             print("Error: organization_id required")

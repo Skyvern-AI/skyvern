@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 
@@ -29,6 +29,25 @@ class OrganizationAuthToken(BaseModel):
     valid: bool
     created_at: datetime
     modified_at: datetime
+
+
+class CreateOnePasswordTokenRequest(BaseModel):
+    """Request model for creating or updating a 1Password service account token."""
+
+    token: str = Field(
+        ...,
+        description="The 1Password service account token",
+        examples=["op_1234567890abcdef"],
+    )
+
+
+class CreateOnePasswordTokenResponse(BaseModel):
+    """Response model for 1Password token operations."""
+
+    token: OrganizationAuthToken = Field(
+        ...,
+        description="The created or updated 1Password service account token",
+    )
 
 
 class GetOrganizationsResponse(BaseModel):

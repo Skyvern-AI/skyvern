@@ -48,7 +48,7 @@ function ImportWorkflowButton() {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
-      navigate(`/workflows/${response.data.workflow_permanent_id}/edit`);
+      navigate(`/workflows/${response.data.workflow_permanent_id}/debug`);
     },
     onError: (error: AxiosError) => {
       toast({

@@ -1,6 +1,7 @@
 import { User } from "@/api/types";
 import { createContext } from "react";
 
-const UserContext = createContext<User | null>(null);
+type GetUser = () => User | null;
+const UserContext = createContext<GetUser>(() => null);
 
 export { UserContext };

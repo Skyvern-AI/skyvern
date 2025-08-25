@@ -1,5 +1,5 @@
 import { useEdges, useNodes } from "@xyflow/react";
-import { useWorkflowParametersState } from "../useWorkflowParametersState";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { AppNode } from ".";
 import { getAvailableOutputParameterKeys } from "../workflowEditorUtils";
 import { PlusIcon } from "@radix-ui/react-icons";
@@ -15,7 +15,7 @@ type Props = {
 
 function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
   const [content, setContent] = useState("parameters");
-  const [workflowParameters] = useWorkflowParametersState();
+  const { parameters: workflowParameters } = useWorkflowParametersStore();
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(

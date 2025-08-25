@@ -18,6 +18,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
@@ -231,7 +232,9 @@ async def _convert_svg_to_string(
         for retry in range(SVG_SHAPE_CONVERTION_ATTEMPTS):
             try:
                 async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                    json_response = await app.SECONDARY_LLM_API_HANDLER(
+                    if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                        raise Exception("To enable svg shape conversion, please set the Secondary LLM key")
+                    json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
                         prompt=svg_convert_prompt, step=step, prompt_name="svg-convert"
                     )
                 svg_shape = json_response.get("shape", "")
@@ -389,7 +392,9 @@ async def _convert_css_shape_to_string(
             for retry in range(CSS_SHAPE_CONVERTION_ATTEMPTS):
                 try:
                     async with asyncio.timeout(_LLM_CALL_TIMEOUT_SECONDS):
-                        json_response = await app.SECONDARY_LLM_API_HANDLER(
+                        if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                            raise Exception("To enable css shape conversion, please set the Secondary LLM key")
+                        json_response = await app.SVG_CSS_CONVERTER_LLM_API_HANDLER(
                             prompt=prompt, screenshots=[screenshot], step=step, prompt_name="css-shape-convert"
                         )
                     css_shape = json_response.get("shape", "")
@@ -538,6 +543,7 @@ class AgentFunction:
     ) -> CleanupElementTreeFunc:
         MAX_ELEMENT_CNT = 3000
 
+        @TraceManager.traced_async(ignore_input=True)
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
             """
             Remove rect and attribute.unique_id from the elements.
@@ -567,7 +573,9 @@ class AgentFunction:
                     LOG.warning(
                         f"Element reached max count {MAX_ELEMENT_CNT}, will stop converting svg and css element."
                     )
-                element_exceeded = element_cnt > MAX_ELEMENT_CNT
+                disable_conversion = element_cnt > MAX_ELEMENT_CNT
+                if app.SVG_CSS_CONVERTER_LLM_API_HANDLER is None:
+                    disable_conversion = True
 
                 if queue_ele.get("frame_index") != current_frame_index:
                     new_frame = next(
@@ -579,10 +587,10 @@ class AgentFunction:
                 _remove_rect(queue_ele)
 
                 # Check SVG eligibility and store for later conversion
-                if await _check_svg_eligibility(skyvern_frame, queue_ele, task, step, always_drop=element_exceeded):
+                if await _check_svg_eligibility(skyvern_frame, queue_ele, task, step, always_drop=disable_conversion):
                     eligible_svgs.append((queue_ele, skyvern_frame))
 
-                if not element_exceeded and _should_css_shape_convert(element=queue_ele):
+                if not disable_conversion and _should_css_shape_convert(element=queue_ele):
                     await _convert_css_shape_to_string(
                         skyvern_frame=skyvern_frame,
                         element=queue_ele,

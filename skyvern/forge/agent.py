@@ -19,7 +19,7 @@ from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOADING_SUFFIX,
-    DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES,
+    DEFAULT_MAX_SCREENSHOT_SCROLLS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -27,6 +27,7 @@ from skyvern.constants import (
     ScrapeType,
 )
 from skyvern.exceptions import (
+    BrowserSessionNotFound,
     BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
@@ -70,10 +71,12 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service
 from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.image_resizer import Resolution
@@ -93,7 +96,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
-from skyvern.webeye.actions.models import AgentStepOutput, DetailedAgentStepOutput
+from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
     parse_anthropic_actions,
@@ -183,8 +186,9 @@ class ForgeAgent:
             error_code_mapping=task_block.error_code_mapping,
             include_action_history_in_verification=task_block.include_action_history_in_verification,
             model=task_block.model,
-            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolling_times,
+            max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             extra_http_headers=workflow_run.extra_http_headers,
+            browser_address=workflow_run.browser_address,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -223,6 +227,15 @@ class ForgeAgent:
     async def create_task(self, task_request: TaskRequest, organization_id: str) -> Task:
         webhook_callback_url = str(task_request.webhook_callback_url) if task_request.webhook_callback_url else None
         totp_verification_url = str(task_request.totp_verification_url) if task_request.totp_verification_url else None
+        # validate browser session id
+        if task_request.browser_session_id:
+            browser_session = await app.DATABASE.get_persistent_browser_session(
+                session_id=task_request.browser_session_id,
+                organization_id=organization_id,
+            )
+            if not browser_session:
+                raise BrowserSessionNotFound(browser_session_id=task_request.browser_session_id)
+
         task = await app.DATABASE.create_task(
             url=str(task_request.url),
             title=task_request.title,
@@ -241,8 +254,10 @@ class ForgeAgent:
             application=task_request.application,
             include_action_history_in_verification=task_request.include_action_history_in_verification,
             model=task_request.model,
-            max_screenshot_scrolling_times=task_request.max_screenshot_scrolling_times,
+            max_screenshot_scrolling_times=task_request.max_screenshot_scrolls,
             extra_http_headers=task_request.extra_http_headers,
+            browser_session_id=task_request.browser_session_id,
+            browser_address=task_request.browser_address,
         )
         LOG.info(
             "Created new task",
@@ -257,6 +272,9 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
+    @TraceManager.traced_async(
+        ignore_inputs=["api_key", "close_browser_on_completion", "task_block", "cua_response", "llm_caller"]
+    )
     async def execute_step(
         self,
         organization: Organization,
@@ -276,6 +294,10 @@ class ForgeAgent:
         # 2. It will significantly slow down CUA tasks
         if engine in CUA_ENGINES:
             complete_verification = False
+
+        close_browser_on_completion = (
+            close_browser_on_completion and browser_session_id is None and not task.browser_address
+        )
 
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -337,7 +359,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=True,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, None, None
 
@@ -361,7 +383,9 @@ class ForgeAgent:
         try:
             if task.workflow_run_id:
                 list_files_before = list_files_in_directory(
-                    get_path_for_workflow_download_directory(task.workflow_run_id)
+                    get_path_for_workflow_download_directory(
+                        context.run_id if context and context.run_id else task.workflow_run_id
+                    )
                 )
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await app.AGENT_FUNCTION.validate_step_execution(task, step)
@@ -393,7 +417,7 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     need_call_webhook=True,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
                 return step, detailed_output, None
@@ -417,8 +441,9 @@ class ForgeAgent:
                 if not llm_caller:
                     # create a new UI-TARS llm_caller
                     llm_key = task.llm_key or settings.VOLCENGINE_CUA_LLM_KEY
-                    llm_caller = UITarsLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=True)
-                    llm_caller.initialize_conversation(task)
+                    ui_tars_llm_caller = UITarsLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=True)
+                    ui_tars_llm_caller.initialize_conversation(task)
+                    llm_caller = ui_tars_llm_caller
 
             # TODO: remove the code after migrating everything to llm callers
             # currently, only anthropic cua and ui_tars tasks use llm_caller
@@ -437,11 +462,13 @@ class ForgeAgent:
                 llm_caller=llm_caller,
             )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
-            task = await self.update_task_errors_from_detailed_output(task, detailed_output)
+            task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             retry = False
 
             if task_block and task_block.complete_on_download and task.workflow_run_id:
-                workflow_download_directory = get_path_for_workflow_download_directory(task.workflow_run_id)
+                workflow_download_directory = get_path_for_workflow_download_directory(
+                    context.run_id if context and context.run_id else task.workflow_run_id
+                )
 
                 downloading_files: list[Path] = list_downloading_files_in_directory(workflow_download_directory)
                 if len(downloading_files) > 0:
@@ -497,7 +524,7 @@ class ForgeAgent:
                         task=completed_task,
                         last_step=last_step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
@@ -514,7 +541,7 @@ class ForgeAgent:
                         task=task,
                         last_step=step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return step, detailed_output, None
@@ -537,7 +564,7 @@ class ForgeAgent:
                         task=task,
                         last_step=last_step,
                         api_key=api_key,
-                        close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                        close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
@@ -622,7 +649,7 @@ class ForgeAgent:
                 task=task,
                 last_step=step,
                 api_key=api_key,
-                close_browser_on_completion=browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
@@ -639,7 +666,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
             else:
@@ -674,7 +701,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     need_final_screenshot=False,
                     browser_session_id=browser_session_id,
                 )
@@ -696,7 +723,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
         except InvalidTaskStatusTransition:
@@ -712,7 +739,7 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
         except (UnsupportedActionType, UnsupportedTaskType, FailedToParseActionInstruction) as e:
@@ -730,26 +757,28 @@ class ForgeAgent:
                 api_key=api_key,
                 need_call_webhook=False,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
             )
             return step, detailed_output, None
-        except ScrapingFailed:
+        except ScrapingFailed as sfe:
             LOG.warning(
                 "Scraping failed, marking the task as failed",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 exc_info=True,
             )
+
             await self.fail_task(
                 task,
                 step,
-                "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
+                sfe.reason
+                or "Skyvern failed to load the website. This usually happens when the website is not properly designed, and crashes the browser as a result.",
             )
             await self.clean_up_task(
                 task=task,
                 last_step=step,
                 api_key=api_key,
-                close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
@@ -770,7 +799,7 @@ class ForgeAgent:
                     task=task,
                     last_step=step,
                     api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion and browser_session_id is None,
+                    close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
             else:
@@ -818,6 +847,9 @@ class ForgeAgent:
             )
             return True
 
+    @TraceManager.traced_async(
+        ignore_inputs=["browser_state", "organization", "task_block", "cua_response", "llm_caller"]
+    )
     async def agent_step(
         self,
         task: Task,
@@ -847,6 +879,12 @@ class ForgeAgent:
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
+
+            # Update context with step_id for auto action/screenshot creation
+            context = skyvern_context.current()
+            if context:
+                context.step_id = step.step_id
+
             step = await self.update_step(step=step, status=StepStatus.running)
             await app.AGENT_FUNCTION.prepare_step_execution(
                 organization=organization, task=task, step=step, browser_state=browser_state
@@ -1373,7 +1411,7 @@ class ForgeAgent:
                 reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
                 assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
                 skyvern_repsonse_prompt = load_prompt_with_elements(
-                    scraped_page=scraped_page,
+                    element_tree_builder=scraped_page,
                     prompt_engine=prompt_engine,
                     template_name="cua-answer-question",
                     navigation_goal=task.navigation_goal,
@@ -1503,7 +1541,20 @@ class ForgeAgent:
                 window_dimension=window_dimension,
             )
         else:
+            current_context = skyvern_context.ensure_context()
+            resp_content = None
+            if task.task_id in current_context.totp_codes:
+                verification_code = current_context.totp_codes[task.task_id]
+                current_context.totp_codes.pop(task.task_id)
+                LOG.info(
+                    "Using verification code from context for anthropic CU call",
+                    task_id=task.task_id,
+                    verification_code=verification_code,
+                )
+                resp_content = f"Here is the verification code: {verification_code}"
+
             llm_response = await llm_caller.call(
+                prompt=resp_content,
                 step=step,
                 screenshots=scraped_page.screenshots,
                 use_message_history=True,
@@ -1597,7 +1648,7 @@ class ForgeAgent:
             actions_and_results_str = await self._get_action_results(task, current_step=step)
 
         verification_prompt = load_prompt_with_elements(
-            scraped_page=scraped_page_refreshed,
+            element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
             template_name="check-user-goal",
             navigation_goal=task.navigation_goal,
@@ -1662,9 +1713,9 @@ class ForgeAgent:
             raise BrowserStateMissingPage()
 
         context = skyvern_context.ensure_context()
-        scrolling_number = context.max_screenshot_scrolling_times
+        scrolling_number = context.max_screenshot_scrolls
         if scrolling_number is None:
-            scrolling_number = DEFAULT_MAX_SCREENSHOT_SCROLLING_TIMES
+            scrolling_number = DEFAULT_MAX_SCREENSHOT_SCROLLS
 
         if engine in CUA_ENGINES:
             scrolling_number = 0
@@ -1849,7 +1900,7 @@ class ForgeAgent:
                     step_id=step.step_id,
                     exc_info=True,
                 )
-                raise ScrapingFailed()
+                raise e
 
         if scraped_page is None:
             raise EmptyScrapePage()
@@ -1974,7 +2025,7 @@ class ForgeAgent:
 
         context = skyvern_context.ensure_context()
         return load_prompt_with_elements(
-            scraped_page=scraped_page,
+            element_tree_builder=scraped_page,
             prompt_engine=prompt_engine,
             template_name=template,
             navigation_goal=navigation_goal,
@@ -2185,8 +2236,10 @@ class ForgeAgent:
         if task.organization_id:
             try:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                    context = skyvern_context.current()
                     await app.STORAGE.save_downloaded_files(
-                        task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
+                        organization_id=task.organization_id,
+                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
@@ -2281,6 +2334,11 @@ class ForgeAgent:
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
+                await app.DATABASE.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    webhook_failure_reason="",
+                )
             else:
                 LOG.info(
                     "Webhook failed",
@@ -2288,6 +2346,11 @@ class ForgeAgent:
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
+                )
+                await app.DATABASE.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
                 )
         except Exception as e:
             raise FailedToSendWebhook(task_id=task.task_id) from e
@@ -2347,8 +2410,10 @@ class ForgeAgent:
         if task.organization_id:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    context = skyvern_context.current()
                     downloaded_files = await app.STORAGE.get_downloaded_files(
-                        organization_id=task.organization_id, task_id=task.task_id, workflow_run_id=task.workflow_run_id
+                        organization_id=task.organization_id,
+                        run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
@@ -2508,6 +2573,7 @@ class ForgeAgent:
         status: TaskStatus,
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> Task:
         # refresh task from db to get the latest status
         task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)

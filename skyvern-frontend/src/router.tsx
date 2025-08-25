@@ -1,4 +1,5 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
+import { BrowserSession } from "@/routes/browserSession/BrowserSession";
 import { PageLayout } from "./components/PageLayout";
 import { DiscoverPage } from "./routes/discover/DiscoverPage";
 import { HistoryPage } from "./routes/history/HistoryPage";
@@ -22,11 +23,20 @@ import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/Workfl
 import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
+import { DebugStoreProvider } from "@/store/DebugStoreContext";
 
 const router = createBrowserRouter([
   {
+    path: "browser-session/:browserSessionId",
+    element: <BrowserSession />,
+  },
+  {
     path: "/",
-    element: <RootLayout />,
+    element: (
+      <DebugStoreProvider>
+        <RootLayout />
+      </DebugStoreProvider>
+    ),
     children: [
       {
         index: true,
@@ -97,6 +107,14 @@ const router = createBrowserRouter([
               {
                 index: true,
                 element: <Navigate to="runs" />,
+              },
+              {
+                path: "debug",
+                element: <WorkflowEditor />,
+              },
+              {
+                path: ":workflowRunId/:blockLabel/debug",
+                element: <WorkflowEditor />,
               },
               {
                 path: "edit",

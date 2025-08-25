@@ -1,6 +1,7 @@
 import type { Node } from "@xyflow/react";
 import { NodeBaseData } from "../types";
 import { RunEngine } from "@/api/types";
+import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
 export type FileDownloadNodeData = NodeBaseData & {
   url: string;
@@ -19,6 +20,7 @@ export type FileDownloadNodeData = NodeBaseData & {
 export type FileDownloadNode = Node<FileDownloadNodeData, "fileDownload">;
 
 export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
+  debuggable: debuggableWorkflowBlockTypes.has("file_download"),
   label: "",
   url: "",
   navigationGoal: "",

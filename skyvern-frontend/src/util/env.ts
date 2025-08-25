@@ -21,10 +21,30 @@ if (!artifactApiBaseUrl) {
 
 const apiPathPrefix = import.meta.env.VITE_API_PATH_PREFIX ?? "";
 
+const lsKeys = {
+  browserSessionId: "skyvern.browserSessionId",
+};
+
+const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
+
+let newWssBaseUrl = wssBaseUrl;
+try {
+  const url = new URL(wssBaseUrl);
+  if (url.pathname.startsWith("/api")) {
+    url.pathname = url.pathname.replace(/^\/api/, "");
+  }
+  newWssBaseUrl = url.toString();
+} catch (e) {
+  newWssBaseUrl = wssBaseUrl.replace("/api", "");
+}
+
 export {
   apiBaseUrl,
   environment,
   envCredential,
   artifactApiBaseUrl,
   apiPathPrefix,
+  lsKeys,
+  wssBaseUrl,
+  newWssBaseUrl,
 };

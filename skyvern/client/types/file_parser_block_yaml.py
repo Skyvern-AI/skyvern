@@ -10,6 +10,7 @@ import pydantic
 class FileParserBlockYaml(UniversalBaseModel):
     label: str
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
     file_type: FileType = "csv"
 

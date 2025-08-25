@@ -152,6 +152,28 @@ class ContextParameterSource_BitwardenCreditCardData(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class ContextParameterSource_Onepassword(UniversalBaseModel):
+    parameter_type: typing.Literal["onepassword"] = "onepassword"
+    key: str
+    description: typing.Optional[str] = None
+    onepassword_credential_parameter_id: str
+    workflow_id: str
+    vault_id: str
+    item_id: str
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class ContextParameterSource_Output(UniversalBaseModel):
     parameter_type: typing.Literal["output"] = "output"
     key: str
@@ -200,6 +222,7 @@ ContextParameterSource = typing.Union[
     ContextParameterSource_BitwardenLoginCredential,
     ContextParameterSource_BitwardenSensitiveInformation,
     ContextParameterSource_BitwardenCreditCardData,
+    ContextParameterSource_Onepassword,
     ContextParameterSource_Output,
     ContextParameterSource_Credential,
 ]

@@ -228,16 +228,16 @@ Inputs:
 
 Downloads and parses a file to be used within other workflow blocks.
 
-**Supported types:** CSV
+**Supported types:** CSV, TSV, Excel, PDF
 
 ```
 - block_type: file_url_parser
-  label: csv_parser
-  file_type: csv
-  file_url: <csv_file_url>
+  label: file_parser
+  file_type: csv  # Auto-detected from URL extension
+  file_url: <file_url>
 ```
 
 Inputs: 
 
-1. **File URL *(required):*** This block allows you to use a CSV within your workflow. 
+1. **File URL *(required):*** This block allows you to use CSV, TSV, Excel, and PDF files within your workflow. 
     * Since we’re still in beta, you will need to [contact us](https://meetings.hubspot.com/skyvern/demo?uuid=7c83865f-1a92-4c44-9e52-1ba0dbc04f7a) to load a value into this block

@@ -84,6 +84,22 @@ class S3Storage(BaseStorage):
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"{self._build_base_uri(organization_id)}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
 
+    def build_script_file_uri(
+        self, *, organization_id: str, script_id: str, script_version: int, file_path: str
+    ) -> str:
+        """Build the S3 URI for a script file.
+
+        Args:
+            organization_id: The organization ID
+            script_id: The script ID
+            script_version: The script version
+            file_path: The file path relative to script root
+
+        Returns:
+            The S3 URI for the script file
+        """
+        return f"{self._build_base_uri(organization_id)}/scripts/{script_id}/{script_version}/{file_path}"
+
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)
         tags = await self._get_tags_for_org(artifact.organization_id)
@@ -179,14 +195,14 @@ class S3Storage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
-    async def save_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> None:
-        download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
+    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
+        download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         sc = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
-        base_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
+        base_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
+        )
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -209,10 +225,8 @@ class S3Storage(BaseStorage):
                 tags=tags,
             )
 
-    async def get_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[FileInfo]:
-        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
+    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
             return []

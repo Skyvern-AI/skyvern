@@ -89,7 +89,7 @@ function WorkflowPage() {
             />
           )}
           <Button asChild variant="secondary">
-            <Link to={`/workflows/${workflowPermanentId}/edit`}>
+            <Link to={`/workflows/${workflowPermanentId}/debug`}>
               <Pencil2Icon className="mr-2 size-4" />
               Edit
             </Link>
