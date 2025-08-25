@@ -120,7 +120,7 @@ function WorkflowRun() {
   const failureTips: { match: (reason: string) => boolean; tip: string }[] = [
     {
       match: (reason) => reason.includes("Invalid master password"),
-      tip: "Tip: If inputting the master password via Docker Compose, make sure to double any dollar signs and do not surround it with quotes."
+      tip: "Tip: If inputting the master password via Docker Compose or in any container environment, make sure to double any dollar signs and do not surround it with quotes."
     }
     // Add more tips as needed
   ];
