@@ -120,21 +120,22 @@ function WorkflowRun() {
   const failureTips: { match: (reason: string) => boolean; tip: string }[] = [
     {
       match: (reason) => reason.includes("Invalid master password"),
-      tip: "Tip: If inputting the master password via Docker Compose or in any container environment, make sure to double any dollar signs and do not surround it with quotes."
-    }
+      tip: "Tip: If inputting the master password via Docker Compose or in any container environment, make sure to double any dollar signs and do not surround it with quotes.",
+    },
     // Add more tips as needed
   ];
 
-  const matchedTips =
-    workflowRun?.failure_reason
-      ? failureTips
-        .filter(({ match }) => match(workflowRun.failure_reason))
+  const failureReason = workflowRun?.failure_reason;
+
+  const matchedTips = failureReason
+    ? failureTips
+        .filter(({ match }) => match(failureReason))
         .map(({ tip }, index) => (
           <div key={index} className="text-sm italic text-red-700">
             {tip}
           </div>
         ))
-      : null;
+    : null;
 
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div
