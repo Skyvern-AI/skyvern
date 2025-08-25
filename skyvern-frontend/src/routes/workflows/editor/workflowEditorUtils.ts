@@ -703,6 +703,8 @@ function getElements(
       editable,
       useScriptCache: settings.useScriptCache,
       scriptCacheKey: settings.scriptCacheKey,
+      label: "__start_block__",
+      showCode: false,
     }),
   );
 
@@ -733,6 +735,8 @@ function getElements(
         {
           withWorkflowSettings: false,
           editable,
+          label: "__start_block__",
+          showCode: false,
         },
         block.id,
       ),

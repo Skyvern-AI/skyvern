@@ -417,6 +417,8 @@ function Workspace({
           {
             withWorkflowSettings: false,
             editable: true,
+            label: "__start_block__",
+            showCode: false,
           },
           id,
         ),
