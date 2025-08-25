@@ -2,11 +2,7 @@ import { ActionsApiResponse, ActionTypes, Status } from "@/api/types";
 import { Separator } from "@/components/ui/separator";
 import { ActionTypePill } from "@/routes/tasks/detail/ActionTypePill";
 import { cn } from "@/util/utils";
-import {
-  CheckCircledIcon,
-  CrossCircledIcon,
-  LightningBoltIcon,
-} from "@radix-ui/react-icons";
+import { CodeIcon } from "@radix-ui/react-icons";
 import { useCallback } from "react";
 
 type Props = {
@@ -45,24 +41,15 @@ function ActionCard({ action, onClick, active, index }: Props) {
       ref={refCallback}
     >
       <div className="flex-1 space-y-2 p-4 pl-5">
-        <div className="flex justify-between">
+        <div className="flex justify-start gap-2">
           <div className="flex items-center gap-2">
             <span>#{index}</span>
           </div>
           <div className="flex items-center gap-2">
             <ActionTypePill actionType={action.action_type} />
-            {action.created_by === "script" && (
+            {action.created_by !== "script" && (
               <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-              </div>
-            )}
-            {success ? (
-              <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                <CheckCircledIcon className="h-4 w-4 text-success" />
-              </div>
-            ) : (
-              <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
-                <CrossCircledIcon className="h-4 w-4 text-destructive" />
+                <CodeIcon className="h-4 w-4" />
               </div>
             )}
           </div>
