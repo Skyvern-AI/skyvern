@@ -16,6 +16,7 @@ class LiteLLMParams(TypedDict, total=False):
     model_info: dict[str, Any] | None
     vertex_credentials: str | None
     vertex_location: str | None
+    thinking: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
