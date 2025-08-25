@@ -787,7 +787,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -798,7 +803,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -809,7 +819,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -820,7 +835,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -831,7 +851,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
 
@@ -1027,8 +1052,11 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-pro" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -1043,8 +1071,11 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-pro-preview-05-06" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -1059,8 +1090,11 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -1075,8 +1109,11 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -1091,8 +1128,11 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-04-17" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -1107,8 +1147,11 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
-            reasoning_effort=settings.GEMINI_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
