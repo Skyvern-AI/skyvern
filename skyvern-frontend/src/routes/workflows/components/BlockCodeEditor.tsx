@@ -95,15 +95,13 @@ function BlockCodeEditor({
           <div className="absolute right-[-0.5rem] top-0 flex h-[2rem] w-[2rem] items-center justify-center rounded hover:bg-slate-800">
             <ExitIcon
               onClick={() => {
-                if (onExit) {
-                  const result = onExit();
+                const result = onExit ? onExit() : true;
 
-                  if (result !== false) {
-                    toggleScriptForNodeCallback({
-                      label: blockLabel,
-                      show: false,
-                    });
-                  }
+                if (result !== false) {
+                  toggleScriptForNodeCallback({
+                    label: blockLabel,
+                    show: false,
+                  });
                 }
               }}
               className="size-5 cursor-pointer"

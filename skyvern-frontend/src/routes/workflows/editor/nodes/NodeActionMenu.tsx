@@ -10,7 +10,7 @@ import { DotsHorizontalIcon } from "@radix-ui/react-icons";
 import { OrgWalled } from "@/components/Orgwalled";
 
 type Props = {
-  isDeleteable?: boolean;
+  isDeletable?: boolean;
   isScriptable?: boolean;
   showScriptText?: string;
   onDelete?: () => void;
@@ -18,13 +18,13 @@ type Props = {
 };
 
 function NodeActionMenu({
-  isDeleteable = true,
+  isDeletable = true,
   isScriptable = false,
   showScriptText,
   onDelete,
   onShowScript,
 }: Props) {
-  if (!isDeleteable && !isScriptable) {
+  if (!isDeletable && !isScriptable) {
     return null;
   }
 
@@ -36,7 +36,7 @@ function NodeActionMenu({
       <DropdownMenuContent>
         <DropdownMenuLabel>Block Actions</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        {isDeleteable && (
+        {isDeletable && (
           <DropdownMenuItem
             onSelect={() => {
               onDelete?.();
