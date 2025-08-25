@@ -36,7 +36,7 @@ services:
       # - ./skyvern:/app/skyvern
       # - ./alembic:/app/alembic
     environment:
-      - DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern
+      - DATABASE_STRING=${DATABASE_STRING}
       - BROWSER_TYPE=chromium-headful
       - ENABLE_CODE_BLOCK=true
       # - BROWSER_TYPE=cdp-connect
