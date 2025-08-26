@@ -127,6 +127,7 @@ function Workspace({
     "history",
     "infiniteCanvas",
   ]);
+  const [hideControlButtons, setHideControlButtons] = useState(false);
 
   // ---start fya: https://github.com/frontyardart
   const hasForLoopNode = nodes.some((node) => node.type === "loop");
@@ -799,6 +800,15 @@ function Workspace({
           onBreakout={handleOnBreakout}
           onCycle={handleOnCycle}
           onFocus={() => promote("browserWindow")}
+          onMinimize={() => {
+            setHideControlButtons(true);
+          }}
+          onMaximize={() => {
+            setHideControlButtons(false);
+          }}
+          onRestore={() => {
+            setHideControlButtons(false);
+          }}
         >
           {activeDebugSession &&
           activeDebugSession.browser_session_id &&
@@ -806,7 +816,7 @@ function Workspace({
             <BrowserStream
               interactive={false}
               browserSessionId={activeDebugSession.browser_session_id}
-              showControlButtons={true}
+              showControlButtons={!hideControlButtons}
             />
           ) : (
             <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
