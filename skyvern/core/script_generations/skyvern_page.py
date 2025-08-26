@@ -222,6 +222,7 @@ class SkyvernPage:
                 text=text,
                 option=select_option,
                 response=response,
+                created_by="script",
             )
 
             created_action = await app.DATABASE.create_action(action)
