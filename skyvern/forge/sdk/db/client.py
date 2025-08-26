@@ -2476,6 +2476,7 @@ class AgentDB:
                 skyvern_element_data=action.skyvern_element_data,
                 action_json=action.model_dump(),
                 confidence_float=action.confidence_float,
+                created_by=action.created_by,
             )
             session.add(new_action)
             await session.commit()
