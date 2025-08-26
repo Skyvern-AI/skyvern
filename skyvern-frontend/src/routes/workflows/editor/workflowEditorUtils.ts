@@ -472,6 +472,7 @@ function convertToNode(
           ...commonData,
           fileUrl: block.file_url,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          model: block.model,
         },
       };
     }
@@ -485,6 +486,7 @@ function convertToNode(
           ...commonData,
           fileUrl: block.file_url,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
+          model: block.model,
         },
       };
     }
@@ -703,6 +705,8 @@ function getElements(
       editable,
       useScriptCache: settings.useScriptCache,
       scriptCacheKey: settings.scriptCacheKey,
+      label: "__start_block__",
+      showCode: false,
     }),
   );
 
@@ -733,6 +737,8 @@ function getElements(
         {
           withWorkflowSettings: false,
           editable,
+          label: "__start_block__",
+          showCode: false,
         },
         block.id,
       ),

@@ -14,11 +14,15 @@ export type WorkflowStartNodeData = {
   editable: boolean;
   useScriptCache: boolean;
   scriptCacheKey: string | null;
+  label: "__start_block__";
+  showCode: boolean;
 };
 
 export type OtherStartNodeData = {
   withWorkflowSettings: false;
   editable: boolean;
+  label: "__start_block__";
+  showCode: boolean;
 };
 
 export type StartNodeData = WorkflowStartNodeData | OtherStartNodeData;
