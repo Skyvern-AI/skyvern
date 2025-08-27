@@ -170,6 +170,7 @@ async def deploy_script(
         script_id=script_id,
         file_count=len(data.files) if data.files else 0,
     )
+    raise HTTPException(status_code=400, detail="Not implemented")
 
     try:
         # Get the latest version of the script
@@ -258,6 +259,7 @@ async def run_script(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
     """Run a script."""
+    raise HTTPException(status_code=400, detail="Not implemented")
     # await script_service.execute_script(
     #     script_id=script_id,
     #     organization_id=current_org.organization_id,
