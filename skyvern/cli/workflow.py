@@ -47,6 +47,7 @@ def run_workflow(
     parameters: str = typer.Option("{}", "--parameters", "-p", help="JSON parameters for the workflow"),
     title: str | None = typer.Option(None, "--title", help="Title for the workflow run"),
     max_steps: int | None = typer.Option(None, "--max-steps", help="Override the workflow max steps"),
+    webhook_url: str | None = typer.Option(None, "--webhook-url", help="Override the default webhook callback URL"),
 ) -> None:
     """Run a workflow."""
     try:
@@ -61,6 +62,7 @@ def run_workflow(
         parameters=params_dict,
         title=title,
         max_steps_override=max_steps,
+        webhook_callback_url=webhook_url,
     )
     console.print(
         Panel(
