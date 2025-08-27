@@ -51,6 +51,7 @@ async def execute_blocks(
     block_labels: list[str],
     workflow_id: str,
     workflow_run_id: str,
+    workflow_permanent_id: str,
     organization: Organization,
     browser_session_id: str | None = None,
 ) -> None:
@@ -71,6 +72,7 @@ async def execute_blocks(
         organization=organization,
         workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
         max_steps_override=None,
         browser_session_id=browser_session_id,
         api_key=api_key,

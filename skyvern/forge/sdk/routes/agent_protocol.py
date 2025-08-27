@@ -878,6 +878,7 @@ async def run_block(
         block_labels=block_run_request.block_labels,
         workflow_id=block_run_request.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
+        workflow_permanent_id=workflow_run.workflow_permanent_id,
         organization=organization,
         browser_session_id=browser_session_id,
     )
