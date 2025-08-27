@@ -1408,6 +1408,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "Exception": Exception,
         }
 
     def generate_async_user_function(
