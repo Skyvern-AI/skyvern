@@ -9,6 +9,7 @@ import structlog
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern import analytics
+from skyvern.client.types.output_parameter import OutputParameter as BlockOutputParameter
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.generate_script import generate_workflow_script as generate_python_workflow_script
@@ -263,6 +264,7 @@ class WorkflowService:
         api_key: str,
         organization: Organization,
         block_labels: list[str] | None = None,
+        block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
     ) -> WorkflowRun:
         """Execute a workflow."""
@@ -273,6 +275,7 @@ class WorkflowService:
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             block_labels=block_labels,
+            block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
@@ -316,6 +319,7 @@ class WorkflowService:
                 workflow_output_parameters,
                 context_parameters,
                 secret_parameters,
+                block_outputs,
             )
         except Exception as e:
             LOG.exception(
@@ -375,6 +379,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 block_cnt=len(blocks),
                 block_labels=block_labels,
+                block_outputs=block_outputs,
             )
 
         else:
@@ -713,6 +718,56 @@ class WorkflowService:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
 
         return workflow
+
+    async def get_block_outputs_for_debug_session(
+        self,
+        workflow_permanent_id: str,
+        user_id: str,
+        organization_id: str,
+        exclude_deleted: bool = True,
+        version: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        workflow = await app.DATABASE.get_workflow_by_permanent_id(
+            workflow_permanent_id,
+            organization_id=organization_id,
+            version=version,
+            exclude_deleted=exclude_deleted,
+        )
+
+        if not workflow:
+            raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
+
+        labels_to_outputs: dict[str, BlockOutputParameter] = {}
+
+        for block in workflow.workflow_definition.blocks:
+            label = block.label
+
+            block_run = await app.DATABASE.get_latest_completed_block_run(
+                organization_id=organization_id,
+                user_id=user_id,
+                block_label=label,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+
+            if not block_run:
+                continue
+
+            output_parameter = await app.DATABASE.get_workflow_run_output_parameter_by_id(
+                workflow_run_id=block_run.workflow_run_id, output_parameter_id=block_run.output_parameter_id
+            )
+
+            if not output_parameter:
+                continue
+
+            block_output_parameter = output_parameter.value
+
+            if not isinstance(block_output_parameter, dict):
+                continue
+
+            block_output_parameter["created_at"] = output_parameter.created_at
+            labels_to_outputs[label] = block_output_parameter
+
+        return labels_to_outputs
 
     async def get_workflows_by_permanent_ids(
         self,
@@ -1773,7 +1828,7 @@ class WorkflowService:
                 raise WorkflowDefinitionHasDuplicateParameterKeys(duplicate_keys=duplicate_parameter_keys)
             # Create blocks from the request
             block_label_mapping = {}
-            blocks = []
+            blocks: list[BlockTypeVar] = []
             for block_yaml in request.workflow_definition.blocks:
                 block = await self.block_yaml_to_block(workflow, block_yaml, parameters)
                 blocks.append(block)

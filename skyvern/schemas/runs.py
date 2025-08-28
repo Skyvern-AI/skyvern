@@ -372,6 +372,12 @@ class BlockRunRequest(WorkflowRunRequest):
         description="Labels of the blocks to execute",
         examples=["block_1", "block_2"],
     )
+    block_outputs: dict[str, Any] | None = Field(
+        default=None,
+        # NOTE(jdo): this is either the last output of the block for a given
+        # org_id/user_id, or an override supplied by the user
+        description="Any active outputs of blocks in a workflow being debugged",
+    )
 
 
 class BaseRunResponse(BaseModel):

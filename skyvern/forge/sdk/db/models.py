@@ -785,6 +785,27 @@ class DebugSessionModel(Base):
     status = Column(String, nullable=False, default="created")
 
 
+class BlockRunModel(Base):
+    """
+    When a block is run in the debugger, it runs "as a 'workflow run'", but that
+    workflow run has just a single block in it. This table ties a block run to
+    the workflow run, and a particular output parameter id (which gets
+    overwritten on each run.)
+
+    Use the `created_at` timestamp to find the latest workflow run (and output
+    param id) for a given `(org_id, user_id, block_label)`.
+    """
+
+    __tablename__ = "block_runs"
+
+    organization_id = Column(String, nullable=False)
+    user_id = Column(String, nullable=False)
+    block_label = Column(String, nullable=False)
+    output_parameter_id = Column(String, nullable=False)
+    workflow_run_id = Column(String, primary_key=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
 class ScriptModel(Base):
     __tablename__ = "scripts"
     __table_args__ = (
