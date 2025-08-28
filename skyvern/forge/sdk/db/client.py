@@ -1245,9 +1245,9 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_artifact_for_workflow_run(
+    async def get_artifact_for_run(
         self,
-        workflow_run_id: str,
+        run_id: str,
         artifact_type: ArtifactType,
         organization_id: str | None = None,
     ) -> Artifact | None:
@@ -1256,8 +1256,7 @@ class AgentDB:
                 artifact = (
                     await session.scalars(
                         select(ArtifactModel)
-                        .join(TaskModel, TaskModel.task_id == ArtifactModel.task_id)
-                        .filter(TaskModel.workflow_run_id == workflow_run_id)
+                        .filter(ArtifactModel.run_id == run_id)
                         .filter(ArtifactModel.artifact_type == artifact_type)
                         .filter(ArtifactModel.organization_id == organization_id)
                         .order_by(ArtifactModel.created_at.desc())
@@ -2476,6 +2475,7 @@ class AgentDB:
                 skyvern_element_data=action.skyvern_element_data,
                 action_json=action.model_dump(),
                 confidence_float=action.confidence_float,
+                created_by=action.created_by,
             )
             session.add(new_action)
             await session.commit()

@@ -32,11 +32,11 @@ import {
   scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
 } from "@/routes/workflows/types/workflowTypes";
-
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
+import { cn } from "@/util/utils";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
@@ -146,7 +146,12 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
             id="a"
             className="opacity-0"
           />
-          <div className="w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 text-center">
+          <div
+            className={cn(
+              "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 text-center",
+              { "h-[20rem] overflow-hidden": facing === "back" },
+            )}
+          >
             <div className="relative">
               <div className="absolute right-0 top-0">
                 <div>

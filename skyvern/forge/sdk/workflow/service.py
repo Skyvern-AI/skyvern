@@ -1197,8 +1197,8 @@ class WorkflowService:
             screenshot_urls = await app.ARTIFACT_MANAGER.get_share_links(screenshot_artifacts)
 
         recording_url = None
-        recording_artifact = await app.DATABASE.get_artifact_for_workflow_run(
-            workflow_run_id=workflow_run_id,
+        recording_artifact = await app.DATABASE.get_artifact_for_run(
+            run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
             artifact_type=ArtifactType.RECORDING,
             organization_id=organization_id,
         )
