@@ -1366,6 +1366,7 @@ class AgentDB:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         generate_script: bool = False,
+        ai_fallback: bool = False,
         cache_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
@@ -1385,6 +1386,7 @@ class AgentDB:
                 is_saved_task=is_saved_task,
                 status=status,
                 generate_script=generate_script,
+                ai_fallback=ai_fallback,
                 cache_key=cache_key,
             )
             if workflow_permanent_id:

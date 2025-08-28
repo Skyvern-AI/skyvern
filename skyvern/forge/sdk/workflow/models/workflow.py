@@ -77,6 +77,7 @@ class Workflow(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     generate_script: bool = False
+    ai_fallback: bool = False
     cache_key: str | None = None
 
     created_at: datetime
