@@ -107,6 +107,7 @@ function useActions({ id }: Props): {
                 success: actionResult?.[0]?.success ?? false,
                 stepId: step.step_id,
                 index,
+                created_by: action.created_by,
               };
             });
             return actions;
@@ -123,6 +124,7 @@ function useActions({ id }: Props): {
               action.status === Status.Skipped,
             stepId: action.step_id ?? "",
             index: action.action_order ?? 0,
+            created_by: action.created_by,
           };
         });
 

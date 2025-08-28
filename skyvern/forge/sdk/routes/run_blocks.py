@@ -16,17 +16,18 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowStatus
-from skyvern.forge.sdk.workflow.models.yaml import (
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+from skyvern.schemas.run_blocks import CredentialType, LoginRequest
+from skyvern.schemas.runs import ProxyLocation, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.schemas.workflows import (
     BitwardenLoginCredentialParameterYAML,
     LoginBlockYAML,
     OnePasswordCredentialParameterYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowParameterYAML,
+    WorkflowStatus,
 )
-from skyvern.schemas.run_blocks import CredentialType, LoginRequest
-from skyvern.schemas.runs import ProxyLocation, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.services import workflow_service
 
 LOG = structlog.get_logger()

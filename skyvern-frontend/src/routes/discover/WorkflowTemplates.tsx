@@ -37,7 +37,7 @@ function WorkflowTemplates() {
                 testImg
               }
               onClick={() => {
-                navigate(`/workflows/${workflow.workflow_permanent_id}/edit`);
+                navigate(`/workflows/${workflow.workflow_permanent_id}/debug`);
               }}
             />
           );

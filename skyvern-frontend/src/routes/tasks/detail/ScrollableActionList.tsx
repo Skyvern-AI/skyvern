@@ -1,5 +1,11 @@
 import { getClient } from "@/api/AxiosClient";
 import { Action, ActionTypes } from "@/api/types";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -8,6 +14,7 @@ import {
   CheckCircledIcon,
   CrossCircledIcon,
   DotFilledIcon,
+  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
 import { ReactNode, useRef } from "react";
@@ -80,15 +87,27 @@ function ScrollableActionList({
               </div>
               <div className="flex items-center gap-2">
                 <ActionTypePill actionType={action.type} />
+                {action.created_by === "script" && (
+                  <TooltipProvider>
+                    <Tooltip delayDuration={300}>
+                      <TooltipTrigger asChild>
+                        <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
+                          <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[250px]">
+                        Scripted Execution
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
                 {action.success ? (
                   <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
                     <CheckCircledIcon className="h-4 w-4 text-success" />
-                    <span className="text-xs">Success</span>
                   </div>
                 ) : (
                   <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
                     <CrossCircledIcon className="h-4 w-4 text-destructive" />
-                    <span className="text-xs">Fail</span>
                   </div>
                 )}
               </div>

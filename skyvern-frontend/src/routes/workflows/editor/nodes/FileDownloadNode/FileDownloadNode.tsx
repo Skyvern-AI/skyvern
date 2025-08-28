@@ -34,10 +34,12 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -50,13 +52,16 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
-  const { debuggable, editable, label } = data;
+  const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
-  const debugStore = useDebugStore();
   const { blockLabel: urlBlockLabel } = useParams();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const [inputs, setInputs] = useState({
     url: data.url,
     navigationGoal: data.navigationGoal,
@@ -70,6 +75,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
     engine: data.engine,
     model: data.model,
   });
+  const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
@@ -105,14 +111,14 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
           className={cn(
             "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
             {
-              "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-                thisBlockIsPlaying,
+              "pointer-events-none": thisBlockIsPlaying,
+              "bg-slate-950 outline outline-2 outline-slate-300":
+                thisBlockIsTargetted,
             },
           )}
         >
           <NodeHeader
             blockLabel={label}
-            disabled={elideFromDebugging}
             editable={editable}
             nodeId={id}
             totpIdentifier={inputs.totpIdentifier}
@@ -163,13 +169,17 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
             </div>
           </div>
           <Separator />
-          <Accordion type="single" collapsible>
+          <Accordion
+            type="single"
+            collapsible
+            onValueChange={() => rerender.bump()}
+          >
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={rerender.key} className="space-y-4">
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"

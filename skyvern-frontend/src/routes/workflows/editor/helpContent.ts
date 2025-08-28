@@ -180,4 +180,7 @@ export const placeholders = {
       '{\n  "Content-Type": "application/json",\n  "Authorization": "Bearer {{ token }}"\n}',
     body: '{\n  "key": "value",\n  "parameter": "{{ parameter_name }}"\n}',
   },
+  scripts: {
+    scriptKey: "my-{{param1}}-{{param2}}-key",
+  },
 };

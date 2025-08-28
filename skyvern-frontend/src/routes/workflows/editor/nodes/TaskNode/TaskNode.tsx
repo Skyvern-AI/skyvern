@@ -36,22 +36,29 @@ import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
-  const { debuggable, editable, label } = data;
+  const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const { blockLabel: urlBlockLabel } = useParams();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
+
+  const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
@@ -108,25 +115,29 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
           className={cn(
             "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
             {
-              "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-                thisBlockIsPlaying,
+              "pointer-events-none": thisBlockIsPlaying,
+              "bg-slate-950 outline outline-2 outline-slate-300":
+                thisBlockIsTargetted,
             },
           )}
         >
           <NodeHeader
             blockLabel={label}
-            disabled={elideFromDebugging}
             editable={editable}
             nodeId={id}
             totpIdentifier={inputs.totpIdentifier}
             totpUrl={inputs.totpVerificationUrl}
             type={type}
           />
-          <Accordion type="multiple" defaultValue={["content", "extraction"]}>
+          <Accordion
+            type="multiple"
+            defaultValue={["content", "extraction"]}
+            onValueChange={() => rerender.bump()}
+          >
             <AccordionItem value="content">
               <AccordionTrigger>Content</AccordionTrigger>
               <AccordionContent className="pl-[1.5rem] pr-1">
-                <div className="space-y-4">
+                <div key={`${rerender.key}-content`} className="space-y-4">
                   <div className="space-y-2">
                     <div className="flex justify-between">
                       <div className="flex gap-2">
@@ -182,7 +193,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
             <AccordionItem value="extraction">
               <AccordionTrigger>Extraction</AccordionTrigger>
               <AccordionContent className="pl-[1.5rem] pr-1">
-                <div className="space-y-4">
+                <div key={`${rerender.key}-extraction`} className="space-y-4">
                   <div className="space-y-2">
                     <div className="flex gap-2">
                       <Label className="text-xs text-slate-300">
@@ -220,7 +231,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger>Advanced Settings</AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={`${rerender.key}-advanced`} className="space-y-4">
                   <div className="space-y-2">
                     <Label className="text-xs text-slate-300">
                       Complete if...

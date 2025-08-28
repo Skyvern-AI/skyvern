@@ -38,6 +38,7 @@ type Props = {
   initialSettings: {
     proxyLocation: ProxyLocation;
     webhookCallbackUrl: string;
+    cdpAddress: string | null;
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
   };
@@ -81,6 +82,7 @@ type RunWorkflowRequestBody = {
   browser_session_id: string | null;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
+  browser_address?: string | null;
 };
 
 function getRunWorkflowRequestBody(
@@ -91,6 +93,7 @@ function getRunWorkflowRequestBody(
     webhookCallbackUrl,
     proxyLocation,
     browserSessionId,
+    cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
     ...parameters
@@ -107,6 +110,7 @@ function getRunWorkflowRequestBody(
     data: parsedParameters,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
+    browser_address: cdpAddress,
   };
 
   if (maxScreenshotScrolls) {
@@ -133,6 +137,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   browserSessionId: string | null;
+  cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
 };
@@ -156,6 +161,7 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation,
       browserSessionId: browserSessionIdDefault,
+      cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
@@ -208,6 +214,7 @@ function RunWorkflowForm({
       browserSessionId,
       maxScreenshotScrolls,
       extraHttpHeaders,
+      cdpAddress,
       ...parameters
     } = values;
 
@@ -222,6 +229,7 @@ function RunWorkflowForm({
       browserSessionId,
       maxScreenshotScrolls,
       extraHttpHeaders,
+      cdpAddress,
     });
   }
 
@@ -413,6 +421,42 @@ function RunWorkflowForm({
                         <Input
                           {...field}
                           placeholder="pbs_xxx"
+                          value={
+                            field.value === null ? "" : (field.value as string)
+                          }
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
+          <FormField
+            key="cdpAddress"
+            control={form.control}
+            name="cdpAddress"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div className="flex gap-16">
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          Browser Address
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          The address of the Browser server to use for the
+                          workflow run.
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <Input
+                          {...field}
+                          placeholder="http://127.0.0.1:9222"
                           value={
                             field.value === null ? "" : (field.value as string)
                           }

@@ -293,6 +293,11 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
+    browser_address: str | None = Field(
+        default=None,
+        description="The CDP address for the task.",
+        examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
+    )
 
     @field_validator("url", "webhook_url", "totp_url")
     @classmethod
@@ -347,6 +352,11 @@ class WorkflowRunRequest(BaseModel):
     extra_http_headers: dict[str, str] | None = Field(
         default=None,
         description="The extra HTTP headers for the requests in browser.",
+    )
+    browser_address: str | None = Field(
+        default=None,
+        description="The CDP address for the workflow run.",
+        examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
 
     @field_validator("webhook_url", "totp_url")

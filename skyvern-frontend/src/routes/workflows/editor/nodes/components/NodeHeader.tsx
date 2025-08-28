@@ -8,6 +8,7 @@ import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation } from "@/api/types";
 import { Timer } from "@/components/Timer";
 import { toast } from "@/components/ui/use-toast";
+import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
@@ -131,6 +132,7 @@ function NodeHeader({
   totpUrl,
   type,
 }: Props) {
+  const log = useLogging();
   const {
     blockLabel: urlBlockLabel,
     workflowPermanentId,
@@ -138,10 +140,6 @@ function NodeHeader({
   } = useParams();
   const debugStore = useDebugStore();
   const { closeWorkflowPanel } = useWorkflowPanelStore();
-  const thisBlockIsPlaying =
-    urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
-  const anyBlockIsPlaying =
-    urlBlockLabel !== undefined && urlBlockLabel.length > 0;
   const workflowSettingsStore = useWorkflowSettingsStore();
   const [label, setLabel] = useNodeLabelChangeHandler({
     id: nodeId,
@@ -164,6 +162,21 @@ function NodeHeader({
   });
   const saveWorkflow = useWorkflowSave();
 
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued &&
+    urlBlockLabel !== undefined &&
+    urlBlockLabel === blockLabel;
+
+  const thisBlockIsTargetted =
+    urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
+
+  const timerDurationOverride =
+    workflowRun && workflowRun.finished_at
+      ? new Date(workflowRun.finished_at).getTime() -
+        new Date(workflowRun.created_at).getTime() +
+        3500
+      : null;
+
   useEffect(() => {
     if (!workflowRun || !workflowPermanentId || !workflowRunId) {
       return;
@@ -173,7 +186,7 @@ function NodeHeader({
       workflowRunId === workflowRun?.workflow_run_id &&
       statusIsFinalized(workflowRun)
     ) {
-      navigate(`/workflows/${workflowPermanentId}/debug`);
+      // navigate(`/workflows/${workflowPermanentId}/debug`);
 
       if (statusIsAFailureType(workflowRun)) {
         toast({
@@ -203,7 +216,7 @@ function NodeHeader({
       await saveWorkflow.mutateAsync();
 
       if (!workflowPermanentId) {
-        console.error("There is no workflowPermanentId");
+        log.error("Run block: there is no workflowPermanentId");
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -213,7 +226,7 @@ function NodeHeader({
       }
 
       if (!debugSession) {
-        console.error("There is no debug session, yet");
+        log.error("Run block: there is no debug session, yet");
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -252,6 +265,12 @@ function NodeHeader({
       });
 
       if (!body) {
+        log.error("Run block: could not construct run payload", {
+          workflowPermanentId,
+          blockLabel,
+          debugSessionId: debugSession.debug_session_id,
+          browserSessionId: debugSession.browser_session_id,
+        });
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -260,6 +279,13 @@ function NodeHeader({
         return;
       }
 
+      log.info("Run block: sending run payload", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession.debug_session_id,
+        browserSessionId: debugSession.browser_session_id,
+      });
+
       return await client.post<Payload, { data: { run_id: string } }>(
         "/run/workflows/blocks",
         body,
@@ -267,7 +293,12 @@ function NodeHeader({
     },
     onSuccess: (response) => {
       if (!response) {
-        console.error("No response");
+        log.error("Run block: no response", {
+          workflowPermanentId,
+          blockLabel,
+          debugSessionId: debugSession?.debug_session_id,
+          browserSessionId: debugSession?.browser_session_id,
+        });
         toast({
           variant: "destructive",
           title: "Failed to start workflow block run",
@@ -275,6 +306,14 @@ function NodeHeader({
         });
         return;
       }
+
+      log.info("Run block: run started", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+        runId: response.data.run_id,
+      });
 
       toast({
         variant: "success",
@@ -288,6 +327,14 @@ function NodeHeader({
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
+      log.error("Run block: error", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+        error,
+        detail,
+      });
       toast({
         variant: "destructive",
         title: "Failed to start workflow block run",
@@ -299,7 +346,10 @@ function NodeHeader({
   const cancelBlock = useMutation({
     mutationFn: async () => {
       if (!debugSession) {
-        console.error("Missing debug session");
+        log.error("Cancel block: missing debug session", {
+          workflowPermanentId,
+          blockLabel,
+        });
         toast({
           variant: "destructive",
           title: "Failed to cancel workflow block run",
@@ -315,17 +365,32 @@ function NodeHeader({
         .then((response) => response.data);
     },
     onSuccess: () => {
+      log.info("Cancel block: canceled", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+      });
       toast({
         variant: "success",
         title: "Workflow Canceled",
         description: "The workflow has been successfully canceled.",
       });
     },
-    onError: (error) => {
+    onError: (error: AxiosError) => {
+      const detail = (error.response?.data as { detail?: string })?.detail;
+      log.error("Cancel block: error", {
+        workflowPermanentId,
+        blockLabel,
+        debugSessionId: debugSession?.debug_session_id,
+        browserSessionId: debugSession?.browser_session_id,
+        error,
+        detail,
+      });
       toast({
         variant: "destructive",
         title: "Error",
-        description: error.message,
+        description: detail ?? error.message,
       });
     },
   });
@@ -340,10 +405,10 @@ function NodeHeader({
 
   return (
     <>
-      {thisBlockIsPlaying && (
+      {thisBlockIsTargetted && (
         <div className="flex w-full animate-[auto-height_1s_ease-in-out_forwards] items-center justify-between overflow-hidden">
           <div className="pb-4">
-            <Timer />
+            <Timer override={timerDurationOverride ?? undefined} />
           </div>
           <div className="pb-4">{workflowRun?.status ?? "pending"}</div>
         </div>
@@ -370,7 +435,7 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
-          {thisBlockIsPlaying && workflowRunIsRunningOrQueued && (
+          {thisBlockIsPlaying && (
             <div className="ml-auto">
               <button className="rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50">
                 {cancelBlock.isPending ? (
@@ -388,9 +453,9 @@ function NodeHeader({
           )}
           {debugStore.isDebugMode && isDebuggable && (
             <button
-              disabled={anyBlockIsPlaying}
+              disabled={workflowRunIsRunningOrQueued}
               className={cn("rounded p-1 disabled:opacity-50", {
-                "hover:bg-muted": anyBlockIsPlaying,
+                "hover:bg-muted": workflowRunIsRunningOrQueued,
               })}
             >
               {runBlock.isPending ? (
@@ -399,7 +464,7 @@ function NodeHeader({
                 <PlayIcon
                   className={cn("size-6", {
                     "fill-gray-500 text-gray-500":
-                      anyBlockIsPlaying || !workflowPermanentId,
+                      workflowRunIsRunningOrQueued || !workflowPermanentId,
                   })}
                   onClick={() => {
                     handleOnPlay();
@@ -408,11 +473,12 @@ function NodeHeader({
               )}
             </button>
           )}
-          {disabled || debugStore.isDebugMode ? null : (
+          {disabled ? null : (
             <div>
               <div
                 className={cn("rounded p-1 hover:bg-muted", {
-                  "pointer-events-none opacity-50": anyBlockIsPlaying,
+                  "pointer-events-none opacity-50":
+                    workflowRunIsRunningOrQueued,
                 })}
               >
                 <NodeActionMenu

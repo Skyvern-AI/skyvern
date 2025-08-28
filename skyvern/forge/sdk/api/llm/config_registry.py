@@ -81,6 +81,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -92,6 +93,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -103,6 +105,7 @@ if settings.ENABLE_OPENAI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -230,7 +233,6 @@ if settings.ENABLE_OPENAI:
             ),
         ),
     )
-
 
 if settings.ENABLE_ANTHROPIC:
     LLMConfigRegistry.register_config(
@@ -591,6 +593,7 @@ if settings.ENABLE_AZURE_GPT5:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
 
@@ -615,6 +618,7 @@ if settings.ENABLE_AZURE_GPT5_MINI:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
 
@@ -639,6 +643,7 @@ if settings.ENABLE_AZURE_GPT5_NANO:
             add_assistant_prefix=False,
             max_completion_tokens=128000,
             temperature=None,
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
 
@@ -782,6 +787,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -792,6 +803,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -802,6 +819,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -812,6 +835,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -822,6 +851,12 @@ if settings.ENABLE_GEMINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
         ),
     )
 
@@ -1017,6 +1052,10 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-pro" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
         ),
     )
@@ -1032,6 +1071,10 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-pro-preview-05-06" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
         ),
     )
@@ -1047,6 +1090,10 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
         ),
     )
@@ -1062,6 +1109,10 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
         ),
     )
@@ -1077,6 +1128,10 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-04-17" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
         ),
     )
@@ -1092,6 +1147,10 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
             ),
         ),
     )
@@ -1199,6 +1258,24 @@ if settings.ENABLE_GROQ:
                 ),
             ),
         )
+
+if settings.ENABLE_MOONSHOT:
+    LLMConfigRegistry.register_config(
+        "MOONSHOT_KIMI_K2",
+        LLMConfig(
+            "moonshot/kimi-k2",
+            ["MOONSHOT_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=32768,
+            litellm_params=LiteLLMParams(
+                api_key=settings.MOONSHOT_API_KEY,
+                api_base=settings.MOONSHOT_API_BASE,
+                api_version=None,
+                model_info={"model_name": "moonshot/kimi-k2"},
+            ),
+        ),
+    )
 # Add support for dynamically configuring OpenAI-compatible LLM models
 # Based on liteLLM's support for OpenAI-compatible APIs
 # See documentation: https://docs.litellm.ai/docs/providers/openai_compatible

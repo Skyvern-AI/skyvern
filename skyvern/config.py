@@ -119,7 +119,9 @@ class Settings(BaseSettings):
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
+    SINGLE_INPUT_AGENT_LLM_KEY: str | None = None
     PROMPT_BLOCK_LLM_KEY: str | None = None
+    EXTRACTION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -140,6 +142,7 @@ class Settings(BaseSettings):
     ENABLE_OPENAI_COMPATIBLE: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
+    GPT5_REASONING_EFFORT: str | None = "medium"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE3.7_SONNET"
@@ -242,6 +245,8 @@ class Settings(BaseSettings):
 
     # GEMINI
     GEMINI_API_KEY: str | None = None
+    GEMINI_INCLUDE_THOUGHT: bool = False
+    GEMINI_THINKING_BUDGET: int | None = None
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None
@@ -270,6 +275,11 @@ class Settings(BaseSettings):
     GROQ_MODEL: str | None = None
     GROQ_API_BASE: str = "https://api.groq.com/openai/v1"
 
+    # MOONSHOT AI
+    ENABLE_MOONSHOT: bool = False
+    MOONSHOT_API_KEY: str | None = None
+    MOONSHOT_API_BASE: str = "https://api.moonshot.cn/v1"
+
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
@@ -279,6 +289,7 @@ class Settings(BaseSettings):
     BITWARDEN_CLIENT_ID: str | None = None
     BITWARDEN_CLIENT_SECRET: str | None = None
     BITWARDEN_MASTER_PASSWORD: str | None = None
+    BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Skyvern Auth Bitwarden Settings
@@ -338,6 +349,9 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
 
+    # script generation settings
+    WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
+
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """
         Keys are model names available to blocks in the frontend. These map to key names
@@ -352,6 +366,7 @@ class Settings(BaseSettings):
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
+                "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
@@ -379,6 +394,7 @@ class Settings(BaseSettings):
                     "label": "Gemini 2.5 Flash",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
+                "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
                 "us.anthropic.claude-opus-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",

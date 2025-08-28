@@ -1,7 +1,9 @@
 import { ExitIcon } from "@radix-ui/react-icons";
+import { useSearchParams } from "react-router-dom";
 import { Handle } from "@xyflow/react";
 import { Position } from "@xyflow/react";
 
+import { KeyIcon } from "@/components/icons/KeyIcon";
 import { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { cn } from "@/util/utils";
@@ -14,15 +16,25 @@ function BlockCodeEditor({
   blockLabel,
   blockType,
   script,
+  title,
   onClick,
+  onExit,
 }: {
   blockLabel: string;
-  blockType: WorkflowBlockType;
+  blockType?: WorkflowBlockType;
   script: string | undefined;
+  title?: string;
   onClick?: (e: React.MouseEvent) => void;
+  /**
+   * Return `false` to cancel the exit.
+   */
+  onExit?: () => boolean;
 }) {
-  const blockTitle = workflowBlockTitle[blockType];
+  const [searchParams] = useSearchParams();
+  const blockTitle = blockType ? workflowBlockTitle[blockType] : title;
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
+
+  const cacheKeyValue = searchParams.get("cache-key-value");
 
   return (
     <div className="h-full">
@@ -47,32 +59,53 @@ function BlockCodeEditor({
           onClick?.(e);
         }}
       >
-        <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
-          <div className="flex w-full gap-2">
-            <div className="relative flex h-[2.75rem] w-[2.75rem] items-center justify-center overflow-hidden rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={blockType}
-                className="size-6"
-              />
-              <div className="absolute -left-3 top-8 flex h-4 w-16 origin-top-left -rotate-45 transform items-center justify-center bg-yellow-400">
-                <span className="text-xs font-bold text-black">code</span>
+        <header className="relative !mt-0 flex h-[2.75rem] justify-between gap-2">
+          {blockType ? (
+            <div className="flex w-full gap-2">
+              <div className="relative flex h-[2.75rem] w-[2.75rem] items-center justify-center overflow-hidden rounded border border-slate-600">
+                <WorkflowBlockIcon
+                  workflowBlockType={blockType}
+                  className="size-6"
+                />
+                <div className="absolute -left-3 top-8 flex h-4 w-16 origin-top-left -rotate-45 transform items-center justify-center bg-yellow-400">
+                  <span className="text-xs font-bold text-black">code</span>
+                </div>
+              </div>
+
+              <div className="flex w-full flex-col gap-1">
+                {blockLabel}
+                <div className="flex w-full items-center justify-center gap-1">
+                  <span className="text-xs text-slate-400">{blockTitle}</span>
+                  <div className="ml-auto scale-[60%] opacity-50">
+                    <KeyIcon />
+                  </div>
+                  <span className="text-xs text-slate-400">
+                    {cacheKeyValue === "" || !cacheKeyValue
+                      ? "(none)"
+                      : cacheKeyValue}
+                  </span>
+                </div>
               </div>
             </div>
-            <div className="flex flex-col gap-1">
-              {blockLabel}
-              <span className="text-xs text-slate-400">{blockTitle}</span>
-            </div>
-            <div className="ml-auto flex w-[2.75rem] items-center justify-center rounded hover:bg-slate-800">
-              <ExitIcon
-                onClick={() => {
+          ) : (
+            <header className="mt-0 flex h-[2.75rem] w-full items-center justify-center">
+              {title ?? blockLabel}
+            </header>
+          )}
+          <div className="absolute right-[-0.5rem] top-0 flex h-[2rem] w-[2rem] items-center justify-center rounded hover:bg-slate-800">
+            <ExitIcon
+              onClick={() => {
+                const result = onExit ? onExit() : true;
+
+                if (result !== false) {
                   toggleScriptForNodeCallback({
                     label: blockLabel,
                     show: false,
                   });
-                }}
-                className="size-5 cursor-pointer"
-              />
-            </div>
+                }
+              }}
+              className="size-5 cursor-pointer"
+            />
           </div>
         </header>
         {script ? (

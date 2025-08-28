@@ -25,6 +25,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { AppNode } from "..";
@@ -33,11 +34,12 @@ import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
-import { useDebugStore } from "@/store/useDebugStore";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { cn } from "@/util/utils";
 import { useParams } from "react-router-dom";
 import { NodeHeader } from "../components/NodeHeader";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -50,7 +52,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
-  const { editable, debuggable, label } = data;
+  const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
   const [inputs, setInputs] = useState({
     url: data.url,
@@ -66,10 +68,14 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
     engine: data.engine,
   });
   const { blockLabel: urlBlockLabel } = useParams();
-  const debugStore = useDebugStore();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
+  const rerender = useRerender({ prefix: "accordian" });
 
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -108,14 +114,14 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
           className={cn(
             "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
             {
-              "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-                thisBlockIsPlaying,
+              "pointer-events-none": thisBlockIsPlaying,
+              "bg-slate-950 outline outline-2 outline-slate-300":
+                thisBlockIsTargetted,
             },
           )}
         >
           <NodeHeader
             blockLabel={label}
-            disabled={elideFromDebugging}
             editable={editable}
             nodeId={id}
             totpIdentifier={inputs.totpIdentifier}
@@ -181,6 +187,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
               "pointer-events-none opacity-50": thisBlockIsPlaying,
             })}
             type="single"
+            onValueChange={() => rerender.bump()}
             collapsible
           >
             <AccordionItem value="advanced" className="border-b-0">
@@ -188,7 +195,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={rerender.key} className="space-y-4">
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"

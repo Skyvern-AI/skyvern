@@ -16,6 +16,7 @@ import {
   useWorkflowSave,
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import {
@@ -77,6 +78,9 @@ import {
   layout,
 } from "./workflowEditorUtils";
 import { useAutoPan } from "./useAutoPan";
+import { useUser } from "@/hooks/useUser";
+
+const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -223,9 +227,9 @@ type Props = {
   onNodesChange: (changes: Array<NodeChange<AppNode>>) => void;
   onEdgesChange: (changes: Array<EdgeChange>) => void;
   initialTitle: string;
-  initialParameters: ParametersState;
+  // initialParameters: ParametersState;
   workflow: WorkflowApiResponse;
-  onDebuggableBlockCountChange: (count: number) => void;
+  onDebuggableBlockCountChange?: (count: number) => void;
   onMouseDownCapture?: () => void;
   zIndex?: number;
 };
@@ -238,7 +242,7 @@ function FlowRenderer({
   onNodesChange,
   onEdgesChange,
   initialTitle,
-  initialParameters,
+  // initialParameters,
   workflow,
   onDebuggableBlockCountChange,
   onMouseDownCapture,
@@ -246,11 +250,14 @@ function FlowRenderer({
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
+  const user = useUser().get();
   const { title, initializeTitle } = useWorkflowTitleStore();
-  const [parameters] = useState<ParametersState>(initialParameters);
+  // const [parameters] = useState<ParametersState>(initialParameters);
+  const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const flowIsConstrained = debugStore.isDebugMode && Boolean(user);
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -303,7 +310,7 @@ function FlowRenderer({
       }
     }
 
-    onDebuggableBlockCountChange(debuggable.length);
+    onDebuggableBlockCountChange?.(debuggable.length);
   }, [nodes, edges, onDebuggableBlockCountChange]);
 
   const constructSaveData = useCallback((): WorkflowSaveData => {
@@ -452,7 +459,7 @@ function FlowRenderer({
   }) {
     if (id) {
       const node = nodes.find((node) => node.id === id);
-      if (!node || !isWorkflowBlockNode(node)) {
+      if (!node) {
         return;
       }
 
@@ -462,7 +469,7 @@ function FlowRenderer({
         (node) => "label" in node.data && node.data.label === label,
       );
 
-      if (!node || !isWorkflowBlockNode(node)) {
+      if (!node) {
         return;
       }
 
@@ -483,12 +490,16 @@ function FlowRenderer({
    * TODO(jdo): hack
    */
   const getXLock = () => {
-    const hasForLoopNode = nodes.some((node) => node.type === "loop");
-    return hasForLoopNode ? 24 : 104;
+    return 24;
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {
+    if (!user) {
+      return;
+    }
+
     const xLock = getXLock();
+
     if (newValue) {
       const currentY = reactFlowInstance.getViewport().y;
       reactFlowInstance.setViewport({ x: xLock, y: currentY, zoom: zoomLock });
@@ -574,7 +585,13 @@ function FlowRenderer({
       </Dialog>
       <BlockActionContext.Provider
         value={{
-          deleteNodeCallback: deleteNode,
+          /**
+           * NOTE: defer deletion to next tick to allow React Flow's internal
+           * event handlers to complete; removes a console warning from the
+           * React Flow library
+           */
+          deleteNodeCallback: (id: string) =>
+            setTimeout(() => deleteNode(id), 0),
           toggleScriptForNodeCallback: toggleScript,
         }}
       >
@@ -612,12 +629,20 @@ function FlowRenderer({
             ) {
               workflowChangesStore.setHasChanges(true);
             }
-            // throttle onNodesChange to prevent cascading React updates
+
+            // only allow one update in _this_ render cycle
             if (onNodesChangeTimeoutRef.current === null) {
               onNodesChange(changes);
               onNodesChangeTimeoutRef.current = setTimeout(() => {
                 onNodesChangeTimeoutRef.current = null;
-              }, 33); // ~30fps throttle
+              }, 0);
+            } else {
+              // if we have an update in this render cycle already, then to
+              // prevent max recursion errors, defer the update to next render
+              // cycle
+              nextTick().then(() => {
+                onNodesChange(changes);
+              });
             }
           }}
           onEdgesChange={onEdgesChange}
@@ -630,18 +655,18 @@ function FlowRenderer({
           }}
           deleteKeyCode={null}
           onMove={(_, viewport) => {
-            if (debugStore.isDebugMode && shouldConstrainPan) {
+            if (flowIsConstrained && shouldConstrainPan) {
               constrainPan(viewport);
             }
           }}
-          maxZoom={debugStore.isDebugMode ? 1 : 2}
-          minZoom={debugStore.isDebugMode ? 1 : 0.5}
+          maxZoom={flowIsConstrained ? 1 : 2}
+          minZoom={flowIsConstrained ? 1 : 0.5}
           panOnDrag={true}
           panOnScroll={true}
           panOnScrollMode={PanOnScrollMode.Vertical}
-          zoomOnDoubleClick={!debugStore.isDebugMode}
-          zoomOnPinch={!debugStore.isDebugMode}
-          zoomOnScroll={!debugStore.isDebugMode}
+          zoomOnDoubleClick={!flowIsConstrained}
+          zoomOnPinch={!flowIsConstrained}
+          zoomOnScroll={!flowIsConstrained}
         >
           <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
           <Controls position="bottom-left" />

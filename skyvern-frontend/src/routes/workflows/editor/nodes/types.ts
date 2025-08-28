@@ -47,7 +47,7 @@ export const workflowBlockTitle: {
   task: "Browser Task",
   text_prompt: "Text Prompt",
   upload_to_s3: "Upload To S3",
-  file_upload: "Upload Files",
+  file_upload: "Cloud Storage",
   validation: "Validation",
   wait: "Wait",
   pdf_parser: "PDF Parser",

@@ -1,5 +1,4 @@
 import copy
-import uuid
 from typing import TYPE_CHECKING, Any, Self
 
 import structlog
@@ -38,6 +37,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.utils.strings import generate_random_string
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunParameter
@@ -193,7 +193,7 @@ class WorkflowRunContext:
 
     @staticmethod
     def generate_random_secret_id() -> str:
-        return f"secret_{uuid.uuid4()}"
+        return f"secret_{generate_random_string()}"
 
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
@@ -416,9 +416,9 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id:
+        if not client_id and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret:
+        if not client_secret and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
@@ -519,9 +519,9 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id:
+        if not client_id and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret:
+        if not client_secret and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")
@@ -586,9 +586,9 @@ class WorkflowRunContext:
             LOG.error(f"Failed to get Bitwarden login credentials from AWS secrets. Error: {e}")
             raise e
 
-        if not client_id:
+        if not client_id and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client ID not found")
-        if not client_secret:
+        if not client_secret and not settings.BITWARDEN_EMAIL:
             raise ValueError("Bitwarden client secret not found")
         if not master_password:
             raise ValueError("Bitwarden master password not found")

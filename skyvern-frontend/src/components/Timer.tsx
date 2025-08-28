@@ -7,10 +7,26 @@ interface HMS {
 }
 
 interface Props {
+  override?: number;
   startAt?: HMS;
 }
 
-function Timer({ startAt }: Props) {
+const formatMs = (elapsed: number) => {
+  let seconds = Math.floor(elapsed / 1000);
+  let minutes = Math.floor(seconds / 60);
+  let hours = Math.floor(minutes / 60);
+  seconds = seconds % 60;
+  minutes = minutes % 60;
+  hours = hours % 24;
+
+  return {
+    hour: hours,
+    minute: minutes,
+    second: seconds,
+  };
+};
+
+function Timer({ override, startAt }: Props) {
   const [time, setTime] = useState<HMS>({
     hour: 0,
     minute: 0,
@@ -18,20 +34,22 @@ function Timer({ startAt }: Props) {
   });
 
   useEffect(() => {
+    if (override) {
+      const formatted = formatMs(override);
+      setTime(() => formatted);
+
+      return;
+    }
+
     const start = performance.now();
 
     const loop = () => {
       const elapsed = performance.now() - start;
-      let seconds = Math.floor(elapsed / 1000);
-      let minutes = Math.floor(seconds / 60);
-      let hours = Math.floor(minutes / 60);
-      seconds = seconds % 60;
-      minutes = minutes % 60;
-      hours = hours % 24;
+      const formatted = formatMs(elapsed);
       setTime(() => ({
-        hour: hours + (startAt?.hour ?? 0),
-        minute: minutes + (startAt?.minute ?? 0),
-        second: seconds + (startAt?.second ?? 0),
+        hour: formatted.hour + (startAt?.hour ?? 0),
+        minute: formatted.minute + (startAt?.minute ?? 0),
+        second: formatted.second + (startAt?.second ?? 0),
       }));
 
       rAF = requestAnimationFrame(loop);
@@ -40,7 +58,7 @@ function Timer({ startAt }: Props) {
     let rAF = requestAnimationFrame(loop);
 
     return () => cancelAnimationFrame(rAF);
-  }, [startAt]);
+  }, [override, startAt]);
 
   return (
     <div>

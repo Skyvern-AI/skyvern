@@ -108,6 +108,11 @@ class TaskBase(BaseModel):
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
         examples=[10],
     )
+    browser_address: str | None = Field(
+        default=None,
+        description="The CDP address for the task.",
+        examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
+    )
 
 
 class TaskRequest(TaskBase):

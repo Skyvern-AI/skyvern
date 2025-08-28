@@ -334,7 +334,7 @@ function BrowserStream({
       ref={setCanvasContainerRef}
     >
       {isVncConnected && (
-        <div className="overlay z-10 flex items-center justify-center">
+        <div className="overlay z-10 flex items-center justify-center overflow-hidden">
           {showControlButtons && (
             <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
               <Button
@@ -362,7 +362,7 @@ function BrowserStream({
                 size="sm"
               >
                 <ExitIcon className="mr-2 h-4 w-4" />
-                cede control
+                stop controlling
               </Button>
             </div>
           )}

@@ -33,7 +33,6 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -53,6 +52,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
     Action,
     ActionType,
@@ -152,6 +152,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         finished_at=task_obj.finished_at,
         max_screenshot_scrolls=task_obj.max_screenshot_scrolling_times,
         browser_session_id=task_obj.browser_session_id,
+        browser_address=task_obj.browser_address,
     )
     return task
 
@@ -300,6 +301,7 @@ def convert_to_workflow_run(
         workflow_title=workflow_title,
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
         extra_http_headers=workflow_run_model.extra_http_headers,
+        browser_address=workflow_run_model.browser_address,
     )
 
 
@@ -553,12 +555,15 @@ def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock
     )
 
 
-def hydrate_action(action_model: ActionModel) -> Action:
+def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) -> Action:
     """
     Convert ActionModel to the appropriate Action type based on action_type.
     The action_json contains all the metadata of different types of actions.
     """
     # Create base action data from the model
+    element_id = action_model.element_id
+    if empty_element_id:
+        element_id = element_id or ""
     action_data = {
         "action_type": action_model.action_type,
         "status": action_model.status,
@@ -574,7 +579,7 @@ def hydrate_action(action_model: ActionModel) -> Action:
         "reasoning": action_model.reasoning,
         "intention": action_model.intention,
         "response": action_model.response,
-        "element_id": action_model.element_id,
+        "element_id": element_id,
         "skyvern_element_hash": action_model.skyvern_element_hash,
         "skyvern_element_data": action_model.skyvern_element_data,
         "created_at": action_model.created_at,

@@ -16,10 +16,11 @@ import { useState } from "react";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Checkbox } from "@/components/ui/checkbox";
 import { getLoopNodeWidth } from "../../workflowEditorUtils";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const { updateNodeData } = useReactFlow();
@@ -28,12 +29,15 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   if (!node) {
     throw new Error("Node not found"); // not possible
   }
-  const { debuggable, editable, label } = data;
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const [inputs, setInputs] = useState({
     loopVariableReference: data.loopVariableReference,
   });
@@ -94,14 +98,14 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
             className={cn(
               "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
               {
-                "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-                  thisBlockIsPlaying,
+                "pointer-events-none": thisBlockIsPlaying,
+                "bg-slate-950 outline outline-2 outline-slate-300":
+                  thisBlockIsTargetted,
               },
             )}
           >
             <NodeHeader
               blockLabel={label}
-              disabled={elideFromDebugging}
               editable={editable}
               nodeId={id}
               totpIdentifier={null}

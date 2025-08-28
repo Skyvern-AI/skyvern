@@ -193,8 +193,10 @@ navigation:
               - GET /v1/artifacts/{artifact_id}
               - GET /v1/runs/{run_id}/artifacts
           - section: Scripts
+            hidden: true
             contents:
               - POST /v1/scripts
+              - POST /v1/scripts/{script_id}/run
               - POST /v1/scripts/{script_id}/deploy
               - GET /v1/scripts/{script_id}
               - GET /v1/scripts

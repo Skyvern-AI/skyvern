@@ -97,6 +97,7 @@ class Action(BaseModel):
 
     created_at: datetime | None = None
     modified_at: datetime | None = None
+    created_by: str | None = None
 
     @classmethod
     def validate(cls: Type[T], value: Any) -> T:

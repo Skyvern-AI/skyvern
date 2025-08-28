@@ -1,8 +1,18 @@
 import { ActionsApiResponse, ActionTypes, Status } from "@/api/types";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { Separator } from "@/components/ui/separator";
 import { ActionTypePill } from "@/routes/tasks/detail/ActionTypePill";
 import { cn } from "@/util/utils";
-import { CheckCircledIcon, CrossCircledIcon } from "@radix-ui/react-icons";
+import {
+  CheckCircledIcon,
+  CrossCircledIcon,
+  LightningBoltIcon,
+} from "@radix-ui/react-icons";
 import { useCallback } from "react";
 
 type Props = {
@@ -47,15 +57,27 @@ function ActionCard({ action, onClick, active, index }: Props) {
           </div>
           <div className="flex items-center gap-2">
             <ActionTypePill actionType={action.action_type} />
+            {action.created_by === "script" && (
+              <TooltipProvider>
+                <Tooltip delayDuration={300}>
+                  <TooltipTrigger asChild>
+                    <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
+                      <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-[250px]">
+                    Scripted Execution
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
             {success ? (
               <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
                 <CheckCircledIcon className="h-4 w-4 text-success" />
-                <span className="text-xs">Success</span>
               </div>
             ) : (
               <div className="flex gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
                 <CrossCircledIcon className="h-4 w-4 text-destructive" />
-                <span className="text-xs">Fail</span>
               </div>
             )}
           </div>

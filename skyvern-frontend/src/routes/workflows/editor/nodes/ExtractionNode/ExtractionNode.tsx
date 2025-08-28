@@ -33,23 +33,28 @@ import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
-import { useDebugStore } from "@/store/useDebugStore";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useRerender } from "@/hooks/useRerender";
 
 function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
-  const { debuggable, editable, label } = data;
+  const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
   const { blockLabel: urlBlockLabel } = useParams();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const [inputs, setInputs] = useState({
     url: data.url,
     dataExtractionGoal: data.dataExtractionGoal,
@@ -63,6 +68,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+  const rerender = useRerender({ prefix: "accordian" });
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
@@ -97,14 +103,14 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
           className={cn(
             "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
             {
-              "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-                thisBlockIsPlaying,
+              "pointer-events-none": thisBlockIsPlaying,
+              "bg-slate-950 outline outline-2 outline-slate-300":
+                thisBlockIsTargetted,
             },
           )}
         >
           <NodeHeader
             blockLabel={label}
-            disabled={elideFromDebugging}
             editable={editable}
             nodeId={id}
             totpIdentifier={null}
@@ -153,13 +159,17 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
             }}
           />
           <Separator />
-          <Accordion type="single" collapsible>
+          <Accordion
+            type="single"
+            collapsible
+            onValueChange={() => rerender.bump()}
+          >
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
-                <div className="space-y-4">
+                <div key={rerender.key} className="space-y-4">
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"

@@ -33,6 +33,7 @@ class BrowserManager:
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -48,6 +49,7 @@ class BrowserManager:
             script_id=script_id,
             organization_id=organization_id,
             extra_http_headers=extra_http_headers,
+            browser_address=browser_address,
         )
         return BrowserState(
             pw=pw,
@@ -113,6 +115,7 @@ class BrowserManager:
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 extra_http_headers=task.extra_http_headers,
+                browser_address=task.browser_address,
             )
 
             if browser_session_id:
@@ -133,6 +136,7 @@ class BrowserManager:
             task_id=task.task_id,
             organization_id=task.organization_id,
             extra_http_headers=task.extra_http_headers,
+            browser_address=task.browser_address,
         )
         return browser_state
 
@@ -187,6 +191,7 @@ class BrowserManager:
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
+                browser_address=workflow_run.browser_address,
             )
 
             if browser_session_id:
@@ -207,6 +212,7 @@ class BrowserManager:
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=workflow_run.organization_id,
             extra_http_headers=workflow_run.extra_http_headers,
+            browser_address=workflow_run.browser_address,
         )
         return browser_state
 
@@ -385,7 +391,7 @@ class BrowserManager:
         script_id: str | None = None,
         browser_session_id: str | None = None,
     ) -> BrowserState:
-        browser_state = await self.get_for_script(script_id=script_id)
+        browser_state = self.get_for_script(script_id=script_id)
         if browser_state:
             return browser_state
 
@@ -422,7 +428,7 @@ class BrowserManager:
 
         return browser_state
 
-    async def get_for_script(self, script_id: str | None = None) -> BrowserState | None:
+    def get_for_script(self, script_id: str | None = None) -> BrowserState | None:
         if script_id and script_id in self.pages:
             return self.pages[script_id]
         return None

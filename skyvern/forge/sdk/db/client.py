@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, List, Sequence
 
 import structlog
-from sqlalchemy import and_, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, asc, delete, distinct, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -85,7 +85,6 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, Tho
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.models.block import BlockStatus, BlockType
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenCreditCardDataParameter,
@@ -103,12 +102,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
-    WorkflowStatus,
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.steps import AgentStepOutput
+from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
 
@@ -140,11 +139,12 @@ class AgentDB:
         self,
         url: str,
         title: str | None,
-        complete_criterion: str | None,
-        terminate_criterion: str | None,
         navigation_goal: str | None,
         data_extraction_goal: str | None,
         navigation_payload: dict[str, Any] | list | str | None,
+        status: str = "created",
+        complete_criterion: str | None = None,
+        terminate_criterion: str | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -163,11 +163,12 @@ class AgentDB:
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_session_id: str | None = None,
+        browser_address: str | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
                 new_task = TaskModel(
-                    status="created",
+                    status=status,
                     task_type=task_type,
                     url=url,
                     title=title,
@@ -193,6 +194,7 @@ class AgentDB:
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
                     browser_session_id=browser_session_id,
+                    browser_address=browser_address,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -211,6 +213,7 @@ class AgentDB:
         order: int,
         retry_index: int,
         organization_id: str | None = None,
+        status: StepStatus = StepStatus.created,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -218,7 +221,7 @@ class AgentDB:
                     task_id=task_id,
                     order=order,
                     retry_index=retry_index,
-                    status="created",
+                    status=status,
                     organization_id=organization_id,
                 )
                 session.add(new_step)
@@ -471,7 +474,7 @@ class AgentDB:
                     .order_by(ActionModel.created_at.desc())
                 )
                 actions = (await session.scalars(query)).all()
-                return [Action.model_validate(action) for action in actions]
+                return [hydrate_action(action, empty_element_id=True) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -1242,9 +1245,9 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_artifact_for_workflow_run(
+    async def get_artifact_for_run(
         self,
-        workflow_run_id: str,
+        run_id: str,
         artifact_type: ArtifactType,
         organization_id: str | None = None,
     ) -> Artifact | None:
@@ -1253,8 +1256,7 @@ class AgentDB:
                 artifact = (
                     await session.scalars(
                         select(ArtifactModel)
-                        .join(TaskModel, TaskModel.task_id == ArtifactModel.task_id)
-                        .filter(TaskModel.workflow_run_id == workflow_run_id)
+                        .filter(ArtifactModel.run_id == run_id)
                         .filter(ArtifactModel.artifact_type == artifact_type)
                         .filter(ArtifactModel.organization_id == organization_id)
                         .order_by(ArtifactModel.created_at.desc())
@@ -1632,6 +1634,7 @@ class AgentDB:
         parent_workflow_run_id: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1648,6 +1651,7 @@ class AgentDB:
                     parent_workflow_run_id=parent_workflow_run_id,
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
+                    browser_address=browser_address,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -2404,15 +2408,20 @@ class AgentDB:
         - organization_id
         - totp_identifier
         2. make sure created_at is within the valid lifespan
-        3. sort by created_at desc
+        3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
         """
+        all_null = and_(
+            TOTPCodeModel.task_id.is_(None),
+            TOTPCodeModel.workflow_id.is_(None),
+            TOTPCodeModel.workflow_run_id.is_(None),
+        )
         async with self.Session() as session:
             query = (
                 select(TOTPCodeModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(totp_identifier=totp_identifier)
                 .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-                .order_by(TOTPCodeModel.created_at.desc())
+                .order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             )
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
@@ -2466,6 +2475,7 @@ class AgentDB:
                 skyvern_element_data=action.skyvern_element_data,
                 action_json=action.model_dump(),
                 confidence_float=action.confidence_float,
+                created_by=action.created_by,
             )
             session.add(new_action)
             await session.commit()
@@ -2602,6 +2612,7 @@ class AgentDB:
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        browser_address: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2620,6 +2631,7 @@ class AgentDB:
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             )
             session.add(new_task_v2)
             await session.commit()
@@ -3919,7 +3931,7 @@ class AgentDB:
                     .where(WorkflowScriptModel.deleted_at.is_(None))
                 )
 
-                if cache_key:
+                if cache_key is not None:
                     ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
 
                 # Latest version per script_id within the org and not deleted
@@ -3944,6 +3956,144 @@ class AgentDB:
 
                 scripts = (await session.scalars(query)).all()
                 return [convert_to_script(script) for script in scripts]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_cache_key_count(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        filter: str | None = None,
+    ) -> int:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(func.count())
+                    .select_from(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key=cache_key)
+                    .filter_by(deleted_at=None)
+                )
+
+                if filter:
+                    query = query.filter(WorkflowScriptModel.cache_key_value.contains(filter))
+
+                return (await session.execute(query)).scalar_one()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_cache_key_values(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        page: int = 1,
+        page_size: int = 100,
+        filter: str | None = None,
+    ) -> list[str]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel.cache_key_value)
+                    .order_by(WorkflowScriptModel.cache_key_value.asc())
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(cache_key=cache_key)
+                    .filter_by(deleted_at=None)
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+
+                if filter:
+                    query = query.filter(WorkflowScriptModel.cache_key_value.contains(filter))
+
+                return (await session.scalars(query)).all()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def create_workflow_cache_key_value(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        cache_key_value: str,
+        script_id: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> str:
+        """
+        Insert a new cache key value for a workflow.
+
+        Returns the workflow_script_id of the created record.
+        """
+        try:
+            async with self.Session() as session:
+                workflow_script = WorkflowScriptModel(
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_key_value=cache_key_value,
+                )
+
+                session.add(workflow_script)
+                await session.commit()
+                await session.refresh(workflow_script)
+
+                return workflow_script.workflow_script_id
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def delete_workflow_cache_key_value(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        cache_key_value: str,
+    ) -> bool:
+        """
+        Soft delete workflow cache key values by setting deleted_at timestamp.
+
+        Returns True if any records were deleted, False otherwise.
+        """
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        and_(
+                            WorkflowScriptModel.organization_id == organization_id,
+                            WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                            WorkflowScriptModel.cache_key_value == cache_key_value,
+                            WorkflowScriptModel.deleted_at.is_(None),
+                        )
+                    )
+                    .values(deleted_at=datetime.now(timezone.utc))
+                )
+
+                result = await session.execute(stmt)
+                await session.commit()
+
+                return result.rowcount > 0
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

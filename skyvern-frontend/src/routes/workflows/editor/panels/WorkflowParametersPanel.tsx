@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { useWorkflowParametersState } from "../useWorkflowParametersState";
 import { WorkflowParameterAddPanel } from "./WorkflowParameterAddPanel";
 import { ParametersState } from "../types";
 import { WorkflowParameterEditPanel } from "./WorkflowParameterEditPanel";
@@ -26,6 +25,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useReactFlow } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import {
   WorkflowEditorParameterType,
@@ -44,8 +44,10 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
   const setHasChanges = useWorkflowHasChangesStore(
     (state) => state.setHasChanges,
   );
-  const [workflowParameters, setWorkflowParameters] =
-    useWorkflowParametersState();
+  const {
+    parameters: workflowParameters,
+    setParameters: setWorkflowParameters,
+  } = useWorkflowParametersStore();
   const [operationPanelState, setOperationPanelState] = useState<{
     active: boolean;
     operation: "add" | "edit";

@@ -100,6 +100,10 @@ const useWorkflowSave = () => {
         }
       }
 
+      const scriptCacheKey = saveData.settings.scriptCacheKey ?? "";
+      const normalizedKey =
+        scriptCacheKey === "" ? "default" : saveData.settings.scriptCacheKey;
+
       const requestBody: WorkflowCreateYAMLRequest = {
         title: saveData.title,
         description: saveData.workflow.description,
@@ -111,7 +115,7 @@ const useWorkflowSave = () => {
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
         generate_script: saveData.settings.useScriptCache,
-        cache_key: saveData.settings.scriptCacheKey,
+        cache_key: normalizedKey,
         workflow_definition: {
           parameters: saveData.parameters,
           blocks: saveData.blocks,
@@ -150,6 +154,10 @@ const useWorkflowSave = () => {
 
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
+      });
+
+      queryClient.invalidateQueries({
+        queryKey: ["block-scripts", saveData.workflow.workflow_permanent_id],
       });
 
       setHasChanges(false);

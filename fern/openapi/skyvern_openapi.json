@@ -1699,126 +1699,6 @@
         ]
       }
     },
-    "/v1/credentials/onepassword/get": {
-      "get": {
-        "tags": [
-          "Auth Tokens"
-        ],
-        "summary": "Get OnePassword service account token",
-        "description": "Retrieves the current OnePassword service account token for the organization.",
-        "operationId": "get_onepassword_token_v1_credentials_onepassword_get_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CreateOnePasswordTokenResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_onepassword_token"
-      }
-    },
-    "/v1/credentials/onepassword/create": {
-      "post": {
-        "tags": [
-          "Auth Tokens"
-        ],
-        "summary": "Create or update OnePassword service account token",
-        "description": "Creates or updates a OnePassword service account token for the current organization. Only one valid token is allowed per organization.",
-        "operationId": "update_onepassword_token_v1_credentials_onepassword_create_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateOnePasswordTokenRequest",
-                "description": "The OnePassword token data",
-                "openapi_extra": {
-                  "x-fern-sdk-parameter-name": "data"
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CreateOnePasswordTokenResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "update_onepassword_token"
-      }
-    },
     "/v1/run/tasks/login": {
       "post": {
         "tags": [
@@ -4002,38 +3882,6 @@
         ],
         "title": "CreateCredentialRequest",
         "description": "Request model for creating a new credential."
-      },
-      "CreateOnePasswordTokenRequest": {
-        "properties": {
-          "token": {
-            "type": "string",
-            "title": "Token",
-            "description": "The 1Password service account token",
-            "examples": [
-              "op_1234567890abcdef"
-            ]
-          }
-        },
-        "type": "object",
-        "required": [
-          "token"
-        ],
-        "title": "CreateOnePasswordTokenRequest",
-        "description": "Request model for creating or updating a 1Password service account token."
-      },
-      "CreateOnePasswordTokenResponse": {
-        "properties": {
-          "token": {
-            "$ref": "#/components/schemas/OrganizationAuthToken",
-            "description": "The created or updated 1Password service account token"
-          }
-        },
-        "type": "object",
-        "required": [
-          "token"
-        ],
-        "title": "CreateOnePasswordTokenResponse",
-        "description": "Response model for 1Password token operations."
       },
       "CreateScriptRequest": {
         "properties": {
@@ -7628,58 +7476,6 @@
         ],
         "title": "OnePasswordCredentialParameterYAML"
       },
-      "OrganizationAuthToken": {
-        "properties": {
-          "id": {
-            "type": "string",
-            "title": "Id"
-          },
-          "organization_id": {
-            "type": "string",
-            "title": "Organization Id"
-          },
-          "token_type": {
-            "$ref": "#/components/schemas/OrganizationAuthTokenType"
-          },
-          "token": {
-            "type": "string",
-            "title": "Token"
-          },
-          "valid": {
-            "type": "boolean",
-            "title": "Valid"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Created At"
-          },
-          "modified_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Modified At"
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "organization_id",
-          "token_type",
-          "token",
-          "valid",
-          "created_at",
-          "modified_at"
-        ],
-        "title": "OrganizationAuthToken"
-      },
-      "OrganizationAuthTokenType": {
-        "type": "string",
-        "enum": [
-          "api",
-          "onepassword_service_account"
-        ],
-        "title": "OrganizationAuthTokenType"
-      },
       "OutputParameter": {
         "properties": {
           "parameter_type": {
@@ -9208,6 +9004,22 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot."
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The CDP address for the task.",
+            "examples": [
+              "http://127.0.0.1:9222",
+              "ws://127.0.0.1:9222/devtools/browser/1234567890"
+            ]
           }
         },
         "type": "object",
@@ -11689,6 +11501,22 @@
             ],
             "title": "Extra Http Headers",
             "description": "The extra HTTP headers for the requests in browser."
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The CDP address for the workflow run.",
+            "examples": [
+              "http://127.0.0.1:9222",
+              "ws://127.0.0.1:9222/devtools/browser/1234567890"
+            ]
           }
         },
         "type": "object",

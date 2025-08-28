@@ -1,12 +1,11 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { type FileUploadNode } from "./types";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { useState } from "react";
-import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
@@ -17,15 +16,20 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
   const { updateNodeData } = useReactFlow();
-  const { debuggable, editable, label } = data;
-  const debugStore = useDebugStore();
-  const elideFromDebugging = debugStore.isDebugMode && !debuggable;
+  const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
-  const thisBlockIsPlaying =
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
 
   const [inputs, setInputs] = useState({
     storageType: data.storageType,
@@ -65,14 +69,14 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
         className={cn(
           "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
           {
-            "pointer-events-none bg-slate-950 outline outline-2 outline-slate-300":
-              thisBlockIsPlaying,
+            "pointer-events-none": thisBlockIsPlaying,
+            "bg-slate-950 outline outline-2 outline-slate-300":
+              thisBlockIsTargetted,
           },
         )}
       >
         <NodeHeader
           blockLabel={label}
-          disabled={elideFromDebugging}
           editable={editable}
           nodeId={id}
           totpIdentifier={null}
@@ -133,12 +137,13 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                     }
                   />
                 </div>
-                <Input
+                <WorkflowBlockInput
+                  nodeId={id}
                   type="password"
                   value={inputs.awsSecretAccessKey as string}
                   className="nopan text-xs"
-                  onChange={(event) => {
-                    handleChange("awsSecretAccessKey", event.target.value);
+                  onChange={(value) => {
+                    handleChange("awsSecretAccessKey", value);
                   }}
                 />
               </div>
@@ -226,12 +231,13 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                     }
                   />
                 </div>
-                <Input
+                <WorkflowBlockInput
+                  nodeId={id}
                   type="password"
                   value={inputs.azureStorageAccountKey as string}
                   className="nopan text-xs"
-                  onChange={(event) => {
-                    handleChange("azureStorageAccountKey", event.target.value);
+                  onChange={(value) => {
+                    handleChange("azureStorageAccountKey", value);
                   }}
                 />
               </div>
