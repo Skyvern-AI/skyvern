@@ -25,6 +25,17 @@ RETRY_RUN_WEBHOOK_CODE_SAMPLE = """from skyvern import Skyvern
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 await skyvern.retry_run_webhook(run_id="tsk_v2_123")
 """
+GET_RUN_TIMELINE_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+# Get timeline for a workflow run
+timeline = await skyvern.get_run_timeline(run_id="wr_123")
+print(timeline)
+
+# Get timeline for a task_v2 run
+timeline = await skyvern.get_run_timeline(run_id="tsk_v2_123")
+print(timeline)
+"""
 LOGIN_CODE_SAMPLE_SKYVERN = """# Login with password saved in Skyvern
 from skyvern import Skyvern
 
