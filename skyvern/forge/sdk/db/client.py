@@ -105,9 +105,9 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
-from skyvern.webeye.actions.models import AgentStepOutput
 
 LOG = structlog.get_logger()
 
@@ -213,6 +213,7 @@ class AgentDB:
         order: int,
         retry_index: int,
         organization_id: str | None = None,
+        status: StepStatus = StepStatus.created,
     ) -> Step:
         try:
             async with self.Session() as session:
@@ -220,7 +221,7 @@ class AgentDB:
                     task_id=task_id,
                     order=order,
                     retry_index=retry_index,
-                    status="created",
+                    status=status,
                     organization_id=organization_id,
                 )
                 session.add(new_step)
@@ -473,7 +474,7 @@ class AgentDB:
                     .order_by(ActionModel.created_at.desc())
                 )
                 actions = (await session.scalars(query)).all()
-                return [Action.model_validate(action) for action in actions]
+                return [hydrate_action(action, empty_element_id=True) for action in actions]
 
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
@@ -1244,9 +1245,9 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_artifact_for_workflow_run(
+    async def get_artifact_for_run(
         self,
-        workflow_run_id: str,
+        run_id: str,
         artifact_type: ArtifactType,
         organization_id: str | None = None,
     ) -> Artifact | None:
@@ -1255,8 +1256,7 @@ class AgentDB:
                 artifact = (
                     await session.scalars(
                         select(ArtifactModel)
-                        .join(TaskModel, TaskModel.task_id == ArtifactModel.task_id)
-                        .filter(TaskModel.workflow_run_id == workflow_run_id)
+                        .filter(ArtifactModel.run_id == run_id)
                         .filter(ArtifactModel.artifact_type == artifact_type)
                         .filter(ArtifactModel.organization_id == organization_id)
                         .order_by(ArtifactModel.created_at.desc())
@@ -2475,6 +2475,7 @@ class AgentDB:
                 skyvern_element_data=action.skyvern_element_data,
                 action_json=action.model_dump(),
                 confidence_float=action.confidence_float,
+                created_by=action.created_by,
             )
             session.add(new_action)
             await session.commit()
@@ -3930,7 +3931,7 @@ class AgentDB:
                     .where(WorkflowScriptModel.deleted_at.is_(None))
                 )
 
-                if cache_key:
+                if cache_key is not None:
                     ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
 
                 # Latest version per script_id within the org and not deleted

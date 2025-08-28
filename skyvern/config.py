@@ -245,6 +245,8 @@ class Settings(BaseSettings):
 
     # GEMINI
     GEMINI_API_KEY: str | None = None
+    GEMINI_INCLUDE_THOUGHT: bool = False
+    GEMINI_THINKING_BUDGET: int | None = None
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None
@@ -272,6 +274,11 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str | None = None
     GROQ_MODEL: str | None = None
     GROQ_API_BASE: str = "https://api.groq.com/openai/v1"
+
+    # MOONSHOT AI
+    ENABLE_MOONSHOT: bool = False
+    MOONSHOT_API_KEY: str | None = None
+    MOONSHOT_API_BASE: str = "https://api.moonshot.cn/v1"
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
@@ -341,6 +348,9 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+
+    # script generation settings
+    WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
     def get_model_name_to_llm_key(self) -> dict[str, dict[str, str]]:
         """

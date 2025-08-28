@@ -1,10 +1,10 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { type FileUploadNode } from "./types";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { useState } from "react";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
@@ -137,12 +137,13 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                     }
                   />
                 </div>
-                <Input
+                <WorkflowBlockInput
+                  nodeId={id}
                   type="password"
                   value={inputs.awsSecretAccessKey as string}
                   className="nopan text-xs"
-                  onChange={(event) => {
-                    handleChange("awsSecretAccessKey", event.target.value);
+                  onChange={(value) => {
+                    handleChange("awsSecretAccessKey", value);
                   }}
                 />
               </div>
@@ -230,12 +231,13 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                     }
                   />
                 </div>
-                <Input
+                <WorkflowBlockInput
+                  nodeId={id}
                   type="password"
                   value={inputs.azureStorageAccountKey as string}
                   className="nopan text-xs"
-                  onChange={(event) => {
-                    handleChange("azureStorageAccountKey", event.target.value);
+                  onChange={(value) => {
+                    handleChange("azureStorageAccountKey", value);
                   }}
                 />
               </div>
