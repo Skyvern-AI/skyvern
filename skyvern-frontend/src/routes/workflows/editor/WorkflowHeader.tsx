@@ -1,5 +1,4 @@
 import {
-  CheckIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   CopyIcon,
@@ -32,25 +31,6 @@ import { cn } from "@/util/utils";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
 import { OrgWalled } from "@/components/Orgwalled";
-
-function CopyButton({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = () => {
-    if (copied) {
-      return;
-    }
-    window.navigator.clipboard.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-
-  return (
-    <Button size="icon" variant="ghost" onClick={handleCopy}>
-      {copied ? <CheckIcon /> : <CopyIcon />}
-    </Button>
-  );
-}
 
 interface Dom {
   input: React.MutableRefObject<HTMLInputElement | null>;
@@ -202,7 +182,6 @@ function WorkflowHeader({
                   }}
                 />
               )}
-              <CopyButton value={chosenCacheKeyValue ?? ""} />
             </div>
           </OrgWalled>
         )}
