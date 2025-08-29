@@ -98,10 +98,10 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
 };
 
 /**
- * Attempt to construct a valid cache key value from the workflow parameters.
+ * Attempt to construct a valid code key value from the workflow parameters.
  */
 const constructCacheKeyValue = (
-  cacheKey: string,
+  codeKey: string,
   workflow: WorkflowApiResponse,
 ) => {
   const workflowParameters = getInitialParameters(workflow)
@@ -119,14 +119,14 @@ const constructCacheKeyValue = (
       continue;
     }
 
-    cacheKey = cacheKey.replace(`{{${name}}}`, value.toString());
+    codeKey = codeKey.replace(`{{${name}}}`, value.toString());
   }
 
-  if (cacheKey.includes("{") || cacheKey.includes("}")) {
+  if (codeKey.includes("{") || codeKey.includes("}")) {
     return "";
   }
 
-  return cacheKey;
+  return codeKey;
 };
 
 export { constructCacheKeyValue, getInitialParameters };
