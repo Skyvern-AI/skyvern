@@ -96,7 +96,7 @@ function ScrollableActionList({
                         </div>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-[250px]">
-                        Scripted Execution
+                        Code Execution
                       </TooltipContent>
                     </Tooltip>
                   </TooltipProvider>

@@ -64,6 +64,7 @@ class WorkflowRunContext:
             | BitwardenSensitiveInformationParameter
             | CredentialParameter
         ],
+        block_outputs: dict[str, Any] | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(aws_client=aws_client, azure_client=azure_client)
@@ -87,6 +88,10 @@ class WorkflowRunContext:
             if output_parameter.key in workflow_run_context.parameters:
                 raise OutputParameterKeyCollisionError(output_parameter.key)
             workflow_run_context.parameters[output_parameter.key] = output_parameter
+
+        if block_outputs:
+            for label, value in block_outputs.items():
+                workflow_run_context.values[f"{label}_output"] = value
 
         for secrete_parameter in secret_parameters:
             if isinstance(secrete_parameter, AWSSecretParameter):
@@ -884,6 +889,7 @@ class WorkflowContextManager:
             | BitwardenCreditCardDataParameter
             | BitwardenSensitiveInformationParameter
         ],
+        block_outputs: dict[str, Any] | None = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -893,6 +899,7 @@ class WorkflowContextManager:
             workflow_output_parameters,
             context_parameters,
             secret_parameters,
+            block_outputs,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

@@ -53,7 +53,7 @@ function NodeActionMenu({
                   onShowScript();
                 }}
               >
-                {showScriptText ?? "Show Script"}
+                {showScriptText ?? "Show Code"}
               </DropdownMenuItem>
             )}
           </OrgWalled>

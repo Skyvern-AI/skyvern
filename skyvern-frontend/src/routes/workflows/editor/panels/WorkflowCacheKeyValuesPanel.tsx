@@ -44,16 +44,16 @@ function WorkflowCacheKeyValuesPanel({
     >
       <div className="space-y-4">
         <header>
-          <h1 className="text-lg">Cached Scripts</h1>
+          <h1 className="text-lg">Code Cache</h1>
           <span className="text-sm text-slate-400">
-            Given your script key,{" "}
+            Given your code key,{" "}
             <code className="font-mono text-xs text-slate-200">
               {scriptKey}
             </code>
-            , search for scripts using a script key value. For this script key
+            , search for saved code using a code key value. For this code key
             there {totalCount === 1 ? "is" : "are"}{" "}
-            <span className="font-bold text-slate-200">{totalCount}</span>{" "}
-            script key {totalCount === 1 ? "value" : "values"}
+            <span className="font-bold text-slate-200">{totalCount}</span> code
+            key {totalCount === 1 ? "value" : "values"}
             {filteredCount !== totalCount && (
               <>
                 {" "}

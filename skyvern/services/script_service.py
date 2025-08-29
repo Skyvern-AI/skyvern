@@ -478,7 +478,7 @@ async def _fallback_to_ai_run(
     try:
         organization_id = context.organization_id
         LOG.info(
-            "Script fallback to AI run",
+            "Script trying to fallback to AI run",
             cache_key=cache_key,
             organization_id=organization_id,
             workflow_id=context.workflow_id,
@@ -510,13 +510,22 @@ async def _fallback_to_ai_run(
         if not task:
             raise Exception(f"Task is missing task_id={context.task_id}")
         workflow = await app.DATABASE.get_workflow(workflow_id=context.workflow_id, organization_id=organization_id)
-        if not workflow:
+        if not workflow or not workflow.ai_fallback:
             return
 
         # get the output_paramter
         output_parameter = workflow.get_output_parameter(cache_key)
         if not output_parameter:
             return
+        LOG.info(
+            "Script starting to fallback to AI run",
+            cache_key=cache_key,
+            organization_id=organization_id,
+            workflow_id=context.workflow_id,
+            workflow_run_id=context.workflow_run_id,
+            task_id=context.task_id,
+            step_id=context.step_id,
+        )
 
         task_block = TaskBlock(
             label=cache_key,
