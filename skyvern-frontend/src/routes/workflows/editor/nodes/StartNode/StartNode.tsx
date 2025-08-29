@@ -2,6 +2,13 @@ import { getClient } from "@/api/AxiosClient";
 import { Handle, Node, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { StartNode } from "./types";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
+import {
   Accordion,
   AccordionContent,
   AccordionItem,
@@ -25,7 +32,6 @@ import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { OrgWalled } from "@/components/Orgwalled";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
-import { NodeActionMenu } from "@/routes/workflows/editor/nodes/NodeActionMenu";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import {
@@ -37,6 +43,7 @@ import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { cn } from "@/util/utils";
+import { LightningBoltIcon } from "@radix-ui/react-icons";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
@@ -153,19 +160,23 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
             )}
           >
             <div className="relative">
-              <div className="absolute right-0 top-0">
+              <div className="absolute right-[-0.5rem] top-[-0.25rem]">
                 <div>
-                  <div className="rounded p-1 hover:bg-muted">
-                    <NodeActionMenu
-                      isDeletable={false}
-                      isScriptable={true}
-                      showScriptText="Show All Code"
-                      onShowScript={showAllScripts}
-                    />
-                  </div>
+                  <OrgWalled className="p-0">
+                    <Button variant="link" size="icon" onClick={showAllScripts}>
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                          </TooltipTrigger>
+                          <TooltipContent>Show all code</TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </Button>
+                  </OrgWalled>
                 </div>
               </div>
-              <header className="mb-4">Start</header>
+              <header className="mb-6 mt-2">Start</header>
               <Separator />
               <Accordion
                 type="single"
