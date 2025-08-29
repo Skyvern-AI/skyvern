@@ -112,7 +112,7 @@ function BlockCodeEditor({
           <div className="h-full flex-1 overflow-y-hidden">
             <CodeEditor
               key="static"
-              className="nopan nowheel h-full overflow-y-scroll"
+              className="nopan h-full overflow-y-scroll"
               language="python"
               value={script}
               lineWrap={false}
