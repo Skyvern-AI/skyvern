@@ -674,6 +674,7 @@ class WorkflowService:
         extra_http_headers: dict[str, str] | None = None,
         generate_script: bool = False,
         cache_key: str | None = None,
+        ai_fallback: bool | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -694,6 +695,7 @@ class WorkflowService:
             extra_http_headers=extra_http_headers,
             generate_script=generate_script,
             cache_key=cache_key,
+            ai_fallback=False if ai_fallback is None else ai_fallback,
         )
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
@@ -1647,6 +1649,7 @@ class WorkflowService:
                     status=request.status,
                     generate_script=request.generate_script,
                     cache_key=request.cache_key,
+                    ai_fallback=request.ai_fallback,
                 )
             else:
                 workflow = await self.create_workflow(
