@@ -64,6 +64,7 @@ function WorkflowEditor() {
       : null,
     useScriptCache: workflow.generate_script,
     scriptCacheKey: workflow.cache_key,
+    aiFallback: workflow.ai_fallback,
   };
 
   const elements = getElements(
