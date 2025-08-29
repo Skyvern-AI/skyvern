@@ -324,7 +324,7 @@ function Workspace({
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete cache key value",
+        title: "Failed to delete code key value",
         description: error.message,
       });
       setToDeleteCacheKeyValue(null);
@@ -534,15 +534,15 @@ function Workspace({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete A Script Key Value</DialogTitle>
+            <DialogTitle>Delete A Code Key Value</DialogTitle>
             <DialogDescription>
               <div className="w-full pb-2 pt-4 text-sm text-slate-400">
                 {deleteCacheKeyValue.isPending ? (
-                  "Deleting script key value..."
+                  "Deleting code key value..."
                 ) : (
                   <div className="flex w-full flex-col gap-2">
                     <div className="w-full">
-                      Are you sure you want to delete this script key value?
+                      Are you sure you want to delete this code key value?
                     </div>
                     <div
                       className="max-w-[29rem] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-slate-400"

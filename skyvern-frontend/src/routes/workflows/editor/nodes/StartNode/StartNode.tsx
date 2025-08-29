@@ -159,7 +159,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                     <NodeActionMenu
                       isDeletable={false}
                       isScriptable={true}
-                      showScriptText="Show All Scripts"
+                      showScriptText="Show All Code"
                       onShowScript={showAllScripts}
                     />
                   </div>
@@ -218,8 +218,8 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                       <OrgWalled className="flex flex-col gap-4">
                         <div className="space-y-2">
                           <div className="flex items-center gap-2">
-                            <Label>Generate Script</Label>
-                            <HelpTooltip content="Generate & use cached scripts for faster execution." />
+                            <Label>Generate Code</Label>
+                            <HelpTooltip content="Generate & use cached code for faster execution." />
                             <Switch
                               className="ml-auto"
                               checked={inputs.useScriptCache}
@@ -232,7 +232,8 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         {inputs.useScriptCache && (
                           <div className="space-y-2">
                             <div className="flex gap-2">
-                              <Label>Script Key (optional)</Label>
+                              <Label>Code Key (optional)</Label>
+                              <HelpTooltip content="A static or dynamic key for directing code generation." />
                             </div>
                             <WorkflowBlockInputTextarea
                               nodeId={id}
