@@ -26,7 +26,13 @@ type Props = {
   maxHeight?: string;
   className?: string;
   fontSize?: number;
+  fullHeight?: boolean;
 };
+
+const fullHeightExtension = EditorView.theme({
+  "&": { height: "100%" }, // the root
+  ".cm-scroller": { flex: 1 }, // makes the scrollable area expand
+});
 
 function CodeEditor({
   value,
@@ -38,10 +44,18 @@ function CodeEditor({
   className,
   readOnly = false,
   fontSize = 12,
+  fullHeight = false,
 }: Props) {
   const extensions = language
     ? [getLanguageExtension(language), lineWrap ? EditorView.lineWrapping : []]
     : [lineWrap ? EditorView.lineWrapping : []];
+
+  const style: React.CSSProperties = { fontSize };
+
+  if (fullHeight) {
+    extensions.push(fullHeightExtension);
+    style.height = "100%";
+  }
 
   return (
     <CodeMirror
@@ -53,9 +67,7 @@ function CodeEditor({
       maxHeight={maxHeight}
       readOnly={readOnly}
       className={cn("cursor-auto", className)}
-      style={{
-        fontSize: fontSize,
-      }}
+      style={style}
     />
   );
 }

@@ -1,8 +1,15 @@
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 
 type Option = {
   label: string;
   value: string;
+  helpText?: string;
 };
 
 type Props = {
@@ -23,7 +30,7 @@ function SwitchBar({ className, highlight, options, value, onChange }: Props) {
     >
       {options.map((option) => {
         const selected = option.value === value;
-        return (
+        const optionElement = (
           <div
             key={option.value}
             className={cn(
@@ -42,6 +49,19 @@ function SwitchBar({ className, highlight, options, value, onChange }: Props) {
             {option.label}
           </div>
         );
+
+        if (option.helpText) {
+          return (
+            <TooltipProvider key={option.value}>
+              <Tooltip>
+                <TooltipTrigger asChild>{optionElement}</TooltipTrigger>
+                <TooltipContent>{option.helpText}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          );
+        }
+
+        return optionElement;
       })}
     </div>
   );
