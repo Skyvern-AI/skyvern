@@ -920,6 +920,7 @@ async def run_block(
     background_tasks: BackgroundTasks,
     block_run_request: BlockRunRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str = Depends(org_auth_service.get_current_user_id),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> BlockRunResponse:
@@ -927,6 +928,12 @@ async def run_block(
     Kick off the execution of one or more blocks in a workflow. Returns the
     workflow_run_id.
     """
+
+    # NOTE(jdo): if you're running debugger locally, and you want to see the
+    # block runs happening (no temporal; no pbs), then uncomment these two
+    # lines; that'll make the block run happen in a new local browser instance.
+    # LOG.critical("REMOVING BROWSER SESSION ID")
+    # block_run_request.browser_session_id = None
 
     workflow_run = await block_service.ensure_workflow_run(
         organization=organization,
@@ -946,7 +953,9 @@ async def run_block(
         workflow_run_id=workflow_run.workflow_run_id,
         workflow_permanent_id=workflow_run.workflow_permanent_id,
         organization=organization,
+        user_id=user_id,
         browser_session_id=browser_session_id,
+        block_outputs=block_run_request.block_outputs,
     )
 
     return BlockRunResponse(
@@ -2290,3 +2299,22 @@ async def new_debug_session(
     )
 
     return debug_session
+
+
+@base_router.get(
+    "/debug-session/{workflow_permanent_id}/block-outputs",
+    response_model=dict[str, dict[str, Any]],
+    include_in_schema=False,
+)
+async def get_block_outputs_for_debug_session(
+    workflow_permanent_id: str,
+    version: int | None = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+) -> dict[str, dict[str, Any]]:
+    return await app.WORKFLOW_SERVICE.get_block_outputs_for_debug_session(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        version=version,
+    )
