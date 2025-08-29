@@ -16,6 +16,7 @@ export type WorkflowCreateYAMLRequest = {
   extra_http_headers?: Record<string, string> | null;
   generate_script?: boolean;
   cache_key?: string | null;
+  ai_fallback?: boolean;
 };
 
 export type WorkflowDefinitionYAML = {

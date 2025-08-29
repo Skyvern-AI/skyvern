@@ -510,6 +510,7 @@ export type WorkflowApiResponse = {
   deleted_at: string | null;
   generate_script: boolean;
   cache_key: string | null;
+  ai_fallback: boolean | null;
 };
 
 export type WorkflowSettings = {
@@ -521,6 +522,7 @@ export type WorkflowSettings = {
   extraHttpHeaders: string | null;
   useScriptCache: boolean;
   scriptCacheKey: string | null;
+  aiFallback: boolean | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;
