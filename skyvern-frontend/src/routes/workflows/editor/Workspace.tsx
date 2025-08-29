@@ -157,18 +157,24 @@ function Workspace({
   );
 
   useEffect(() => {
-    if (cacheKeyValue === "") {
-      setSearchParams((prev) => {
-        const newParams = new URLSearchParams(prev);
-        newParams.delete("cache-key-value");
-        return newParams;
-      });
-    } else {
-      setSearchParams({
-        "cache-key-value": `${cacheKeyValue}`,
-      });
+    const currentUrlValue = searchParams.get("cache-key-value");
+    const targetValue = cacheKeyValue === "" ? null : cacheKeyValue;
+
+    if (currentUrlValue !== targetValue) {
+      setSearchParams(
+        (prev) => {
+          const newParams = new URLSearchParams(prev);
+          if (cacheKeyValue === "") {
+            newParams.delete("cache-key-value");
+          } else {
+            newParams.set("cache-key-value", cacheKeyValue);
+          }
+          return newParams;
+        },
+        { replace: true },
+      );
     }
-  }, [cacheKeyValue, setSearchParams]);
+  }, [cacheKeyValue, searchParams, setSearchParams]);
 
   const { data: blockScripts } = useBlockScriptsQuery({
     cacheKey,
