@@ -506,6 +506,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     generate_script: bool = False
+    ai_fallback: bool = False
     cache_key: str | None = None
 
 

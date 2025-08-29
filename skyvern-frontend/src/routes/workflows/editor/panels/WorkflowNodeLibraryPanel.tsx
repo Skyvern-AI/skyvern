@@ -204,7 +204,7 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "File Upload Block",
+    title: "Cloud Storage Block",
     description: "Upload files to storage",
   },
   {

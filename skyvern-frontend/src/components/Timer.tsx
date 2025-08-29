@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 
+import { formatMs } from "@/util/utils";
+
 interface HMS {
   hour: number;
   minute: number;
@@ -10,21 +12,6 @@ interface Props {
   override?: number;
   startAt?: HMS;
 }
-
-const formatMs = (elapsed: number) => {
-  let seconds = Math.floor(elapsed / 1000);
-  let minutes = Math.floor(seconds / 60);
-  let hours = Math.floor(minutes / 60);
-  seconds = seconds % 60;
-  minutes = minutes % 60;
-  hours = hours % 24;
-
-  return {
-    hour: hours,
-    minute: minutes,
-    second: seconds,
-  };
-};
 
 function Timer({ override, startAt }: Props) {
   const [time, setTime] = useState<HMS>({

@@ -6,6 +6,15 @@ from pydantic import BaseModel, ConfigDict
 DebugSessionStatus = t.Literal["created", "completed"]
 
 
+class BlockRun(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    block_label: str
+    output_parameter_id: str
+    workflow_run_id: str
+    created_at: datetime
+
+
 class DebugSession(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

@@ -20,7 +20,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
@@ -164,6 +164,7 @@ class SkyvernPage:
                         intention=intention,
                         status=action_status,
                         data=data,
+                        kwargs=kwargs,
                     )
 
                     # Auto-create screenshot artifact after execution
@@ -173,8 +174,11 @@ class SkyvernPage:
 
         return decorator
 
-    async def goto(self, url: str) -> None:
-        await self.page.goto(url)
+    async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
+        await self.page.goto(
+            url,
+            timeout=timeout,
+        )
 
     async def _create_action_before_execution(
         self,
@@ -182,6 +186,7 @@ class SkyvernPage:
         intention: str = "",
         status: ActionStatus = ActionStatus.pending,
         data: str | dict[str, Any] = "",
+        kwargs: dict[str, Any] | None = None,
     ) -> Action | None:
         """Create an action record in the database before execution if task_id and step_id are available."""
         try:
@@ -190,7 +195,20 @@ class SkyvernPage:
                 return None
 
             # Create action record. TODO: store more action fields
+            kwargs = kwargs or {}
+            text = kwargs.get("text")
+            option_value = kwargs.get("option")
+            select_option = SelectOption(value=option_value) if option_value else None
+            response: str | None = kwargs.get("response")
+            if not response:
+                if action_type == ActionType.INPUT_TEXT:
+                    response = text
+                elif action_type == ActionType.SELECT_OPTION:
+                    if select_option:
+                        response = select_option.value
+
             action = Action(
+                element_id="",
                 action_type=action_type,
                 status=status,
                 organization_id=context.organization_id,
@@ -201,6 +219,10 @@ class SkyvernPage:
                 action_order=0,  # Will be updated by the system if needed
                 intention=intention,
                 reasoning=f"Auto-generated action for {action_type.value}",
+                text=text,
+                option=select_option,
+                response=response,
+                created_by="script",
             )
 
             created_action = await app.DATABASE.create_action(action)
@@ -329,6 +351,11 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         inputting the originally supplied ``text``.
         """
+        # format the text with the actual value of the parameter if it's a secret when running a workflow
+        context = skyvern_context.current()
+        if context and context.workflow_run_id:
+            text = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, text)
+
         locator = self.page.locator(f"xpath={xpath}")
         await handler_utils.input_sequentially(locator, text, timeout=timeout)
 
@@ -440,7 +467,8 @@ class SkyvernPage:
     @action_wrap(ActionType.VERIFICATION_CODE)
     async def verification_code(
         self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None
-    ) -> None: ...
+    ) -> None:
+        return
 
     @action_wrap(ActionType.SCROLL)
     async def scroll(
@@ -500,3 +528,16 @@ class RunContext:
         self.page = page
         self.trace: list[ActionCall] = []
         self.prompt: str | None = None
+
+
+async def _get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
+    """
+    Get the actual value of a parameter if it's a secret. If it's not a secret, return the parameter value as is.
+
+    Just return the parameter value if the task isn't a workflow's task.
+
+    This is only used for InputTextAction, UploadFileAction, and ClickAction (if it has a file_url).
+    """
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
+    return secret_value if secret_value is not None else parameter

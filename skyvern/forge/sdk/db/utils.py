@@ -264,6 +264,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
         generate_script=workflow_model.generate_script,
+        ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
     )
 
@@ -555,12 +556,15 @@ def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock
     )
 
 
-def hydrate_action(action_model: ActionModel) -> Action:
+def hydrate_action(action_model: ActionModel, empty_element_id: bool = False) -> Action:
     """
     Convert ActionModel to the appropriate Action type based on action_type.
     The action_json contains all the metadata of different types of actions.
     """
     # Create base action data from the model
+    element_id = action_model.element_id
+    if empty_element_id:
+        element_id = element_id or ""
     action_data = {
         "action_type": action_model.action_type,
         "status": action_model.status,
@@ -576,7 +580,7 @@ def hydrate_action(action_model: ActionModel) -> Action:
         "reasoning": action_model.reasoning,
         "intention": action_model.intention,
         "response": action_model.response,
-        "element_id": action_model.element_id,
+        "element_id": element_id,
         "skyvern_element_hash": action_model.skyvern_element_hash,
         "skyvern_element_data": action_model.skyvern_element_data,
         "created_at": action_model.created_at,

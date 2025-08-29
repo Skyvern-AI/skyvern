@@ -109,6 +109,21 @@ class Block(BaseModel, abc.ABC):
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
 
+    @property
+    def override_llm_key(self) -> str | None:
+        """
+        If the `Block` has a `model` defined, then return the mapped llm_key for it.
+
+        Otherwise return `None`.
+        """
+        if self.model:
+            model_name = self.model.get("model_name")
+            if model_name:
+                mapping = settings.get_model_name_to_llm_key()
+                return mapping.get(model_name, {}).get("llm_key")
+
+        return None
+
     async def record_output_parameter_value(
         self,
         workflow_run_context: WorkflowRunContext,
@@ -1393,6 +1408,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "Exception": Exception,
         }
 
     def generate_async_user_function(
@@ -2564,7 +2580,12 @@ class FileParserBlock(Block):
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use
         )
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            self.override_llm_key, default=app.LLM_API_HANDLER
+        )
+
+        llm_response = await llm_api_handler(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
         return llm_response
 
     async def execute(
@@ -3188,8 +3209,8 @@ class HttpRequestBlock(Block):
                 method=self.method,
                 url=self.url,
                 headers=self.headers,
-                has_body=bool(self.body),
                 workflow_run_id=workflow_run_id,
+                body=self.body,
             )
 
             # Use the generic aiohttp_request function
@@ -3203,7 +3224,16 @@ class HttpRequestBlock(Block):
             )
 
             response_data = {
+                # Response information
                 "status_code": status_code,
+                "response_headers": response_headers,
+                "response_body": response_body,
+                # Request information (what was sent)
+                "request_method": self.method,
+                "request_url": self.url,
+                "request_headers": self.headers,
+                "request_body": self.body,
+                # Backwards compatibility
                 "headers": response_headers,
                 "body": response_body,
                 "url": self.url,

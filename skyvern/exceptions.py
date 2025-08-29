@@ -754,3 +754,8 @@ class NoTOTPSecretFound(SkyvernException):
 class NoElementFound(SkyvernException):
     def __init__(self) -> None:
         super().__init__("No element found.")
+
+
+class OutputParameterNotFound(SkyvernException):
+    def __init__(self, block_label: str, workflow_permanent_id: str) -> None:
+        super().__init__(f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}")

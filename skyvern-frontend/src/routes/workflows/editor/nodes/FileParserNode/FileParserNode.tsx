@@ -13,6 +13,7 @@ import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/
 import { dataSchemaExampleForFileExtraction } from "../types";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { ModelSelector } from "@/components/ModelSelector";
 
 function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const { updateNodeData } = useReactFlow();
@@ -28,6 +29,7 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
   const [inputs, setInputs] = useState({
     fileUrl: data.fileUrl,
     jsonSchema: data.jsonSchema,
+    model: data.model,
   });
 
   function handleChange(key: string, value: unknown) {
@@ -102,6 +104,13 @@ function FileParserNode({ id, data }: NodeProps<FileParserNode>) {
               handleChange("jsonSchema", value);
             }}
             suggestionContext={{}}
+          />
+          <ModelSelector
+            className="nopan w-52 text-xs"
+            value={inputs.model}
+            onChange={(value) => {
+              handleChange("model", value);
+            }}
           />
         </div>
       </div>

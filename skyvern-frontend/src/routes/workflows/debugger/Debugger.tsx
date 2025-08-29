@@ -7,11 +7,16 @@ import { WorkflowSettings } from "../types/workflowTypes";
 import { getElements } from "@/routes/workflows/editor/workflowEditorUtils";
 import { getInitialParameters } from "@/routes/workflows/editor/utils";
 import { Workspace } from "@/routes/workflows/editor/Workspace";
+import { useDebugSessionBlockOutputsQuery } from "../hooks/useDebugSessionBlockOutputsQuery";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useBlockOutputStore } from "@/store/BlockOutputStore";
 
 function Debugger() {
   const { workflowPermanentId } = useParams();
   const { data: workflow } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+  const { data: outputParameters } = useDebugSessionBlockOutputsQuery({
     workflowPermanentId,
   });
 
@@ -19,12 +24,29 @@ function Debugger() {
     (state) => state.setParameters,
   );
 
+  const setBlockOutputs = useBlockOutputStore((state) => state.setOutputs);
+
   useEffect(() => {
     if (workflow) {
       const initialParameters = getInitialParameters(workflow);
       setParameters(initialParameters);
     }
   }, [workflow, setParameters]);
+
+  useEffect(() => {
+    if (!outputParameters) {
+      return;
+    }
+
+    const blockOutputs = Object.entries(outputParameters).reduce<{
+      [k: string]: Record<string, unknown>;
+    }>((acc, [blockLabel, outputs]) => {
+      acc[blockLabel] = outputs ?? null;
+      return acc;
+    }, {});
+
+    setBlockOutputs(blockOutputs);
+  }, [outputParameters, setBlockOutputs]);
 
   if (!workflow) {
     return null;

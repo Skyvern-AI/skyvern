@@ -5,8 +5,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.models import AgentStepOutput
 
 
 class StepStatus(StrEnum):

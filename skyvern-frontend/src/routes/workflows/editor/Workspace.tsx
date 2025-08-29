@@ -127,6 +127,7 @@ function Workspace({
     "history",
     "infiniteCanvas",
   ]);
+  const [hideControlButtons, setHideControlButtons] = useState(false);
 
   // ---start fya: https://github.com/frontyardart
   const hasForLoopNode = nodes.some((node) => node.type === "loop");
@@ -156,18 +157,24 @@ function Workspace({
   );
 
   useEffect(() => {
-    if (cacheKeyValue === "") {
-      setSearchParams((prev) => {
-        const newParams = new URLSearchParams(prev);
-        newParams.delete("cache-key-value");
-        return newParams;
-      });
-    } else {
-      setSearchParams({
-        "cache-key-value": `${cacheKeyValue}`,
-      });
+    const currentUrlValue = searchParams.get("cache-key-value");
+    const targetValue = cacheKeyValue === "" ? null : cacheKeyValue;
+
+    if (currentUrlValue !== targetValue) {
+      setSearchParams(
+        (prev) => {
+          const newParams = new URLSearchParams(prev);
+          if (cacheKeyValue === "") {
+            newParams.delete("cache-key-value");
+          } else {
+            newParams.set("cache-key-value", cacheKeyValue);
+          }
+          return newParams;
+        },
+        { replace: true },
+      );
     }
-  }, [cacheKeyValue, setSearchParams]);
+  }, [cacheKeyValue, searchParams, setSearchParams]);
 
   const { data: blockScripts } = useBlockScriptsQuery({
     cacheKey,
@@ -317,7 +324,7 @@ function Workspace({
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete cache key value",
+        title: "Failed to delete code key value",
         description: error.message,
       });
       setToDeleteCacheKeyValue(null);
@@ -417,6 +424,8 @@ function Workspace({
           {
             withWorkflowSettings: false,
             editable: true,
+            label: "__start_block__",
+            showCode: false,
           },
           id,
         ),
@@ -525,15 +534,15 @@ function Workspace({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete A Script Key Value</DialogTitle>
+            <DialogTitle>Delete A Code Key Value</DialogTitle>
             <DialogDescription>
               <div className="w-full pb-2 pt-4 text-sm text-slate-400">
                 {deleteCacheKeyValue.isPending ? (
-                  "Deleting script key value..."
+                  "Deleting code key value..."
                 ) : (
                   <div className="flex w-full flex-col gap-2">
                     <div className="w-full">
-                      Are you sure you want to delete this script key value?
+                      Are you sure you want to delete this code key value?
                     </div>
                     <div
                       className="max-w-[29rem] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-slate-400"
@@ -681,7 +690,7 @@ function Workspace({
             <WorkflowCacheKeyValuesPanel
               cacheKeyValues={cacheKeyValues}
               pending={cacheKeyValuesLoading}
-              scriptKey={workflow.cache_key ?? "<none>"}
+              scriptKey={workflow.cache_key ?? "default"}
               onDelete={(cacheKeyValue) => {
                 setToDeleteCacheKeyValue(cacheKeyValue);
                 setOpenConfirmCacheKeyValueDeleteDialogue(true);
@@ -797,6 +806,15 @@ function Workspace({
           onBreakout={handleOnBreakout}
           onCycle={handleOnCycle}
           onFocus={() => promote("browserWindow")}
+          onMinimize={() => {
+            setHideControlButtons(true);
+          }}
+          onMaximize={() => {
+            setHideControlButtons(false);
+          }}
+          onRestore={() => {
+            setHideControlButtons(false);
+          }}
         >
           {activeDebugSession &&
           activeDebugSession.browser_session_id &&
@@ -804,7 +822,7 @@ function Workspace({
             <BrowserStream
               interactive={false}
               browserSessionId={activeDebugSession.browser_session_id}
-              showControlButtons={true}
+              showControlButtons={!hideControlButtons}
             />
           ) : (
             <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
