@@ -975,6 +975,95 @@
         ]
       }
     },
+    "/v1/runs/{run_id}/timeline": {
+      "get": {
+        "tags": [
+          "Agent",
+          "Workflows"
+        ],
+        "summary": "Get run timeline",
+        "description": "Get timeline for a run (workflow run or task_v2 run)",
+        "operationId": "get_run_timeline_v1_runs__run_id__timeline_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the workflow run or task_v2 run.",
+              "examples": [
+                "wr_123",
+                "tsk_v2_123"
+              ],
+              "title": "Run Id"
+            },
+            "description": "The id of the workflow run or task_v2 run."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved run timeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRunTimeline"
+                  },
+                  "title": "Response Get Run Timeline V1 Runs  Run Id  Timeline Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Timeline not available for this run type"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_timeline",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Get timeline for a workflow run\ntimeline = await skyvern.get_run_timeline(run_id=\"wr_123\")\nprint(timeline)\n\n# Get timeline for a task_v2 run\ntimeline = await skyvern.get_run_timeline(run_id=\"tsk_v2_123\")\nprint(timeline)\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/browser_sessions": {
       "post": {
         "tags": [
@@ -2245,6 +2334,351 @@
         ],
         "title": "AWSSecretParameterYAML"
       },
+      "Action": {
+        "properties": {
+          "action_type": {
+            "$ref": "#/components/schemas/ActionType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ActionStatus",
+            "default": "pending"
+          },
+          "action_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Id"
+          },
+          "source_action_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Action Id"
+          },
+          "organization_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organization Id"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "step_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Id"
+          },
+          "step_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Order"
+          },
+          "action_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Order"
+          },
+          "confidence_float": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence Float"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning"
+          },
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          },
+          "element_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Element Id"
+          },
+          "skyvern_element_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skyvern Element Hash"
+          },
+          "skyvern_element_data": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skyvern Element Data"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/UserDefinedError"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors"
+          },
+          "data_extraction_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Goal"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "file_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Url"
+          },
+          "download": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download"
+          },
+          "is_upload_file_tag": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Upload File Tag"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "option": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SelectOption"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "is_checked": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Checked"
+          },
+          "verified": {
+            "type": "boolean",
+            "title": "Verified",
+            "default": false
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "modified_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          }
+        },
+        "type": "object",
+        "required": [
+          "action_type"
+        ],
+        "title": "Action"
+      },
       "ActionBlock": {
         "properties": {
           "label": {
@@ -2652,6 +3086,41 @@
           "label"
         ],
         "title": "ActionBlockYAML"
+      },
+      "ActionStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "skipped",
+          "failed",
+          "completed"
+        ],
+        "title": "ActionStatus"
+      },
+      "ActionType": {
+        "type": "string",
+        "enum": [
+          "click",
+          "input_text",
+          "upload_file",
+          "download_file",
+          "select_option",
+          "checkbox",
+          "wait",
+          "null_action",
+          "solve_captcha",
+          "terminate",
+          "complete",
+          "reload_page",
+          "extract",
+          "verification_code",
+          "scroll",
+          "keypress",
+          "move",
+          "drag",
+          "left_mouse"
+        ],
+        "title": "ActionType"
       },
       "Artifact": {
         "properties": {
@@ -3380,6 +3849,32 @@
           "bitwarden_identity_fields"
         ],
         "title": "BitwardenSensitiveInformationParameterYAML"
+      },
+      "BlockType": {
+        "type": "string",
+        "enum": [
+          "task",
+          "task_v2",
+          "for_loop",
+          "code",
+          "text_prompt",
+          "download_to_s3",
+          "upload_to_s3",
+          "file_upload",
+          "send_email",
+          "file_url_parser",
+          "validation",
+          "action",
+          "navigation",
+          "extraction",
+          "login",
+          "wait",
+          "file_download",
+          "goto_url",
+          "pdf_parser",
+          "http_request"
+        ],
+        "title": "BlockType"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -7861,6 +8356,45 @@
         "title": "ScriptFileCreate",
         "description": "Model representing a file in a script."
       },
+      "SelectOption": {
+        "properties": {
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index"
+          }
+        },
+        "type": "object",
+        "title": "SelectOption"
+      },
       "SendEmailBlock": {
         "properties": {
           "label": {
@@ -9622,6 +10156,242 @@
         ],
         "title": "TextPromptBlockYAML"
       },
+      "Thought": {
+        "properties": {
+          "thought_id": {
+            "type": "string",
+            "title": "Thought Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
+          },
+          "workflow_run_block_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Block Id"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id"
+          },
+          "user_input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Input"
+          },
+          "observation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observation"
+          },
+          "thought": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thought"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "thought_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ThoughtType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "plan"
+          },
+          "thought_scenario": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ThoughtScenario"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "input_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Token Count"
+          },
+          "output_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Token Count"
+          },
+          "reasoning_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Token Count"
+          },
+          "cached_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Token Count"
+          },
+          "thought_cost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thought Cost"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "thought_id",
+          "task_id",
+          "organization_id",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "Thought"
+      },
+      "ThoughtScenario": {
+        "type": "string",
+        "enum": [
+          "generate_plan",
+          "user_goal_check",
+          "failure_describe",
+          "summarization",
+          "generate_metadata",
+          "extract_loop_values",
+          "generate_task_in_loop",
+          "generate_general_task"
+        ],
+        "title": "ThoughtScenario"
+      },
+      "ThoughtType": {
+        "type": "string",
+        "enum": [
+          "plan",
+          "metadata",
+          "user_goal_check",
+          "internal_plan",
+          "failure_describe"
+        ],
+        "title": "ThoughtType"
+      },
       "UploadToS3Block": {
         "properties": {
           "label": {
@@ -10019,6 +10789,31 @@
           "url"
         ],
         "title": "UrlBlockYAML"
+      },
+      "UserDefinedError": {
+        "properties": {
+          "error_code": {
+            "type": "string",
+            "title": "Error Code"
+          },
+          "reasoning": {
+            "type": "string",
+            "title": "Reasoning"
+          },
+          "confidence_float": {
+            "type": "number",
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Confidence Float"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error_code",
+          "reasoning",
+          "confidence_float"
+        ],
+        "title": "UserDefinedError"
       },
       "ValidationBlock": {
         "properties": {
@@ -10678,6 +11473,11 @@
             "title": "Generate Script",
             "default": false
           },
+          "ai_fallback": {
+            "type": "boolean",
+            "title": "Ai Fallback",
+            "default": false
+          },
           "cache_key": {
             "anyOf": [
               {
@@ -10843,6 +11643,11 @@
           "generate_script": {
             "type": "boolean",
             "title": "Generate Script",
+            "default": false
+          },
+          "ai_fallback": {
+            "type": "boolean",
+            "title": "Ai Fallback",
             "default": false
           },
           "cache_key": {
@@ -11372,6 +12177,364 @@
         "type": "object",
         "title": "WorkflowRequest"
       },
+      "WorkflowRunBlock": {
+        "properties": {
+          "workflow_run_block_id": {
+            "type": "string",
+            "title": "Workflow Run Block Id"
+          },
+          "block_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Block Workflow Run Id"
+          },
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "parent_workflow_run_block_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Workflow Run Block Id"
+          },
+          "block_type": {
+            "$ref": "#/components/schemas/BlockType"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "navigation_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Goal"
+          },
+          "navigation_payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Payload"
+          },
+          "data_extraction_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Goal"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
+          },
+          "terminate_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminate Criterion"
+          },
+          "complete_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete Criterion"
+          },
+          "actions": {
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "type": "array",
+            "title": "Actions",
+            "default": []
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "include_action_history_in_verification": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Action History In Verification",
+            "default": false
+          },
+          "duration": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration"
+          },
+          "loop_values": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loop Values"
+          },
+          "current_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Value"
+          },
+          "current_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Index"
+          },
+          "recipients": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipients"
+          },
+          "attachments": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attachments"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_block_id",
+          "workflow_run_id",
+          "organization_id",
+          "block_type",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "WorkflowRunBlock"
+      },
       "WorkflowRunRequest": {
         "properties": {
           "workflow_id": {
@@ -11752,6 +12915,66 @@
           "run_type"
         ],
         "title": "WorkflowRunResponse"
+      },
+      "WorkflowRunTimeline": {
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/WorkflowRunTimelineType"
+          },
+          "block": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunBlock"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "thought": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Thought"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunTimeline"
+            },
+            "type": "array",
+            "title": "Children",
+            "default": []
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "WorkflowRunTimeline"
+      },
+      "WorkflowRunTimelineType": {
+        "type": "string",
+        "enum": [
+          "thought",
+          "block"
+        ],
+        "title": "WorkflowRunTimelineType"
       },
       "WorkflowStatus": {
         "type": "string",
