@@ -2273,6 +2273,7 @@ class WorkflowService:
         proxy_location: ProxyLocation | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        generate_script: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
         """
@@ -2289,6 +2290,7 @@ class WorkflowService:
             status=status,
             max_screenshot_scrolls=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            generate_script=generate_script,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,

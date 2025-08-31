@@ -52,6 +52,7 @@ class TaskV2(BaseModel):
     max_screenshot_scrolls: int | None = Field(default=None, alias="max_screenshot_scrolling_times")
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
+    generate_script: bool = False
 
     created_at: datetime
     modified_at: datetime
@@ -155,6 +156,7 @@ class TaskV2Request(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
+    generate_script: bool = False
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

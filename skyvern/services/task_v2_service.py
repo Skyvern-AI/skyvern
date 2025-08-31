@@ -164,7 +164,11 @@ async def initialize_task_v2(
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
+    generate_script: bool = False,
 ) -> TaskV2:
+    if generate_script:
+        publish_workflow = True
+
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -178,6 +182,7 @@ async def initialize_task_v2(
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
         browser_address=browser_address,
+        generate_script=generate_script,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -224,6 +229,7 @@ async def initialize_task_v2(
             status=workflow_status,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            generate_script=generate_script,
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -886,6 +892,11 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
+                if task_v2.generate_script:
+                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                    )
                 break
 
         # total step number validation
