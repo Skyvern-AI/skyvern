@@ -117,9 +117,6 @@ def _generate_pydantic_schema(schema_fields: Dict[str, Dict[str, str]]) -> str:
         return _generate_empty_schema()
 
     lines = [
-        "from pydantic import BaseModel, Field",
-        "",
-        "",
         "class GeneratedWorkflowParameters(BaseModel):",
         '    """Generated schema representing all input_text action values from the workflow run."""',
         "",
