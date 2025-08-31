@@ -283,7 +283,7 @@ class WorkflowService:
         skyvern_context.current()
 
         # Set workflow run status to running, create workflow run parameters
-        workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
+        workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
 
         # Get all context parameters from the workflow definition
         context_parameters = [
@@ -309,7 +309,7 @@ class WorkflowService:
         ]
 
         # Get all <workflow parameter, workflow run parameter> tuples
-        wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run.workflow_run_id)
+        wp_wps_tuples = await self.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
         workflow_output_parameters = await self.get_workflow_output_parameters(workflow_id=workflow.workflow_id)
         try:
             await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
@@ -323,8 +323,8 @@ class WorkflowService:
             )
         except Exception as e:
             LOG.exception(
-                f"Error while initializing workflow run context for workflow run {workflow_run.workflow_run_id}",
-                workflow_run_id=workflow_run.workflow_run_id,
+                f"Error while initializing workflow run context for workflow run {workflow_run_id}",
+                workflow_run_id=workflow_run_id,
             )
 
             exception_message = f"Unexpected error: {str(e)}"
@@ -333,7 +333,7 @@ class WorkflowService:
 
             failure_reason = f"Failed to initialize workflow run context. failure reason: {exception_message}"
             workflow_run = await self.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                workflow_run_id=workflow_run_id, failure_reason=failure_reason
             )
             await self.clean_up_workflow(
                 workflow=workflow,
@@ -354,14 +354,83 @@ class WorkflowService:
                 organization_id=organization_id,
                 workflow_script_id=workflow_script.script_id,
             )
-            return await self._execute_workflow_script(
+            workflow_run = await self._execute_workflow_script(
                 script_id=workflow_script.script_id,
                 workflow=workflow,
                 workflow_run=workflow_run,
                 api_key=api_key,
                 organization=organization,
             )
+        else:
+            workflow_run = await self._execute_workflow_blocks(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                organization=organization,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+                block_labels=block_labels,
+                block_outputs=block_outputs,
+            )
 
+        if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        ):
+            workflow_run = refreshed_workflow_run
+            if workflow_run.status not in (
+                WorkflowRunStatus.canceled,
+                WorkflowRunStatus.failed,
+                WorkflowRunStatus.terminated,
+                WorkflowRunStatus.timed_out,
+            ):
+                workflow_run = await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run_id)
+                await self.generate_script_if_needed(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    block_labels=block_labels,
+                )
+            else:
+                LOG.info(
+                    "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_status=workflow_run.status if workflow_run else None,
+                )
+        await self.clean_up_workflow(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            api_key=api_key,
+            browser_session_id=browser_session_id,
+            close_browser_on_completion=close_browser_on_completion,
+        )
+
+        # Track workflow run duration when completed
+        duration_seconds = (datetime.now(UTC) - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
+        LOG.info(
+            "Workflow run duration metrics",
+            workflow_run_id=workflow_run_id,
+            workflow_id=workflow_run.workflow_id,
+            duration_seconds=duration_seconds,
+            workflow_run_status=WorkflowRunStatus.completed,
+            organization_id=organization_id,
+            is_script_run=workflow_script is not None,
+        )
+
+        return workflow_run
+
+    async def _execute_workflow_blocks(
+        self,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        api_key: str,
+        organization: Organization,
+        close_browser_on_completion: bool,
+        browser_session_id: str | None = None,
+        block_labels: list[str] | None = None,
+        block_outputs: dict[str, Any] | None = None,
+    ) -> WorkflowRun:
+        organization_id = organization.organization_id
+        workflow_run_id = workflow_run.workflow_run_id
         top_level_blocks = workflow.workflow_definition.blocks
         all_blocks = get_all_blocks(top_level_blocks)
 
@@ -376,7 +445,7 @@ class WorkflowService:
 
             LOG.info(
                 "Executing workflow blocks via whitelist",
-                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_run_id=workflow_run_id,
                 block_cnt=len(blocks),
                 block_labels=block_labels,
                 block_outputs=block_outputs,
@@ -394,14 +463,14 @@ class WorkflowService:
         for block_idx, block in enumerate(blocks):
             try:
                 if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=workflow_run_id,
                     organization_id=organization_id,
                 ):
                     workflow_run = refreshed_workflow_run
                     if workflow_run.status == WorkflowRunStatus.canceled:
                         LOG.info(
                             "Workflow run is canceled, stopping execution inside workflow execution loop",
-                            workflow_run_id=workflow_run.workflow_run_id,
+                            workflow_run_id=workflow_run_id,
                             block_idx=block_idx,
                             block_type=block.block_type,
                             block_label=block.label,
@@ -419,7 +488,7 @@ class WorkflowService:
                     if workflow_run.status == WorkflowRunStatus.timed_out:
                         LOG.info(
                             "Workflow run is timed out, stopping execution inside workflow execution loop",
-                            workflow_run_id=workflow_run.workflow_run_id,
+                            workflow_run_id=workflow_run_id,
                             block_idx=block_idx,
                             block_type=block.block_type,
                             block_label=block.label,
@@ -441,7 +510,7 @@ class WorkflowService:
                 LOG.info(
                     f"Executing root block {block.block_type} at index {block_idx}/{blocks_cnt - 1} for workflow run {workflow_run_id}",
                     block_type=block.block_type,
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=workflow_run_id,
                     block_idx=block_idx,
                     block_type_var=block.block_type,
                     block_label=block.label,
@@ -456,15 +525,13 @@ class WorkflowService:
                     LOG.info(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
                         block_type=block.block_type,
-                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
                         block_type_var=block.block_type,
                         block_label=block.label,
                     )
-                    workflow_run = await self.mark_workflow_run_as_canceled(
-                        workflow_run_id=workflow_run.workflow_run_id
-                    )
+                    workflow_run = await self.mark_workflow_run_as_canceled(workflow_run_id=workflow_run_id)
                     # We're not sending a webhook here because the workflow run is manually marked as canceled.
                     await self.clean_up_workflow(
                         workflow=workflow,
@@ -479,7 +546,7 @@ class WorkflowService:
                     LOG.error(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed for workflow run {workflow_run_id}",
                         block_type=block.block_type,
-                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
                         block_type_var=block.block_type,
@@ -490,7 +557,7 @@ class WorkflowService:
                             f"{block.block_type} block failed. failure reason: {block_result.failure_reason}"
                         )
                         workflow_run = await self.mark_workflow_run_as_failed(
-                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                            workflow_run_id=workflow_run_id, failure_reason=failure_reason
                         )
                         await self.clean_up_workflow(
                             workflow=workflow,
@@ -504,7 +571,7 @@ class WorkflowService:
                     LOG.warning(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} failed but will continue executing the workflow run {workflow_run_id}",
                         block_type=block.block_type,
-                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
                         continue_on_failure=block.continue_on_failure,
@@ -516,7 +583,7 @@ class WorkflowService:
                     LOG.info(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, marking workflow run as terminated",
                         block_type=block.block_type,
-                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
                         block_type_var=block.block_type,
@@ -526,7 +593,7 @@ class WorkflowService:
                     if not block.continue_on_failure:
                         failure_reason = f"{block.block_type} block terminated. Reason: {block_result.failure_reason}"
                         workflow_run = await self.mark_workflow_run_as_terminated(
-                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                            workflow_run_id=workflow_run_id, failure_reason=failure_reason
                         )
                         await self.clean_up_workflow(
                             workflow=workflow,
@@ -540,7 +607,7 @@ class WorkflowService:
                     LOG.warning(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
                         block_type=block.block_type,
-                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
                         continue_on_failure=block.continue_on_failure,
@@ -552,7 +619,7 @@ class WorkflowService:
                     LOG.info(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, marking workflow run as failed",
                         block_type=block.block_type,
-                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
                         block_type_var=block.block_type,
@@ -562,7 +629,7 @@ class WorkflowService:
                     if not block.continue_on_failure:
                         failure_reason = f"{block.block_type} block timed out. Reason: {block_result.failure_reason}"
                         workflow_run = await self.mark_workflow_run_as_failed(
-                            workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                            workflow_run_id=workflow_run_id, failure_reason=failure_reason
                         )
                         await self.clean_up_workflow(
                             workflow=workflow,
@@ -576,7 +643,7 @@ class WorkflowService:
                     LOG.warning(
                         f"Block with type {block.block_type} at index {block_idx}/{blocks_cnt - 1} timed out for workflow run {workflow_run_id}, but will continue executing the workflow run",
                         block_type=block.block_type,
-                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_id=workflow_run_id,
                         block_idx=block_idx,
                         block_result=block_result,
                         continue_on_failure=block.continue_on_failure,
@@ -586,8 +653,8 @@ class WorkflowService:
 
             except Exception as e:
                 LOG.exception(
-                    f"Error while executing workflow run {workflow_run.workflow_run_id}",
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    f"Error while executing workflow run {workflow_run_id}",
+                    workflow_run_id=workflow_run_id,
                     block_idx=block_idx,
                     block_type=block.block_type,
                     block_label=block.label,
@@ -599,7 +666,7 @@ class WorkflowService:
 
                 failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
                 workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason
+                    workflow_run_id=workflow_run_id, failure_reason=failure_reason
                 )
                 await self.clean_up_workflow(
                     workflow=workflow,
@@ -609,50 +676,6 @@ class WorkflowService:
                     close_browser_on_completion=close_browser_on_completion,
                 )
                 return workflow_run
-
-        if refreshed_workflow_run := await app.DATABASE.get_workflow_run(
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=organization_id,
-        ):
-            workflow_run = refreshed_workflow_run
-            if workflow_run.status not in (
-                WorkflowRunStatus.canceled,
-                WorkflowRunStatus.failed,
-                WorkflowRunStatus.terminated,
-                WorkflowRunStatus.timed_out,
-            ):
-                workflow_run = await self.mark_workflow_run_as_completed(workflow_run_id=workflow_run.workflow_run_id)
-                await self.generate_script_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    block_labels=block_labels,
-                )
-            else:
-                LOG.info(
-                    "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    workflow_run_status=workflow_run.status if workflow_run else None,
-                )
-        await self.clean_up_workflow(
-            workflow=workflow,
-            workflow_run=workflow_run,
-            api_key=api_key,
-            browser_session_id=browser_session_id,
-            close_browser_on_completion=close_browser_on_completion,
-        )
-
-        # Track workflow run duration when completed
-        duration_seconds = (datetime.now(UTC) - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
-        LOG.info(
-            "Workflow run duration metrics",
-            workflow_run_id=workflow_run_id,
-            workflow_id=workflow_run.workflow_id,
-            duration_seconds=duration_seconds,
-            workflow_run_status=WorkflowRunStatus.completed,
-            organization_id=organization_id,
-        )
-
-        return workflow_run
 
     async def create_workflow(
         self,
