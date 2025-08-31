@@ -3967,6 +3967,7 @@ class AgentDB:
                     select(ScriptBlockModel)
                     .filter_by(script_revision_id=script_revision_id)
                     .filter_by(organization_id=organization_id)
+                    .order_by(ScriptBlockModel.created_at.asc())
                 )
             ).all()
             return [convert_to_script_block(record) for record in records]

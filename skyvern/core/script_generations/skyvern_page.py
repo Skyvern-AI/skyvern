@@ -278,7 +278,6 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         clicking the originally supplied ``xpath``.
         """
-
         new_xpath = xpath
 
         if intention and data:
