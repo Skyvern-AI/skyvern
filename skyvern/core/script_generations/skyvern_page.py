@@ -20,7 +20,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
+from skyvern.webeye.actions.actions import Action, ActionStatus, ExtractAction, SelectOption
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
@@ -224,6 +224,25 @@ class SkyvernPage:
                 response=response,
                 created_by="script",
             )
+            if action_type == ActionType.EXTRACT:
+                action = ExtractAction(
+                    element_id="",
+                    action_type=action_type,
+                    status=status,
+                    organization_id=context.organization_id,
+                    workflow_run_id=context.workflow_run_id,
+                    task_id=context.task_id,
+                    step_id=context.step_id,
+                    step_order=0,
+                    action_order=0,
+                    intention=intention,
+                    reasoning=f"Auto-generated action for {action_type.value}",
+                    data_extraction_goal=kwargs.get("prompt"),
+                    data_extraction_schema=kwargs.get("schema"),
+                    option=select_option,
+                    response=response,
+                    created_by="script",
+                )
 
             created_action = await app.DATABASE.create_action(action)
             return created_action

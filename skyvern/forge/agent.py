@@ -3010,6 +3010,7 @@ class ForgeAgent:
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,
+            data_extraction_schema=task.extracted_information_schema,
             organization_id=task.organization_id,
             task_id=task.task_id,
             workflow_run_id=task.workflow_run_id,
