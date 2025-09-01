@@ -294,13 +294,25 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
         args.append(
             cst.Arg(
                 keyword=cst.Name("prompt"),
-                value=_value(act["data_extraction_goal"]),
+                value=_render_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
                 ),
             )
         )
+        if act.get("data_extraction_schema"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("schema"),
+                    value=_value(act["data_extraction_schema"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                    comma=cst.Comma(),
+                )
+            )
 
     args.extend(
         [
@@ -560,6 +572,14 @@ def _build_extract_statement(block_title: str, block: dict[str, Any]) -> cst.Sim
         cst.Arg(
             keyword=cst.Name("prompt"),
             value=_render_value(block.get("data_extraction_goal", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("schema"),
+            value=_value(block.get("data_schema", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),

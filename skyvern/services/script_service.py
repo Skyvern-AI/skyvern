@@ -251,6 +251,7 @@ async def execute_script(
 async def _create_workflow_block_run_and_task(
     block_type: BlockType,
     prompt: str | None = None,
+    schema: dict[str, Any] | list | str | None = None,
     url: str | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
@@ -287,7 +288,8 @@ async def _create_workflow_block_run_and_task(
                 title=f"Script {block_type.value} task",
                 navigation_goal=prompt,
                 data_extraction_goal=prompt if block_type == BlockType.EXTRACTION else None,
-                navigation_payload={},
+                extracted_information_schema=schema,
+                navigation_payload=None,
                 status="running",
                 organization_id=organization_id,
                 workflow_run_id=workflow_run_id,
@@ -899,6 +901,10 @@ async def _generate_block_code_from_task(
                 continue
             action_dump = task_action.model_dump()
             action_dump["xpath"] = task_action.get_xpath()
+            is_data_extraction_goal = "data_extraction_goal" in block_data and "data_extraction_goal" in action_dump
+            if is_data_extraction_goal:
+                # use the raw data extraction goal which is potentially a template
+                action_dump["data_extraction_goal"] = block_data["data_extraction_goal"]
             actions_to_cache.append(action_dump)
 
         if not actions_to_cache:
@@ -1157,6 +1163,7 @@ async def login(
 
 async def extract(
     prompt: str,
+    schema: dict[str, Any] | list | str | None = None,
     url: str | None = None,
     max_steps: int | None = None,
     cache_key: str | None = None,
@@ -1165,6 +1172,7 @@ async def extract(
     workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
         block_type=BlockType.EXTRACTION,
         prompt=prompt,
+        schema=schema,
         url=url,
     )
     # set the prompt in the RunContext
