@@ -48,6 +48,7 @@ import {
   MAX_SCREENSHOT_SCROLLS_DEFAULT,
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import { OrgWalled } from "@/components/Orgwalled";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -156,6 +157,7 @@ function PromptBox() {
   );
   const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
   const [cdpAddress, setCdpAddress] = useState<string | null>(null);
+  const [generateScript, setGenerateScript] = useState(false);
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
@@ -178,7 +180,8 @@ function PromptBox() {
           browser_session_id: browserSessionId,
           browser_address: cdpAddress,
           totp_identifier: totpIdentifier,
-          publish_workflow: publishWorkflow,
+          generate_script: generateScript,
+          publish_workflow: publishWorkflow || generateScript,
           max_screenshot_scrolls: maxScreenshotScrolls,
           extracted_information_schema: dataSchema
             ? (() => {
@@ -468,11 +471,29 @@ function PromptBox() {
                       />
                     </div>
                   </div>
+                  <OrgWalled className="p-0">
+                    <div className="flex gap-16">
+                      <div className="w-48 shrink-0">
+                        <div className="text-sm">Generate Script</div>
+                        <div className="text-xs text-slate-400">
+                          Whether to generate scripts for this task run (on
+                          success).
+                        </div>
+                      </div>
+                      <Switch
+                        checked={generateScript}
+                        onCheckedChange={(checked) => {
+                          setGenerateScript(Boolean(checked));
+                        }}
+                      />
+                    </div>
+                  </OrgWalled>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Publish Workflow</div>
                       <div className="text-xs text-slate-400">
                         Whether to create a workflow alongside this task run.
+                        Will also be created if "Generate Scripts" is true.
                       </div>
                     </div>
                     <Switch
