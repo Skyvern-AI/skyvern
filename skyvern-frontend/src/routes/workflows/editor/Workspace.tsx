@@ -750,12 +750,12 @@ function Workspace({
 
         {/* divider if browser is in play */}
         {showBrowser && (
-          <div className="mt-[8rem] h-[calc(100%-8rem)] w-[1px] bg-slate-800" />
+          <div className="mt-[8rem] h-[calc(100%_-_8rem)] w-[1px] bg-slate-800" />
         )}
 
         {/* browser & timeline & sub-panels in debug mode */}
         {showBrowser && (
-          <div className="skyvern-split-right relative flex h-full w-[calc(100%-33rem)] items-end justify-center bg-[#020617] p-4 pl-6">
+          <div className="skyvern-split-right relative flex h-full w-[calc(100%_-_33rem)] items-end justify-center bg-[#020617] p-4 pl-6">
             {/* sub panels */}
             {workflowPanelState.active && (
               <div
@@ -803,9 +803,9 @@ function Workspace({
             )}
 
             {/* browser & timeline */}
-            <div className="flex h-[calc(100%-8rem)] w-full gap-6">
+            <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
               {/* browser */}
-              <div className="flex h-full w-full flex-1 flex-col items-center justify-center">
+              <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                 <div key={reloadKey} className="w-full flex-1">
                   {activeDebugSession &&
                   activeDebugSession.browser_session_id &&
