@@ -126,6 +126,7 @@ function Workspace({
     useState<DebugSessionApiResponse | null>(null);
   const [showPowerButton, setShowPowerButton] = useState(true);
   const [reloadKey, setReloadKey] = useState(0);
+  const [windowResizeTrigger, setWindowResizeTrigger] = useState(0);
   const [isReloading, setIsReloading] = useState(false);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -262,6 +263,16 @@ function Workspace({
       document.removeEventListener("keydown", closePanelsWhenEscapeIsPressed);
     };
   });
+
+  // Add window resize listener to trigger NoVNC canvas resize
+  useEffect(() => {
+    const handleResize = () => {
+      setWindowResizeTrigger((prev) => prev + 1);
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(() => {
     blockScriptStore.setScripts(blockScripts ?? {});
@@ -720,7 +731,7 @@ function Workspace({
       <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
         {/* infinite canvas */}
         <div
-          className={cn("skyvern-split-left h-full w-[33rem]", {
+          className={cn("skyvern-split-left h-full w-[33rem] min-w-[33rem]", {
             "w-full": !showBrowser,
           })}
         >
@@ -744,11 +755,11 @@ function Workspace({
 
         {/* browser & timeline & sub-panels in debug mode */}
         {showBrowser && (
-          <div className="skyvern-split-right relative flex h-full flex-1 items-end justify-center bg-[#020617] p-4 pl-6">
+          <div className="skyvern-split-right relative flex h-full w-[calc(100%-33rem)] items-end justify-center bg-[#020617] p-4 pl-6">
             {/* sub panels */}
             {workflowPanelState.active && (
               <div
-                className={cn("absolute right-6 top-[8.5rem]", {
+                className={cn("absolute right-6 top-[8.5rem] z-20", {
                   "left-6": workflowPanelState.content === "nodeLibrary",
                 })}
                 style={{
@@ -803,6 +814,7 @@ function Workspace({
                       interactive={interactor === "human"}
                       browserSessionId={activeDebugSession.browser_session_id}
                       showControlButtons={interactor === "human"}
+                      resizeTrigger={windowResizeTrigger}
                     />
                   ) : (
                     <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
@@ -831,7 +843,8 @@ function Workspace({
               {/* timeline */}
               <div
                 className={cn("h-full w-[5rem] overflow-visible", {
-                  "pointer-events-none w-[0px] overflow-hidden": !blockLabel,
+                  "pointer-events-none hidden w-[0px] overflow-hidden":
+                    !blockLabel,
                 })}
               >
                 <div
@@ -897,6 +910,53 @@ function Workspace({
                 </div>
               </div>
             </div>
+          </div>
+        )}
+
+        {!showBrowser && workflowPanelState.active && (
+          <div
+            className={cn(
+              "pointer-events-none absolute right-6 top-[5rem] z-20",
+            )}
+            style={{
+              top: "8.5rem",
+              height:
+                workflowPanelState.content === "nodeLibrary"
+                  ? "calc(100vh - 14rem)"
+                  : "unset",
+            }}
+          >
+            {workflowPanelState.content === "cacheKeyValues" && (
+              <WorkflowCacheKeyValuesPanel
+                cacheKeyValues={cacheKeyValues}
+                pending={cacheKeyValuesLoading}
+                scriptKey={workflow.cache_key ?? "default"}
+                onDelete={(cacheKeyValue) => {
+                  setToDeleteCacheKeyValue(cacheKeyValue);
+                  setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                }}
+                onPaginate={(page) => {
+                  setPage(page);
+                }}
+                onSelect={(cacheKeyValue) => {
+                  setCacheKeyValue(cacheKeyValue);
+                  setCacheKeyValueFilter("");
+                  closeWorkflowPanel();
+                }}
+              />
+            )}
+            {workflowPanelState.content === "parameters" && (
+              <WorkflowParametersPanel />
+            )}
+            {workflowPanelState.content === "nodeLibrary" && (
+              <div className="pointer-events-auto relative right-0 top-0 z-20 h-full w-[25rem]">
+                <WorkflowNodeLibraryPanel
+                  onNodeClick={(props) => {
+                    addNode(props);
+                  }}
+                />
+              </div>
+            )}
           </div>
         )}
       </div>
