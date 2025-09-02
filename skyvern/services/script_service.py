@@ -306,6 +306,8 @@ async def _create_workflow_block_run_and_task(
                 status=StepStatus.running,
             )
             step_id = step.step_id
+            # reset the action order to 0
+            context.action_order = 0
 
             # Update workflow run block with task_id
             await app.DATABASE.update_workflow_run_block(
