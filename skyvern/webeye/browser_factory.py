@@ -657,6 +657,7 @@ class BrowserState:
 
         if await self.get_working_page() is None:
             page: Page | None = None
+            use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
                 pages = [
                     http_page
@@ -665,11 +666,13 @@ class BrowserState:
                 ]
                 if len(pages) > 0:
                     page = pages[0]
+                    use_existing_page = True
             if page is None:
                 page = await self.browser_context.new_page()
 
             await self.set_working_page(page, 0)
-            await self._close_all_other_pages()
+            if not use_existing_page:
+                await self._close_all_other_pages()
 
             if url:
                 await self.navigate_to_url(page=page, url=url)
