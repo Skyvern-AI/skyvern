@@ -17,7 +17,7 @@ from yarl import URL
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX, REPO_ROOT_DIR
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaitingTime
-from skyvern.forge.sdk.api.aws import AsyncAWSClient
+from skyvern.forge.sdk.api.aws import AsyncAWSClient, aws_client
 from skyvern.utils.url_validators import encode_url
 
 LOG = structlog.get_logger()
@@ -195,24 +195,28 @@ def list_files_in_directory(directory: Path, recursive: bool = False) -> list[st
 
 def list_downloading_files_in_directory(
     directory: Path, downloading_suffix: str = BROWSER_DOWNLOADING_SUFFIX
-) -> list[Path]:
+) -> list[str]:
     # check if there's any file is still downloading
-    downloading_files: list[Path] = []
+    downloading_files: list[str] = []
     for file in list_files_in_directory(directory):
         path = Path(file)
         if path.suffix == downloading_suffix:
-            downloading_files.append(path)
+            downloading_files.append(file)
     return downloading_files
 
 
-async def wait_for_download_finished(downloading_files: list[Path], timeout: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
+async def wait_for_download_finished(downloading_files: list[str], timeout: float = BROWSER_DOWNLOAD_TIMEOUT) -> None:
     cur_downloading_files = downloading_files
     try:
         async with asyncio.timeout(timeout):
             while len(cur_downloading_files) > 0:
-                new_downloading_files: list[Path] = []
+                new_downloading_files: list[str] = []
                 for path in cur_downloading_files:
-                    if not path.exists():
+                    if path.startswith("s3://"):
+                        metadata = await aws_client.get_file_metadata(path, log_exception=False)
+                        if not metadata:
+                            continue
+                    if not Path(path).exists():
                         continue
                     new_downloading_files.append(path)
                 cur_downloading_files = new_downloading_files

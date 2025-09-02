@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from fastapi import status
 
 
@@ -281,7 +279,7 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
 
 
 class DownloadFileMaxWaitingTime(SkyvernException):
-    def __init__(self, downloading_files: list[Path]) -> None:
+    def __init__(self, downloading_files: list[str]) -> None:
         self.downloading_files = downloading_files
         super().__init__(f"Long-time downloading files [{downloading_files}].")
 
