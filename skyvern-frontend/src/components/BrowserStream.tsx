@@ -44,6 +44,7 @@ type Props = {
   workflow?: {
     run: WorkflowRunStatusApiResponse;
   };
+  resizeTrigger?: number;
   // --
   onClose?: () => void;
 };
@@ -54,6 +55,7 @@ function BrowserStream({
   showControlButtons = undefined,
   task = undefined,
   workflow = undefined,
+  resizeTrigger,
   // --
   onClose,
 }: Props) {
@@ -290,6 +292,19 @@ function BrowserStream({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interactive, isCommandConnected, userIsControlling]);
+
+  // Effect to handle window resize trigger for NoVNC canvas
+  useEffect(() => {
+    if (!resizeTrigger || !canvasContainer || !rfbRef.current) {
+      return;
+    }
+
+    // const originalDisplay = canvasContainer.style.display;
+    // canvasContainer.style.display = "none";
+    // canvasContainer.offsetHeight;
+    // canvasContainer.style.display = originalDisplay;
+    // window.dispatchEvent(new Event("resize"));
+  }, [resizeTrigger, canvasContainer]);
 
   // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {
