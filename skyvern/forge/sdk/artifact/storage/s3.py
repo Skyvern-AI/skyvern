@@ -7,7 +7,7 @@ from typing import BinaryIO
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import DOWNLOAD_FILE_PREFIX
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
@@ -194,6 +194,23 @@ class S3Storage(BaseStorage):
         unzip_files(temp_zip_file_path, temp_dir)
         temp_zip_file.close()
         return temp_dir
+
+    async def list_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
+        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        return [
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
+        ]
+
+    async def list_downloading_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
+        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        files = [
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
+        ]
+        return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
 
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         download_dir = get_download_dir(run_id=run_id)

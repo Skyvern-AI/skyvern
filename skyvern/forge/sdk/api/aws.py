@@ -203,6 +203,16 @@ class AsyncAWSClient:
                 LOG.exception("S3 download failed", uri=uri)
             return None
 
+    async def delete_file(self, uri: str, log_exception: bool = True) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
+        try:
+            async with self._s3_client() as client:
+                parsed_uri = S3Uri(uri)
+                await client.delete_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+        except Exception:
+            if log_exception:
+                LOG.exception("S3 delete failed", uri=uri)
+
     async def get_object_info(self, uri: str) -> dict:
         async with self._s3_client() as client:
             parsed_uri = S3Uri(uri)
