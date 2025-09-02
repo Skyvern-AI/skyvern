@@ -124,7 +124,7 @@ function BlockOutputs({
             <>
               <CodeEditor
                 key="output"
-                className="nopan nowheel h-full w-full flex-1 overflow-y-scroll"
+                className="nopan h-full w-full flex-1 overflow-y-scroll"
                 language="json"
                 value={codeOutput}
                 lineWrap={false}
@@ -150,7 +150,7 @@ function BlockOutputs({
         >
           <CodeEditor
             key="override"
-            className="nopan nowheel h-full w-full flex-1 overflow-y-scroll"
+            className="nopan h-full w-full flex-1 overflow-y-scroll"
             language="json"
             value={codeOverride ?? ""}
             lineWrap={false}
