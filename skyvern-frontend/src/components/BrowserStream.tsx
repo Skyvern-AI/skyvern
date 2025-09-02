@@ -328,7 +328,7 @@ function BrowserStream({
 
   return (
     <div
-      className={cn("browser-stream", {
+      className={cn("browser-stream flex items-center justify-center", {
         "user-is-controlling": theUserIsControlling,
       })}
       ref={setCanvasContainerRef}
@@ -369,7 +369,7 @@ function BrowserStream({
         </div>
       )}
       {!isVncConnected && (
-        <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
+        <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
           <RotateThrough interval={7 * 1000}>
             <span>Hm, working on the connection...</span>
             <span>Hang tight, we're almost there...</span>

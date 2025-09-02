@@ -756,4 +756,4 @@ function FloatingWindow({
   );
 }
 
-export { FloatingWindow };
+export { BreakoutButton, FloatingWindow, PowerButton, ReloadButton };
