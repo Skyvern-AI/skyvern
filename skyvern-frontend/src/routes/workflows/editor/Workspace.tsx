@@ -731,7 +731,7 @@ function Workspace({
       <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
         {/* infinite canvas */}
         <div
-          className={cn("skyvern-split-left h-full w-[33rem] min-w-[33rem]", {
+          className={cn("skyvern-split-left h-full w-[39rem] min-w-[39rem]", {
             "w-full": !showBrowser,
           })}
         >
@@ -755,7 +755,7 @@ function Workspace({
 
         {/* browser & timeline & sub-panels in debug mode */}
         {showBrowser && (
-          <div className="skyvern-split-right relative flex h-full w-[calc(100%_-_33rem)] items-end justify-center bg-[#020617] p-4 pl-6">
+          <div className="skyvern-split-right relative flex h-full w-[calc(100%_-_39rem)] items-end justify-center bg-[#020617] p-4 pl-6">
             {/* sub panels */}
             {workflowPanelState.active && (
               <div
