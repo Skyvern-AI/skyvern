@@ -216,7 +216,7 @@ class SkyvernPage:
                 task_id=context.task_id,
                 step_id=context.step_id,
                 step_order=0,  # Will be updated by the system if needed
-                action_order=0,  # Will be updated by the system if needed
+                action_order=context.action_order,  # Will be updated by the system if needed
                 intention=intention,
                 reasoning=f"Auto-generated action for {action_type.value}",
                 text=text,
@@ -234,7 +234,7 @@ class SkyvernPage:
                     task_id=context.task_id,
                     step_id=context.step_id,
                     step_order=0,
-                    action_order=0,
+                    action_order=context.action_order,
                     intention=intention,
                     reasoning=f"Auto-generated action for {action_type.value}",
                     data_extraction_goal=kwargs.get("prompt"),
@@ -245,6 +245,7 @@ class SkyvernPage:
                 )
 
             created_action = await app.DATABASE.create_action(action)
+            context.action_order += 1
             return created_action
 
         except Exception:
