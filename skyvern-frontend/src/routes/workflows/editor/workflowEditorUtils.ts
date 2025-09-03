@@ -705,6 +705,7 @@ function getElements(
       editable,
       useScriptCache: settings.useScriptCache,
       scriptCacheKey: settings.scriptCacheKey,
+      aiFallback: settings.aiFallback ?? false,
       label: "__start_block__",
       showCode: false,
     }),
@@ -1416,6 +1417,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     extraHttpHeaders: null,
     useScriptCache: false,
     scriptCacheKey: null,
+    aiFallback: false,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1435,6 +1437,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       extraHttpHeaders: data.extraHttpHeaders,
       useScriptCache: data.useScriptCache,
       scriptCacheKey: data.scriptCacheKey,
+      aiFallback: data.aiFallback,
     };
   }
   return defaultSettings;

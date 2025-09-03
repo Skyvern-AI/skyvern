@@ -307,7 +307,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                           onChange={(value) => {
                             handleChange("errorCodeMapping", value);
                           }}
-                          className="nowheel nopan"
+                          className="nopan"
                           fontSize={8}
                         />
                       </div>

@@ -125,7 +125,7 @@ function WorkflowDataSchemaInputGroup({
             language="json"
             value={value}
             onChange={onChange}
-            className="nowheel nopan"
+            className="nopan"
             fontSize={8}
           />
         </div>

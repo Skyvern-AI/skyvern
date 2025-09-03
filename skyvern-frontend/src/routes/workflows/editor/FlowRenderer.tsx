@@ -220,6 +220,7 @@ function convertToParametersYAML(
 }
 
 type Props = {
+  hideBackground?: boolean;
   nodes: Array<AppNode>;
   edges: Array<Edge>;
   setNodes: (nodes: Array<AppNode>) => void;
@@ -235,6 +236,7 @@ type Props = {
 };
 
 function FlowRenderer({
+  hideBackground = false,
   nodes,
   edges,
   setNodes,
@@ -648,7 +650,7 @@ function FlowRenderer({
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
-          colorMode="dark"
+          // colorMode="dark"
           fitView={true}
           fitViewOptions={{
             maxZoom: 1,
@@ -668,7 +670,9 @@ function FlowRenderer({
           zoomOnPinch={!flowIsConstrained}
           zoomOnScroll={!flowIsConstrained}
         >
-          <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
+          {!hideBackground && (
+            <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
+          )}
           <Controls position="bottom-left" />
         </ReactFlow>
       </BlockActionContext.Provider>

@@ -53,6 +53,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.files import (
     get_path_for_workflow_download_directory,
     list_downloading_files_in_directory,
@@ -189,6 +190,7 @@ class ForgeAgent:
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             extra_http_headers=workflow_run.extra_http_headers,
             browser_address=workflow_run.browser_address,
+            browser_session_id=workflow_run.browser_session_id,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -387,6 +389,12 @@ class ForgeAgent:
                         context.run_id if context and context.run_id else task.workflow_run_id
                     )
                 )
+            if task.browser_session_id:
+                browser_session_downloaded_files = await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=organization.organization_id,
+                    browser_session_id=task.browser_session_id,
+                )
+                list_files_before = list_files_before + browser_session_downloaded_files
             # Check some conditions before executing the step, throw an exception if the step can't be executed
             await app.AGENT_FUNCTION.validate_step_execution(task, step)
 
@@ -470,7 +478,13 @@ class ForgeAgent:
                     context.run_id if context and context.run_id else task.workflow_run_id
                 )
 
-                downloading_files: list[Path] = list_downloading_files_in_directory(workflow_download_directory)
+                downloading_files = list_downloading_files_in_directory(workflow_download_directory)
+                if task.browser_session_id:
+                    browser_session_downloading_files = await app.STORAGE.list_downloading_files_in_browser_session(
+                        organization_id=organization.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    downloading_files = downloading_files + browser_session_downloading_files
                 if len(downloading_files) > 0:
                     LOG.info(
                         "Detecting files are still downloading, waiting for files to be completely downloaded.",
@@ -489,9 +503,23 @@ class ForgeAgent:
                         )
 
                 list_files_after = list_files_in_directory(workflow_download_directory)
+                if task.browser_session_id:
+                    browser_session_downloaded_files_after = await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=organization.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                    list_files_after = list_files_after + browser_session_downloaded_files_after
                 if len(list_files_after) > len(list_files_before):
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
+                        if file.startswith("s3://"):
+                            file_data = await aws_client.download_file(file, log_exception=False)
+                            if not file_data:
+                                continue
+                            file = file.split("/")[-1]  # Extract filename from the end of S3 URI
+                            with open(os.path.join(workflow_download_directory, file), "wb") as f:
+                                f.write(file_data)
+
                         file_extension = Path(file).suffix
                         if file_extension == BROWSER_DOWNLOADING_SUFFIX:
                             LOG.warning(
@@ -3010,6 +3038,7 @@ class ForgeAgent:
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,
+            data_extraction_schema=task.extracted_information_schema,
             organization_id=task.organization_id,
             task_id=task.task_id,
             workflow_run_id=task.workflow_run_id,

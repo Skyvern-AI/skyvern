@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
+    BlockRunModel,
     CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
@@ -75,7 +76,7 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
-from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
+from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -1245,9 +1246,9 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_artifact_for_workflow_run(
+    async def get_artifact_for_run(
         self,
-        workflow_run_id: str,
+        run_id: str,
         artifact_type: ArtifactType,
         organization_id: str | None = None,
     ) -> Artifact | None:
@@ -1256,8 +1257,7 @@ class AgentDB:
                 artifact = (
                     await session.scalars(
                         select(ArtifactModel)
-                        .join(TaskModel, TaskModel.task_id == ArtifactModel.task_id)
-                        .filter(TaskModel.workflow_run_id == workflow_run_id)
+                        .filter(ArtifactModel.run_id == run_id)
                         .filter(ArtifactModel.artifact_type == artifact_type)
                         .filter(ArtifactModel.organization_id == organization_id)
                         .order_by(ArtifactModel.created_at.desc())
@@ -1367,6 +1367,7 @@ class AgentDB:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         generate_script: bool = False,
+        ai_fallback: bool = False,
         cache_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
@@ -1386,6 +1387,7 @@ class AgentDB:
                 is_saved_task=is_saved_task,
                 status=status,
                 generate_script=generate_script,
+                ai_fallback=ai_fallback,
                 cache_key=cache_key,
             )
             if workflow_permanent_id:
@@ -2123,6 +2125,29 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflow_run_output_parameter_by_id(
+        self, workflow_run_id: str, output_parameter_id: str
+    ) -> WorkflowRunOutputParameter | None:
+        try:
+            async with self.Session() as session:
+                parameter = (
+                    await session.scalars(
+                        select(WorkflowRunOutputParameterModel)
+                        .filter_by(workflow_run_id=workflow_run_id)
+                        .filter_by(output_parameter_id=output_parameter_id)
+                        .order_by(WorkflowRunOutputParameterModel.created_at)
+                    )
+                ).first()
+
+                if parameter:
+                    return convert_to_workflow_run_output_parameter(parameter, self.debug_enabled)
+
+                return None
+
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def create_or_update_workflow_run_output_parameter(
         self,
         workflow_run_id: str,
@@ -2476,6 +2501,7 @@ class AgentDB:
                 skyvern_element_data=action.skyvern_element_data,
                 action_json=action.model_dump(),
                 confidence_float=action.confidence_float,
+                created_by=action.created_by,
             )
             session.add(new_action)
             await session.commit()
@@ -2613,6 +2639,7 @@ class AgentDB:
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        generate_script: bool = False,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2632,6 +2659,7 @@ class AgentDB:
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                generate_script=generate_script,
             )
             session.add(new_task_v2)
             await session.commit()
@@ -3518,6 +3546,72 @@ class AgentDB:
 
             return DebugSession.model_validate(debug_session)
 
+    async def get_latest_block_run(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        block_label: str,
+    ) -> BlockRun | None:
+        async with self.Session() as session:
+            query = (
+                select(BlockRunModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(user_id=user_id)
+                .filter_by(block_label=block_label)
+                .order_by(BlockRunModel.created_at.desc())
+            )
+
+            model = (await session.scalars(query)).first()
+
+            return BlockRun.model_validate(model) if model else None
+
+    async def get_latest_completed_block_run(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        block_label: str,
+        workflow_permanent_id: str,
+    ) -> BlockRun | None:
+        async with self.Session() as session:
+            query = (
+                select(BlockRunModel)
+                .join(WorkflowRunModel, BlockRunModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .filter(BlockRunModel.organization_id == organization_id)
+                .filter(BlockRunModel.user_id == user_id)
+                .filter(BlockRunModel.block_label == block_label)
+                .filter(WorkflowRunModel.status == WorkflowRunStatus.completed)
+                .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .order_by(BlockRunModel.created_at.desc())
+            )
+
+            model = (await session.scalars(query)).first()
+
+            return BlockRun.model_validate(model) if model else None
+
+    async def create_block_run(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        block_label: str,
+        output_parameter_id: str,
+        workflow_run_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            block_run = BlockRunModel(
+                organization_id=organization_id,
+                user_id=user_id,
+                block_label=block_label,
+                output_parameter_id=output_parameter_id,
+                workflow_run_id=workflow_run_id,
+            )
+
+            session.add(block_run)
+
+            await session.commit()
+
     async def get_latest_debug_session_for_user(
         self,
         *,
@@ -3875,6 +3969,7 @@ class AgentDB:
                     select(ScriptBlockModel)
                     .filter_by(script_revision_id=script_revision_id)
                     .filter_by(organization_id=organization_id)
+                    .order_by(ScriptBlockModel.created_at.asc())
                 )
             ).all()
             return [convert_to_script_block(record) for record in records]

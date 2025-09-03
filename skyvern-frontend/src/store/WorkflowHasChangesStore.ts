@@ -116,6 +116,7 @@ const useWorkflowSave = () => {
         extra_http_headers: extraHttpHeaders,
         generate_script: saveData.settings.useScriptCache,
         cache_key: normalizedKey,
+        ai_fallback: saveData.settings.aiFallback ?? undefined,
         workflow_definition: {
           parameters: saveData.parameters,
           blocks: saveData.blocks,

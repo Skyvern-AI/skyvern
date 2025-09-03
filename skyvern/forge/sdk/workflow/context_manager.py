@@ -64,6 +64,7 @@ class WorkflowRunContext:
             | BitwardenSensitiveInformationParameter
             | CredentialParameter
         ],
+        block_outputs: dict[str, Any] | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(aws_client=aws_client, azure_client=azure_client)
@@ -87,6 +88,10 @@ class WorkflowRunContext:
             if output_parameter.key in workflow_run_context.parameters:
                 raise OutputParameterKeyCollisionError(output_parameter.key)
             workflow_run_context.parameters[output_parameter.key] = output_parameter
+
+        if block_outputs:
+            for label, value in block_outputs.items():
+                workflow_run_context.values[f"{label}_output"] = value
 
         for secrete_parameter in secret_parameters:
             if isinstance(secrete_parameter, AWSSecretParameter):
@@ -193,7 +198,7 @@ class WorkflowRunContext:
 
     @staticmethod
     def generate_random_secret_id() -> str:
-        return f"secret_{generate_random_string()}"
+        return f"placeholder_{generate_random_string()}"
 
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
@@ -294,7 +299,9 @@ class WorkflowRunContext:
         credential_item = bitwarden_credential.credential
 
         self.parameters[parameter.key] = parameter
-        self.values[parameter.key] = {}
+        self.values[parameter.key] = {
+            "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+        }
         credential_dict = credential_item.model_dump()
         for key, value in credential_dict.items():
             random_secret_id = self.generate_random_secret_id()
@@ -375,7 +382,9 @@ class WorkflowRunContext:
             raise ValueError(f"1Password item not found: vault_id:{parameter.vault_id}, item_id:{parameter.item_id}")
 
         self.parameters[parameter.key] = parameter
-        self.values[parameter.key] = {}
+        self.values[parameter.key] = {
+            "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+        }
 
         # Process all fields
         for field in item.fields:
@@ -483,6 +492,7 @@ class WorkflowRunContext:
                 password_secret_id = f"{random_secret_id}_password"
                 self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
                 self.values[parameter.key] = {
+                    "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
                     "username": username_secret_id,
                     "password": password_secret_id,
                 }
@@ -555,7 +565,9 @@ class WorkflowRunContext:
                 self.secrets[BitwardenConstants.BW_COLLECTION_ID] = collection_id
 
                 self.parameters[parameter.key] = parameter
-                self.values[parameter.key] = {}
+                self.values[parameter.key] = {
+                    "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+                }
                 for key, value in sensitive_values.items():
                     random_secret_id = self.generate_random_secret_id()
                     secret_id = f"{random_secret_id}_{key}"
@@ -636,6 +648,9 @@ class WorkflowRunContext:
             parameter_value: dict[str, Any] = {
                 field_name: credit_card_data[field_key] for field_key, field_name in pass_through_fields.items()
             }
+            parameter_value["context"] = (
+                "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)"
+            )
 
             for data_key, secret_suffix in fields_to_obfuscate.items():
                 random_secret_id = self.generate_random_secret_id()
@@ -884,6 +899,7 @@ class WorkflowContextManager:
             | BitwardenCreditCardDataParameter
             | BitwardenSensitiveInformationParameter
         ],
+        block_outputs: dict[str, Any] | None = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -893,6 +909,7 @@ class WorkflowContextManager:
             workflow_output_parameters,
             context_parameters,
             secret_parameters,
+            block_outputs,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

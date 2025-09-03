@@ -7,6 +7,7 @@ from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.forge import app
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
+from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
 
@@ -100,6 +101,19 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
                 for action in actions:
                     action_dump = action.model_dump()
                     action_dump["xpath"] = action.get_xpath()
+                    if (
+                        "data_extraction_goal" in final_dump
+                        and final_dump["data_extraction_goal"]
+                        and action.action_type == ActionType.EXTRACT
+                    ):
+                        # use the right data extraction goal for the extract action
+                        action_dump["data_extraction_goal"] = final_dump["data_extraction_goal"]
+                    if (
+                        "extracted_information_schema" in final_dump
+                        and final_dump["extracted_information_schema"]
+                        and action.action_type == ActionType.EXTRACT
+                    ):
+                        action_dump["data_extraction_schema"] = final_dump["extracted_information_schema"]
                     action_dumps.append(action_dump)
                 actions_by_task[run_block.task_id] = action_dumps
             else:

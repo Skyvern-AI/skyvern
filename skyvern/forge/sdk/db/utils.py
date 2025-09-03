@@ -264,6 +264,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
         generate_script=workflow_model.generate_script,
+        ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
     )
 

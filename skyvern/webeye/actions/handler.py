@@ -836,6 +836,12 @@ async def handle_click_to_download_file_action(
         get_download_dir(run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id)
     )
     list_files_before = list_files_in_directory(download_dir)
+    if task.browser_session_id:
+        files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+            organization_id=task.organization_id, browser_session_id=task.browser_session_id
+        )
+        list_files_before = list_files_before + files_in_browser_session
+
     LOG.info(
         "Number of files in download directory before click",
         num_downloaded_files_before=len(list_files_before),
@@ -868,6 +874,12 @@ async def handle_click_to_download_file_action(
         async with asyncio.timeout(BROWSER_DOWNLOAD_MAX_WAIT_TIME):
             while True:
                 list_files_after = list_files_in_directory(download_dir)
+                if task.browser_session_id:
+                    files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                    )
+                    list_files_after = list_files_after + files_in_browser_session
+
                 if len(list_files_after) > len(list_files_before):
                     LOG.info(
                         "Found new files in download directory after click",
@@ -891,6 +903,12 @@ async def handle_click_to_download_file_action(
 
     # check if there's any file is still downloading
     downloading_files = list_downloading_files_in_directory(download_dir)
+    if task.browser_session_id:
+        files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
+            organization_id=task.organization_id, browser_session_id=task.browser_session_id
+        )
+        downloading_files = downloading_files + files_in_browser_session
+
     if len(downloading_files) == 0:
         return [ActionSuccess(download_triggered=True)]
 

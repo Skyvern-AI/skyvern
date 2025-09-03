@@ -1408,6 +1408,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "Exception": Exception,
         }
 
     def generate_async_user_function(
@@ -3208,8 +3209,8 @@ class HttpRequestBlock(Block):
                 method=self.method,
                 url=self.url,
                 headers=self.headers,
-                has_body=bool(self.body),
                 workflow_run_id=workflow_run_id,
+                body=self.body,
             )
 
             # Use the generic aiohttp_request function
@@ -3223,7 +3224,16 @@ class HttpRequestBlock(Block):
             )
 
             response_data = {
+                # Response information
                 "status_code": status_code,
+                "response_headers": response_headers,
+                "response_body": response_body,
+                # Request information (what was sent)
+                "request_method": self.method,
+                "request_url": self.url,
+                "request_headers": self.headers,
+                "request_body": self.body,
+                # Backwards compatibility
                 "headers": response_headers,
                 "body": response_body,
                 "url": self.url,
