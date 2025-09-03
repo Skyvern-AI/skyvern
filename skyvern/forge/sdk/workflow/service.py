@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,6 +26,7 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
@@ -109,6 +111,9 @@ from skyvern.services import script_service
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
+
+DEFAULT_FIRST_BLOCK_LABEL = "block_1"
+DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
 
 class WorkflowService:
@@ -668,6 +673,62 @@ class WorkflowService:
             cache_key=cache_key,
             ai_fallback=False if ai_fallback is None else ai_fallback,
         )
+
+    async def create_workflow_from_prompt(
+        self,
+        organization: Organization,
+        user_prompt: str,
+        totp_identifier: str | None = None,
+        totp_verification_url: str | None = None,
+        webhook_callback_url: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+        max_screenshot_scrolling_times: int | None = None,
+        extra_http_headers: dict[str, str] | None = None,
+        max_iterations: int | None = None,
+        max_steps: int | None = None,
+    ) -> Workflow:
+        metadata_prompt = prompt_engine.load_prompt(
+            "conversational_ui_goal",
+            user_goal=user_prompt,
+        )
+
+        metadata_response = await app.LLM_API_HANDLER(
+            prompt=metadata_prompt,
+            prompt_name="conversational_ui_goal",
+        )
+
+        block_label: str = metadata_response.get("block_label", DEFAULT_FIRST_BLOCK_LABEL)
+        title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
+
+        task_v2_block = TaskV2Block(
+            prompt=user_prompt,
+            totp_identifier=totp_identifier,
+            totp_verification_url=totp_verification_url,
+            label=block_label,
+            max_iterations=max_iterations or settings.MAX_ITERATIONS_PER_TASK_V2,
+            max_steps=max_steps or settings.MAX_STEPS_PER_TASK_V2,
+            output_parameter=OutputParameter(
+                output_parameter_id=str(uuid.uuid4()),
+                key=f"{block_label}_output",
+                workflow_id="",
+                created_at=datetime.now(UTC),
+                modified_at=datetime.now(UTC),
+            ),
+        )
+
+        new_workflow = await self.create_workflow(
+            title=title,
+            workflow_definition=WorkflowDefinition(parameters=[], blocks=[task_v2_block]),
+            organization_id=organization.organization_id,
+            proxy_location=proxy_location,
+            webhook_callback_url=webhook_callback_url,
+            totp_verification_url=totp_verification_url,
+            totp_identifier=totp_identifier,
+            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+            extra_http_headers=extra_http_headers,
+        )
+
+        return new_workflow
 
     async def get_workflow(self, workflow_id: str, organization_id: str | None = None) -> Workflow:
         workflow = await app.DATABASE.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
