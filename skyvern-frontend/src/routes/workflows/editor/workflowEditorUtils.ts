@@ -149,7 +149,7 @@ export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
 export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
   const maxNesting = maxNestingLevel(nodes);
   const nestingLevel = getNestingLevel(node, nodes);
-  return 600 + (maxNesting - nestingLevel) * 50;
+  return 450 + (maxNesting - nestingLevel) * 50;
 }
 
 function maxNestingLevel(nodes: Array<AppNode>): number {
