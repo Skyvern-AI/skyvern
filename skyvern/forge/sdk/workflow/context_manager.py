@@ -251,7 +251,9 @@ class WorkflowRunContext:
             credential_item = bitwarden_credential.credential
 
             self.parameters[parameter.key] = parameter
-            self.values[parameter.key] = {}
+            self.values[parameter.key] = {
+                "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+            }
             credential_dict = credential_item.model_dump()
             for key, value in credential_dict.items():
                 if value is None:
