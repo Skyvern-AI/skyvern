@@ -198,7 +198,7 @@ class WorkflowRunContext:
 
     @staticmethod
     def generate_random_secret_id() -> str:
-        return f"secret_{generate_random_string()}"
+        return f"placeholder_{generate_random_string()}"
 
     async def _get_credential_vault_and_item_ids(self, credential_id: str) -> tuple[str, str]:
         """
@@ -299,7 +299,9 @@ class WorkflowRunContext:
         credential_item = bitwarden_credential.credential
 
         self.parameters[parameter.key] = parameter
-        self.values[parameter.key] = {}
+        self.values[parameter.key] = {
+            "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+        }
         credential_dict = credential_item.model_dump()
         for key, value in credential_dict.items():
             random_secret_id = self.generate_random_secret_id()
@@ -380,7 +382,9 @@ class WorkflowRunContext:
             raise ValueError(f"1Password item not found: vault_id:{parameter.vault_id}, item_id:{parameter.item_id}")
 
         self.parameters[parameter.key] = parameter
-        self.values[parameter.key] = {}
+        self.values[parameter.key] = {
+            "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+        }
 
         # Process all fields
         for field in item.fields:
@@ -488,6 +492,7 @@ class WorkflowRunContext:
                 password_secret_id = f"{random_secret_id}_password"
                 self.secrets[password_secret_id] = secret_credentials[BitwardenConstants.PASSWORD]
                 self.values[parameter.key] = {
+                    "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
                     "username": username_secret_id,
                     "password": password_secret_id,
                 }
@@ -560,7 +565,9 @@ class WorkflowRunContext:
                 self.secrets[BitwardenConstants.BW_COLLECTION_ID] = collection_id
 
                 self.parameters[parameter.key] = parameter
-                self.values[parameter.key] = {}
+                self.values[parameter.key] = {
+                    "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+                }
                 for key, value in sensitive_values.items():
                     random_secret_id = self.generate_random_secret_id()
                     secret_id = f"{random_secret_id}_{key}"
@@ -641,6 +648,9 @@ class WorkflowRunContext:
             parameter_value: dict[str, Any] = {
                 field_name: credit_card_data[field_key] for field_key, field_name in pass_through_fields.items()
             }
+            parameter_value["context"] = (
+                "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)"
+            )
 
             for data_key, secret_suffix in fields_to_obfuscate.items():
                 random_secret_id = self.generate_random_secret_id()
