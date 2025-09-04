@@ -1701,6 +1701,7 @@ class WorkflowService:
                     status=request.status,
                     generate_script=request.generate_script,
                     cache_key=request.cache_key,
+                    ai_fallback=request.ai_fallback,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id
