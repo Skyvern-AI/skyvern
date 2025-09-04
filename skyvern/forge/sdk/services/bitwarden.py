@@ -884,6 +884,8 @@ class BitwardenService:
 
         collection_template["name"] = name
         collection_template["organizationId"] = bw_organization_id
+        if "groups" not in collection_template:
+            collection_template["groups"] = []
 
         response = await aiohttp_post(
             f"{BITWARDEN_SERVER_BASE_URL}/object/org-collection?organizationId={bw_organization_id}",
