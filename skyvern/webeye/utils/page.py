@@ -310,7 +310,7 @@ class SkyvernFrame:
             )
         finally:
             if x is not None and y is not None:
-                await skyvern_frame.scroll_to_x_y(x, y)
+                await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
     @TraceManager.traced_async(ignore_inputs=["page"])
@@ -365,6 +365,12 @@ class SkyvernFrame:
     async def scroll_to_x_y(self, x: int, y: int) -> None:
         js_script = "([x, y]) => scrollToXY(x, y)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[x, y])
+
+    async def safe_scroll_to_x_y(self, x: int, y: int) -> None:
+        try:
+            await self.scroll_to_x_y(x, y)
+        except Exception:
+            LOG.warning("Failed to scroll to x, y, ignore it", x=x, y=y, exc_info=True)
 
     async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
         js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
