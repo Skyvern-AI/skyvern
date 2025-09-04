@@ -271,7 +271,7 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
         )
         args.append(
             cst.Arg(
-                keyword=cst.Name("ai_adapt_value"),
+                keyword=cst.Name("ai_infer"),
                 value=cst.Name("True"),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
