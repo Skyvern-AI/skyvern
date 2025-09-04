@@ -30,7 +30,6 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
-import { OrgWalled } from "@/components/Orgwalled";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
@@ -163,18 +162,16 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
             <div className="relative">
               <div className="absolute right-[-0.5rem] top-[-0.25rem]">
                 <div>
-                  <OrgWalled className="p-0">
-                    <Button variant="link" size="icon" onClick={showAllScripts}>
-                      <TooltipProvider>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-                          </TooltipTrigger>
-                          <TooltipContent>Show all code</TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
-                    </Button>
-                  </OrgWalled>
+                  <Button variant="link" size="icon" onClick={showAllScripts}>
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                        </TooltipTrigger>
+                        <TooltipContent>Show all code</TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </Button>
                 </div>
               </div>
               <header className="mb-6 mt-2">Start</header>
@@ -227,58 +224,57 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
-                      <OrgWalled className="p-0 hover:p-0">
-                        <div className="flex flex-col gap-4">
-                          <div className="space-y-2">
-                            <div className="flex items-center gap-2">
-                              <Label>Generate Code</Label>
-                              <HelpTooltip content="Generate & use cached code for faster execution." />
-                              <Switch
-                                className="ml-auto"
-                                checked={inputs.useScriptCache}
-                                onCheckedChange={(value) => {
-                                  handleChange("useScriptCache", value);
+
+                      <div className="flex flex-col gap-4">
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            <Label>Generate Code</Label>
+                            <HelpTooltip content="Generate & use cached code for faster execution." />
+                            <Switch
+                              className="ml-auto"
+                              checked={inputs.useScriptCache}
+                              onCheckedChange={(value) => {
+                                handleChange("useScriptCache", value);
+                              }}
+                            />
+                          </div>
+                        </div>
+                        {inputs.useScriptCache && (
+                          <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
+                            <div className="space-y-2">
+                              <div className="flex gap-2">
+                                <Label>Code Key (optional)</Label>
+                                <HelpTooltip content="A static or dynamic key for directing code generation." />
+                              </div>
+                              <WorkflowBlockInputTextarea
+                                nodeId={id}
+                                onChange={(value) => {
+                                  const v = value.length ? value : null;
+                                  handleChange("scriptCacheKey", v);
                                 }}
+                                value={inputs.scriptCacheKey ?? ""}
+                                placeholder={
+                                  placeholders["scripts"]["scriptKey"]
+                                }
+                                className="nopan text-xs"
                               />
                             </div>
-                          </div>
-                          {inputs.useScriptCache && (
-                            <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
-                              <div className="space-y-2">
-                                <div className="flex gap-2">
-                                  <Label>Code Key (optional)</Label>
-                                  <HelpTooltip content="A static or dynamic key for directing code generation." />
-                                </div>
-                                <WorkflowBlockInputTextarea
-                                  nodeId={id}
-                                  onChange={(value) => {
-                                    const v = value.length ? value : null;
-                                    handleChange("scriptCacheKey", v);
+                            <div className="space-y-2">
+                              <div className="flex items-center gap-2">
+                                <Label>Fallback To AI On Failure</Label>
+                                <HelpTooltip content="If cached code fails, fallback to AI." />
+                                <Switch
+                                  className="ml-auto"
+                                  checked={inputs.aiFallback}
+                                  onCheckedChange={(value) => {
+                                    handleChange("aiFallback", value);
                                   }}
-                                  value={inputs.scriptCacheKey ?? ""}
-                                  placeholder={
-                                    placeholders["scripts"]["scriptKey"]
-                                  }
-                                  className="nopan text-xs"
                                 />
                               </div>
-                              <div className="space-y-2">
-                                <div className="flex items-center gap-2">
-                                  <Label>Fallback To AI On Failure</Label>
-                                  <HelpTooltip content="If cached code fails, fallback to AI." />
-                                  <Switch
-                                    className="ml-auto"
-                                    checked={inputs.aiFallback}
-                                    onCheckedChange={(value) => {
-                                      handleChange("aiFallback", value);
-                                    }}
-                                  />
-                                </div>
-                              </div>
                             </div>
-                          )}
-                        </div>
-                      </OrgWalled>
+                          </div>
+                        )}
+                      </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
                           <Label>Save &amp; Reuse Session</Label>
