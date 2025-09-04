@@ -339,30 +339,30 @@ class SkyvernPage:
         self,
         xpath: str,
         value: str,
-        ai_adapt_value: bool = False,
+        ai_infer: bool = False,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> None:
-        await self._input_text(xpath, value, ai_adapt_value, intention, data, timeout)
+        await self._input_text(xpath, value, ai_infer, intention, data, timeout)
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def type(
         self,
         xpath: str,
         value: str,
-        ai_adapt_value: bool = False,
+        ai_infer: bool = False,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> None:
-        await self._input_text(xpath, value, ai_adapt_value, intention, data, timeout)
+        await self._input_text(xpath, value, ai_infer, intention, data, timeout)
 
     async def _input_text(
         self,
         xpath: str,
         value: str,
-        ai_adapt_value: bool = False,
+        ai_infer: bool = False,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -383,7 +383,7 @@ class SkyvernPage:
         if context and context.workflow_run_id:
             value = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
 
-        if ai_adapt_value and intention:
+        if ai_infer and intention:
             try:
                 prompt = context.prompt if context else None
                 # Build the element tree of the current page for the prompt
