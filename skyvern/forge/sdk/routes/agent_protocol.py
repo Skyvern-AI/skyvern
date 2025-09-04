@@ -525,6 +525,55 @@ async def create_workflow(
         raise FailedToCreateWorkflow(str(e))
 
 
+@base_router.post(
+    "/workflows/create-from-prompt",
+    include_in_schema=False,
+)
+async def create_workflow_from_prompt(
+    data: TaskV2Request,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    x_max_iterations_override: Annotated[int | str | None, Header()] = None,
+    x_max_steps_override: Annotated[int | str | None, Header()] = None,
+) -> dict[str, Any]:
+    if x_max_iterations_override or x_max_steps_override:
+        LOG.info(
+            "Overriding max steps for workflow-from-prompt",
+            max_iterations_override=x_max_iterations_override,
+            max_steps_override=x_max_steps_override,
+        )
+    await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
+
+    if isinstance(x_max_iterations_override, str):
+        try:
+            x_max_iterations_override = int(x_max_iterations_override)
+        except ValueError:
+            x_max_iterations_override = None
+
+    if isinstance(x_max_steps_override, str):
+        try:
+            x_max_steps_override = int(x_max_steps_override)
+        except ValueError:
+            x_max_steps_override = None
+    try:
+        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_prompt(
+            organization=organization,
+            user_prompt=data.user_prompt,
+            totp_identifier=data.totp_identifier,
+            totp_verification_url=data.totp_verification_url,
+            webhook_callback_url=data.webhook_callback_url,
+            proxy_location=data.proxy_location,
+            max_screenshot_scrolling_times=data.max_screenshot_scrolls,
+            extra_http_headers=data.extra_http_headers,
+            max_iterations=x_max_iterations_override,
+            max_steps=x_max_steps_override,
+        )
+    except Exception as e:
+        LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
+        raise FailedToCreateWorkflow(str(e))
+
+    return workflow.model_dump(by_alias=True)
+
+
 @legacy_base_router.put(
     "/workflows/{workflow_id}",
     openapi_extra={

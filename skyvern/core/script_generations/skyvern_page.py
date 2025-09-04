@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Callable, Literal
 
+import structlog
 from playwright.async_api import Page
 
 from skyvern.config import settings
@@ -23,6 +24,8 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, ExtractAction, SelectOption
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
+
+LOG = structlog.get_logger()
 
 
 class Driver(StrEnum):
@@ -196,7 +199,8 @@ class SkyvernPage:
 
             # Create action record. TODO: store more action fields
             kwargs = kwargs or {}
-            text = kwargs.get("text")
+            # we're using "value" instead of "text" for input text actions interface
+            text = kwargs.get("value", "")
             option_value = kwargs.get("option")
             select_option = SelectOption(value=option_value) if option_value else None
             response: str | None = kwargs.get("response")
@@ -216,7 +220,7 @@ class SkyvernPage:
                 task_id=context.task_id,
                 step_id=context.step_id,
                 step_order=0,  # Will be updated by the system if needed
-                action_order=0,  # Will be updated by the system if needed
+                action_order=context.action_order,  # Will be updated by the system if needed
                 intention=intention,
                 reasoning=f"Auto-generated action for {action_type.value}",
                 text=text,
@@ -234,7 +238,7 @@ class SkyvernPage:
                     task_id=context.task_id,
                     step_id=context.step_id,
                     step_order=0,
-                    action_order=0,
+                    action_order=context.action_order,
                     intention=intention,
                     reasoning=f"Auto-generated action for {action_type.value}",
                     data_extraction_goal=kwargs.get("prompt"),
@@ -245,6 +249,7 @@ class SkyvernPage:
                 )
 
             created_action = await app.DATABASE.create_action(action)
+            context.action_order += 1
             return created_action
 
         except Exception:
@@ -313,7 +318,7 @@ class SkyvernPage:
                     current_url=self.page.url,
                     elements=element_tree,
                     local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
-                    user_context=getattr(context, "prompt", None),
+                    # user_context=getattr(context, "prompt", None),
                 )
                 json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
                     prompt=single_click_prompt,
@@ -333,28 +338,31 @@ class SkyvernPage:
     async def fill(
         self,
         xpath: str,
-        text: str,
+        value: str,
+        ai_adapt_value: bool = False,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> None:
-        await self._input_text(xpath, text, intention, data, timeout)
+        await self._input_text(xpath, value, ai_adapt_value, intention, data, timeout)
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def type(
         self,
         xpath: str,
-        text: str,
+        value: str,
+        ai_adapt_value: bool = False,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> None:
-        await self._input_text(xpath, text, intention, data, timeout)
+        await self._input_text(xpath, value, ai_adapt_value, intention, data, timeout)
 
     async def _input_text(
         self,
         xpath: str,
-        text: str,
+        value: str,
+        ai_adapt_value: bool = False,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -371,11 +379,33 @@ class SkyvernPage:
         """
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         context = skyvern_context.current()
+        value = value or ""
         if context and context.workflow_run_id:
-            text = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, text)
+            value = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
+
+        if ai_adapt_value and intention:
+            try:
+                prompt = context.prompt if context else None
+                # Build the element tree of the current page for the prompt
+                # clean up empty data values
+                data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
+                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                script_generation_input_text_prompt = prompt_engine.load_prompt(
+                    template="script-generation-input-text-generatiion",
+                    intention=intention,
+                    data=payload_str,
+                    goal=prompt,
+                )
+                json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    prompt=script_generation_input_text_prompt,
+                    prompt_name="script-generation-input-text-generatiion",
+                )
+                value = json_response.get("answer", value)
+            except Exception:
+                LOG.exception(f"Failed to adapt value for input text action on xpath={xpath}, value={value}")
 
         locator = self.page.locator(f"xpath={xpath}")
-        await handler_utils.input_sequentially(locator, text, timeout=timeout)
+        await handler_utils.input_sequentially(locator, value, timeout=timeout)
 
     @action_wrap(ActionType.UPLOAD_FILE)
     async def upload_file(
@@ -541,11 +571,13 @@ class RunContext:
         self.original_parameters = parameters
         self.generated_parameters = generated_parameters
         self.parameters = copy.deepcopy(parameters)
-        # if generated_parameters:
-        #     self.parameters.update(generated_parameters)
+        if generated_parameters:
+            # hydrate the generated parameter fields in the run context parameters
+            for key, value in generated_parameters.items():
+                if key not in self.parameters:
+                    self.parameters[key] = value
         self.page = page
         self.trace: list[ActionCall] = []
-        self.prompt: str | None = None
 
 
 async def _get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
@@ -559,3 +591,34 @@ async def _get_actual_value_of_parameter_if_secret(workflow_run_id: str, paramet
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
     return secret_value if secret_value is not None else parameter
+
+
+class ScriptRunContextManager:
+    """
+    Manages the run context for code runs.
+    """
+
+    def __init__(self) -> None:
+        # self.run_contexts: dict[str, RunContext] = {}
+        self.run_context: RunContext | None = None
+        self.cached_fns: dict[str, Callable] = {}
+
+    def get_run_context(self) -> RunContext | None:
+        return self.run_context
+
+    def set_run_context(self, run_context: RunContext) -> None:
+        self.run_context = run_context
+
+    def ensure_run_context(self) -> RunContext:
+        if not self.run_context:
+            raise Exception("Run context not found")
+        return self.run_context
+
+    def set_cached_fn(self, cache_key: str, fn: Callable) -> None:
+        self.cached_fns[cache_key] = fn
+
+    def get_cached_fn(self, cache_key: str) -> Callable | None:
+        return self.cached_fns.get(cache_key)
+
+
+script_run_context_manager = ScriptRunContextManager()

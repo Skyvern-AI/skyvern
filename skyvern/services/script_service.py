@@ -16,7 +16,7 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_script_block
-from skyvern.core.script_generations.script_run_context_manager import script_run_context_manager
+from skyvern.core.script_generations.skyvern_page import script_run_context_manager
 from skyvern.exceptions import ScriptNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -306,6 +306,8 @@ async def _create_workflow_block_run_and_task(
                 status=StepStatus.running,
             )
             step_id = step.step_id
+            # reset the action order to 0
+            context.action_order = 0
 
             # Update workflow run block with task_id
             await app.DATABASE.update_workflow_run_block(
@@ -940,8 +942,8 @@ async def run_task(
         url=url,
     )
     # set the prompt in the RunContext
-    run_context = script_run_context_manager.ensure_run_context()
-    run_context.prompt = prompt
+    context = skyvern_context.ensure_context()
+    context.prompt = prompt
 
     if cache_key:
         try:
@@ -970,7 +972,7 @@ async def run_task(
             )
         finally:
             # clear the prompt in the RunContext
-            run_context.prompt = None
+            context.prompt = None
     else:
         if workflow_run_block_id:
             await _update_workflow_block(
@@ -982,7 +984,7 @@ async def run_task(
                 step_status=StepStatus.failed,
                 failure_reason="Cache key is required",
             )
-        run_context.prompt = None
+        context.prompt = None
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -999,8 +1001,8 @@ async def download(
         url=url,
     )
     # set the prompt in the RunContext
-    run_context = script_run_context_manager.ensure_run_context()
-    run_context.prompt = prompt
+    context = skyvern_context.ensure_context()
+    context.prompt = prompt
 
     if cache_key:
         try:
@@ -1029,7 +1031,7 @@ async def download(
                 workflow_run_block_id=workflow_run_block_id,
             )
         finally:
-            run_context.prompt = None
+            context.prompt = None
     else:
         if workflow_run_block_id:
             await _update_workflow_block(
@@ -1041,7 +1043,7 @@ async def download(
                 step_status=StepStatus.failed,
                 failure_reason="Cache key is required",
             )
-        run_context.prompt = None
+        context.prompt = None
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -1058,8 +1060,8 @@ async def action(
         url=url,
     )
     # set the prompt in the RunContext
-    run_context = script_run_context_manager.ensure_run_context()
-    run_context.prompt = prompt
+    context = skyvern_context.ensure_context()
+    context.prompt = prompt
 
     if cache_key:
         try:
@@ -1087,7 +1089,7 @@ async def action(
                 workflow_run_block_id=workflow_run_block_id,
             )
         finally:
-            run_context.prompt = None
+            context.prompt = None
     else:
         if workflow_run_block_id:
             await _update_workflow_block(
@@ -1099,7 +1101,7 @@ async def action(
                 step_status=StepStatus.failed,
                 failure_reason="Cache key is required",
             )
-        run_context.prompt = None
+        context.prompt = None
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -1116,8 +1118,8 @@ async def login(
         url=url,
     )
     # set the prompt in the RunContext
-    run_context = script_run_context_manager.ensure_run_context()
-    run_context.prompt = prompt
+    context = skyvern_context.ensure_context()
+    context.prompt = prompt
 
     if cache_key:
         try:
@@ -1145,7 +1147,7 @@ async def login(
                 workflow_run_block_id=workflow_run_block_id,
             )
         finally:
-            run_context.prompt = None
+            context.prompt = None
     else:
         if workflow_run_block_id:
             await _update_workflow_block(
@@ -1157,7 +1159,7 @@ async def login(
                 step_status=StepStatus.failed,
                 failure_reason="Cache key is required",
             )
-        run_context.prompt = None
+        context.prompt = None
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -1176,8 +1178,8 @@ async def extract(
         url=url,
     )
     # set the prompt in the RunContext
-    run_context = script_run_context_manager.ensure_run_context()
-    run_context.prompt = prompt
+    context = skyvern_context.ensure_context()
+    context.prompt = prompt
     output: dict[str, Any] | list | str | None = None
 
     if cache_key:
@@ -1211,7 +1213,7 @@ async def extract(
                 )
             raise
         finally:
-            run_context.prompt = None
+            context.prompt = None
     else:
         if workflow_run_block_id:
             await _update_workflow_block(
@@ -1223,7 +1225,7 @@ async def extract(
                 step_status=StepStatus.failed,
                 failure_reason="Cache key is required",
             )
-        run_context.prompt = None
+        context.prompt = None
         raise Exception("Cache key is required to run task block in a script")
 
 
@@ -1294,8 +1296,8 @@ async def generate_text(
     new_text = text or ""
     if intention and data:
         try:
-            run_context = script_run_context_manager.ensure_run_context()
-            prompt = run_context.prompt
+            context = skyvern_context.ensure_context()
+            prompt = context.prompt
             # Build the element tree of the current page for the prompt
             payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
             script_generation_input_text_prompt = prompt_engine.load_prompt(

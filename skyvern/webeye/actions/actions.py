@@ -242,7 +242,7 @@ class CompleteAction(DecisiveAction):
 class ExtractAction(Action):
     action_type: ActionType = ActionType.EXTRACT
     data_extraction_goal: str | None = None
-    data_extraction_schema: dict[str, Any] | None = None
+    data_extraction_schema: dict[str, Any] | list | str | None = None
 
 
 class ScrollAction(Action):

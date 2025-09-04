@@ -203,6 +203,14 @@ function Workspace({
   const showBreakoutButton =
     activeDebugSession && activeDebugSession.browser_session_id;
 
+  const hasLoopBlock = nodes.some((node) => node.type === "loop");
+  const hasHttpBlock = nodes.some((node) => node.type === "http_request");
+  const workflowWidth = hasHttpBlock
+    ? "39rem"
+    : hasLoopBlock
+      ? "34.25rem"
+      : "33rem";
+
   /**
    * Open a new tab (not window) with the browser session URL.
    */
@@ -731,9 +739,13 @@ function Workspace({
       <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
         {/* infinite canvas */}
         <div
-          className={cn("skyvern-split-left h-full w-[33rem] min-w-[33rem]", {
+          className={cn("skyvern-split-left h-full", {
             "w-full": !showBrowser,
           })}
+          style={{
+            width: workflowWidth,
+            maxWidth: workflowWidth,
+          }}
         >
           <FlowRenderer
             hideBackground={showBrowser}
@@ -755,7 +767,12 @@ function Workspace({
 
         {/* browser & timeline & sub-panels in debug mode */}
         {showBrowser && (
-          <div className="skyvern-split-right relative flex h-full w-[calc(100%_-_33rem)] items-end justify-center bg-[#020617] p-4 pl-6">
+          <div
+            className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6"
+            style={{
+              width: `calc(100% - ${workflowWidth})`,
+            }}
+          >
             {/* sub panels */}
             {workflowPanelState.active && (
               <div
@@ -830,7 +847,11 @@ function Workspace({
                   {showBreakoutButton && (
                     <BreakoutButton onClick={() => breakout()} />
                   )}
-                  <div className="ml-auto flex items-center gap-2">
+                  <div
+                    className={cn("ml-auto flex items-center gap-2", {
+                      "mr-16": !blockLabel,
+                    })}
+                  >
                     {showPowerButton && <PowerButton onClick={() => cycle()} />}
                     <ReloadButton
                       isReloading={isReloading}
