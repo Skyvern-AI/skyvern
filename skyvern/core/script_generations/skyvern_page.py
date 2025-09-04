@@ -380,9 +380,6 @@ class SkyvernPage:
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         context = skyvern_context.current()
         value = value or ""
-        if context and context.workflow_run_id:
-            value = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
-
         if ai_infer and intention:
             try:
                 prompt = context.prompt if context else None
@@ -403,6 +400,9 @@ class SkyvernPage:
                 value = json_response.get("answer", value)
             except Exception:
                 LOG.exception(f"Failed to adapt value for input text action on xpath={xpath}, value={value}")
+
+        if context and context.workflow_run_id:
+            value = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
 
         locator = self.page.locator(f"xpath={xpath}")
         await handler_utils.input_sequentially(locator, value, timeout=timeout)
