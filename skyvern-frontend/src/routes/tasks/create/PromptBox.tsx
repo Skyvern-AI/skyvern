@@ -48,7 +48,6 @@ import {
   MAX_SCREENSHOT_SCROLLS_DEFAULT,
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
-import { OrgWalled } from "@/components/Orgwalled";
 
 function createTemplateTaskFromTaskGenerationParameters(
   values: TaskGenerationApiResponse,
@@ -471,23 +470,22 @@ function PromptBox() {
                       />
                     </div>
                   </div>
-                  <OrgWalled className="p-0">
-                    <div className="flex gap-16">
-                      <div className="w-48 shrink-0">
-                        <div className="text-sm">Generate Script</div>
-                        <div className="text-xs text-slate-400">
-                          Whether to generate scripts for this task run (on
-                          success).
-                        </div>
+
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Generate Script</div>
+                      <div className="text-xs text-slate-400">
+                        Whether to generate scripts for this task run (on
+                        success).
                       </div>
-                      <Switch
-                        checked={generateScript}
-                        onCheckedChange={(checked) => {
-                          setGenerateScript(Boolean(checked));
-                        }}
-                      />
                     </div>
-                  </OrgWalled>
+                    <Switch
+                      checked={generateScript}
+                      onCheckedChange={(checked) => {
+                        setGenerateScript(Boolean(checked));
+                      }}
+                    />
+                  </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Publish Workflow</div>
