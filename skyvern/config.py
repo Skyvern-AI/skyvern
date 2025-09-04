@@ -304,7 +304,7 @@ class Settings(BaseSettings):
     SVG_MAX_LENGTH: int = 100000
 
     ENABLE_LOG_ARTIFACTS: bool = False
-    ENABLE_CODE_BLOCK: bool = False
+    ENABLE_CODE_BLOCK: bool = True
 
     TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
 
