@@ -7,6 +7,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { DotsHorizontalIcon } from "@radix-ui/react-icons";
+import { OrgWalled } from "@/components/Orgwalled";
 
 type Props = {
   isDeletable?: boolean;
@@ -44,14 +45,18 @@ function NodeActionMenu({
             Delete Block
           </DropdownMenuItem>
         )}
-        {isScriptable && onShowScript && (
-          <DropdownMenuItem
-            onSelect={() => {
-              onShowScript();
-            }}
-          >
-            {showScriptText ?? "Show Code"}
-          </DropdownMenuItem>
+        {isScriptable && (
+          <OrgWalled className="p-0">
+            {onShowScript && (
+              <DropdownMenuItem
+                onSelect={() => {
+                  onShowScript();
+                }}
+              >
+                {showScriptText ?? "Show Code"}
+              </DropdownMenuItem>
+            )}
+          </OrgWalled>
         )}
       </DropdownMenuContent>
     </DropdownMenu>
