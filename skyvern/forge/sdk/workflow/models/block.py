@@ -581,22 +581,6 @@ class BaseTaskBlock(Block):
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
                     )
-                    # assert that the browser state is not None, otherwise we can't go through typing
-                    assert browser_state is not None
-                    # add screenshot artifact for the first task
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            workflow_run_id,
-                            properties={"organization_id": str(organization_id)},
-                        )
-                    )
-                    if screenshot:
-                        await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
-                            workflow_run_block=workflow_run_block,
-                            artifact_type=ArtifactType.SCREENSHOT_LLM,
-                            data=screenshot,
-                        )
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",
@@ -611,6 +595,28 @@ class BaseTaskBlock(Block):
                         failure_reason=str(e),
                     )
                     raise e
+                try:
+                    # add screenshot artifact for the first task
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            workflow_run_id,
+                            properties={"organization_id": str(organization_id)},
+                        )
+                    )
+                    if screenshot:
+                        await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                            workflow_run_block=workflow_run_block,
+                            artifact_type=ArtifactType.SCREENSHOT_LLM,
+                            data=screenshot,
+                        )
+                except Exception:
+                    LOG.warning(
+                        "Failed to take screenshot for first task",
+                        task_id=task.task_id,
+                        workflow_run_id=workflow_run_id,
+                        exc_info=True,
+                    )
             else:
                 # if not the first task block, need to navigate manually
                 browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
