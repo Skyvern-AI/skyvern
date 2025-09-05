@@ -743,8 +743,8 @@ function Workspace({
             "w-full": !showBrowser,
           })}
           style={{
-            width: workflowWidth,
-            maxWidth: workflowWidth,
+            width: showBrowser ? workflowWidth : "100%",
+            maxWidth: showBrowser ? workflowWidth : "100%",
           }}
         >
           <FlowRenderer
