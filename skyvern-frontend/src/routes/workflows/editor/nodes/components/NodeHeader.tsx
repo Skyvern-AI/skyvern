@@ -11,6 +11,7 @@ import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useOnChange } from "@/hooks/useOnChange";
+import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
@@ -186,6 +187,28 @@ function NodeHeader({
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
   );
+  const { getAutoplay, setAutoplay } = useAutoplayStore();
+
+  useEffect(() => {
+    if (!debugSession) {
+      return;
+    }
+
+    const details = getAutoplay();
+
+    if (
+      workflowPermanentId === details.wpid &&
+      blockLabel === details.blockLabel
+    ) {
+      setAutoplay(null, null);
+      setTimeout(() => {
+        runBlock.mutateAsync();
+      }, 100);
+    }
+
+    // on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debugSession]);
 
   useEffect(() => {
     setWorkflowRunStatus(workflowRun?.status);
@@ -496,8 +519,10 @@ function NodeHeader({
               ) : (
                 <PlayIcon
                   className={cn("size-6", {
-                    "fill-gray-500 text-gray-500":
-                      workflowRunIsRunningOrQueued || !workflowPermanentId,
+                    "pointer-events-none fill-gray-500 text-gray-500":
+                      workflowRunIsRunningOrQueued ||
+                      !workflowPermanentId ||
+                      debugSession === undefined,
                   })}
                   onClick={() => {
                     handleOnPlay();

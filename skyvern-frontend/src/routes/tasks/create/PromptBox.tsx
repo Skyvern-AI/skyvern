@@ -1,10 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import {
-  Createv2TaskRequest,
-  TaskV2,
-  ProxyLocation,
-  TaskGenerationApiResponse,
-} from "@/api/types";
+import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
@@ -26,6 +21,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
   FileTextIcon,
@@ -38,7 +34,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { stringify as convertToYAML } from "yaml";
 import {
   generatePhoneNumber,
   generateUniqueEmail,
@@ -48,38 +43,7 @@ import {
   MAX_SCREENSHOT_SCROLLS_DEFAULT,
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
-
-function createTemplateTaskFromTaskGenerationParameters(
-  values: TaskGenerationApiResponse,
-) {
-  return {
-    title: values.suggested_title ?? "Untitled Task",
-    description: "",
-    is_saved_task: true,
-    webhook_callback_url: null,
-    proxy_location: "RESIDENTIAL",
-    workflow_definition: {
-      parameters: [
-        {
-          parameter_type: "workflow",
-          workflow_parameter_type: "json",
-          key: "navigation_payload",
-          default_value: JSON.stringify(values.navigation_payload),
-        },
-      ],
-      blocks: [
-        {
-          block_type: "task",
-          label: values.suggested_title ?? "Untitled Task",
-          url: values.url,
-          navigation_goal: values.navigation_goal,
-          data_extraction_goal: values.data_extraction_goal,
-          data_schema: values.extracted_information_schema,
-        },
-      ],
-    },
-  };
-}
+import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 const exampleCases = [
   {
@@ -166,21 +130,22 @@ function PromptBox() {
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
+  const { setAutoplay } = useAutoplayStore();
 
-  const startObserverCruiseMutation = useMutation({
+  const generateWorkflowMutation = useMutation({
     mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter, "v2");
-      return client.post<Createv2TaskRequest, { data: TaskV2 }>(
-        "/tasks",
+      const client = await getClient(credentialGetter, "sans-api-v1");
+
+      const result = await client.post<
+        Createv2TaskRequest,
+        { data: WorkflowApiResponse }
+      >(
+        "/workflows/create-from-prompt",
         {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
-          browser_session_id: browserSessionId,
-          browser_address: cdpAddress,
           totp_identifier: totpIdentifier,
-          generate_script: generateScript,
-          publish_workflow: publishWorkflow || generateScript,
           max_screenshot_scrolls: maxScreenshotScrolls,
           extracted_information_schema: dataSchema
             ? (() => {
@@ -207,76 +172,32 @@ function PromptBox() {
           },
         },
       );
+
+      return result;
     },
-    onSuccess: (response) => {
+    onSuccess: ({ data: workflow }) => {
       toast({
         variant: "success",
-        title: "Workflow Run Created",
-        description: `Workflow run created successfully.`,
+        title: "Workflow Created",
+        description: `Workflow created successfully.`,
       });
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
+
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
-      queryClient.invalidateQueries({
-        queryKey: ["runs"],
-      });
-      navigate(
-        `/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`,
-      );
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating workflow run from prompt",
-        description: error.message,
-      });
-    },
-  });
 
-  const getTaskFromPromptMutation = useMutation({
-    mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter);
-      return client
-        .post<
-          { prompt: string },
-          { data: TaskGenerationApiResponse }
-        >("/generate/task", { prompt })
-        .then((response) => response.data);
-    },
-    onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
-      toast({
-        variant: "destructive",
-        title: "Error creating task from prompt",
-        description: detail ? detail : error.message,
-      });
-    },
-  });
+      const firstBlock = workflow.workflow_definition.blocks[0];
 
-  const saveTaskMutation = useMutation({
-    mutationFn: async (params: TaskGenerationApiResponse) => {
-      const client = await getClient(credentialGetter);
-      const templateTask =
-        createTemplateTaskFromTaskGenerationParameters(params);
-      const yaml = convertToYAML(templateTask);
-      return client.post("/workflows", yaml, {
-        headers: {
-          "Content-Type": "text/plain",
-        },
-      });
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["savedTasks"],
-      });
+      if (firstBlock) {
+        setAutoplay(workflow.workflow_permanent_id, firstBlock.label);
+      }
+
+      navigate(`/workflows/${workflow.workflow_permanent_id}/debug`);
     },
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Error saving task",
+        title: "Error creating workflow from prompt",
         description: error.message,
       });
     },
@@ -343,30 +264,21 @@ function PromptBox() {
                 />
               </div>
               <div className="flex items-center">
-                {startObserverCruiseMutation.isPending ||
-                getTaskFromPromptMutation.isPending ||
-                saveTaskMutation.isPending ? (
+                {generateWorkflowMutation.isPending ? (
                   <ReloadIcon className="size-6 animate-spin" />
                 ) : (
-                  <PaperPlaneIcon
-                    className="size-6 cursor-pointer"
-                    onClick={async () => {
-                      if (selectValue === "v2") {
-                        startObserverCruiseMutation.mutate(prompt);
-                        return;
-                      }
-                      const taskGenerationResponse =
-                        await getTaskFromPromptMutation.mutateAsync(prompt);
-                      await saveTaskMutation.mutateAsync(
-                        taskGenerationResponse,
-                      );
-                      navigate("/tasks/create/from-prompt", {
-                        state: {
-                          data: taskGenerationResponse,
-                        },
-                      });
-                    }}
-                  />
+                  <div className="flex items-center">
+                    {generateWorkflowMutation.isPending ? (
+                      <ReloadIcon className="size-6 animate-spin" />
+                    ) : (
+                      <PaperPlaneIcon
+                        className="size-6 cursor-pointer"
+                        onClick={async () => {
+                          generateWorkflowMutation.mutate(prompt);
+                        }}
+                      />
+                    )}
+                  </div>
                 )}
               </div>
             </div>
