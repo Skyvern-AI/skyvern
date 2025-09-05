@@ -1,13 +1,10 @@
-
 /* Mobile-specific styles for Workflows page  */
 @media (max-width: 768px) {
-  
-  
   .mobileMainContainer {
     padding: 0 1rem !important;
     overflow-x: hidden !important;
   }
-  
+
   /* Header section */
   .mobileHeaderContainer {
     flex-direction: column !important;
@@ -15,8 +12,7 @@
     gap: 1rem !important;
     margin-bottom: 2rem !important;
   }
-  
-  
+
   .mobileNarrativeCards {
     flex-direction: column !important;
     gap: 0.75rem !important;
@@ -24,54 +20,46 @@
     margin-top: 1rem !important;
   }
 
-   .mobileNarrativeCards > * {
+  .mobileNarrativeCards > * {
     width: 100% !important;
     max-width: 100% !important;
     min-width: auto !important;
     font-size: 0.875rem !important;
     padding: 1rem !important;
   }
-  
-  
+
   .mobileHeaderContent {
     width: 100% !important;
   }
-  
-  
+
   .mobileFlowsSection {
     margin-top: 2rem !important;
   }
-  
-  
+
   .mobileFlowsHeader {
     margin-bottom: 1rem !important;
   }
-  
-  
+
   .mobileSearchButtonContainer {
     flex-direction: column !important;
     gap: 1rem !important;
     align-items: stretch !important;
     width: 100% !important;
   }
-  
-  
+
   .mobileSearchContainer {
     width: 100% !important;
     max-width: 100% !important;
   }
 
-  
-  
   .mobileSearchInput {
     width: 100% !important;
     max-width: 100% !important;
     min-height: 44px !important;
-    font-size: 16px !important; 
+    font-size: 16px !important;
     box-sizing: border-box !important;
   }
-  
-  
+
   .mobileButtonContainer {
     display: flex !important;
     gap: 0.75rem !important;
@@ -79,94 +67,141 @@
     justify-content: center !important;
     align-items: center !important;
   }
-  
-  
+
   .mobileButton {
     min-height: 44px !important;
     font-size: 0.875rem !important;
     padding: 0.75rem 1.5rem !important;
     flex: 0 1 auto !important;
   }
-  
-  
+
   .mobileButtonContainer > * {
     min-height: 44px !important;
   }
-  
-  
+
   .mobileTableContainer {
     width: 100% !important;
     margin: 0 !important;
     border-radius: 0.5rem !important;
     overflow: hidden !important;
   }
-  
-  
+
   .mobileTableWrapper {
     overflow-x: auto !important;
     -webkit-overflow-scrolling: touch !important;
     width: 100% !important;
+    max-width: 100vw !important;
   }
-  
-  
+
   .mobileTable {
-    min-width: 600px !important;
-    width: max(600px, 100%) !important;
+    min-width: 100% !important;
+    width: 100% !important;
     font-size: 0.875rem !important;
     margin: 0 !important;
+    table-layout: fixed !important;
   }
-  
-  
+
   .mobileTable th,
   .mobileTable td {
     padding: 0.75rem 0.5rem !important;
     font-size: 0.875rem !important;
     white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
   }
-  
-  
+
   .mobileTable th {
     font-size: 0.75rem !important;
     font-weight: 600 !important;
   }
-  
-  
-  .mobileTable th:first-child,
-  .mobileTable td:first-child {
-    width: 120px !important;
-    min-width: 120px !important;
+
+  .mobileTable th:nth-child(1),
+  .mobileTable td:nth-child(1) {
+    width: 80px !important;
+    min-width: 80px !important;
+    max-width: 80px !important;
     font-size: 0.75rem !important;
   }
-  
-  
+
+  .mobileTable th:nth-child(2),
+  .mobileTable td:nth-child(2) {
+    width: 40% !important;
+    min-width: 120px !important;
+    max-width: 150px !important;
+  }
+
+  .mobileTable th:nth-child(3),
+  .mobileTable td:nth-child(3) {
+    width: 100px !important;
+    min-width: 100px !important;
+    max-width: 100px !important;
+    font-size: 0.75rem !important;
+  }
+
+  .mobileTable th:nth-child(4),
+  .mobileTable td:nth-child(4) {
+    width: 120px !important;
+    min-width: 120px !important;
+    max-width: 120px !important;
+  }
+
   .mobileTableActions button {
     min-height: 40px !important;
     min-width: 40px !important;
   }
-  
-  
+
   .mobilePagination {
-    padding-top: 1rem !important;
+    padding-top: 0 !important;
     width: 100% !important;
     justify-content: center !important;
+    margin-top: 1rem !important;
   }
-  
+
   .mobilePagination button {
     min-height: 44px !important;
     min-width: 44px !important;
     font-size: 0.875rem !important;
   }
-  
-  
+
   .mobileContainer {
     max-width: 100vw !important;
     overflow-x: hidden !important;
     box-sizing: border-box !important;
   }
-  
-  
+
   .mobileWorkflowTemplates {
     width: 100% !important;
     overflow-x: hidden !important;
+  }
+
+  .mobileTableContainer div[class*="relative px-3 py-3"] {
+    position: static !important;
+    padding: 1rem !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 1rem !important;
+  }
+
+  .mobileTableContainer div[class*="absolute left-3"] {
+    position: static !important;
+    transform: none !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    text-align: center !important;
+  }
+
+  .mobileTableContainer select {
+    width: 100% !important;
+    max-width: 200px !important;
+    min-height: 44px !important;
+    font-size: 16px !important;
+    text-align: center !important;
+  }
+
+  .mobileTableContainer .text-slate-400 {
+    font-size: 0.875rem !important;
+    text-align: center !important;
+    margin-bottom: 0.5rem !important;
   }
 }

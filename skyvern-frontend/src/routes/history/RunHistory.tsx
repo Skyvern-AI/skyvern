@@ -1,3 +1,4 @@
+import styles from "./RunHistory.module.css";
 import { Status, Task, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
@@ -96,110 +97,121 @@ function RunHistory() {
     setParamPatch({ page: String(page + 1) });
   }
   return (
-    <div className="space-y-4">
-      <div className="flex justify-between">
+    <div
+      className={cn(
+        "space-y-4",
+        styles.mobileContainer,
+        styles.mobileMainContainer,
+      )}
+    >
+      <div className={cn("flex justify-between", styles.mobileHeaderContainer)}>
         <h1 className="text-2xl">Run History</h1>
         <StatusFilterDropdown
           values={statusFilters}
           onChange={setStatusFilters}
         />
       </div>
-      <div className="rounded-lg border">
-        <Table>
-          <TableHeader className="rounded-t-lg bg-slate-elevation2">
-            <TableRow>
-              <TableHead className="w-1/4 rounded-tl-lg text-slate-400">
-                Run ID
-              </TableHead>
-              <TableHead className="w-1/4 text-slate-400">Detail</TableHead>
-              <TableHead className="w-1/4 text-slate-400">Status</TableHead>
-              <TableHead className="w-1/4 rounded-tr-lg text-slate-400">
-                Created At
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {isFetching ? (
-              Array.from({ length: 10 }).map((_, index) => (
-                <TableRow key={index}>
+      <div className={cn("rounded-lg border", styles.mobileTableContainer)}>
+        <div className={styles.mobileTableWrapper}>
+          <Table className={styles.mobileTable}>
+            <TableHeader className="rounded-t-lg bg-slate-elevation2">
+              <TableRow>
+                <TableHead className="w-1/4 rounded-tl-lg text-slate-400">
+                  Run ID
+                </TableHead>
+                <TableHead className="w-1/4 text-slate-400">Detail</TableHead>
+                <TableHead className="w-1/4 text-slate-400">Status</TableHead>
+                <TableHead className="w-1/4 rounded-tr-lg text-slate-400">
+                  Created At
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {isFetching ? (
+                Array.from({ length: 10 }).map((_, index) => (
+                  <TableRow key={index}>
+                    <TableCell colSpan={4}>
+                      <Skeleton className="h-4 w-full" />
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : runs?.length === 0 ? (
+                <TableRow>
                   <TableCell colSpan={4}>
-                    <Skeleton className="h-4 w-full" />
+                    <div className="text-center">No runs found</div>
                   </TableCell>
                 </TableRow>
-              ))
-            ) : runs?.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={4}>
-                  <div className="text-center">No runs found</div>
-                </TableCell>
-              </TableRow>
-            ) : (
-              runs?.map((run) => {
-                if (isTask(run)) {
+              ) : (
+                runs?.map((run) => {
+                  if (isTask(run)) {
+                    return (
+                      <TableRow
+                        key={run.task_id}
+                        className="cursor-pointer"
+                        onClick={(event) => {
+                          handleNavigate(
+                            event,
+                            `/tasks/${run.task_id}/actions`,
+                          );
+                        }}
+                      >
+                        <TableCell className="max-w-0 truncate">
+                          {run.task_id}
+                        </TableCell>
+                        <TableCell className="max-w-0 truncate">
+                          {run.url}
+                        </TableCell>
+                        <TableCell>
+                          <StatusBadge status={run.status} />
+                        </TableCell>
+                        <TableCell
+                          title={basicTimeFormat(run.created_at)}
+                          className="max-w-0 truncate"
+                        >
+                          {basicLocalTimeFormat(run.created_at)}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  }
                   return (
                     <TableRow
-                      key={run.task_id}
+                      key={run.workflow_run_id}
                       className="cursor-pointer"
                       onClick={(event) => {
-                        handleNavigate(event, `/tasks/${run.task_id}/actions`);
+                        handleNavigate(
+                          event,
+                          `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
+                        );
                       }}
                     >
-                      <TableCell className="max-w-0 truncate">
-                        {run.task_id}
+                      <TableCell
+                        className="max-w-0 truncate"
+                        title={run.workflow_run_id}
+                      >
+                        {run.workflow_run_id}
                       </TableCell>
-                      <TableCell className="max-w-0 truncate">
-                        {run.url}
+                      <TableCell
+                        className="max-w-0 truncate"
+                        title={run.workflow_title ?? undefined}
+                      >
+                        {run.workflow_title ?? ""}
                       </TableCell>
                       <TableCell>
                         <StatusBadge status={run.status} />
                       </TableCell>
                       <TableCell
-                        title={basicTimeFormat(run.created_at)}
                         className="max-w-0 truncate"
+                        title={basicTimeFormat(run.created_at)}
                       >
                         {basicLocalTimeFormat(run.created_at)}
                       </TableCell>
                     </TableRow>
                   );
-                }
-                return (
-                  <TableRow
-                    key={run.workflow_run_id}
-                    className="cursor-pointer"
-                    onClick={(event) => {
-                      handleNavigate(
-                        event,
-                        `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
-                      );
-                    }}
-                  >
-                    <TableCell
-                      className="max-w-0 truncate"
-                      title={run.workflow_run_id}
-                    >
-                      {run.workflow_run_id}
-                    </TableCell>
-                    <TableCell
-                      className="max-w-0 truncate"
-                      title={run.workflow_title ?? undefined}
-                    >
-                      {run.workflow_title ?? ""}
-                    </TableCell>
-                    <TableCell>
-                      <StatusBadge status={run.status} />
-                    </TableCell>
-                    <TableCell
-                      className="max-w-0 truncate"
-                      title={basicTimeFormat(run.created_at)}
-                    >
-                      {basicLocalTimeFormat(run.created_at)}
-                    </TableCell>
-                  </TableRow>
-                );
-              })
-            )}
-          </TableBody>
-        </Table>
+                })
+              )}
+            </TableBody>
+          </Table>
+        </div>
         <div className="relative px-3 py-3">
           <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
             <span className="text-slate-400">Items per page</span>
@@ -220,7 +232,7 @@ function RunHistory() {
               <option value={50}>50</option>
             </select>
           </div>
-          <Pagination className="pt-0">
+          <Pagination className={cn("pt-0", styles.mobilePagination)}>
             <PaginationContent>
               <PaginationItem>
                 <PaginationPrevious
