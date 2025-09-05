@@ -62,7 +62,7 @@ function Workflows() {
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
     ? Number(searchParams.get("page_size"))
-    : 5;
+    : 10;
 
   const { data: workflows = [], isLoading } = useQuery<
     Array<WorkflowApiResponse>
