@@ -26,6 +26,7 @@ from skyvern.constants import (
     SPECIAL_FIELD_VERIFICATION_CODE,
     ScrapeType,
 )
+from skyvern.errors.errors import ReachMaxRetriesError, ReachMaxStepsError
 from skyvern.exceptions import (
     BrowserSessionNotFound,
     BrowserStateMissingPage,
@@ -2602,6 +2603,7 @@ class ForgeAgent:
         extracted_information: dict[str, Any] | list | str | None = None,
         failure_reason: str | None = None,
         webhook_failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
     ) -> Task:
         # refresh task from db to get the latest status
         task_from_db = await app.DATABASE.get_task(task_id=task.task_id, organization_id=task.organization_id)
@@ -2616,6 +2618,8 @@ class ForgeAgent:
             updates["extracted_information"] = extracted_information
         if failure_reason is not None:
             updates["failure_reason"] = failure_reason
+        if errors is not None:
+            updates["errors"] = errors
         update_comparison = {
             key: {"old": getattr(task, key), "new": value}
             for key, value in updates.items()
@@ -2677,6 +2681,7 @@ class ForgeAgent:
                 failure_reason=(
                     f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
                 ),
+                errors=[ReachMaxRetriesError().model_dump()],
             )
             return None
         else:
@@ -2913,6 +2918,7 @@ class ForgeAgent:
                 task,
                 status=TaskStatus.failed,
                 failure_reason=failure_reason,
+                errors=[ReachMaxStepsError().model_dump()],
             )
             return False, last_step, None
         else:
