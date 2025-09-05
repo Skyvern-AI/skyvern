@@ -2438,7 +2438,13 @@ class WorkflowService:
             return None, rendered_cache_key_value
 
     async def _execute_workflow_script(
-        self, script_id: str, workflow: Workflow, workflow_run: WorkflowRun, api_key: str, organization: Organization
+        self,
+        script_id: str,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        api_key: str,
+        organization: Organization,
+        browser_session_id: str | None = None,
     ) -> WorkflowRun:
         """
         Execute the related workflow script instead of running the workflow blocks.
@@ -2458,6 +2464,7 @@ class WorkflowService:
                 organization_id=organization.organization_id,
                 parameters=parameters,
                 workflow_run_id=workflow_run.workflow_run_id,
+                browser_session_id=browser_session_id,
                 background_tasks=None,  # Execute synchronously
             )
 

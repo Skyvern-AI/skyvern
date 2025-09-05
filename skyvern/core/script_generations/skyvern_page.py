@@ -71,7 +71,7 @@ class SkyvernPage:
         self._record = recorder or (lambda ac: None)
 
     @classmethod
-    async def _get_or_create_browser_state(cls) -> BrowserState:
+    async def _get_or_create_browser_state(cls, browser_session_id: str | None = None) -> BrowserState:
         context = skyvern_context.current()
         if context and context.workflow_run_id and context.organization_id:
             workflow_run = await app.DATABASE.get_workflow_run(
@@ -79,12 +79,13 @@ class SkyvernPage:
             )
             if workflow_run:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run, browser_session_id=None
+                    workflow_run=workflow_run,
+                    browser_session_id=browser_session_id,
                 )
             else:
                 raise WorkflowRunNotFound(workflow_run_id=context.workflow_run_id)
         else:
-            browser_state = await app.BROWSER_MANAGER.get_or_create_for_script()
+            browser_state = await app.BROWSER_MANAGER.get_or_create_for_script(browser_session_id=browser_session_id)
         return browser_state
 
     @classmethod
@@ -103,10 +104,13 @@ class SkyvernPage:
         return browser_state
 
     @classmethod
-    async def create(cls) -> SkyvernPage:
+    async def create(
+        cls,
+        browser_session_id: str | None = None,
+    ) -> SkyvernPage:
         # initialize browser state
         # TODO: add workflow_run_id or eventually script_id/script_run_id
-        browser_state = await cls._get_or_create_browser_state()
+        browser_state = await cls._get_or_create_browser_state(browser_session_id=browser_session_id)
         scraped_page = await scrape_website(
             browser_state=browser_state,
             url="",
