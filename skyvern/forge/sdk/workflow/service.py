@@ -365,6 +365,7 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 api_key=api_key,
                 organization=organization,
+                browser_session_id=browser_session_id,
             )
         else:
             workflow_run = await self._execute_workflow_blocks(
