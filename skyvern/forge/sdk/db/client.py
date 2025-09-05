@@ -668,7 +668,7 @@ class AgentDB:
                     if failure_reason is not None:
                         task.failure_reason = failure_reason
                     if errors is not None:
-                        task.errors = task.errors + errors
+                        task.errors = (task.errors or []) + errors
                     if max_steps_per_run is not None:
                         task.max_steps_per_run = max_steps_per_run
                     if webhook_failure_reason is not None:
