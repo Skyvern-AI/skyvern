@@ -98,7 +98,7 @@ function Workspace({
   const { blockLabel, workflowPermanentId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
-  const [timelineMode, setTimelineMode] = useState("narrow");
+  const [timelineMode, setTimelineMode] = useState("wide");
   const [cacheKeyValueFilter, setCacheKeyValueFilter] = useState<string | null>(
     null,
   );
