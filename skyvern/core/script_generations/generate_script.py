@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import keyword
+import re
 from typing import Any
 
 import libcst as cst
@@ -39,6 +40,50 @@ LOG = structlog.get_logger(__name__)
 # --------------------------------------------------------------------- #
 # 1. helpers                                                            #
 # --------------------------------------------------------------------- #
+
+
+def sanitize_variable_name(name: str) -> str:
+    """
+    Sanitize a string to be a valid Python variable name.
+
+    - Converts to snake_case
+    - Removes invalid characters
+    - Ensures it doesn't start with a number
+    - Handles Python keywords by appending underscore
+    - Removes empty spaces
+    """
+    # Remove leading/trailing whitespace and replace internal spaces with underscores
+    name = name.strip().replace(" ", "_")
+
+    # Convert to snake_case: handle camelCase and PascalCase
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+
+    # Remove any characters that aren't alphanumeric or underscore
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+    # Convert to lowercase
+    name = name.lower()
+
+    # Remove consecutive underscores
+    name = re.sub(r"_+", "_", name)
+
+    # Remove leading/trailing underscores
+    name = name.strip("_")
+
+    # Ensure it doesn't start with a number
+    if name and name[0].isdigit():
+        name = f"param_{name}"
+
+    # Handle empty string or invalid names
+    if not name or name == "_":
+        name = "param"
+
+    # Handle Python keywords
+    if keyword.iskeyword(name):
+        name = f"{name}_"
+
+    return name
+
 
 ACTION_MAP = {
     "click": "click",
@@ -419,12 +464,12 @@ def _build_model(workflow: dict[str, Any]) -> cst.ClassDef:
     """
     ann_lines: list[cst.BaseStatement] = []
 
-    for p in workflow["workflow_definition"]["parameters"]:
-        if p["parameter_type"] != "workflow":
+    for parameter in workflow["workflow_definition"]["parameters"]:
+        if parameter["parameter_type"] != "workflow":
             continue
 
         ann = cst.AnnAssign(
-            target=cst.Name(p["key"]),
+            target=cst.Name(sanitize_variable_name(parameter["key"])),
             annotation=cst.Annotation(cst.Name("str")),
             value=None,
         )
