@@ -1,8 +1,8 @@
-import styles from './Workflows.module.css';
+import styles from "./Workflows.module.css";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import React from 'react';
+import React from "react";
 import {
   Pagination,
   PaginationContent,
@@ -51,10 +51,7 @@ import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
-  workflow_definition: {
-    blocks: [],
-    parameters: [],
-  },
+  workflow_definition: { blocks: [], parameters: [] },
 };
 
 function Workflows() {
@@ -65,13 +62,19 @@ function Workflows() {
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
+  const itemsPerPage = searchParams.get("page_size")
+    ? Number(searchParams.get("page_size"))
+    : 10;
 
-  const { data: workflows, isLoading } = useQuery<Array<WorkflowApiResponse>>({
-    queryKey: ["workflows", debouncedSearch, page],
+  const { data: workflows = [], isLoading } = useQuery<
+    Array<WorkflowApiResponse>
+  >({
+    queryKey: ["workflows", debouncedSearch, page, itemsPerPage],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       params.append("page", String(page));
+      params.append("page_size", String(itemsPerPage));
       params.append("only_workflows", "true");
       params.append("title", debouncedSearch);
       return client
@@ -81,6 +84,27 @@ function Workflows() {
         .then((response) => response.data);
     },
   });
+
+  const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
+    queryKey: ["workflows", debouncedSearch, page + 1, itemsPerPage],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      const params = new URLSearchParams();
+      params.append("page", String(page + 1));
+      params.append("page_size", String(itemsPerPage));
+      params.append("only_workflows", "true");
+      params.append("title", debouncedSearch);
+      return client
+        .get(`/workflows`, {
+          params,
+        })
+        .then((response) => response.data);
+    },
+    enabled: workflows.length === itemsPerPage,
+  });
+
+  const isNextDisabled =
+    isLoading || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -112,9 +136,36 @@ function Workflows() {
     navigate(path);
   }
 
+  function setParamPatch(patch: Record<string, string>) {
+    const params = new URLSearchParams(searchParams);
+    Object.entries(patch).forEach(([k, v]) => params.set(k, v));
+    setSearchParams(params, { replace: true });
+  }
+
+  function handlePreviousPage() {
+    if (page === 1) return;
+    setParamPatch({ page: String(page - 1) });
+  }
+
+  function handleNextPage() {
+    if (isNextDisabled) return;
+    setParamPatch({ page: String(page + 1) });
+  }
+
   return (
-    <div className={cn("space-y-10", styles.mobileContainer, styles.mobileMainContainer)}>
-      <div className={cn("flex h-32 justify-between gap-6", styles.mobileHeaderContainer)}>
+    <div
+      className={cn(
+        "space-y-10",
+        styles.mobileContainer,
+        styles.mobileMainContainer,
+      )}
+    >
+      <div
+        className={cn(
+          "flex h-32 justify-between gap-6",
+          styles.mobileHeaderContainer,
+        )}
+      >
         <div className={cn("space-y-5", styles.mobileHeaderContent)}>
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
@@ -144,7 +195,12 @@ function Workflows() {
         <header className={styles.mobileFlowsHeader}>
           <h1 className="text-xl">My Flows</h1>
         </header>
-        <div className={cn("flex justify-between", styles.mobileSearchButtonContainer)}>
+        <div
+          className={cn(
+            "flex justify-between",
+            styles.mobileSearchButtonContainer,
+          )}
+        >
           <div className={cn("relative", styles.mobileSearchContainer)}>
             <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
               <MagnifyingGlassIcon className="size-6" />
@@ -153,6 +209,7 @@ function Workflows() {
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value);
+                setParamPatch({ page: "1" });
               }}
               placeholder="Search by title..."
               className={cn("w-48 pl-9 lg:w-72", styles.mobileSearchInput)}
@@ -161,12 +218,12 @@ function Workflows() {
           <div className={cn("flex gap-4", styles.mobileButtonContainer)}>
             <ImportWorkflowButton />
             <Button
-                disabled={createWorkflowMutation.isPending}
-                onClick={() => {
-                  createWorkflowMutation.mutate(emptyWorkflowRequest);
-                }}
-                className={styles.mobileButton}
-              >
+              disabled={createWorkflowMutation.isPending}
+              onClick={() => {
+                createWorkflowMutation.mutate(emptyWorkflowRequest);
+              }}
+              className={styles.mobileButton}
+            >
               {createWorkflowMutation.isPending ? (
                 <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
               ) : (
@@ -178,136 +235,160 @@ function Workflows() {
         </div>
         <div className={cn("rounded-lg border", styles.mobileTableContainer)}>
           <div className={styles.mobileTableWrapper}>
-          <Table className={styles.mobileTable}>
-            <TableHeader className="rounded-t-lg bg-slate-elevation2">
-              <TableRow>
-                <TableHead className="w-1/3 rounded-tl-lg text-slate-400">
-                  ID
-                </TableHead>
-                <TableHead className="w-1/3 text-slate-400">Title</TableHead>
-                <TableHead className="w-1/3 text-slate-400">
-                  Created At
-                </TableHead>
-                <TableHead className="rounded-tr-lg"></TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading ? (
+            <Table className={styles.mobileTable}>
+              <TableHeader className="rounded-t-lg bg-slate-elevation2">
                 <TableRow>
-                  <TableCell colSpan={4}>Loading...</TableCell>
+                  <TableHead className="w-1/3 rounded-tl-lg text-slate-400">
+                    ID
+                  </TableHead>
+                  <TableHead className="w-1/3 text-slate-400">Title</TableHead>
+                  <TableHead className="w-1/3 text-slate-400">
+                    Created At
+                  </TableHead>
+                  <TableHead className="rounded-tr-lg"></TableHead>
                 </TableRow>
-              ) : workflows?.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={4}>No workflows found</TableCell>
-                </TableRow>
-              ) : (
-                workflows?.map((workflow) => {
-                  return (
-                    <TableRow
-                      key={workflow.workflow_permanent_id}
-                      className="cursor-pointer"
-                    >
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
+              </TableHeader>
+              <TableBody>
+                {isLoading ? (
+                  <TableRow>
+                    <TableCell colSpan={4}>Loading...</TableCell>
+                  </TableRow>
+                ) : workflows?.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={4}>No workflows found</TableCell>
+                  </TableRow>
+                ) : (
+                  workflows?.map((workflow) => {
+                    return (
+                      <TableRow
+                        key={workflow.workflow_permanent_id}
+                        className="cursor-pointer"
                       >
-                        {workflow.workflow_permanent_id}
-                      </TableCell>
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
-                      >
-                        {workflow.title}
-                      </TableCell>
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
-                        title={basicTimeFormat(workflow.created_at)}
-                      >
-                        {basicLocalTimeFormat(workflow.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex justify-end gap-2">
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    handleIconClick(
-                                      event,
-                                      `/workflows/${workflow.workflow_permanent_id}/debug`,
-                                    );
-                                  }}
-                                >
-                                  <Pencil2Icon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>Open in Editor</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    handleIconClick(
-                                      event,
-                                      `/workflows/${workflow.workflow_permanent_id}/run`,
-                                    );
-                                  }}
-                                >
-                                  <PlayIcon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>Create New Run</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                          <WorkflowActions workflow={workflow} />
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  );
-                })
-              )}
-            </TableBody>
-          </Table>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id,
+                            );
+                          }}
+                        >
+                          {workflow.workflow_permanent_id}
+                        </TableCell>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id,
+                            );
+                          }}
+                        >
+                          {workflow.title}
+                        </TableCell>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id,
+                            );
+                          }}
+                          title={basicTimeFormat(workflow.created_at)}
+                        >
+                          {basicLocalTimeFormat(workflow.created_at)}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex justify-end gap-2">
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="outline"
+                                    onClick={(event) => {
+                                      handleIconClick(
+                                        event,
+                                        `/workflows/${workflow.workflow_permanent_id}/debug`,
+                                      );
+                                    }}
+                                  >
+                                    <Pencil2Icon className="h-4 w-4" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Open in Editor</TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="outline"
+                                    onClick={(event) => {
+                                      handleIconClick(
+                                        event,
+                                        `/workflows/${workflow.workflow_permanent_id}/run`,
+                                      );
+                                    }}
+                                  >
+                                    <PlayIcon className="h-4 w-4" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Create New Run</TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                            <WorkflowActions workflow={workflow} />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })
+                )}
+              </TableBody>
+            </Table>
           </div>
-          <Pagination className={cn("pt-2", styles.mobilePagination)}>
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({ "cursor-not-allowed": page === 1 })}
-                  onClick={() => {
-                    if (page === 1) {
-                      return;
-                    }
-                    const params = new URLSearchParams();
-                    params.set("page", String(Math.max(1, page - 1)));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{page}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  onClick={() => {
-                    const params = new URLSearchParams();
-                    params.set("page", String(page + 1));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
+          <div className="relative px-3 py-3">
+            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <span className="text-slate-400">Items per page</span>
+              <select
+                className="h-9 rounded-md border border-slate-300 bg-background px-3"
+                value={itemsPerPage}
+                onChange={(e) => {
+                  const next = Number(e.target.value);
+                  const params = new URLSearchParams(searchParams);
+                  params.set("page_size", String(next));
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              >
+                <option value={5}>5</option>
+                <option value={10}>10</option>
+                <option value={20}>20</option>
+                <option value={50}>50</option>
+              </select>
+            </div>
+            <Pagination className={cn("pt-0", styles.mobilePagination)}>
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    className={cn({
+                      "cursor-not-allowed opacity-50": page === 1,
+                    })}
+                    onClick={handlePreviousPage}
+                  />
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationLink>{page}</PaginationLink>
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationNext
+                    className={cn({
+                      "cursor-not-allowed opacity-50": isNextDisabled,
+                    })}
+                    onClick={handleNextPage}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
+          </div>
         </div>
         <div className={styles.mobileWorkflowTemplates}>
           <WorkflowTemplates />

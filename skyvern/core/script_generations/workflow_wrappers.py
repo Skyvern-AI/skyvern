@@ -1,7 +1,6 @@
 from typing import Any, Callable
 
-from skyvern import RunContext, SkyvernPage
-from skyvern.core.script_generations.script_run_context_manager import script_run_context_manager
+from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage, script_run_context_manager
 
 
 # Build a dummy workflow decorator

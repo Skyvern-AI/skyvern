@@ -662,7 +662,7 @@ class BrowserState:
                 pages = [
                     http_page
                     for http_page in self.browser_context.pages
-                    if urlparse(http_page.url).scheme in ["http", "https"]
+                    if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
                 ]
                 if len(pages) > 0:
                     page = pages[0]

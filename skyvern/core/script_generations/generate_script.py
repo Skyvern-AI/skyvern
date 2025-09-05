@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import keyword
+import re
 from typing import Any
 
 import libcst as cst
@@ -39,6 +40,50 @@ LOG = structlog.get_logger(__name__)
 # --------------------------------------------------------------------- #
 # 1. helpers                                                            #
 # --------------------------------------------------------------------- #
+
+
+def sanitize_variable_name(name: str) -> str:
+    """
+    Sanitize a string to be a valid Python variable name.
+
+    - Converts to snake_case
+    - Removes invalid characters
+    - Ensures it doesn't start with a number
+    - Handles Python keywords by appending underscore
+    - Removes empty spaces
+    """
+    # Remove leading/trailing whitespace and replace internal spaces with underscores
+    name = name.strip().replace(" ", "_")
+
+    # Convert to snake_case: handle camelCase and PascalCase
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+
+    # Remove any characters that aren't alphanumeric or underscore
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+    # Convert to lowercase
+    name = name.lower()
+
+    # Remove consecutive underscores
+    name = re.sub(r"_+", "_", name)
+
+    # Remove leading/trailing underscores
+    name = name.strip("_")
+
+    # Ensure it doesn't start with a number
+    if name and name[0].isdigit():
+        name = f"param_{name}"
+
+    # Handle empty string or invalid names
+    if not name or name == "_":
+        name = "param"
+
+    # Handle Python keywords
+    if keyword.iskeyword(name):
+        name = f"{name}_"
+
+    return name
+
 
 ACTION_MAP = {
     "click": "click",
@@ -126,12 +171,12 @@ def _generate_text_call(text_value: str, intention: str, parameter_key: str) -> 
                 last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
             ),
             args=[
-                # First positional argument: context.generated_parameters['parameter_key']
+                # First positional argument: context.parameters['parameter_key']
                 cst.Arg(
                     value=cst.Subscript(
                         value=cst.Attribute(
                             value=cst.Name("context"),
-                            attr=cst.Name("generated_parameters"),
+                            attr=cst.Name("parameters"),
                         ),
                         slice=[cst.SubscriptElement(slice=cst.Index(value=_value(parameter_key)))],
                     ),
@@ -247,21 +292,32 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
         )
 
     if method in ["type", "fill"]:
-        # Get intention from action
-        intention = act.get("intention") or act.get("reasoning") or ""
-
-        # Use generate_text call if field_name is available, otherwise fallback to direct value
+        # Use context.parameters if field_name is available, otherwise fallback to direct value
         if act.get("field_name"):
-            text_value = _generate_text_call(
-                text_value=act["text"], intention=intention, parameter_key=act["field_name"]
+            text_value = cst.Subscript(
+                value=cst.Attribute(
+                    value=cst.Name("context"),
+                    attr=cst.Name("parameters"),
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
             )
         else:
             text_value = _value(act["text"])
 
         args.append(
             cst.Arg(
-                keyword=cst.Name("text"),
+                keyword=cst.Name("value"),
                 value=text_value,
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("ai_infer"),
+                value=cst.Name("True"),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -408,12 +464,12 @@ def _build_model(workflow: dict[str, Any]) -> cst.ClassDef:
     """
     ann_lines: list[cst.BaseStatement] = []
 
-    for p in workflow["workflow_definition"]["parameters"]:
-        if p["parameter_type"] != "workflow":
+    for parameter in workflow["workflow_definition"]["parameters"]:
+        if parameter["parameter_type"] != "workflow":
             continue
 
         ann = cst.AnnAssign(
-            target=cst.Name(p["key"]),
+            target=cst.Name(sanitize_variable_name(parameter["key"])),
             annotation=cst.Annotation(cst.Name("str")),
             value=None,
         )
