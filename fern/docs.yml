@@ -134,6 +134,10 @@ navigation:
         contents:
           - page: Introduction
             path: browser-sessions/introduction.mdx
+      - section: Observability
+        contents:
+          - page: Overview
+            path: observability/overview.mdx
       - section: Integrations
         contents:
           - page: Skyvern MCP
@@ -158,6 +162,7 @@ navigation:
               - GET /v1/runs/{run_id}
               - POST /v1/runs/{run_id}/cancel
               - POST /v1/runs/{run_id}/retry_webhook
+              - POST /v1/run/tasks/login
           - section: Workflows
             contents:
               - POST /v1/run/workflows
@@ -168,22 +173,31 @@ navigation:
               - POST /v1/workflows
               - POST /v1/workflows/{workflow_id}
               - POST /v1/workflows/{workflow_id}/delete
+          - section: Browser Sessions
+            contents:
+              - POST /v1/browser_sessions
+              - GET /v1/browser_sessions/{browser_session_id}
+              - POST /v1/browser_sessions/{browser_session_id}/close
+              - GET /v1/browser_sessions
+          - section: Credentials
+            contents:
+              - POST /v1/credentials
+              - GET /v1/credentials/{credential_id}
+              - POST /v1/credentials/{credential_id}/delete
+              - GET /v1/credentials
+              - POST /v1/credentials/totp
           - section: Artifacts
             contents:
               - GET /v1/artifacts/{artifact_id}
-          - section: Browser Session
+              - GET /v1/runs/{run_id}/artifacts
+          - section: Scripts
+            hidden: true
             contents:
-              - GET /v1/browser_sessions
-              - POST /v1/browser_sessions
-              - POST /v1/browser_sessions/{browser_session_id}/close
-              - GET /v1/browser_sessions/{browser_session_id}
-          - section: Credentials
-            contents:
-              - POST /v1/credentials/totp
-              - GET /v1/credentials
-              - POST /v1/credentials
-              - POST /v1/credentials/{credential_id}/delete
-              - GET /v1/credentials/{credential_id}
+              - POST /v1/scripts
+              - POST /v1/scripts/{script_id}/run
+              - POST /v1/scripts/{script_id}/deploy
+              - GET /v1/scripts/{script_id}
+              - GET /v1/scripts
   - tab: blog
   - tab: community
   - tab: github

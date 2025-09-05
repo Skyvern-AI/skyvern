@@ -3,7 +3,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 import psutil
 import typer
@@ -26,7 +26,7 @@ mcp = FastMCP("Skyvern")
 
 
 @mcp.tool()
-async def skyvern_run_task(prompt: str, url: str) -> dict[str, str]:
+async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
     """Use Skyvern to execute anything in the browser. Useful for accomplishing tasks that require browser automation.
 
     This tool uses Skyvern's browser automation to navigate websites and perform actions to achieve
@@ -85,7 +85,7 @@ def run_server() -> None:
     """Run the Skyvern API server."""
     load_dotenv()
     load_dotenv(".env")
-    from skyvern.config import settings
+    from skyvern.config import settings  # noqa: PLC0415
 
     port = settings.PORT
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))
@@ -202,5 +202,6 @@ def run_all() -> None:
 @run_app.command(name="mcp")
 def run_mcp() -> None:
     """Run the MCP server."""
-    console.print(Panel("[bold green]Starting MCP Server...[/bold green]", border_style="green"))
+    # This breaks the MCP processing because it expects json output only
+    # console.print(Panel("[bold green]Starting MCP Server...[/bold green]", border_style="green"))
     mcp.run(transport="stdio")

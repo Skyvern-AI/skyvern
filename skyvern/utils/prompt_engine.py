@@ -20,6 +20,13 @@ class CheckPhoneNumberFormatResponse(BaseModel):
     recommended_phone_number: str | None
 
 
+class CheckDateFormatResponse(BaseModel):
+    page_info: str
+    thought: str
+    is_current_format_correct: bool
+    recommended_date: str | None
+
+
 HTMLTreeStr = str
 
 

@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from fastapi import status
 
 
@@ -54,11 +52,6 @@ class ProxyLocationNotSupportedError(SkyvernException):
 class TaskNotFound(SkyvernHTTPException):
     def __init__(self, task_id: str | None = None):
         super().__init__(f"Task {task_id} not found", status_code=status.HTTP_404_NOT_FOUND)
-
-
-class ScriptNotFound(SkyvernException):
-    def __init__(self, script_name: str | None = None):
-        super().__init__(f"Script {script_name} not found. Has the script been registered?")
 
 
 class MissingElement(SkyvernException):
@@ -126,6 +119,11 @@ class ContextParameterValueNotFound(SkyvernException):
 class UnknownBlockType(SkyvernException):
     def __init__(self, block_type: str) -> None:
         super().__init__(f"Unknown block type {block_type}")
+
+
+class BlockNotFound(SkyvernException):
+    def __init__(self, block_label: str) -> None:
+        super().__init__(f"Block {block_label} not found")
 
 
 class WorkflowNotFound(SkyvernHTTPException):
@@ -259,8 +257,14 @@ class EmptyScrapePage(SkyvernException):
 
 
 class ScrapingFailed(SkyvernException):
-    def __init__(self) -> None:
+    def __init__(self, *, reason: str | None = None) -> None:
+        self.reason = reason
         super().__init__("Scraping failed.")
+
+
+class ScrapingFailedBlankPage(ScrapingFailed):
+    def __init__(self) -> None:
+        super().__init__(reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.")
 
 
 class WorkflowRunContextNotInitialized(SkyvernException):
@@ -275,7 +279,7 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
 
 
 class DownloadFileMaxWaitingTime(SkyvernException):
-    def __init__(self, downloading_files: list[Path]) -> None:
+    def __init__(self, downloading_files: list[str]) -> None:
         self.downloading_files = downloading_files
         super().__init__(f"Long-time downloading files [{downloading_files}].")
 
@@ -707,11 +711,49 @@ class BrowserSessionAlreadyOccupiedError(SkyvernHTTPException):
         super().__init__(f"Browser session {browser_session_id} is already occupied")
 
 
-class MissingBrowserSessionError(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
-        super().__init__(f"Browser session {browser_session_id} does not exist.")
+class BrowserSessionNotRenewable(SkyvernException):
+    def __init__(self, reason: str, browser_session_id: str) -> None:
+        super().__init__(f"Browser session {browser_session_id} is not renewable: {reason}")
 
 
 class MissingBrowserAddressError(SkyvernException):
     def __init__(self, browser_session_id: str) -> None:
         super().__init__(f"Browser session {browser_session_id} does not have an address.")
+
+
+class BrowserSessionNotFound(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} does not exist or is not live.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class APIKeyNotFound(SkyvernHTTPException):
+    def __init__(self, organization_id: str) -> None:
+        super().__init__(f"No valid API key token found for organization {organization_id}")
+
+
+class ElementOutOfCurrentViewport(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(f"Element {element_id} is out of current viewport")
+
+
+class ScriptNotFound(SkyvernHTTPException):
+    def __init__(self, script_id: str) -> None:
+        super().__init__(f"Script {script_id} not found")
+
+
+class NoTOTPSecretFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No TOTP secret found")
+
+
+class NoElementFound(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("No element found.")
+
+
+class OutputParameterNotFound(SkyvernException):
+    def __init__(self, block_label: str, workflow_permanent_id: str) -> None:
+        super().__init__(f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}")

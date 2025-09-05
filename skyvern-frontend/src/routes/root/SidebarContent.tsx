@@ -16,9 +16,9 @@ function SidebarContent({ useCollapsedState }: Props) {
   const collapsed = useCollapsedState ? collapsedState : false;
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col overflow-y-auto px-6">
       <Link to={window.location.origin}>
-        <div className="flex h-24 items-center">
+        <div className="flex h-24 items-center justify-center">
           {collapsed ? <LogoMinimized /> : <Logo />}
         </div>
       </Link>

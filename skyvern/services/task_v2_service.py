@@ -1,6 +1,4 @@
 import json
-import os
-import random
 import string
 from datetime import UTC, datetime
 from typing import Any
@@ -30,9 +28,8 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import (
-    BlockResult,
-    BlockStatus,
     BlockTypeVar,
     ExtractionBlock,
     ForLoopBlock,
@@ -41,16 +38,13 @@ from skyvern.forge.sdk.workflow.models.block import (
     UrlBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
-from skyvern.forge.sdk.workflow.models.workflow import (
-    Workflow,
-    WorkflowRequestBody,
-    WorkflowRun,
-    WorkflowRunStatus,
-    WorkflowStatus,
-)
-from skyvern.forge.sdk.workflow.models.yaml import (
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.workflows import (
     BLOCK_YAML_TYPES,
     PARAMETER_YAML_TYPES,
+    BlockResult,
+    BlockStatus,
     ContextParameterYAML,
     ExtractionBlockYAML,
     ForLoopBlockYAML,
@@ -59,9 +53,10 @@ from skyvern.forge.sdk.workflow.models.yaml import (
     UrlBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
+    WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType, TaskRunRequest, TaskRunResponse
 from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.strings import generate_random_string
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -168,7 +163,12 @@ async def initialize_task_v2(
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    browser_address: str | None = None,
+    generate_script: bool = False,
 ) -> TaskV2:
+    if generate_script:
+        publish_workflow = True
+
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -181,13 +181,15 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        browser_address=browser_address,
+        generate_script=generate_script,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
     if context:
         context.task_v2_id = task_v2.observer_cruise_id
         context.run_id = context.run_id or task_v2.observer_cruise_id
-        context.max_screenshot_scrolling_times = max_screenshot_scrolling_times
+        context.max_screenshot_scrolls = max_screenshot_scrolling_times
 
     thought = await app.DATABASE.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -227,13 +229,15 @@ async def initialize_task_v2(
             status=workflow_status,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            generate_script=generate_script,
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
             workflow_request=WorkflowRequestBody(
-                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
                 extra_http_headers=extra_http_headers,
+                browser_address=browser_address,
             ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
@@ -244,7 +248,7 @@ async def initialize_task_v2(
     except Exception:
         LOG.error("Failed to setup cruise workflow run", exc_info=True)
         # fail the workflow run
-        await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=task_v2.workflow_run_id,
             failure_reason="Skyvern failed to setup the workflow run",
@@ -287,7 +291,7 @@ async def initialize_task_v2(
     except Exception:
         LOG.warning("Failed to update task 2.0", exc_info=True)
         # fail the workflow run
-        await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             failure_reason="Skyvern failed to update the task 2.0 after initializing the workflow run",
@@ -298,6 +302,7 @@ async def initialize_task_v2(
     return task_v2
 
 
+@TraceManager.traced_async(ignore_inputs=["organization"])
 async def run_task_v2(
     organization: Organization,
     task_v2_id: str,
@@ -315,7 +320,7 @@ async def run_task_v2(
             organization_id=organization_id,
             exc_info=True,
         )
-        return await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id,
             organization_id=organization_id,
             failure_reason="Failed to get task v2",
@@ -371,7 +376,7 @@ async def run_task_v2(
                 workflow=workflow,
                 workflow_run=workflow_run,
                 browser_session_id=browser_session_id,
-                close_browser_on_completion=browser_session_id is None,
+                close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
                 need_call_webhook=False,
             )
         else:
@@ -412,7 +417,7 @@ async def run_task_v2_helper(
             failure_reason = "Task prompt is missing"
         elif not task_v2.url:
             failure_reason = "Task url is missing"
-        await mark_task_v2_as_failed(
+        task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=task_v2.workflow_run_id,
             failure_reason=failure_reason,
@@ -470,7 +475,7 @@ async def run_task_v2_helper(
             task_v2_id=task_v2_id,
             run_id=current_run_id,
             browser_session_id=browser_session_id,
-            max_screenshot_scrolling_times=task_v2.max_screenshot_scrolling_times,
+            max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
         )
     )
 
@@ -508,7 +513,7 @@ async def run_task_v2_helper(
                 workflow_run_id=workflow_run_id,
                 task_v2_id=task_v2_id,
             )
-            await mark_task_v2_as_canceled(
+            task_v2 = await mark_task_v2_as_canceled(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -688,7 +693,7 @@ async def run_task_v2_helper(
             # parse task v2 response and run the next task
             if not task_type:
                 LOG.error("No task type found in task v2 response", task_v2_response=task_v2_response)
-                await mark_task_v2_as_failed(
+                task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
                     failure_reason="Skyvern failed to generate a task. Please try again later.",
@@ -740,7 +745,7 @@ async def run_task_v2_helper(
                     }
                 except Exception:
                     LOG.exception("Failed to generate loop task")
-                    await mark_task_v2_as_failed(
+                    task_v2 = await mark_task_v2_as_failed(
                         task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
                         failure_reason="Failed to generate the loop.",
@@ -748,7 +753,7 @@ async def run_task_v2_helper(
                     break
             else:
                 LOG.info("Unsupported task type", task_type=task_type)
-                await mark_task_v2_as_failed(
+                task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
                     failure_reason=f"Unsupported task block type gets generated: {task_type}",
@@ -788,7 +793,7 @@ async def run_task_v2_helper(
             proxy_location=task_v2.proxy_location or ProxyLocation.RESIDENTIAL,
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
-            max_screenshot_scrolling_times=task_v2.max_screenshot_scrolling_times,
+            max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
         )
         LOG.info("Creating workflow from request", workflow_create_request=workflow_create_request)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
@@ -812,6 +817,11 @@ async def run_task_v2_helper(
                 "Workflow run is not running anymore, stopping the task v2",
                 workflow_run_id=workflow_run_id,
                 status=workflow_run.status,
+            )
+            task_v2 = await update_task_v2_status_to_workflow_run_status(
+                task_v2_id=task_v2_id,
+                workflow_run_status=workflow_run.status,
+                organization_id=organization_id,
             )
             break
         if block_result.success is True:
@@ -882,6 +892,11 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
+                if task_v2.generate_script:
+                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                    )
                 break
 
         # total step number validation
@@ -893,7 +908,7 @@ async def run_task_v2_helper(
         if total_step_count >= max_steps:
             LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
             failure_reason = await _summarize_max_steps_failure_reason(task_v2, organization_id, browser_state)
-            await mark_task_v2_as_failed(
+            task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
                 failure_reason=f'Reached the max number of {max_steps} steps. Possible failure reasons: {failure_reason} If you need more steps, update the "Max Steps Override" configuration when running the task. Or add/update the "x-max-steps-override" header with your desired number of steps in the API request.',
@@ -1040,7 +1055,7 @@ async def _generate_loop_task(
                 artifact_type=ArtifactType.SCREENSHOT_LLM,
                 data=screenshot,
             )
-    loop_random_string = _generate_random_string()
+    loop_random_string = generate_random_string()
     label = f"extraction_task_for_loop_{loop_random_string}"
     loop_values_key = f"loop_values_{loop_random_string}"
     extraction_block_yaml = ExtractionBlockYAML(
@@ -1140,7 +1155,7 @@ async def _generate_loop_task(
     )
     app.WORKFLOW_CONTEXT_MANAGER.add_context_parameter(workflow_run_id, url_value_context_parameter)
 
-    task_in_loop_label = f"task_in_loop_{_generate_random_string()}"
+    task_in_loop_label = f"task_in_loop_{generate_random_string()}"
     context = skyvern_context.ensure_context()
     task_in_loop_metadata_prompt = prompt_engine.load_prompt(
         "task_v2_generate_task_block",
@@ -1210,7 +1225,7 @@ async def _generate_loop_task(
 
     # use the output parameter of the extraction block to create the for loop block
     for_loop_yaml = ForLoopBlockYAML(
-        label=f"loop_{_generate_random_string()}",
+        label=f"loop_{generate_random_string()}",
         loop_over_parameter_key=loop_for_context_parameter.key,
         loop_blocks=[block_yaml],
     )
@@ -1268,7 +1283,7 @@ async def _generate_extraction_task(
 
     # create OutputParameter for the data_extraction block
     data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
-    label = f"data_extraction_{_generate_random_string()}"
+    label = f"data_extraction_{generate_random_string()}"
     url: str | None = None
     if not task_history:
         # data extraction is the very first block
@@ -1307,7 +1322,7 @@ async def _generate_navigation_task(
     totp_identifier: str | None = None,
 ) -> tuple[NavigationBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
     LOG.info("Generating navigation task", navigation_goal=navigation_goal, original_url=original_url)
-    label = f"navigation_{_generate_random_string()}"
+    label = f"navigation_{generate_random_string()}"
     navigation_block_yaml = NavigationBlockYAML(
         label=label,
         url=original_url,
@@ -1341,7 +1356,7 @@ async def _generate_goto_url_task(
 ) -> tuple[UrlBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
     LOG.info("Generating goto url task", url=url)
     # create OutputParameter for the data_extraction block
-    label = f"goto_url_{_generate_random_string()}"
+    label = f"goto_url_{generate_random_string()}"
 
     url_block_yaml = UrlBlockYAML(
         label=label,
@@ -1361,12 +1376,6 @@ async def _generate_goto_url_task(
         [url_block_yaml],
         [],
     )
-
-
-def _generate_random_string(length: int = 5) -> str:
-    # Use the current timestamp as the seed
-    random.seed(os.urandom(16))
-    return "".join(random.choices(RANDOM_STRING_POOL, k=length))
 
 
 async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
@@ -1494,6 +1503,19 @@ async def mark_task_v2_as_timed_out(
     return task_v2
 
 
+async def update_task_v2_status_to_workflow_run_status(
+    task_v2_id: str,
+    workflow_run_status: WorkflowRunStatus,
+    organization_id: str,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id,
+        organization_id=organization_id,
+        status=TaskV2Status(workflow_run_status),
+    )
+    return task_v2
+
+
 def _get_extracted_data_from_block_result(
     block_result: BlockResult,
     task_type: str,
@@ -1614,7 +1636,7 @@ async def _summarize_task_v2(
 
 async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
-    from skyvern.services import workflow_service
+    from skyvern.services import workflow_service  # noqa: PLC0415
 
     workflow_run_resp = None
     if task_v2.workflow_run_id:
@@ -1707,6 +1729,11 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )
+            await app.DATABASE.update_task_v2(
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                webhook_failure_reason="",
+            )
         else:
             LOG.info(
                 "Task v2 webhook failed",
@@ -1714,6 +1741,11 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
                 resp=resp,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
+            )
+            await app.DATABASE.update_task_v2(
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
             )
     except Exception as e:
         raise FailedToSendWebhook(task_v2_id=task_v2.observer_cruise_id) from e

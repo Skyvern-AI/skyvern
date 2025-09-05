@@ -44,11 +44,11 @@ function RetryTask() {
           proxyLocation: task.request.proxy_location ?? null,
           includeActionHistoryInVerification:
             task.request.include_action_history_in_verification ?? false,
-          maxScreenshotScrollingTimes:
-            task.request.max_screenshot_scrolling_times ?? null,
+          maxScreenshotScrolls: task.request.max_screenshot_scrolls ?? null,
           extraHttpHeaders: task.request.extra_http_headers
             ? JSON.stringify(task.request.extra_http_headers)
             : null,
+          cdpAddress: task.request.browser_address ?? null,
         }}
       />
     </div>

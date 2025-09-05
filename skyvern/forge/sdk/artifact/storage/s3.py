@@ -7,7 +7,7 @@ from typing import BinaryIO
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import DOWNLOAD_FILE_PREFIX
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
@@ -83,6 +83,22 @@ class S3Storage(BaseStorage):
     ) -> str:
         file_ext = FILE_EXTENTSION_MAP[artifact_type]
         return f"{self._build_base_uri(organization_id)}/ai_suggestions/{ai_suggestion.ai_suggestion_id}/{datetime.utcnow().isoformat()}_{artifact_id}_{artifact_type}.{file_ext}"
+
+    def build_script_file_uri(
+        self, *, organization_id: str, script_id: str, script_version: int, file_path: str
+    ) -> str:
+        """Build the S3 URI for a script file.
+
+        Args:
+            organization_id: The organization ID
+            script_id: The script ID
+            script_version: The script version
+            file_path: The file path relative to script root
+
+        Returns:
+            The S3 URI for the script file
+        """
+        return f"{self._build_base_uri(organization_id)}/scripts/{script_id}/{script_version}/{file_path}"
 
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id)
@@ -179,14 +195,31 @@ class S3Storage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
-    async def save_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> None:
-        download_dir = get_download_dir(workflow_run_id=workflow_run_id, task_id=task_id)
+    async def list_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
+        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        return [
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
+        ]
+
+    async def list_downloading_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
+        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/downloads"
+        files = [
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
+        ]
+        return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+
+    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
+        download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         sc = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
-        base_uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
+        base_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
+        )
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -209,10 +242,8 @@ class S3Storage(BaseStorage):
                 tags=tags,
             )
 
-    async def get_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[FileInfo]:
-        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{workflow_run_id or task_id}"
+    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
             return []

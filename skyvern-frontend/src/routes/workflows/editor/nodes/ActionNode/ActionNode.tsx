@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+import { Flippable } from "@/components/Flippable";
 import {
   Accordion,
   AccordionContent,
@@ -6,8 +8,6 @@ import {
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
-import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import {
   Handle,
   NodeProps,
@@ -17,8 +17,6 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import { useState } from "react";
-import { EditableNodeTitle } from "../components/EditableNodeTitle";
-import { NodeActionMenu } from "../NodeActionMenu";
 import type { ActionNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -27,15 +25,21 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useRerender } from "@/hooks/useRerender";
+import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
-import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
-import { WorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 import { AppNode } from "..";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { RunEngineSelector } from "@/components/EngineSelector";
 import { ModelSelector } from "@/components/ModelSelector";
+import { useBlockScriptStore } from "@/store/BlockScriptStore";
+import { cn } from "@/util/utils";
+import { useParams } from "react-router-dom";
+import { NodeHeader } from "../components/NodeHeader";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
+import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -44,13 +48,12 @@ const navigationGoalTooltip =
 
 const navigationGoalPlaceholder = 'Input {{ name }} into "Name" field.';
 
-function ActionNode({ id, data }: NodeProps<ActionNode>) {
+function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const { updateNodeData } = useReactFlow();
-  const { editable } = data;
-  const [label, setLabel] = useNodeLabelChangeHandler({
-    id,
-    initialValue: data.label,
-  });
+  const [facing, setFacing] = useState<"front" | "back">("front");
+  const blockScriptStore = useBlockScriptStore();
+  const { editable, label } = data;
+  const script = blockScriptStore.scripts[label];
   const [inputs, setInputs] = useState({
     url: data.url,
     navigationGoal: data.navigationGoal,
@@ -64,7 +67,15 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
     totpIdentifier: data.totpIdentifier,
     engine: data.engine,
   });
-  const deleteNodeCallback = useDeleteNodeCallback();
+  const { blockLabel: urlBlockLabel } = useParams();
+  const { data: workflowRun } = useWorkflowRunQuery();
+  const workflowRunIsRunningOrQueued =
+    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const thisBlockIsTargetted =
+    urlBlockLabel !== undefined && urlBlockLabel === label;
+  const thisBlockIsPlaying =
+    workflowRunIsRunningOrQueued && thisBlockIsTargetted;
+  const rerender = useRerender({ prefix: "accordian" });
 
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -80,305 +91,320 @@ function ActionNode({ id, data }: NodeProps<ActionNode>) {
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
-  return (
-    <div>
-      <Handle
-        type="source"
-        position={Position.Bottom}
-        id="a"
-        className="opacity-0"
-      />
-      <Handle
-        type="target"
-        position={Position.Top}
-        id="b"
-        className="opacity-0"
-      />
-      <div className="w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4">
-        <header className="flex h-[2.75rem] justify-between">
-          <div className="flex gap-2">
-            <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
-              <WorkflowBlockIcon
-                workflowBlockType={WorkflowBlockTypes.Action}
-                className="size-6"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <EditableNodeTitle
-                value={label}
-                editable={editable}
-                onChange={setLabel}
-                titleClassName="text-base"
-                inputClassName="text-base"
-              />
-              <span className="text-xs text-slate-400">Action Block</span>
-            </div>
-          </div>
-          <NodeActionMenu
-            onDelete={() => {
-              deleteNodeCallback(id);
-            }}
-          />
-        </header>
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <div className="flex justify-between">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">URL</Label>
-                <HelpTooltip content={urlTooltip} />
-              </div>
-              {isFirstWorkflowBlock ? (
-                <div className="flex justify-end text-xs text-slate-400">
-                  Tip: Use the {"+"} button to add parameters!
-                </div>
-              ) : null}
-            </div>
+  useEffect(() => {
+    setFacing(data.showCode ? "back" : "front");
+  }, [data.showCode]);
 
-            <WorkflowBlockInputTextarea
-              nodeId={id}
-              onChange={(value) => {
-                handleChange("url", value);
-              }}
-              value={inputs.url}
-              placeholder={placeholders["action"]["url"]}
-              className="nopan text-xs"
-            />
-          </div>
-          <div className="space-y-2">
-            <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">
-                Action Instruction
-              </Label>
-              <HelpTooltip content={navigationGoalTooltip} />
-            </div>
-            <WorkflowBlockInputTextarea
-              nodeId={id}
-              onChange={(value) => {
-                handleChange("navigationGoal", value);
-              }}
-              value={inputs.navigationGoal}
-              placeholder={navigationGoalPlaceholder}
-              className="nopan text-xs"
-            />
-          </div>
-          <div className="rounded-md bg-slate-800 p-2">
-            <div className="space-y-1 text-xs text-slate-400">
-              Tip: While executing the action block, Skyvern will only take one
-              action.
-            </div>
-          </div>
-        </div>
-        <Separator />
-        <Accordion type="single" collapsible>
-          <AccordionItem value="advanced" className="border-b-0">
-            <AccordionTrigger className="py-0">
-              Advanced Settings
-            </AccordionTrigger>
-            <AccordionContent className="pl-6 pr-1 pt-1">
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <ModelSelector
-                    className="nopan w-52 text-xs"
-                    value={inputs.model}
-                    onChange={(value) => {
-                      handleChange("model", value);
-                    }}
-                  />
-                  <ParametersMultiSelect
-                    availableOutputParameters={outputParameterKeys}
-                    parameters={data.parameterKeys}
-                    onParametersChange={(parameterKeys) => {
-                      updateNodeData(id, { parameterKeys });
-                    }}
-                  />
+  return (
+    <Flippable facing={facing} preserveFrontsideHeight={true}>
+      <div>
+        <Handle
+          type="source"
+          position={Position.Bottom}
+          id="a"
+          className="opacity-0"
+        />
+        <Handle
+          type="target"
+          position={Position.Top}
+          id="b"
+          className="opacity-0"
+        />
+        <div
+          className={cn(
+            "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+            {
+              "pointer-events-none": thisBlockIsPlaying,
+              "bg-slate-950 outline outline-2 outline-slate-300":
+                thisBlockIsTargetted,
+            },
+          )}
+        >
+          <NodeHeader
+            blockLabel={label}
+            editable={editable}
+            nodeId={id}
+            totpIdentifier={inputs.totpIdentifier}
+            totpUrl={inputs.totpVerificationUrl}
+            type={type}
+          />
+          <div
+            className={cn("space-y-4", {
+              "opacity-50": thisBlockIsPlaying,
+            })}
+          >
+            <div className="space-y-2">
+              <div className="flex justify-between">
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">URL</Label>
+                  <HelpTooltip content={urlTooltip} />
                 </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Engine
-                    </Label>
+                {isFirstWorkflowBlock ? (
+                  <div className="flex justify-end text-xs text-slate-400">
+                    Tip: Use the {"+"} button to add parameters!
                   </div>
-                  <RunEngineSelector
-                    value={inputs.engine}
-                    onChange={(value) => {
-                      handleChange("engine", value);
-                    }}
-                    className="nopan w-52 text-xs"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <div className="flex gap-4">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Error Messages
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["action"]["errorCodeMapping"]}
-                      />
-                    </div>
-                    <Checkbox
-                      checked={inputs.errorCodeMapping !== "null"}
-                      disabled={!editable}
-                      onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
-                        handleChange(
-                          "errorCodeMapping",
-                          checked
-                            ? JSON.stringify(errorMappingExampleValue, null, 2)
-                            : "null",
-                        );
+                ) : null}
+              </div>
+
+              <WorkflowBlockInputTextarea
+                canWriteTitle={true}
+                nodeId={id}
+                onChange={(value) => {
+                  handleChange("url", value);
+                }}
+                value={inputs.url}
+                placeholder={placeholders["action"]["url"]}
+                className="nopan text-xs"
+              />
+            </div>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-slate-300">
+                  Action Instruction
+                </Label>
+                <HelpTooltip content={navigationGoalTooltip} />
+              </div>
+              <WorkflowBlockInputTextarea
+                nodeId={id}
+                onChange={(value) => {
+                  handleChange("navigationGoal", value);
+                }}
+                value={inputs.navigationGoal}
+                placeholder={navigationGoalPlaceholder}
+                className="nopan text-xs"
+              />
+            </div>
+            <div className="rounded-md bg-slate-800 p-2">
+              <div className="space-y-1 text-xs text-slate-400">
+                Tip: While executing the action block, Skyvern will only take
+                one action.
+              </div>
+            </div>
+          </div>
+          <Separator />
+          <Accordion
+            className={cn({
+              "pointer-events-none opacity-50": thisBlockIsPlaying,
+            })}
+            type="single"
+            onValueChange={() => rerender.bump()}
+            collapsible
+          >
+            <AccordionItem value="advanced" className="border-b-0">
+              <AccordionTrigger className="py-0">
+                Advanced Settings
+              </AccordionTrigger>
+              <AccordionContent className="pl-6 pr-1 pt-1">
+                <div key={rerender.key} className="space-y-4">
+                  <div className="space-y-2">
+                    <ModelSelector
+                      className="nopan w-52 text-xs"
+                      value={inputs.model}
+                      onChange={(value) => {
+                        handleChange("model", value);
+                      }}
+                    />
+                    <ParametersMultiSelect
+                      availableOutputParameters={outputParameterKeys}
+                      parameters={data.parameterKeys}
+                      onParametersChange={(parameterKeys) => {
+                        updateNodeData(id, { parameterKeys });
                       }}
                     />
                   </div>
-                  {inputs.errorCodeMapping !== "null" && (
-                    <div>
-                      <CodeEditor
-                        language="json"
-                        value={inputs.errorCodeMapping}
-                        onChange={(value) => {
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs font-normal text-slate-300">
+                        Engine
+                      </Label>
+                    </div>
+                    <RunEngineSelector
+                      value={inputs.engine}
+                      onChange={(value) => {
+                        handleChange("engine", value);
+                      }}
+                      className="nopan w-52 text-xs"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex gap-4">
+                      <div className="flex gap-2">
+                        <Label className="text-xs font-normal text-slate-300">
+                          Error Messages
+                        </Label>
+                        <HelpTooltip
+                          content={helpTooltips["action"]["errorCodeMapping"]}
+                        />
+                      </div>
+                      <Checkbox
+                        checked={inputs.errorCodeMapping !== "null"}
+                        disabled={!editable}
+                        onCheckedChange={(checked) => {
                           if (!editable) {
                             return;
                           }
-                          handleChange("errorCodeMapping", value);
+                          handleChange(
+                            "errorCodeMapping",
+                            checked
+                              ? JSON.stringify(
+                                  errorMappingExampleValue,
+                                  null,
+                                  2,
+                                )
+                              : "null",
+                          );
                         }}
-                        className="nowheel nopan"
-                        fontSize={8}
                       />
                     </div>
-                  )}
-                </div>
-                <Separator />
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Continue on Failure
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["action"]["continueOnFailure"]}
-                    />
+                    {inputs.errorCodeMapping !== "null" && (
+                      <div>
+                        <CodeEditor
+                          language="json"
+                          value={inputs.errorCodeMapping}
+                          onChange={(value) => {
+                            if (!editable) {
+                              return;
+                            }
+                            handleChange("errorCodeMapping", value);
+                          }}
+                          className="nopan"
+                          fontSize={8}
+                        />
+                      </div>
+                    )}
                   </div>
-                  <div className="w-52">
-                    <Switch
-                      checked={inputs.continueOnFailure}
-                      onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
-                        handleChange("continueOnFailure", checked);
+                  <Separator />
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs font-normal text-slate-300">
+                        Continue on Failure
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["action"]["continueOnFailure"]}
+                      />
+                    </div>
+                    <div className="w-52">
+                      <Switch
+                        checked={inputs.continueOnFailure}
+                        onCheckedChange={(checked) => {
+                          if (!editable) {
+                            return;
+                          }
+                          handleChange("continueOnFailure", checked);
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs font-normal text-slate-300">
+                        Cache Actions
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["action"]["cacheActions"]}
+                      />
+                    </div>
+                    <div className="w-52">
+                      <Switch
+                        checked={inputs.cacheActions}
+                        onCheckedChange={(checked) => {
+                          if (!editable) {
+                            return;
+                          }
+                          handleChange("cacheActions", checked);
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <Separator />
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs font-normal text-slate-300">
+                        Complete on Download
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["action"]["completeOnDownload"]}
+                      />
+                    </div>
+                    <div className="w-52">
+                      <Switch
+                        checked={inputs.allowDownloads}
+                        onCheckedChange={(checked) => {
+                          if (!editable) {
+                            return;
+                          }
+                          handleChange("allowDownloads", checked);
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <div className="flex gap-2">
+                      <Label className="text-xs font-normal text-slate-300">
+                        File Suffix
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["action"]["fileSuffix"]}
+                      />
+                    </div>
+                    <WorkflowBlockInput
+                      nodeId={id}
+                      type="text"
+                      placeholder={placeholders["action"]["downloadSuffix"]}
+                      className="nopan w-52 text-xs"
+                      value={inputs.downloadSuffix ?? ""}
+                      onChange={(value) => {
+                        handleChange("downloadSuffix", value);
                       }}
                     />
                   </div>
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Cache Actions
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["action"]["cacheActions"]}
-                    />
-                  </div>
-                  <div className="w-52">
-                    <Switch
-                      checked={inputs.cacheActions}
-                      onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
-                        handleChange("cacheActions", checked);
+                  <Separator />
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        2FA Identifier
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["action"]["totpIdentifier"]}
+                      />
+                    </div>
+                    <WorkflowBlockInputTextarea
+                      nodeId={id}
+                      onChange={(value) => {
+                        handleChange("totpIdentifier", value);
                       }}
+                      value={inputs.totpIdentifier ?? ""}
+                      placeholder={placeholders["action"]["totpIdentifier"]}
+                      className="nopan text-xs"
                     />
                   </div>
-                </div>
-                <Separator />
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      Complete on Download
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["action"]["completeOnDownload"]}
-                    />
-                  </div>
-                  <div className="w-52">
-                    <Switch
-                      checked={inputs.allowDownloads}
-                      onCheckedChange={(checked) => {
-                        if (!editable) {
-                          return;
-                        }
-                        handleChange("allowDownloads", checked);
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        2FA Verification URL
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["task"]["totpVerificationUrl"]}
+                      />
+                    </div>
+                    <WorkflowBlockInputTextarea
+                      nodeId={id}
+                      onChange={(value) => {
+                        handleChange("totpVerificationUrl", value);
                       }}
+                      value={inputs.totpVerificationUrl ?? ""}
+                      placeholder={placeholders["task"]["totpVerificationUrl"]}
+                      className="nopan text-xs"
                     />
                   </div>
                 </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
-                      File Suffix
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["action"]["fileSuffix"]}
-                    />
-                  </div>
-                  <WorkflowBlockInput
-                    nodeId={id}
-                    type="text"
-                    placeholder={placeholders["action"]["downloadSuffix"]}
-                    className="nopan w-52 text-xs"
-                    value={inputs.downloadSuffix ?? ""}
-                    onChange={(value) => {
-                      handleChange("downloadSuffix", value);
-                    }}
-                  />
-                </div>
-                <Separator />
-                <div className="space-y-2">
-                  <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
-                      2FA Identifier
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["action"]["totpIdentifier"]}
-                    />
-                  </div>
-                  <WorkflowBlockInputTextarea
-                    nodeId={id}
-                    onChange={(value) => {
-                      handleChange("totpIdentifier", value);
-                    }}
-                    value={inputs.totpIdentifier ?? ""}
-                    placeholder={placeholders["action"]["totpIdentifier"]}
-                    className="nopan text-xs"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
-                      2FA Verification URL
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["task"]["totpVerificationUrl"]}
-                    />
-                  </div>
-                  <WorkflowBlockInputTextarea
-                    nodeId={id}
-                    onChange={(value) => {
-                      handleChange("totpVerificationUrl", value);
-                    }}
-                    value={inputs.totpVerificationUrl ?? ""}
-                    placeholder={placeholders["task"]["totpVerificationUrl"]}
-                    className="nopan text-xs"
-                  />
-                </div>
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        </div>
       </div>
-    </div>
+      <BlockCodeEditor blockLabel={label} blockType={type} script={script} />
+    </Flippable>
   );
 }
 

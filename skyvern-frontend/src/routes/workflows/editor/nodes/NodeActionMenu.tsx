@@ -9,10 +9,24 @@ import {
 import { DotsHorizontalIcon } from "@radix-ui/react-icons";
 
 type Props = {
-  onDelete: () => void;
+  isDeletable?: boolean;
+  isScriptable?: boolean;
+  showScriptText?: string;
+  onDelete?: () => void;
+  onShowScript?: () => void;
 };
 
-function NodeActionMenu({ onDelete }: Props) {
+function NodeActionMenu({
+  isDeletable = true,
+  isScriptable = false,
+  showScriptText,
+  onDelete,
+  onShowScript,
+}: Props) {
+  if (!isDeletable && !isScriptable) {
+    return null;
+  }
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -21,13 +35,24 @@ function NodeActionMenu({ onDelete }: Props) {
       <DropdownMenuContent>
         <DropdownMenuLabel>Block Actions</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuItem
-          onSelect={() => {
-            onDelete();
-          }}
-        >
-          Delete Block
-        </DropdownMenuItem>
+        {isDeletable && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onDelete?.();
+            }}
+          >
+            Delete Block
+          </DropdownMenuItem>
+        )}
+        {isScriptable && onShowScript && (
+          <DropdownMenuItem
+            onSelect={() => {
+              onShowScript();
+            }}
+          >
+            {showScriptText ?? "Show Code"}
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

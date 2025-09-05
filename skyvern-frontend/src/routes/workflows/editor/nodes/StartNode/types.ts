@@ -9,14 +9,21 @@ export type WorkflowStartNodeData = {
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
-  maxScreenshotScrollingTimes: number | null;
+  maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
   editable: boolean;
+  useScriptCache: boolean;
+  scriptCacheKey: string | null;
+  aiFallback: boolean;
+  label: "__start_block__";
+  showCode: boolean;
 };
 
 export type OtherStartNodeData = {
   withWorkflowSettings: false;
   editable: boolean;
+  label: "__start_block__";
+  showCode: boolean;
 };
 
 export type StartNodeData = WorkflowStartNodeData | OtherStartNodeData;

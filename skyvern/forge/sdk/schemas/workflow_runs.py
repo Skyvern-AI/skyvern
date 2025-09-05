@@ -7,8 +7,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.task_v2 import Thought
-from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.actions import Action
 
 
@@ -38,6 +38,7 @@ class WorkflowRunBlock(BaseModel):
     created_at: datetime
     modified_at: datetime
     include_action_history_in_verification: bool | None = False
+    duration: float | None = None
 
     # for loop block
     loop_values: list[Any] | None = None

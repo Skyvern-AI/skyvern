@@ -31,6 +31,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
 
 LOG = structlog.get_logger()
@@ -89,6 +90,7 @@ class LLMAPIHandlerFactory:
         )
         main_model_group = llm_config.main_model_group
 
+        @TraceManager.traced_async(tags=[llm_key], ignore_inputs=["prompt", "screenshots", "parameters"])
         async def llm_api_handler_with_router_and_fallback(
             prompt: str,
             prompt_name: str,
@@ -196,6 +198,13 @@ class LLMAPIHandlerFactory:
                 thought=thought,
                 ai_suggestion=ai_suggestion,
             )
+            prompt_tokens = 0
+            completion_tokens = 0
+            reasoning_tokens = 0
+            cached_tokens = 0
+            completion_token_detail = None
+            cached_token_detail = None
+            llm_cost = 0
             if step or thought:
                 try:
                     # FIXME: volcengine doesn't support litellm cost calculation.
@@ -257,7 +266,7 @@ class LLMAPIHandlerFactory:
                     ai_suggestion=ai_suggestion,
                 )
 
-            # Track LLM API handler duration
+            # Track LLM API handler duration, token counts, and cost
             duration_seconds = time.time() - start_time
             LOG.info(
                 "LLM API handler duration metrics",
@@ -268,6 +277,11 @@ class LLMAPIHandlerFactory:
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=step.organization_id if step else (thought.organization_id if thought else None),
+                input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                output_tokens=completion_tokens if completion_tokens > 0 else None,
+                reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                llm_cost=llm_cost if llm_cost > 0 else None,
             )
 
             return parsed_response
@@ -286,6 +300,7 @@ class LLMAPIHandlerFactory:
 
         assert isinstance(llm_config, LLMConfig)
 
+        @TraceManager.traced_async(tags=[llm_key], ignore_inputs=["prompt", "screenshots", "parameters"])
         async def llm_api_handler(
             prompt: str,
             prompt_name: str,
@@ -400,6 +415,13 @@ class LLMAPIHandlerFactory:
                 ai_suggestion=ai_suggestion,
             )
 
+            prompt_tokens = 0
+            completion_tokens = 0
+            reasoning_tokens = 0
+            cached_tokens = 0
+            completion_token_detail = None
+            cached_token_detail = None
+            llm_cost = 0
             if step or thought:
                 try:
                     # FIXME: volcengine doesn't support litellm cost calculation.
@@ -461,7 +483,7 @@ class LLMAPIHandlerFactory:
                     ai_suggestion=ai_suggestion,
                 )
 
-            # Track LLM API handler duration
+            # Track LLM API handler duration, token counts, and cost
             duration_seconds = time.time() - start_time
             LOG.info(
                 "LLM API handler duration metrics",
@@ -472,6 +494,11 @@ class LLMAPIHandlerFactory:
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=step.organization_id if step else (thought.organization_id if thought else None),
+                input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                output_tokens=completion_tokens if completion_tokens > 0 else None,
+                reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                llm_cost=llm_cost if llm_cost > 0 else None,
             )
 
             return parsed_response
@@ -675,6 +702,7 @@ class LLMCaller:
             ai_suggestion=ai_suggestion,
         )
 
+        call_stats = None
         if step or thought:
             call_stats = await self.get_call_stats(response)
             if step:
@@ -698,7 +726,7 @@ class LLMCaller:
                     cached_token_count=call_stats.cached_tokens,
                     thought_cost=call_stats.llm_cost,
                 )
-        # Track LLM API handler duration
+        # Track LLM API handler duration, token counts, and cost
         duration_seconds = time.perf_counter() - start_time
         LOG.info(
             "LLM API handler duration metrics",
@@ -709,6 +737,11 @@ class LLMCaller:
             step_id=step.step_id if step else None,
             thought_id=thought.observer_thought_id if thought else None,
             organization_id=step.organization_id if step else (thought.organization_id if thought else None),
+            input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
+            output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
+            reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
+            cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
+            llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
         )
         if raw_response:
             return response.model_dump(exclude_none=True)
@@ -743,6 +776,7 @@ class LLMCaller:
             return get_resize_target_dimension(window_dimension)
         return self.screenshot_resize_target_dimension
 
+    @TraceManager.traced_async(ignore_input=True)
     async def _dispatch_llm_call(
         self,
         messages: list[dict[str, Any]],

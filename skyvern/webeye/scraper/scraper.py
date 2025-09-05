@@ -12,10 +12,18 @@ from playwright.async_api import ElementHandle, Frame, Locator, Page
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
-from skyvern.exceptions import FailedToTakeScreenshot, ScrapingFailed, UnknownElementTreeFormat
+from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_DIR, SKYVERN_ID_ATTR
+from skyvern.exceptions import (
+    FailedToTakeScreenshot,
+    NoElementFound,
+    ScrapingFailed,
+    ScrapingFailedBlankPage,
+    UnknownElementTreeFormat,
+)
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.browser_factory import BrowserState
@@ -106,7 +114,7 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
         if not interactable:
             return ""
         else:
-            LOG.info("Element is interactable. Trimmed all attributes instead of dropping it", element=element)
+            LOG.debug("Element is interactable. Trimmed all attributes instead of dropping it", element=element)
             attributes = {}
 
     context = skyvern_context.ensure_context()
@@ -249,16 +257,16 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     elements: list[dict]
     id_to_element_dict: dict[str, dict] = {}
     id_to_frame_dict: dict[str, str] = {}
-    id_to_css_dict: dict[str, str]
-    id_to_element_hash: dict[str, str]
-    hash_to_element_ids: dict[str, list[str]]
+    id_to_css_dict: dict[str, str] = {}
+    id_to_element_hash: dict[str, str] = {}
+    hash_to_element_ids: dict[str, list[str]] = {}
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     economy_element_tree: list[dict] | None = None
     last_used_element_tree: list[dict] | None = None
-    screenshots: list[bytes]
-    url: str
-    html: str
+    screenshots: list[bytes] = []
+    url: str = ""
+    html: str = ""
     extracted_text: str | None = None
     window_dimension: dict[str, int] | None = None
     _browser_state: BrowserState = PrivateAttr()
@@ -320,16 +328,18 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
 
             self.economy_element_tree = economy_elements
 
-        final_element_tree = self.economy_element_tree[: int(len(self.economy_element_tree) * percent_to_keep)]
-        self.last_used_element_tree = final_element_tree
+        self.last_used_element_tree = self.economy_element_tree
 
         if fmt == ElementTreeFormat.JSON:
-            return json.dumps(final_element_tree)
+            element_str = json.dumps(self.economy_element_tree)
+            return element_str[: int(len(element_str) * percent_to_keep)]
 
         if fmt == ElementTreeFormat.HTML:
-            return "".join(
-                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs) for element in final_element_tree
+            element_str = "".join(
+                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
+                for element in self.economy_element_tree
             )
+            return element_str[: int(len(element_str) * percent_to_keep)]
 
         raise UnknownElementTreeFormat(fmt=fmt)
 
@@ -392,6 +402,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         return await self.generate_scraped_page(take_screenshots=False)
 
 
+@TraceManager.traced_async(ignore_input=True)
 async def scrape_website(
     browser_state: BrowserState,
     url: str,
@@ -402,6 +413,8 @@ async def scrape_website(
     draw_boxes: bool = True,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
+    support_empty_page: bool = False,
+    wait_seconds: float = 0,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -424,6 +437,7 @@ async def scrape_website(
 
     :raises Exception: When scraping fails after maximum retries.
     """
+
     try:
         num_retry += 1
         return await scrape_web_unsafe(
@@ -435,7 +449,11 @@ async def scrape_website(
             draw_boxes=draw_boxes,
             max_screenshot_number=max_screenshot_number,
             scroll=scroll,
+            support_empty_page=support_empty_page,
+            wait_seconds=wait_seconds,
         )
+    except ScrapingFailedBlankPage:
+        raise
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > settings.MAX_SCRAPING_RETRIES:
@@ -511,6 +529,8 @@ async def scrape_web_unsafe(
     draw_boxes: bool = True,
     max_screenshot_number: int = settings.MAX_NUM_SCREENSHOTS,
     scroll: bool = True,
+    support_empty_page: bool = False,
+    wait_seconds: float = 0,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -531,11 +551,23 @@ async def scrape_web_unsafe(
     # We check if the scroll_y_px_old is the same as scroll_y_px to determine if we have reached the end of the page.
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
+    url = page.url
+    if url == "about:blank" and not support_empty_page:
+        raise ScrapingFailedBlankPage()
 
-    LOG.info("Waiting for 3 seconds before scraping the website.")
-    await asyncio.sleep(3)
+    skyvern_frame = await SkyvernFrame.create_instance(page)
+    await skyvern_frame.safe_wait_for_animation_end()
+
+    if wait_seconds > 0:
+        LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
+        await asyncio.sleep(wait_seconds)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
+    if not elements and not support_empty_page:
+        LOG.warning("No elements found on the page, wait for 3 seconds and retry")
+        await asyncio.sleep(3)
+        elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
+
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
     element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
 
@@ -559,9 +591,9 @@ async def scrape_web_unsafe(
         elements
     )
 
-    # if there are no elements, fail the scraping
-    if not elements:
-        raise Exception("No elements found on the page")
+    # if there are no elements, fail the scraping unless support_empty_page is True
+    if not elements and not support_empty_page:
+        raise NoElementFound()
 
     text_content = await get_frame_text(page.main_frame)
 
@@ -589,7 +621,7 @@ async def scrape_web_unsafe(
         element_tree=element_tree,
         element_tree_trimmed=element_tree_trimmed,
         screenshots=screenshots,
-        url=page.url,
+        url=url,
         html=html,
         extracted_text=text_content,
         window_dimension=window_dimension,
@@ -639,6 +671,12 @@ async def add_frame_interactable_elements(
         if not await frame_element.is_visible():
             return elements, element_tree
         unique_id = await frame_element.get_attribute("unique_id")
+        if not unique_id:
+            LOG.info(
+                "No unique_id found for frame, skipping",
+                frame_index=frame_index,
+            )
+            return elements, element_tree
     except Exception:
         LOG.warning(
             "Unable to get unique_id from frame_element",
@@ -646,11 +684,11 @@ async def add_frame_interactable_elements(
         )
         return elements, element_tree
 
-    frame_js_script = f"async () => await buildTreeFromBody('{unique_id}', {frame_index})"
+    skyvern_frame = await SkyvernFrame.create_instance(frame)
+    await skyvern_frame.safe_wait_for_animation_end()
 
-    await SkyvernFrame.evaluate(frame=frame, expression=JS_FUNCTION_DEFS)
-    frame_elements, frame_element_tree = await SkyvernFrame.evaluate(
-        frame=frame, expression=frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+    frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
+        frame_name=unique_id, frame_index=frame_index
     )
 
     for element in elements:
@@ -662,6 +700,7 @@ async def add_frame_interactable_elements(
     return elements, element_tree
 
 
+@TraceManager.traced_async(ignore_input=True)
 async def get_interactable_element_tree(
     page: Page,
     scrape_exclude: ScrapeExcludeFunc | None = None,
@@ -671,12 +710,9 @@ async def get_interactable_element_tree(
     :param page: Page instance to get the element tree from.
     :return: Tuple containing the element tree and a map of element IDs to elements.
     """
-    await SkyvernFrame.evaluate(frame=page, expression=JS_FUNCTION_DEFS)
     # main page index is 0
-    main_frame_js_script = "async () => await buildTreeFromBody('main.frame', 0)"
-    elements, element_tree = await SkyvernFrame.evaluate(
-        frame=page, expression=main_frame_js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
-    )
+    skyvern_page = await SkyvernFrame.create_instance(page)
+    elements, element_tree = await skyvern_page.build_tree_from_body(frame_name="main.frame", frame_index=0)
 
     context = skyvern_context.ensure_context()
     frames = await get_all_children_frames(page)
@@ -718,25 +754,23 @@ class IncrementalScrapePage(ElementTreeBuilder):
             return True
         return False
 
+    @TraceManager.traced_async(ignore_input=True)
     async def get_incremental_element_tree(
         self,
         cleanup_element_tree: CleanupElementTreeFunc,
     ) -> list[dict]:
         frame = self.skyvern_frame.get_frame()
 
-        js_script = "async () => await getIncrementElements()"
         try:
-            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
-                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
+                wait_until_finished=True
             )
         except TimeoutError:
             LOG.warning(
                 "Timeout to get incremental elements with wait_until_finished, going to get incremental elements without waiting",
             )
-
-            js_script = "async () => await getIncrementElements(false)"
-            incremental_elements, incremental_tree = await SkyvernFrame.evaluate(
-                frame=frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            incremental_elements, incremental_tree = await self.skyvern_frame.get_incremental_element_tree(
+                wait_until_finished=False
             )
 
         # we listen the incremental elements seperated by frames, so all elements will be in the same SkyvernFrame
@@ -763,7 +797,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
             return
         js_script = "async () => await stopGlobalIncrementalObserver()"
         await SkyvernFrame.evaluate(
-            frame=self.skyvern_frame.get_frame(), expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS
+            frame=self.skyvern_frame.get_frame(),
+            expression=js_script,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
         )
 
     async def get_incremental_elements_num(self) -> int:

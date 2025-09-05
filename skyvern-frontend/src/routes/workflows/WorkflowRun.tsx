@@ -41,6 +41,8 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const embed = searchParams.get("embed");
+  const isEmbedded = embed === "true";
   const active = searchParams.get("active");
   const { workflowRunId, workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
@@ -100,8 +102,7 @@ function WorkflowRun() {
   const parameters = workflowRun?.parameters ?? {};
   const proxyLocation =
     workflowRun?.proxy_location ?? ProxyLocation.Residential;
-  const maxScreenshotScrollingTimes =
-    workflowRun?.max_screenshot_scrolling_times ?? null;
+  const maxScreenshotScrolls = workflowRun?.max_screenshot_scrolls ?? null;
 
   const title = workflowIsLoading ? (
     <Skeleton className="h-9 w-48" />
@@ -116,6 +117,26 @@ function WorkflowRun() {
     </h1>
   );
 
+  const failureTips: { match: (reason: string) => boolean; tip: string }[] = [
+    {
+      match: (reason) => reason.includes("Invalid master password"),
+      tip: "Tip: If inputting the master password via Docker Compose or in any container environment, make sure to double any dollar signs and do not surround it with quotes.",
+    },
+    // Add more tips as needed
+  ];
+
+  const failureReason = workflowRun?.failure_reason;
+
+  const matchedTips = failureReason
+    ? failureTips
+        .filter(({ match }) => match(failureReason))
+        .map(({ tip }, index) => (
+          <div key={index} className="text-sm italic text-red-700">
+            {tip}
+          </div>
+        ))
+    : null;
+
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div
       className="space-y-2 rounded-md border border-red-600 p-4"
@@ -125,6 +146,7 @@ function WorkflowRun() {
     >
       <div className="font-bold">Workflow Failure Reason</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
+      {matchedTips}
     </div>
   ) : null;
 
@@ -136,6 +158,19 @@ function WorkflowRun() {
   }
 
   const isTaskv2Run = workflowRun && workflowRun.task_v2 !== null;
+
+  const webhookFailureReasonData =
+    workflowRun?.task_v2?.webhook_failure_reason ??
+    workflowRun?.webhook_failure_reason;
+
+  const webhookFailureReason = webhookFailureReasonData ? (
+    <div className="space-y-4">
+      <Label>Webhook Failure Reason</Label>
+      <div className="rounded-md border border-yellow-600 p-4 text-sm">
+        {webhookFailureReasonData}
+      </div>
+    </div>
+  ) : null;
 
   const outputs = workflowRun?.outputs;
   const extractedInformation =
@@ -165,97 +200,105 @@ function WorkflowRun() {
 
   const showOutputSection =
     workflowRunIsFinalized &&
-    (hasSomeExtractedInformation || hasFileUrls || hasTaskv2Output) &&
+    (hasSomeExtractedInformation ||
+      hasFileUrls ||
+      hasTaskv2Output ||
+      webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
   return (
     <div className="space-y-8">
-      <header className="flex justify-between">
-        <div className="space-y-3">
-          <div className="flex items-center gap-5">
-            {title}
-            {workflowRunIsLoading ? (
-              <Skeleton className="h-8 w-28" />
-            ) : workflowRun ? (
-              <StatusBadge status={workflowRun?.status} />
-            ) : null}
+      {!isEmbedded && (
+        <header className="flex justify-between">
+          <div className="space-y-3">
+            <div className="mr-2 flex items-start gap-5">
+              {title}
+              {workflowRunIsLoading ? (
+                <Skeleton className="h-8 w-28" />
+              ) : workflowRun ? (
+                <StatusBadge
+                  className="mt-[0.27rem]"
+                  status={workflowRun?.status}
+                />
+              ) : null}
+            </div>
+            <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
           </div>
-          <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
-        </div>
 
-        <div className="flex gap-2">
-          <CopyApiCommandDropdown
-            getOptions={() =>
-              ({
-                method: "POST",
-                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                body: {
-                  data: workflowRun?.parameters,
-                  proxy_location: "RESIDENTIAL",
-                },
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
-              }) satisfies ApiCommandOptions
-            }
-          />
-          <Button asChild variant="secondary">
-            <Link to={`/workflows/${workflowPermanentId}/edit`}>
-              <Pencil2Icon className="mr-2 h-4 w-4" />
-              Edit
-            </Link>
-          </Button>
-          {workflowRunIsRunningOrQueued && (
-            <Dialog>
-              <DialogTrigger asChild>
-                <Button variant="destructive">Cancel</Button>
-              </DialogTrigger>
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Are you sure?</DialogTitle>
-                  <DialogDescription>
-                    Are you sure you want to cancel this workflow run?
-                  </DialogDescription>
-                </DialogHeader>
-                <DialogFooter>
-                  <DialogClose asChild>
-                    <Button variant="secondary">Back</Button>
-                  </DialogClose>
-                  <Button
-                    variant="destructive"
-                    onClick={() => {
-                      cancelWorkflowMutation.mutate();
-                    }}
-                    disabled={cancelWorkflowMutation.isPending}
-                  >
-                    {cancelWorkflowMutation.isPending && (
-                      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                    )}
-                    Cancel Workflow Run
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-          )}
-          {workflowRunIsFinalized && !isTaskv2Run && (
-            <Button asChild>
-              <Link
-                to={`/workflows/${workflowPermanentId}/run`}
-                state={{
-                  data: parameters,
-                  proxyLocation,
-                  webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
-                  maxScreenshotScrollingTimes,
-                }}
-              >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                Rerun
+          <div className="flex gap-2">
+            <CopyApiCommandDropdown
+              getOptions={() =>
+                ({
+                  method: "POST",
+                  url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
+                  body: {
+                    data: workflowRun?.parameters,
+                    proxy_location: "RESIDENTIAL",
+                  },
+                  headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": apiCredential ?? "<your-api-key>",
+                  },
+                }) satisfies ApiCommandOptions
+              }
+            />
+            <Button asChild variant="secondary">
+              <Link to={`/workflows/${workflowPermanentId}/debug`}>
+                <Pencil2Icon className="mr-2 h-4 w-4" />
+                Edit
               </Link>
             </Button>
-          )}
-        </div>
-      </header>
+            {workflowRunIsRunningOrQueued && (
+              <Dialog>
+                <DialogTrigger asChild>
+                  <Button variant="destructive">Cancel</Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Are you sure?</DialogTitle>
+                    <DialogDescription>
+                      Are you sure you want to cancel this workflow run?
+                    </DialogDescription>
+                  </DialogHeader>
+                  <DialogFooter>
+                    <DialogClose asChild>
+                      <Button variant="secondary">Back</Button>
+                    </DialogClose>
+                    <Button
+                      variant="destructive"
+                      onClick={() => {
+                        cancelWorkflowMutation.mutate();
+                      }}
+                      disabled={cancelWorkflowMutation.isPending}
+                    >
+                      {cancelWorkflowMutation.isPending && (
+                        <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                      )}
+                      Cancel Workflow Run
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+            )}
+            {workflowRunIsFinalized && !isTaskv2Run && (
+              <Button asChild>
+                <Link
+                  to={`/workflows/${workflowPermanentId}/run`}
+                  state={{
+                    data: parameters,
+                    proxyLocation,
+                    webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
+                    maxScreenshotScrolls,
+                  }}
+                >
+                  <PlayIcon className="mr-2 h-4 w-4" />
+                  Rerun
+                </Link>
+              </Button>
+            )}
+          </div>
+        </header>
+      )}
       {showOutputSection && (
         <div
           className={cn("grid gap-4 rounded-lg bg-slate-elevation1 p-4", {
@@ -305,29 +348,32 @@ function WorkflowRun() {
               </ScrollArea>
             </div>
           )}
+          {webhookFailureReason}
         </div>
       )}
       {workflowFailureReason}
-      <SwitchBarNavigation
-        options={[
-          {
-            label: "Overview",
-            to: "overview",
-          },
-          {
-            label: "Output",
-            to: "output",
-          },
-          {
-            label: "Parameters",
-            to: "parameters",
-          },
-          {
-            label: "Recording",
-            to: "recording",
-          },
-        ]}
-      />
+      {!isEmbedded && (
+        <SwitchBarNavigation
+          options={[
+            {
+              label: "Overview",
+              to: "overview",
+            },
+            {
+              label: "Output",
+              to: "output",
+            },
+            {
+              label: "Parameters",
+              to: "parameters",
+            },
+            {
+              label: "Recording",
+              to: "recording",
+            },
+          ]}
+        />
+      )}
       <div className="flex h-[42rem] gap-6">
         <div className="w-2/3">
           <Outlet />

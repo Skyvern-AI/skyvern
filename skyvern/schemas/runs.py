@@ -289,9 +289,14 @@ class TaskRunRequest(BaseModel):
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
     )
-    max_screenshot_scrolling_times: int | None = Field(
+    max_screenshot_scrolls: int | None = Field(
         default=None,
-        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+        description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
+    )
+    browser_address: str | None = Field(
+        default=None,
+        description="The CDP address for the task.",
+        examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
 
     @field_validator("url", "webhook_url", "totp_url")
@@ -316,7 +321,7 @@ class WorkflowRunRequest(BaseModel):
     workflow_id: str = Field(
         description="ID of the workflow to run. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     )
-    parameters: dict[str, Any] = Field(default={}, description="Parameters to pass to the workflow")
+    parameters: dict[str, Any] | None = Field(default=None, description="Parameters to pass to the workflow")
     title: str | None = Field(default=None, description="The title for this workflow run")
     proxy_location: ProxyLocation | None = Field(
         default=ProxyLocation.RESIDENTIAL,
@@ -340,13 +345,18 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
-    max_screenshot_scrolling_times: int | None = Field(
+    max_screenshot_scrolls: int | None = Field(
         default=None,
-        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's None or 0, it takes the current viewpoint screenshot.",
+        description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
     extra_http_headers: dict[str, str] | None = Field(
         default=None,
         description="The extra HTTP headers for the requests in browser.",
+    )
+    browser_address: str | None = Field(
+        default=None,
+        description="The CDP address for the workflow run.",
+        examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
 
     @field_validator("webhook_url", "totp_url")
@@ -355,6 +365,19 @@ class WorkflowRunRequest(BaseModel):
         if url is None:
             return None
         return validate_url(url)
+
+
+class BlockRunRequest(WorkflowRunRequest):
+    block_labels: list[str] = Field(
+        description="Labels of the blocks to execute",
+        examples=["block_1", "block_2"],
+    )
+    block_outputs: dict[str, Any] | None = Field(
+        default=None,
+        # NOTE(jdo): this is either the last output of the block for a given
+        # org_id/user_id, or an override supplied by the user
+        description="Any active outputs of blocks in a workflow being debugged",
+    )
 
 
 class BaseRunResponse(BaseModel):
@@ -392,9 +415,9 @@ class BaseRunResponse(BaseModel):
     browser_session_id: str | None = Field(
         default=None, description="ID of the Skyvern persistent browser session used for this run", examples=["pbs_123"]
     )
-    max_screenshot_scrolling_times: int | None = Field(
+    max_screenshot_scrolls: int | None = Field(
         default=None,
-        description="Scroll down n times to get the merged screenshot of the page after taking an action. When it's NONE or 0, it takes the current view point screenshot.",
+        description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot",
     )
 
 
@@ -415,3 +438,7 @@ class WorkflowRunResponse(BaseRunResponse):
 
 
 RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discriminator="run_type")]
+
+
+class BlockRunResponse(WorkflowRunResponse):
+    block_labels: list[str] = Field(description="A whitelist of block labels; only these blocks will execute")

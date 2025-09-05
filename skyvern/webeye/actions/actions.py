@@ -97,6 +97,7 @@ class Action(BaseModel):
 
     created_at: datetime | None = None
     modified_at: datetime | None = None
+    created_by: str | None = None
 
     @classmethod
     def validate(cls: Type[T], value: Any) -> T:
@@ -241,7 +242,7 @@ class CompleteAction(DecisiveAction):
 class ExtractAction(Action):
     action_type: ActionType = ActionType.EXTRACT
     data_extraction_goal: str | None = None
-    data_extraction_schema: dict[str, Any] | None = None
+    data_extraction_schema: dict[str, Any] | list | str | None = None
 
 
 class ScrollAction(Action):

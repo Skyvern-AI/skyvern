@@ -190,7 +190,8 @@ export type WorkflowBlock =
   | FileDownloadBlock
   | PDFParserBlock
   | Taskv2Block
-  | URLBlock;
+  | URLBlock
+  | HttpRequestBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -212,7 +213,24 @@ export const WorkflowBlockTypes = {
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
   URL: "goto_url",
+  HttpRequest: "http_request",
 } as const;
+
+// all of them
+export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set(
+  Object.values(WorkflowBlockTypes),
+);
+
+export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
+  "action",
+  "extraction",
+  "file_download",
+  "goto_url",
+  "login",
+  "navigation",
+  "task",
+  "validation",
+]);
 
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
@@ -257,7 +275,7 @@ export type TaskBlock = WorkflowBlockBase & {
   title: string;
   navigation_goal: string | null;
   data_extraction_goal: string | null;
-  data_schema: Record<string, unknown> | null;
+  data_schema: Record<string, unknown> | string | null;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
@@ -317,11 +335,14 @@ export type UploadToS3Block = WorkflowBlockBase & {
 export type FileUploadBlock = WorkflowBlockBase & {
   block_type: "file_upload";
   path: string;
-  storage_type: string;
-  s3_bucket: string;
-  region_name: string;
-  aws_access_key_id: string;
-  aws_secret_access_key: string;
+  storage_type: "s3" | "azure";
+  s3_bucket: string | null;
+  region_name: string | null;
+  aws_access_key_id: string | null;
+  aws_secret_access_key: string | null;
+  azure_storage_account_name: string | null;
+  azure_storage_account_key: string | null;
+  azure_blob_container_name: string | null;
 };
 
 export type SendEmailBlock = WorkflowBlockBase & {
@@ -340,7 +361,8 @@ export type SendEmailBlock = WorkflowBlockBase & {
 export type FileURLParserBlock = WorkflowBlockBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv";
+  file_type: "csv" | "excel" | "pdf";
+  json_schema: Record<string, unknown> | null;
 };
 
 export type ValidationBlock = WorkflowBlockBase & {
@@ -393,7 +415,7 @@ export type ExtractionBlock = WorkflowBlockBase & {
   data_extraction_goal: string | null;
   url: string | null;
   title: string;
-  data_schema: Record<string, unknown> | null;
+  data_schema: Record<string, unknown> | string | null;
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
@@ -450,6 +472,17 @@ export type URLBlock = WorkflowBlockBase & {
   url: string;
 };
 
+export type HttpRequestBlock = WorkflowBlockBase & {
+  block_type: "http_request";
+  method: string;
+  url: string | null;
+  headers: Record<string, string> | null;
+  body: Record<string, unknown> | null;
+  timeout: number;
+  follow_redirects: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type WorkflowDefinition = {
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
@@ -471,10 +504,13 @@ export type WorkflowApiResponse = {
   model: WorkflowModel | null;
   totp_verification_url: string | null;
   totp_identifier: string | null;
-  max_screenshot_scrolling_times: number | null;
+  max_screenshot_scrolls: number | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
+  generate_script: boolean;
+  cache_key: string | null;
+  ai_fallback: boolean | null;
 };
 
 export type WorkflowSettings = {
@@ -482,8 +518,11 @@ export type WorkflowSettings = {
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
-  maxScreenshotScrollingTimes: number | null;
+  maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
+  useScriptCache: boolean;
+  scriptCacheKey: string | null;
+  aiFallback: boolean | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

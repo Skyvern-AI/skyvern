@@ -14,6 +14,7 @@ from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR, TEXT_INPUT_DELAY
 from skyvern.exceptions import (
     ElementIsNotLabel,
+    ElementOutOfCurrentViewport,
     InteractWithDisabledElement,
     MissingElement,
     MissingElementDict,
@@ -134,13 +135,6 @@ class SkyvernElement:
 
     def __repr__(self) -> str:
         return f"SkyvernElement({str(self.__static_element)})"
-
-    async def _trim_target_attr(self) -> None:
-        if "target" not in self.get_attributes():
-            return
-        LOG.debug("Removing target attribute from the element", element=self.get_id())
-        skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
-        await skyvern_frame.remove_target_attr(await self.get_element_handler())
 
     def build_HTML(self, need_trim_element: bool = True, need_skyvern_attrs: bool = True) -> str:
         element_dict = self.get_element_dict()
@@ -578,7 +572,8 @@ class SkyvernElement:
         await self.get_locator().press(key=key, timeout=timeout)
 
     async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
-        await self.get_locator().press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=timeout)
+        for char in text:
+            await self.get_locator().type(char, delay=TEXT_INPUT_DELAY, timeout=timeout)
 
     async def input(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if self.get_tag_name().lower() not in COMMON_INPUT_TAGS:
@@ -591,6 +586,40 @@ class SkyvernElement:
 
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
+
+    async def check(self, delay: int = 2, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        # HACK: sometimes playwright will raise exception when checking the element.
+        # we need to trigger the hack to check again in several seconds
+        try:
+            await self.get_locator().check(timeout=timeout)
+        except Exception:
+            LOG.info(
+                f"Failed to check the element at the first time, trigger the hack to check again in {delay} seconds",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            await asyncio.sleep(delay)
+            if await self.get_locator().count() == 0:
+                LOG.info("Element is not on the page, the checking should work", element_id=self.get_id())
+                return
+            await self.get_locator().check(timeout=timeout)
+
+    async def uncheck(self, delay: int = 2, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        # HACK: sometimes playwright will raise exception when unchecking the element.
+        # we need to trigger the hack to uncheck again in several seconds
+        try:
+            await self.get_locator().uncheck(timeout=timeout)
+        except Exception:
+            LOG.info(
+                f"Failed to uncheck the element at the first time, trigger the hack to uncheck again in {delay} seconds",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            await asyncio.sleep(delay)
+            if await self.get_locator().count() == 0:
+                LOG.info("Element is not on the page, the unchecking should work", element_id=self.get_id())
+                return
+            await self.get_locator().uncheck(timeout=timeout)
 
     async def move_mouse_to_safe(
         self,
@@ -605,6 +634,14 @@ class SkyvernElement:
         except NoElementBoudingBox:
             LOG.warning(
                 "Failed to move mouse to the element - NoElementBoudingBox",
+                task_id=task_id,
+                step_id=step_id,
+                element_id=element_id,
+                exc_info=True,
+            )
+        except ElementOutOfCurrentViewport:
+            LOG.warning(
+                "Failed to move mouse to the element - ElementOutOfCurrentViewport",
                 task_id=task_id,
                 step_id=step_id,
                 element_id=element_id,
@@ -632,6 +669,12 @@ class SkyvernElement:
         epsilon = 0.01
         dest_x = uniform(x + epsilon, x + width - epsilon) if width > 2 * epsilon else (x + width) / 2
         dest_y = uniform(y + epsilon, y + height - epsilon) if height > 2 * epsilon else (y + height) / 2
+
+        # TODO: a better way to check if the element is out of current viewport
+        # eg: x > window.innerWidth or y > window.innerHeight; part of the element is out of the viewport
+        if dest_x < 0 or dest_y < 0:
+            raise ElementOutOfCurrentViewport(element_id=self.get_id())
+
         await page.mouse.move(dest_x, dest_y)
 
         return dest_x, dest_y
@@ -766,12 +809,10 @@ class SkyvernElement:
 
     async def navigate_to_a_href(self, page: Page) -> str | None:
         if self.get_tag_name() != InteractiveElement.A:
-            await self._trim_target_attr()
             return None
 
         href = await self.should_use_navigation_instead_click(page)
         if not href:
-            await self._trim_target_attr()
             return None
 
         LOG.info(

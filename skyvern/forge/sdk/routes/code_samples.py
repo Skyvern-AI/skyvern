@@ -25,6 +25,56 @@ RETRY_RUN_WEBHOOK_CODE_SAMPLE = """from skyvern import Skyvern
 skyvern = Skyvern(api_key="YOUR_API_KEY")
 await skyvern.retry_run_webhook(run_id="tsk_v2_123")
 """
+GET_RUN_TIMELINE_CODE_SAMPLE = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+# Get timeline for a workflow run
+timeline = await skyvern.get_run_timeline(run_id="wr_123")
+print(timeline)
+
+# Get timeline for a task_v2 run
+timeline = await skyvern.get_run_timeline(run_id="tsk_v2_123")
+print(timeline)
+"""
+LOGIN_CODE_SAMPLE_SKYVERN = """# Login with password saved in Skyvern
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.login(
+    url="https://example.com",
+    credential_type="skyvern",
+    credential_id="cred_123"),
+)
+"""
+LOGIN_CODE_SAMPLE_BITWARDEN = """# Login with password saved in Bitwarden
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+# Login with a Bitwarden collection and website url filter
+await skyvern.login(
+    url="https://example.com",
+    credential_type="bitwarden",
+    bitwarden_collection_id="BITWARDEN COLLECTION ID",
+)
+
+# Login with a Bitwarden item
+await skyvern.login(
+    url="https://example.com",
+    credential_type="bitwarden",
+    bitwarden_item_id="BITWARDEN ITEM ID",
+)
+"""
+LOGIN_CODE_SAMPLE_ONEPASSWORD = """# Login with password saved in 1Password
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.login(
+    url="https://example.com",
+    credential_type="onepassword",
+    onepassword_vault_id="1PASSWORD VAULT ID",
+    onepassword_item_id="1PASSWORD ITEM ID",
+)
+"""
 
 # Workflows
 CREATE_WORKFLOW_CODE_SAMPLE = """curl -X POST https://api.skyvern.com/v1/workflows \

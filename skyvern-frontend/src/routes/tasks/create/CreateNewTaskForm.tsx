@@ -40,7 +40,7 @@ import {
 } from "./taskFormTypes";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Switch } from "@/components/ui/switch";
-import { MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
@@ -90,8 +90,9 @@ function createTaskRequestObject(
     extracted_information_schema: extractedInformationSchema,
     extra_http_headers: extraHttpHeaders,
     totp_identifier: transform(formValues.totpIdentifier),
+    browser_address: transform(formValues.cdpAddress),
     error_code_mapping: errorCodeMapping,
-    max_screenshot_scrolling_times: formValues.maxScreenshotScrollingTimes,
+    max_screenshot_scrolls: formValues.maxScreenshotScrolls,
     include_action_history_in_verification:
       formValues.includeActionHistoryInVerification,
   };
@@ -126,8 +127,8 @@ function CreateNewTaskForm({ initialValues }: Props) {
       ...initialValues,
       maxStepsOverride: initialValues.maxStepsOverride ?? null,
       proxyLocation: initialValues.proxyLocation ?? ProxyLocation.Residential,
-      maxScreenshotScrollingTimes:
-        initialValues.maxScreenshotScrollingTimes ?? null,
+      maxScreenshotScrolls: initialValues.maxScreenshotScrolls ?? null,
+      cdpAddress: initialValues.cdpAddress ?? null,
     },
   });
   const { errors } = useFormState({ control: form.control });
@@ -573,17 +574,15 @@ function CreateNewTaskForm({ initialValues }: Props) {
                 />
                 <FormField
                   control={form.control}
-                  name="maxScreenshotScrollingTimes"
+                  name="maxScreenshotScrolls"
                   render={({ field }) => (
                     <FormItem>
                       <div className="flex gap-16">
                         <FormLabel>
                           <div className="w-72">
-                            <h1 className="text-lg">
-                              Max Scrolling Screenshots
-                            </h1>
+                            <h1 className="text-lg">Max Screenshot Scrolls</h1>
                             <h2 className="text-base text-slate-400">
-                              {`The maximum number of times to scroll down the page to take merged screenshots after action. Default is ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                              {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                             </h2>
                           </div>
                         </FormLabel>
@@ -594,7 +593,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                               type="number"
                               min={0}
                               value={field.value ?? ""}
-                              placeholder={`Default: ${MAX_SCREENSHOT_SCROLLING_TIMES_DEFAULT}`}
+                              placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
                               onChange={(event) => {
                                 const value =
                                   event.target.value === ""
@@ -689,6 +688,35 @@ function CreateNewTaskForm({ initialValues }: Props) {
                             <Input
                               {...field}
                               placeholder="Add an ID that links your TOTP to the task"
+                              value={field.value === null ? "" : field.value}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </div>
+                      </div>
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="cdpAddress"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-16">
+                        <FormLabel>
+                          <div className="w-72">
+                            <h1 className="text-lg">Browser Address</h1>
+                            <h2 className="text-base text-slate-400">
+                              The address of the Browser server to use for the
+                              task run.
+                            </h2>
+                          </div>
+                        </FormLabel>
+                        <div className="w-full">
+                          <FormControl>
+                            <Input
+                              {...field}
+                              placeholder="http://127.0.0.1:9222"
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>

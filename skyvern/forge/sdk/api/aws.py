@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 import aioboto3
 import structlog
+from types_boto3_ec2.client import EC2Client
 from types_boto3_ecs.client import ECSClient
 from types_boto3_s3.client import S3Client
 from types_boto3_secretsmanager.client import SecretsManagerClient
@@ -29,6 +30,7 @@ class AWSClientType(StrEnum):
     S3 = "s3"
     SECRETS_MANAGER = "secretsmanager"
     ECS = "ecs"
+    EC2 = "ec2"
 
 
 class AsyncAWSClient:
@@ -56,6 +58,9 @@ class AsyncAWSClient:
 
     def _s3_client(self) -> S3Client:
         return self.session.client(AWSClientType.S3, region_name=self.region_name, endpoint_url=self._endpoint_url)
+
+    def _ec2_client(self) -> EC2Client:
+        return self.session.client(AWSClientType.EC2, region_name=self.region_name, endpoint_url=self._endpoint_url)
 
     def _create_tag_string(self, tags: dict[str, str]) -> str:
         return "&".join([f"{k}={v}" for k, v in tags.items()])
@@ -198,6 +203,16 @@ class AsyncAWSClient:
                 LOG.exception("S3 download failed", uri=uri)
             return None
 
+    async def delete_file(self, uri: str, log_exception: bool = True) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
+        try:
+            async with self._s3_client() as client:
+                parsed_uri = S3Uri(uri)
+                await client.delete_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+        except Exception:
+            if log_exception:
+                LOG.exception("S3 delete failed", uri=uri)
+
     async def get_object_info(self, uri: str) -> dict:
         async with self._s3_client() as client:
             parsed_uri = S3Uri(uri)
@@ -268,6 +283,8 @@ class AsyncAWSClient:
         task_definition: str,
         subnets: list[str],
         security_groups: list[str],
+        assign_public_ip: str = "DISABLED",
+        enable_execute_command: bool = False,
     ) -> dict:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/run_task.html
         async with self._ecs_client() as client:
@@ -279,9 +296,10 @@ class AsyncAWSClient:
                     "awsvpcConfiguration": {
                         "subnets": subnets,
                         "securityGroups": security_groups,
-                        "assignPublicIp": "DISABLED",
+                        "assignPublicIp": assign_public_ip,
                     }
                 },
+                enableExecuteCommand=enable_execute_command,
             )
 
     async def stop_task(self, cluster: str, task: str, reason: str | None = None) -> dict:
@@ -308,6 +326,12 @@ class AsyncAWSClient:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/deregister_task_definition.html
         async with self._ecs_client() as client:
             return await client.deregister_task_definition(taskDefinition=task_definition)
+
+    ###### EC2 ######
+    async def describe_network_interfaces(self, network_interface_ids: list[str]) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2/client/describe_network_interfaces.html
+        async with self._ec2_client() as client:
+            return await client.describe_network_interfaces(NetworkInterfaceIds=network_interface_ids)
 
 
 class S3Uri:

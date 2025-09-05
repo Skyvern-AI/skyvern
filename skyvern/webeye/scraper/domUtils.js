@@ -92,6 +92,8 @@ class Rect {
 }
 
 class DomUtils {
+  static elementListCache = [];
+  static visibleClientRectCache = new WeakMap();
   //
   // Bounds the rect by the current viewport dimensions. If the rect is offscreen or has a height or
   // width < 3 then null is returned instead of a rect.
@@ -113,10 +115,20 @@ class DomUtils {
     }
   }
 
-  static getVisibleClientRect(element, testChildren) {
+  // add cache to optimize performance
+  static getVisibleClientRect(element, testChildren = false) {
+    // check cache
+    const cacheKey = `${testChildren}`;
+    if (DomUtils.visibleClientRectCache.has(element)) {
+      const elementCache = DomUtils.visibleClientRectCache.get(element);
+      if (elementCache.has(cacheKey)) {
+        _jsConsoleLog("hit cache to get the rect of element");
+        return elementCache.get(cacheKey);
+      }
+    }
+
     // Note: this call will be expensive if we modify the DOM in between calls.
     let clientRect;
-    if (testChildren == null) testChildren = false;
     const clientRects = (() => {
       const result = [];
       for (clientRect of element.getClientRects()) {
@@ -137,6 +149,8 @@ class DomUtils {
       isInlineZeroHeight = () => isInlineZeroFontSize;
       return isInlineZeroFontSize;
     };
+
+    let result = null;
 
     for (clientRect of clientRects) {
       // If the link has zero dimensions, it may be wrapping visible but floated elements. Check for
@@ -172,8 +186,10 @@ class DomUtils {
             childClientRect.height < 3
           )
             continue;
-          return childClientRect;
+          result = childClientRect;
+          break;
         }
+        if (result) break;
       } else {
         clientRect = this.cropRectToVisible(clientRect);
 
@@ -192,11 +208,23 @@ class DomUtils {
         if (computedStyle.getPropertyValue("visibility") !== "visible")
           continue;
 
-        return clientRect;
+        result = clientRect;
+        break;
       }
     }
 
-    return null;
+    // cache result
+    if (!DomUtils.visibleClientRectCache.has(element)) {
+      DomUtils.visibleClientRectCache.set(element, new Map());
+    }
+    DomUtils.visibleClientRectCache.get(element).set(cacheKey, result);
+
+    return result;
+  }
+
+  // clear cache
+  static clearVisibleClientRectCache() {
+    DomUtils.visibleClientRectCache = new WeakMap();
   }
 
   static getViewportTopLeft() {
@@ -222,6 +250,113 @@ class DomUtils {
         left: -rect.left - clientLeft,
       };
     }
+  }
+}
+
+class QuadTreeNode {
+  constructor(bounds, maxElements = 10, maxDepth = 4) {
+    this.bounds = bounds; // {x, y, width, height}
+    this.maxElements = maxElements;
+    this.maxDepth = maxDepth;
+    this.elements = [];
+    this.children = null;
+    this.depth = 0;
+  }
+
+  insert(element) {
+    if (!this.contains(element.rect)) {
+      return false;
+    }
+
+    if (this.children === null && this.elements.length < this.maxElements) {
+      this.elements.push(element);
+      return true;
+    }
+
+    if (this.children === null) {
+      this.subdivide();
+    }
+
+    for (const child of this.children) {
+      if (child.insert(element)) {
+        return true;
+      }
+    }
+
+    this.elements.push(element);
+    return true;
+  }
+
+  subdivide() {
+    const x = this.bounds.x;
+    const y = this.bounds.y;
+    const w = this.bounds.width / 2;
+    const h = this.bounds.height / 2;
+
+    this.children = [
+      new QuadTreeNode(
+        { x, y, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+      new QuadTreeNode(
+        { x: x + w, y, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+      new QuadTreeNode(
+        { x, y: y + h, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+      new QuadTreeNode(
+        { x: x + w, y: y + h, width: w, height: h },
+        this.maxElements,
+        this.maxDepth,
+      ),
+    ];
+
+    for (const child of this.children) {
+      child.depth = this.depth + 1;
+    }
+  }
+
+  contains(rect) {
+    return (
+      rect.left >= this.bounds.x &&
+      rect.right <= this.bounds.x + this.bounds.width &&
+      rect.top >= this.bounds.y &&
+      rect.bottom <= this.bounds.y + this.bounds.height
+    );
+  }
+
+  query(rect) {
+    const result = [];
+    this.queryRecursive(rect, result);
+    return result;
+  }
+
+  queryRecursive(rect, result) {
+    if (!this.intersects(rect)) {
+      return;
+    }
+
+    result.push(...this.elements);
+
+    if (this.children) {
+      for (const child of this.children) {
+        child.queryRecursive(rect, result);
+      }
+    }
+  }
+
+  intersects(rect) {
+    return (
+      rect.left < this.bounds.x + this.bounds.width &&
+      rect.right > this.bounds.x &&
+      rect.top < this.bounds.y + this.bounds.height &&
+      rect.bottom > this.bounds.y
+    );
   }
 }
 
@@ -617,7 +752,7 @@ function isHoverPointerElement(element, hoverStylesMap) {
 
   // Check if element has hover styles that change cursor to pointer
   // This is to handle the case where an element's cursor is "auto", but resolves to "pointer" on hover
-  if (elementCursor === "auto") {
+  if (elementCursor === "auto" || elementCursor === "default") {
     // TODO: we need a better algorithm to match the selector with better performance
     for (const [selector, styles] of hoverStylesMap) {
       let shouldMatch = false;
@@ -700,6 +835,9 @@ function isInteractable(element, hoverStylesMap) {
   }
 
   const tagName = element.tagName.toLowerCase();
+  if (tagName === "html") {
+    return false;
+  }
 
   if (tagName === "iframe") {
     return false;
@@ -743,7 +881,7 @@ function isInteractable(element, hoverStylesMap) {
     return true;
   }
 
-  const className = element.className.toString();
+  const className = element.className?.toString() ?? "";
 
   if (tagName === "div" || tagName === "span") {
     if (hasAngularClickBinding(element)) {
@@ -1059,16 +1197,42 @@ const checkParentClass = (className) => {
 };
 
 function removeMultipleSpaces(str) {
-  if (!str) {
+  // Optimization: check for empty values early
+  if (!str || str.length === 0) {
     return str;
   }
+
+  // Optimization: check if contains multiple spaces to avoid unnecessary regex replacement
+  if (
+    str.indexOf("  ") === -1 &&
+    str.indexOf("\t") === -1 &&
+    str.indexOf("\n") === -1
+  ) {
+    return str;
+  }
+
   return str.replace(/\s+/g, " ");
 }
 
 function cleanupText(text) {
-  return removeMultipleSpaces(
-    text.replace("SVGs not supported by this browser.", ""),
-  ).trim();
+  // Optimization: check for empty values early to avoid unnecessary processing
+  if (!text || text.length === 0) {
+    return "";
+  }
+
+  // Optimization: use more efficient string replacement
+  let cleanedText = text;
+
+  // Remove specific SVG error message
+  if (cleanedText.includes("SVGs not supported by this browser.")) {
+    cleanedText = cleanedText.replace(
+      "SVGs not supported by this browser.",
+      "",
+    );
+  }
+
+  // Optimization: combine space processing and trim operations
+  return removeMultipleSpaces(cleanedText).trim();
 }
 
 const checkStringIncludeRequire = (str) => {
@@ -1105,51 +1269,6 @@ function checkDisabledFromStyle(element) {
   return false;
 }
 
-// element should always be the parent of stopped_element
-function getElementContext(element, stopped_element) {
-  // dfs to collect the non unique_id context
-  let fullContext = new Array();
-
-  if (element === stopped_element) {
-    return fullContext;
-  }
-
-  // sometimes '*' shows as an after custom style
-  const afterCustomStyle = getElementComputedStyle(element, "::after");
-  if (afterCustomStyle) {
-    const afterCustom = afterCustomStyle
-      .getPropertyValue("content")
-      .replace(/"/g, "");
-    if (
-      afterCustom.toLowerCase().includes("*") ||
-      afterCustom.toLowerCase().includes("require")
-    ) {
-      fullContext.push(afterCustom);
-    }
-  }
-
-  if (element.childNodes.length === 0) {
-    return fullContext.join(";");
-  }
-  // if the element already has a context, then add it to the list first
-  for (var child of element.childNodes) {
-    let childContext = "";
-    if (child.nodeType === Node.TEXT_NODE && isElementVisible(element)) {
-      if (!element.hasAttribute("unique_id")) {
-        childContext = getElementText(child).trim();
-      }
-    } else if (child.nodeType === Node.ELEMENT_NODE) {
-      if (!child.hasAttribute("unique_id") && isElementVisible(child)) {
-        childContext = getElementContext(child, stopped_element);
-      }
-    }
-    if (childContext.length > 0) {
-      fullContext.push(childContext);
-    }
-  }
-  return fullContext.join(";");
-}
-
 function getVisibleText(element) {
   let visibleText = [];
 
@@ -1179,62 +1298,29 @@ function getElementText(element) {
     return element.data.trim();
   }
 
-  let visibleText = [];
-  for (let i = 0; i < element.childNodes.length; i++) {
-    var node = element.childNodes[i];
-    let nodeText = "";
-    if (node.nodeType === Node.TEXT_NODE && (nodeText = node.data.trim())) {
-      visibleText.push(nodeText);
-    }
-  }
-  return visibleText.join(";");
-}
+  const childNodes = element.childNodes;
+  const childNodesLength = childNodes.length;
 
-function getElementContent(element, skipped_element = null) {
-  // DFS to get all the text content from all the nodes under the element
-  if (skipped_element && element === skipped_element) {
+  // If no child nodes, return empty string directly
+  if (childNodesLength === 0) {
     return "";
   }
 
-  let textContent = getElementText(element);
-  let nodeContent = "";
-  // if element has children, then build a list of text and join with a semicolon
-  if (element.childNodes.length > 0) {
-    let childTextContentList = new Array();
-    let nodeTextContentList = new Array();
-    for (var child of element.childNodes) {
-      let childText = "";
-      if (child.nodeType === Node.TEXT_NODE) {
-        childText = getElementText(child).trim();
-        if (childText.length > 0) {
-          nodeTextContentList.push(childText);
-        }
-      } else if (child.nodeType === Node.ELEMENT_NODE) {
-        // childText = child.textContent.trim();
-        childText = getElementContent(child, skipped_element);
-      } else {
-        _jsConsoleLog("Unhandled node type: ", child.nodeType);
+  const visibleText = [];
+  let hasText = false;
+
+  for (let i = 0; i < childNodesLength; i++) {
+    const node = childNodes[i];
+    if (node.nodeType === Node.TEXT_NODE) {
+      const nodeText = node.data.trim();
+      if (nodeText.length > 0) {
+        visibleText.push(nodeText);
+        hasText = true;
       }
-      if (childText.length > 0) {
-        childTextContentList.push(childText);
-      }
-    }
-    textContent = childTextContentList.join(";");
-    nodeContent = cleanupText(nodeTextContentList.join(";"));
-  }
-  let finalTextContent = cleanupText(textContent);
-  // Currently we don't support too much context. Character limit is 1000 per element.
-  // we don't think element context has to be that big
-  const charLimit = 5000;
-  if (finalTextContent.length > charLimit) {
-    if (nodeContent.length <= charLimit) {
-      finalTextContent = nodeContent;
-    } else {
-      finalTextContent = "";
     }
   }
 
-  return finalTextContent;
+  return hasText ? visibleText.join(";") : "";
 }
 
 function getSelectOptions(element) {
@@ -1391,7 +1477,6 @@ async function buildElementObject(
     text: getElementText(element),
     afterPseudoText: getPseudoContent(element, "::after"),
     children: [],
-    rect: DomUtils.getVisibleClientRect(element, true),
     // if purgeable is True, which means this element is only used for building the tree relationship
     purgeable: purgeable,
     // don't trim any attr of this element if keepAllAttr=True
@@ -1448,19 +1533,27 @@ async function buildTreeFromBody(
   ) {
     window.GlobalSkyvernFrameIndex = frame_index;
   }
-  return await buildElementTree(document.body, frame);
+  const elementsAndResultArray = await buildElementTree(
+    document.documentElement,
+    frame,
+  );
+  DomUtils.elementListCache = elementsAndResultArray[0];
+  return elementsAndResultArray;
 }
 
 async function buildElementTree(
-  starter = document.body,
+  starter = document.documentElement,
   frame,
   full_tree = false,
-  needContext = true,
   hoverStylesMap = undefined,
 ) {
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
     hoverStylesMap = await getHoverStylesMap();
+  }
+
+  if (window.GlobalEnableAllTextualElements === undefined) {
+    window.GlobalEnableAllTextualElements = false;
   }
 
   var elements = [];
@@ -1483,13 +1576,17 @@ async function buildElementTree(
       return;
     }
 
+    if (tagName === "head") {
+      return;
+    }
+
     // skip processing option element as they are already added to the select.options
     if (tagName === "option") {
       return;
     }
 
     let current_xpath = null;
-    if (parent_xpath) {
+    if (parent_xpath !== null) {
       // ignore the namespace, otherwise the xpath sometimes won't find anything, specially for SVG elements
       current_xpath =
         parent_xpath +
@@ -1509,7 +1606,7 @@ async function buildElementTree(
     }
     const isVisible = isElementVisible(element);
     if (isVisible && !isHidden(element) && !isScriptOrStyle(element)) {
-      const interactable = isInteractable(element, hoverStylesMap);
+      let interactable = isInteractable(element, hoverStylesMap);
       let elementObj = null;
       let isParentSVG = null;
       if (interactable) {
@@ -1542,6 +1639,10 @@ async function buildElementTree(
         getElementText(element).length > 0 &&
         getElementText(element).length <= 5000
       ) {
+        if (window.GlobalEnableAllTextualElements) {
+          // force all textual elements to be interactable
+          interactable = true;
+        }
         elementObj = await buildElementObject(frame, element, interactable);
       } else if (full_tree) {
         // when building full tree, we only get text from element itself
@@ -1612,141 +1713,6 @@ async function buildElementTree(
     return;
   }
 
-  const getContextByParent = (element, ctx) => {
-    // for most elements, we're going 5 layers up to see if we can find "label" as a parent
-    // if found, most likely the context under label is relevant to this element
-    let targetParentElements = new Set(["label", "fieldset"]);
-
-    // look up for 5 levels to find the most contextual parent element
-    let targetContextualParent = null;
-    let currentEle = getDOMElementBySkyvenElement(element);
-    if (!currentEle) {
-      return ctx;
-    }
-    let parentEle = currentEle;
-    for (var i = 0; i < 5; i++) {
-      parentEle = parentEle.parentElement;
-      if (parentEle) {
-        if (
-          targetParentElements.has(parentEle.tagName.toLowerCase()) ||
-          (typeof parentEle.className === "string" &&
-            checkParentClass(parentEle.className.toLowerCase()))
-        ) {
-          targetContextualParent = parentEle;
-        }
-      } else {
-        break;
-      }
-    }
-    if (!targetContextualParent) {
-      return ctx;
-    }
-
-    let context = "";
-    var lowerCaseTagName = targetContextualParent.tagName.toLowerCase();
-    if (lowerCaseTagName === "fieldset") {
-      // fieldset is usually within a form or another element that contains the whole context
-      targetContextualParent = targetContextualParent.parentElement;
-      if (targetContextualParent) {
-        context = getElementContext(targetContextualParent, currentEle);
-      }
-    } else {
-      context = getElementContext(targetContextualParent, currentEle);
-    }
-    if (context.length > 0) {
-      ctx.push(context);
-    }
-    return ctx;
-  };
-
-  const getContextByLinked = (element, ctx) => {
-    let currentEle = getDOMElementBySkyvenElement(element);
-    if (!currentEle) {
-      return ctx;
-    }
-
-    const document = currentEle.getRootNode();
-    // check labels pointed to this element
-    // 1. element id -> labels pointed to this id
-    // 2. by attr "aria-labelledby" -> only one label with this id
-    let linkedElements = new Array();
-    const elementId = currentEle.getAttribute("id");
-    if (elementId) {
-      try {
-        linkedElements = [
-          ...document.querySelectorAll(`label[for="${elementId}"]`),
-        ];
-      } catch (e) {
-        _jsConsoleLog("failed to query labels: ", e);
-      }
-    }
-    const labelled = currentEle.getAttribute("aria-labelledby");
-    if (labelled) {
-      const label = document.getElementById(labelled);
-      if (label) {
-        linkedElements.push(label);
-      }
-    }
-    const described = currentEle.getAttribute("aria-describedby");
-    if (described) {
-      const describe = document.getElementById(described);
-      if (describe) {
-        linkedElements.push(describe);
-      }
-    }
-
-    const fullContext = new Array();
-    for (let i = 0; i < linkedElements.length; i++) {
-      const linked = linkedElements[i];
-      // if the element is a child of the label, we should stop to get context before the element
-      const content = getElementContent(linked, currentEle);
-      if (content) {
-        fullContext.push(content);
-      }
-    }
-
-    const context = fullContext.join(";");
-    if (context.length > 0) {
-      ctx.push(context);
-    }
-    return ctx;
-  };
-
-  const getContextByTable = (element, ctx) => {
-    // pass element's parent's context to the element for listed tags
-    let tagsWithDirectParentContext = new Set(["a"]);
-    // if the element is a child of a td, th, or tr, then pass the grandparent's context to the element
-    let parentTagsThatDelegateParentContext = new Set(["td", "th", "tr"]);
-    if (tagsWithDirectParentContext.has(element.tagName)) {
-      let curElement = getDOMElementBySkyvenElement(element);
-      if (!curElement) {
-        return ctx;
-      }
-      let parentElement = curElement.parentElement;
-      if (!parentElement) {
-        return ctx;
-      }
-      if (
-        parentTagsThatDelegateParentContext.has(
-          parentElement.tagName.toLowerCase(),
-        )
-      ) {
-        let grandParentElement = parentElement.parentElement;
-        if (grandParentElement) {
-          let context = getElementContext(grandParentElement, curElement);
-          if (context.length > 0) {
-            ctx.push(context);
-          }
-        }
-      }
-      let context = getElementContext(parentElement, curElement);
-      if (context.length > 0) {
-        ctx.push(context);
-      }
-    }
-    return ctx;
-  };
-
   const trimDuplicatedText = (element) => {
     if (element.children.length === 0 && !element.options) {
       return;
@@ -1770,26 +1736,6 @@ async function buildElementTree(
     element.text = element.text.replace(/;+/g, ";");
     // trimleft and trimright ";"
     element.text = element.text.replace(new RegExp(`^;+|;+$`, "g"), "");
-  };
-
-  const trimDuplicatedContext = (element) => {
-    if (element.children.length === 0) {
-      return;
-    }
-
-    // DFS to delete duplicated context
-    element.children.forEach((child) => {
-      trimDuplicatedContext(child);
-      if (element.context === child.context) {
-        delete child.context;
-      }
-      if (child.context) {
-        child.context = child.context.replace(element.text, "");
-        if (!child.context) {
-          delete child.context;
-        }
-      }
-    });
   };
 
   // some elements without children nodes should be removed out, such as <label>
@@ -1817,8 +1763,8 @@ async function buildElementTree(
   };
 
   let current_xpath = null;
-  if (starter === document.body) {
-    current_xpath = "/html[1]";
+  if (starter === document.documentElement) {
+    current_xpath = "";
   }
 
   // setup before parsing the dom
@@ -1837,48 +1783,11 @@ async function buildElementTree(
         element,
       );
     }
-
-    let ctxList = [];
-    if (needContext) {
-      try {
-        ctxList = getContextByLinked(element, ctxList);
-      } catch (e) {
-        _jsConsoleError("failed to get context by linked: ", e);
-      }
-
-      try {
-        ctxList = getContextByParent(element, ctxList);
-      } catch (e) {
-        _jsConsoleError("failed to get context by parent: ", e);
-      }
-
-      try {
-        ctxList = getContextByTable(element, ctxList);
-      } catch (e) {
-        _jsConsoleError("failed to get context by table: ", e);
-      }
-      const context = ctxList.join(";");
-      if (context && context.length <= 5000) {
-        element.context = context;
-      }
-      // FIXME: skip <a> for now to prevent navigating to other page by mistake
-      if (element.tagName !== "a" && checkStringIncludeRequire(context)) {
-        if (
-          !element.attributes["required"] &&
-          !element.attributes["aria-required"]
-        ) {
-          element.attributes["required"] = true;
-        }
-      }
-    }
   }
 
   resultArray = removeOrphanNode(resultArray);
   resultArray.forEach((root) => {
     trimDuplicatedText(root);
-    if (needContext) {
-      trimDuplicatedContext(root);
-    }
   });
 
   return [elements, resultArray];
@@ -1886,15 +1795,26 @@ async function buildElementTree(
 
 function drawBoundingBoxes(elements) {
   // draw a red border around the elements
+  DomUtils.clearVisibleClientRectCache();
+  elements.forEach((element) => {
+    const ele = getDOMElementBySkyvenElement(element);
+    element.rect = ele ? DomUtils.getVisibleClientRect(ele, true) : null;
+  });
   var groups = groupElementsVisually(elements);
   var hintMarkers = createHintMarkersForGroups(groups);
   addHintMarkersToPage(hintMarkers);
+  DomUtils.clearVisibleClientRectCache();
 }
 
 async function buildElementsAndDrawBoundingBoxes(
   frame = "main.frame",
   frame_index = undefined,
 ) {
+  if (DomUtils.elementListCache.length > 0) {
+    drawBoundingBoxes(DomUtils.elementListCache);
+    return;
+  }
+  _jsConsoleWarn("no element list cache, drawBoundingBoxes from scratch");
   var elementsAndResultArray = await buildTreeFromBody(frame, frame_index);
   drawBoundingBoxes(elementsAndResultArray[0]);
 }
@@ -1916,37 +1836,86 @@ function getCaptchaSolves() {
 }
 
 function groupElementsVisually(elements) {
-  const groups = [];
-  // o n^2
-  // go through each hint and see if it overlaps with any other hints, if it does, add it to the group of the other hint
-  // *** if we start from the bigger elements (top -> bottom) we can avoid merging groups
-  for (const element of elements) {
-    if (!element.rect) {
-      continue;
-    }
-    const group = groups.find((group) => {
-      for (const groupElement of group.elements) {
-        if (Rect.intersects(groupElement.rect, element.rect)) {
-          return true;
-        }
-      }
-      return false;
-    });
-    if (group) {
-      group.elements.push(element);
-    } else {
-      groups.push({
-        elements: [element],
-      });
-    }
-  }
+  // Quadtree O(n log n)
+  const validElements = elements.filter((element) => element.rect);
 
-  // go through each group and create a rectangle that encompasses all the hints in the group
-  for (const group of groups) {
+  if (validElements.length === 0) return [];
+
+  // Calculate bounds
+  const bounds = calculateBounds(validElements);
+
+  // Create quadtree
+  const quadTree = new QuadTreeNode(bounds);
+  validElements.forEach((element) => quadTree.insert(element));
+
+  const groups = [];
+  const processed = new Set();
+
+  for (const element of validElements) {
+    if (processed.has(element)) continue;
+
+    const group = { elements: [element], rect: null };
+    processed.add(element);
+
+    // Find all elements overlapping with current element
+    const overlapping = findOverlappingElements(
+      element,
+      validElements,
+      quadTree,
+      processed,
+    );
+
+    for (const overlappingElement of overlapping) {
+      group.elements.push(overlappingElement);
+      processed.add(overlappingElement);
+    }
+
     group.rect = createRectangleForGroup(group);
+    groups.push(group);
   }
 
   return groups;
+}
+
+// Helper functions
+function calculateBounds(elements) {
+  const rects = elements.map((el) => el.rect);
+  const left = Math.min(...rects.map((r) => r.left));
+  const top = Math.min(...rects.map((r) => r.top));
+  const right = Math.max(...rects.map((r) => r.right));
+  const bottom = Math.max(...rects.map((r) => r.bottom));
+
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function findOverlappingElements(element, allElements, quadTree, processed) {
+  const result = [];
+  const queue = [element];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+
+    // Use quadtree to query nearby elements
+    const nearby = quadTree.query(current.rect);
+
+    for (const nearbyElement of nearby) {
+      if (
+        !processed.has(nearbyElement) &&
+        nearbyElement !== current &&
+        Rect.intersects(current.rect, nearbyElement.rect)
+      ) {
+        result.push(nearbyElement);
+        processed.add(nearbyElement);
+        queue.push(nearbyElement);
+      }
+    }
+  }
+  return result;
 }
 
 function createRectangleForGroup(group) {
@@ -2105,6 +2074,13 @@ async function safeScrollToTop(
     await buildElementsAndDrawBoundingBoxes(frame, frame_index);
   }
   return window.scrollY;
+}
+
+function getScrollWidthAndHeight() {
+  return [
+    document.documentElement.scrollWidth,
+    document.documentElement.scrollHeight,
+  ];
 }
 
 function getScrollXY() {
@@ -2267,13 +2243,13 @@ async function getHoverStylesMap() {
 
           let newLink = null;
           try {
+            const oldLink = sheet.ownerNode;
+            const url = new URL(sheet.href);
             _jsConsoleLog("recreating the link element: ", sheet.href);
-            const oldLink = document.querySelector(
-              `link[href="${sheet.href}"]`,
-            );
             newLink = document.createElement("link");
             newLink.rel = "stylesheet";
-            newLink.href = oldLink.href + "?v=" + Date.now(); // to void cache
+            url.searchParams.set("v", Date.now());
+            newLink.href = url.toString();
             newLink.crossOrigin = "anonymous";
             // until the new link loaded, removing the old one
             document.head.append(newLink);
@@ -2403,7 +2379,6 @@ async function addIncrementalNodeToMap(parentNode, childrenNode) {
           child,
           "",
           true,
-          false,
           window.globalHoverStylesMap,
         );
         if (newNodeTree.length > 0) {
@@ -2571,8 +2546,10 @@ async function stopGlobalIncrementalObserver() {
   window.globalObserverForDOMIncrement.disconnect();
   window.globalObserverForDOMIncrement.takeRecords(); // cleanup the older data
   while (
+    window.globalParsedElementCounter &&
+    window.globalOneTimeIncrementElements &&
     (await window.globalParsedElementCounter.get()) <
-    window.globalOneTimeIncrementElements.length
+      window.globalOneTimeIncrementElements.length
   ) {
     await asyncSleepFor(100);
   }
@@ -2673,6 +2650,17 @@ async function getIncrementElements(wait_until_finished = true) {
   }
 
   return [Array.from(idToElement.values()), cleanedTreeList];
+}
+
+function isAnimationFinished() {
+  const animations = document.getAnimations({ subtree: true });
+  const unfinishedAnimations = animations.filter(
+    (a) => a.playState !== "finished",
+  );
+  if (!unfinishedAnimations || unfinishedAnimations.length == 0) {
+    return true;
+  }
+  return false;
 }
 
 /**

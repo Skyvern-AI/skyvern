@@ -21,6 +21,7 @@ class ParameterType(StrEnum):
     ONEPASSWORD = "onepassword"
     OUTPUT = "output"
     CREDENTIAL = "credential"
+    AZURE_SECRET = "azure_secret"
 
 
 class Parameter(BaseModel, abc.ABC):
@@ -43,6 +44,18 @@ class AWSSecretParameter(Parameter):
     aws_secret_parameter_id: str
     workflow_id: str
     aws_key: str
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
+class AzureSecretParameter(Parameter):
+    parameter_type: Literal[ParameterType.AZURE_SECRET] = ParameterType.AZURE_SECRET
+
+    azure_secret_parameter_id: str
+    workflow_id: str
+    azure_key: str
 
     created_at: datetime
     modified_at: datetime
@@ -214,6 +227,7 @@ ParameterSubclasses = Union[
     WorkflowParameter,
     ContextParameter,
     AWSSecretParameter,
+    AzureSecretParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
     BitwardenCreditCardDataParameter,

@@ -9,6 +9,7 @@ import pydantic
 class UrlBlockYaml(UniversalBaseModel):
     label: str
     continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     url: str
 
     if IS_PYDANTIC_V2:

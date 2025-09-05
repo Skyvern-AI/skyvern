@@ -21,12 +21,11 @@ from skyvern.webeye.schemas import BrowserSessionResponse
     response_model=BrowserSessionResponse,
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "create_browser_session",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CREATE_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
-    description="Create a new browser session",
-    summary="Create a new browser session",
+    description="Create a browser session that persists across multiple runs",
+    summary="Create a session",
     responses={
         200: {"description": "Successfully created browser session"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
@@ -52,12 +51,11 @@ async def create_browser_session(
     "/browser_sessions/{browser_session_id}/close",
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "close_browser_session",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CLOSE_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
-    description="Close a browser session",
-    summary="Close a browser session",
+    description="Close a session. Once closed, the session cannot be used again.",
+    summary="Close a session",
     responses={
         200: {"description": "Successfully closed browser session"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
@@ -88,12 +86,11 @@ async def close_browser_session(
     response_model=BrowserSessionResponse,
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_session",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSION_CODE_SAMPLE}]}],
     },
-    description="Get details about a specific browser session by ID",
-    summary="Get browser session details",
+    description="Get details about a specific browser session, including the browser address for cdp connection.",
+    summary="Get a session",
     responses={
         200: {"description": "Successfully retrieved browser session details"},
         404: {"description": "Browser session not found"},
@@ -126,12 +123,11 @@ async def get_browser_session(
     response_model=list[BrowserSessionResponse],
     tags=["Browser Sessions"],
     openapi_extra={
-        "x-fern-sdk-group-name": "browser_session",
         "x-fern-sdk-method-name": "get_browser_sessions",
         "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_BROWSER_SESSIONS_CODE_SAMPLE}]}],
     },
     description="Get all active browser sessions for the organization",
-    summary="Get all active browser sessions",
+    summary="Get active browser sessions",
     responses={
         200: {"description": "Successfully retrieved all active browser sessions"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},

@@ -107,6 +107,7 @@ function useActions({ id }: Props): {
                 success: actionResult?.[0]?.success ?? false,
                 stepId: step.step_id,
                 index,
+                created_by: action.created_by,
               };
             });
             return actions;
@@ -118,9 +119,12 @@ function useActions({ id }: Props): {
             confidence: action.confidence_float ?? undefined,
             input: action.response ?? "",
             type: action.action_type,
-            success: action.status === Status.Completed,
+            success:
+              action.status === Status.Completed ||
+              action.status === Status.Skipped,
             stepId: action.step_id ?? "",
             index: action.action_order ?? 0,
+            created_by: action.created_by,
           };
         });
 

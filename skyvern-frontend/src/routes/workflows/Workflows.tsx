@@ -49,10 +49,7 @@ import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
-  workflow_definition: {
-    blocks: [],
-    parameters: [],
-  },
+  workflow_definition: { blocks: [], parameters: [] },
 };
 
 function Workflows() {
@@ -63,13 +60,19 @@ function Workflows() {
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
+  const itemsPerPage = searchParams.get("page_size")
+    ? Number(searchParams.get("page_size"))
+    : 5;
 
-  const { data: workflows, isLoading } = useQuery<Array<WorkflowApiResponse>>({
-    queryKey: ["workflows", debouncedSearch, page],
+  const { data: workflows = [], isLoading } = useQuery<
+    Array<WorkflowApiResponse>
+  >({
+    queryKey: ["workflows", debouncedSearch, page, itemsPerPage],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
       params.append("page", String(page));
+      params.append("page_size", String(itemsPerPage));
       params.append("only_workflows", "true");
       params.append("title", debouncedSearch);
       return client
@@ -79,6 +82,27 @@ function Workflows() {
         .then((response) => response.data);
     },
   });
+
+  const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
+    queryKey: ["workflows", debouncedSearch, page + 1, itemsPerPage],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      const params = new URLSearchParams();
+      params.append("page", String(page + 1));
+      params.append("page_size", String(itemsPerPage));
+      params.append("only_workflows", "true");
+      params.append("title", debouncedSearch);
+      return client
+        .get(`/workflows`, {
+          params,
+        })
+        .then((response) => response.data);
+    },
+    enabled: workflows.length === itemsPerPage,
+  });
+
+  const isNextDisabled =
+    isLoading || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -108,6 +132,22 @@ function Workflows() {
       return;
     }
     navigate(path);
+  }
+
+  function setParamPatch(patch: Record<string, string>) {
+    const params = new URLSearchParams(searchParams);
+    Object.entries(patch).forEach(([k, v]) => params.set(k, v));
+    setSearchParams(params, { replace: true });
+  }
+
+  function handlePreviousPage() {
+    if (page === 1) return;
+    setParamPatch({ page: String(page - 1) });
+  }
+
+  function handleNextPage() {
+    if (isNextDisabled) return;
+    setParamPatch({ page: String(page + 1) });
   }
 
   return (
@@ -151,6 +191,7 @@ function Workflows() {
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value);
+                setParamPatch({ page: "1" });
               }}
               placeholder="Search by title..."
               className="w-48 pl-9 lg:w-72"
@@ -236,7 +277,7 @@ function Workflows() {
                                   onClick={(event) => {
                                     handleIconClick(
                                       event,
-                                      `/workflows/${workflow.workflow_permanent_id}/edit`,
+                                      `/workflows/${workflow.workflow_permanent_id}/debug`,
                                     );
                                   }}
                                 >
@@ -274,35 +315,50 @@ function Workflows() {
               )}
             </TableBody>
           </Table>
-          <Pagination className="pt-2">
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({ "cursor-not-allowed": page === 1 })}
-                  onClick={() => {
-                    if (page === 1) {
-                      return;
-                    }
-                    const params = new URLSearchParams();
-                    params.set("page", String(Math.max(1, page - 1)));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{page}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  onClick={() => {
-                    const params = new URLSearchParams();
-                    params.set("page", String(page + 1));
-                    setSearchParams(params, { replace: true });
-                  }}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
+          <div className="relative px-3 py-3">
+            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <span className="text-slate-400">Items per page</span>
+              <select
+                className="h-9 rounded-md border border-slate-300 bg-background px-3"
+                value={itemsPerPage}
+                onChange={(e) => {
+                  const next = Number(e.target.value);
+                  const params = new URLSearchParams(searchParams);
+                  params.set("page_size", String(next));
+                  params.set("page", "1");
+                  setSearchParams(params, { replace: true });
+                }}
+              >
+                <option value={5}>5</option>
+                <option value={10}>10</option>
+                <option value={20}>20</option>
+                <option value={50}>50</option>
+              </select>
+            </div>
+            <Pagination className="pt-0">
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    className={cn({
+                      "cursor-not-allowed opacity-50": page === 1,
+                    })}
+                    onClick={handlePreviousPage}
+                  />
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationLink>{page}</PaginationLink>
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationNext
+                    className={cn({
+                      "cursor-not-allowed opacity-50": isNextDisabled,
+                    })}
+                    onClick={handleNextPage}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
+          </div>
         </div>
         <WorkflowTemplates />
       </div>

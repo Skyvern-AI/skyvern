@@ -9,10 +9,10 @@ Skyvern Browser Session is a way to persist the real-time state of the browser, 
 - You have multiple continuous tasks that need to interact with the browser in real-time without much delay. For example, you are developing a phone agent for your customer support center and your agent needs access to real time information in the browser.
 - You have several related tasks that may need to be executed but with interruptions in between. For example, you are developing an shopping agent that needs human in the loop to help fulfill the purchase.
 
-Skyvern Browser Sessions are currently only available via [API & SDK](/api-reference/api-reference/browser-session/create-browser-session).
+Skyvern Browser Sessions are currently only available via [API & SDK](/api-reference/api-reference/browser-sessions/create-browser-session).
 
 ## Create a Browser Session
-- [API doc](/api-reference/api-reference/browser-session/create-browser-session)
+- [API doc](/api-reference/api-reference/browser-sessions/create-browser-session)
 
 ```python
 from skyvern import Skyvern
@@ -27,7 +27,7 @@ browser_session = await skyvern.create_browser_session(
 - The `browser_session_id` the session ID you should note.
 
 ## Get A Browser Session
-- [API doc](/api-reference/api-reference/browser-session/get-browser-session)
+- [API doc](/api-reference/api-reference/browser-sessions/get-browser-session)
 
 ```python
 from skyvern import Skyvern
@@ -39,7 +39,7 @@ browser_session = await skyvern.get_browser_session(
 ```
 
 ## Close A Browser Session
-- [API doc](/api-reference/api-reference/browser-session/close-browser-session)
+- [API doc](/api-reference/api-reference/browser-sessions/close-browser-session)
 
 ```python
 from skyvern import Skyvern

@@ -18,8 +18,11 @@ class WorkflowCreateYamlRequest(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     persist_browser_session: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     workflow_definition: WorkflowDefinitionYaml
     is_saved_task: typing.Optional[bool] = None
+    max_screenshot_scrolls: typing.Optional[int] = None
+    extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     status: typing.Optional[WorkflowStatus] = None
 
     if IS_PYDANTIC_V2:

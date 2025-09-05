@@ -71,8 +71,13 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import OnePasswordConstants
+from skyvern.forge.sdk.trace import TraceManager
 from skyvern.services.task_v1_service import is_cua_task
-from skyvern.utils.prompt_engine import CheckPhoneNumberFormatResponse, load_prompt_with_elements
+from skyvern.utils.prompt_engine import (
+    CheckDateFormatResponse,
+    CheckPhoneNumberFormatResponse,
+    load_prompt_with_elements,
+)
 from skyvern.webeye.actions import actions, handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -80,6 +85,7 @@ from skyvern.webeye.actions.actions import (
     ActionStatus,
     CheckboxAction,
     ClickAction,
+    CompleteVerifyResult,
     InputOrSelectContext,
     InputTextAction,
     ScrapeResult,
@@ -293,6 +299,43 @@ async def check_phone_number_format(
     return check_phone_number_format_response.recommended_phone_number
 
 
+async def check_date_format(
+    value: str,
+    action: actions.InputTextAction,
+    skyvern_element: SkyvernElement,
+    task: Task,
+    step: Step,
+) -> str:
+    # check the date format
+    LOG.info(
+        "Input is a date input, trigger date format checking",
+        action=action,
+        element_id=skyvern_element.get_id(),
+    )
+
+    prompt = prompt_engine.load_prompt(
+        template="check-date-format",
+        current_value=value,
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+
+    json_response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="check-date-format")
+
+    check_date_format_response = CheckDateFormatResponse.model_validate(json_response)
+    if check_date_format_response.is_current_format_correct or not check_date_format_response.recommended_date:
+        return value
+
+    LOG.info(
+        "The current date format is incorrect, using the recommended date",
+        action=action,
+        element_id=skyvern_element.get_id(),
+        recommended_date=check_date_format_response.recommended_date,
+    )
+    return check_date_format_response.recommended_date
+
+
 class AutoCompletionResult(BaseModel):
     auto_completion_attempt: bool = False
     incremental_elements: list[dict] = []
@@ -340,6 +383,7 @@ class ActionHandler:
         cls._teardown_action_types[action_type] = handler
 
     @staticmethod
+    @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
     async def handle_action(
         scraped_page: ScrapedPage,
         task: Task,
@@ -459,6 +503,7 @@ def check_for_invalid_web_action(
     return []
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_solve_captcha_action(
     action: actions.SolveCaptchaAction,
     page: Page,
@@ -474,6 +519,7 @@ async def handle_solve_captcha_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_click_action(
     action: actions.ClickAction,
     page: Page,
@@ -622,6 +668,7 @@ async def handle_click_action(
             try:
                 if sequential_click_result := await handle_sequential_click_for_dropdown(
                     action=action,
+                    action_history=results,
                     anchor_element=skyvern_element,
                     dom=dom,
                     page=page,
@@ -650,8 +697,10 @@ async def handle_click_action(
     return results
 
 
+@TraceManager.traced_async(ignore_inputs=["anchor_element", "scraped_page", "page", "incremental_scraped", "dom"])
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
+    action_history: list[ActionResult],
     anchor_element: SkyvernElement,
     dom: DomUtil,
     page: Page,
@@ -673,6 +722,51 @@ async def handle_sequential_click_for_dropdown(
         return None
 
     LOG.info("Detected new element after clicking", action=action)
+    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+
+    dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
+    new_interactable_element_ids = [
+        element_id
+        for element_id in new_element_ids
+        if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+    ]
+
+    action_history_str = ""
+    if action_history and len(action_history) > 0:
+        result = action_history[-1]
+        action_result = {
+            "action_type": action.action_type,
+            "reasoning": action.reasoning,
+            "result": result.success,
+        }
+        action_history_str = json.dumps(action_result)
+
+    prompt = load_prompt_with_elements(
+        element_tree_builder=scraped_page_after_open,
+        prompt_engine=prompt_engine,
+        template_name="check-user-goal",
+        navigation_goal=task.navigation_goal,
+        navigation_payload=task.navigation_payload,
+        new_elements_ids=new_element_ids,
+        without_screenshots=True,
+        action_history=action_history_str,
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+    response = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt,
+        step=step,
+        prompt_name="check-user-goal",
+    )
+    verify_result = CompleteVerifyResult.model_validate(response)
+    if verify_result.user_goal_achieved:
+        LOG.info(
+            "User goal achieved, exiting the sequential click logic",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        return None
+
     dropdown_menu_element = await locate_dropdown_menu(
         current_anchor_element=anchor_element,
         incremental_scraped=incremental_scraped,
@@ -688,7 +782,8 @@ async def handle_sequential_click_for_dropdown(
             reasoning=action.reasoning, intention=action.intention, element_id=action.element_id
         ),
         step=step,
-        scraped_page=scraped_page,
+        element_tree_builder=scraped_page,
+        skyvern_element=anchor_element,
     )
 
     if dropdown_select_context.is_date_related:
@@ -719,9 +814,12 @@ async def handle_sequential_click_for_dropdown(
         scraped_page=scraped_page,
         step=step,
         task=task,
+        scraped_page_after_open=scraped_page_after_open,
+        new_interactable_element_ids=new_interactable_element_ids,
     )
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_click_to_download_file_action(
     action: actions.ClickAction,
     page: Page,
@@ -733,8 +831,17 @@ async def handle_click_to_download_file_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
-    download_dir = Path(get_download_dir(workflow_run_id=task.workflow_run_id, task_id=task.task_id))
+    context = skyvern_context.current()
+    download_dir = Path(
+        get_download_dir(run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id)
+    )
     list_files_before = list_files_in_directory(download_dir)
+    if task.browser_session_id:
+        files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+            organization_id=task.organization_id, browser_session_id=task.browser_session_id
+        )
+        list_files_before = list_files_before + files_in_browser_session
+
     LOG.info(
         "Number of files in download directory before click",
         num_downloaded_files_before=len(list_files_before),
@@ -767,6 +874,12 @@ async def handle_click_to_download_file_action(
         async with asyncio.timeout(BROWSER_DOWNLOAD_MAX_WAIT_TIME):
             while True:
                 list_files_after = list_files_in_directory(download_dir)
+                if task.browser_session_id:
+                    files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                    )
+                    list_files_after = list_files_after + files_in_browser_session
+
                 if len(list_files_after) > len(list_files_before):
                     LOG.info(
                         "Found new files in download directory after click",
@@ -790,6 +903,12 @@ async def handle_click_to_download_file_action(
 
     # check if there's any file is still downloading
     downloading_files = list_downloading_files_in_directory(download_dir)
+    if task.browser_session_id:
+        files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
+            organization_id=task.organization_id, browser_session_id=task.browser_session_id
+        )
+        downloading_files = downloading_files + files_in_browser_session
+
     if len(downloading_files) == 0:
         return [ActionSuccess(download_triggered=True)]
 
@@ -814,6 +933,7 @@ async def handle_click_to_download_file_action(
     return [ActionSuccess(download_triggered=True)]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_input_text_action(
     action: actions.InputTextAction,
     page: Page,
@@ -826,7 +946,6 @@ async def handle_input_text_action(
         await page.keyboard.type(action.text)
         return [ActionSuccess()]
 
-    input_or_select_context: InputOrSelectContext | None = None
     dom = DomUtil(scraped_page, page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
@@ -875,8 +994,20 @@ async def handle_input_text_action(
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
+
+    input_or_select_context = await _get_input_or_select_context(
+        action=action,
+        element_tree_builder=scraped_page,
+        skyvern_element=skyvern_element,
+        step=step,
+    )
+
     # check if it's selectable
-    if skyvern_element.get_tag_name() == InteractiveElement.INPUT and not await skyvern_element.is_raw_input():
+    if (
+        not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
+        and skyvern_element.get_tag_name() == InteractiveElement.INPUT
+        and not await skyvern_element.is_raw_input()
+    ):
         await skyvern_element.scroll_into_view()
         # press arrowdown to watch if there's any options popping up
         await incremental_scraped.start_listen_dom_increment(await skyvern_element.get_element_handler())
@@ -902,8 +1033,7 @@ async def handle_input_text_action(
                 action=action,
             )
 
-        await asyncio.sleep(5)
-
+        await skyvern_frame.safe_wait_for_animation_end()
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -923,12 +1053,6 @@ async def handle_input_text_action(
             try_to_quit_dropdown = True
             try:
                 # TODO: we don't select by value for the auto completion detect case
-                if input_or_select_context is None:
-                    input_or_select_context = await _get_input_or_select_context(
-                        action=action,
-                        scraped_page=scraped_page,
-                        step=step,
-                    )
 
                 select_result = await sequentially_select_from_dropdown(
                     action=select_action,
@@ -1025,8 +1149,21 @@ async def handle_input_text_action(
                 exc_info=True,
             )
 
+    # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
+    # we need find a better way to detect the attribute in the future
+    class_name: str | None = await skyvern_element.get_attr("class")
+    if class_name and "blinking-cursor" in class_name:
+        if is_totp_value:
+            text = generate_totp_value(task=task, parameter=action.text)
+        await skyvern_element.press_fill(text=text)
+        return [ActionSuccess()]
+
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
-    if not await skyvern_element.is_spinbtn_input():
+    # run `Locator.clear()` when:
+    # 1. the element is not a spin button
+    #   1.1. the element has a value attribute
+    #   1.2. the element is not common input tag
+    if not await skyvern_element.is_spinbtn_input() and (current_text or (tag_name not in COMMON_INPUT_TAGS)):
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
@@ -1034,20 +1171,10 @@ async def handle_input_text_action(
             return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
         except Exception:
             LOG.warning("Failed to clear the input field", action=action, exc_info=True)
+            return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
-            # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
-            # we need find a better way to detect the attribute in the future
-            class_name: str | None = await skyvern_element.get_attr("class")
-            if not class_name or "blinking-cursor" not in class_name:
-                return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
-
-            if is_totp_value:
-                text = generate_totp_value(task=task, parameter=action.text)
-            await skyvern_element.press_fill(text=text)
-            return [ActionSuccess()]
-
-    # wait 2s for blocking element to show up
-    await asyncio.sleep(2)
+    # wait for blocking element to show up
+    await skyvern_frame.safe_wait_for_animation_end()
     try:
         blocking_element, exist = await skyvern_element.find_blocking_element(
             dom=dom, incremental_page=incremental_scraped
@@ -1080,17 +1207,31 @@ async def handle_input_text_action(
         if len(text) == 0:
             return [ActionSuccess()]
 
-        if not await skyvern_element.is_raw_input():
-            if input_or_select_context is None:
-                input_or_select_context = await _get_input_or_select_context(
+        if tag_name == InteractiveElement.INPUT and await skyvern_element.get_attr("type") == "date":
+            try:
+                text = await check_date_format(
+                    value=text,
                     action=action,
-                    scraped_page=scraped_page,
+                    skyvern_element=skyvern_element,
+                    task=task,
                     step=step,
                 )
+            except Exception:
+                LOG.warning(
+                    "Failed to check the date format, using the original text to fill in the date input",
+                    text=text,
+                    action=action,
+                    exc_info=True,
+                )
 
+            await skyvern_element.input_fill(text=text)
+            return [ActionSuccess()]
+
+        if not await skyvern_element.is_raw_input():
             if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
+                    scraped_page=scraped_page,
                     page=page,
                     dom=dom,
                     text=text,
@@ -1135,6 +1276,7 @@ async def handle_input_text_action(
             await skyvern_element.press_key("Tab")
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
     page: Page,
@@ -1212,6 +1354,7 @@ async def handle_upload_file_action(
 
 
 # This function is deprecated. Downloads are handled by the click action handler now.
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
     page: Page,
@@ -1253,6 +1396,7 @@ async def handle_download_file_action(
     return [ActionSuccess(data={"file_path": full_file_path})]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_null_action(
     action: actions.NullAction,
     page: Page,
@@ -1263,6 +1407,7 @@ async def handle_null_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_select_option_action(
     action: actions.SelectOptionAction,
     page: Page,
@@ -1449,8 +1594,8 @@ async def handle_select_option_action(
         await skyvern_element.scroll_into_view()
 
         await skyvern_element.click(page=page, dom=dom, timeout=timeout)
-        # wait 5s for options to load
-        await asyncio.sleep(5)
+        # wait for options to load
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
@@ -1467,8 +1612,8 @@ async def handle_select_option_action(
             )
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
-            # wait 5s for options to load
-            await asyncio.sleep(5)
+            # wait for options to load
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
                     task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -1476,7 +1621,7 @@ async def handle_select_option_action(
             )
 
         input_or_select_context = await _get_input_or_select_context(
-            action=action, scraped_page=scraped_page, step=step
+            action=action, element_tree_builder=scraped_page, step=step, skyvern_element=skyvern_element
         )
 
         if len(incremental_element) == 0:
@@ -1564,7 +1709,8 @@ async def handle_select_option_action(
             )
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
-        await asyncio.sleep(5)
+
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
         is_open = True
 
         result = await select_from_dropdown_by_value(
@@ -1600,6 +1746,7 @@ async def handle_select_option_action(
         await incremental_scraped.stop_listen_dom_increment()
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_checkbox_action(
     action: actions.CheckboxAction,
     page: Page,
@@ -1628,6 +1775,7 @@ async def handle_checkbox_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_wait_action(
     action: actions.WaitAction,
     page: Page,
@@ -1639,6 +1787,7 @@ async def handle_wait_action(
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_terminate_action(
     action: actions.TerminateAction,
     page: Page,
@@ -1649,6 +1798,7 @@ async def handle_terminate_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_complete_action(
     action: actions.CompleteAction,
     page: Page,
@@ -1694,6 +1844,7 @@ async def handle_complete_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_extract_action(
     action: actions.ExtractAction,
     page: Page,
@@ -1715,6 +1866,7 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_scroll_action(
     action: actions.ScrollAction,
     page: Page,
@@ -1728,6 +1880,7 @@ async def handle_scroll_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_keypress_action(
     action: actions.KeypressAction,
     page: Page,
@@ -1735,58 +1888,11 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    updated_keys = []
-    for key in action.keys:
-        key_lower_case = key.lower()
-        if key_lower_case in ("enter", "return"):
-            updated_keys.append("Enter")
-        elif key_lower_case == "space":
-            updated_keys.append(" ")
-        elif key_lower_case == "ctrl":
-            updated_keys.append("Control")
-        elif key_lower_case == "backspace":
-            updated_keys.append("Backspace")
-        elif key_lower_case == "pagedown":
-            updated_keys.append("PageDown")
-        elif key_lower_case == "pageup":
-            updated_keys.append("PageUp")
-        elif key_lower_case == "tab":
-            updated_keys.append("Tab")
-        elif key_lower_case == "shift":
-            updated_keys.append("Shift")
-        elif key_lower_case in ("arrowleft", "left"):
-            updated_keys.append("ArrowLeft")
-        elif key_lower_case in ("arrowright", "right"):
-            updated_keys.append("ArrowRight")
-        elif key_lower_case in ("arrowup", "up"):
-            updated_keys.append("ArrowUp")
-        elif key_lower_case in ("arrowdown", "down"):
-            updated_keys.append("ArrowDown")
-        elif key_lower_case == "home":
-            updated_keys.append("Home")
-        elif key_lower_case == "end":
-            updated_keys.append("End")
-        elif key_lower_case == "delete":
-            updated_keys.append("Delete")
-        elif key_lower_case == "ecs":
-            updated_keys.append("Escape")
-        elif key_lower_case == "alt":
-            updated_keys.append("Alt")
-        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
-            # Handle function keys: f1 -> F1, f5 -> F5, etc.
-            updated_keys.append(key_lower_case.upper())
-        else:
-            updated_keys.append(key)
-    keypress_str = "+".join(updated_keys)
-    if action.hold:
-        await page.keyboard.down(keypress_str)
-        await asyncio.sleep(action.duration)
-        await page.keyboard.up(keypress_str)
-    else:
-        await page.keyboard.press(keypress_str)
+    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration)
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_move_action(
     action: actions.MoveAction,
     page: Page,
@@ -1798,6 +1904,7 @@ async def handle_move_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_drag_action(
     action: actions.DragAction,
     page: Page,
@@ -1805,16 +1912,11 @@ async def handle_drag_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if action.start_x and action.start_y:
-        await page.mouse.move(action.start_x, action.start_y)
-    await page.mouse.down()
-    for point in action.path:
-        x, y = point[0], point[1]
-        await page.mouse.move(x, y)
-    await page.mouse.up()
+    await handler_utils.drag(page, action.start_x, action.start_y, action.path)
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_verification_code_action(
     action: actions.VerificationCodeAction,
     page: Page,
@@ -1833,6 +1935,7 @@ async def handle_verification_code_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_left_mouse_action(
     action: actions.LeftMouseAction,
     page: Page,
@@ -1840,12 +1943,7 @@ async def handle_left_mouse_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if action.x and action.y:
-        await page.mouse.move(action.x, action.y)
-    if action.direction == "down":
-        await page.mouse.down()
-    elif action.direction == "up":
-        await page.mouse.up()
+    await handler_utils.left_mouse(page, action.x, action.y, action.direction)
     return [ActionSuccess()]
 
 
@@ -1891,8 +1989,10 @@ def generate_totp_value(task: Task, parameter: str) -> str:
     workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
     totp_secret_key = workflow_run_context.totp_secret_value_key(parameter)
     totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
-    totp_secret_no_whitespace = "".join(totp_secret.split())
-    return pyotp.TOTP(totp_secret_no_whitespace).now()
+    if not totp_secret:
+        LOG.warning("No TOTP secret found, returning the parameter value as is", parameter=parameter)
+        return parameter
+    return pyotp.TOTP(totp_secret).now()
 
 
 async def chain_click(
@@ -2033,6 +2133,22 @@ async def chain_click(
                 )
                 return action_results
 
+            try:
+                LOG.info(
+                    "Chain click: element is blocked by an non-interactable element, try to click by the coordinates",
+                    task_id=task.task_id,
+                    action=action,
+                    element=str(skyvern_element),
+                    locator=locator,
+                )
+                await skyvern_element.coordinate_click(page=page)
+                action_results.append(ActionSuccess())
+                return action_results
+            except Exception as e:
+                action_results.append(
+                    ActionFailure(FailToClick(action.element_id, anchor="coordinate_click", msg=str(e)))
+                )
+
             LOG.info(
                 "Chain click: element is blocked by an non-interactable element, going to use javascript click instead of playwright click",
                 task_id=task.task_id,
@@ -2092,9 +2208,11 @@ async def chain_click(
             return [ActionFailure(WrongElementToUploadFile(action.element_id))]
 
 
+@TraceManager.traced_async(ignore_inputs=["context", "page", "dom", "text", "skyvern_element", "preserved_elements"])
 async def choose_auto_completion_dropdown(
     context: InputOrSelectContext,
     page: Page,
+    scraped_page: ScrapedPage,
     dom: DomUtil,
     text: str,
     skyvern_element: SkyvernElement,
@@ -2115,7 +2233,7 @@ async def choose_auto_completion_dropdown(
     try:
         await skyvern_element.press_fill(text)
         # wait for new elemnts to load
-        await asyncio.sleep(5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -2153,11 +2271,34 @@ async def choose_auto_completion_dropdown(
         incremental_element.extend(confirmed_preserved_list)
 
         result.incremental_elements = copy.deepcopy(incremental_element)
-        if len(incremental_element) == 0:
-            raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+        html = ""
+        new_interactable_element_ids = []
+        if len(incremental_element) > 0:
+            cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+            html = incremental_scraped.build_html_tree(cleaned_incremental_element)
+        else:
+            scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+            new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(
+                scraped_page.id_to_css_dict.keys()
+            )
 
-        cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
-        html = incremental_scraped.build_html_tree(cleaned_incremental_element)
+            dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
+            new_interactable_element_ids = [
+                element_id
+                for element_id in new_element_ids
+                if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
+            ]
+            if len(new_interactable_element_ids) == 0:
+                raise NoIncrementalElementFoundForAutoCompletion(element_id=skyvern_element.get_id(), text=text)
+            LOG.info(
+                "New elements detected after the input",
+                new_elements_ids=new_interactable_element_ids,
+            )
+            result.incremental_elements = copy.deepcopy(
+                [scraped_page_after_open.id_to_element_dict[element_id] for element_id in new_interactable_element_ids]
+            )
+            html = scraped_page_after_open.build_element_tree()
+
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             is_search=context.is_search_bar,
@@ -2166,6 +2307,7 @@ async def choose_auto_completion_dropdown(
             navigation_goal=task.navigation_goal,
             navigation_payload_str=json.dumps(task.navigation_payload),
             elements=html,
+            new_elements_ids=new_interactable_element_ids,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
         LOG.info(
@@ -2220,6 +2362,7 @@ async def choose_auto_completion_dropdown(
         await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         clear_input = False
         return result
+
     except Exception as e:
         LOG.info(
             "Failed to choose the auto completion dropdown",
@@ -2250,6 +2393,7 @@ def remove_duplicated_HTML_element(elements: list[dict]) -> list[dict]:
 
 async def input_or_auto_complete_input(
     input_or_select_context: InputOrSelectContext,
+    scraped_page: ScrapedPage,
     page: Page,
     dom: DomUtil,
     text: str,
@@ -2289,6 +2433,7 @@ async def input_or_auto_complete_input(
         result = await choose_auto_completion_dropdown(
             context=input_or_select_context,
             page=page,
+            scraped_page=scraped_page,
             dom=dom,
             text=current_value,
             preserved_elements=result.incremental_elements,
@@ -2358,6 +2503,7 @@ async def input_or_auto_complete_input(
             result = await choose_auto_completion_dropdown(
                 context=input_or_select_context,
                 page=page,
+                scraped_page=scraped_page,
                 dom=dom,
                 text=value,
                 preserved_elements=result.incremental_elements,
@@ -2418,6 +2564,19 @@ async def input_or_auto_complete_input(
         return None
 
 
+@TraceManager.traced_async(
+    ignore_inputs=[
+        "input_or_select_context",
+        "page",
+        "dom",
+        "skyvern_element",
+        "skyvern_frame",
+        "incremental_scraped",
+        "dropdown_menu_element",
+        "target_value",
+        "continue_until_close",
+    ]
+)
 async def sequentially_select_from_dropdown(
     action: SelectOptionAction,
     input_or_select_context: InputOrSelectContext,
@@ -2447,13 +2606,15 @@ async def sequentially_select_from_dropdown(
         return None
 
     # TODO: only support the third-level dropdown selection now, but for date picker, we need to support more levels as it will move the month, year, etc.
-    MAX_SELECT_DEPTH = 5 if input_or_select_context.is_date_related else 3
+    MAX_DATEPICKER_DEPTH = 30
+    MAX_SELECT_DEPTH = 3
+    max_depth = MAX_DATEPICKER_DEPTH if input_or_select_context.is_date_related else MAX_SELECT_DEPTH
     values: list[str | None] = []
     select_history: list[CustomSingleSelectResult] = []
     single_select_result: CustomSingleSelectResult | None = None
 
     check_filter_funcs: list[CheckFilterOutElementIDFunc] = [check_existed_but_not_option_element_in_dom_factory(dom)]
-    for i in range(MAX_SELECT_DEPTH):
+    for i in range(max_depth):
         single_select_result = await select_from_dropdown(
             context=input_or_select_context,
             page=page,
@@ -2468,15 +2629,16 @@ async def sequentially_select_from_dropdown(
             force_select=force_select,
             target_value=target_value,
         )
+        assert single_select_result is not None
         select_history.append(single_select_result)
         values.append(single_select_result.value)
         # wait 1s until DOM finished updating
-        await asyncio.sleep(1)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
 
         if await single_select_result.is_done():
             return single_select_result
 
-        if i == MAX_SELECT_DEPTH - 1:
+        if i == max_depth - 1:
             LOG.warning(
                 "Reaching the max selection depth",
                 depth=i,
@@ -2491,8 +2653,8 @@ async def sequentially_select_from_dropdown(
             task_id=task.task_id,
             step_id=step.step_id,
         )
-        # wait for 3s to load new options
-        await asyncio.sleep(3)
+        # wait to load new options
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
 
         check_filter_funcs.append(
             check_disappeared_element_id_in_incremental_factory(incremental_scraped=incremental_scraped)
@@ -2612,6 +2774,7 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def select_from_emerging_elements(
     current_element_id: str,
     options: CustomSelectPromptOptions,
@@ -2619,6 +2782,8 @@ async def select_from_emerging_elements(
     scraped_page: ScrapedPage,
     step: Step,
     task: Task,
+    scraped_page_after_open: ScrapedPage | None = None,
+    new_interactable_element_ids: list[str] | None = None,
 ) -> ActionResult:
     """
     This is the function to select an element from the new showing elements.
@@ -2626,11 +2791,11 @@ async def select_from_emerging_elements(
     """
 
     # TODO: support to handle the case when options are loaded by scroll
-    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    scraped_page_after_open = scraped_page_after_open or await scraped_page.generate_scraped_page_without_screenshots()
     new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
 
     dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
-    new_interactable_element_ids = [
+    new_interactable_element_ids = new_interactable_element_ids or [
         element_id
         for element_id in new_element_ids
         if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
@@ -2676,6 +2841,7 @@ async def select_from_emerging_elements(
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
+        actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
         LOG.info(
             "No clickable option found, but found input element to search",
             element_id=element_id,
@@ -2683,11 +2849,11 @@ async def select_from_emerging_elements(
         input_element = await dom_after_open.get_skyvern_element_by_id(element_id)
         await input_element.scroll_into_view()
         current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
-        if current_text == value:
+        if current_text == actual_value:
             return ActionSuccess()
 
         await input_element.input_clear()
-        await input_element.input_sequentially(value)
+        await input_element.input_sequentially(actual_value)
         return ActionSuccess()
 
     else:
@@ -2700,6 +2866,19 @@ async def select_from_emerging_elements(
     return ActionSuccess()
 
 
+@TraceManager.traced_async(
+    ignore_inputs=[
+        "context",
+        "page",
+        "skyvern_element",
+        "skyvern_frame",
+        "incremental_scraped",
+        "check_filter_funcs",
+        "dropdown_menu_element",
+        "select_history",
+        "target_value",
+    ]
+)
 async def select_from_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -2820,15 +2999,16 @@ async def select_from_dropdown(
             step_id=step.step_id,
         )
         try:
+            actual_value = await get_actual_value_of_parameter_if_secret(task=task, parameter=value)
             input_element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
             await input_element.scroll_into_view()
             current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
-            if current_text == value:
+            if current_text == actual_value:
                 single_select_result.action_result = ActionSuccess()
                 return single_select_result
 
             await input_element.input_clear()
-            await input_element.input_sequentially(value)
+            await input_element.input_sequentially(actual_value)
             single_select_result.action_result = ActionSuccess()
             return single_select_result
         except Exception as e:
@@ -2891,6 +3071,17 @@ async def select_from_dropdown(
         return single_select_result
 
 
+@TraceManager.traced_async(
+    ignore_inputs=[
+        "value",
+        "page",
+        "skyvern_element",
+        "skyvern_frame",
+        "dom",
+        "incremental_scraped",
+        "dropdown_menu_element",
+    ]
+)
 async def select_from_dropdown_by_value(
     value: str,
     page: Page,
@@ -3131,6 +3322,9 @@ async def try_to_find_potential_scrollable_element(
     return skyvern_element
 
 
+@TraceManager.traced_async(
+    ignore_inputs=["scrollable_element", "page", "skyvern_frame", "incremental_scraped", "is_continue"]
+)
 async def scroll_down_to_load_all_options(
     scrollable_element: SkyvernElement,
     page: Page,
@@ -3155,7 +3349,7 @@ async def scroll_down_to_load_all_options(
     else:
         await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
 
-    await scrollable_element.move_mouse_to(page=page)
+    await scrollable_element.move_mouse_to_safe(page=page)
 
     scroll_pace = 0
     previous_num = await incremental_scraped.get_incremental_elements_num()
@@ -3171,13 +3365,13 @@ async def scroll_down_to_load_all_options(
         else:
             await skyvern_frame.scroll_to_element_bottom(dropdown_menu_element_handle, page_by_page)
             # wait until animation ends, otherwise the scroll operation could be overwritten
-            await asyncio.sleep(2)
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
 
         # scroll a little back and scroll down to trigger the loading
         await page.mouse.wheel(0, -1e-5)
         await page.mouse.wheel(0, 1e-5)
         # wait for while to load new options
-        await asyncio.sleep(10)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
 
         current_num = await incremental_scraped.get_incremental_elements_num()
         LOG.info(
@@ -3202,7 +3396,7 @@ async def scroll_down_to_load_all_options(
         await page.mouse.wheel(0, -scroll_pace)
     else:
         await skyvern_frame.scroll_to_element_top(dropdown_menu_element_handle)
-    await asyncio.sleep(5)
+    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
 
 
 async def normal_select(
@@ -3222,26 +3416,9 @@ async def normal_select(
     action_result: List[ActionResult] = []
     is_success = False
     locator = skyvern_element.get_locator()
-
-    prompt = load_prompt_with_elements(
-        element_tree_builder=builder,
-        prompt_engine=prompt_engine,
-        template_name="parse-input-or-select-context",
-        action_reasoning=action.reasoning,
-        element_id=action.element_id,
+    input_or_select_context = await _get_input_or_select_context(
+        action=action, element_tree_builder=builder, step=step, skyvern_element=skyvern_element
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
-        prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
-    )
-    json_response["intention"] = action.intention
-    input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
-        "Parsed input/select context",
-        context=input_or_select_context,
-        task_id=task.task_id,
-        step_id=step.step_id,
-    )
-
     await skyvern_element.refresh_select_options()
     options_html = skyvern_element.build_HTML()
     field_information = (
@@ -3257,7 +3434,7 @@ async def normal_select(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
@@ -3584,10 +3761,46 @@ class AbstractActionForContextParse(BaseModel):
 
 
 async def _get_input_or_select_context(
-    action: InputTextAction | SelectOptionAction | AbstractActionForContextParse, scraped_page: ScrapedPage, step: Step
+    action: InputTextAction | SelectOptionAction | AbstractActionForContextParse,
+    skyvern_element: SkyvernElement,
+    element_tree_builder: ElementTreeBuilder,
+    step: Step,
+    ancestor_depth: int = 5,
 ) -> InputOrSelectContext:
+    skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
+    try:
+        depth = await skyvern_frame.get_element_dom_depth(await skyvern_element.get_element_handler())
+    except Exception:
+        LOG.warning("Failed to get element depth, using the original element tree", exc_info=True)
+        depth = 0
+
+    if depth > ancestor_depth:
+        # use ancestor to build the context
+        path = "/".join([".."] * ancestor_depth)
+        locator = skyvern_element.get_locator().locator(path)
+        try:
+            element_handle = await locator.element_handle(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            if element_handle is not None:
+                elements, element_tree = await skyvern_frame.build_tree_from_element(
+                    starter=element_handle,
+                    frame=skyvern_element.get_frame_id(),
+                )
+                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory()
+                element_tree = await clean_up_func(skyvern_element.get_frame(), "", copy.deepcopy(element_tree))
+                element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
+                element_tree_builder = ScrapedPage(
+                    elements=elements,
+                    element_tree=element_tree,
+                    element_tree_trimmed=element_tree_trimmed,
+                    _browser_state=None,
+                    _clean_up_func=None,
+                    _scrape_exclude=None,
+                )
+        except Exception:
+            LOG.warning("Failed to get sub element tree, using the original element tree", exc_info=True, path=path)
+
     prompt = load_prompt_with_elements(
-        element_tree_builder=scraped_page,
+        element_tree_builder=element_tree_builder,
         prompt_engine=prompt_engine,
         template_name="parse-input-or-select-context",
         action_reasoning=action.reasoning,

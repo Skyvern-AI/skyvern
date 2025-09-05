@@ -82,6 +82,12 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    def build_script_file_uri(
+        self, *, organization_id: str, script_id: str, script_version: int, file_path: str
+    ) -> str:
+        pass
+
+    @abstractmethod
     async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
         pass
 
@@ -118,15 +124,23 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
-    async def save_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> None:
+    async def list_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
         pass
 
     @abstractmethod
-    async def get_downloaded_files(
-        self, organization_id: str, task_id: str | None, workflow_run_id: str | None
-    ) -> list[FileInfo]:
+    async def list_downloading_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
+        pass
+
+    @abstractmethod
+    async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
+        pass
+
+    @abstractmethod
+    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
         pass
 
     @abstractmethod

@@ -11,9 +11,10 @@ from PIL import Image
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Page
 
-from skyvern.config import settings
-from skyvern.constants import BUILDING_ELEMENT_TREE_TIMEOUT_MS, PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
+from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.trace import TraceManager
 
 LOG = structlog.get_logger()
 
@@ -43,7 +44,7 @@ async def _page_screenshot_helper(
     page: Page,
     file_path: str | None = None,
     full_page: bool = False,
-    timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+    timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
 ) -> bytes:
     try:
         return await page.screenshot(
@@ -68,14 +69,14 @@ async def _current_viewpoint_screenshot_helper(
     page: Page,
     file_path: str | None = None,
     full_page: bool = False,
-    timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+    timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
 ) -> bytes:
     if page.is_closed():
         raise FailedToTakeScreenshot(error_message="Page is closed")
     try:
         if mode == ScreenshotMode.DETAILED:
-            await page.wait_for_load_state(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            await page.wait_for_load_state(timeout=SettingsManager.get_settings().BROWSER_LOADING_TIMEOUT_MS)
             LOG.debug("Page is fully loaded, agent is about to take screenshots")
         start_time = time.time()
         screenshot: bytes = b""
@@ -104,7 +105,7 @@ async def _scrolling_screenshots_helper(
     skyvern_page: SkyvernFrame,
     url: str | None = None,
     draw_boxes: bool = False,
-    max_number: int = settings.MAX_NUM_SCREENSHOTS,
+    max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
 ) -> tuple[list[bytes], list[int]]:
     # page is the main frame and the index must be 0
@@ -121,11 +122,23 @@ async def _scrolling_screenshots_helper(
     positions: list[int] = []
     if await skyvern_page.is_window_scrollable():
         scroll_y_px_old = -30.0
+        _, initial_scroll_height = await skyvern_page.get_scroll_width_and_height()
         scroll_y_px = await skyvern_page.scroll_to_top(draw_boxes=draw_boxes, frame=frame, frame_index=frame_index)
         # Checking max number of screenshots to prevent infinite loop
         # We are checking the difference between the old and new scroll_y_px to determine if we have reached the end of the
         # page. If the difference is less than 25, we assume we have reached the end of the page.
         while abs(scroll_y_px_old - scroll_y_px) > 25 and len(screenshots) < max_number:
+            # check if the scroll height changed, if so, rebuild the element tree
+            _, scroll_height = await skyvern_page.get_scroll_width_and_height()
+            if scroll_height != initial_scroll_height:
+                LOG.warning(
+                    "Scroll height changed, rebuild the element tree",
+                    scroll_height=scroll_height,
+                    initial_scroll_height=initial_scroll_height,
+                )
+                await skyvern_page.build_tree_from_body(frame_name=frame, frame_index=frame_index)
+                initial_scroll_height = scroll_height
+
             screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame, mode=mode)
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
@@ -148,8 +161,7 @@ async def _scrolling_screenshots_helper(
 
         if mode == ScreenshotMode.DETAILED:
             # wait until animation ends, which is triggered by scrolling
-            LOG.debug("Waiting for 2 seconds until animation ends.")
-            await asyncio.sleep(2)
+            await skyvern_page.safe_wait_for_animation_end()
     else:
         if draw_boxes:
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
@@ -207,7 +219,7 @@ class SkyvernFrame:
         frame: Page | Frame,
         expression: str,
         arg: Any | None = None,
-        timeout_ms: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
     ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
@@ -221,12 +233,13 @@ class SkyvernFrame:
         return await SkyvernFrame.evaluate(frame=frame, expression="() => document.location.href")
 
     @staticmethod
+    @TraceManager.traced_async(ignore_inputs=["file_path", "timeout"])
     async def take_scrolling_screenshot(
         page: Page,
         file_path: str | None = None,
-        timeout: float = settings.BROWSER_SCREENSHOT_TIMEOUT_MS,
+        timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
         mode: ScreenshotMode = ScreenshotMode.DETAILED,
-        scrolling_number: int = settings.MAX_NUM_SCREENSHOTS,
+        scrolling_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         if scrolling_number <= 0:
@@ -239,20 +252,22 @@ class SkyvernFrame:
                 page=page, file_path=file_path, timeout=timeout, full_page=True
             )
 
-        if scrolling_number > settings.MAX_NUM_SCREENSHOTS:
+        if scrolling_number > SettingsManager.get_settings().MAX_NUM_SCREENSHOTS:
             LOG.warning(
                 "scrolling_number is greater than the max number of screenshots, setting it to the max number of screenshots",
                 scrolling_number=scrolling_number,
-                max_number=settings.MAX_NUM_SCREENSHOTS,
+                max_number=SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
             )
-            scrolling_number = settings.MAX_NUM_SCREENSHOTS
+            scrolling_number = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS
 
         # use spilt screenshot with lite mode, isntead of fullpage screenshot from playwright
         LOG.debug("Page is fully loaded, agent is about to generate the full page screenshot")
         start_time = time.time()
         skyvern_frame = await SkyvernFrame.create_instance(frame=page)
-        x, y = await skyvern_frame.get_scroll_x_y()
+        x: int | None = None
+        y: int | None = None
         try:
+            x, y = await skyvern_frame.get_scroll_x_y()
             async with asyncio.timeout(timeout):
                 screenshots, positions = await _scrolling_screenshots_helper(
                     skyvern_page=skyvern_frame, mode=mode, max_number=scrolling_number
@@ -282,15 +297,28 @@ class SkyvernFrame:
                     file_path=file_path,
                 )
                 return img_data
+        except Exception:
+            LOG.warning(
+                "Failed to take full page screenshot, fallback to use playwright full page screenshot",
+                exc_info=True,
+            )
+            # reset x and y to None to avoid the scroll_to_x_y call in finally block
+            x = None
+            y = None
+            return await _current_viewpoint_screenshot_helper(
+                page=page, file_path=file_path, timeout=timeout, full_page=True
+            )
         finally:
-            await skyvern_frame.scroll_to_x_y(x, y)
+            if x is not None and y is not None:
+                await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
+    @TraceManager.traced_async(ignore_inputs=["page"])
     async def take_split_screenshots(
         page: Page,
         url: str | None = None,
         draw_boxes: bool = False,
-        max_number: int = settings.MAX_NUM_SCREENSHOTS,
+        max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
         scroll: bool = True,
     ) -> list[bytes]:
         if not scroll:
@@ -310,6 +338,10 @@ class SkyvernFrame:
     async def create_instance(cls, frame: Page | Frame) -> SkyvernFrame:
         instance = cls(frame=frame)
         await cls.evaluate(frame=instance.frame, expression=JS_FUNCTION_DEFS)
+        if SettingsManager.get_settings().ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE:
+            await instance.evaluate(
+                frame=instance.frame, expression="() => window.GlobalEnableAllTextualElements = true"
+            )
         return instance
 
     def __init__(self, frame: Page | Frame) -> None:
@@ -326,9 +358,19 @@ class SkyvernFrame:
         js_script = "() => getScrollXY()"
         return await self.evaluate(frame=self.frame, expression=js_script)
 
+    async def get_scroll_width_and_height(self) -> tuple[int, int]:
+        js_script = "() => getScrollWidthAndHeight()"
+        return await self.evaluate(frame=self.frame, expression=js_script)
+
     async def scroll_to_x_y(self, x: int, y: int) -> None:
         js_script = "([x, y]) => scrollToXY(x, y)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[x, y])
+
+    async def safe_scroll_to_x_y(self, x: int, y: int) -> None:
+        try:
+            await self.scroll_to_x_y(x, y)
+        except Exception:
+            LOG.warning("Failed to scroll to x, y, ignore it", x=x, y=y, exc_info=True)
 
     async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
         js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
@@ -369,7 +411,7 @@ class SkyvernFrame:
         scroll_y_px = await self.evaluate(
             frame=self.frame,
             expression=js_script,
-            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[draw_boxes, frame, frame_index],
         )
         return scroll_y_px
@@ -387,7 +429,7 @@ class SkyvernFrame:
         scroll_y_px = await self.evaluate(
             frame=self.frame,
             expression=js_script,
-            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[draw_boxes, frame, frame_index, need_overlap],
         )
         return scroll_y_px
@@ -398,14 +440,18 @@ class SkyvernFrame:
         :param page: Page instance to remove the bounding boxes from.
         """
         js_script = "() => removeBoundingBoxes()"
-        await self.evaluate(frame=self.frame, expression=js_script, timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS)
+        await self.evaluate(
+            frame=self.frame,
+            expression=js_script,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+        )
 
     async def build_elements_and_draw_bounding_boxes(self, frame: str, frame_index: int) -> None:
         js_script = "async ([frame, frame_index]) => await buildElementsAndDrawBoundingBoxes(frame, frame_index)"
         await self.evaluate(
             frame=self.frame,
             expression=js_script,
-            timeout_ms=BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+            timeout_ms=SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
             arg=[frame, frame_index],
         )
 
@@ -436,3 +482,64 @@ class SkyvernFrame:
     async def get_select_options(self, element: ElementHandle) -> tuple[list, str]:
         js_script = "([element]) => getSelectOptions(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
+
+    async def get_element_dom_depth(self, element: ElementHandle) -> int:
+        js_script = "([element]) => getElementDomDepth(element)"
+        return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
+
+    @TraceManager.traced_async()
+    async def build_tree_from_body(
+        self,
+        frame_name: str | None,
+        frame_index: int,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+    ) -> tuple[list[dict], list[dict]]:
+        js_script = "async ([frame_name, frame_index]) => await buildTreeFromBody(frame_name, frame_index)"
+        return await self.evaluate(
+            frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[frame_name, frame_index]
+        )
+
+    @TraceManager.traced_async()
+    async def get_incremental_element_tree(
+        self,
+        wait_until_finished: bool = True,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+    ) -> tuple[list[dict], list[dict]]:
+        js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
+        return await self.evaluate(
+            frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
+        )
+
+    @TraceManager.traced_async()
+    async def build_tree_from_element(
+        self,
+        starter: ElementHandle,
+        frame: str,
+        full_tree: bool = False,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
+    ) -> tuple[list[dict], list[dict]]:
+        js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
+        return await self.evaluate(
+            frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
+        )
+
+    async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
+        try:
+            await asyncio.sleep(before_wait_sec)
+            await self.frame.wait_for_load_state("load", timeout=timeout_ms)
+            await self.wait_for_animation_end(timeout_ms=timeout_ms)
+        except Exception:
+            LOG.debug("Failed to wait for animation end, but ignore it", exc_info=True)
+            return
+
+    async def wait_for_animation_end(self, timeout_ms: float = 3000) -> None:
+        async with asyncio.timeout(timeout_ms / 1000):
+            while True:
+                is_finished = await self.evaluate(
+                    frame=self.frame,
+                    expression="() => isAnimationFinished()",
+                    timeout_ms=timeout_ms,
+                )
+                if is_finished:
+                    return
+                await asyncio.sleep(0.1)

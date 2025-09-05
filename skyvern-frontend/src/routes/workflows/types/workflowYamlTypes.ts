@@ -12,8 +12,11 @@ export type WorkflowCreateYAMLRequest = {
   totp_verification_url?: string | null;
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
-  max_screenshot_scrolling_times?: number | null;
+  max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
+  generate_script?: boolean;
+  cache_key?: string | null;
+  ai_fallback?: boolean;
 };
 
 export type WorkflowDefinitionYAML = {
@@ -120,7 +123,8 @@ export type BlockYAML =
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
   | Taskv2BlockYAML
-  | URLBlockYAML;
+  | URLBlockYAML
+  | HttpRequestBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -134,7 +138,7 @@ export type TaskBlockYAML = BlockYAMLBase & {
   title?: string;
   navigation_goal: string | null;
   data_extraction_goal: string | null;
-  data_schema: Record<string, unknown> | null;
+  data_schema: Record<string, unknown> | string | null;
   error_code_mapping: Record<string, string> | null;
   max_retries?: number;
   max_steps_per_run?: number | null;
@@ -209,7 +213,7 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   url: string | null;
   title?: string;
   data_extraction_goal: string | null;
-  data_schema: Record<string, unknown> | null;
+  data_schema: Record<string, unknown> | string | null;
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
@@ -287,6 +291,9 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   region_name: string;
   aws_access_key_id: string;
   aws_secret_access_key: string;
+  azure_storage_account_name?: string | null;
+  azure_storage_account_key?: string | null;
+  azure_blob_container_name?: string | null;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {
@@ -307,7 +314,8 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
   block_type: "file_url_parser";
   file_url: string;
-  file_type: "csv";
+  file_type: "csv" | "excel" | "pdf";
+  json_schema?: Record<string, unknown> | null;
 };
 
 export type ForLoopBlockYAML = BlockYAMLBase & {
@@ -327,4 +335,15 @@ export type PDFParserBlockYAML = BlockYAMLBase & {
 export type URLBlockYAML = BlockYAMLBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type HttpRequestBlockYAML = BlockYAMLBase & {
+  block_type: "http_request";
+  method: string;
+  url: string | null;
+  headers: Record<string, string> | null;
+  body: Record<string, unknown> | null;
+  timeout: number;
+  follow_redirects: boolean;
+  parameter_keys?: Array<string> | null;
 };

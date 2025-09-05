@@ -1,24 +1,28 @@
-import { Status } from "@/api/types";
-import { useEffect, useState, useRef, useCallback } from "react";
-import { HandIcon, PlayIcon } from "@radix-ui/react-icons";
-import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
-import { statusIsNotFinalized } from "@/routes/tasks/types";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { envCredential } from "@/util/env";
-import { toast } from "@/components/ui/use-toast";
 import RFB from "@novnc/novnc/lib/rfb.js";
-import { environment } from "@/util/env";
-import { cn } from "@/util/utils";
-import { useClientIdStore } from "@/store/useClientIdStore";
+import { ExitIcon, HandIcon } from "@radix-ui/react-icons";
+import { useEffect, useState, useRef, useCallback } from "react";
+
+import { Status } from "@/api/types";
 import type {
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { Button } from "@/components/ui/button";
+import { AnimatedWave } from "@/components/AnimatedWave";
+import { toast } from "@/components/ui/use-toast";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { statusIsNotFinalized } from "@/routes/tasks/types";
+import { useClientIdStore } from "@/store/useClientIdStore";
+import {
+  envCredential,
+  environment,
+  wssBaseUrl,
+  newWssBaseUrl,
+} from "@/util/env";
+import { cn } from "@/util/utils";
 
+import { RotateThrough } from "./RotateThrough";
 import "./browser-stream.css";
-
-const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
 interface CommandTakeControl {
   kind: "take-control";
@@ -31,27 +35,39 @@ interface CommandCedeControl {
 type Command = CommandTakeControl | CommandCedeControl;
 
 type Props = {
+  browserSessionId?: string;
+  interactive?: boolean;
+  showControlButtons?: boolean;
   task?: {
     run: TaskApiResponse;
   };
   workflow?: {
     run: WorkflowRunStatusApiResponse;
   };
+  resizeTrigger?: number;
   // --
   onClose?: () => void;
 };
 
 function BrowserStream({
+  browserSessionId = undefined,
+  interactive = true,
+  showControlButtons = undefined,
   task = undefined,
   workflow = undefined,
+  resizeTrigger,
   // --
   onClose,
 }: Props) {
   let showStream: boolean = false;
   let runId: string;
-  let entity: "task" | "workflow";
+  let entity: "browserSession" | "task" | "workflow";
 
-  if (task) {
+  if (browserSessionId) {
+    runId = browserSessionId;
+    entity = "browserSession";
+    showStream = true;
+  } else if (task) {
     runId = task.run.task_id;
     showStream = statusIsNotFinalized(task.run);
     entity = "task";
@@ -60,11 +76,10 @@ function BrowserStream({
     showStream = statusIsNotFinalized(workflow.run);
     entity = "workflow";
   } else {
-    throw new Error("No task or workflow provided");
+    throw new Error("No browser session, task or workflow provided");
   }
-
+  const [userIsControlling, setUserIsControlling] = useState(interactive);
   const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
-  const [userIsControlling, setUserIsControlling] = useState<boolean>(false);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
@@ -141,11 +156,13 @@ function BrowserStream({
 
         const wsParams = await getWebSocketParams();
         const vncUrl =
-          entity === "task"
-            ? `${wssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
-            : entity === "workflow"
-              ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
-              : null;
+          entity === "browserSession"
+            ? `${newWssBaseUrl}/stream/vnc/browser_session/${runId}?${wsParams}`
+            : entity === "task"
+              ? `${wssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
+              : entity === "workflow"
+                ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
+                : null;
 
         if (!vncUrl) {
           throw new Error("No vnc url");
@@ -209,11 +226,13 @@ function BrowserStream({
       const wsParams = await getWebSocketParams();
 
       const commandUrl =
-        entity === "task"
-          ? `${wssBaseUrl}/stream/commands/task/${runId}?${wsParams}`
-          : entity === "workflow"
-            ? `${wssBaseUrl}/stream/commands/workflow_run/${runId}?${wsParams}`
-            : null;
+        entity === "browserSession"
+          ? `${newWssBaseUrl}/stream/commands/browser_session/${runId}?${wsParams}`
+          : entity === "task"
+            ? `${wssBaseUrl}/stream/commands/task/${runId}?${wsParams}`
+            : entity === "workflow"
+              ? `${wssBaseUrl}/stream/commands/workflow_run/${runId}?${wsParams}`
+              : null;
 
       if (!commandUrl) {
         throw new Error("No command url");
@@ -266,13 +285,26 @@ function BrowserStream({
       commandSocket.send(JSON.stringify(command));
     };
 
-    if (userIsControlling) {
+    if (interactive || userIsControlling) {
       sendCommand({ kind: "take-control" });
     } else {
       sendCommand({ kind: "cede-control" });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userIsControlling, isCommandConnected]);
+  }, [interactive, isCommandConnected, userIsControlling]);
+
+  // Effect to handle window resize trigger for NoVNC canvas
+  useEffect(() => {
+    if (!resizeTrigger || !canvasContainer || !rfbRef.current) {
+      return;
+    }
+
+    // const originalDisplay = canvasContainer.style.display;
+    // canvasContainer.style.display = "none";
+    // canvasContainer.offsetHeight;
+    // canvasContainer.style.display = originalDisplay;
+    // window.dispatchEvent(new Event("resize"));
+  }, [resizeTrigger, canvasContainer]);
 
   // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {
@@ -306,43 +338,64 @@ function BrowserStream({
     }
   }, [task, workflow]);
 
+  const theUserIsControlling =
+    userIsControlling || (interactive && !showControlButtons);
+
   return (
     <div
-      className={cn("browser-stream", {
-        "user-is-controlling": userIsControlling,
+      className={cn("browser-stream flex items-center justify-center", {
+        "user-is-controlling": theUserIsControlling,
       })}
       ref={setCanvasContainerRef}
     >
       {isVncConnected && (
-        <div className="overlay-container">
-          <div className="overlay">
-            <Button
-              // className="take-control"
-              className={cn("take-control", { hide: userIsControlling })}
-              type="button"
-              onClick={() => setUserIsControlling(true)}
-            >
-              <HandIcon className="mr-2 h-4 w-4" />
-              take control
-            </Button>
-            <div className="absolute bottom-[-1rem] right-[1rem]">
+        <div className="overlay z-10 flex items-center justify-center overflow-hidden">
+          {showControlButtons && (
+            <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
               <Button
-                className={cn("relinquish-control", {
-                  hide: !userIsControlling,
+                onClick={() => {
+                  setUserIsControlling(true);
+                }}
+                className={cn("control-button pointer-events-auto border", {
+                  hide: userIsControlling,
                 })}
-                type="button"
-                onClick={() => setUserIsControlling(false)}
+                size="sm"
               >
-                <PlayIcon className="mr-2 h-4 w-4" />
-                run agent
+                <HandIcon className="mr-2 h-4 w-4" />
+                take control
+              </Button>
+              <Button
+                onClick={() => {
+                  setUserIsControlling(false);
+                }}
+                className={cn(
+                  "control-button pointer-events-auto absolute bottom-0 border",
+                  {
+                    hide: !userIsControlling,
+                  },
+                )}
+                size="sm"
+              >
+                <ExitIcon className="mr-2 h-4 w-4" />
+                stop controlling
               </Button>
             </div>
-          </div>
+          )}
         </div>
       )}
       {!isVncConnected && (
-        <div className="absolute left-0 top-0 flex h-full w-full items-center justify-center bg-black">
-          <Skeleton className="aspect-[16/9] h-auto max-h-full w-full max-w-full rounded-lg object-cover" />
+        <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
+          <RotateThrough interval={7 * 1000}>
+            <span>Hm, working on the connection...</span>
+            <span>Hang tight, we're almost there...</span>
+            <span>Just a moment...</span>
+            <span>Backpropagating...</span>
+            <span>Attention is all I need...</span>
+            <span>Consulting the manual...</span>
+            <span>Looking for the bat phone...</span>
+            <span>Where's Shu?...</span>
+          </RotateThrough>
+          <AnimatedWave text=".‧₊˚ ⋅ ? ✨ ?★ ‧₊˚ ⋅" />
         </div>
       )}
     </div>

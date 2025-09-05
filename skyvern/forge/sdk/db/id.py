@@ -37,6 +37,7 @@ BITWARDEN_SENSITIVE_INFORMATION_PARAMETER_PREFIX = "bsi"
 CREDENTIAL_ONEPASSWORD_PARAMETER_PREFIX = "opp"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
+DEBUG_SESSION_PREFIX = "ds"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -44,6 +45,10 @@ ORGANIZATION_AUTH_TOKEN_PREFIX = "oat"
 ORG_PREFIX = "o"
 OUTPUT_PARAMETER_PREFIX = "op"
 PERSISTENT_BROWSER_SESSION_ID = "pbs"
+SCRIPT_FILE_PREFIX = "sf"
+SCRIPT_REVISION_PREFIX = "sr"
+SCRIPT_PREFIX = "s"
+SCRIPT_BLOCK_PREFIX = "sb"
 STEP_PREFIX = "stp"
 TASK_GENERATION_PREFIX = "tg"
 TASK_PREFIX = "tsk"
@@ -55,6 +60,7 @@ WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
 WORKFLOW_PREFIX = "w"
 WORKFLOW_RUN_BLOCK_PREFIX = "wrb"
 WORKFLOW_RUN_PREFIX = "wr"
+WORKFLOW_SCRIPT_PREFIX = "ws"
 
 
 def generate_workflow_id() -> str:
@@ -75,6 +81,11 @@ def generate_workflow_run_block_id() -> str:
 def generate_workflow_run_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_RUN_PREFIX}_{int_id}"
+
+
+def generate_workflow_script_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_SCRIPT_PREFIX}_{int_id}"
 
 
 def generate_aws_secret_parameter_id() -> str:
@@ -192,11 +203,37 @@ def generate_credential_id() -> str:
     return f"{CREDENTIAL_PREFIX}_{int_id}"
 
 
+def generate_debug_session_id() -> str:
+    int_id = generate_id()
+    return f"{DEBUG_SESSION_PREFIX}_{int_id}"
+
+
 def generate_organization_bitwarden_collection_id() -> str:
     int_id = generate_id()
     return f"{ORGANIZATION_BITWARDEN_COLLECTION_PREFIX}_{int_id}"
 
 
+def generate_script_id() -> str:
+    int_id = generate_id()
+    return f"{SCRIPT_PREFIX}_{int_id}"
+
+
+def generate_script_revision_id() -> str:
+    int_id = generate_id()
+    return f"{SCRIPT_REVISION_PREFIX}_{int_id}"
+
+
+def generate_script_file_id() -> str:
+    int_id = generate_id()
+    return f"{SCRIPT_FILE_PREFIX}_{int_id}"
+
+
+def generate_script_block_id() -> str:
+    int_id = generate_id()
+    return f"{SCRIPT_BLOCK_PREFIX}_{int_id}"
+
+
+############# Helper functions below ##############
 def generate_id() -> int:
     """
     generate a 64-bit int ID
