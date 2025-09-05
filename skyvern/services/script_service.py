@@ -167,6 +167,7 @@ async def execute_script(
     organization_id: str,
     parameters: dict[str, Any] | None = None,
     workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
     background_tasks: BackgroundTasks | None = None,
 ) -> None:
     # TODO: assume the script only has one ScriptFile called main.py
@@ -229,17 +230,26 @@ async def execute_script(
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
         LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
 
+    script_path = os.path.join(script.script_id, "main.py")
     if background_tasks:
         # Execute asynchronously in background
         background_tasks.add_task(
-            run_script, parameters=parameters, organization_id=organization_id, workflow_run_id=workflow_run_id
+            run_script,
+            script_path,
+            parameters=parameters,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
         )
     else:
         # Execute synchronously
-        script_path = os.path.join(script.script_id, "main.py")
         if os.path.exists(script_path):
             await run_script(
-                script_path, parameters=parameters, organization_id=organization_id, workflow_run_id=workflow_run_id
+                script_path,
+                parameters=parameters,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
             )
         else:
             LOG.error("Script main.py not found", script_path=script_path, script_id=script_id)
@@ -1252,12 +1262,14 @@ async def run_script(
     parameters: dict[str, Any] | None = None,
     organization_id: str | None = None,
     workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
 ) -> None:
     # register the script run
     context = skyvern_context.current()
     if not context:
         context = skyvern_context.ensure_context()
         skyvern_context.set(skyvern_context.SkyvernContext())
+    context.browser_session_id = browser_session_id
     if workflow_run_id and organization_id:
         workflow_run = await app.DATABASE.get_workflow_run(
             workflow_run_id=workflow_run_id, organization_id=organization_id
