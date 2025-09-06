@@ -116,3 +116,88 @@ body,
   -moz-user-select: none !important;
   -ms-user-select: none !important;
 }
+
+/* Mobile Responsiveness Fixes  */
+@media (max-width: 768px) {
+  
+  textarea {
+    writing-mode: horizontal-tb !important;
+    text-orientation: mixed !important;
+    direction: ltr !important;
+    font-size: 16px !important;
+    line-height: 1.4 !important;
+    min-height: 44px !important;
+    height: 44px !important; 
+    resize: none !important;
+    overflow-y: hidden !important; 
+    white-space: nowrap !important; 
+    overflow-x: auto; 
+    word-wrap: normal !important;
+    word-break: normal !important;
+  }
+  
+  
+  textarea:focus {
+    height: auto !important;
+    min-height: 44px !important;
+    max-height: 120px !important;
+    overflow-y: auto !important;
+    white-space: pre-wrap !important;
+    overflow-x: hidden;
+  }
+  
+  /*  Placeholder text */
+  textarea::placeholder {
+    writing-mode: horizontal-tb !important;
+    text-orientation: mixed !important;
+    direction: ltr !important;
+    font-size: 16px !important;
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  
+  /* Input field fixes */
+  input[type="text"],
+  input[type="email"], 
+  input[type="password"] {
+    writing-mode: horizontal-tb !important;
+    text-orientation: mixed !important;
+    direction: ltr !important;
+    font-size: 16px !important;
+    max-width: 100%;
+  }
+  
+  /* Table responsiveness */
+  table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+    font-size: 0.875rem;
+    min-width: 600px;
+  }
+  
+  /* Prevent horizontal page scroll */
+  body {
+    overflow-x: hidden;
+  }
+  
+  /* Container adjustments */
+  .container {
+    padding-left: 0.5rem;
+    padding-right: 0.5rem;
+  }
+  
+  /* Grid to single column on mobile */
+  .grid {
+    grid-template-columns: 1fr !important;
+  }
+  
+  /* Text size adjustments */
+  h1 { font-size: 1.5rem; }
+  h2 { font-size: 1.25rem; }
+  h3 { font-size: 1.125rem; }
+}
+
+
