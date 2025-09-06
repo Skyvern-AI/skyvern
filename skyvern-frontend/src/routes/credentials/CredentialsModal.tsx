@@ -27,6 +27,7 @@ const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   username: "",
   password: "",
   totp: "",
+  totp_type: "none" as "none" | "authenticator" | "email" | "text",
 };
 
 const CREDIT_CARD_CREDENTIAL_INITIAL_VALUES = {
@@ -156,6 +157,7 @@ function CredentialsModal({ onCredentialCreated }: Props) {
           username,
           password,
           totp: totp === "" ? null : totp,
+          totp_type: passwordCredentialValues.totp_type,
         },
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {

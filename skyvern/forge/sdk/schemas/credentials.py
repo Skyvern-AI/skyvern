@@ -11,10 +11,24 @@ class CredentialType(StrEnum):
     CREDIT_CARD = "credit_card"
 
 
+class TotpType(StrEnum):
+    """Type of 2FA/TOTP method used."""
+
+    AUTHENTICATOR = "authenticator"
+    EMAIL = "email"
+    TEXT = "text"
+    NONE = "none"
+
+
 class PasswordCredentialResponse(BaseModel):
     """Response model for password credentials, containing only the username."""
 
     username: str = Field(..., description="The username associated with the credential", examples=["user@example.com"])
+    totp_type: TotpType = Field(
+        TotpType.NONE,
+        description="Type of 2FA method used for this credential",
+        examples=[TotpType.AUTHENTICATOR],
+    )
 
 
 class CreditCardCredentialResponse(BaseModel):
@@ -33,6 +47,11 @@ class PasswordCredential(BaseModel):
         None,
         description="Optional TOTP (Time-based One-Time Password) string used to generate 2FA codes",
         examples=["JBSWY3DPEHPK3PXP"],
+    )
+    totp_type: TotpType = Field(
+        TotpType.NONE,
+        description="Type of 2FA method used for this credential",
+        examples=[TotpType.AUTHENTICATOR],
     )
 
 
@@ -124,6 +143,11 @@ class Credential(BaseModel):
     name: str = Field(..., description="Name of the credential", examples=["Skyvern Login"])
     credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
     item_id: str = Field(..., description="ID of the associated credential item", examples=["item_1234567890"])
+    totp_type: TotpType = Field(
+        TotpType.NONE,
+        description="Type of 2FA method used for this credential",
+        examples=[TotpType.AUTHENTICATOR],
+    )
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
