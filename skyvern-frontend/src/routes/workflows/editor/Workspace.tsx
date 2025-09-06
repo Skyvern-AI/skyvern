@@ -566,15 +566,16 @@ function Workspace({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete A Code Key Value</DialogTitle>
+            <DialogTitle>Delete Generated Code</DialogTitle>
             <DialogDescription>
               <div className="w-full pb-2 pt-4 text-sm text-slate-400">
                 {deleteCacheKeyValue.isPending ? (
-                  "Deleting code key value..."
+                  "Deleting generated code..."
                 ) : (
                   <div className="flex w-full flex-col gap-2">
                     <div className="w-full">
-                      Are you sure you want to delete this code key value?
+                      Are you sure you want to delete the generated code for
+                      this code key value?
                     </div>
                     <div
                       className="max-w-[29rem] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-slate-400"
