@@ -82,7 +82,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
     useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
-    aiFallback: data.withWorkflowSettings ? data.aiFallback : false,
+    aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
   });
 
   const [facing, setFacing] = useState<"front" | "back">("front");
