@@ -1,0 +1,123 @@
+---
+title: Ollama + LiteLLM
+description: Run Skyvern with a local LLM via Ollama or an OpenAI-compatible proxy via LiteLLM.
+---
+
+## Overview
+
+Skyvern can use local models via **Ollama** or any **OpenAI-compatible** endpoint (e.g., **LiteLLM**). Two paths:
+
+- **(A) Direct Ollama** — use the Ollama API (`/v1/chat/completions`)
+- **(B) OpenAI-compatible (LiteLLM)** — Skyvern connects to a proxy that exposes an OpenAI-style API
+
+---
+
+## A) Direct Ollama
+
+### 1) Start Ollama locally
+Install Ollama and run a model (example: `llama3.1`):
+```bash
+ollama pull llama3.1
+ollama serve
+```
+The API is usually at `http://localhost:11434`.
+
+### 2) Configure Skyvern (ENV)
+Add to your `.env`:
+```bash
+# Enable Ollama integration
+ENABLE_OLLAMA=true
+
+# Ollama server URL
+OLLAMA_SERVER_URL=http://localhost:11434
+
+# Model name in Ollama (check with `ollama list`)
+OLLAMA_MODEL=llama3.1
+```
+
+> Note: Ollama may not support `max_completion_tokens` — Skyvern handles this internally.
+
+---
+
+## B) OpenAI-compatible via LiteLLM
+
+### 1) Run LiteLLM as a proxy
+Minimal example (see LiteLLM docs for more options):
+```bash
+# Map an Ollama model behind an OpenAI-compatible endpoint
+litellm --model ollama/llama3.1 --host 0.0.0.0 --port 4000
+```
+
+### 2) Configure Skyvern (ENV)
+Add to your `.env`:
+```bash
+# Enable OpenAI-compatible provider
+ENABLE_OPENAI_COMPATIBLE=true
+
+# The "model" exposed by the proxy (any identifier your proxy accepts)
+OPENAI_COMPATIBLE_MODEL_NAME=llama3.1
+
+# API key required by the proxy (use any placeholder if proxy doesn't enforce)
+OPENAI_COMPATIBLE_API_KEY=sk-test
+
+# Base URL for the LiteLLM proxy (OpenAI-compatible)
+OPENAI_COMPATIBLE_API_BASE=http://localhost:4000/v1
+
+# (optional)
+# OPENAI_COMPATIBLE_API_VERSION=2024-06-01
+# OPENAI_COMPATIBLE_SUPPORTS_VISION=false
+# OPENAI_COMPATIBLE_REASONING_EFFORT=low|medium|high
+```
+
+---
+
+## Start Skyvern (local)
+
+After setting the environment variables in `.env`, start backend + UI:
+```bash
+# with Docker (recommended)
+docker compose up -d
+
+# or locally (dev):
+# poetry install
+# ./run_skyvern.sh
+# ./run_ui.sh
+```
+
+Open the UI and pick the model (or keep default); if only Ollama/LiteLLM are enabled, Skyvern will use that.
+
+---
+
+## Verify your setup
+
+Before starting Skyvern, quickly verify that your LLM endpoint is reachable.
+
+### Ollama
+```bash
+# Should return the list of local models
+curl -s http://localhost:11434/api/tags | jq .
+```
+
+### LiteLLM (OpenAI-compatible)
+```bash
+# Should return available models exposed by your proxy
+curl -s http://localhost:4000/v1/models   -H "Authorization: Bearer sk-test" | jq .
+```
+
+> If your model doesn’t appear, re-check the proxy flags and your `.env` values (`OPENAI_COMPATIBLE_API_BASE`, `OPENAI_COMPATIBLE_MODEL_NAME`, etc.).
+
+---
+
+## Troubleshooting
+
+- **Model not responding / timeout**: ensure `ollama serve` is running and `OLLAMA_MODEL` exists (`ollama list`).
+- **LiteLLM 401**: set `OPENAI_COMPATIBLE_API_KEY` to a value accepted by the proxy or disable auth on the proxy.
+- **CORS / wrong base URL**: confirm `OPENAI_COMPATIBLE_API_BASE` and that it ends with `/v1`.
+- **Model not visible**: ensure `ENABLE_OLLAMA=true` or `ENABLE_OPENAI_COMPATIBLE=true` in `.env`, then restart services.
+
+---
+
+## Internal References
+
+- Ollama vars: `ENABLE_OLLAMA`, `OLLAMA_SERVER_URL`, `OLLAMA_MODEL`
+- OpenAI-compatible vars: `ENABLE_OPENAI_COMPATIBLE`, `OPENAI_COMPATIBLE_MODEL_NAME`, `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_API_BASE`, `OPENAI_COMPATIBLE_API_VERSION`, `OPENAI_COMPATIBLE_SUPPORTS_VISION`, `OPENAI_COMPATIBLE_REASONING_EFFORT`
