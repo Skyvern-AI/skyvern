@@ -11,9 +11,11 @@ import { cn } from "@/util/utils";
 function OrgWalled({
   children,
   className,
+  hideTooltipContent,
 }: {
   children: React.ReactNode;
   className?: string;
+  hideTooltipContent?: boolean;
 }) {
   const isSkyvernUser = useIsSkyvernUser();
 
@@ -35,9 +37,13 @@ function OrgWalled({
             {children}
           </div>
         </TooltipTrigger>
-        <TooltipContent>
-          <p>This feature is only available to Skyvern organization members</p>
-        </TooltipContent>
+        {!hideTooltipContent && (
+          <TooltipContent>
+            <p>
+              This feature is only available to Skyvern organization members
+            </p>
+          </TooltipContent>
+        )}
       </Tooltip>
     </TooltipProvider>
   );

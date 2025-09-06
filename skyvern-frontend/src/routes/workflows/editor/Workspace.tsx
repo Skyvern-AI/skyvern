@@ -98,7 +98,7 @@ function Workspace({
   const { blockLabel, workflowPermanentId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
-  const [timelineMode, setTimelineMode] = useState("narrow");
+  const [timelineMode, setTimelineMode] = useState("wide");
   const [cacheKeyValueFilter, setCacheKeyValueFilter] = useState<string | null>(
     null,
   );
@@ -506,6 +506,7 @@ function Workspace({
 
   return (
     <div className="relative h-full w-full">
+      {/* cycle browser dialog */}
       <Dialog
         open={openCycleBrowserDialogue}
         onOpenChange={(open) => {
@@ -553,6 +554,7 @@ function Workspace({
         </DialogContent>
       </Dialog>
 
+      {/* cache key value delete dialog */}
       <Dialog
         open={openConfirmCacheKeyValueDeleteDialogue}
         onOpenChange={(open) => {
@@ -611,7 +613,7 @@ function Workspace({
       </Dialog>
 
       {/* header panel */}
-      <div className="absolute left-6 right-6 top-8 z-10 h-20">
+      <div className="absolute left-6 right-6 top-8 z-40 h-20">
         <WorkflowHeader
           cacheKeyValue={cacheKeyValue}
           cacheKeyValues={cacheKeyValues}
@@ -692,63 +694,11 @@ function Workspace({
         />
       </div>
 
-      {/* sub panels in design mode */}
-      {!showBrowser && workflowPanelState.active && (
-        <div
-          className="absolute right-6 top-[8.5rem]"
-          style={{
-            height:
-              workflowPanelState.content === "nodeLibrary"
-                ? "calc(100vh - 9.5rem)"
-                : "unset",
-          }}
-          onMouseDownCapture={() => {}}
-        >
-          {workflowPanelState.content === "cacheKeyValues" && (
-            <WorkflowCacheKeyValuesPanel
-              cacheKeyValues={cacheKeyValues}
-              pending={cacheKeyValuesLoading}
-              scriptKey={workflow.cache_key ?? "default"}
-              onDelete={(cacheKeyValue) => {
-                setToDeleteCacheKeyValue(cacheKeyValue);
-                setOpenConfirmCacheKeyValueDeleteDialogue(true);
-              }}
-              onPaginate={(page) => {
-                setPage(page);
-              }}
-              onSelect={(cacheKeyValue) => {
-                setCacheKeyValue(cacheKeyValue);
-                setCacheKeyValueFilter("");
-                closeWorkflowPanel();
-              }}
-            />
-          )}
-          {workflowPanelState.content === "parameters" && (
-            <WorkflowParametersPanel />
-          )}
-          {workflowPanelState.content === "nodeLibrary" && (
-            <WorkflowNodeLibraryPanel
-              onNodeClick={(props) => {
-                addNode(props);
-              }}
-            />
-          )}
-        </div>
-      )}
-
-      <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
-        {/* infinite canvas */}
-        <div
-          className={cn("skyvern-split-left h-full", {
-            "w-full": !showBrowser,
-          })}
-          style={{
-            width: workflowWidth,
-            maxWidth: workflowWidth,
-          }}
-        >
+      {/* infinite canvas and sub panels when not in debug mode */}
+      {!showBrowser && (
+        <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
+          {/* infinite canvas */}
           <FlowRenderer
-            hideBackground={showBrowser}
             nodes={nodes}
             edges={edges}
             setNodes={setNodes}
@@ -758,15 +708,84 @@ function Workspace({
             initialTitle={initialTitle}
             workflow={workflow}
           />
+
+          {/* sub panels */}
+          {workflowPanelState.active && (
+            <div
+              className="pointer-events-none absolute right-6 top-[5rem] z-30"
+              style={{
+                height:
+                  workflowPanelState.content === "nodeLibrary"
+                    ? "calc(100vh - 14rem)"
+                    : "unset",
+              }}
+            >
+              {workflowPanelState.content === "cacheKeyValues" && (
+                <WorkflowCacheKeyValuesPanel
+                  cacheKeyValues={cacheKeyValues}
+                  pending={cacheKeyValuesLoading}
+                  scriptKey={workflow.cache_key ?? "default"}
+                  onDelete={(cacheKeyValue) => {
+                    setToDeleteCacheKeyValue(cacheKeyValue);
+                    setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                  }}
+                  onPaginate={(page) => {
+                    setPage(page);
+                  }}
+                  onSelect={(cacheKeyValue) => {
+                    setCacheKeyValue(cacheKeyValue);
+                    setCacheKeyValueFilter("");
+                    closeWorkflowPanel();
+                  }}
+                />
+              )}
+              {workflowPanelState.content === "parameters" && (
+                <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30">
+                  <WorkflowParametersPanel />
+                </div>
+              )}
+              {workflowPanelState.content === "nodeLibrary" && (
+                <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-full w-[25rem]">
+                  <WorkflowNodeLibraryPanel
+                    onNodeClick={(props) => {
+                      addNode(props);
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
         </div>
+      )}
 
-        {/* divider if browser is in play */}
-        {showBrowser && (
+      {/* infinite canvas, sub panels, browser, and timeline when in debug mode */}
+      {showBrowser && (
+        <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
+          {/* infinite canvas */}
+          <div
+            className="skyvern-split-left h-full"
+            style={{
+              width: workflowWidth,
+              maxWidth: workflowWidth,
+            }}
+          >
+            <FlowRenderer
+              hideBackground={true}
+              nodes={nodes}
+              edges={edges}
+              setNodes={setNodes}
+              setEdges={setEdges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              initialTitle={initialTitle}
+              workflow={workflow}
+            />
+          </div>
+
+          {/* divider*/}
           <div className="mt-[8rem] h-[calc(100%_-_8rem)] w-[1px] bg-slate-800" />
-        )}
 
-        {/* browser & timeline & sub-panels in debug mode */}
-        {showBrowser && (
+          {/* browser & timeline & sub-panels in debug mode */}
           <div
             className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6"
             style={{
@@ -776,11 +795,10 @@ function Workspace({
             {/* sub panels */}
             {workflowPanelState.active && (
               <div
-                className={cn("absolute right-6 top-[8.5rem] z-20", {
+                className={cn("absolute right-6 top-[8.5rem] z-30", {
                   "left-6": workflowPanelState.content === "nodeLibrary",
                 })}
                 style={{
-                  top: "10.5rem",
                   height:
                     workflowPanelState.content === "nodeLibrary"
                       ? "calc(100vh - 14rem)"
@@ -863,7 +881,7 @@ function Workspace({
 
               {/* timeline */}
               <div
-                className={cn("h-full w-[5rem] overflow-visible", {
+                className={cn("z-20 h-full w-[5rem] overflow-visible", {
                   "pointer-events-none hidden w-[0px] overflow-hidden":
                     !blockLabel,
                 })}
@@ -904,7 +922,7 @@ function Workspace({
 
                   {/* slide indicator */}
                   <div
-                    className="absolute left-0 top-0 z-10 flex h-full items-center justify-center p-1 opacity-30 transition-opacity hover:opacity-100 group-hover:opacity-100"
+                    className="absolute left-0 top-0 z-20 flex h-full items-center justify-center p-1 opacity-30 transition-opacity hover:opacity-100 group-hover:opacity-100"
                     onClick={(e) => {
                       e.stopPropagation();
                       setTimelineMode(
@@ -932,55 +950,8 @@ function Workspace({
               </div>
             </div>
           </div>
-        )}
-
-        {!showBrowser && workflowPanelState.active && (
-          <div
-            className={cn(
-              "pointer-events-none absolute right-6 top-[5rem] z-20",
-            )}
-            style={{
-              top: "8.5rem",
-              height:
-                workflowPanelState.content === "nodeLibrary"
-                  ? "calc(100vh - 14rem)"
-                  : "unset",
-            }}
-          >
-            {workflowPanelState.content === "cacheKeyValues" && (
-              <WorkflowCacheKeyValuesPanel
-                cacheKeyValues={cacheKeyValues}
-                pending={cacheKeyValuesLoading}
-                scriptKey={workflow.cache_key ?? "default"}
-                onDelete={(cacheKeyValue) => {
-                  setToDeleteCacheKeyValue(cacheKeyValue);
-                  setOpenConfirmCacheKeyValueDeleteDialogue(true);
-                }}
-                onPaginate={(page) => {
-                  setPage(page);
-                }}
-                onSelect={(cacheKeyValue) => {
-                  setCacheKeyValue(cacheKeyValue);
-                  setCacheKeyValueFilter("");
-                  closeWorkflowPanel();
-                }}
-              />
-            )}
-            {workflowPanelState.content === "parameters" && (
-              <WorkflowParametersPanel />
-            )}
-            {workflowPanelState.content === "nodeLibrary" && (
-              <div className="pointer-events-auto relative right-0 top-0 z-20 h-full w-[25rem]">
-                <WorkflowNodeLibraryPanel
-                  onNodeClick={(props) => {
-                    addNode(props);
-                  }}
-                />
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
