@@ -28,6 +28,7 @@ import {
   PowerButton,
   ReloadButton,
 } from "@/components/FloatingWindow";
+import { Splitter } from "@/components/Splitter";
 import {
   Dialog,
   DialogContent,
@@ -127,6 +128,7 @@ function Workspace({
   const [showPowerButton, setShowPowerButton] = useState(true);
   const [reloadKey, setReloadKey] = useState(0);
   const [windowResizeTrigger, setWindowResizeTrigger] = useState(0);
+  const [containerResizeTrigger, setContainerResizeTrigger] = useState(0);
   const [isReloading, setIsReloading] = useState(false);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -206,10 +208,10 @@ function Workspace({
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
   const workflowWidth = hasHttpBlock
-    ? "39rem"
+    ? "35.1rem"
     : hasLoopBlock
-      ? "34.25rem"
-      : "33rem";
+      ? "31.25rem"
+      : "30rem";
 
   /**
    * Open a new tab (not window) with the browser session URL.
@@ -762,195 +764,193 @@ function Workspace({
       {/* infinite canvas, sub panels, browser, and timeline when in debug mode */}
       {showBrowser && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
-          {/* infinite canvas */}
-          <div
-            className="skyvern-split-left h-full"
-            style={{
-              width: workflowWidth,
-              maxWidth: workflowWidth,
-            }}
+          <Splitter
+            className="splittah"
+            classNameLeft="flex items-center justify-center"
+            direction="vertical"
+            split={{ left: workflowWidth }}
+            onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            <FlowRenderer
-              hideBackground={true}
-              nodes={nodes}
-              edges={edges}
-              setNodes={setNodes}
-              setEdges={setEdges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              initialTitle={initialTitle}
-              workflow={workflow}
-            />
-          </div>
+            {/* infinite canvas */}
+            <div className="skyvern-split-left h-full w-full">
+              <FlowRenderer
+                hideBackground={true}
+                hideControls={true}
+                nodes={nodes}
+                edges={edges}
+                setNodes={setNodes}
+                setEdges={setEdges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                initialTitle={initialTitle}
+                workflow={workflow}
+                onContainerResize={containerResizeTrigger}
+              />
+            </div>
 
-          {/* divider*/}
-          <div className="mt-[8rem] h-[calc(100%_-_8rem)] w-[1px] bg-slate-800" />
-
-          {/* browser & timeline & sub-panels in debug mode */}
-          <div
-            className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6"
-            style={{
-              width: `calc(100% - ${workflowWidth})`,
-            }}
-          >
-            {/* sub panels */}
-            {workflowPanelState.active && (
-              <div
-                className={cn("absolute right-6 top-[8.5rem] z-30", {
-                  "left-6": workflowPanelState.content === "nodeLibrary",
-                })}
-                style={{
-                  height:
-                    workflowPanelState.content === "nodeLibrary"
-                      ? "calc(100vh - 14rem)"
-                      : "unset",
-                }}
-              >
-                {workflowPanelState.content === "cacheKeyValues" && (
-                  <WorkflowCacheKeyValuesPanel
-                    cacheKeyValues={cacheKeyValues}
-                    pending={cacheKeyValuesLoading}
-                    scriptKey={workflow.cache_key ?? "default"}
-                    onDelete={(cacheKeyValue) => {
-                      setToDeleteCacheKeyValue(cacheKeyValue);
-                      setOpenConfirmCacheKeyValueDeleteDialogue(true);
-                    }}
-                    onPaginate={(page) => {
-                      setPage(page);
-                    }}
-                    onSelect={(cacheKeyValue) => {
-                      setCacheKeyValue(cacheKeyValue);
-                      setCacheKeyValueFilter("");
-                      closeWorkflowPanel();
-                    }}
-                  />
-                )}
-                {workflowPanelState.content === "parameters" && (
-                  <WorkflowParametersPanel />
-                )}
-                {workflowPanelState.content === "nodeLibrary" && (
-                  <WorkflowNodeLibraryPanel
-                    onNodeClick={(props) => {
-                      addNode(props);
-                    }}
-                  />
-                )}
-              </div>
-            )}
-
-            {/* browser & timeline */}
-            <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
-              {/* browser */}
-              <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                <div key={reloadKey} className="w-full flex-1">
-                  {activeDebugSession &&
-                  activeDebugSession.browser_session_id &&
-                  !cycleBrowser.isPending ? (
-                    <BrowserStream
-                      interactive={interactor === "human"}
-                      browserSessionId={activeDebugSession.browser_session_id}
-                      showControlButtons={interactor === "human"}
-                      resizeTrigger={windowResizeTrigger}
-                    />
-                  ) : (
-                    <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
-                      Connecting to your browser...
-                      <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
-                    </div>
-                  )}
-                </div>
-                <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
-                  <div className="flex items-center gap-2">
-                    <GlobeIcon /> Live Browser
-                  </div>
-                  {showBreakoutButton && (
-                    <BreakoutButton onClick={() => breakout()} />
-                  )}
-                  <div
-                    className={cn("ml-auto flex items-center gap-2", {
-                      "mr-16": !blockLabel,
-                    })}
-                  >
-                    {showPowerButton && <PowerButton onClick={() => cycle()} />}
-                    <ReloadButton
-                      isReloading={isReloading}
-                      onClick={() => reload()}
-                    />
-                  </div>
-                </footer>
-              </div>
-
-              {/* timeline */}
-              <div
-                className={cn("z-20 h-full w-[5rem] overflow-visible", {
-                  "pointer-events-none hidden w-[0px] overflow-hidden":
-                    !blockLabel,
-                })}
-              >
+            {/* browser & timeline & sub-panels in debug mode */}
+            <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
+              {/* sub panels */}
+              {workflowPanelState.active && (
                 <div
-                  className={cn(
-                    "relative h-full w-[25rem] translate-x-[-20.5rem] bg-[#020617] transition-all",
-                    {
-                      "translate-x-[0rem]": timelineMode === "narrow",
-                      group: timelineMode === "narrow",
-                    },
-                  )}
-                  onClick={() => {
-                    if (timelineMode === "narrow") {
-                      setTimelineMode("wide");
-                    }
+                  className={cn("absolute right-6 top-[8.5rem] z-30", {
+                    "left-6": workflowPanelState.content === "nodeLibrary",
+                  })}
+                  style={{
+                    height:
+                      workflowPanelState.content === "nodeLibrary"
+                        ? "calc(100vh - 14rem)"
+                        : "unset",
                   }}
                 >
-                  {/* timeline wide */}
-                  <div
-                    className={cn(
-                      "pointer-events-none absolute left-[0.5rem] right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end opacity-0 transition-all duration-1000",
-                      { "opacity-100": timelineMode === "wide" },
+                  {workflowPanelState.content === "cacheKeyValues" && (
+                    <WorkflowCacheKeyValuesPanel
+                      cacheKeyValues={cacheKeyValues}
+                      pending={cacheKeyValuesLoading}
+                      scriptKey={workflow.cache_key ?? "default"}
+                      onDelete={(cacheKeyValue) => {
+                        setToDeleteCacheKeyValue(cacheKeyValue);
+                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                      }}
+                      onPaginate={(page) => {
+                        setPage(page);
+                      }}
+                      onSelect={(cacheKeyValue) => {
+                        setCacheKeyValue(cacheKeyValue);
+                        setCacheKeyValueFilter("");
+                        closeWorkflowPanel();
+                      }}
+                    />
+                  )}
+                  {workflowPanelState.content === "parameters" && (
+                    <WorkflowParametersPanel />
+                  )}
+                  {workflowPanelState.content === "nodeLibrary" && (
+                    <WorkflowNodeLibraryPanel
+                      onNodeClick={(props) => {
+                        addNode(props);
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+
+              {/* browser & timeline */}
+              <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
+                {/* browser */}
+                <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                  <div key={reloadKey} className="w-full flex-1">
+                    {activeDebugSession &&
+                    activeDebugSession.browser_session_id &&
+                    !cycleBrowser.isPending ? (
+                      <BrowserStream
+                        interactive={interactor === "human"}
+                        browserSessionId={activeDebugSession.browser_session_id}
+                        showControlButtons={interactor === "human"}
+                        resizeTrigger={windowResizeTrigger}
+                      />
+                    ) : (
+                      <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
+                        Connecting to your browser...
+                        <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                      </div>
                     )}
-                  >
-                    <div
-                      className={cn(
-                        "pointer-events-none relative flex h-full w-full flex-col items-start overflow-hidden bg-[#020617]",
-                        { "pointer-events-auto": timelineMode === "wide" },
-                      )}
-                    >
-                      <DebuggerRun />
+                  </div>
+                  <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                    <div className="flex items-center gap-2">
+                      <GlobeIcon /> Live Browser
                     </div>
-                  </div>
+                    {showBreakoutButton && (
+                      <BreakoutButton onClick={() => breakout()} />
+                    )}
+                    <div
+                      className={cn("ml-auto flex items-center gap-2", {
+                        "mr-16": !blockLabel,
+                      })}
+                    >
+                      {showPowerButton && (
+                        <PowerButton onClick={() => cycle()} />
+                      )}
+                      <ReloadButton
+                        isReloading={isReloading}
+                        onClick={() => reload()}
+                      />
+                    </div>
+                  </footer>
+                </div>
 
-                  {/* divider */}
-                  <div className="vertical-line-gradient absolute left-0 top-0 h-full w-[2px]"></div>
-
-                  {/* slide indicator */}
-                  <div
-                    className="absolute left-0 top-0 z-20 flex h-full items-center justify-center p-1 opacity-30 transition-opacity hover:opacity-100 group-hover:opacity-100"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setTimelineMode(
-                        timelineMode === "wide" ? "narrow" : "wide",
-                      );
-                    }}
-                  >
-                    {timelineMode === "narrow" && <ChevronLeftIcon />}
-                    {timelineMode === "wide" && <ChevronRightIcon />}
-                  </div>
-
-                  {/* timeline narrow */}
+                {/* timeline */}
+                <div
+                  className={cn("z-20 h-full w-[5rem] overflow-visible", {
+                    "pointer-events-none hidden w-[0px] overflow-hidden":
+                      !blockLabel,
+                  })}
+                >
                   <div
                     className={cn(
-                      "delay-[300ms] pointer-events-none absolute left-0 top-0 h-full w-[6rem] rounded-l-lg opacity-0 transition-all duration-1000",
+                      "relative h-full w-[25rem] translate-x-[-20.5rem] bg-[#020617] transition-all",
                       {
-                        "pointer-events-auto opacity-100":
-                          timelineMode === "narrow",
+                        "translate-x-[0rem]": timelineMode === "narrow",
+                        group: timelineMode === "narrow",
                       },
                     )}
+                    onClick={() => {
+                      if (timelineMode === "narrow") {
+                        setTimelineMode("wide");
+                      }
+                    }}
                   >
-                    <DebuggerRunMinimal />
+                    {/* timeline wide */}
+                    <div
+                      className={cn(
+                        "pointer-events-none absolute left-[0.5rem] right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end opacity-0 transition-all duration-1000",
+                        { "opacity-100": timelineMode === "wide" },
+                      )}
+                    >
+                      <div
+                        className={cn(
+                          "pointer-events-none relative flex h-full w-full flex-col items-start overflow-hidden bg-[#020617]",
+                          { "pointer-events-auto": timelineMode === "wide" },
+                        )}
+                      >
+                        <DebuggerRun />
+                      </div>
+                    </div>
+
+                    {/* divider */}
+                    <div className="vertical-line-gradient absolute left-0 top-0 h-full w-[2px]"></div>
+
+                    {/* slide indicator */}
+                    <div
+                      className="absolute left-0 top-0 z-20 flex h-full items-center justify-center p-1 opacity-30 transition-opacity hover:opacity-100 group-hover:opacity-100"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTimelineMode(
+                          timelineMode === "wide" ? "narrow" : "wide",
+                        );
+                      }}
+                    >
+                      {timelineMode === "narrow" && <ChevronLeftIcon />}
+                      {timelineMode === "wide" && <ChevronRightIcon />}
+                    </div>
+
+                    {/* timeline narrow */}
+                    <div
+                      className={cn(
+                        "delay-[300ms] pointer-events-none absolute left-0 top-0 h-full w-[6rem] rounded-l-lg opacity-0 transition-all duration-1000",
+                        {
+                          "pointer-events-auto opacity-100":
+                            timelineMode === "narrow",
+                        },
+                      )}
+                    >
+                      <DebuggerRunMinimal />
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
-          </div>
+          </Splitter>
         </div>
       )}
     </div>

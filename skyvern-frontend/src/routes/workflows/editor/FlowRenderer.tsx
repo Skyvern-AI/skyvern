@@ -221,6 +221,7 @@ function convertToParametersYAML(
 
 type Props = {
   hideBackground?: boolean;
+  hideControls?: boolean;
   nodes: Array<AppNode>;
   edges: Array<Edge>;
   setNodes: (nodes: Array<AppNode>) => void;
@@ -233,10 +234,12 @@ type Props = {
   onDebuggableBlockCountChange?: (count: number) => void;
   onMouseDownCapture?: () => void;
   zIndex?: number;
+  onContainerResize?: number;
 };
 
 function FlowRenderer({
   hideBackground = false,
+  hideControls = false,
   nodes,
   edges,
   setNodes,
@@ -249,6 +252,7 @@ function FlowRenderer({
   onDebuggableBlockCountChange,
   onMouseDownCapture,
   zIndex,
+  onContainerResize,
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
@@ -485,14 +489,34 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
 
+  useEffect(() => {
+    doLayout(nodes, edges);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onContainerResize]);
+
   const zoomLock = 1 as const;
   const yLockMax = 140 as const;
 
   /**
    * TODO(jdo): hack
+   *
+   * Locks the x position of the flow to an ideal x based on the ideal width
+   * of the flow. The ideal width is based on differently-width'd blocks.
    */
   const getXLock = () => {
-    return 24;
+    const rect = editorElementRef.current?.getBoundingClientRect();
+
+    if (!rect) {
+      return 24;
+    }
+
+    const width = rect.width;
+    const hasLoopBlock = nodes.some((node) => node.type === "loop");
+    const hasHttpBlock = nodes.some((node) => node.type === "http_request");
+    const idealWidth = hasHttpBlock ? 580 : hasLoopBlock ? 498 : 475;
+    const split = (width - idealWidth) / 2;
+
+    return Math.max(24, split);
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {
@@ -673,7 +697,7 @@ function FlowRenderer({
           {!hideBackground && (
             <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
           )}
-          <Controls position="bottom-left" />
+          {!hideControls && <Controls position="bottom-left" />}
         </ReactFlow>
       </BlockActionContext.Provider>
     </div>
