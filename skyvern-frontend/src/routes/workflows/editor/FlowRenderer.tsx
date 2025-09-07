@@ -50,6 +50,7 @@ import {
   ContextParameterYAML,
   CredentialParameterYAML,
   OnePasswordCredentialParameterYAML,
+  AzureVaultCredentialParameterYAML,
   ParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
@@ -65,6 +66,7 @@ import {
   parameterIsSkyvernCredential,
   parameterIsOnePasswordCredential,
   parameterIsBitwardenCredential,
+  parameterIsAzureVaultCredential,
 } from "./types";
 import "./reactFlowOverrideStyles.css";
 import {
@@ -90,6 +92,7 @@ function convertToParametersYAML(
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
   | OnePasswordCredentialParameterYAML
+  | AzureVaultCredentialParameterYAML
   | CredentialParameterYAML
 > {
   return parameters
@@ -103,6 +106,7 @@ function convertToParametersYAML(
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
         | OnePasswordCredentialParameterYAML
+        | AzureVaultCredentialParameterYAML
         | CredentialParameterYAML
         | undefined => {
         if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
@@ -191,6 +195,15 @@ function convertToParametersYAML(
               vault_id: parameter.vaultId,
               item_id: parameter.itemId,
             };
+          } else if (parameterIsAzureVaultCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Azure_Vault_Credential,
+              key: parameter.key,
+              description: parameter.description || null,
+              vault_id: parameter.vaultId,
+              login_id: parameter.loginId,
+              password_id: parameter.passwordId,
+            };
           }
         }
         return undefined;
@@ -205,6 +218,7 @@ function convertToParametersYAML(
           | BitwardenSensitiveInformationParameterYAML
           | BitwardenCreditCardDataParameterYAML
           | OnePasswordCredentialParameterYAML
+          | AzureVaultCredentialParameterYAML
           | CredentialParameterYAML
           | undefined,
       ): param is
@@ -214,6 +228,7 @@ function convertToParametersYAML(
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
         | OnePasswordCredentialParameterYAML
+        | AzureVaultCredentialParameterYAML
         | CredentialParameterYAML => param !== undefined,
     );
 }

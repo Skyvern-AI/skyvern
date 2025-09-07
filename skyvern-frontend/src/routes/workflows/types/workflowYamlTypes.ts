@@ -31,6 +31,7 @@ export type ParameterYAML =
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
   | OnePasswordCredentialParameterYAML
+  | AzureVaultCredentialParameterYAML
   | ContextParameterYAML
   | OutputParameterYAML
   | CredentialParameterYAML;
@@ -88,6 +89,13 @@ export type OnePasswordCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "onepassword";
   vault_id: string;
   item_id: string;
+};
+
+export type AzureVaultCredentialParameterYAML = ParameterYAMLBase & {
+  parameter_type: "azure_vault_credential";
+  vault_id: string;
+  login_id: string;
+  password_id: string;
 };
 
 export type ContextParameterYAML = ParameterYAMLBase & {

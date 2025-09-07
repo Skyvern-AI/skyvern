@@ -72,6 +72,18 @@ export type OnePasswordCredentialParameter = WorkflowParameterBase & {
   deleted_at: string | null;
 };
 
+export type AzureVaultCredentialParameter = WorkflowParameterBase & {
+  parameter_type: "azure_vault_credential";
+  workflow_id: string;
+  azure_vault_credential_parameter_id: string;
+  vault_id: string;
+  login_id: string;
+  password_id: string;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+};
+
 export type CredentialParameter = WorkflowParameterBase & {
   parameter_type: "credential";
   workflow_id: string;
@@ -130,6 +142,7 @@ export const WorkflowParameterTypes = {
   Bitwarden_Sensitive_Information: "bitwarden_sensitive_information",
   Bitwarden_Credit_Card_Data: "bitwarden_credit_card_data",
   OnePassword: "onepassword",
+  Azure_Vault_Credential: "azure_vault_credential",
   Credential: "credential",
 } as const;
 
@@ -145,6 +158,7 @@ export function isDisplayedInWorkflowEditor(
   | BitwardenLoginCredentialParameter
   | BitwardenSensitiveInformationParameter
   | OnePasswordCredentialParameter
+  | AzureVaultCredentialParameter
   | CredentialParameter {
   return (
     parameter.parameter_type === WorkflowParameterTypes.Workflow ||
@@ -156,6 +170,8 @@ export function isDisplayedInWorkflowEditor(
     parameter.parameter_type ===
       WorkflowParameterTypes.Bitwarden_Credit_Card_Data ||
     parameter.parameter_type === WorkflowParameterTypes.OnePassword ||
+    parameter.parameter_type ===
+      WorkflowParameterTypes.Azure_Vault_Credential ||
     parameter.parameter_type === WorkflowParameterTypes.Credential
   );
 }
@@ -168,6 +184,7 @@ export type Parameter =
   | BitwardenSensitiveInformationParameter
   | BitwardenCreditCardDataParameter
   | OnePasswordCredentialParameter
+  | AzureVaultCredentialParameter
   | AWSSecretParameter
   | CredentialParameter;
 

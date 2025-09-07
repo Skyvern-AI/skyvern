@@ -1805,6 +1805,15 @@ function convertParametersToParameterYAML(
             item_id: parameter.item_id,
           };
         }
+        case WorkflowParameterTypes.Azure_Vault_Credential: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Azure_Vault_Credential,
+            vault_id: parameter.vault_id,
+            login_id: parameter.login_id,
+            password_id: parameter.password_id,
+          };
+        }
       }
     })
     .filter(Boolean);

@@ -81,7 +81,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
   >(undefined);
 
   const [credentialType, setCredentialType] = useState<
-    "bitwarden" | "skyvern" | "onepassword"
+    "bitwarden" | "skyvern" | "onepassword" | "azurevault"
   >("skyvern");
   const [vaultId, setVaultId] = useState("");
   const [itemId, setItemId] = useState("");
@@ -92,6 +92,10 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
     useState("");
 
   const [credentialId, setCredentialId] = useState("");
+
+  const [azureVaultId, setAzureVaultId] = useState("");
+  const [azureLoginId, setAzureLoginId] = useState("");
+  const [azurePasswordId, setAzurePasswordId] = useState("");
 
   return (
     <ScrollArea>
@@ -203,13 +207,18 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               value={credentialType}
               onChange={(value) => {
                 setCredentialType(
-                  value as "bitwarden" | "skyvern" | "onepassword",
+                  value as
+                    | "bitwarden"
+                    | "skyvern"
+                    | "onepassword"
+                    | "azurevault",
                 );
               }}
               options={[
                 { label: "Skyvern", value: "skyvern" },
                 { label: "Bitwarden", value: "bitwarden" },
                 { label: "1Password", value: "onepassword" },
+                { label: "Azure Vault", value: "azurevault" },
               ]}
             />
           )}
@@ -256,6 +265,32 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                 <Input
                   value={itemId}
                   onChange={(e) => setItemId(e.target.value)}
+                />
+              </div>
+            </>
+          )}
+          {type === "credential" && credentialType === "azurevault" && (
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Vault ID</Label>
+                <Input
+                  value={azureVaultId}
+                  onChange={(e) => setAzureVaultId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Login ID</Label>
+                <Input
+                  autoComplete="off"
+                  value={azureLoginId}
+                  onChange={(e) => setAzureLoginId(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Password ID</Label>
+                <Input
+                  value={azurePasswordId}
+                  onChange={(e) => setAzurePasswordId(e.target.value)}
                 />
               </div>
             </>
@@ -425,6 +460,29 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     vaultId,
                     itemId,
                     description,
+                  });
+                }
+                if (type === "credential" && credentialType === "azurevault") {
+                  if (
+                    azureVaultId.trim() === "" ||
+                    azureLoginId.trim() === "" ||
+                    azurePasswordId.trim() === ""
+                  ) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description:
+                        "Azure Vault ID, Login ID and Password ID are required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    vaultId: azureVaultId,
+                    loginId: azureLoginId,
+                    passwordId: azurePasswordId,
+                    description: description,
                   });
                 }
                 if (type === "secret" || type === "creditCardData") {
