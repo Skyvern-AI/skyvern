@@ -847,13 +847,11 @@ class WorkflowRunContext:
         if not parameter_value:
             return parameter_value
 
-        parameter_value = jinja_sandbox_env.from_string(parameter_value).render(self.values)
-
         # Fallback on direct value in case configured as 'my_parameter' instead of '{{ my_parameter }}'
         if self.has_parameter(parameter_value) and self.has_value(parameter_value):
             return self.values[parameter_value]
         else:
-            return parameter_value
+            return jinja_sandbox_env.from_string(parameter_value).render(self.values)
 
 
 class WorkflowContextManager:
