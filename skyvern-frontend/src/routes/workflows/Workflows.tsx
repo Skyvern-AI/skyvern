@@ -51,7 +51,11 @@ import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
-  workflow_definition: { blocks: [], parameters: [] },
+  ai_fallback: true,
+  workflow_definition: {
+    blocks: [],
+    parameters: [],
+  },
 };
 
 function Workflows() {
