@@ -284,12 +284,7 @@ class WorkflowRunContext:
     ) -> None:
         LOG.info(f"Fetching credential parameter value for credential: {parameter.credential_id}")
 
-        credential_id = None
-        if parameter.credential_id:
-            if self.has_parameter(parameter.credential_id) and self.has_value(parameter.credential_id):
-                credential_id = self.values[parameter.credential_id]
-            else:
-                credential_id = parameter.credential_id
+        credential_id = self._resolve_parameter_value(parameter.credential_id)
 
         if credential_id is None:
             LOG.error(f"Credential ID not found for credential: {parameter.credential_id}")
@@ -372,12 +367,8 @@ class WorkflowRunContext:
             integration_name="Skyvern",
             integration_version="v1.0.0",
         )
-        item_id = parameter.item_id
-        vault_id = parameter.vault_id
-        if self.has_parameter(parameter.item_id) and self.has_value(parameter.item_id):
-            item_id = self.values[parameter.item_id]
-        if self.has_parameter(parameter.vault_id) and self.has_value(parameter.vault_id):
-            vault_id = self.values[parameter.vault_id]
+        item_id = self._resolve_parameter_value(parameter.item_id)
+        vault_id = self._resolve_parameter_value(parameter.vault_id)
 
         item = await client.items.get(vault_id, item_id)
 
@@ -518,13 +509,8 @@ class WorkflowRunContext:
         if not master_password:
             raise ValueError("Bitwarden master password not found")
 
-        bitwarden_identity_key = parameter.bitwarden_identity_key
-        if self.has_parameter(parameter.bitwarden_identity_key) and self.has_value(parameter.bitwarden_identity_key):
-            bitwarden_identity_key = self.values[parameter.bitwarden_identity_key]
-
-        collection_id = parameter.bitwarden_collection_id
-        if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(parameter.bitwarden_collection_id):
-            collection_id = self.values[parameter.bitwarden_collection_id]
+        bitwarden_identity_key = self._resolve_parameter_value(parameter.bitwarden_identity_key)
+        collection_id = self._resolve_parameter_value(parameter.bitwarden_collection_id)
 
         try:
             sensitive_values = await BitwardenService.get_sensitive_information_from_identity(
@@ -587,15 +573,8 @@ class WorkflowRunContext:
         if not master_password:
             raise ValueError("Bitwarden master password not found")
 
-        if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
-            item_id = self.values[parameter.bitwarden_item_id]
-        else:
-            item_id = parameter.bitwarden_item_id
-
-        if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(parameter.bitwarden_collection_id):
-            collection_id = self.values[parameter.bitwarden_collection_id]
-        else:
-            collection_id = parameter.bitwarden_collection_id
+        item_id = self._resolve_parameter_value(parameter.bitwarden_item_id)
+        collection_id = self._resolve_parameter_value(parameter.bitwarden_collection_id)
 
         try:
             credit_card_data = await BitwardenService.get_credit_card_data(
