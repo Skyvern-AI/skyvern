@@ -9,6 +9,7 @@ class CredentialType(StrEnum):
     skyvern = "skyvern"
     bitwarden = "bitwarden"
     onepassword = "1password"
+    azure_vault = "azure_vault"
 
 
 class LoginRequest(BaseModel):
@@ -51,3 +52,8 @@ class LoginRequest(BaseModel):
     # 1Password credential
     onepassword_vault_id: str | None = Field(default=None, description="1Password vault ID")
     onepassword_item_id: str | None = Field(default=None, description="1Password item ID")
+
+    # Azure Vault credential
+    azure_vault_id: str | None = Field(default=None, description="Azure Vault ID")
+    azure_vault_login_id: str | None = Field(default=None, description="Azure Vault login ID")
+    azure_vault_password_id: str | None = Field(default=None, description="Azure Vault password ID")

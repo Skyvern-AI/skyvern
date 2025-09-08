@@ -53,6 +53,7 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
     generate_workflow_script_id,
+    generate_azure_vault_credential_parameter_id,
 )
 from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 
@@ -456,6 +457,29 @@ class OnePasswordCredentialParameterModel(Base):
     description = Column(String, nullable=True)
     vault_id = Column(String, nullable=False)
     item_id = Column(String, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class AzureVaultCredentialParameterModel(Base):
+    __tablename__ = "azure_vault_credential_parameters"
+
+    azure_vault_credential_parameter_id = Column(
+        String, primary_key=True, default=generate_azure_vault_credential_parameter_id
+    )
+    workflow_id = Column(String, index=True, nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    vault_id = Column(String, nullable=False)
+    login_id = Column(String, nullable=False)
+    password_id = Column(String, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

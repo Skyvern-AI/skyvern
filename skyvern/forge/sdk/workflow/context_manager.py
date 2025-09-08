@@ -32,6 +32,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ContextParameter,
     CredentialParameter,
     OnePasswordCredentialParameter,
+    AzureVaultCredentialParameter,
     OutputParameter,
     Parameter,
     ParameterType,

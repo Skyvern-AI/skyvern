@@ -23,6 +23,7 @@ from skyvern.schemas.workflows import (
     BitwardenLoginCredentialParameterYAML,
     LoginBlockYAML,
     OnePasswordCredentialParameterYAML,
+    AzureVaultCredentialParameterYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowParameterYAML,
@@ -128,6 +129,27 @@ async def login(
                 key=parameter_key,
                 vault_id=login_request.onepassword_vault_id,
                 item_id=login_request.onepassword_item_id,
+            )
+        ]
+    elif login_request.credential_type == CredentialType.azure_vault:
+        if not login_request.azure_vault_id:
+            raise HTTPException(
+                status_code=400, detail="azure_vault_vault_id is required to login with Azure Vault credential"
+            )
+        if not login_request.azure_vault_login_id:
+            raise HTTPException(
+                status_code=400, detail="azure_vault_login_id is required to login with Azure Vault credential"
+            )
+        if not login_request.azure_vault_password_id:
+            raise HTTPException(
+                status_code=400, detail="azure_vault_password_id is required to login with Azure Vault credential"
+            )
+        yaml_parameters = [
+            AzureVaultCredentialParameterYAML(
+                key=parameter_key,
+                vault_id=login_request.azure_vault_id,
+                login_id=login_request.azure_vault_login_id,
+                password_id=login_request.azure_vault_password_id,
             )
         ]
 

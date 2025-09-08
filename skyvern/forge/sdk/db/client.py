@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.models import (
     CredentialParameterModel,
     DebugSessionModel,
     OnePasswordCredentialParameterModel,
+    AzureVaultCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
     OrganizationModel,
@@ -93,6 +94,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenSensitiveInformationParameter,
     CredentialParameter,
     OnePasswordCredentialParameter,
+    AzureVaultCredentialParameter,
     OutputParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -2102,6 +2104,34 @@ class AgentDB:
                 description=parameter.description,
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
+                created_at=parameter.created_at,
+                modified_at=parameter.modified_at,
+                deleted_at=parameter.deleted_at,
+            )
+
+    async def create_azure_vault_credential_parameter(
+        self, workflow_id: str, key: str, vault_id: str, login_id: str, password_id: str, description: str | None = None
+    ) -> AzureVaultCredentialParameter:
+        async with self.Session() as session:
+            parameter = AzureVaultCredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                vault_id=vault_id,
+                login_id=login_id,
+                password_id=password_id,
+            )
+            session.add(parameter)
+            await session.commit()
+            await session.refresh(parameter)
+            return AzureVaultCredentialParameter(
+                azure_vault_credential_parameter_id=parameter.azure_vault_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_id=parameter.vault_id,
+                login_id=parameter.login_id,
+                password_id=parameter.password_id,
                 created_at=parameter.created_at,
                 modified_at=parameter.modified_at,
                 deleted_at=parameter.deleted_at,

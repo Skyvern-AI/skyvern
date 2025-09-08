@@ -150,6 +150,13 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
     item_id: str
 
 
+class AzureVaultCredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.AZURE_VAULT_CREDENTIAL] = ParameterType.AZURE_VAULT_CREDENTIAL  # type: ignore
+    vault_id: str
+    login_id: str
+    password_id: str
+
+
 class WorkflowParameterYAML(ParameterYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -454,6 +461,7 @@ PARAMETER_YAML_SUBCLASSES = (
     | BitwardenSensitiveInformationParameterYAML
     | BitwardenCreditCardDataParameterYAML
     | OnePasswordCredentialParameterYAML
+    | AzureVaultCredentialParameterYAML
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
