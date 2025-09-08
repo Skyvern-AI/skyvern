@@ -108,6 +108,8 @@ class WorkflowRunContext:
                 await workflow_run_context.register_onepassword_credential_parameter_value(
                     secrete_parameter, organization
                 )
+            elif isinstance(secrete_parameter, AzureVaultCredentialParameter):
+                await workflow_run_context.register_azure_vault_credential_parameter_value(secrete_parameter)
             elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
                     secrete_parameter, organization
@@ -488,6 +490,35 @@ class WorkflowRunContext:
         except BitwardenBaseError as e:
             LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
             raise e
+
+    async def register_azure_vault_credential_parameter_value(self, parameter: AzureVaultCredentialParameter) -> None:
+        vault_id = self._resolve_parameter_value(parameter.vault_id)
+        if not vault_id:
+            raise ValueError("Azure Vault ID is missing")
+        login_id = self._resolve_parameter_value(parameter.login_id)
+        if not login_id:
+            raise ValueError("Azure Login ID is missing")
+        password_id = self._resolve_parameter_value(parameter.password_id)
+        if not password_id:
+            raise ValueError("Azure Password ID is missing")
+
+        secret_login = await self._azure_client.get_secret(login_id, vault_id)
+        secret_password = await self._azure_client.get_secret(password_id, vault_id)
+
+        if secret_login is not None and secret_password is not None:
+            random_secret_id = self.generate_random_secret_id()
+            # login secret
+            username_secret_id = f"{random_secret_id}_username"
+            self.secrets[username_secret_id] = secret_login
+            # password secret
+            password_secret_id = f"{random_secret_id}_password"
+            self.secrets[password_secret_id] = secret_password
+            self.values[parameter.key] = {
+                "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+                "username": username_secret_id,
+                "password": password_secret_id,
+            }
+            self.parameters[parameter.key] = parameter
 
     async def register_bitwarden_sensitive_information_parameter_value(
         self,
