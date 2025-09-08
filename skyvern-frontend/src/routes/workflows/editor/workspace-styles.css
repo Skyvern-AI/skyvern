@@ -30,3 +30,37 @@
     transparent 100%
   );
 }
+
+.skyvern-animate-nudge {
+  animation: nudge 0.3s ease-in-out forwards;
+}
+
+.skyvern-animate-ghost {
+  animation: ghost 0.3s ease-in-out forwards;
+}
+
+/* nudge right and little, and then back */
+@keyframes nudge {
+  0% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(2px);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+/* ghost */
+@keyframes ghost {
+  0% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 0.3;
+  }
+  100% {
+    opacity: 0;
+  }
+}
