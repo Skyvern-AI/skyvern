@@ -2,6 +2,7 @@ import copy
 from typing import TYPE_CHECKING, Any, Self
 
 import structlog
+from jinja2.sandbox import SandboxedEnvironment
 from onepassword.client import Client as OnePasswordClient
 
 from skyvern.config import settings
@@ -45,6 +46,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 BlockMetadata = dict[str, str | int | float | bool | dict | list]
+
+jinja_sandbox_env = SandboxedEnvironment()
 
 
 class WorkflowRunContext:
@@ -434,36 +437,13 @@ class WorkflowRunContext:
         if not master_password:
             raise ValueError("Bitwarden master password not found")
 
-        if (
-            parameter.url_parameter_key
-            and self.has_parameter(parameter.url_parameter_key)
-            and self.has_value(parameter.url_parameter_key)
-        ):
-            url = self.values[parameter.url_parameter_key]
-        elif parameter.url_parameter_key:
-            # If a key can't be found within the parameter values dict, assume it's a URL (and not a URL Parameter)
-            url = parameter.url_parameter_key
-        elif parameter.bitwarden_item_id:
-            url = None
-        else:
+        url = self._resolve_parameter_value(parameter.url_parameter_key)
+        if not url and not parameter.bitwarden_item_id:
             LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
             raise SkyvernException("URL parameter for Bitwarden login credentials not found or has no value")
 
-        collection_id = None
-        if parameter.bitwarden_collection_id:
-            if self.has_parameter(parameter.bitwarden_collection_id) and self.has_value(
-                parameter.bitwarden_collection_id
-            ):
-                collection_id = self.values[parameter.bitwarden_collection_id]
-            else:
-                collection_id = parameter.bitwarden_collection_id
-
-        item_id = None
-        if parameter.bitwarden_item_id:
-            if self.has_parameter(parameter.bitwarden_item_id) and self.has_value(parameter.bitwarden_item_id):
-                item_id = self.values[parameter.bitwarden_item_id]
-            else:
-                item_id = parameter.bitwarden_item_id
+        collection_id = self._resolve_parameter_value(parameter.bitwarden_collection_id)
+        item_id = self._resolve_parameter_value(parameter.bitwarden_item_id)
 
         try:
             secret_credentials = await BitwardenService.get_secret_value_from_url(
@@ -862,6 +842,16 @@ class WorkflowRunContext:
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"
+
+    def _resolve_parameter_value(self, parameter_value: str | None) -> str | None:
+        if not parameter_value:
+            return parameter_value
+
+        # Fallback on direct value in case configured as 'my_parameter' instead of '{{ my_parameter }}'
+        if self.has_parameter(parameter_value) and self.has_value(parameter_value):
+            return self.values[parameter_value]
+        else:
+            return jinja_sandbox_env.from_string(parameter_value).render(self.values)
 
 
 class WorkflowContextManager:

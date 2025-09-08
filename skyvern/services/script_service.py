@@ -20,10 +20,11 @@ from skyvern.core.script_generations.skyvern_page import script_run_context_mana
 from skyvern.exceptions import ScriptNotFound, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.tasks import TaskOutput, TaskStatus
+from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.runs import RunEngine
@@ -318,6 +319,10 @@ async def _create_workflow_block_run_and_task(
             step_id = step.step_id
             # reset the action order to 0
             context.action_order = 0
+            await _create_video_artifact(
+                task=task,
+                step=step,
+            )
 
             # Update workflow run block with task_id
             await app.DATABASE.update_workflow_run_block(
@@ -340,6 +345,32 @@ async def _create_workflow_block_run_and_task(
             exc_info=True,
         )
         return None, None, None
+
+
+async def _create_video_artifact(
+    task: Task,
+    step: Step,
+) -> None:
+    workflow_run_id = task.workflow_run_id
+    if not workflow_run_id:
+        return None
+    browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+    if not browser_state:
+        return None
+    if browser_state.browser_artifacts:
+        video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+            task_id=task.task_id, browser_state=browser_state
+        )
+        for idx, video_artifact in enumerate(video_artifacts):
+            if video_artifact.video_artifact_id:
+                continue
+            video_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.RECORDING,
+                data=video_artifact.video_data,
+            )
+            video_artifacts[idx].video_artifact_id = video_artifact_id
+        app.BROWSER_MANAGER.set_video_artifact_for_task(task, video_artifacts)
 
 
 async def _record_output_parameter_value(
