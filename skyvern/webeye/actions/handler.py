@@ -92,12 +92,14 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SelectOptionAction,
     UploadFileAction,
+    UserDefinedError,
     WebAction,
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraper import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
+    ElementTreeFormat,
     IncrementalScrapePage,
     ScrapedPage,
     hash_element,
@@ -1795,6 +1797,8 @@ async def handle_terminate_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    if task.error_code_mapping:
+        action.errors = await extract_user_defined_errors(task=task, step=step, scraped_page=scraped_page)
     return [ActionSuccess()]
 
 
@@ -1834,6 +1838,10 @@ async def handle_complete_action(
             workflow_run_id=task.workflow_run_id,
         )
         action.verified = True
+
+        if task.error_code_mapping:
+            action.errors = await extract_user_defined_errors(task=task, step=step, scraped_page=scraped_page)
+
         if not task.data_extraction_goal and verification_result.thoughts:
             await app.DATABASE.update_task(
                 task.task_id,
@@ -3816,3 +3824,23 @@ async def _get_input_or_select_context(
         context=input_or_select_context,
     )
     return input_or_select_context
+
+
+async def extract_user_defined_errors(task: Task, step: Step, scraped_page: ScrapedPage) -> list[UserDefinedError]:
+    scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
+    prompt = prompt_engine.load_prompt(
+        "surface-user-defined-errors",
+        navigation_goal=task.navigation_goal,
+        navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML),
+        current_url=task.url,
+        error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else {},
+        local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+    )
+    json_response = await app.EXTRACTION_LLM_API_HANDLER(
+        prompt=prompt,
+        screenshots=scraped_page_refreshed.screenshots,
+        step=step,
+        prompt_name="surface-user-defined-errors",
+    )
+    return [UserDefinedError.model_validate(error) for error in json_response.get("errors", [])]
