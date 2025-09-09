@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.id import (
     generate_ai_suggestion_id,
     generate_artifact_id,
     generate_aws_secret_parameter_id,
+    generate_azure_vault_credential_parameter_id,
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
@@ -53,7 +54,6 @@ from skyvern.forge.sdk.db.id import (
     generate_workflow_run_block_id,
     generate_workflow_run_id,
     generate_workflow_script_id,
-    generate_azure_vault_credential_parameter_id,
 )
 from skyvern.forge.sdk.schemas.task_v2 import ThoughtType
 

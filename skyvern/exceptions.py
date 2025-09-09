@@ -758,9 +758,11 @@ class OutputParameterNotFound(SkyvernException):
     def __init__(self, block_label: str, workflow_permanent_id: str) -> None:
         super().__init__(f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}")
 
+
 class AzureBaseError(SkyvernException):
     def __init__(self, message: str) -> None:
         super().__init__(f"Azure error: {message}")
+
 
 class AzureConfigurationError(AzureBaseError):
     def __init__(self, message: str) -> None:

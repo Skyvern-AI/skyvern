@@ -20,10 +20,10 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.schemas.run_blocks import CredentialType, LoginRequest
 from skyvern.schemas.runs import ProxyLocation, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.schemas.workflows import (
+    AzureVaultCredentialParameterYAML,
     BitwardenLoginCredentialParameterYAML,
     LoginBlockYAML,
     OnePasswordCredentialParameterYAML,
-    AzureVaultCredentialParameterYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowParameterYAML,
