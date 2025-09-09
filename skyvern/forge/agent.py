@@ -26,7 +26,7 @@ from skyvern.constants import (
     SPECIAL_FIELD_VERIFICATION_CODE,
     ScrapeType,
 )
-from skyvern.errors.errors import ReachMaxRetriesError, ReachMaxStepsError
+from skyvern.errors.errors import ReachMaxRetriesError, ReachMaxStepsError, UserDefinedError
 from skyvern.exceptions import (
     BrowserSessionNotFound,
     BrowserStateMissingPage,
@@ -82,7 +82,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service
 from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -93,7 +93,6 @@ from skyvern.webeye.actions.actions import (
     ExtractAction,
     ReloadPageAction,
     TerminateAction,
-    UserDefinedError,
     WebAction,
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
@@ -2706,7 +2705,7 @@ class ForgeAgent:
         task: Task,
         step: Step,
         page: Page | None,
-    ) -> str:
+    ) -> MaxStepsReasonResponse:
         steps_results = []
         try:
             steps = await app.DATABASE.get_task_steps(
@@ -2717,7 +2716,12 @@ class ForgeAgent:
                     continue
 
                 if len(step.output.errors) > 0:
-                    return ";".join([repr(err) for err in step.output.errors])
+                    failure_reason = ";".join([repr(err) for err in step.output.errors])
+                    return MaxStepsReasonResponse(
+                        page_info="",
+                        reasoning=failure_reason,
+                        errors=step.output.errors,
+                    )
 
                 if step.output.actions_and_results is None:
                     continue
@@ -2749,18 +2753,27 @@ class ForgeAgent:
                 navigation_goal=task.navigation_goal,
                 navigation_payload=task.navigation_payload,
                 steps=steps_results,
+                error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await app.LLM_API_HANDLER(
                 prompt=prompt, screenshots=screenshots, step=step, prompt_name="summarize-max-steps-reason"
             )
-            return json_response.get("reasoning", "")
+            return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning("Failed to summary the failure reason", task_id=task.task_id, step_id=step.step_id)
             if steps_results:
                 last_step_result = steps_results[-1]
-                return f"Step {last_step_result['order']}: {last_step_result['actions_result']}"
-            return ""
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=f"Step {last_step_result['order']}: {last_step_result['actions_result']}",
+                    errors=[],
+                )
+            return MaxStepsReasonResponse(
+                page_info="",
+                reasoning="",
+                errors=[],
+            )
 
     async def summary_failure_reason_for_max_retries(
         self,
@@ -2904,21 +2917,22 @@ class ForgeAgent:
             )
             last_step = await self.update_step(step, is_last=True)
 
-            failure_reason = await self.summary_failure_reason_for_max_steps(
+            generated_failure_reason = await self.summary_failure_reason_for_max_steps(
                 organization=organization,
                 task=task,
                 step=step,
                 page=page,
             )
-            failure_reason = (
-                f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {failure_reason}"
-            )
+            failure_reason = f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {generated_failure_reason.reasoning}"
+            errors = [ReachMaxStepsError().model_dump()] + [
+                error.model_dump() for error in generated_failure_reason.errors
+            ]
 
             await self.update_task(
                 task,
                 status=TaskStatus.failed,
                 failure_reason=failure_reason,
-                errors=[ReachMaxStepsError().model_dump()],
+                errors=errors,
             )
             return False, last_step, None
         else:
