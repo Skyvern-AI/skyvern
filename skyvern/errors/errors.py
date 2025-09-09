@@ -1,4 +1,13 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class UserDefinedError(BaseModel):
+    error_code: str
+    reasoning: str
+    confidence_float: float = Field(..., ge=0, le=1)
+
+    def __repr__(self) -> str:
+        return f"{self.reasoning}(error_code={self.error_code}, confidence_float={self.confidence_float})"
 
 
 class SkyvernDefinedError(BaseModel):
