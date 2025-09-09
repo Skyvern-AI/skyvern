@@ -55,7 +55,7 @@ class WorkflowRunContext:
     async def init(
         cls,
         aws_client: AsyncAWSClient,
-        azure_client: AsyncAzureClient | None,
+        azure_client: AsyncAzureClient,
         organization: Organization,
         workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
         workflow_output_parameters: list[OutputParameter],
@@ -128,7 +128,7 @@ class WorkflowRunContext:
 
         return workflow_run_context
 
-    def __init__(self, aws_client: AsyncAWSClient, azure_client: AsyncAzureClient | None) -> None:
+    def __init__(self, aws_client: AsyncAWSClient, azure_client: AsyncAzureClient) -> None:
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
@@ -343,9 +343,6 @@ class WorkflowRunContext:
         # If the parameter is an Azure secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
-        if self._azure_client is None:
-            LOG.error("Azure client not initialized, cannot register Azure secret parameter value")
-            raise ValueError("Azure client not initialized")
         secret_value = await self._azure_client.get_secret(parameter.azure_key)
         if secret_value is not None:
             random_secret_id = self.generate_random_secret_id()
@@ -856,7 +853,7 @@ class WorkflowRunContext:
 
 class WorkflowContextManager:
     aws_client: AsyncAWSClient
-    azure_client: AsyncAzureClient | None
+    azure_client: AsyncAzureClient
     workflow_run_contexts: dict[str, WorkflowRunContext]
 
     parameters: dict[str, PARAMETER_TYPE]
@@ -865,12 +862,10 @@ class WorkflowContextManager:
 
     def __init__(self) -> None:
         self.aws_client = AsyncAWSClient()
-        self.azure_client = None
-        if settings.AZURE_STORAGE_ACCOUNT_NAME and settings.AZURE_STORAGE_ACCOUNT_KEY:
-            self.azure_client = AsyncAzureClient(
-                account_name=settings.AZURE_STORAGE_ACCOUNT_NAME,
-                account_key=settings.AZURE_STORAGE_ACCOUNT_KEY,
-            )
+        self.azure_client = AsyncAzureClient(
+            storage_account_name=settings.AZURE_STORAGE_ACCOUNT_NAME,
+            storage_account_key=settings.AZURE_STORAGE_ACCOUNT_KEY,
+        )
         self.workflow_run_contexts = {}
 
     def _validate_workflow_run_context(self, workflow_run_id: str) -> None:
