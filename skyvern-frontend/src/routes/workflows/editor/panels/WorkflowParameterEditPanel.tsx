@@ -1,4 +1,3 @@
-import { SwitchBar } from "@/components/SwitchBar";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -285,24 +284,37 @@ function WorkflowParameterEditPanel({
             </>
           )}
           {type === "credential" && (
-            <SwitchBar
-              value={credentialType}
-              onChange={(value) => {
-                setCredentialType(
-                  value as
-                    | "bitwarden"
-                    | "skyvern"
-                    | "onepassword"
-                    | "azurevault",
-                );
-              }}
-              options={[
-                { label: "Skyvern", value: "skyvern" },
-                { label: "Bitwarden", value: "bitwarden" },
-                { label: "1Password", value: "onepassword" },
-                { label: "Azure Vault", value: "azurevault" },
-              ]}
-            />
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  Credential Type
+                </Label>
+                <Select
+                  value={credentialType}
+                  onValueChange={(value) => {
+                    setCredentialType(
+                      value as
+                        | "bitwarden"
+                        | "skyvern"
+                        | "onepassword"
+                        | "azurevault",
+                    );
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select a type" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="skyvern">Skyvern</SelectItem>
+                      <SelectItem value="bitwarden">Bitwarden</SelectItem>
+                      <SelectItem value="onepassword">1Password</SelectItem>
+                      <SelectItem value="azurevault">Azure Vault</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
+            </>
           )}
           {type === "credential" && credentialType === "bitwarden" && (
             <>
