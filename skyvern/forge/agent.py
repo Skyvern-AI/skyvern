@@ -2062,7 +2062,6 @@ class ForgeAgent:
             current_url=current_url,
             data_extraction_goal=task.data_extraction_goal,
             action_history=actions_and_results_str,
-            error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
             local_datetime=datetime.now(context.tz_info).isoformat(),
             verification_code_check=verification_code_check,
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
