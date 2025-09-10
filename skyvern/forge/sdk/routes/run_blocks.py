@@ -134,7 +134,7 @@ async def login(
     elif login_request.credential_type == CredentialType.azure_vault:
         if not login_request.azure_vault_id:
             raise HTTPException(
-                status_code=400, detail="azure_vault_vault_id is required to login with Azure Vault credential"
+                status_code=400, detail="azure_vault_id is required to login with Azure Vault credential"
             )
         if not login_request.azure_vault_login_id:
             raise HTTPException(
