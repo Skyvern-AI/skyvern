@@ -3764,6 +3764,9 @@ class AsyncSkyvern:
         bitwarden_item_id: typing.Optional[str] = OMIT,
         onepassword_vault_id: typing.Optional[str] = OMIT,
         onepassword_item_id: typing.Optional[str] = OMIT,
+        azure_vault_id: typing.Optional[str] = OMIT,
+        azure_vault_login_id: typing.Optional[str] = OMIT,
+        azure_vault_password_id: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -3816,6 +3819,15 @@ class AsyncSkyvern:
         onepassword_item_id : typing.Optional[str]
             1Password item ID
 
+        azure_vault_id : typing.Optional[str]
+            Azure Vault ID
+
+        azure_vault_login_id : typing.Optional[str]
+            ID of the login/username record in the Azure Vault
+
+        azure_vault_password_id : typing.Optional[str]
+            ID of the password record in the Azure Vault
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3863,6 +3875,9 @@ class AsyncSkyvern:
                 "bitwarden_item_id": bitwarden_item_id,
                 "onepassword_vault_id": onepassword_vault_id,
                 "onepassword_item_id": onepassword_item_id,
+                "azure_vault_id": azure_vault_id,
+                "azure_vault_login_id": azure_vault_login_id,
+                "azure_vault_password_id": azure_vault_password_id,
             },
             headers={
                 "content-type": "application/json",
