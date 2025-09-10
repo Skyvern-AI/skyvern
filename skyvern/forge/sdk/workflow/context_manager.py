@@ -97,30 +97,30 @@ class WorkflowRunContext:
             for label, value in block_outputs.items():
                 workflow_run_context.values[f"{label}_output"] = value
 
-        for secrete_parameter in secret_parameters:
-            if isinstance(secrete_parameter, AWSSecretParameter):
-                await workflow_run_context.register_aws_secret_parameter_value(secrete_parameter)
-            elif isinstance(secrete_parameter, AzureSecretParameter):
-                await workflow_run_context.register_azure_secret_parameter_value(secrete_parameter)
-            elif isinstance(secrete_parameter, CredentialParameter):
-                await workflow_run_context.register_credential_parameter_value(secrete_parameter, organization)
-            elif isinstance(secrete_parameter, OnePasswordCredentialParameter):
+        for secret_parameter in secret_parameters:
+            if isinstance(secret_parameter, AWSSecretParameter):
+                await workflow_run_context.register_aws_secret_parameter_value(secret_parameter)
+            elif isinstance(secret_parameter, AzureSecretParameter):
+                await workflow_run_context.register_azure_secret_parameter_value(secret_parameter)
+            elif isinstance(secret_parameter, CredentialParameter):
+                await workflow_run_context.register_credential_parameter_value(secret_parameter, organization)
+            elif isinstance(secret_parameter, OnePasswordCredentialParameter):
                 await workflow_run_context.register_onepassword_credential_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
-            elif isinstance(secrete_parameter, AzureVaultCredentialParameter):
-                await workflow_run_context.register_azure_vault_credential_parameter_value(secrete_parameter)
-            elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
+            elif isinstance(secret_parameter, AzureVaultCredentialParameter):
+                await workflow_run_context.register_azure_vault_credential_parameter_value(secret_parameter)
+            elif isinstance(secret_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
-            elif isinstance(secrete_parameter, BitwardenCreditCardDataParameter):
+            elif isinstance(secret_parameter, BitwardenCreditCardDataParameter):
                 await workflow_run_context.register_bitwarden_credit_card_data_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
-            elif isinstance(secrete_parameter, BitwardenSensitiveInformationParameter):
+            elif isinstance(secret_parameter, BitwardenSensitiveInformationParameter):
                 await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
 
         for context_parameter in context_parameters:
