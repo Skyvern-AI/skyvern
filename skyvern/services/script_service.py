@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
@@ -26,12 +27,12 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, TaskBlock
-from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, FileUploadBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import CreateScriptResponse, FileEncoding, FileNode, ScriptFileCreate
-from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType
 
 LOG = structlog.get_logger(__name__)
 jinja_sandbox_env = SandboxedEnvironment()
@@ -1376,11 +1377,18 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
 
 
 # Non-task-based blocks
-async def run_code(
-    code: str,
-    label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
-) -> dict[str, Any]:
+## Non-task-based block helpers
+@dataclass
+class BlockValidationOutput:
+    label: str
+    output_parameter: OutputParameter
+    workflow_id: str
+    workflow_run_id: str
+    organization_id: str
+    browser_session_id: str | None = None
+
+
+async def _validate_and_get_output_parameter(label: str | None = None) -> BlockValidationOutput:
     context = skyvern_context.ensure_context()
     workflow_id = context.workflow_id
     workflow_run_id = context.workflow_run_id
@@ -1399,16 +1407,66 @@ async def run_code(
     output_parameter = workflow.get_output_parameter(label)
     if not output_parameter:
         raise Exception("Output parameter not found")
-
-    code_block = CodeBlock(
-        code=code,
+    return BlockValidationOutput(
         label=label,
-        parameters=parameters or [],
         output_parameter=output_parameter,
-    )
-    block_result = await code_block.execute_safe(
+        workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
         browser_session_id=browser_session_id,
     )
+
+
+async def run_code(
+    code: str,
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+) -> dict[str, Any]:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    code_block = CodeBlock(
+        code=code,
+        label=block_validation_output.label,
+        parameters=parameters or [],
+        output_parameter=block_validation_output.output_parameter,
+    )
+    block_result = await code_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
     return cast(dict[str, Any], block_result.output_parameter_value)
+
+
+async def upload_file(
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+    storage_type: FileStorageType = FileStorageType.S3,
+    s3_bucket: str | None = None,
+    aws_access_key_id: str | None = None,
+    aws_secret_access_key: str | None = None,
+    region_name: str | None = None,
+    azure_storage_account_name: str | None = None,
+    azure_storage_account_key: str | None = None,
+    azure_blob_container_name: str | None = None,
+    path: str | None = None,
+) -> None:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    file_upload_block = FileUploadBlock(
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=parameters or [],
+        storage_type=storage_type,
+        s3_bucket=s3_bucket,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=region_name,
+        azure_storage_account_name=azure_storage_account_name,
+        azure_storage_account_key=azure_storage_account_key,
+        azure_blob_container_name=azure_blob_container_name,
+        path=path,
+    )
+    await file_upload_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
