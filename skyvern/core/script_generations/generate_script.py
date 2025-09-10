@@ -32,6 +32,7 @@ from skyvern.core.script_generations.generate_workflow_parameters import (
     hydrate_input_text_actions_with_field_names,
 )
 from skyvern.forge import app
+from skyvern.schemas.workflows import FileStorageType
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
@@ -920,6 +921,64 @@ def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
+def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.upload_file statement."""
+    args = [
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("parameters"),
+            value=_value(block.get("parameters", None)),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("storage_type"),
+            value=_value(block.get("storage_type", FileStorageType.S3)),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+            ),
+        ),
+    ]
+    for key in [
+        "s3_bucket",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "region_name",
+        "azure_storage_account_name",
+        "azure_storage_account_key",
+        "azure_blob_container_name",
+        "path",
+    ]:
+        if block.get(key) is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name(key),
+                    value=_value(block.get(key, "")),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                    ),
+                )
+            )
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("upload_file")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
 def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list[cst.Arg]:
     args = [
         cst.Arg(
@@ -1031,6 +1090,8 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
             stmt = _build_goto_statement(block)
         elif block_type == "code":
             stmt = _build_code_statement(block)
+        elif block_type == "file_upload":
+            stmt = _build_file_upload_statement(block)
         else:
             # Default case for unknown block types
             stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
