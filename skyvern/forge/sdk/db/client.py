@@ -3387,7 +3387,7 @@ class AgentDB:
             await session.refresh(credential)
             return Credential.model_validate(credential)
 
-    async def get_credential(self, credential_id: str, organization_id: str) -> Credential:
+    async def get_credential(self, credential_id: str, organization_id: str) -> Credential | None:
         async with self.Session() as session:
             credential = (
                 await session.scalars(
@@ -3399,7 +3399,7 @@ class AgentDB:
             ).first()
             if credential:
                 return Credential.model_validate(credential)
-            raise NotFoundError(f"Credential {credential_id} not found")
+            return None
 
     async def get_credentials(self, organization_id: str, page: int = 1, page_size: int = 10) -> list[Credential]:
         async with self.Session() as session:

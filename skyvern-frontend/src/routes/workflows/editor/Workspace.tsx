@@ -104,6 +104,7 @@ function Workspace({
     null,
   );
   const [page, setPage] = useState(1);
+  const [nudge, setNudge] = useState(false);
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -881,14 +882,34 @@ function Workspace({
 
                 {/* timeline */}
                 <div
-                  className={cn("z-20 h-full w-[5rem] overflow-visible", {
-                    "pointer-events-none hidden w-[0px] overflow-hidden":
-                      !blockLabel,
-                  })}
+                  className={cn(
+                    "z-20 h-full w-[5rem] overflow-visible",
+                    {
+                      "skyvern-animate-nudge": nudge,
+                    },
+                    {
+                      "pointer-events-none hidden w-[0px] overflow-hidden":
+                        !blockLabel,
+                    },
+                  )}
+                  onMouseEnter={() => {
+                    if (timelineMode === "narrow") {
+                      return;
+                    }
+
+                    setNudge(true);
+                  }}
+                  onMouseLeave={() => {
+                    if (timelineMode === "narrow") {
+                      return;
+                    }
+
+                    setNudge(false);
+                  }}
                 >
                   <div
                     className={cn(
-                      "relative h-full w-[25rem] translate-x-[-20.5rem] bg-[#020617] transition-all",
+                      "group relative h-full w-[25rem] translate-x-[-20.5rem] bg-[#020617] transition-all",
                       {
                         "translate-x-[0rem]": timelineMode === "narrow",
                         group: timelineMode === "narrow",
@@ -904,7 +925,9 @@ function Workspace({
                     <div
                       className={cn(
                         "pointer-events-none absolute left-[0.5rem] right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end opacity-0 transition-all duration-1000",
-                        { "opacity-100": timelineMode === "wide" },
+                        {
+                          "opacity-100": timelineMode === "wide",
+                        },
                       )}
                     >
                       <div
@@ -919,6 +942,16 @@ function Workspace({
 
                     {/* divider */}
                     <div className="vertical-line-gradient absolute left-0 top-0 h-full w-[2px]"></div>
+
+                    {/* slide nudge ghost */}
+                    <div
+                      className={cn(
+                        "slide-nudge-ghost vertical-line-gradient absolute left-0 top-0 h-full w-[2rem] opacity-0 transition-opacity",
+                        {
+                          "skyvern-animate-ghost": nudge,
+                        },
+                      )}
+                    />
 
                     {/* slide indicator */}
                     <div
