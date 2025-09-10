@@ -152,9 +152,9 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
 
 class AzureVaultCredentialParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.AZURE_VAULT_CREDENTIAL] = ParameterType.AZURE_VAULT_CREDENTIAL  # type: ignore
-    vault_id: str
-    login_id: str
-    password_id: str
+    vault_name: str
+    username_key: str
+    password_key: str
 
 
 class WorkflowParameterYAML(ParameterYAML):

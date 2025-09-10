@@ -132,24 +132,24 @@ async def login(
             )
         ]
     elif login_request.credential_type == CredentialType.azure_vault:
-        if not login_request.azure_vault_id:
+        if not login_request.azure_vault_name:
             raise HTTPException(
-                status_code=400, detail="azure_vault_id is required to login with Azure Vault credential"
+                status_code=400, detail="azure_vault_name is required to login with Azure Vault credential"
             )
-        if not login_request.azure_vault_login_id:
+        if not login_request.azure_vault_username_key:
             raise HTTPException(
-                status_code=400, detail="azure_vault_login_id is required to login with Azure Vault credential"
+                status_code=400, detail="azure_vault_username_key is required to login with Azure Vault credential"
             )
-        if not login_request.azure_vault_password_id:
+        if not login_request.azure_vault_password_key:
             raise HTTPException(
-                status_code=400, detail="azure_vault_password_id is required to login with Azure Vault credential"
+                status_code=400, detail="azure_vault_password_key is required to login with Azure Vault credential"
             )
         yaml_parameters = [
             AzureVaultCredentialParameterYAML(
                 key=parameter_key,
-                vault_id=login_request.azure_vault_id,
-                login_id=login_request.azure_vault_login_id,
-                password_id=login_request.azure_vault_password_id,
+                vault_name=login_request.azure_vault_name,
+                username_key=login_request.azure_vault_username_key,
+                password_key=login_request.azure_vault_password_key,
             )
         ]
 

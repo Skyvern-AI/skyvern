@@ -54,6 +54,6 @@ class LoginRequest(BaseModel):
     onepassword_item_id: str | None = Field(default=None, description="1Password item ID")
 
     # Azure Vault credential
-    azure_vault_id: str | None = Field(default=None, description="Azure Vault ID")
-    azure_vault_login_id: str | None = Field(default=None, description="Azure Vault login ID")
-    azure_vault_password_id: str | None = Field(default=None, description="Azure Vault password ID")
+    azure_vault_name: str | None = Field(default=None, description="Azure Vault Name")
+    azure_vault_username_key: str | None = Field(default=None, description="Azure Vault username key")
+    azure_vault_password_key: str | None = Field(default=None, description="Azure Vault password key")

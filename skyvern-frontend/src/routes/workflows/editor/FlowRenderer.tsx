@@ -200,9 +200,9 @@ function convertToParametersYAML(
               parameter_type: WorkflowParameterTypes.Azure_Vault_Credential,
               key: parameter.key,
               description: parameter.description || null,
-              vault_id: parameter.vaultId,
-              login_id: parameter.loginId,
-              password_id: parameter.passwordId,
+              vault_name: parameter.vaultName,
+              username_key: parameter.usernameKey,
+              password_key: parameter.passwordKey,
             };
           }
         }

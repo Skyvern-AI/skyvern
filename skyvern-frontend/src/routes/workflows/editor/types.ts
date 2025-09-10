@@ -28,9 +28,9 @@ export type AzureVaultCredential = {
   key: string;
   description?: string | null;
   parameterType: "credential";
-  vaultId: string;
-  loginId: string;
-  passwordId: string;
+  vaultName: string;
+  usernameKey: string;
+  passwordKey: string;
 };
 
 export function parameterIsBitwardenCredential(
@@ -55,9 +55,9 @@ export function parameterIsAzureVaultCredential(
   parameter: CredentialParameterState,
 ): parameter is AzureVaultCredential {
   return (
-    "vaultId" in parameter &&
-    "loginId" in parameter &&
-    "passwordId" in parameter
+    "vaultName" in parameter &&
+    "usernameKey" in parameter &&
+    "passwordKey" in parameter
   );
 }
 

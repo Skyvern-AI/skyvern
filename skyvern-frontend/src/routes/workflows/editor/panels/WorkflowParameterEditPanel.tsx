@@ -168,14 +168,14 @@ function WorkflowParameterEditPanel({
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
     useState(isBitwardenCredential ? initialValues.itemId ?? "" : "");
 
-  const [azureVaultId, setAzureVaultId] = useState(
-    isAzureVaultCredential ? initialValues.vaultId : "",
+  const [azureVaultName, setAzureVaultName] = useState(
+    isAzureVaultCredential ? initialValues.vaultName : "",
   );
-  const [azureLoginId, setAzureLoginId] = useState(
-    isAzureVaultCredential ? initialValues.loginId : "",
+  const [azureUsernameKey, setAzureUsernameKey] = useState(
+    isAzureVaultCredential ? initialValues.usernameKey : "",
   );
-  const [azurePasswordId, setAzurePasswordId] = useState(
-    isAzureVaultCredential ? initialValues.passwordId : "",
+  const [azurePasswordKey, setAzurePasswordKey] = useState(
+    isAzureVaultCredential ? initialValues.passwordKey : "",
   );
 
   return (
@@ -366,25 +366,25 @@ function WorkflowParameterEditPanel({
           {type === "credential" && credentialType === "azurevault" && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Vault ID</Label>
+                <Label className="text-xs text-slate-300">Vault Name</Label>
                 <Input
-                  value={azureVaultId}
-                  onChange={(e) => setAzureVaultId(e.target.value)}
+                  value={azureVaultName}
+                  onChange={(e) => setAzureVaultName(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Login ID</Label>
+                <Label className="text-xs text-slate-300">Username Key</Label>
                 <Input
                   autoComplete="off"
-                  value={azureLoginId}
-                  onChange={(e) => setAzureLoginId(e.target.value)}
+                  value={azureUsernameKey}
+                  onChange={(e) => setAzureUsernameKey(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Password ID</Label>
+                <Label className="text-xs text-slate-300">Password Key</Label>
                 <Input
-                  value={azurePasswordId}
-                  onChange={(e) => setAzurePasswordId(e.target.value)}
+                  value={azurePasswordKey}
+                  onChange={(e) => setAzurePasswordKey(e.target.value)}
                 />
               </div>
             </>
@@ -545,24 +545,24 @@ function WorkflowParameterEditPanel({
                 }
                 if (type === "credential" && credentialType === "azurevault") {
                   if (
-                    azureVaultId.trim() === "" ||
-                    azureLoginId.trim() === "" ||
-                    azurePasswordId.trim() === ""
+                    azureVaultName.trim() === "" ||
+                    azureUsernameKey.trim() === "" ||
+                    azurePasswordKey.trim() === ""
                   ) {
                     toast({
                       variant: "destructive",
                       title: "Failed to add parameter",
                       description:
-                        "Azure Vault ID, Login ID and Password ID are required",
+                        "Azure Vault Name, Username Key and Password Key are required",
                     });
                     return;
                   }
                   onSave({
                     key,
                     parameterType: "credential",
-                    vaultId: azureVaultId,
-                    loginId: azureLoginId,
-                    passwordId: azurePasswordId,
+                    vaultName: azureVaultName,
+                    usernameKey: azureUsernameKey,
+                    passwordKey: azurePasswordKey,
                     description: description,
                   });
                 }

@@ -492,18 +492,18 @@ class WorkflowRunContext:
             raise e
 
     async def register_azure_vault_credential_parameter_value(self, parameter: AzureVaultCredentialParameter) -> None:
-        vault_id = self._resolve_parameter_value(parameter.vault_id)
-        if not vault_id:
-            raise ValueError("Azure Vault ID is missing")
-        login_id = self._resolve_parameter_value(parameter.login_id)
-        if not login_id:
-            raise ValueError("Azure Login ID is missing")
-        password_id = self._resolve_parameter_value(parameter.password_id)
-        if not password_id:
-            raise ValueError("Azure Password ID is missing")
+        vault_name = self._resolve_parameter_value(parameter.vault_name)
+        if not vault_name:
+            raise ValueError("Azure Vault Name is missing")
+        username_key = self._resolve_parameter_value(parameter.username_key)
+        if not username_key:
+            raise ValueError("Azure Username Key is missing")
+        password_key = self._resolve_parameter_value(parameter.password_key)
+        if not password_key:
+            raise ValueError("Azure Password Key is missing")
 
-        secret_login = await self._azure_client.get_secret(login_id, vault_id)
-        secret_password = await self._azure_client.get_secret(password_id, vault_id)
+        secret_login = await self._azure_client.get_secret(username_key, vault_name)
+        secret_password = await self._azure_client.get_secret(password_key, vault_name)
 
         if secret_login is not None and secret_password is not None:
             random_secret_id = self.generate_random_secret_id()

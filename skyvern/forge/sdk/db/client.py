@@ -2110,16 +2110,22 @@ class AgentDB:
             )
 
     async def create_azure_vault_credential_parameter(
-        self, workflow_id: str, key: str, vault_id: str, login_id: str, password_id: str, description: str | None = None
+        self,
+        workflow_id: str,
+        key: str,
+        vault_name: str,
+        username_key: str,
+        password_key: str,
+        description: str | None = None,
     ) -> AzureVaultCredentialParameter:
         async with self.Session() as session:
             parameter = AzureVaultCredentialParameterModel(
                 workflow_id=workflow_id,
                 key=key,
                 description=description,
-                vault_id=vault_id,
-                login_id=login_id,
-                password_id=password_id,
+                vault_name=vault_name,
+                username_key=username_key,
+                password_key=password_key,
             )
             session.add(parameter)
             await session.commit()
@@ -2129,9 +2135,9 @@ class AgentDB:
                 workflow_id=parameter.workflow_id,
                 key=parameter.key,
                 description=parameter.description,
-                vault_id=parameter.vault_id,
-                login_id=parameter.login_id,
-                password_id=parameter.password_id,
+                vault_name=parameter.vault_name,
+                username_key=parameter.username_key,
+                password_key=parameter.password_key,
                 created_at=parameter.created_at,
                 modified_at=parameter.modified_at,
                 deleted_at=parameter.deleted_at,

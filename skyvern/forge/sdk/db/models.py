@@ -477,9 +477,9 @@ class AzureVaultCredentialParameterModel(Base):
     workflow_id = Column(String, index=True, nullable=False)
     key = Column(String, nullable=False)
     description = Column(String, nullable=True)
-    vault_id = Column(String, nullable=False)
-    login_id = Column(String, nullable=False)
-    password_id = Column(String, nullable=False)
+    vault_name = Column(String, nullable=False)
+    username_key = Column(String, nullable=False)
+    password_key = Column(String, nullable=False)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

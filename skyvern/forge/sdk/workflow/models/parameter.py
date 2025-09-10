@@ -160,9 +160,9 @@ class AzureVaultCredentialParameter(Parameter):
 
     azure_vault_credential_parameter_id: str
     workflow_id: str
-    vault_id: str
-    login_id: str
-    password_id: str
+    vault_name: str
+    username_key: str
+    password_key: str
 
     created_at: datetime
     modified_at: datetime

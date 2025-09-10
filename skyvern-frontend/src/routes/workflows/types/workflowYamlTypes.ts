@@ -93,9 +93,9 @@ export type OnePasswordCredentialParameterYAML = ParameterYAMLBase & {
 
 export type AzureVaultCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "azure_vault_credential";
-  vault_id: string;
-  login_id: string;
-  password_id: string;
+  vault_name: string;
+  username_key: string;
+  password_key: string;
 };
 
 export type ContextParameterYAML = ParameterYAMLBase & {

@@ -76,9 +76,9 @@ export type AzureVaultCredentialParameter = WorkflowParameterBase & {
   parameter_type: "azure_vault_credential";
   workflow_id: string;
   azure_vault_credential_parameter_id: string;
-  vault_id: string;
-  login_id: string;
-  password_id: string;
+  vault_name: string;
+  username_key: string;
+  password_key: string;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;

@@ -86,9 +86,9 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
         return {
           key: parameter.key,
           parameterType: WorkflowEditorParameterTypes.Credential,
-          vaultId: parameter.vault_id,
-          loginId: parameter.login_id,
-          passwordId: parameter.password_id,
+          vaultName: parameter.vault_name,
+          usernameKey: parameter.username_key,
+          passwordKey: parameter.password_key,
           description: parameter.description,
         };
       } else if (
