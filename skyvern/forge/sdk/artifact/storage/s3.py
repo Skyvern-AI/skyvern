@@ -163,6 +163,10 @@ class S3Storage(BaseStorage):
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         return await self.async_client.download_file(path, log_exception=False)
 
+    async def set_streaming_file(self, organization_id: str, file_name: str, data: bytes) -> None:
+        # we only write streaming files locally
+        pass
+
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
         # Zip the directory to a temp file
         temp_zip_file = create_named_temporary_file()

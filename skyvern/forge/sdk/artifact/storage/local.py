@@ -167,6 +167,7 @@ class LocalStorage(BaseStorage):
         return [artifact.uri for artifact in artifacts]
 
     async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+        # noop
         return
 
     async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:
@@ -178,6 +179,22 @@ class LocalStorage(BaseStorage):
                 return f.read()
         except Exception:
             return None
+
+    async def set_streaming_file(self, organization_id: str, file_name: str, data: bytes) -> None:
+        Path(f"{get_skyvern_temp_dir()}/{organization_id}").mkdir(parents=True, exist_ok=True)
+
+        file_path = Path(f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}")
+
+        try:
+            with open(file_path, "wb") as f:
+                f.write(data)
+        except Exception:
+            LOG.exception(
+                "Failed to write streaming file locally",
+                organization_id=organization_id,
+                file_name=file_name,
+                file_path=file_path,
+            )
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
         stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id

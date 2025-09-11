@@ -22,6 +22,7 @@ import structlog
 from playwright.async_api import BrowserContext, ConsoleMessage, Download, Page, Playwright
 from pydantic import BaseModel, PrivateAttr
 
+
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME, SKYVERN_DIR
 from skyvern.exceptions import (
@@ -32,6 +33,7 @@ from skyvern.exceptions import (
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
+from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
@@ -924,12 +926,17 @@ class BrowserState:
         use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         page = await self.__assert_page()
-        return await SkyvernFrame.take_scrolling_screenshot(
+        screenshot = await SkyvernFrame.take_scrolling_screenshot(
             page=page,
             file_path=file_path,
             mode=ScreenshotMode.LITE,
             use_playwright_fullpage=use_playwright_fullpage,
         )
+
+        if not settings.is_cloud_environment():
+            await self.save_local_streaming_screenshot(screenshot)
+
+        return screenshot
 
     async def take_post_action_screenshot(
         self,
@@ -938,10 +945,41 @@ class BrowserState:
         use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         page = await self.__assert_page()
-        return await SkyvernFrame.take_scrolling_screenshot(
+        screenshot = await SkyvernFrame.take_scrolling_screenshot(
             page=page,
             file_path=file_path,
             mode=ScreenshotMode.LITE,
             scrolling_number=scrolling_number,
             use_playwright_fullpage=use_playwright_fullpage,
         )
+
+        if not settings.is_cloud_environment():
+            await self.save_local_streaming_screenshot(screenshot)
+
+        return screenshot
+
+
+    async def save_local_streaming_screenshot(self, screenshot: bytes) -> None:
+        context = current()
+
+        if not context:
+            LOG.warning("Failed to save streaming screenshot locally, no context")
+            return
+
+        organization_id = context.organization_id
+
+        if not organization_id:
+            LOG.warning("Failed to save streaming screenshot locally, no organization id")
+            return
+
+        try:
+            if context and context.organization_id:
+                file_name = f"{context.workflow_run_id}.png" if context.workflow_run_id else f"{context.task_id}.png"
+                await app.STORAGE.set_streaming_file(organization_id, file_name, screenshot)
+        except Exception:
+            LOG.exception(
+                "Failed to save streaming screenshot locally",
+                organization_id=organization_id,
+                task_id=context.task_id,
+                workflow_run_id=context.workflow_run_id,
+            )

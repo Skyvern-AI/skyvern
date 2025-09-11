@@ -116,6 +116,10 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def set_streaming_file(self, organization_id: str, file_name: str, data: bytes) -> None:
+        pass
+
+    @abstractmethod
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
         pass
 

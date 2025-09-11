@@ -890,7 +890,9 @@ function Workspace({
                 {/* Screenshot browser} */}
                 {!user && (
                   <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                    <WorkflowRunStream />
+                    <div className="aspect-video w-full">
+                      <WorkflowRunStream alwaysShowStream={true} />
+                    </div>
                   </div>
                 )}
 

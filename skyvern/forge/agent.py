@@ -1762,6 +1762,11 @@ class ForgeAgent:
                 artifact_type=ArtifactType.SCREENSHOT_ACTION,
                 data=screenshot,
             )
+
+            if not settings.is_cloud_environment():
+                # screenshot for local streaming
+                file_name = f"{task.workflow_run_id}.png" if task.workflow_run_id else f"{task.task_id}.png"
+                await app.STORAGE.set_streaming_file(task.organization_id, file_name, screenshot)
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2247,6 +2252,11 @@ class ForgeAgent:
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,
                         data=screenshot,
                     )
+
+                    if not settings.is_cloud_environment():
+                        # screenshot for local streaming
+                        file_name = f"{task.workflow_run_id}.png" if task.workflow_run_id else f"{task.task_id}.png"
+                        await app.STORAGE.set_streaming_file(task.organization_id, file_name, screenshot)
                 except TargetClosedError:
                     LOG.warning(
                         "Failed to take screenshot before sending task response, page is closed",
