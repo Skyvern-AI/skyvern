@@ -784,9 +784,9 @@ async def handle_sequential_click_for_dropdown(
         action=AbstractActionForContextParse(
             reasoning=action.reasoning, intention=action.intention, element_id=action.element_id
         ),
-        step=step,
-        element_tree_builder=scraped_page,
         skyvern_element=anchor_element,
+        element_tree_builder=scraped_page,
+        step=step,
     )
 
     if dropdown_select_context.is_date_related:
@@ -3425,9 +3425,20 @@ async def normal_select(
     action_result: List[ActionResult] = []
     is_success = False
     locator = skyvern_element.get_locator()
+
     input_or_select_context = await _get_input_or_select_context(
-        action=action, element_tree_builder=builder, step=step, skyvern_element=skyvern_element
+        action=action,
+        element_tree_builder=builder,
+        step=step,
+        skyvern_element=skyvern_element,
     )
+    LOG.info(
+        "Parsed input/select context",
+        context=input_or_select_context,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
     await skyvern_element.refresh_select_options()
     options_html = skyvern_element.build_HTML()
     field_information = (
@@ -3766,6 +3777,11 @@ async def _get_input_or_select_context(
     step: Step,
     ancestor_depth: int = 5,
 ) -> InputOrSelectContext:
+    # Early return optimization: if action already has input_or_select_context, use it
+    if not isinstance(action, AbstractActionForContextParse) and action.input_or_select_context is not None:
+        return action.input_or_select_context
+
+    # Ancestor depth optimization: use ancestor element for deep DOM structures
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame())
     try:
         depth = await skyvern_frame.get_element_dom_depth(await skyvern_element.get_element_handler())

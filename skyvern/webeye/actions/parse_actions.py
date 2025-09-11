@@ -21,6 +21,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    InputOrSelectContext,
     InputTextAction,
     KeypressAction,
     LeftMouseAction,
@@ -68,6 +69,7 @@ def parse_action(action: Dict[str, Any], scraped_page: ScrapedPage, data_extract
         "intention": intention,
         "response": response,
     }
+    input_or_select_context: InputOrSelectContext | None = None
 
     if "action_type" not in action or action["action_type"] is None:
         return NullAction(**base_action_dict)
@@ -89,7 +91,11 @@ def parse_action(action: Dict[str, Any], scraped_page: ScrapedPage, data_extract
         return ClickAction(**base_action_dict, file_url=file_url, download=action.get("download", False))
 
     if action_type == ActionType.INPUT_TEXT:
-        return InputTextAction(**base_action_dict, text=action["text"])
+        context_dict = action.get("context", {})
+        if context_dict and len(context_dict) > 0:
+            context_dict["intention"] = intention
+            input_or_select_context = InputOrSelectContext.model_validate(context_dict)
+        return InputTextAction(**base_action_dict, text=action["text"], input_or_select_context=input_or_select_context)
 
     if action_type == ActionType.UPLOAD_FILE:
         # TODO: see if the element is a file input element. if it's not, convert this action into a click action
@@ -106,6 +112,12 @@ def parse_action(action: Dict[str, Any], scraped_page: ScrapedPage, data_extract
         option = action["option"]
         if option is None:
             raise ValueError("SelectOptionAction requires an 'option' field")
+
+        context_dict = action.get("context", {})
+        if context_dict and len(context_dict) > 0:
+            context_dict["intention"] = intention
+            input_or_select_context = InputOrSelectContext.model_validate(context_dict)
+
         label = option.get("label")
         value = option.get("value")
         index = option.get("index")
@@ -118,6 +130,7 @@ def parse_action(action: Dict[str, Any], scraped_page: ScrapedPage, data_extract
                 value=value,
                 index=index,
             ),
+            input_or_select_context=input_or_select_context,
         )
 
     if action_type == ActionType.CHECKBOX:

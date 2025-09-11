@@ -30,6 +30,11 @@ Terminate Criterion:
 ```
 {{ terminate_criterion }}
 ```{% endif %}
+{% if error_code_mapping_str %}
+Use the error codes and their descriptions to surface user-defined errors. Do not return any error that's not defined by the user. User defined errors:
+```
+{{ error_code_mapping_str }}
+```{% endif %}
 
 User details:
 ```

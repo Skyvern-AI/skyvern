@@ -466,6 +466,11 @@ async def run_task_v2_helper(
 
     context: skyvern_context.SkyvernContext | None = skyvern_context.current()
     current_run_id = context.run_id if context and context.run_id else task_v2_id
+    enable_parse_select_in_extract = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+        "ENABLE_PARSE_SELECT_IN_EXTRACT",
+        organization_id,
+        properties={"organization_id": organization_id, "task_url": task_v2.url},
+    )
     skyvern_context.set(
         SkyvernContext(
             organization_id=organization_id,
@@ -476,6 +481,7 @@ async def run_task_v2_helper(
             run_id=current_run_id,
             browser_session_id=browser_session_id,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,
+            enable_parse_select_in_extract=bool(enable_parse_select_in_extract),
         )
     )
 
