@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     FailedToFetchSecret,
     FailToClick,
     FailToSelectByIndex,
+    FailToSelectByLabel,
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
@@ -3446,20 +3447,6 @@ async def normal_select(
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
-    try:
-        await locator.click(
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
-    except Exception as e:
-        LOG.info(
-            "Failed to click before select action",
-            exc_info=True,
-            action=action,
-            locator=locator,
-        )
-        action_result.append(ActionFailure(e))
-        return action_result
-
     if not is_success and value is not None:
         try:
             # click by value (if it matches)
@@ -3473,6 +3460,24 @@ async def normal_select(
             action_result.append(ActionFailure(FailToSelectByValue(action.element_id)))
             LOG.info(
                 "Failed to take select action by value",
+                exc_info=True,
+                action=action,
+                locator=locator,
+            )
+
+    if not is_success and value is not None:
+        try:
+            # click by label (if it matches)
+            await locator.select_option(
+                label=value,
+                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+            )
+            is_success = True
+            action_result.append(ActionSuccess())
+        except Exception:
+            action_result.append(ActionFailure(FailToSelectByLabel(action.element_id)))
+            LOG.info(
+                "Failed to take select action by label",
                 exc_info=True,
                 action=action,
                 locator=locator,
@@ -3503,20 +3508,6 @@ async def normal_select(
                     action=action,
                     locator=locator,
                 )
-
-    try:
-        await locator.click(
-            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-        )
-    except Exception as e:
-        LOG.info(
-            "Failed to click after select action",
-            exc_info=True,
-            action=action,
-            locator=locator,
-        )
-        action_result.append(ActionFailure(e))
-        return action_result
 
     if len(action_result) == 0:
         action_result.append(ActionFailure(EmptySelect(element_id=action.element_id)))
