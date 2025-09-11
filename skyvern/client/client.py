@@ -3764,10 +3764,6 @@ class AsyncSkyvern:
         bitwarden_item_id: typing.Optional[str] = OMIT,
         onepassword_vault_id: typing.Optional[str] = OMIT,
         onepassword_item_id: typing.Optional[str] = OMIT,
-        azure_vault_name: typing.Optional[str] = OMIT,
-        azure_vault_username_key: typing.Optional[str] = OMIT,
-        azure_vault_password_key: typing.Optional[str] = OMIT,
-        azure_vault_totp_key: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -3820,18 +3816,6 @@ class AsyncSkyvern:
         onepassword_item_id : typing.Optional[str]
             1Password item ID
 
-        azure_vault_name : typing.Optional[str]
-            Azure Vault Name
-
-        azure_vault_username_key : typing.Optional[str]
-            Name/Key of the login/username record in the Azure Vault
-
-        azure_vault_password_key : typing.Optional[str]
-            Name/Key of the password record in the Azure Vault
-
-        azure_vault_totp_key : typing.Optional[str]
-            Name/Key of the password record in the Azure Vault
-
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3879,10 +3863,6 @@ class AsyncSkyvern:
                 "bitwarden_item_id": bitwarden_item_id,
                 "onepassword_vault_id": onepassword_vault_id,
                 "onepassword_item_id": onepassword_item_id,
-                "azure_vault_name": azure_vault_name,
-                "azure_vault_username_key": azure_vault_username_key,
-                "azure_vault_password_key": azure_vault_password_key,
-                "azure_vault_totp_key": azure_vault_totp_key,
             },
             headers={
                 "content-type": "application/json",
