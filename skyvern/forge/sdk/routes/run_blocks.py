@@ -64,7 +64,7 @@ If login is completed, you're successful."""
             }
         ],
     },
-    description="Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password",
+    description="Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault",
     summary="Login Task",
 )
 async def login(
