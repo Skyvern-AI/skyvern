@@ -90,6 +90,12 @@ class Workflow(BaseModel):
                 return block.output_parameter
         return None
 
+    def get_parameter(self, key: str) -> PARAMETER_TYPE | None:
+        for parameter in self.workflow_definition.parameters:
+            if parameter.key == key:
+                return parameter
+        return None
+
 
 class WorkflowRunStatus(StrEnum):
     created = "created"
