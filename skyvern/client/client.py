@@ -3767,6 +3767,7 @@ class AsyncSkyvern:
         azure_vault_name: typing.Optional[str] = OMIT,
         azure_vault_username_key: typing.Optional[str] = OMIT,
         azure_vault_password_key: typing.Optional[str] = OMIT,
+        azure_vault_totp_key: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -3828,6 +3829,9 @@ class AsyncSkyvern:
         azure_vault_password_key : typing.Optional[str]
             Name/Key of the password record in the Azure Vault
 
+        azure_vault_totp_key : typing.Optional[str]
+            Name/Key of the password record in the Azure Vault
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3878,6 +3882,7 @@ class AsyncSkyvern:
                 "azure_vault_name": azure_vault_name,
                 "azure_vault_username_key": azure_vault_username_key,
                 "azure_vault_password_key": azure_vault_password_key,
+                "azure_vault_totp_key": azure_vault_totp_key,
             },
             headers={
                 "content-type": "application/json",

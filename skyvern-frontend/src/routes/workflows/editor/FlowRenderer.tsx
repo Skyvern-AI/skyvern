@@ -203,6 +203,7 @@ function convertToParametersYAML(
               vault_name: parameter.vaultName,
               username_key: parameter.usernameKey,
               password_key: parameter.passwordKey,
+              totp_secret_key: parameter.totpSecretKey,
             };
           }
         }

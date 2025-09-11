@@ -2116,6 +2116,7 @@ class AgentDB:
         vault_name: str,
         username_key: str,
         password_key: str,
+        totp_secret_key: str,
         description: str | None = None,
     ) -> AzureVaultCredentialParameter:
         async with self.Session() as session:
@@ -2126,6 +2127,7 @@ class AgentDB:
                 vault_name=vault_name,
                 username_key=username_key,
                 password_key=password_key,
+                totp_secret_key=totp_secret_key,
             )
             session.add(parameter)
             await session.commit()
@@ -2138,6 +2140,7 @@ class AgentDB:
                 vault_name=parameter.vault_name,
                 username_key=parameter.username_key,
                 password_key=parameter.password_key,
+                totp_secret_key=parameter.totp_secret_key,
                 created_at=parameter.created_at,
                 modified_at=parameter.modified_at,
                 deleted_at=parameter.deleted_at,

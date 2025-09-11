@@ -1129,6 +1129,7 @@ class WorkflowService:
         vault_name: str,
         username_key: str,
         password_key: str,
+        totp_secret_key: str,
         description: str | None = None,
     ) -> AzureVaultCredentialParameterModel:
         return await app.DATABASE.create_azure_vault_credential_parameter(
@@ -1137,6 +1138,7 @@ class WorkflowService:
             vault_name=vault_name,
             username_key=username_key,
             password_key=password_key,
+            totp_secret_key=totp_secret_key,
             description=description,
         )
 
@@ -1800,6 +1802,7 @@ class WorkflowService:
                         vault_name=parameter.vault_name,
                         username_key=parameter.username_key,
                         password_key=parameter.password_key,
+                        totp_secret_key=parameter.totp_secret_key,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:

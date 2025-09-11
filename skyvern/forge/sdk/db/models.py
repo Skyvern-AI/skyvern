@@ -480,6 +480,7 @@ class AzureVaultCredentialParameterModel(Base):
     vault_name = Column(String, nullable=False)
     username_key = Column(String, nullable=False)
     password_key = Column(String, nullable=False)
+    totp_secret_key = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

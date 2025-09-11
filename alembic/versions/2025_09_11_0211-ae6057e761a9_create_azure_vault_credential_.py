@@ -1,8 +1,8 @@
 """create azure_vault_credential_parameters table
 
-Revision ID: 44050968fae5
+Revision ID: ae6057e761a9
 Revises: 8de03b8cb83a
-Create Date: 2025-09-11 00:04:55.478195+00:00
+Create Date: 2025-09-11 02:11:25.593521+00:00
 
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "44050968fae5"
+revision: str = "ae6057e761a9"
 down_revision: Union[str, None] = "8de03b8cb83a"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -30,6 +30,7 @@ def upgrade() -> None:
         sa.Column("vault_name", sa.String(), nullable=False),
         sa.Column("username_key", sa.String(), nullable=False),
         sa.Column("password_key", sa.String(), nullable=False),
+        sa.Column("totp_secret_key", sa.String(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("modified_at", sa.DateTime(), nullable=False),
         sa.Column("deleted_at", sa.DateTime(), nullable=True),

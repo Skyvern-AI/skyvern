@@ -177,6 +177,9 @@ function WorkflowParameterEditPanel({
   const [azurePasswordKey, setAzurePasswordKey] = useState(
     isAzureVaultCredential ? initialValues.passwordKey : "",
   );
+  const [azureTotpSecretKey, setAzureTotpKey] = useState(
+    isAzureVaultCredential ? initialValues.totpSecretKey : "",
+  );
 
   return (
     <ScrollArea>
@@ -387,6 +390,15 @@ function WorkflowParameterEditPanel({
                   onChange={(e) => setAzurePasswordKey(e.target.value)}
                 />
               </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  TOTP Secret Key
+                </Label>
+                <Input
+                  value={azureTotpSecretKey}
+                  onChange={(e) => setAzureTotpKey(e.target.value)}
+                />
+              </div>
             </>
           )}
           {type === "context" && (
@@ -563,6 +575,7 @@ function WorkflowParameterEditPanel({
                     vaultName: azureVaultName,
                     usernameKey: azureUsernameKey,
                     passwordKey: azurePasswordKey,
+                    totpSecretKey: azureTotpSecretKey,
                     description: description,
                   });
                 }

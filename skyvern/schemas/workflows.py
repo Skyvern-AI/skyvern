@@ -155,6 +155,7 @@ class AzureVaultCredentialParameterYAML(ParameterYAML):
     vault_name: str
     username_key: str
     password_key: str
+    totp_secret_key: str
 
 
 class WorkflowParameterYAML(ParameterYAML):

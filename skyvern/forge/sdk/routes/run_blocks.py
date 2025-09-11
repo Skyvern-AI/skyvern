@@ -150,6 +150,7 @@ async def login(
                 vault_name=login_request.azure_vault_name,
                 username_key=login_request.azure_vault_username_key,
                 password_key=login_request.azure_vault_password_key,
+                totp_secret_key=login_request.azure_vault_totp_secret_key,
             )
         ]
 

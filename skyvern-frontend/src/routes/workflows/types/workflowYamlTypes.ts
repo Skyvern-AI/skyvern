@@ -96,6 +96,7 @@ export type AzureVaultCredentialParameterYAML = ParameterYAMLBase & {
   vault_name: string;
   username_key: string;
   password_key: string;
+  totp_secret_key: string;
 };
 
 export type ContextParameterYAML = ParameterYAMLBase & {

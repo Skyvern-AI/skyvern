@@ -57,3 +57,4 @@ class LoginRequest(BaseModel):
     azure_vault_name: str | None = Field(default=None, description="Azure Vault Name")
     azure_vault_username_key: str | None = Field(default=None, description="Azure Vault username key")
     azure_vault_password_key: str | None = Field(default=None, description="Azure Vault password key")
+    azure_vault_totp_secret_key: str | None = Field(default=None, description="Azure Vault TOTP secret key")

@@ -95,6 +95,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
   const [azureVaultName, setAzureVaultName] = useState("");
   const [azureUsernameKey, setAzureUsernameKey] = useState("");
   const [azurePasswordKey, setAzurePasswordKey] = useState("");
+  const [azureTotpSecretKey, setAzureTotpKey] = useState("");
 
   return (
     <ScrollArea>
@@ -305,6 +306,15 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                   onChange={(e) => setAzurePasswordKey(e.target.value)}
                 />
               </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  TOTP Secret Key
+                </Label>
+                <Input
+                  value={azureTotpSecretKey}
+                  onChange={(e) => setAzureTotpKey(e.target.value)}
+                />
+              </div>
             </>
           )}
           {type === "context" && (
@@ -494,6 +504,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     vaultName: azureVaultName,
                     usernameKey: azureUsernameKey,
                     passwordKey: azurePasswordKey,
+                    totpSecretKey: azureTotpSecretKey,
                     description: description,
                   });
                 }

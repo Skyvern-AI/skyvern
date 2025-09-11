@@ -89,6 +89,7 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           vaultName: parameter.vault_name,
           usernameKey: parameter.username_key,
           passwordKey: parameter.password_key,
+          totpSecretKey: parameter.totp_secret_key,
           description: parameter.description,
         };
       } else if (
