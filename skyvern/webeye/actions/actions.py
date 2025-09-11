@@ -83,6 +83,7 @@ class Action(BaseModel):
     download: bool | None = None
     is_upload_file_tag: bool | None = None
     text: str | None = None
+    input_or_select_context: InputOrSelectContext | None = None
     option: SelectOption | None = None
     is_checked: bool | None = None
     verified: bool = False
@@ -165,7 +166,7 @@ class InputTextAction(WebAction):
     text: str
 
     def __repr__(self) -> str:
-        return f"InputTextAction(element_id={self.element_id}, text={self.text}, tool_call_id={self.tool_call_id})"
+        return f"InputTextAction(element_id={self.element_id}, text={self.text}, context={self.input_or_select_context}, tool_call_id={self.tool_call_id})"
 
 
 class UploadFileAction(WebAction):
@@ -199,7 +200,7 @@ class SelectOptionAction(WebAction):
     option: SelectOption
 
     def __repr__(self) -> str:
-        return f"SelectOptionAction(element_id={self.element_id}, option={self.option})"
+        return f"SelectOptionAction(element_id={self.element_id}, option={self.option}, context={self.input_or_select_context})"
 
 
 ###

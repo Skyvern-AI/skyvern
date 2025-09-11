@@ -2052,6 +2052,7 @@ class ForgeAgent:
             raise UnsupportedTaskType(task_type=task_type)
 
         context = skyvern_context.ensure_context()
+
         return load_prompt_with_elements(
             element_tree_builder=scraped_page,
             prompt_engine=prompt_engine,
@@ -2067,6 +2068,7 @@ class ForgeAgent:
             verification_code_check=verification_code_check,
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+            parse_select_feature_enabled=context.enable_parse_select_in_extract,
         )
 
     def _build_navigation_payload(
