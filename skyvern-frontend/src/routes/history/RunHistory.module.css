@@ -1,0 +1,136 @@
+/* Mobile responsiveness for Run History section */
+
+@media (max-width: 768px) {
+  .mobileContainer {
+    padding: 0 1rem !important;
+    width: 100% !important;
+    max-width: 100vw !important;
+    overflow-x: hidden !important;
+  }
+
+  .mobileMainContainer {
+    margin: 0 !important;
+    width: 100% !important;
+  }
+
+  .mobileHeaderContainer {
+    flex-direction: column !important;
+    gap: 1rem !important;
+    align-items: flex-start !important;
+  }
+
+  .mobileTableContainer {
+    overflow-x: hidden !important;
+    width: 100% !important;
+    max-width: 100vw !important;
+  }
+
+  .mobileTableWrapper {
+    overflow-x: auto !important;
+    width: 100% !important;
+    max-width: 100vw !important;
+  }
+
+  .mobileTable {
+    min-width: 100% !important;
+    width: 100% !important;
+    table-layout: fixed !important;
+  }
+
+  .mobileTable th:nth-child(1),
+  .mobileTable td:nth-child(1) {
+    width: 80px !important;
+    max-width: 80px !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+  }
+
+  .mobileTable th:nth-child(2),
+  .mobileTable td:nth-child(2) {
+    width: 120px !important;
+    max-width: 120px !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+  }
+
+  .mobileTable th:nth-child(3),
+  .mobileTable td:nth-child(3) {
+    width: 80px !important;
+    max-width: 80px !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+  }
+
+  .mobileTable th:nth-child(4),
+  .mobileTable td:nth-child(4) {
+    width: 90px !important;
+    max-width: 90px !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+  }
+
+  .mobileTableContainer div[class*="relative px-3 py-3"] {
+    position: static !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 1rem !important;
+    padding: 1rem !important;
+  }
+
+  .mobileTableContainer div[class*="absolute left-3"] {
+    position: static !important;
+    transform: none !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 0.5rem !important;
+  }
+
+  .mobilePagination {
+    justify-content: center !important;
+  }
+
+  .mobilePagination button {
+    min-width: 44px !important;
+    min-height: 44px !important;
+  }
+
+  .mobileTable .statusBadge {
+    font-size: 0.75rem !important;
+    padding: 0.25rem 0.5rem !important;
+  }
+
+  .mobileTable tbody tr:hover {
+    background-color: rgba(255, 255, 255, 0.05) !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .mobileContainer {
+    padding: 0 0.5rem !important;
+  }
+
+  .mobileTable th:nth-child(1),
+  .mobileTable td:nth-child(1) {
+    width: 60px !important;
+    max-width: 60px !important;
+  }
+
+  .mobileTable th:nth-child(2),
+  .mobileTable td:nth-child(2) {
+    width: 100px !important;
+    max-width: 100px !important;
+  }
+
+  .mobileTable th:nth-child(3),
+  .mobileTable td:nth-child(3) {
+    width: 70px !important;
+    max-width: 70px !important;
+  }
+
+  .mobileTable th:nth-child(4),
+  .mobileTable td:nth-child(4) {
+    width: 80px !important;
+    max-width: 80px !important;
+  }
+}
