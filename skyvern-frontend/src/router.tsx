@@ -13,6 +13,7 @@ import { TaskDetails } from "./routes/tasks/detail/TaskDetails";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TasksPage } from "./routes/tasks/list/TasksPage";
+import { Debugger } from "@/routes/workflows/debugger/Debugger";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
@@ -110,11 +111,11 @@ const router = createBrowserRouter([
               },
               {
                 path: "debug",
-                element: <WorkflowEditor />,
+                element: <Debugger />,
               },
               {
                 path: ":workflowRunId/:blockLabel/debug",
-                element: <WorkflowEditor />,
+                element: <Debugger />,
               },
               {
                 path: "edit",

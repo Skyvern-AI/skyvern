@@ -17,6 +17,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useSidebarStore } from "@/store/SidebarStore";
@@ -40,6 +41,7 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { BrowserStream } from "@/components/BrowserStream";
+import { useUser } from "@/hooks/useUser";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
@@ -136,6 +138,7 @@ function Workspace({
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const cacheKey = workflow?.cache_key ?? "";
+  const user = useUser().get();
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
     cacheKey === ""
@@ -838,47 +841,58 @@ function Workspace({
 
               {/* browser & timeline */}
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
-                {/* browser */}
-                <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                  <div key={reloadKey} className="w-full flex-1">
-                    {activeDebugSession &&
-                    activeDebugSession.browser_session_id &&
-                    !cycleBrowser.isPending ? (
-                      <BrowserStream
-                        interactive={interactor === "human"}
-                        browserSessionId={activeDebugSession.browser_session_id}
-                        showControlButtons={interactor === "human"}
-                        resizeTrigger={windowResizeTrigger}
-                      />
-                    ) : (
-                      <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
-                        Connecting to your browser...
-                        <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
-                      </div>
-                    )}
-                  </div>
-                  <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
-                    <div className="flex items-center gap-2">
-                      <GlobeIcon /> Live Browser
-                    </div>
-                    {showBreakoutButton && (
-                      <BreakoutButton onClick={() => breakout()} />
-                    )}
-                    <div
-                      className={cn("ml-auto flex items-center gap-2", {
-                        "mr-16": !blockLabel,
-                      })}
-                    >
-                      {showPowerButton && (
-                        <PowerButton onClick={() => cycle()} />
+                {/* VNC browser */}
+                {user && (
+                  <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                    <div key={reloadKey} className="w-full flex-1">
+                      {activeDebugSession &&
+                      activeDebugSession.browser_session_id &&
+                      !cycleBrowser.isPending ? (
+                        <BrowserStream
+                          interactive={interactor === "human"}
+                          browserSessionId={
+                            activeDebugSession.browser_session_id
+                          }
+                          showControlButtons={interactor === "human"}
+                          resizeTrigger={windowResizeTrigger}
+                        />
+                      ) : (
+                        <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
+                          Connecting to your browser...
+                          <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                        </div>
                       )}
-                      <ReloadButton
-                        isReloading={isReloading}
-                        onClick={() => reload()}
-                      />
                     </div>
-                  </footer>
-                </div>
+                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                      <div className="flex items-center gap-2">
+                        <GlobeIcon /> Live Browser
+                      </div>
+                      {showBreakoutButton && (
+                        <BreakoutButton onClick={() => breakout()} />
+                      )}
+                      <div
+                        className={cn("ml-auto flex items-center gap-2", {
+                          "mr-16": !blockLabel,
+                        })}
+                      >
+                        {showPowerButton && (
+                          <PowerButton onClick={() => cycle()} />
+                        )}
+                        <ReloadButton
+                          isReloading={isReloading}
+                          onClick={() => reload()}
+                        />
+                      </div>
+                    </footer>
+                  </div>
+                )}
+
+                {/* Screenshot browser} */}
+                {!user && (
+                  <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                    <WorkflowRunStream />
+                  </div>
+                )}
 
                 {/* timeline */}
                 <div

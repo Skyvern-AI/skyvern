@@ -80,7 +80,7 @@ function WorkflowEditor() {
           initialEdges={elements.edges}
           initialNodes={elements.nodes}
           initialTitle={workflow.title}
-          showBrowser={false}
+          showBrowser={true}
           workflow={workflow}
         />
       </ReactFlowProvider>

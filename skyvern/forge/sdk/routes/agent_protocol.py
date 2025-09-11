@@ -978,12 +978,6 @@ async def run_block(
     workflow_run_id.
     """
 
-    # NOTE(jdo): if you're running debugger locally, and you want to see the
-    # block runs happening (no temporal; no pbs), then uncomment these two
-    # lines; that'll make the block run happen in a new local browser instance.
-    # LOG.critical("REMOVING BROWSER SESSION ID")
-    # block_run_request.browser_session_id = None
-
     workflow_run = await block_service.ensure_workflow_run(
         organization=organization,
         template=template,
@@ -991,7 +985,15 @@ async def run_block(
         workflow_run_request=block_run_request,
     )
 
-    browser_session_id = block_run_request.browser_session_id
+    # NOTE: anonymous (read: OSS) users do not have browser session ids, as they
+    # do not have access to pbs infrastructure; in this case, a
+    # browser_session_id of None will make the block run happen in a new local
+    # browser instance.
+    #
+    # NOTE: if you're running debugger locally, and you want to see the
+    # block runs happening (no temporal; no pbs), set the browser_session_id to
+    # None with a manual edit.
+    # browser_session_id = None if user_id == org_auth_service.ANONYMOUS_USER_ID else block_run_request.browser_session_id
 
     await block_service.execute_blocks(
         request=request,
@@ -1003,7 +1005,7 @@ async def run_block(
         workflow_permanent_id=workflow_run.workflow_permanent_id,
         organization=organization,
         user_id=user_id,
-        browser_session_id=browser_session_id,
+        browser_session_id=block_run_request.browser_session_id,
         block_outputs=block_run_request.block_outputs,
     )
 

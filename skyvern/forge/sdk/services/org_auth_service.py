@@ -21,6 +21,7 @@ LOG = structlog.get_logger()
 AUTHENTICATION_TTL = 60 * 60  # one hour
 CACHE_SIZE = 128
 ALGORITHM = "HS256"
+ANONYMOUS_USER_ID = "anonymous"
 
 
 async def get_current_org(
@@ -89,6 +90,9 @@ async def _authenticate_helper(authorization: str) -> Organization:
 async def get_current_user_id(
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> str:
+    if not settings.is_cloud_environment():
+        return ANONYMOUS_USER_ID
+
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

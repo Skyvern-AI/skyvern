@@ -78,7 +78,6 @@ import {
   layout,
 } from "./workflowEditorUtils";
 import { useAutoPan } from "./useAutoPan";
-import { useUser } from "@/hooks/useUser";
 
 const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -256,14 +255,13 @@ function FlowRenderer({
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
-  const user = useUser().get();
   const { title, initializeTitle } = useWorkflowTitleStore();
   // const [parameters] = useState<ParametersState>(initialParameters);
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const flowIsConstrained = debugStore.isDebugMode && Boolean(user);
+  const flowIsConstrained = debugStore.isDebugMode;
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -520,10 +518,6 @@ function FlowRenderer({
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {
-    if (!user) {
-      return;
-    }
-
     const xLock = getXLock();
 
     if (newValue) {
