@@ -33,12 +33,17 @@ from skyvern.services.script_service import (  # noqa: E402
     action,  # noqa: E402
     download,  # noqa: E402
     extract,  # noqa: E402
+    http_request,  # noqa: E402
     generate_text,  # noqa: E402
+    goto,  # noqa: E402
     login,  # noqa: E402
+    parse_file,  # noqa: E402
+    prompt,  # noqa: E402
     render_template,  # noqa: E402
     run_code,  # noqa: E402
     run_script,  # noqa: E402
     run_task,  # noqa: E402
+    send_email,  # noqa: E402
     wait,  # noqa: E402
 )  # noqa: E402
 
@@ -51,12 +56,17 @@ __all__ = [
     "cached",
     "download",
     "extract",
+    "http_request",
     "generate_text",
+    "goto",
     "login",
+    "parse_file",
+    "prompt",
     "render_template",
     "run_code",
     "run_script",
     "run_task",
+    "send_email",
     "setup",
     "wait",
     "workflow",
