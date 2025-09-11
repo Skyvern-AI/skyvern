@@ -1,0 +1,9 @@
+
+workflow_id: "cli-test-workflow"
+title: "CLI Test Workflow"
+description: "Testing the new skyvern run workflow command"
+
+
+default_parameters:
+  test_url: "https://example.com"
+  environment: "test"
