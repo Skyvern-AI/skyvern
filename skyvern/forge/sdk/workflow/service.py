@@ -32,6 +32,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.models import AzureVaultCredentialParameterModel
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -74,6 +75,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     RESERVED_PARAMETER_KEYS,
     AWSSecretParameter,
+    AzureVaultCredentialParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
@@ -308,6 +310,7 @@ class WorkflowService:
                     BitwardenCreditCardDataParameter,
                     BitwardenSensitiveInformationParameter,
                     OnePasswordCredentialParameter,
+                    AzureVaultCredentialParameter,
                     CredentialParameter,
                 ),
             )
@@ -1119,6 +1122,26 @@ class WorkflowService:
             description=description,
         )
 
+    async def create_azure_vault_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        vault_name: str,
+        username_key: str,
+        password_key: str,
+        totp_secret_key: str | None = None,
+        description: str | None = None,
+    ) -> AzureVaultCredentialParameterModel:
+        return await app.DATABASE.create_azure_vault_credential_parameter(
+            workflow_id=workflow_id,
+            key=key,
+            vault_name=vault_name,
+            username_key=username_key,
+            password_key=password_key,
+            totp_secret_key=totp_secret_key,
+            description=description,
+        )
+
     async def create_bitwarden_sensitive_information_parameter(
         self,
         workflow_id: str,
@@ -1770,6 +1793,16 @@ class WorkflowService:
                         description=parameter.description,
                         vault_id=parameter.vault_id,
                         item_id=parameter.item_id,
+                    )
+                elif parameter.parameter_type == ParameterType.AZURE_VAULT_CREDENTIAL:
+                    parameters[parameter.key] = await self.create_azure_vault_credential_parameter(
+                        workflow_id=workflow.workflow_id,
+                        key=parameter.key,
+                        description=parameter.description,
+                        vault_name=parameter.vault_name,
+                        username_key=parameter.username_key,
+                        password_key=parameter.password_key,
+                        totp_secret_key=parameter.totp_secret_key,
                     )
                 elif parameter.parameter_type == ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
                     if not parameter.bitwarden_collection_id and not parameter.bitwarden_item_id:

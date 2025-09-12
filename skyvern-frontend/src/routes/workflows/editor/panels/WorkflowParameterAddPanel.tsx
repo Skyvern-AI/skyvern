@@ -1,4 +1,3 @@
-import { SwitchBar } from "@/components/SwitchBar";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -81,7 +80,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
   >(undefined);
 
   const [credentialType, setCredentialType] = useState<
-    "bitwarden" | "skyvern" | "onepassword"
+    "bitwarden" | "skyvern" | "onepassword" | "azurevault"
   >("skyvern");
   const [vaultId, setVaultId] = useState("");
   const [itemId, setItemId] = useState("");
@@ -92,6 +91,11 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
     useState("");
 
   const [credentialId, setCredentialId] = useState("");
+
+  const [azureVaultName, setAzureVaultName] = useState("");
+  const [azureUsernameKey, setAzureUsernameKey] = useState("");
+  const [azurePasswordKey, setAzurePasswordKey] = useState("");
+  const [azureTotpSecretKey, setAzureTotpKey] = useState("");
 
   return (
     <ScrollArea>
@@ -199,19 +203,37 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
             </>
           )}
           {type === "credential" && (
-            <SwitchBar
-              value={credentialType}
-              onChange={(value) => {
-                setCredentialType(
-                  value as "bitwarden" | "skyvern" | "onepassword",
-                );
-              }}
-              options={[
-                { label: "Skyvern", value: "skyvern" },
-                { label: "Bitwarden", value: "bitwarden" },
-                { label: "1Password", value: "onepassword" },
-              ]}
-            />
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  Credential Type
+                </Label>
+                <Select
+                  value={credentialType}
+                  onValueChange={(value) => {
+                    setCredentialType(
+                      value as
+                        | "bitwarden"
+                        | "skyvern"
+                        | "onepassword"
+                        | "azurevault",
+                    );
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select a type" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="skyvern">Skyvern</SelectItem>
+                      <SelectItem value="bitwarden">Bitwarden</SelectItem>
+                      <SelectItem value="onepassword">1Password</SelectItem>
+                      <SelectItem value="azurevault">Azure Vault</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
+            </>
           )}
           {type === "credential" && credentialType === "bitwarden" && (
             <>
@@ -256,6 +278,41 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                 <Input
                   value={itemId}
                   onChange={(e) => setItemId(e.target.value)}
+                />
+              </div>
+            </>
+          )}
+          {type === "credential" && credentialType === "azurevault" && (
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Vault Name</Label>
+                <Input
+                  value={azureVaultName}
+                  onChange={(e) => setAzureVaultName(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Username Key</Label>
+                <Input
+                  autoComplete="off"
+                  value={azureUsernameKey}
+                  onChange={(e) => setAzureUsernameKey(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Password Key</Label>
+                <Input
+                  value={azurePasswordKey}
+                  onChange={(e) => setAzurePasswordKey(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  TOTP Secret Key
+                </Label>
+                <Input
+                  value={azureTotpSecretKey}
+                  onChange={(e) => setAzureTotpKey(e.target.value)}
                 />
               </div>
             </>
@@ -425,6 +482,31 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     vaultId,
                     itemId,
                     description,
+                  });
+                }
+                if (type === "credential" && credentialType === "azurevault") {
+                  if (
+                    azureVaultName.trim() === "" ||
+                    azureUsernameKey.trim() === "" ||
+                    azurePasswordKey.trim() === ""
+                  ) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description:
+                        "Azure Vault Name, Username Key and Password Key are required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    vaultName: azureVaultName,
+                    usernameKey: azureUsernameKey,
+                    passwordKey: azurePasswordKey,
+                    totpSecretKey:
+                      azureTotpSecretKey === "" ? null : azureTotpSecretKey,
+                    description: description,
                   });
                 }
                 if (type === "secret" || type === "creditCardData") {

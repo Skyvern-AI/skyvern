@@ -81,6 +81,19 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
         };
       } else if (
         parameter.parameter_type ===
+        WorkflowParameterTypes.Azure_Vault_Credential
+      ) {
+        return {
+          key: parameter.key,
+          parameterType: WorkflowEditorParameterTypes.Credential,
+          vaultName: parameter.vault_name,
+          usernameKey: parameter.username_key,
+          passwordKey: parameter.password_key,
+          totpSecretKey: parameter.totp_secret_key,
+          description: parameter.description,
+        };
+      } else if (
+        parameter.parameter_type ===
         WorkflowParameterTypes.Bitwarden_Login_Credential
       ) {
         return {

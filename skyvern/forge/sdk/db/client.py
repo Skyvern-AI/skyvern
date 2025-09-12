@@ -17,6 +17,7 @@ from skyvern.forge.sdk.db.models import (
     AISuggestionModel,
     ArtifactModel,
     AWSSecretParameterModel,
+    AzureVaultCredentialParameterModel,
     BitwardenCreditCardDataParameterModel,
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
@@ -88,6 +89,7 @@ from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
+    AzureVaultCredentialParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
@@ -2102,6 +2104,43 @@ class AgentDB:
                 description=parameter.description,
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
+                created_at=parameter.created_at,
+                modified_at=parameter.modified_at,
+                deleted_at=parameter.deleted_at,
+            )
+
+    async def create_azure_vault_credential_parameter(
+        self,
+        workflow_id: str,
+        key: str,
+        vault_name: str,
+        username_key: str,
+        password_key: str,
+        totp_secret_key: str | None = None,
+        description: str | None = None,
+    ) -> AzureVaultCredentialParameter:
+        async with self.Session() as session:
+            parameter = AzureVaultCredentialParameterModel(
+                workflow_id=workflow_id,
+                key=key,
+                description=description,
+                vault_name=vault_name,
+                username_key=username_key,
+                password_key=password_key,
+                totp_secret_key=totp_secret_key,
+            )
+            session.add(parameter)
+            await session.commit()
+            await session.refresh(parameter)
+            return AzureVaultCredentialParameter(
+                azure_vault_credential_parameter_id=parameter.azure_vault_credential_parameter_id,
+                workflow_id=parameter.workflow_id,
+                key=parameter.key,
+                description=parameter.description,
+                vault_name=parameter.vault_name,
+                username_key=parameter.username_key,
+                password_key=parameter.password_key,
+                totp_secret_key=parameter.totp_secret_key,
                 created_at=parameter.created_at,
                 modified_at=parameter.modified_at,
                 deleted_at=parameter.deleted_at,
