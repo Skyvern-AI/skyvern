@@ -39,6 +39,7 @@ class BrowserSessionResponse(BaseModel):
         description="Url for the browser session page",
         examples=["https://app.skyvern.com/browser-session/pbs_123456"],
     )
+    vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
     started_at: datetime | None = Field(None, description="Timestamp when the session was started")
     completed_at: datetime | None = Field(None, description="Timestamp when the session was completed")
     created_at: datetime = Field(
@@ -68,6 +69,7 @@ class BrowserSessionResponse(BaseModel):
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
             browser_address=browser_session.browser_address,
+            vnc_streaming_supported=True if browser_session.ip_address else False,
             app_url=app_url,
             started_at=browser_session.started_at,
             completed_at=browser_session.completed_at,
