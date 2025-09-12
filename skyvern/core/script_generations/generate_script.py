@@ -334,7 +334,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                 args.append(
                     cst.Arg(
                         keyword=cst.Name("totp_identifier"),
-                        value=cst.Name(task.get("totp_identifier")),
+                        value=_value(task.get("totp_identifier")),
                         whitespace_after_arg=cst.ParenthesizedWhitespace(
                             indent=True,
                             last_line=cst.SimpleWhitespace(INDENT),
@@ -345,7 +345,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                 args.append(
                     cst.Arg(
                         keyword=cst.Name("totp_url"),
-                        value=cst.Name(task.get("totp_verification_url")),
+                        value=_value(task.get("totp_verification_url")),
                         whitespace_after_arg=cst.ParenthesizedWhitespace(
                             indent=True,
                             last_line=cst.SimpleWhitespace(INDENT),

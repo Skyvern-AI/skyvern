@@ -30,6 +30,14 @@ async def poll_verification_code(
     if not org_token:
         LOG.error("Failed to get organization token when trying to get verification code")
         return None
+    LOG.info(
+        "Polling verification code",
+        task_id=task_id,
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        totp_verification_url=totp_verification_url,
+        totp_identifier=totp_identifier,
+    )
     while True:
         await asyncio.sleep(10)
         # check timeout
