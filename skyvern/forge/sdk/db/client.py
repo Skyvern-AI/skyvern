@@ -3675,6 +3675,7 @@ class AgentDB:
         organization_id: str,
         user_id: str,
         workflow_permanent_id: str,
+        vnc_streaming_supported: bool,
     ) -> DebugSession:
         async with self.Session() as session:
             debug_session = DebugSessionModel(
@@ -3682,6 +3683,7 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 user_id=user_id,
                 browser_session_id=browser_session_id,
+                vnc_streaming_supported=vnc_streaming_supported,
                 status="created",
             )
 
