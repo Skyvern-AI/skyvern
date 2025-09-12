@@ -1479,7 +1479,7 @@ async def upload_file(
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=parameters or [],
-        storage_type=storage_type,
+        storage_type=FileStorageType(storage_type),
         s3_bucket=s3_bucket,
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
