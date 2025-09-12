@@ -999,6 +999,8 @@ class ForgeAgent:
                         )
                         detailed_agent_step_output.llm_response = json_response
                         actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+                        if context:
+                            context.pop_totp_code(task.task_id)
                     except NoTOTPVerificationCodeFound:
                         actions = [
                             TerminateAction(
@@ -3003,7 +3005,6 @@ class ForgeAgent:
                 browser_state,
                 scraped_page,
                 verification_code_check=False,
-                expire_verification_code=True,
             )
             llm_key_override = task.llm_key
             if await is_cua_task(task=task):
