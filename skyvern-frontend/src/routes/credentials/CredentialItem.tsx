@@ -1,12 +1,25 @@
-import { isPasswordCredential } from "@/api/types";
+import { CredentialApiResponse, isPasswordCredential } from "@/api/types";
 import { DeleteCredentialButton } from "./DeleteCredentialButton";
-import { CredentialApiResponse } from "@/api/types";
 
 type Props = {
   credential: CredentialApiResponse;
 };
 
 function CredentialItem({ credential }: Props) {
+  const getTotpTypeDisplay = (totpType: string) => {
+    switch (totpType) {
+      case "authenticator":
+        return "2FA: Authenticator App";
+      case "email":
+        return "2FA: Email";
+      case "text":
+        return "2FA: Text Message";
+      case "none":
+      default:
+        return "";
+    }
+  };
+
   return (
     <div className="flex gap-5 rounded-lg bg-slate-elevation2 p-4">
       <div className="w-48 space-y-2">
@@ -21,10 +34,18 @@ function CredentialItem({ credential }: Props) {
             <div className="shrink-0 space-y-2">
               <p className="text-sm text-slate-400">Username/Email</p>
               <p className="text-sm text-slate-400">Password</p>
+              {credential.credential.totp_type !== "none" && (
+                <p className="text-sm text-slate-400">2FA</p>
+              )}
             </div>
             <div className="space-y-2">
               <p className="text-sm">{credential.credential.username}</p>
               <p className="text-sm">{"********"}</p>
+              {credential.credential.totp_type !== "none" && (
+                <p className="text-sm text-blue-400">
+                  {getTotpTypeDisplay(credential.credential.totp_type)}
+                </p>
+              )}
             </div>
           </div>
         </div>
