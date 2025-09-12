@@ -3176,7 +3176,7 @@ class AgentDB:
     async def set_persistent_browser_session_browser_address(
         self,
         browser_session_id: str,
-        browser_address: str,
+        browser_address: str | None,
         ip_address: str,
         ecs_task_arn: str | None,
         organization_id: str | None = None,
@@ -3193,11 +3193,14 @@ class AgentDB:
                     )
                 ).first()
                 if persistent_browser_session:
-                    persistent_browser_session.browser_address = browser_address
-                    persistent_browser_session.ip_address = ip_address
-                    persistent_browser_session.ecs_task_arn = ecs_task_arn
-                    # once the address is set, the session is started
-                    persistent_browser_session.started_at = datetime.utcnow()
+                    if browser_address:
+                        persistent_browser_session.browser_address = browser_address
+                        # once the address is set, the session is started
+                        persistent_browser_session.started_at = datetime.utcnow()
+                    if ip_address:
+                        persistent_browser_session.ip_address = ip_address
+                    if ecs_task_arn:
+                        persistent_browser_session.ecs_task_arn = ecs_task_arn
                     await session.commit()
                     await session.refresh(persistent_browser_session)
                 else:
