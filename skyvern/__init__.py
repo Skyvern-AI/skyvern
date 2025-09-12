@@ -44,6 +44,7 @@ from skyvern.services.script_service import (  # noqa: E402
     run_script,  # noqa: E402
     run_task,  # noqa: E402
     send_email,  # noqa: E402
+    upload_file,  # noqa: E402
     wait,  # noqa: E402
 )  # noqa: E402
 
@@ -68,6 +69,7 @@ __all__ = [
     "run_task",
     "send_email",
     "setup",
+    "upload_file",
     "wait",
     "workflow",
 ]
