@@ -468,7 +468,7 @@ async def run_task_v2_helper(
     current_run_id = context.run_id if context and context.run_id else task_v2_id
     enable_parse_select_in_extract = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_PARSE_SELECT_IN_EXTRACT",
-        organization_id,
+        current_run_id,
         properties={"organization_id": organization_id, "task_url": task_v2.url},
     )
     skyvern_context.set(
@@ -1284,6 +1284,7 @@ async def _generate_extraction_task(
         generate_extraction_task_prompt,
         task_v2=task_v2,
         prompt_name="task_v2_generate_extraction_task",
+        organization_id=task_v2.organization_id,
     )
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 

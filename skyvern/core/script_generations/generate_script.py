@@ -151,8 +151,10 @@ def _value(value: Any) -> cst.BaseExpression:
     return cst.SimpleString(repr(str(value)))
 
 
-def _render_value(prompt_text: str) -> cst.BaseExpression:
+def _render_value(prompt_text: str | None = None) -> cst.BaseExpression:
     """Create a prompt value with template rendering logic if needed."""
+    if not prompt_text:
+        return cst.SimpleString("")
     if "{{" in prompt_text and "}}" in prompt_text:
         # Generate code for: render_template(prompt_text)
         return cst.Call(
@@ -269,7 +271,7 @@ def _make_decorator(block_label: str, block: dict[str, Any]) -> cst.Decorator:
     )
 
 
-def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
+def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
     """
     Turn one Action dict into:
 
@@ -327,6 +329,29 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
                 ),
             )
         )
+        if act.get("totp_code_required"):
+            if task.get("totp_identifier"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=cst.Name(task.get("totp_identifier")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            if task.get("totp_url"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_url"),
+                        value=cst.Name(task.get("totp_verification_url")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
     elif method == "select_option":
         args.append(
             cst.Arg(
@@ -431,7 +456,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
 
         # For extraction blocks, assign extract action results to output variable
         assign_to_output = is_extraction_block and act["action_type"] == "extract"
-        body_stmts.append(_action_to_stmt(act, assign_to_output=assign_to_output))
+        body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output))
 
     # For extraction blocks, add return output statement if we have actions
     if is_extraction_block and any(
@@ -533,7 +558,7 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
+            value=_render_value(block.get("navigation_goal") or ""),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -547,14 +572,19 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("download_suffix"),
-            value=_render_value(block.get("download_suffix", "")),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
+    ]
+    if block.get("download_suffix"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("download_suffix"),
+                value=_render_value(block.get("download_suffix")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    args.append(
         cst.Arg(
             keyword=cst.Name("cache_key"),
             value=_value(block_title),
@@ -562,8 +592,8 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
                 indent=True,
             ),
             comma=cst.Comma(),
-        ),
-    ]
+        )
+    )
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
@@ -959,7 +989,7 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         ),
         cst.Arg(
             keyword=cst.Name("storage_type"),
-            value=_value(block.get("storage_type", FileStorageType.S3)),
+            value=_value(str(block.get("storage_type", FileStorageType.S3))),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1403,42 +1433,6 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
                         ),
                     )
                 ),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("title"),
-                annotation=cst.Annotation(cst.Name("str")),
-                default=_value(wf_req.get("title", "")),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("webhook_url"),
-                annotation=cst.Annotation(cst.parse_expression("str | None")),
-                default=_value(wf_req.get("webhook_url")),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("totp_url"),
-                annotation=cst.Annotation(cst.parse_expression("str | None")),
-                default=_value(wf_req.get("totp_url")),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("totp_identifier"),
-                annotation=cst.Annotation(cst.parse_expression("str | None")),
-                default=_value(wf_req.get("totp_identifier")),
                 whitespace_after_param=cst.ParenthesizedWhitespace(),
                 comma=cst.Comma(),
             ),
@@ -1614,9 +1608,6 @@ async def generate_workflow_script(
     module_body = [
         *start_block_body,
         *block_fns,
-        cst.EmptyLine(),
-        cst.EmptyLine(),
-        cst.parse_statement("if __name__ == '__main__':\n    asyncio.run(run_workflow())"),
     ]
 
     module = cst.Module(body=module_body)

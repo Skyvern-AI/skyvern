@@ -1,5 +1,5 @@
 import { AxiosError } from "axios";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { nanoid } from "nanoid";
 import {
   ChevronRightIcon,
@@ -139,6 +139,12 @@ function Workspace({
   const blockScriptStore = useBlockScriptStore();
   const cacheKey = workflow?.cache_key ?? "";
   const user = useUser().get();
+
+  const enableDebugBrowser = useMemo(() => {
+    return (
+      showBrowser && (activeDebugSession?.vnc_streaming_supported ?? false)
+    );
+  }, [showBrowser, activeDebugSession?.vnc_streaming_supported]);
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
     cacheKey === ""
@@ -702,7 +708,7 @@ function Workspace({
       </div>
 
       {/* infinite canvas and sub panels when not in debug mode */}
-      {!showBrowser && (
+      {!enableDebugBrowser && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           {/* infinite canvas */}
           <FlowRenderer
@@ -766,7 +772,7 @@ function Workspace({
       )}
 
       {/* infinite canvas, sub panels, browser, and timeline when in debug mode */}
-      {showBrowser && (
+      {enableDebugBrowser && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
             className="splittah"

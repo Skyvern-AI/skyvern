@@ -516,7 +516,7 @@ async def _fallback_to_ai_run(
     max_steps: int | None = None,
     complete_on_download: bool = False,
     download_suffix: str | None = None,
-    totp_verification_url: str | None = None,
+    totp_url: str | None = None,
     totp_identifier: str | None = None,
     complete_verification: bool = True,
     include_action_history_in_verification: bool = False,
@@ -620,7 +620,7 @@ async def _fallback_to_ai_run(
             max_steps_per_run=max_steps,
             complete_on_download=complete_on_download,
             download_suffix=download_suffix,
-            totp_verification_url=totp_verification_url,
+            totp_verification_url=totp_url,
             totp_identifier=totp_identifier,
             complete_verification=complete_verification,
             include_action_history_in_verification=include_action_history_in_verification,
@@ -664,7 +664,7 @@ async def _fallback_to_ai_run(
                 max_steps=max_steps,
                 complete_on_download=complete_on_download,
                 download_suffix=download_suffix,
-                totp_verification_url=totp_verification_url,
+                totp_verification_url=totp_url,
                 totp_identifier=totp_identifier,
                 complete_verification=complete_verification,
                 include_action_history_in_verification=include_action_history_in_verification,
@@ -982,6 +982,8 @@ async def run_task(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
     cache_key: str | None = None,
 ) -> None:
     # Auto-create workflow block run and task if workflow_run_id is available
@@ -1016,6 +1018,8 @@ async def run_task(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -1100,6 +1104,8 @@ async def action(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
     cache_key: str | None = None,
 ) -> None:
     # Auto-create workflow block run and task if workflow_run_id is available
@@ -1134,6 +1140,8 @@ async def action(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -1158,6 +1166,8 @@ async def login(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
     cache_key: str | None = None,
 ) -> None:
     # Auto-create workflow block run and task if workflow_run_id is available
@@ -1192,6 +1202,8 @@ async def login(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -1360,6 +1372,7 @@ async def generate_text(
             json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                 prompt=script_generation_input_text_prompt,
                 prompt_name="script-generation-input-text-generatiion",
+                organization_id=context.organization_id,
             )
             new_text = json_response.get("answer", new_text)
         except Exception:

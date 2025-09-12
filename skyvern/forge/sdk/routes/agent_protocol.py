@@ -1865,7 +1865,10 @@ async def suggest(
         )
 
         llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt, ai_suggestion=new_ai_suggestion, prompt_name="suggest-data-schema"
+            prompt=llm_prompt,
+            ai_suggestion=new_ai_suggestion,
+            prompt_name="suggest-data-schema",
+            organization_id=current_org.organization_id,
         )
         parsed_ai_suggestion = AISuggestionBase.model_validate(llm_response)
 
@@ -2338,6 +2341,7 @@ async def new_debug_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
+        vnc_streaming_supported=True if new_browser_session.ip_address else False,
     )
 
     LOG.info(

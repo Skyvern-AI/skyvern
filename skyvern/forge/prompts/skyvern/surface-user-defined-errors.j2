@@ -3,6 +3,7 @@ Do not return any error that's not defined by the user.
 
 Reply in JSON format with the following keys:
 {
+    "reasoning": str, // A string to explain the reason for inferring the result.
     "errors": array // A list of errors. If no error description suits the current situation on the screenshots, return an empty list. You are allowed to return multiple errors if there are multiple errors on the page.
     [{
         "error_code": str, // The error code from the user's error code list
