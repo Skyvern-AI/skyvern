@@ -741,6 +741,7 @@ async def generate_cua_fallback_actions(
     action_response = await app.LLM_API_HANDLER(
         prompt=fallback_action_prompt,
         prompt_name="cua-fallback-action",
+        step=step,
     )
     LOG.info("Fallback action response", action_response=action_response)
     skyvern_action_type = action_response.get("action")

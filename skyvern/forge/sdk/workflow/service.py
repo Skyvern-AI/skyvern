@@ -696,6 +696,7 @@ class WorkflowService:
         metadata_response = await app.LLM_API_HANDLER(
             prompt=metadata_prompt,
             prompt_name="conversational_ui_goal",
+            organization_id=organization.organization_id,
         )
 
         block_label: str = metadata_response.get("block_label", DEFAULT_FIRST_BLOCK_LABEL)
