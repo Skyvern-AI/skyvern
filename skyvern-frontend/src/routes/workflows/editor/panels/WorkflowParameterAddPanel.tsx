@@ -504,7 +504,8 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     vaultName: azureVaultName,
                     usernameKey: azureUsernameKey,
                     passwordKey: azurePasswordKey,
-                    totpSecretKey: azureTotpSecretKey,
+                    totpSecretKey:
+                      azureTotpSecretKey === "" ? null : azureTotpSecretKey,
                     description: description,
                   });
                 }

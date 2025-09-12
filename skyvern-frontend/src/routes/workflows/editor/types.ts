@@ -31,7 +31,7 @@ export type AzureVaultCredential = {
   vaultName: string;
   usernameKey: string;
   passwordKey: string;
-  totpSecretKey: string;
+  totpSecretKey: string | null;
 };
 
 export function parameterIsBitwardenCredential(

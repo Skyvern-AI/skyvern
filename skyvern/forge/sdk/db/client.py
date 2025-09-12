@@ -2116,7 +2116,7 @@ class AgentDB:
         vault_name: str,
         username_key: str,
         password_key: str,
-        totp_secret_key: str,
+        totp_secret_key: str | None = None,
         description: str | None = None,
     ) -> AzureVaultCredentialParameter:
         async with self.Session() as session:

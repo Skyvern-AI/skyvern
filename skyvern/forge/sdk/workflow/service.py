@@ -1129,7 +1129,7 @@ class WorkflowService:
         vault_name: str,
         username_key: str,
         password_key: str,
-        totp_secret_key: str,
+        totp_secret_key: str | None = None,
         description: str | None = None,
     ) -> AzureVaultCredentialParameterModel:
         return await app.DATABASE.create_azure_vault_credential_parameter(

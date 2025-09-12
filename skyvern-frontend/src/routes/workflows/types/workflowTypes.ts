@@ -79,7 +79,7 @@ export type AzureVaultCredentialParameter = WorkflowParameterBase & {
   vault_name: string;
   username_key: string;
   password_key: string;
-  totp_secret_key: string;
+  totp_secret_key: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;

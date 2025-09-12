@@ -163,7 +163,7 @@ class AzureVaultCredentialParameter(Parameter):
     vault_name: str
     username_key: str
     password_key: str
-    totp_secret_key: str
+    totp_secret_key: str | None = None
 
     created_at: datetime
     modified_at: datetime

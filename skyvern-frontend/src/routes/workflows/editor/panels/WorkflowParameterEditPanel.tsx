@@ -178,7 +178,7 @@ function WorkflowParameterEditPanel({
     isAzureVaultCredential ? initialValues.passwordKey : "",
   );
   const [azureTotpSecretKey, setAzureTotpKey] = useState(
-    isAzureVaultCredential ? initialValues.totpSecretKey : "",
+    isAzureVaultCredential ? initialValues.totpSecretKey ?? "" : "",
   );
 
   return (
@@ -575,7 +575,8 @@ function WorkflowParameterEditPanel({
                     vaultName: azureVaultName,
                     usernameKey: azureUsernameKey,
                     passwordKey: azurePasswordKey,
-                    totpSecretKey: azureTotpSecretKey,
+                    totpSecretKey:
+                      azureTotpSecretKey === "" ? null : azureTotpSecretKey,
                     description: description,
                   });
                 }
