@@ -7,9 +7,11 @@ from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
 from skyvern.constants import SCROLL_AMOUNT_MULTIPLIER
+from skyvern.core.totp import poll_verification_code
 from skyvern.exceptions import NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
@@ -36,13 +38,17 @@ from skyvern.webeye.actions.actions import (
     VerificationCodeAction,
     WaitAction,
 )
-from skyvern.webeye.actions.handler import poll_verification_code
 from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
 
 
-def parse_action(action: Dict[str, Any], scraped_page: ScrapedPage, data_extraction_goal: str | None = None) -> Action:
+def parse_action(
+    action: Dict[str, Any],
+    scraped_page: ScrapedPage,
+    data_extraction_goal: str | None = None,
+    totp_code_required: bool = False,
+) -> Action:
     if "id" in action:
         element_id = action["id"]
     elif "element_id" in action:
@@ -95,7 +101,12 @@ def parse_action(action: Dict[str, Any], scraped_page: ScrapedPage, data_extract
         if context_dict and len(context_dict) > 0:
             context_dict["intention"] = intention
             input_or_select_context = InputOrSelectContext.model_validate(context_dict)
-        return InputTextAction(**base_action_dict, text=action["text"], input_or_select_context=input_or_select_context)
+        return InputTextAction(
+            **base_action_dict,
+            text=action["text"],
+            input_or_select_context=input_or_select_context,
+            totp_code_required=totp_code_required,
+        )
 
     if action_type == ActionType.UPLOAD_FILE:
         # TODO: see if the element is a file input element. if it's not, convert this action into a click action
@@ -162,10 +173,16 @@ def parse_actions(
     task: Task, step_id: str, step_order: int, scraped_page: ScrapedPage, json_response: list[Dict[str, Any]]
 ) -> list[Action]:
     actions: list[Action] = []
+    context = skyvern_context.ensure_context()
+    totp_code = context.totp_codes.get(task.task_id)
+    totp_code_required = bool(totp_code)
     for idx, action in enumerate(json_response):
         try:
             action_instance = parse_action(
-                action=action, scraped_page=scraped_page, data_extraction_goal=task.data_extraction_goal
+                action=action,
+                scraped_page=scraped_page,
+                data_extraction_goal=task.data_extraction_goal,
+                totp_code_required=totp_code_required,
             )
             action_instance.organization_id = task.organization_id
             action_instance.workflow_run_id = task.workflow_run_id
@@ -793,8 +810,8 @@ async def generate_cua_fallback_actions(
             )
             try:
                 verification_code = await poll_verification_code(
-                    task.task_id,
-                    task.organization_id,
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,

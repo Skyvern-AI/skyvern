@@ -26,6 +26,7 @@ from skyvern.constants import (
     SPECIAL_FIELD_VERIFICATION_CODE,
     ScrapeType,
 )
+from skyvern.core.totp import poll_verification_code
 from skyvern.errors.errors import ReachMaxRetriesError, ReachMaxStepsError, UserDefinedError
 from skyvern.exceptions import (
     BrowserSessionNotFound,
@@ -96,7 +97,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
-from skyvern.webeye.actions.handler import ActionHandler, poll_verification_code
+from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
@@ -2985,8 +2986,8 @@ class ForgeAgent:
                     workflow_id = workflow_run.workflow_id
                     workflow_permanent_id = workflow_run.workflow_permanent_id
             verification_code = await poll_verification_code(
-                task.task_id,
-                task.organization_id,
+                organization_id=task.organization_id,
+                task_id=task.task_id,
                 workflow_id=workflow_id,
                 workflow_run_id=task.workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,

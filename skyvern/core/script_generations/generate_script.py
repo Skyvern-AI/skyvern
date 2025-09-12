@@ -269,7 +269,7 @@ def _make_decorator(block_label: str, block: dict[str, Any]) -> cst.Decorator:
     )
 
 
-def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
+def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
     """
     Turn one Action dict into:
 
@@ -327,6 +327,29 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
                 ),
             )
         )
+        if act.get("totp_code_required"):
+            if task.get("totp_identifier"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=cst.Name(task.get("totp_identifier")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            if task.get("totp_url"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_url"),
+                        value=cst.Name(task.get("totp_verification_url")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
     elif method == "select_option":
         args.append(
             cst.Arg(
@@ -431,7 +454,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
 
         # For extraction blocks, assign extract action results to output variable
         assign_to_output = is_extraction_block and act["action_type"] == "extract"
-        body_stmts.append(_action_to_stmt(act, assign_to_output=assign_to_output))
+        body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output))
 
     # For extraction blocks, add return output statement if we have actions
     if is_extraction_block and any(

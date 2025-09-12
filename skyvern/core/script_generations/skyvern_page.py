@@ -12,6 +12,8 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.config import settings
+from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
+from skyvern.core.totp import poll_verification_code
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -351,8 +353,19 @@ class SkyvernPage:
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
     ) -> str:
-        return await self._input_text(xpath, value, ai_infer, intention, data, timeout)
+        return await self._input_text(
+            xpath=xpath,
+            value=value,
+            ai_infer=ai_infer,
+            intention=intention,
+            data=data,
+            timeout=timeout,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+        )
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def type(
@@ -363,8 +376,19 @@ class SkyvernPage:
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
     ) -> str:
-        return await self._input_text(xpath, value, ai_infer, intention, data, timeout)
+        return await self._input_text(
+            xpath=xpath,
+            value=value,
+            ai_infer=ai_infer,
+            intention=intention,
+            data=data,
+            timeout=timeout,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+        )
 
     async def _input_text(
         self,
@@ -374,6 +398,8 @@ class SkyvernPage:
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
     ) -> str:
         """Input text into an element identified by ``xpath``.
 
@@ -395,6 +421,24 @@ class SkyvernPage:
                 # Build the element tree of the current page for the prompt
                 # clean up empty data values
                 data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
+                if (totp_identifier or totp_url) and context and context.organization_id and context.task_id:
+                    verification_code = await poll_verification_code(
+                        organization_id=context.organization_id,
+                        task_id=context.task_id,
+                        workflow_run_id=context.workflow_run_id,
+                        totp_identifier=totp_identifier,
+                        totp_verification_url=totp_url,
+                    )
+                    if verification_code:
+                        if isinstance(data, dict) and SPECIAL_FIELD_VERIFICATION_CODE not in data:
+                            data[SPECIAL_FIELD_VERIFICATION_CODE] = verification_code
+                        elif isinstance(data, str) and SPECIAL_FIELD_VERIFICATION_CODE not in data:
+                            data = f"{data}\n" + str({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                        elif isinstance(data, list):
+                            data.append({SPECIAL_FIELD_VERIFICATION_CODE: verification_code})
+                        else:
+                            data = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
+
                 payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
                 script_generation_input_text_prompt = prompt_engine.load_prompt(
                     template="script-generation-input-text-generatiion",
