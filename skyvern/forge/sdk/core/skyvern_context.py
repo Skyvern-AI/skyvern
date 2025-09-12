@@ -39,6 +39,10 @@ class SkyvernContext:
     def __str__(self) -> str:
         return self.__repr__()
 
+    def pop_totp_code(self, task_id: str) -> None:
+        if task_id in self.totp_codes:
+            self.totp_codes.pop(task_id)
+
 
 _context: ContextVar[SkyvernContext | None] = ContextVar(
     "Global context",
