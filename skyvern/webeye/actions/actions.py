@@ -164,6 +164,7 @@ class ClickAction(WebAction):
 class InputTextAction(WebAction):
     action_type: ActionType = ActionType.INPUT_TEXT
     text: str
+    totp_code_required: bool = False
 
     def __repr__(self) -> str:
         return f"InputTextAction(element_id={self.element_id}, text={self.text}, context={self.input_or_select_context}, tool_call_id={self.tool_call_id})"
