@@ -2611,6 +2611,16 @@
             ],
             "title": "Text"
           },
+          "input_or_select_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InputOrSelectContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "option": {
             "anyOf": [
               {
@@ -6685,6 +6695,78 @@
           "label"
         ],
         "title": "HttpRequestBlockYAML"
+      },
+      "InputOrSelectContext": {
+        "properties": {
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "is_required": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Required"
+          },
+          "is_search_bar": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Search Bar"
+          },
+          "is_location_input": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Location Input"
+          },
+          "is_date_related": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Date Related"
+          }
+        },
+        "type": "object",
+        "title": "InputOrSelectContext"
       },
       "LoginBlock": {
         "properties": {
