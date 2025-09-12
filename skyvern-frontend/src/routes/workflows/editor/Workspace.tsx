@@ -139,7 +139,7 @@ function Workspace({
 
   const enableDebugBrowser = useMemo(() => {
     return (
-      showBrowser || (activeDebugSession?.vnc_streaming_supported ?? false)
+      showBrowser && (activeDebugSession?.vnc_streaming_supported ?? false)
     );
   }, [showBrowser, activeDebugSession?.vnc_streaming_supported]);
 
