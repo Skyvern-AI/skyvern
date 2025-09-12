@@ -3736,8 +3736,8 @@ async def extract_user_defined_errors(task: Task, step: Step, scraped_page: Scra
         navigation_goal=task.navigation_goal,
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML),
-        current_url=task.url,
-        error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else {},
+        current_url=scraped_page_refreshed.url,
+        error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
     json_response = await app.EXTRACTION_LLM_API_HANDLER(
