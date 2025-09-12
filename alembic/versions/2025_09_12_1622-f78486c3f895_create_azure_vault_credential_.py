@@ -1,8 +1,8 @@
 """create azure_vault_credential_parameters table
 
-Revision ID: ae6057e761a9
-Revises: 8de03b8cb83a
-Create Date: 2025-09-11 02:11:25.593521+00:00
+Revision ID: f78486c3f895
+Revises: d15d85a702a4
+Create Date: 2025-09-12 16:22:11.988864+00:00
 
 """
 
@@ -13,8 +13,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "ae6057e761a9"
-down_revision: Union[str, None] = "8de03b8cb83a"
+revision: str = "f78486c3f895"
+down_revision: Union[str, None] = "d15d85a702a4"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
