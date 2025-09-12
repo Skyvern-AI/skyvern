@@ -15,14 +15,20 @@ type StreamMessage = {
   screenshot?: string;
 };
 
+interface Props {
+  alwaysShowStream?: boolean;
+}
+
 let socket: WebSocket | null = null;
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
 
-function WorkflowRunStream() {
+function WorkflowRunStream(props?: Props) {
+  const alwaysShowStream = props?.alwaysShowStream ?? false;
   const { data: workflowRun } = useWorkflowRunQuery();
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
-  const showStream = workflowRun && statusIsNotFinalized(workflowRun);
+  const showStream =
+    alwaysShowStream || (workflowRun && statusIsNotFinalized(workflowRun));
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
   const queryClient = useQueryClient();
@@ -149,6 +155,26 @@ function WorkflowRunStream() {
       </div>
     );
   }
+
+  if (alwaysShowStream) {
+    if (streamImgSrc?.length > 0) {
+      return (
+        <div className="h-full w-full">
+          <ZoomableImage
+            src={`data:image/png;base64,${streamImgSrc}`}
+            className="rounded-md"
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex h-full w-full items-center justify-center">
+        Waiting for stream...
+      </div>
+    );
+  }
+
   return null;
 }
 

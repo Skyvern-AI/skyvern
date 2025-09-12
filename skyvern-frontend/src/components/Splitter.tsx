@@ -1,7 +1,7 @@
 import { useRef, useState, RefObject } from "react";
-import { useMountEffect } from "@/hooks/useMountEffect";
 import { cn } from "@/util/utils";
 import { useOnChange } from "@/hooks/useOnChange";
+import { useMountEffect } from "@/hooks/useMountEffect";
 
 function Handle({
   direction,
@@ -341,21 +341,30 @@ function Splitter({
   const [isDragging, setIsDragging] = useState(false);
 
   useMountEffect(() => {
-    if (containerRef.current) {
-      const newPosition = normalizeUnitsToPercent(
-        containerRef,
-        direction,
-        firstSizingTarget,
-        firstSizing,
-        storageKey,
-      );
+    // small delay here, to allow for arbitrary layout thrashing to settle;
+    // otherwise we have to rely on an observer for the container size, and
+    // resetting whenever the container resizes it likely incorrect behaviour
+    setTimeout(() => {
+      if (containerRef.current) {
+        const newPosition = normalizeUnitsToPercent(
+          containerRef,
+          direction,
+          firstSizingTarget,
+          firstSizing,
+          storageKey,
+        );
 
-      setSplitPosition(newPosition);
+        setSplitPosition(newPosition);
 
-      if (storageKey) {
-        setStoredSizing(firstSizingTarget, storageKey, newPosition.toString());
+        if (storageKey) {
+          setStoredSizing(
+            firstSizingTarget,
+            storageKey,
+            newPosition.toString(),
+          );
+        }
       }
-    }
+    }, 100);
   });
 
   useOnChange(isDragging, (newValue, oldValue) => {
