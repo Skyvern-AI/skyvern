@@ -296,6 +296,7 @@ export type DebugSessionApiResponse = {
   workflow_permanent_id: string | null;
   created_at: string;
   modified_at: string;
+  vnc_streaming_supported: boolean | null;
 };
 
 export type WorkflowRunApiResponse = {
