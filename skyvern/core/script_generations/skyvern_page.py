@@ -330,6 +330,7 @@ class SkyvernPage:
                 json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
                     prompt=single_click_prompt,
                     prompt_name="single-click-action",
+                    organization_id=context.organization_id,
                 )
                 actions = json_response.get("actions", [])
                 if actions:
@@ -404,6 +405,7 @@ class SkyvernPage:
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                     prompt=script_generation_input_text_prompt,
                     prompt_name="script-generation-input-text-generatiion",
+                    organization_id=context.organization_id if context else None,
                 )
                 value = json_response.get("answer", value)
             except Exception:

@@ -3800,7 +3800,7 @@ async def _get_input_or_select_context(
                     starter=element_handle,
                     frame=skyvern_element.get_frame_id(),
                 )
-                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory()
+                clean_up_func = app.AGENT_FUNCTION.cleanup_element_tree_factory(step=step)
                 element_tree = await clean_up_func(skyvern_element.get_frame(), "", copy.deepcopy(element_tree))
                 element_tree_trimmed = trim_element_tree(copy.deepcopy(element_tree))
                 element_tree_builder = ScrapedPage(

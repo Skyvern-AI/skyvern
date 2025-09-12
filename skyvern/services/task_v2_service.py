@@ -1284,6 +1284,7 @@ async def _generate_extraction_task(
         generate_extraction_task_prompt,
         task_v2=task_v2,
         prompt_name="task_v2_generate_extraction_task",
+        organization_id=task_v2.organization_id,
     )
     LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
 

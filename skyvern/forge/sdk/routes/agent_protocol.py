@@ -1863,7 +1863,10 @@ async def suggest(
         )
 
         llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt, ai_suggestion=new_ai_suggestion, prompt_name="suggest-data-schema"
+            prompt=llm_prompt,
+            ai_suggestion=new_ai_suggestion,
+            prompt_name="suggest-data-schema",
+            organization_id=current_org.organization_id,
         )
         parsed_ai_suggestion = AISuggestionBase.model_validate(llm_response)
 

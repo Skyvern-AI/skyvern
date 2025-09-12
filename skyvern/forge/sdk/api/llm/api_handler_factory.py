@@ -100,6 +100,7 @@ class LLMAPIHandlerFactory:
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
+            organization_id: str | None = None,
         ) -> dict[str, Any]:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
@@ -204,45 +205,43 @@ class LLMAPIHandlerFactory:
             cached_tokens = 0
             completion_token_detail = None
             cached_token_detail = None
-            llm_cost = 0
-            if step or thought:
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
-                prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-                completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                reasoning_tokens = 0
-                completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
-                if completion_token_detail:
-                    reasoning_tokens = completion_token_detail.reasoning_tokens or 0
-                cached_tokens = 0
-                cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
-                if cached_token_detail:
-                    cached_tokens = cached_token_detail.cached_tokens or 0
-                if step:
-                    await app.DATABASE.update_step(
-                        task_id=step.task_id,
-                        step_id=step.step_id,
-                        organization_id=step.organization_id,
-                        incremental_cost=llm_cost,
-                        incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                        incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
-                        incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                        incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    )
-                if thought:
-                    await app.DATABASE.update_thought(
-                        thought_id=thought.observer_thought_id,
-                        organization_id=thought.organization_id,
-                        input_token_count=prompt_tokens if prompt_tokens > 0 else None,
-                        output_token_count=completion_tokens if completion_tokens > 0 else None,
-                        thought_cost=llm_cost,
-                        reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
-                        cached_token_count=cached_tokens if cached_tokens > 0 else None,
-                    )
+            try:
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = litellm.completion_cost(completion_response=response)
+            except Exception as e:
+                LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
+                llm_cost = 0
+            prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
+            completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+            reasoning_tokens = 0
+            completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
+            if completion_token_detail:
+                reasoning_tokens = completion_token_detail.reasoning_tokens or 0
+            cached_tokens = 0
+            cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
+            if cached_token_detail:
+                cached_tokens = cached_token_detail.cached_tokens or 0
+            if step:
+                await app.DATABASE.update_step(
+                    task_id=step.task_id,
+                    step_id=step.step_id,
+                    organization_id=step.organization_id,
+                    incremental_cost=llm_cost,
+                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                    incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                )
+            if thought:
+                await app.DATABASE.update_thought(
+                    thought_id=thought.observer_thought_id,
+                    organization_id=thought.organization_id,
+                    input_token_count=prompt_tokens if prompt_tokens > 0 else None,
+                    output_token_count=completion_tokens if completion_tokens > 0 else None,
+                    thought_cost=llm_cost,
+                    reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
+                    cached_token_count=cached_tokens if cached_tokens > 0 else None,
+                )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
@@ -267,6 +266,9 @@ class LLMAPIHandlerFactory:
                 )
 
             # Track LLM API handler duration, token counts, and cost
+            organization_id = organization_id or (
+                step.organization_id if step else (thought.organization_id if thought else None)
+            )
             duration_seconds = time.time() - start_time
             LOG.info(
                 "LLM API handler duration metrics",
@@ -276,7 +278,7 @@ class LLMAPIHandlerFactory:
                 duration_seconds=duration_seconds,
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
-                organization_id=step.organization_id if step else (thought.organization_id if thought else None),
+                organization_id=organization_id,
                 input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                 output_tokens=completion_tokens if completion_tokens > 0 else None,
                 reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
@@ -310,6 +312,7 @@ class LLMAPIHandlerFactory:
             ai_suggestion: AISuggestion | None = None,
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
+            organization_id: str | None = None,
         ) -> dict[str, Any]:
             start_time = time.time()
             active_parameters = base_parameters or {}
@@ -421,45 +424,44 @@ class LLMAPIHandlerFactory:
             cached_tokens = 0
             completion_token_detail = None
             cached_token_detail = None
-            llm_cost = 0
-            if step or thought:
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
-                prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-                completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
-                reasoning_tokens = 0
-                completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
-                if completion_token_detail:
-                    reasoning_tokens = completion_token_detail.reasoning_tokens or 0
-                cached_tokens = 0
-                cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
-                if cached_token_detail:
-                    cached_tokens = cached_token_detail.cached_tokens or 0
-                if step:
-                    await app.DATABASE.update_step(
-                        task_id=step.task_id,
-                        step_id=step.step_id,
-                        organization_id=step.organization_id,
-                        incremental_cost=llm_cost,
-                        incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
-                        incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
-                        incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
-                        incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
-                    )
-                if thought:
-                    await app.DATABASE.update_thought(
-                        thought_id=thought.observer_thought_id,
-                        organization_id=thought.organization_id,
-                        input_token_count=prompt_tokens if prompt_tokens > 0 else None,
-                        output_token_count=completion_tokens if completion_tokens > 0 else None,
-                        reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
-                        cached_token_count=cached_tokens if cached_tokens > 0 else None,
-                        thought_cost=llm_cost,
-                    )
+            try:
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = litellm.completion_cost(completion_response=response)
+            except Exception as e:
+                LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
+                llm_cost = 0
+            prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
+            completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+            reasoning_tokens = 0
+            completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
+            if completion_token_detail:
+                reasoning_tokens = completion_token_detail.reasoning_tokens or 0
+            cached_tokens = 0
+            cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
+            if cached_token_detail:
+                cached_tokens = cached_token_detail.cached_tokens or 0
+
+            if step:
+                await app.DATABASE.update_step(
+                    task_id=step.task_id,
+                    step_id=step.step_id,
+                    organization_id=step.organization_id,
+                    incremental_cost=llm_cost,
+                    incremental_input_tokens=prompt_tokens if prompt_tokens > 0 else None,
+                    incremental_output_tokens=completion_tokens if completion_tokens > 0 else None,
+                    incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
+                    incremental_cached_tokens=cached_tokens if cached_tokens > 0 else None,
+                )
+            if thought:
+                await app.DATABASE.update_thought(
+                    thought_id=thought.observer_thought_id,
+                    organization_id=thought.organization_id,
+                    input_token_count=prompt_tokens if prompt_tokens > 0 else None,
+                    output_token_count=completion_tokens if completion_tokens > 0 else None,
+                    reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
+                    cached_token_count=cached_tokens if cached_tokens > 0 else None,
+                    thought_cost=llm_cost,
+                )
             parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
@@ -484,6 +486,9 @@ class LLMAPIHandlerFactory:
                 )
 
             # Track LLM API handler duration, token counts, and cost
+            organization_id = organization_id or (
+                step.organization_id if step else (thought.organization_id if thought else None)
+            )
             duration_seconds = time.time() - start_time
             LOG.info(
                 "LLM API handler duration metrics",
@@ -493,7 +498,7 @@ class LLMAPIHandlerFactory:
                 duration_seconds=duration_seconds,
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
-                organization_id=step.organization_id if step else (thought.organization_id if thought else None),
+                organization_id=organization_id,
                 input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                 output_tokens=completion_tokens if completion_tokens > 0 else None,
                 reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
@@ -572,6 +577,7 @@ class LLMCaller:
         use_message_history: bool = False,
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
+        organization_id: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any]:
         start_time = time.perf_counter()
@@ -702,30 +708,32 @@ class LLMCaller:
             ai_suggestion=ai_suggestion,
         )
 
-        call_stats = None
-        if step or thought:
-            call_stats = await self.get_call_stats(response)
-            if step:
-                await app.DATABASE.update_step(
-                    task_id=step.task_id,
-                    step_id=step.step_id,
-                    organization_id=step.organization_id,
-                    incremental_cost=call_stats.llm_cost,
-                    incremental_input_tokens=call_stats.input_tokens,
-                    incremental_output_tokens=call_stats.output_tokens,
-                    incremental_reasoning_tokens=call_stats.reasoning_tokens,
-                    incremental_cached_tokens=call_stats.cached_tokens,
-                )
-            if thought:
-                await app.DATABASE.update_thought(
-                    thought_id=thought.observer_thought_id,
-                    organization_id=thought.organization_id,
-                    input_token_count=call_stats.input_tokens,
-                    output_token_count=call_stats.output_tokens,
-                    reasoning_token_count=call_stats.reasoning_tokens,
-                    cached_token_count=call_stats.cached_tokens,
-                    thought_cost=call_stats.llm_cost,
-                )
+        call_stats = await self.get_call_stats(response)
+        if step:
+            await app.DATABASE.update_step(
+                task_id=step.task_id,
+                step_id=step.step_id,
+                organization_id=step.organization_id,
+                incremental_cost=call_stats.llm_cost,
+                incremental_input_tokens=call_stats.input_tokens,
+                incremental_output_tokens=call_stats.output_tokens,
+                incremental_reasoning_tokens=call_stats.reasoning_tokens,
+                incremental_cached_tokens=call_stats.cached_tokens,
+            )
+        if thought:
+            await app.DATABASE.update_thought(
+                thought_id=thought.observer_thought_id,
+                organization_id=thought.organization_id,
+                input_token_count=call_stats.input_tokens,
+                output_token_count=call_stats.output_tokens,
+                reasoning_token_count=call_stats.reasoning_tokens,
+                cached_token_count=call_stats.cached_tokens,
+                thought_cost=call_stats.llm_cost,
+            )
+
+        organization_id = organization_id or (
+            step.organization_id if step else (thought.organization_id if thought else None)
+        )
         # Track LLM API handler duration, token counts, and cost
         duration_seconds = time.perf_counter() - start_time
         LOG.info(
@@ -736,7 +744,7 @@ class LLMCaller:
             duration_seconds=duration_seconds,
             step_id=step.step_id if step else None,
             thought_id=thought.observer_thought_id if thought else None,
-            organization_id=step.organization_id if step else (thought.organization_id if thought else None),
+            organization_id=organization_id,
             input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
             output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
             reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
@@ -920,7 +928,7 @@ class LLMCaller:
             try:
                 llm_cost = litellm.completion_cost(completion_response=response)
             except Exception as e:
-                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
+                LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
             input_tokens = response.get("usage", {}).get("prompt_tokens", 0)
             output_tokens = response.get("usage", {}).get("completion_tokens", 0)

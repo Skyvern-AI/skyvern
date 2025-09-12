@@ -1360,6 +1360,7 @@ async def generate_text(
             json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                 prompt=script_generation_input_text_prompt,
                 prompt_name="script-generation-input-text-generatiion",
+                organization_id=context.organization_id,
             )
             new_text = json_response.get("answer", new_text)
         except Exception:
