@@ -1409,13 +1409,41 @@ async def get_task_v2(task_v2_id: str, organization_id: str | None = None) -> Ta
     return await app.DATABASE.get_task_v2(task_v2_id, organization_id=organization_id)
 
 
+async def _update_task_v2_status(
+    task_v2_id: str,
+    status: TaskV2Status,
+    organization_id: str | None = None,
+    summary: str | None = None,
+    output: dict[str, Any] | None = None,
+) -> TaskV2:
+    task_v2 = await app.DATABASE.update_task_v2(
+        task_v2_id, organization_id=organization_id, status=status, summary=summary, output=output
+    )
+    if status in [TaskV2Status.completed, TaskV2Status.failed, TaskV2Status.terminated]:
+        start_time = (
+            task_v2.started_at.replace(tzinfo=UTC) if task_v2.started_at else task_v2.created_at.replace(tzinfo=UTC)
+        )
+        queued_seconds = (start_time - task_v2.created_at.replace(tzinfo=UTC)).total_seconds()
+        duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
+        LOG.info(
+            "Task v2 duration metrics",
+            task_v2_id=task_v2_id,
+            workflow_run_id=task_v2.workflow_run_id,
+            duration_seconds=duration_seconds,
+            queued_seconds=queued_seconds,
+            task_v2_status=task_v2.status,
+            organization_id=organization_id,
+        )
+    return task_v2
+
+
 async def mark_task_v2_as_failed(
     task_v2_id: str,
     workflow_run_id: str | None = None,
     failure_reason: str | None = None,
     organization_id: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.failed,
@@ -1435,7 +1463,7 @@ async def mark_task_v2_as_completed(
     summary: str | None = None,
     output: dict[str, Any] | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.completed,
@@ -1444,17 +1472,6 @@ async def mark_task_v2_as_completed(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
-
-    # Track task v2 duration when completed
-    duration_seconds = (datetime.now(UTC) - task_v2.created_at.replace(tzinfo=UTC)).total_seconds()
-    LOG.info(
-        "Task v2 duration metrics",
-        task_v2_id=task_v2_id,
-        workflow_run_id=workflow_run_id,
-        duration_seconds=duration_seconds,
-        task_v2_status=TaskV2Status.completed,
-        organization_id=organization_id,
-    )
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1465,7 +1482,7 @@ async def mark_task_v2_as_canceled(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.canceled,
@@ -1482,7 +1499,7 @@ async def mark_task_v2_as_terminated(
     organization_id: str | None = None,
     failure_reason: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.terminated,
@@ -1499,7 +1516,7 @@ async def mark_task_v2_as_timed_out(
     organization_id: str | None = None,
     failure_reason: str | None = None,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.timed_out,
@@ -1515,7 +1532,7 @@ async def update_task_v2_status_to_workflow_run_status(
     workflow_run_status: WorkflowRunStatus,
     organization_id: str,
 ) -> TaskV2:
-    task_v2 = await app.DATABASE.update_task_v2(
+    task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status(workflow_run_status),
