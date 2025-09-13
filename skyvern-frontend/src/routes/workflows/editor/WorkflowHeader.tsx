@@ -206,38 +206,36 @@ function WorkflowHeader({
           </Button>
         ) : (
           <>
-            {user && (
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="icon"
-                      variant={debugStore.isDebugMode ? "default" : "tertiary"}
-                      className="size-10 min-w-[2.5rem]"
-                      disabled={workflowRunIsRunningOrQueued}
-                      onClick={() => {
-                        if (debugStore.isDebugMode) {
-                          navigate(`/workflows/${workflowPermanentId}/edit`);
-                        } else {
-                          navigate(`/workflows/${workflowPermanentId}/debug`);
-                        }
-                      }}
-                    >
-                      {debugStore.isDebugMode ? (
-                        <BrowserIcon className="h-6 w-6" />
-                      ) : (
-                        <BrowserIcon className="h-6 w-6" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    {debugStore.isDebugMode
-                      ? "Turn off Browser"
-                      : "Turn on Browser"}
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            )}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant={debugStore.isDebugMode ? "default" : "tertiary"}
+                    className="size-10 min-w-[2.5rem]"
+                    disabled={workflowRunIsRunningOrQueued}
+                    onClick={() => {
+                      if (debugStore.isDebugMode) {
+                        navigate(`/workflows/${workflowPermanentId}/edit`);
+                      } else {
+                        navigate(`/workflows/${workflowPermanentId}/debug`);
+                      }
+                    }}
+                  >
+                    {debugStore.isDebugMode ? (
+                      <BrowserIcon className="h-6 w-6" />
+                    ) : (
+                      <BrowserIcon className="h-6 w-6" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {debugStore.isDebugMode
+                    ? "Turn off Browser"
+                    : "Turn on Browser"}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
