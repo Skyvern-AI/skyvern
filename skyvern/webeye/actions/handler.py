@@ -3603,7 +3603,10 @@ async def extract_information_for_navigation_goal(
         # CUA tasks should use the default data extraction llm key
         llm_key_override = None
 
-    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key_override, default=app.LLM_API_HANDLER)
+    # Use the appropriate LLM handler based on the feature flag
+    llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        llm_key_override, default=app.EXTRACTION_LLM_API_HANDLER
+    )
     json_response = await llm_api_handler(
         prompt=extract_information_prompt,
         step=step,

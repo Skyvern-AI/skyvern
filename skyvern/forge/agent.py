@@ -3020,7 +3020,7 @@ class ForgeAgent:
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
 
-        data_extraction_summary_resp = await app.SECONDARY_LLM_API_HANDLER(
+        data_extraction_summary_resp = await app.EXTRACTION_LLM_API_HANDLER(
             prompt=prompt, step=step, prompt_name="data-extraction-summary"
         )
         return ExtractAction(
