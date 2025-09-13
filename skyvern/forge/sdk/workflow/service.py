@@ -2541,6 +2541,14 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id, is_script=True
             )
 
+            # Clean up workflow to persist video data and other artifacts
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+            )
+
             LOG.info(
                 "Successfully executed workflow script",
                 workflow_run_id=workflow_run.workflow_run_id,
@@ -2563,6 +2571,22 @@ class WorkflowService:
             workflow_run = await self.mark_workflow_run_as_failed(
                 workflow_run_id=workflow_run.workflow_run_id, failure_reason=failure_reason, is_script=True
             )
+
+            # Clean up workflow to persist video data and other artifacts even on failure
+            try:
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                )
+            except Exception as cleanup_error:
+                LOG.error(
+                    "Failed to clean up workflow after script execution failure",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    cleanup_error=str(cleanup_error),
+                    exc_info=True,
+                )
 
             return workflow_run
 
