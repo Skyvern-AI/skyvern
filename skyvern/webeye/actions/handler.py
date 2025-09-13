@@ -69,6 +69,7 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
+from skyvern.services.action_service import get_action_history
 from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
@@ -3732,6 +3733,7 @@ async def _get_input_or_select_context(
 
 
 async def extract_user_defined_errors(task: Task, step: Step, scraped_page: ScrapedPage) -> list[UserDefinedError]:
+    action_history = await get_action_history(task=task, current_step=step)
     scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
     prompt = prompt_engine.load_prompt(
         "surface-user-defined-errors",
@@ -3739,6 +3741,7 @@ async def extract_user_defined_errors(task: Task, step: Step, scraped_page: Scra
         navigation_payload_str=json.dumps(task.navigation_payload),
         elements=scraped_page_refreshed.build_element_tree(fmt=ElementTreeFormat.HTML),
         current_url=scraped_page_refreshed.url,
+        action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
