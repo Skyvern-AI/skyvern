@@ -2632,12 +2632,15 @@ class ForgeAgent:
 
         # Track task duration when task is completed, failed, or terminated
         if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
-            duration_seconds = (datetime.now(UTC) - task.created_at.replace(tzinfo=UTC)).total_seconds()
+            start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
+            queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
+            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             LOG.info(
                 "Task duration metrics",
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
                 duration_seconds=duration_seconds,
+                queued_seconds=queued_seconds,
                 task_status=status,
                 organization_id=task.organization_id,
             )
