@@ -1,18 +1,19 @@
 You are an expert at analyzing user interface automation actions and generating meaningful field names for data structures.
 
-Given a list of input_text actions with their intentions and text values, generate appropriate field names for a Pydantic BaseModel class called "GeneratedWorkflowParameters".
+Given a list of input_text, upload_file and select_option actions with their intentions and values, generate appropriate field names for a Pydantic BaseModel class called "GeneratedWorkflowParameters".
 
 ## Rules:
 1. Field names should be valid Python identifiers (snake_case, no spaces, no special characters except underscore)
 2. Field names should be descriptive and based on the intention of the action
-3. If multiple actions input the same text value, they should map to the same field name
+3. If multiple actions use the same text value, they should map to the same field name
 4. Field names should be concise but clear about what data they represent
 5. Avoid generic names like "field1", "input1" - use meaningful names based on the intention
 
-## Input Actions:
-{% for action in input_actions %}
+## Actions:
+{% for action in custom_field_actions %}
 Action {{ loop.index }}:
-- Text: "{{ action.text }}"
+- Action type: "{{ action.action_type }}"
+- Value: "{{ action.value }}"
 - Intention: "{{ action.intention }}"
 {% endfor %}
 
