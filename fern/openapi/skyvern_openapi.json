@@ -1794,7 +1794,7 @@
           "Agent"
         ],
         "summary": "Login Task",
-        "description": "Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password",
+        "description": "Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault",
         "operationId": "login_v1_run_tasks_login_post",
         "parameters": [
           {
@@ -2611,6 +2611,16 @@
             ],
             "title": "Text"
           },
+          "input_or_select_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InputOrSelectContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "option": {
             "anyOf": [
               {
@@ -2857,6 +2867,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -2868,6 +2881,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -3355,6 +3369,152 @@
           "modified_at"
         ],
         "title": "AzureSecretParameter"
+      },
+      "AzureVaultCredentialParameter": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "azure_vault_credential",
+            "title": "Parameter Type",
+            "default": "azure_vault_credential"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "azure_vault_credential_parameter_id": {
+            "type": "string",
+            "title": "Azure Vault Credential Parameter Id"
+          },
+          "workflow_id": {
+            "type": "string",
+            "title": "Workflow Id"
+          },
+          "vault_name": {
+            "type": "string",
+            "title": "Vault Name"
+          },
+          "username_key": {
+            "type": "string",
+            "title": "Username Key"
+          },
+          "password_key": {
+            "type": "string",
+            "title": "Password Key"
+          },
+          "totp_secret_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Secret Key"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "azure_vault_credential_parameter_id",
+          "workflow_id",
+          "vault_name",
+          "username_key",
+          "password_key",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "AzureVaultCredentialParameter"
+      },
+      "AzureVaultCredentialParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "azure_vault_credential",
+            "title": "Parameter Type",
+            "default": "azure_vault_credential"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "vault_name": {
+            "type": "string",
+            "title": "Vault Name"
+          },
+          "username_key": {
+            "type": "string",
+            "title": "Username Key"
+          },
+          "password_key": {
+            "type": "string",
+            "title": "Password Key"
+          },
+          "totp_secret_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Secret Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "vault_name",
+          "username_key",
+          "password_key"
+        ],
+        "title": "AzureVaultCredentialParameterYAML"
       },
       "BitwardenCreditCardDataParameter": {
         "properties": {
@@ -3970,6 +4130,12 @@
               "https://app.skyvern.com/browser-session/pbs_123456"
             ]
           },
+          "vnc_streaming_supported": {
+            "type": "boolean",
+            "title": "Vnc Streaming Supported",
+            "description": "Whether the browser session supports VNC streaming",
+            "default": false
+          },
           "started_at": {
             "anyOf": [
               {
@@ -4096,6 +4262,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -4107,6 +4276,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -4234,6 +4404,9 @@
               },
               {
                 "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+              },
+              {
+                "$ref": "#/components/schemas/AzureVaultCredentialParameter"
               },
               {
                 "$ref": "#/components/schemas/OutputParameter"
@@ -4965,6 +5138,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -4976,6 +5152,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -5346,6 +5523,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -5357,6 +5537,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -6246,6 +6427,9 @@
                     "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                   },
                   {
+                    "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                  },
+                  {
                     "$ref": "#/components/schemas/OutputParameter"
                   },
                   {
@@ -6257,6 +6441,7 @@
                   "mapping": {
                     "aws_secret": "#/components/schemas/AWSSecretParameter",
                     "azure_secret": "#/components/schemas/AzureSecretParameter",
+                    "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                     "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                     "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                     "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -6550,6 +6735,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -6561,6 +6749,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -6685,6 +6874,78 @@
           "label"
         ],
         "title": "HttpRequestBlockYAML"
+      },
+      "InputOrSelectContext": {
+        "properties": {
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "is_required": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Required"
+          },
+          "is_search_bar": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Search Bar"
+          },
+          "is_location_input": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Location Input"
+          },
+          "is_date_related": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Date Related"
+          }
+        },
+        "type": "object",
+        "title": "InputOrSelectContext"
       },
       "LoginBlock": {
         "properties": {
@@ -6864,6 +7125,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -6875,6 +7139,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -7297,6 +7562,54 @@
             ],
             "title": "Onepassword Item Id",
             "description": "1Password item ID"
+          },
+          "azure_vault_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Name",
+            "description": "Azure Vault Name"
+          },
+          "azure_vault_username_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Username Key",
+            "description": "Azure Vault username key"
+          },
+          "azure_vault_password_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Password Key",
+            "description": "Azure Vault password key"
+          },
+          "azure_vault_totp_secret_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Totp Secret Key",
+            "description": "Azure Vault TOTP secret key"
           }
         },
         "type": "object",
@@ -7476,6 +7789,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -7487,6 +7803,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -8997,6 +9314,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -9008,6 +9328,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -10037,6 +10358,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -10048,6 +10372,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -10661,6 +10986,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -10672,6 +11000,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -10993,6 +11322,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -11004,6 +11336,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -11263,6 +11596,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -11274,6 +11610,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -11699,6 +12036,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -11710,6 +12050,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -11846,6 +12187,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameterYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameterYAML"
+                },
+                {
                   "$ref": "#/components/schemas/WorkflowParameterYAML"
                 },
                 {
@@ -11862,6 +12206,7 @@
                 "propertyName": "parameter_type",
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameterYAML",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameterYAML",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameterYAML",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameterYAML",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameterYAML",
@@ -12999,7 +13344,8 @@
         "enum": [
           "skyvern",
           "bitwarden",
-          "1password"
+          "1password",
+          "azure_vault"
         ],
         "title": "CredentialType"
       }

@@ -27,12 +27,22 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, FileUploadBlock, TaskBlock
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.block import (
+    CodeBlock,
+    FileParserBlock,
+    FileUploadBlock,
+    HttpRequestBlock,
+    SendEmailBlock,
+    TaskBlock,
+    TextPromptBlock,
+    UrlBlock,
+)
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import CreateScriptResponse, FileEncoding, FileNode, ScriptFileCreate
-from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType
+from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
 
 LOG = structlog.get_logger(__name__)
 jinja_sandbox_env = SandboxedEnvironment()
@@ -262,6 +272,33 @@ async def execute_script(
     LOG.info("Script executed successfully", script_id=script_id)
 
 
+async def _take_workflow_run_block_screenshot(
+    workflow_run_id: str,
+    organization_id: str,
+    workflow_run_block: WorkflowRunBlock,
+) -> None:
+    """
+    This function is a copy of the block screenshot logic from the execute_safe function in the block.py file.
+    """
+    browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+    if not browser_state:
+        LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+    else:
+        screenshot = await browser_state.take_fullpage_screenshot(
+            use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "ENABLE_PLAYWRIGHT_FULLPAGE",
+                workflow_run_id,
+                properties={"organization_id": str(organization_id)},
+            )
+        )
+        if screenshot:
+            await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                workflow_run_block=workflow_run_block,
+                artifact_type=ArtifactType.SCREENSHOT_LLM,
+                data=screenshot,
+            )
+
+
 async def _create_workflow_block_run_and_task(
     block_type: BlockType,
     prompt: str | None = None,
@@ -333,6 +370,12 @@ async def _create_workflow_block_run_and_task(
                 task_id=task_id,
                 organization_id=organization_id,
             )
+
+        await _take_workflow_run_block_screenshot(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            workflow_run_block=workflow_run_block,
+        )
 
         context.step_id = step_id
         context.task_id = task_id
@@ -419,6 +462,7 @@ async def _update_workflow_block(
     label: str | None = None,
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
+    ai_fallback_triggered: bool = False,
 ) -> None:
     """Update the status of a workflow run block."""
     try:
@@ -507,7 +551,7 @@ async def _fallback_to_ai_run(
     max_steps: int | None = None,
     complete_on_download: bool = False,
     download_suffix: str | None = None,
-    totp_verification_url: str | None = None,
+    totp_url: str | None = None,
     totp_identifier: str | None = None,
     complete_verification: bool = True,
     include_action_history_in_verification: bool = False,
@@ -611,7 +655,7 @@ async def _fallback_to_ai_run(
             max_steps_per_run=max_steps,
             complete_on_download=complete_on_download,
             download_suffix=download_suffix,
-            totp_verification_url=totp_verification_url,
+            totp_verification_url=totp_url,
             totp_identifier=totp_identifier,
             complete_verification=complete_verification,
             include_action_history_in_verification=include_action_history_in_verification,
@@ -622,6 +666,13 @@ async def _fallback_to_ai_run(
             step=ai_step,
             task_block=task_block,
         )
+
+        # update workflow run to indicate that there's a script run
+        if workflow_run_id:
+            await app.DATABASE.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                ai_fallback_triggered=True,
+            )
 
         # Update block status to completed if workflow block was created
         if workflow_run_block_id:
@@ -655,7 +706,7 @@ async def _fallback_to_ai_run(
                 max_steps=max_steps,
                 complete_on_download=complete_on_download,
                 download_suffix=download_suffix,
-                totp_verification_url=totp_verification_url,
+                totp_verification_url=totp_url,
                 totp_identifier=totp_identifier,
                 complete_verification=complete_verification,
                 include_action_history_in_verification=include_action_history_in_verification,
@@ -973,6 +1024,8 @@ async def run_task(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
     cache_key: str | None = None,
 ) -> None:
     # Auto-create workflow block run and task if workflow_run_id is available
@@ -1007,6 +1060,8 @@ async def run_task(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -1091,6 +1146,8 @@ async def action(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
     cache_key: str | None = None,
 ) -> None:
     # Auto-create workflow block run and task if workflow_run_id is available
@@ -1125,6 +1182,8 @@ async def action(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -1149,6 +1208,8 @@ async def login(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
     cache_key: str | None = None,
 ) -> None:
     # Auto-create workflow block run and task if workflow_run_id is available
@@ -1183,6 +1244,8 @@ async def login(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -1306,6 +1369,11 @@ async def run_script(
         )
         if not workflow_run:
             raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+        # update workfow run to indicate that there's a script run
+        workflow_run = await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            ai_fallback_triggered=False,
+        )
         context.workflow_run_id = workflow_run_id
         context.organization_id = organization_id
 
@@ -1323,7 +1391,7 @@ async def run_script(
         if parameters:
             await user_script.run_workflow(parameters=parameters)
         else:
-            await user_script.run_workflow()
+            await user_script.run_workflow(parameters={})
     else:
         raise Exception(f"No 'run_workflow' function found in {path}")
 
@@ -1351,6 +1419,7 @@ async def generate_text(
             json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                 prompt=script_generation_input_text_prompt,
                 prompt_name="script-generation-input-text-generatiion",
+                organization_id=context.organization_id,
             )
             new_text = json_response.get("answer", new_text)
         except Exception:
@@ -1382,6 +1451,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
 class BlockValidationOutput:
     label: str
     output_parameter: OutputParameter
+    workflow: Workflow
     workflow_id: str
     workflow_run_id: str
     organization_id: str
@@ -1410,6 +1480,7 @@ async def _validate_and_get_output_parameter(label: str | None = None) -> BlockV
     return BlockValidationOutput(
         label=label,
         output_parameter=output_parameter,
+        workflow=workflow,
         workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
@@ -1455,7 +1526,7 @@ async def upload_file(
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
         parameters=parameters or [],
-        storage_type=storage_type,
+        storage_type=FileStorageType(storage_type),
         s3_bucket=s3_bucket,
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
@@ -1470,3 +1541,134 @@ async def upload_file(
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+
+
+async def send_email(
+    sender: str,
+    recipients: list[str],
+    subject: str,
+    body: str,
+    file_attachments: list[str] = [],
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+) -> None:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    workflow = block_validation_output.workflow
+    smtp_host_parameter = workflow.get_parameter("smtp_host")
+    smtp_port_parameter = workflow.get_parameter("smtp_port")
+    smtp_username_parameter = workflow.get_parameter("smtp_username")
+    smtp_password_parameter = workflow.get_parameter("smtp_password")
+    if not smtp_host_parameter or not smtp_port_parameter or not smtp_username_parameter or not smtp_password_parameter:
+        raise Exception("SMTP host, port, username, and password parameters are required")
+    send_email_block = SendEmailBlock(
+        smtp_host=smtp_host_parameter,
+        smtp_port=smtp_port_parameter,
+        smtp_username=smtp_username_parameter,
+        smtp_password=smtp_password_parameter,
+        sender=sender,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        file_attachments=file_attachments,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=parameters or [],
+    )
+    await send_email_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+
+
+async def parse_file(
+    file_url: str,
+    file_type: FileType,
+    schema: dict[str, Any] | None = None,
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+) -> None:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    file_parser_block = FileParserBlock(
+        file_url=file_url,
+        file_type=file_type,
+        json_schema=schema,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=parameters or [],
+    )
+    await file_parser_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+
+
+async def http_request(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    body: dict[str, Any] | None = None,
+    timeout: int = 30,
+    follow_redirects: bool = True,
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+) -> None:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    http_request_block = HttpRequestBlock(
+        method=method,
+        url=url,
+        headers=headers,
+        body=body,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=parameters or [],
+    )
+    await http_request_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+
+
+async def goto(
+    url: str,
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+) -> None:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    goto_url_block = UrlBlock(
+        url=url,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=parameters or [],
+    )
+    await goto_url_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+
+
+async def prompt(
+    prompt: str,
+    schema: dict[str, Any] | None = None,
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+) -> dict[str, Any] | list | str | None:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    prompt_block = TextPromptBlock(
+        prompt=prompt,
+        json_schema=schema,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=parameters or [],
+    )
+    result = await prompt_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+    return result.output_parameter_value

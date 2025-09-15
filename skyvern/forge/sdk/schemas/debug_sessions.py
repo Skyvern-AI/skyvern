@@ -20,6 +20,7 @@ class DebugSession(BaseModel):
 
     debug_session_id: str
     browser_session_id: str
+    vnc_streaming_supported: bool | None = None
     workflow_permanent_id: str | None = None
     created_at: datetime
     modified_at: datetime

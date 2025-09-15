@@ -20,12 +20,13 @@ from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
-from skyvern.forge.sdk.services.credentials import OnePasswordConstants, parse_totp_secret
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, parse_totp_secret
 from skyvern.forge.sdk.workflow.exceptions import OutputParameterKeyCollisionError
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
     AzureSecretParameter,
+    AzureVaultCredentialParameter,
     BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
     BitwardenSensitiveInformationParameter,
@@ -55,7 +56,7 @@ class WorkflowRunContext:
     async def init(
         cls,
         aws_client: AsyncAWSClient,
-        azure_client: AsyncAzureClient | None,
+        azure_client: AsyncAzureClient,
         organization: Organization,
         workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
         workflow_output_parameters: list[OutputParameter],
@@ -96,28 +97,30 @@ class WorkflowRunContext:
             for label, value in block_outputs.items():
                 workflow_run_context.values[f"{label}_output"] = value
 
-        for secrete_parameter in secret_parameters:
-            if isinstance(secrete_parameter, AWSSecretParameter):
-                await workflow_run_context.register_aws_secret_parameter_value(secrete_parameter)
-            elif isinstance(secrete_parameter, AzureSecretParameter):
-                await workflow_run_context.register_azure_secret_parameter_value(secrete_parameter)
-            elif isinstance(secrete_parameter, CredentialParameter):
-                await workflow_run_context.register_credential_parameter_value(secrete_parameter, organization)
-            elif isinstance(secrete_parameter, OnePasswordCredentialParameter):
+        for secret_parameter in secret_parameters:
+            if isinstance(secret_parameter, AWSSecretParameter):
+                await workflow_run_context.register_aws_secret_parameter_value(secret_parameter)
+            elif isinstance(secret_parameter, AzureSecretParameter):
+                await workflow_run_context.register_azure_secret_parameter_value(secret_parameter)
+            elif isinstance(secret_parameter, CredentialParameter):
+                await workflow_run_context.register_credential_parameter_value(secret_parameter, organization)
+            elif isinstance(secret_parameter, OnePasswordCredentialParameter):
                 await workflow_run_context.register_onepassword_credential_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
-            elif isinstance(secrete_parameter, BitwardenLoginCredentialParameter):
+            elif isinstance(secret_parameter, AzureVaultCredentialParameter):
+                await workflow_run_context.register_azure_vault_credential_parameter_value(secret_parameter)
+            elif isinstance(secret_parameter, BitwardenLoginCredentialParameter):
                 await workflow_run_context.register_bitwarden_login_credential_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
-            elif isinstance(secrete_parameter, BitwardenCreditCardDataParameter):
+            elif isinstance(secret_parameter, BitwardenCreditCardDataParameter):
                 await workflow_run_context.register_bitwarden_credit_card_data_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
-            elif isinstance(secrete_parameter, BitwardenSensitiveInformationParameter):
+            elif isinstance(secret_parameter, BitwardenSensitiveInformationParameter):
                 await workflow_run_context.register_bitwarden_sensitive_information_parameter_value(
-                    secrete_parameter, organization
+                    secret_parameter, organization
                 )
 
         for context_parameter in context_parameters:
@@ -128,7 +131,7 @@ class WorkflowRunContext:
 
         return workflow_run_context
 
-    def __init__(self, aws_client: AsyncAWSClient, azure_client: AsyncAzureClient | None) -> None:
+    def __init__(self, aws_client: AsyncAWSClient, azure_client: AsyncAzureClient) -> None:
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
@@ -343,9 +346,6 @@ class WorkflowRunContext:
         # If the parameter is an Azure secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
-        if self._azure_client is None:
-            LOG.error("Azure client not initialized, cannot register Azure secret parameter value")
-            raise ValueError("Azure client not initialized")
         secret_value = await self._azure_client.get_secret(parameter.azure_key)
         if secret_value is not None:
             random_secret_id = self.generate_random_secret_id()
@@ -490,6 +490,48 @@ class WorkflowRunContext:
         except BitwardenBaseError as e:
             LOG.error(f"Failed to get secret from Bitwarden. Error: {e}")
             raise e
+
+    async def register_azure_vault_credential_parameter_value(self, parameter: AzureVaultCredentialParameter) -> None:
+        vault_name = self._resolve_parameter_value(parameter.vault_name)
+        if not vault_name:
+            raise ValueError("Azure Vault Name is missing")
+        username_key = self._resolve_parameter_value(parameter.username_key)
+        if not username_key:
+            raise ValueError("Azure Username Key is missing")
+        password_key = self._resolve_parameter_value(parameter.password_key)
+        if not password_key:
+            raise ValueError("Azure Password Key is missing")
+
+        totp_secret_key = self._resolve_parameter_value(parameter.totp_secret_key)
+
+        secret_login = await self._azure_client.get_secret(username_key, vault_name)
+        secret_password = await self._azure_client.get_secret(password_key, vault_name)
+        if totp_secret_key:
+            totp_secret = await self._azure_client.get_secret(totp_secret_key, vault_name)
+        else:
+            totp_secret = None
+
+        if secret_login is not None and secret_password is not None:
+            random_secret_id = self.generate_random_secret_id()
+            # login secret
+            username_secret_id = f"{random_secret_id}_username"
+            self.secrets[username_secret_id] = secret_login
+            # password secret
+            password_secret_id = f"{random_secret_id}_password"
+            self.secrets[password_secret_id] = secret_password
+            self.values[parameter.key] = {
+                "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
+                "username": username_secret_id,
+                "password": password_secret_id,
+            }
+            self.parameters[parameter.key] = parameter
+
+            if totp_secret:
+                totp_secret_id = f"{random_secret_id}_totp"
+                self.secrets[totp_secret_id] = AzureVaultConstants.TOTP
+                totp_secret_value = self.totp_secret_value_key(totp_secret_id)
+                self.secrets[totp_secret_value] = parse_totp_secret(totp_secret)
+                self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_bitwarden_sensitive_information_parameter_value(
         self,
@@ -856,7 +898,7 @@ class WorkflowRunContext:
 
 class WorkflowContextManager:
     aws_client: AsyncAWSClient
-    azure_client: AsyncAzureClient | None
+    azure_client: AsyncAzureClient
     workflow_run_contexts: dict[str, WorkflowRunContext]
 
     parameters: dict[str, PARAMETER_TYPE]
@@ -865,12 +907,10 @@ class WorkflowContextManager:
 
     def __init__(self) -> None:
         self.aws_client = AsyncAWSClient()
-        self.azure_client = None
-        if settings.AZURE_STORAGE_ACCOUNT_NAME and settings.AZURE_STORAGE_ACCOUNT_KEY:
-            self.azure_client = AsyncAzureClient(
-                account_name=settings.AZURE_STORAGE_ACCOUNT_NAME,
-                account_key=settings.AZURE_STORAGE_ACCOUNT_KEY,
-            )
+        self.azure_client = AsyncAzureClient(
+            storage_account_name=settings.AZURE_STORAGE_ACCOUNT_NAME,
+            storage_account_key=settings.AZURE_STORAGE_ACCOUNT_KEY,
+        )
         self.workflow_run_contexts = {}
 
     def _validate_workflow_run_context(self, workflow_run_id: str) -> None:

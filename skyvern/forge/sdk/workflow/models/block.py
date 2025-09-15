@@ -2062,8 +2062,8 @@ class FileUploadBlock(Block):
                     or self.azure_storage_account_key
                 )
                 azure_client = AsyncAzureClient(
-                    account_name=actual_azure_storage_account_name or "",
-                    account_key=actual_azure_storage_account_key or "",
+                    storage_account_name=actual_azure_storage_account_name,
+                    storage_account_key=actual_azure_storage_account_key,
                 )
                 for file_path in files_to_upload:
                     blob_name = Path(file_path).name

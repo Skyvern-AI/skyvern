@@ -380,6 +380,10 @@ class BlockRunRequest(WorkflowRunRequest):
     )
 
 
+class ScriptRunResponse(BaseModel):
+    ai_fallback_triggered: bool = False
+
+
 class BaseRunResponse(BaseModel):
     run_id: str = Field(
         description="Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs.",
@@ -418,6 +422,10 @@ class BaseRunResponse(BaseModel):
     max_screenshot_scrolls: int | None = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot",
+    )
+    script_run: ScriptRunResponse | None = Field(
+        default=None,
+        description="The script run result",
     )
 
 

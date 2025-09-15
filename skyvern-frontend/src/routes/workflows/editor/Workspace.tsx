@@ -17,6 +17,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useSidebarStore } from "@/store/SidebarStore";
@@ -209,10 +210,10 @@ function Workspace({
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
   const workflowWidth = hasHttpBlock
-    ? "35.1rem"
+    ? "39rem"
     : hasLoopBlock
-      ? "31.25rem"
-      : "30rem";
+      ? "34.25rem"
+      : "34rem";
 
   /**
    * Open a new tab (not window) with the browser session URL.
@@ -716,7 +717,7 @@ function Workspace({
           {/* sub panels */}
           {workflowPanelState.active && (
             <div
-              className="pointer-events-none absolute right-6 top-[5rem] z-30"
+              className="absolute right-6 top-[8.5rem] z-30"
               style={{
                 height:
                   workflowPanelState.content === "nodeLibrary"
@@ -744,12 +745,12 @@ function Workspace({
                 />
               )}
               {workflowPanelState.content === "parameters" && (
-                <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30">
+                <div className="z-30">
                   <WorkflowParametersPanel />
                 </div>
               )}
               {workflowPanelState.content === "nodeLibrary" && (
-                <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-full w-[25rem]">
+                <div className="z-30 h-full w-[25rem]">
                   <WorkflowNodeLibraryPanel
                     onNodeClick={(props) => {
                       addNode(props);
@@ -762,7 +763,50 @@ function Workspace({
         </div>
       )}
 
-      {/* infinite canvas, sub panels, browser, and timeline when in debug mode */}
+      {/* sub panels when in debug mode */}
+      {showBrowser && workflowPanelState.active && (
+        <div
+          className="absolute right-6 top-[8.5rem] z-30"
+          style={{
+            height:
+              workflowPanelState.content === "nodeLibrary"
+                ? "calc(100vh - 14rem)"
+                : "unset",
+          }}
+        >
+          {workflowPanelState.content === "cacheKeyValues" && (
+            <WorkflowCacheKeyValuesPanel
+              cacheKeyValues={cacheKeyValues}
+              pending={cacheKeyValuesLoading}
+              scriptKey={workflow.cache_key ?? "default"}
+              onDelete={(cacheKeyValue) => {
+                setToDeleteCacheKeyValue(cacheKeyValue);
+                setOpenConfirmCacheKeyValueDeleteDialogue(true);
+              }}
+              onPaginate={(page) => {
+                setPage(page);
+              }}
+              onSelect={(cacheKeyValue) => {
+                setCacheKeyValue(cacheKeyValue);
+                setCacheKeyValueFilter("");
+                closeWorkflowPanel();
+              }}
+            />
+          )}
+          {workflowPanelState.content === "parameters" && (
+            <WorkflowParametersPanel />
+          )}
+          {workflowPanelState.content === "nodeLibrary" && (
+            <WorkflowNodeLibraryPanel
+              onNodeClick={(props) => {
+                addNode(props);
+              }}
+            />
+          )}
+        </div>
+      )}
+
+      {/* infinite canvas, browser, and timeline when in debug mode */}
       {showBrowser && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
@@ -789,96 +833,65 @@ function Workspace({
               />
             </div>
 
-            {/* browser & timeline & sub-panels in debug mode */}
+            {/* browser & timeline */}
             <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
-              {/* sub panels */}
-              {workflowPanelState.active && (
-                <div
-                  className={cn("absolute right-6 top-[8.5rem] z-30", {
-                    "left-6": workflowPanelState.content === "nodeLibrary",
-                  })}
-                  style={{
-                    height:
-                      workflowPanelState.content === "nodeLibrary"
-                        ? "calc(100vh - 14rem)"
-                        : "unset",
-                  }}
-                >
-                  {workflowPanelState.content === "cacheKeyValues" && (
-                    <WorkflowCacheKeyValuesPanel
-                      cacheKeyValues={cacheKeyValues}
-                      pending={cacheKeyValuesLoading}
-                      scriptKey={workflow.cache_key ?? "default"}
-                      onDelete={(cacheKeyValue) => {
-                        setToDeleteCacheKeyValue(cacheKeyValue);
-                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
-                      }}
-                      onPaginate={(page) => {
-                        setPage(page);
-                      }}
-                      onSelect={(cacheKeyValue) => {
-                        setCacheKeyValue(cacheKeyValue);
-                        setCacheKeyValueFilter("");
-                        closeWorkflowPanel();
-                      }}
-                    />
-                  )}
-                  {workflowPanelState.content === "parameters" && (
-                    <WorkflowParametersPanel />
-                  )}
-                  {workflowPanelState.content === "nodeLibrary" && (
-                    <WorkflowNodeLibraryPanel
-                      onNodeClick={(props) => {
-                        addNode(props);
-                      }}
-                    />
-                  )}
-                </div>
-              )}
-
-              {/* browser & timeline */}
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
-                {/* browser */}
-                <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                  <div key={reloadKey} className="w-full flex-1">
-                    {activeDebugSession &&
-                    activeDebugSession.browser_session_id &&
-                    !cycleBrowser.isPending ? (
-                      <BrowserStream
-                        interactive={interactor === "human"}
-                        browserSessionId={activeDebugSession.browser_session_id}
-                        showControlButtons={interactor === "human"}
-                        resizeTrigger={windowResizeTrigger}
-                      />
-                    ) : (
-                      <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
-                        Connecting to your browser...
-                        <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                {/* VNC browser */}
+                {!activeDebugSession ||
+                  (activeDebugSession.vnc_streaming_supported && (
+                    <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                      <div key={reloadKey} className="w-full flex-1">
+                        {activeDebugSession &&
+                        activeDebugSession.browser_session_id &&
+                        !cycleBrowser.isPending ? (
+                          <BrowserStream
+                            interactive={interactor === "human"}
+                            browserSessionId={
+                              activeDebugSession.browser_session_id
+                            }
+                            showControlButtons={interactor === "human"}
+                            resizeTrigger={windowResizeTrigger}
+                          />
+                        ) : (
+                          <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
+                            Connecting to your browser...
+                            <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
-                  <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
-                    <div className="flex items-center gap-2">
-                      <GlobeIcon /> Live Browser
+                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                        <div className="flex items-center gap-2">
+                          <GlobeIcon /> Live Browser
+                        </div>
+                        {showBreakoutButton && (
+                          <BreakoutButton onClick={() => breakout()} />
+                        )}
+                        <div
+                          className={cn("ml-auto flex items-center gap-2", {
+                            "mr-16": !blockLabel,
+                          })}
+                        >
+                          {showPowerButton && (
+                            <PowerButton onClick={() => cycle()} />
+                          )}
+                          <ReloadButton
+                            isReloading={isReloading}
+                            onClick={() => reload()}
+                          />
+                        </div>
+                      </footer>
                     </div>
-                    {showBreakoutButton && (
-                      <BreakoutButton onClick={() => breakout()} />
-                    )}
-                    <div
-                      className={cn("ml-auto flex items-center gap-2", {
-                        "mr-16": !blockLabel,
-                      })}
-                    >
-                      {showPowerButton && (
-                        <PowerButton onClick={() => cycle()} />
-                      )}
-                      <ReloadButton
-                        isReloading={isReloading}
-                        onClick={() => reload()}
-                      />
+                  ))}
+
+                {/* Screenshot browser} */}
+                {activeDebugSession &&
+                  !activeDebugSession.vnc_streaming_supported && (
+                    <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                      <div className="aspect-video w-full">
+                        <WorkflowRunStream alwaysShowStream={true} />
+                      </div>
                     </div>
-                  </footer>
-                </div>
+                  )}
 
                 {/* timeline */}
                 <div

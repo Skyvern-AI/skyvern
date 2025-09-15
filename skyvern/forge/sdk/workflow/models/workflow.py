@@ -10,7 +10,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateBlockLabels
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.url_validators import validate_url
 
@@ -90,6 +90,12 @@ class Workflow(BaseModel):
                 return block.output_parameter
         return None
 
+    def get_parameter(self, key: str) -> PARAMETER_TYPE | None:
+        for parameter in self.workflow_definition.parameters:
+            if parameter.key == key:
+                return parameter
+        return None
+
 
 class WorkflowRunStatus(StrEnum):
     created = "created"
@@ -129,6 +135,7 @@ class WorkflowRun(BaseModel):
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
+    script_run: ScriptRunResponse | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -180,3 +187,4 @@ class WorkflowRunResponseBase(BaseModel):
     browser_session_id: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
+    script_run: ScriptRunResponse | None = None

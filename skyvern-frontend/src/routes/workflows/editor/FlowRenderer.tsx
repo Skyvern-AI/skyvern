@@ -50,6 +50,7 @@ import {
   ContextParameterYAML,
   CredentialParameterYAML,
   OnePasswordCredentialParameterYAML,
+  AzureVaultCredentialParameterYAML,
   ParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
@@ -65,6 +66,7 @@ import {
   parameterIsSkyvernCredential,
   parameterIsOnePasswordCredential,
   parameterIsBitwardenCredential,
+  parameterIsAzureVaultCredential,
 } from "./types";
 import "./reactFlowOverrideStyles.css";
 import {
@@ -78,7 +80,6 @@ import {
   layout,
 } from "./workflowEditorUtils";
 import { useAutoPan } from "./useAutoPan";
-import { useUser } from "@/hooks/useUser";
 
 const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -91,6 +92,7 @@ function convertToParametersYAML(
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
   | OnePasswordCredentialParameterYAML
+  | AzureVaultCredentialParameterYAML
   | CredentialParameterYAML
 > {
   return parameters
@@ -104,6 +106,7 @@ function convertToParametersYAML(
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
         | OnePasswordCredentialParameterYAML
+        | AzureVaultCredentialParameterYAML
         | CredentialParameterYAML
         | undefined => {
         if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
@@ -192,6 +195,16 @@ function convertToParametersYAML(
               vault_id: parameter.vaultId,
               item_id: parameter.itemId,
             };
+          } else if (parameterIsAzureVaultCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Azure_Vault_Credential,
+              key: parameter.key,
+              description: parameter.description || null,
+              vault_name: parameter.vaultName,
+              username_key: parameter.usernameKey,
+              password_key: parameter.passwordKey,
+              totp_secret_key: parameter.totpSecretKey,
+            };
           }
         }
         return undefined;
@@ -206,6 +219,7 @@ function convertToParametersYAML(
           | BitwardenSensitiveInformationParameterYAML
           | BitwardenCreditCardDataParameterYAML
           | OnePasswordCredentialParameterYAML
+          | AzureVaultCredentialParameterYAML
           | CredentialParameterYAML
           | undefined,
       ): param is
@@ -215,6 +229,7 @@ function convertToParametersYAML(
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
         | OnePasswordCredentialParameterYAML
+        | AzureVaultCredentialParameterYAML
         | CredentialParameterYAML => param !== undefined,
     );
 }
@@ -256,14 +271,13 @@ function FlowRenderer({
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
-  const user = useUser().get();
   const { title, initializeTitle } = useWorkflowTitleStore();
   // const [parameters] = useState<ParametersState>(initialParameters);
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const flowIsConstrained = debugStore.isDebugMode && Boolean(user);
+  const flowIsConstrained = debugStore.isDebugMode;
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -520,10 +534,6 @@ function FlowRenderer({
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {
-    if (!user) {
-      return;
-    }
-
     const xLock = getXLock();
 
     if (newValue) {
