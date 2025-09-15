@@ -17,7 +17,7 @@ import { MAX_STEPS_DEFAULT, type Taskv2Node } from "./types";
 import { ModelSelector } from "@/components/ModelSelector";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
-import { NodeFooter } from "../components/NodeFooter";
+import { NodeTabs } from "../components/NodeTabs";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -196,7 +196,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
             </AccordionContent>
           </AccordionItem>
         </Accordion>
-        <NodeFooter blockLabel={label} />
+        <NodeTabs blockLabel={label} />
       </div>
     </div>
   );
