@@ -118,6 +118,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
               "bg-slate-950 outline outline-2 outline-slate-300":
                 thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader

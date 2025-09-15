@@ -62,8 +62,13 @@ import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
-import { getWorkflowErrors } from "./workflowEditorUtils";
+import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
+import { getWorkflowErrors, getElements } from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
+import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
+import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
+import { WorkflowSettings } from "../types/workflowTypes";
+import { ProxyLocation } from "@/api/types";
 import {
   nodeAdderNode,
   createNode,
@@ -568,6 +573,84 @@ function Workspace({
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
   const code = getCode(orderedBlockLabels, blockScripts).join("");
+  const handleCompareVersions = (
+    version1: WorkflowVersion,
+    version2: WorkflowVersion,
+    mode: "visual" | "json" = "visual",
+  ) => {
+    console.log(
+      `${mode === "visual" ? "Visual" : "JSON"} comparison between versions:`,
+      version1.version,
+      "and",
+      version2.version,
+    );
+
+    // Implement visual drawer comparison
+    if (mode === "visual") {
+      console.log("Opening visual comparison panel...");
+      // Keep history panel active but add comparison data
+      setWorkflowPanelState({
+        active: true,
+        content: "history", // Keep history panel active
+        data: {
+          ...workflowPanelState.data,
+          version1: JSON.parse(JSON.stringify(version1)),
+          version2: JSON.parse(JSON.stringify(version2)),
+          showComparison: true, // Add flag to show comparison
+        },
+      });
+    }
+
+    // TODO: Implement JSON diff comparison
+    if (mode === "json") {
+      // This will open a JSON diff view
+      console.log("Opening JSON diff view...");
+      // Future: setJsonDiffOpen(true);
+      // Future: setJsonDiffVersions({ version1, version2 });
+    }
+  };
+
+  const handleSelectState = (selectedVersion: WorkflowVersion) => {
+    console.log("Loading version into main editor:", selectedVersion.version);
+
+    // Close panels
+    setWorkflowPanelState({
+      active: false,
+      content: "parameters",
+      data: {
+        showComparison: false,
+        version1: undefined,
+        version2: undefined,
+      },
+    });
+
+    // Load the selected version into the main editor
+    const settings: WorkflowSettings = {
+      proxyLocation:
+        selectedVersion.proxy_location || ProxyLocation.Residential,
+      webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
+      persistBrowserSession: selectedVersion.persist_browser_session,
+      model: selectedVersion.model,
+      maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
+      extraHttpHeaders: selectedVersion.extra_http_headers
+        ? JSON.stringify(selectedVersion.extra_http_headers)
+        : null,
+      useScriptCache: selectedVersion.generate_script,
+      scriptCacheKey: selectedVersion.cache_key,
+      aiFallback: selectedVersion.ai_fallback ?? true,
+      runSequentially: selectedVersion.run_sequentially ?? false,
+    };
+
+    const elements = getElements(
+      selectedVersion.workflow_definition?.blocks || [],
+      settings,
+      true, // editable
+    );
+
+    // Update the main editor with the selected version
+    setNodes(elements.nodes);
+    setEdges(elements.edges);
+  };
 
   return (
     <div className="relative h-full w-full">
@@ -758,8 +841,36 @@ function Workspace({
           onRun={() => {
             closeWorkflowPanel();
           }}
+<<<<<<< HEAD
           onShowAllCodeClick={() => {
             setShowAllCode(!showAllCode);
+=======
+          onHistory={() => {
+            if (
+              workflowPanelState.active &&
+              workflowPanelState.content === "history"
+            ) {
+              // Close panel and clear comparison data
+              setWorkflowPanelState({
+                active: false,
+                content: "history",
+                data: {
+                  showComparison: false,
+                  version1: undefined,
+                  version2: undefined,
+                },
+              });
+            } else {
+              setWorkflowPanelState({
+                active: true,
+                content: "history",
+                data: {
+                  // Clear any existing comparison when opening fresh
+                  showComparison: false,
+                },
+              });
+            }
+>>>>>>> 1ee5c931 (Feature: added Workflow Comparison)
           }}
         />
       </div>
@@ -767,17 +878,35 @@ function Workspace({
       {/* infinite canvas and sub panels when not in debug mode */}
       {!showBrowser && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
-          {/* infinite canvas */}
-          <FlowRenderer
-            nodes={nodes}
-            edges={edges}
-            setNodes={setNodes}
-            setEdges={setEdges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            initialTitle={initialTitle}
-            workflow={workflow}
-          />
+          {/* infinite canvas or comparison view */}
+          {workflowPanelState.data?.showComparison &&
+          workflowPanelState.data?.version1 &&
+          workflowPanelState.data?.version2 ? (
+            <div
+              className="absolute left-6 top-[6rem]"
+              style={{
+                width: "calc(100% - 32rem)",
+                height: "calc(100vh - 11rem)",
+              }}
+            >
+              <WorkflowComparisonPanel
+                version1={workflowPanelState.data.version1}
+                version2={workflowPanelState.data.version2}
+                onSelectState={handleSelectState}
+              />
+            </div>
+          ) : (
+            <FlowRenderer
+              nodes={nodes}
+              edges={edges}
+              setNodes={setNodes}
+              setEdges={setEdges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              initialTitle={initialTitle}
+              workflow={workflow}
+            />
+          )}
 
           {/* sub panels */}
           {workflowPanelState.active && (
@@ -812,6 +941,14 @@ function Workspace({
               {workflowPanelState.content === "parameters" && (
                 <div className="z-30">
                   <WorkflowParametersPanel />
+                </div>
+              )}
+              {workflowPanelState.content === "history" && (
+                <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-[calc(100vh-14rem)]">
+                  <WorkflowHistoryPanel
+                    workflowPermanentId={workflowPermanentId!}
+                    onCompare={handleCompareVersions}
+                  />
                 </div>
               )}
               {workflowPanelState.content === "nodeLibrary" && (
@@ -881,6 +1018,7 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
+<<<<<<< HEAD
             {/* code and infinite canvas */}
             <div className="relative h-full w-full">
               <div
@@ -939,10 +1077,100 @@ function Workspace({
                   />
                 </div>
               </div>
+=======
+            {/* infinite canvas or comparison view */}
+            <div className="skyvern-split-left h-full w-full">
+              {workflowPanelState.data?.showComparison &&
+              workflowPanelState.data?.version1 &&
+              workflowPanelState.data?.version2 ? (
+                <div
+                  className="absolute left-6 top-[9.5rem]"
+                  style={{
+                    width: "calc(100% - 32rem)",
+                    height: "calc(100vh - 14.5rem)",
+                  }}
+                >
+                  <WorkflowComparisonPanel
+                    version1={workflowPanelState.data.version1}
+                    version2={workflowPanelState.data.version2}
+                    onSelectState={handleSelectState}
+                  />
+                </div>
+              ) : (
+                <FlowRenderer
+                  hideBackground={true}
+                  hideControls={true}
+                  nodes={nodes}
+                  edges={edges}
+                  setNodes={setNodes}
+                  setEdges={setEdges}
+                  onNodesChange={onNodesChange}
+                  onEdgesChange={onEdgesChange}
+                  initialTitle={initialTitle}
+                  workflow={workflow}
+                  onContainerResize={containerResizeTrigger}
+                />
+              )}
+>>>>>>> 1ee5c931 (Feature: added Workflow Comparison)
             </div>
 
             {/* browser & timeline */}
             <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
+<<<<<<< HEAD
+=======
+              {/* sub panels */}
+              {workflowPanelState.active && (
+                <div
+                  className={cn("absolute right-6 top-[8.5rem] z-30", {
+                    "left-6": workflowPanelState.content === "nodeLibrary",
+                  })}
+                  style={{
+                    height:
+                      workflowPanelState.content === "nodeLibrary"
+                        ? "calc(100vh - 14rem)"
+                        : "unset",
+                  }}
+                >
+                  {workflowPanelState.content === "cacheKeyValues" && (
+                    <WorkflowCacheKeyValuesPanel
+                      cacheKeyValues={cacheKeyValues}
+                      pending={cacheKeyValuesLoading}
+                      scriptKey={workflow.cache_key ?? "default"}
+                      onDelete={(cacheKeyValue) => {
+                        setToDeleteCacheKeyValue(cacheKeyValue);
+                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                      }}
+                      onPaginate={(page) => {
+                        setPage(page);
+                      }}
+                      onSelect={(cacheKeyValue) => {
+                        setCacheKeyValue(cacheKeyValue);
+                        setCacheKeyValueFilter("");
+                        closeWorkflowPanel();
+                      }}
+                    />
+                  )}
+                  {workflowPanelState.content === "parameters" && (
+                    <WorkflowParametersPanel />
+                  )}
+                  {workflowPanelState.content === "history" && (
+                    <WorkflowHistoryPanel
+                      workflowPermanentId={workflowPermanentId!}
+                      onCompare={handleCompareVersions}
+                    />
+                  )}
+                  {workflowPanelState.content === "nodeLibrary" && (
+                    <WorkflowNodeLibraryPanel
+                      onNodeClick={(props) => {
+                        addNode(props);
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+
+              {/* browser & timeline */}
+>>>>>>> 1ee5c931 (Feature: added Workflow Comparison)
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
                 {/* VNC browser */}
                 {!activeDebugSession ||
