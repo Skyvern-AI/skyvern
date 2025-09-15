@@ -32,7 +32,7 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "GEMINI_API_KEY": "",
             "ENABLE_NOVITA": "false",
             "NOVITA_API_KEY": "",
-            "LLM_KEY": "",
+            "LLM_KEY": "gpt-4o",  # Default to direct litellm model name
             "SECONDARY_LLM_KEY": "",
             "BROWSER_TYPE": "chromium-headful",
             "MAX_SCRAPING_RETRIES": "0",

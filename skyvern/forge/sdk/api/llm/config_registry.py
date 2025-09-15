@@ -37,10 +37,11 @@ class LLMConfigRegistry:
     @classmethod
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
         if llm_key not in cls._configs:
-            # If the key is not found in registered configs, treat it as a general model
+            # If the key is not found in registered configs, treat it as a litellm model name directly
             if not llm_key:
                 raise InvalidLLMConfigError(f"LLM_KEY not set for {llm_key}")
 
+            # Handle OpenRouter models specially
             if llm_key.startswith("openrouter/"):
                 return LLMConfig(
                     llm_key,
@@ -56,15 +57,138 @@ class LLMConfigRegistry:
                     ),
                 )
 
+            # Handle other provider-specific models with appropriate API keys
+            provider_configs = cls._get_provider_config_for_model(llm_key)
+            
             return LLMConfig(
-                llm_key,  # Use the LLM_KEY as the model name
-                ["LLM_API_KEY"],
-                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
-                add_assistant_prefix=settings.LLM_CONFIG_ADD_ASSISTANT_PREFIX,
+                llm_key,  # Use the LLM_KEY directly as the litellm model name
+                provider_configs["required_env_vars"],
+                supports_vision=provider_configs.get("supports_vision", settings.LLM_CONFIG_SUPPORT_VISION),
+                add_assistant_prefix=provider_configs.get("add_assistant_prefix", settings.LLM_CONFIG_ADD_ASSISTANT_PREFIX),
                 max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=provider_configs.get("litellm_params"),
             )
 
         return cls._configs[llm_key]
+
+    @classmethod
+    def _get_provider_config_for_model(cls, model_name: str) -> dict[str, Any]:
+        """
+        Determine provider configuration based on litellm model name patterns.
+        This enables direct use of litellm model names as LLM_KEY values.
+        """
+        # OpenAI models (no prefix or openai/ prefix)
+        if (not "/" in model_name and any(model_name.startswith(prefix) for prefix in ["gpt-", "o1-", "o3-", "o4-"])) or model_name.startswith("openai/"):
+            return {
+                "required_env_vars": ["OPENAI_API_KEY"],
+                "supports_vision": True,
+                "add_assistant_prefix": False,
+            }
+        
+        # Anthropic models
+        elif model_name.startswith("anthropic/"):
+            return {
+                "required_env_vars": ["ANTHROPIC_API_KEY"],
+                "supports_vision": True,
+                "add_assistant_prefix": True,
+            }
+        
+        # Azure models
+        elif model_name.startswith("azure/"):
+            return {
+                "required_env_vars": ["AZURE_API_KEY", "AZURE_API_BASE", "AZURE_API_VERSION"],
+                "supports_vision": True,
+                "add_assistant_prefix": False,
+                "litellm_params": LiteLLMParams(
+                    api_key=settings.AZURE_API_KEY,
+                    api_base=settings.AZURE_API_BASE,
+                    api_version=settings.AZURE_API_VERSION,
+                ),
+            }
+        
+        # AWS Bedrock models
+        elif model_name.startswith("bedrock/"):
+            return {
+                "required_env_vars": ["AWS_REGION"],
+                "supports_vision": True,
+                "add_assistant_prefix": True,
+            }
+        
+        # Google Gemini models
+        elif model_name.startswith("gemini/"):
+            return {
+                "required_env_vars": ["GEMINI_API_KEY"],
+                "supports_vision": True,
+                "add_assistant_prefix": False,
+            }
+        
+        # Vertex AI models
+        elif model_name.startswith("vertex_ai/"):
+            return {
+                "required_env_vars": ["VERTEX_CREDENTIALS"],
+                "supports_vision": True,
+                "add_assistant_prefix": False,
+                "litellm_params": LiteLLMParams(
+                    vertex_credentials=settings.VERTEX_CREDENTIALS,
+                    vertex_location=settings.VERTEX_LOCATION,
+                ),
+            }
+        
+        # Ollama models
+        elif model_name.startswith("ollama/"):
+            return {
+                "required_env_vars": ["OLLAMA_SERVER_URL"],
+                "supports_vision": False,
+                "add_assistant_prefix": False,
+                "litellm_params": LiteLLMParams(
+                    api_base=settings.OLLAMA_SERVER_URL,
+                    api_key=None,
+                ),
+            }
+        
+        # Groq models
+        elif model_name.startswith("groq/"):
+            return {
+                "required_env_vars": ["GROQ_API_KEY"],
+                "supports_vision": False,
+                "add_assistant_prefix": False,
+                "litellm_params": LiteLLMParams(
+                    api_key=settings.GROQ_API_KEY,
+                    api_base=settings.GROQ_API_BASE,
+                ),
+            }
+        
+        # Volcengine models
+        elif model_name.startswith("volcengine/"):
+            return {
+                "required_env_vars": ["VOLCENGINE_API_KEY"],
+                "supports_vision": True,
+                "add_assistant_prefix": False,
+                "litellm_params": LiteLLMParams(
+                    api_key=settings.VOLCENGINE_API_KEY,
+                    api_base=settings.VOLCENGINE_API_BASE,
+                ),
+            }
+        
+        # Moonshot models
+        elif model_name.startswith("moonshot/"):
+            return {
+                "required_env_vars": ["MOONSHOT_API_KEY"],
+                "supports_vision": True,
+                "add_assistant_prefix": False,
+                "litellm_params": LiteLLMParams(
+                    api_key=settings.MOONSHOT_API_KEY,
+                    api_base=settings.MOONSHOT_API_BASE,
+                ),
+            }
+        
+        # Default fallback for unknown models
+        else:
+            return {
+                "required_env_vars": ["LLM_API_KEY"],
+                "supports_vision": settings.LLM_CONFIG_SUPPORT_VISION,
+                "add_assistant_prefix": settings.LLM_CONFIG_ADD_ASSISTANT_PREFIX,
+            }
 
     @classmethod
     def get_model_names(cls) -> list[str]:

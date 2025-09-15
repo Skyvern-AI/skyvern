@@ -486,11 +486,25 @@ Recommended `LLM_KEY`: `OPENROUTER`
 
 Supported LLM Key: `OPENAI_COMPATIBLE`
 
+##### Direct LiteLLM Model Names
+
+Skyvern now supports using litellm model names directly as `LLM_KEY` values. This means you can use any model supported by litellm without needing to register it first. The system will automatically detect the provider and configure appropriate settings.
+
+**Examples:**
+- `LLM_KEY=gpt-4o` (OpenAI)
+- `LLM_KEY=anthropic/claude-3-5-sonnet-latest` (Anthropic)
+- `LLM_KEY=gemini/gemini-2.5-pro` (Google)
+- `LLM_KEY=bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0` (AWS Bedrock)
+- `LLM_KEY=azure/gpt-4o` (Azure OpenAI)
+- `LLM_KEY=ollama/llama3.2` (Ollama)
+
+The system maintains full backward compatibility with existing registered Skyvern keys (e.g., `OPENAI_GPT4O`, `ANTHROPIC_CLAUDE3.5_SONNET`).
+
 ##### General LLM Configuration
 | Variable | Description| Type | Sample Value|
 | -------- | ------- | ------- | ------- |
-| `LLM_KEY` | The name of the model you want to use | String | See supported LLM keys above |
-| `SECONDARY_LLM_KEY` | The name of the model for mini agents skyvern runs with | String | See supported LLM keys above |
+| `LLM_KEY` | The model you want to use. Can be a direct litellm model name or a registered Skyvern key | String | `gpt-4o`, `anthropic/claude-3-5-sonnet-latest`, `OPENAI_GPT4O` |
+| `SECONDARY_LLM_KEY` | The model for mini agents. Can be a direct litellm model name or a registered Skyvern key | String | `gpt-4o-mini`, `ANTHROPIC_CLAUDE3.5_SONNET` |
 | `LLM_CONFIG_MAX_TOKENS` | Override the max tokens used by the LLM | Integer | `128000` |
 
 # Feature Roadmap
