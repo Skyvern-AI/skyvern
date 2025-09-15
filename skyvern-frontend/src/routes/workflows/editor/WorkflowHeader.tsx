@@ -1,6 +1,7 @@
 import {
   ChevronDownIcon,
   ChevronUpIcon,
+  ClockIcon,
   CodeIcon,
   CopyIcon,
   PlayIcon,
@@ -53,6 +54,7 @@ type Props = {
   onCacheKeyValuesClick: () => void;
   onSave: () => void;
   onRun?: () => void;
+  onHistory?: () => void;
 };
 
 function WorkflowHeader({
@@ -72,6 +74,7 @@ function WorkflowHeader({
   onCacheKeyValuesClick,
   onSave,
   onRun,
+  onHistory,
 }: Props) {
   const { title, setTitle } = useWorkflowTitleStore();
   const workflowChangesStore = useWorkflowHasChangesStore();
@@ -278,6 +281,23 @@ function WorkflowHeader({
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Save</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant="tertiary"
+                    className="size-10 min-w-[2.5rem]"
+                    onClick={() => {
+                      onHistory?.();
+                    }}
+                  >
+                    <ClockIcon className="size-6" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>History</TooltipContent>
               </Tooltip>
             </TooltipProvider>
             <Button variant="tertiary" size="lg" onClick={onParametersClick}>
