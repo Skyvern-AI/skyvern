@@ -428,6 +428,7 @@ async def _update_workflow_block(
     label: str | None = None,
     failure_reason: str | None = None,
     output: dict[str, Any] | list | str | None = None,
+    ai_fallback_triggered: bool = False,
 ) -> None:
     """Update the status of a workflow run block."""
     try:
@@ -631,6 +632,13 @@ async def _fallback_to_ai_run(
             step=ai_step,
             task_block=task_block,
         )
+
+        # update workflow run to indicate that there's a script run
+        if workflow_run_id:
+            await app.DATABASE.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                ai_fallback_triggered=True,
+            )
 
         # Update block status to completed if workflow block was created
         if workflow_run_block_id:
@@ -1327,6 +1335,11 @@ async def run_script(
         )
         if not workflow_run:
             raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+        # update workfow run to indicate that there's a script run
+        workflow_run = await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            ai_fallback_triggered=False,
+        )
         context.workflow_run_id = workflow_run_id
         context.organization_id = organization_id
 

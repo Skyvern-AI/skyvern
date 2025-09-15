@@ -1445,6 +1445,7 @@ class WorkflowService:
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,
+            script_run=workflow_run.script_run,
         )
 
     async def clean_up_workflow(
@@ -1554,6 +1555,7 @@ class WorkflowService:
             screenshot_urls=workflow_run_status_response.screenshot_urls,
             failure_reason=workflow_run_status_response.failure_reason,
             app_url=app_url,
+            script_run=workflow_run_status_response.script_run,
             created_at=workflow_run_status_response.created_at,
             modified_at=workflow_run_status_response.modified_at,
             run_request=WorkflowRunRequest(

@@ -283,6 +283,7 @@ class WorkflowRunModel(Base):
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
+    script_run = Column(JSON, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
