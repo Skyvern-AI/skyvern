@@ -53,6 +53,8 @@ function WorkflowRun() {
     workflowPermanentId,
   });
 
+  const hasScript = false;
+
   const {
     data: workflowRun,
     isLoading: workflowRunIsLoading,
@@ -206,6 +208,32 @@ function WorkflowRun() {
       webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
+  const switchBarOptions = [
+    {
+      label: "Overview",
+      to: "overview",
+    },
+    {
+      label: "Output",
+      to: "output",
+    },
+    {
+      label: "Parameters",
+      to: "parameters",
+    },
+    {
+      label: "Recording",
+      to: "recording",
+    },
+  ];
+
+  if (!hasScript) {
+    switchBarOptions.push({
+      label: "Code",
+      to: "code",
+    });
+  }
+
   return (
     <div className="space-y-8">
       {!isEmbedded && (
@@ -352,28 +380,7 @@ function WorkflowRun() {
         </div>
       )}
       {workflowFailureReason}
-      {!isEmbedded && (
-        <SwitchBarNavigation
-          options={[
-            {
-              label: "Overview",
-              to: "overview",
-            },
-            {
-              label: "Output",
-              to: "output",
-            },
-            {
-              label: "Parameters",
-              to: "parameters",
-            },
-            {
-              label: "Recording",
-              to: "recording",
-            },
-          ]}
-        />
-      )}
+      {!isEmbedded && <SwitchBarNavigation options={switchBarOptions} />}
       <div className="flex h-[42rem] gap-6">
         <div className="w-2/3">
           <Outlet />

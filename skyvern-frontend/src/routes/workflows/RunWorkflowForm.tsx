@@ -3,6 +3,12 @@ import { ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Button } from "@/components/ui/button";
 import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
+import {
   Form,
   FormControl,
   FormField,
@@ -311,7 +317,7 @@ function RunWorkflowForm({
 
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
-            <h1 className="text-lg">Advanced Settings</h1>
+            <h1 className="text-lg">Settings</h1>
           </header>
           <FormField
             key="webhookCallbackUrl"
@@ -433,118 +439,136 @@ function RunWorkflowForm({
               );
             }}
           />
-          <FormField
-            key="cdpAddress"
-            control={form.control}
-            name="cdpAddress"
-            render={({ field }) => {
-              return (
-                <FormItem>
-                  <div className="flex gap-16">
-                    <FormLabel>
-                      <div className="w-72">
-                        <div className="flex items-center gap-2 text-lg">
-                          Browser Address
-                        </div>
-                        <h2 className="text-sm text-slate-400">
-                          The address of the Browser server to use for the
-                          workflow run.
-                        </h2>
-                      </div>
-                    </FormLabel>
-                    <div className="w-full space-y-2">
-                      <FormControl>
-                        <Input
-                          {...field}
-                          placeholder="http://127.0.0.1:9222"
-                          value={
-                            field.value === null ? "" : (field.value as string)
-                          }
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </div>
-                  </div>
-                </FormItem>
-              );
-            }}
-          />
-          <FormField
-            key="extraHttpHeaders"
-            control={form.control}
-            name="extraHttpHeaders"
-            render={({ field }) => {
-              return (
-                <FormItem>
-                  <div className="flex gap-16">
-                    <FormLabel>
-                      <div className="w-72">
-                        <div className="flex items-center gap-2 text-lg">
-                          Extra HTTP Headers
-                        </div>
-                        <h2 className="text-sm text-slate-400">
-                          Specify some self defined HTTP requests headers in
-                          Dict format
-                        </h2>
-                      </div>
-                    </FormLabel>
-                    <div className="w-full space-y-2">
-                      <FormControl>
-                        <KeyValueInput
-                          value={field.value ?? ""}
-                          onChange={(val) => field.onChange(val)}
-                          addButtonText="Add Header"
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </div>
-                  </div>
-                </FormItem>
-              );
-            }}
-          />
-          <FormField
-            key="maxScreenshotScrolls"
-            control={form.control}
-            name="maxScreenshotScrolls"
-            render={({ field }) => {
-              return (
-                <FormItem>
-                  <div className="flex gap-16">
-                    <FormLabel>
-                      <div className="w-72">
-                        <div className="flex items-center gap-2 text-lg">
-                          Max Screenshot Scrolls
-                        </div>
-                        <h2 className="text-sm text-slate-400">
-                          {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
-                        </h2>
-                      </div>
-                    </FormLabel>
-                    <div className="w-full space-y-2">
-                      <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
-                          min={0}
-                          value={field.value ?? ""}
-                          placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
-                          onChange={(event) => {
-                            const value =
-                              event.target.value === ""
-                                ? null
-                                : Number(event.target.value);
-                            field.onChange(value);
-                          }}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </div>
-                  </div>
-                </FormItem>
-              );
-            }}
-          />
+        </div>
+
+        <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
+          <Accordion type="single" collapsible>
+            <AccordionItem value="advanced" className="border-b-0">
+              <AccordionTrigger className="py-0">
+                <header>
+                  <h1 className="text-lg">Advanced Settings</h1>
+                </header>
+              </AccordionTrigger>
+              <AccordionContent className="pl-6 pr-1 pt-1">
+                <div className="space-y-8 pt-5">
+                  <FormField
+                    key="cdpAddress"
+                    control={form.control}
+                    name="cdpAddress"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Browser Address
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  The address of the Browser server to use for
+                                  the workflow run.
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder="http://127.0.0.1:9222"
+                                  value={
+                                    field.value === null
+                                      ? ""
+                                      : (field.value as string)
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    key="extraHttpHeaders"
+                    control={form.control}
+                    name="extraHttpHeaders"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Extra HTTP Headers
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  Specify some self defined HTTP requests
+                                  headers in Dict format
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <KeyValueInput
+                                  value={field.value ?? ""}
+                                  onChange={(val) => field.onChange(val)}
+                                  addButtonText="Add Header"
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    key="maxScreenshotScrolls"
+                    control={form.control}
+                    name="maxScreenshotScrolls"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Max Screenshot Scrolls
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="number"
+                                  min={0}
+                                  value={field.value ?? ""}
+                                  placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
+                                  onChange={(event) => {
+                                    const value =
+                                      event.target.value === ""
+                                        ? null
+                                        : Number(event.target.value);
+                                    field.onChange(value);
+                                  }}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
         </div>
         <div className="flex justify-end gap-2">
           <CopyApiCommandDropdown

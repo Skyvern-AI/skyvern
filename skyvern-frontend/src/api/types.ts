@@ -304,6 +304,7 @@ export type WorkflowRunApiResponse = {
   failure_reason: string | null;
   modified_at: string;
   proxy_location: ProxyLocation | null;
+  script_run: boolean | null;
   status: Status;
   title?: string;
   webhook_callback_url: string;
