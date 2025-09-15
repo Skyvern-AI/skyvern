@@ -312,6 +312,7 @@ class Settings(BaseSettings):
     # SkyvernClient Settings
     SKYVERN_BASE_URL: str = "https://api.skyvern.com"
     SKYVERN_API_KEY: str = "PLACEHOLDER"
+    SKYVERN_LLM_NAME: str = "gpt-4o-mini"
 
     SKYVERN_BROWSER_VNC_PORT: int = 6080
     """

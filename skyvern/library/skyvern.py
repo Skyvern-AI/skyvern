@@ -10,6 +10,7 @@ from skyvern.client import AsyncSkyvern
 from skyvern.client.core.pydantic_utilities import parse_obj_as
 from skyvern.client.environment import SkyvernEnvironment
 from skyvern.client.types.get_run_response import GetRunResponse
+from skyvern.client.types.llm import LLM
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.config import settings
@@ -43,6 +44,7 @@ class Skyvern(AsyncSkyvern):
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
+        llm: LLM | None = None,
     ) -> None:
         super().__init__(
             base_url=base_url,
@@ -52,6 +54,7 @@ class Skyvern(AsyncSkyvern):
             timeout=timeout,
             follow_redirects=follow_redirects,
             httpx_client=httpx_client,
+            llm=llm,
         )
         if base_url is None and api_key is None:
             if not os.path.exists(".env"):
@@ -298,7 +301,7 @@ class Skyvern(AsyncSkyvern):
         self,
         prompt: str,
         engine: RunEngine = RunEngine.skyvern_v2,
-        model: dict[str, Any] | None = None,
+        # model: dict[str, Any] | None = None,
         url: str | None = None,
         webhook_url: str | None = None,
         totp_identifier: str | None = None,
@@ -312,7 +315,11 @@ class Skyvern(AsyncSkyvern):
         timeout: float = DEFAULT_AGENT_TIMEOUT,
         browser_session_id: str | None = None,
         user_agent: str | None = None,
+        llm: LLM | None = None,
     ) -> TaskRunResponse:
+        llm = llm or self.llm
+        model = llm.model_dump() if llm else None
+
         if not self._api_key:
             if engine == RunEngine.skyvern_v1 or engine in CUA_ENGINES:
                 data_extraction_goal = None
@@ -403,6 +410,7 @@ class Skyvern(AsyncSkyvern):
             proxy_location=proxy_location,
             max_steps=max_steps,
             user_agent=user_agent,
+            model=model,
         )
 
         if wait_for_completion:

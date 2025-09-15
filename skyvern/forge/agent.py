@@ -974,6 +974,16 @@ class ForgeAgent:
                     using_cached_action_plan = True
                 else:
                     llm_key_override = task.llm_key
+                    LOG.critical(
+                        "LLM_KEY_OVERRIDE", 
+                        llm_key_override=llm_key_override, 
+                        engine=engine, 
+                        task_id=task.task_id, 
+                        step_id=step.step_id,
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        organization_id=task.organization_id, 
+                    )
                     # FIXME: Redundant engine check?
                     if engine in CUA_ENGINES:
                         self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)

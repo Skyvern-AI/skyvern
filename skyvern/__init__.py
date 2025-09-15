@@ -47,8 +47,11 @@ from skyvern.services.script_service import (  # noqa: E402
     wait,  # noqa: E402
 )  # noqa: E402
 
+from skyvern.client.types.llm import LLM
+
 
 __all__ = [
+    "LLM",
     "Skyvern",
     "SkyvernPage",
     "RunContext",

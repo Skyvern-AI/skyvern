@@ -4,6 +4,7 @@ import typing
 from .environment import SkyvernEnvironment
 import httpx
 from .core.client_wrapper import SyncClientWrapper
+from .types.llm import LLM
 from .types.run_engine import RunEngine
 from .types.proxy_location import ProxyLocation
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
@@ -66,6 +67,9 @@ class Skyvern:
     httpx_client : typing.Optional[httpx.Client]
         The httpx client to use for making requests, a preconfigured client is used by default, however this is useful should you want to pass in any custom httpx configuration.
 
+    llm : typing.Optional[LLM]
+        The default LLM to use for runs.
+
     Examples
     --------
     from skyvern import Skyvern
@@ -86,6 +90,7 @@ class Skyvern:
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.Client] = None,
+        llm: typing.Optional[LLM] = None,
     ):
         _defaulted_timeout = timeout if timeout is not None else 60 if httpx_client is None else None
         self._client_wrapper = SyncClientWrapper(
@@ -99,6 +104,8 @@ class Skyvern:
             else httpx.Client(timeout=_defaulted_timeout),
             timeout=_defaulted_timeout,
         )
+
+        self.llm = llm
 
     def run_task(
         self,
@@ -1909,6 +1916,9 @@ class AsyncSkyvern:
     httpx_client : typing.Optional[httpx.AsyncClient]
         The httpx client to use for making requests, a preconfigured client is used by default, however this is useful should you want to pass in any custom httpx configuration.
 
+    llm : typing.Optional[LLM]
+        The LLM to use for running tasks. If not provided, the default LLM is used.
+
     Examples
     --------
     from skyvern import AsyncSkyvern
@@ -1929,6 +1939,7 @@ class AsyncSkyvern:
         timeout: typing.Optional[float] = None,
         follow_redirects: typing.Optional[bool] = True,
         httpx_client: typing.Optional[httpx.AsyncClient] = None,
+        llm: typing.Optional[LLM] = None,
     ):
         _defaulted_timeout = timeout if timeout is not None else 60 if httpx_client is None else None
         self._client_wrapper = AsyncClientWrapper(
@@ -1942,6 +1953,8 @@ class AsyncSkyvern:
             else httpx.AsyncClient(timeout=_defaulted_timeout),
             timeout=_defaulted_timeout,
         )
+
+        self.llm = llm 
 
     async def run_task(
         self,
