@@ -347,7 +347,7 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
             <span>Added ({stats.added})</span>
           </div>
           <div className="flex items-center gap-1">
-            <div className="h-3 w-3 rounded-full bg-orange-500"></div>
+            <div className="h-3 w-3 rounded-full bg-orange-700"></div>
             <span>Removed ({stats.removed})</span>
           </div>
         </div>
