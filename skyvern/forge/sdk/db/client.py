@@ -1672,6 +1672,7 @@ class AgentDB:
         status: WorkflowRunStatus | None = None,
         failure_reason: str | None = None,
         webhook_failure_reason: str | None = None,
+        ai_fallback_triggered: bool | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1690,6 +1691,8 @@ class AgentDB:
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
                     workflow_run.webhook_failure_reason = webhook_failure_reason
+                if ai_fallback_triggered is not None:
+                    workflow_run.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -2936,6 +2939,7 @@ class AgentDB:
         http_request_parameters: dict[str, Any] | None = None,
         http_request_timeout: int | None = None,
         http_request_follow_redirects: bool | None = None,
+        ai_fallback_triggered: bool | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -2993,6 +2997,8 @@ class AgentDB:
                     workflow_run_block.http_request_timeout = http_request_timeout
                 if http_request_follow_redirects is not None:
                     workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
+                if ai_fallback_triggered is not None:
+                    workflow_run_block.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
