@@ -1,5 +1,4 @@
 import {
-  CheckIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   CopyIcon,
@@ -31,26 +30,6 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
-import { OrgWalled } from "@/components/Orgwalled";
-
-function CopyButton({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = () => {
-    if (copied) {
-      return;
-    }
-    window.navigator.clipboard.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-
-  return (
-    <Button size="icon" variant="ghost" onClick={handleCopy}>
-      {copied ? <CheckIcon /> : <CopyIcon />}
-    </Button>
-  );
-}
 
 interface Dom {
   input: React.MutableRefObject<HTMLInputElement | null>;
@@ -146,65 +125,62 @@ function WorkflowHeader({
       <div className="flex h-full items-center justify-end gap-4">
         {user && workflow.generate_script && (
           // (cacheKeyValues?.total_count ?? 0) > 0 && (
-          <OrgWalled className="p-0">
-            <div
-              tabIndex={1}
-              className="flex max-w-[15rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
-            >
-              <Input
-                ref={dom.input}
-                className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
-                onChange={(e) => {
-                  setChosenCacheKeyValue(e.target.value);
-                  onCacheKeyValuesFilter(e.target.value);
-                }}
-                onMouseDown={() => {
-                  if (!cacheKeyValuesPanelOpen) {
-                    onCacheKeyValuesClick();
-                  }
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    const numFiltered = cacheKeyValues?.values?.length ?? 0;
+          <div
+            tabIndex={1}
+            className="flex max-w-[15rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
+          >
+            <Input
+              ref={dom.input}
+              className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
+              onChange={(e) => {
+                setChosenCacheKeyValue(e.target.value);
+                onCacheKeyValuesFilter(e.target.value);
+              }}
+              onMouseDown={() => {
+                if (!cacheKeyValuesPanelOpen) {
+                  onCacheKeyValuesClick();
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const numFiltered = cacheKeyValues?.values?.length ?? 0;
 
-                    if (numFiltered === 1) {
-                      const first = cacheKeyValues?.values?.[0];
-                      if (first) {
-                        setChosenCacheKeyValue(first);
-                        onCacheKeyValueAccept(first);
-                      }
-                      return;
+                  if (numFiltered === 1) {
+                    const first = cacheKeyValues?.values?.[0];
+                    if (first) {
+                      setChosenCacheKeyValue(first);
+                      onCacheKeyValueAccept(first);
                     }
-
-                    setChosenCacheKeyValue(chosenCacheKeyValue);
-                    onCacheKeyValueAccept(chosenCacheKeyValue);
+                    return;
                   }
-                  onCacheKeyValuesKeydown(e);
-                }}
-                placeholder="Script Key Value"
-                value={chosenCacheKeyValue ?? undefined}
-                onBlur={(e) => {
-                  onCacheKeyValuesBlurred(e.target.value);
-                  setChosenCacheKeyValue(e.target.value);
+
+                  setChosenCacheKeyValue(chosenCacheKeyValue);
+                  onCacheKeyValueAccept(chosenCacheKeyValue);
+                }
+                onCacheKeyValuesKeydown(e);
+              }}
+              placeholder="Code Key Value"
+              value={chosenCacheKeyValue ?? undefined}
+              onBlur={(e) => {
+                onCacheKeyValuesBlurred(e.target.value);
+                setChosenCacheKeyValue(e.target.value);
+              }}
+            />
+            {cacheKeyValuesPanelOpen ? (
+              <ChevronUpIcon
+                className="h-6 w-6 cursor-pointer"
+                onClick={onCacheKeyValuesClick}
+              />
+            ) : (
+              <ChevronDownIcon
+                className="h-6 w-6 cursor-pointer"
+                onClick={() => {
+                  dom.input.current?.focus();
+                  onCacheKeyValuesClick();
                 }}
               />
-              {cacheKeyValuesPanelOpen ? (
-                <ChevronUpIcon
-                  className="h-6 w-6 cursor-pointer"
-                  onClick={onCacheKeyValuesClick}
-                />
-              ) : (
-                <ChevronDownIcon
-                  className="h-6 w-6 cursor-pointer"
-                  onClick={() => {
-                    dom.input.current?.focus();
-                    onCacheKeyValuesClick();
-                  }}
-                />
-              )}
-              <CopyButton value={chosenCacheKeyValue ?? ""} />
-            </div>
-          </OrgWalled>
+            )}
+          </div>
         )}
         {isGlobalWorkflow ? (
           <Button
@@ -230,38 +206,36 @@ function WorkflowHeader({
           </Button>
         ) : (
           <>
-            {user && (
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="icon"
-                      variant={debugStore.isDebugMode ? "default" : "tertiary"}
-                      className="size-10 min-w-[2.5rem]"
-                      disabled={workflowRunIsRunningOrQueued}
-                      onClick={() => {
-                        if (debugStore.isDebugMode) {
-                          navigate(`/workflows/${workflowPermanentId}/edit`);
-                        } else {
-                          navigate(`/workflows/${workflowPermanentId}/debug`);
-                        }
-                      }}
-                    >
-                      {debugStore.isDebugMode ? (
-                        <BrowserIcon className="h-6 w-6" />
-                      ) : (
-                        <BrowserIcon className="h-6 w-6" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    {debugStore.isDebugMode
-                      ? "Turn off Browser"
-                      : "Turn on Browser"}
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            )}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant={debugStore.isDebugMode ? "default" : "tertiary"}
+                    className="size-10 min-w-[2.5rem]"
+                    disabled={workflowRunIsRunningOrQueued}
+                    onClick={() => {
+                      if (debugStore.isDebugMode) {
+                        navigate(`/workflows/${workflowPermanentId}/edit`);
+                      } else {
+                        navigate(`/workflows/${workflowPermanentId}/debug`);
+                      }
+                    }}
+                  >
+                    {debugStore.isDebugMode ? (
+                      <BrowserIcon className="h-6 w-6" />
+                    ) : (
+                      <BrowserIcon className="h-6 w-6" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {debugStore.isDebugMode
+                    ? "Turn off Browser"
+                    : "Turn on Browser"}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>

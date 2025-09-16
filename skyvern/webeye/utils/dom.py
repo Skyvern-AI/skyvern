@@ -573,7 +573,7 @@ class SkyvernElement:
 
     async def press_fill(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         for char in text:
-            await self.get_locator().press(char, delay=TEXT_INPUT_DELAY, timeout=timeout)
+            await self.get_locator().type(char, delay=TEXT_INPUT_DELAY, timeout=timeout)
 
     async def input(self, text: str, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if self.get_tag_name().lower() not in COMMON_INPUT_TAGS:

@@ -14,6 +14,12 @@ class OnePasswordConstants(StrEnum):
     TOTP = "OP_TOTP"  # Special value to indicate a TOTP code
 
 
+class AzureVaultConstants(StrEnum):
+    """Constants for Azure Vault integration."""
+
+    TOTP = "AZ_TOTP"  # Special value to indicate a TOTP code
+
+
 def parse_totp_secret(totp_secret: str) -> str:
     if not totp_secret:
         return ""

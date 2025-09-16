@@ -1,7 +1,12 @@
 import { AxiosError } from "axios";
 import { useEffect, useRef, useState } from "react";
 import { nanoid } from "nanoid";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import {
+  ChevronRightIcon,
+  ChevronLeftIcon,
+  GlobeIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useEdgesState, useNodesState, Edge } from "@xyflow/react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -10,15 +15,21 @@ import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
-import { useRanker } from "../hooks/useRanker";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { WorkflowRunStream } from "@/routes/workflows/workflowRun/WorkflowRunStream";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useSidebarStore } from "@/store/SidebarStore";
 
 import { AnimatedWave } from "@/components/AnimatedWave";
 import { Button } from "@/components/ui/button";
+import {
+  BreakoutButton,
+  PowerButton,
+  ReloadButton,
+} from "@/components/FloatingWindow";
+import { Splitter } from "@/components/Splitter";
 import {
   Dialog,
   DialogContent,
@@ -28,20 +39,19 @@ import {
   DialogTitle,
   DialogClose,
 } from "@/components/ui/dialog";
-import { SwitchBar } from "@/components/SwitchBar";
 import { toast } from "@/components/ui/use-toast";
 import { BrowserStream } from "@/components/BrowserStream";
-import { FloatingWindow } from "@/components/FloatingWindow";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
+import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { DebuggerRunOutput } from "@/routes/workflows/debugger/DebuggerRunOutput";
-import { DebuggerPostRunParameters } from "@/routes/workflows/debugger/DebuggerPostRunParameters";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
+
+import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
@@ -59,6 +69,8 @@ import {
   startNode,
 } from "./workflowEditorUtils";
 import { constructCacheKeyValue } from "./utils";
+
+import "./workspace-styles.css";
 
 const Constants = {
   NewBrowserCooldown: 30000,
@@ -85,14 +97,15 @@ function Workspace({
   showBrowser = false,
   workflow,
 }: Props) {
-  const { blockLabel, workflowPermanentId, workflowRunId } = useParams();
+  const { blockLabel, workflowPermanentId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
-  const [content, setContent] = useState("actions");
+  const [timelineMode, setTimelineMode] = useState("wide");
   const [cacheKeyValueFilter, setCacheKeyValueFilter] = useState<string | null>(
     null,
   );
   const [page, setPage] = useState(1);
+  const [nudge, setNudge] = useState(false);
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -102,7 +115,6 @@ function Workspace({
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
   const interactor = workflowRun && isFinalized === false ? "agent" : "human";
-  const browserTitle = interactor === "agent" ? `Browser [🤖]` : `Browser [👤]`;
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -116,36 +128,14 @@ function Workspace({
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
   const [showPowerButton, setShowPowerButton] = useState(true);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [windowResizeTrigger, setWindowResizeTrigger] = useState(0);
+  const [containerResizeTrigger, setContainerResizeTrigger] = useState(0);
+  const [isReloading, setIsReloading] = useState(false);
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const blockScriptStore = useBlockScriptStore();
-  const { rankedItems, promote } = useRanker([
-    "browserWindow",
-    "header",
-    "dropdown",
-    "history",
-    "infiniteCanvas",
-  ]);
-  const [hideControlButtons, setHideControlButtons] = useState(false);
-
-  // ---start fya: https://github.com/frontyardart
-  const hasForLoopNode = nodes.some((node) => node.type === "loop");
-
-  const initialBrowserPosition = {
-    x: hasForLoopNode ? 600 : 520,
-    y: 132,
-  };
-
-  const windowWidth = window.innerWidth;
-  const rightPadding = 567;
-  const initialWidth = Math.max(
-    512,
-    windowWidth - initialBrowserPosition.x - rightPadding,
-  );
-  const initialHeight = (initialWidth / 16) * 9;
-  // ---end fya
-
   const cacheKey = workflow?.cache_key ?? "";
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
@@ -157,18 +147,36 @@ function Workspace({
   );
 
   useEffect(() => {
-    if (cacheKeyValue === "") {
-      setSearchParams((prev) => {
-        const newParams = new URLSearchParams(prev);
-        newParams.delete("cache-key-value");
-        return newParams;
-      });
-    } else {
-      setSearchParams({
-        "cache-key-value": `${cacheKeyValue}`,
-      });
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setTimelineMode("narrow");
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    const currentUrlValue = searchParams.get("cache-key-value");
+    const targetValue = cacheKeyValue === "" ? null : cacheKeyValue;
+
+    if (currentUrlValue !== targetValue) {
+      setSearchParams(
+        (prev) => {
+          const newParams = new URLSearchParams(prev);
+          if (cacheKeyValue === "") {
+            newParams.delete("cache-key-value");
+          } else {
+            newParams.set("cache-key-value", cacheKeyValue);
+          }
+          return newParams;
+        },
+        { replace: true },
+      );
     }
-  }, [cacheKeyValue, setSearchParams]);
+  }, [cacheKeyValue, searchParams, setSearchParams]);
 
   const { data: blockScripts } = useBlockScriptsQuery({
     cacheKey,
@@ -196,10 +204,21 @@ function Workspace({
 
   const workflowChangesStore = useWorkflowHasChangesStore();
 
+  const showBreakoutButton =
+    activeDebugSession && activeDebugSession.browser_session_id;
+
+  const hasLoopBlock = nodes.some((node) => node.type === "loop");
+  const hasHttpBlock = nodes.some((node) => node.type === "http_request");
+  const workflowWidth = hasHttpBlock
+    ? "39rem"
+    : hasLoopBlock
+      ? "34.25rem"
+      : "34rem";
+
   /**
    * Open a new tab (not window) with the browser session URL.
    */
-  const handleOnBreakout = () => {
+  const breakout = () => {
     if (activeDebugSession) {
       const pbsId = activeDebugSession.browser_session_id;
       if (pbsId) {
@@ -208,8 +227,21 @@ function Workspace({
     }
   };
 
-  const handleOnCycle = () => {
+  const cycle = () => {
     setOpenCycleBrowserDialogue(true);
+  };
+
+  const reload = () => {
+    if (isReloading) {
+      return;
+    }
+
+    setReloadKey((prev) => prev + 1);
+    setIsReloading(true);
+
+    setTimeout(() => {
+      setIsReloading(false);
+    }, 1000);
   };
 
   useMountEffect(() => {
@@ -243,6 +275,16 @@ function Workspace({
       document.removeEventListener("keydown", closePanelsWhenEscapeIsPressed);
     };
   });
+
+  // Add window resize listener to trigger NoVNC canvas resize
+  useEffect(() => {
+    const handleResize = () => {
+      setWindowResizeTrigger((prev) => prev + 1);
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(() => {
     blockScriptStore.setScripts(blockScripts ?? {});
@@ -318,7 +360,7 @@ function Workspace({
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete cache key value",
+        title: "Failed to delete code key value",
         description: error.message,
       });
       setToDeleteCacheKeyValue(null);
@@ -453,7 +495,6 @@ function Workspace({
       active: true,
       content: "cacheKeyValues",
     });
-    promote("dropdown");
   }
 
   function toggleCacheKeyValuesPanel() {
@@ -462,7 +503,6 @@ function Workspace({
       workflowPanelState.content === "cacheKeyValues"
     ) {
       closeWorkflowPanel();
-      promote("header");
     } else {
       openCacheKeyValuesPanel();
     }
@@ -470,6 +510,7 @@ function Workspace({
 
   return (
     <div className="relative h-full w-full">
+      {/* cycle browser dialog */}
       <Dialog
         open={openCycleBrowserDialogue}
         onOpenChange={(open) => {
@@ -517,6 +558,7 @@ function Workspace({
         </DialogContent>
       </Dialog>
 
+      {/* cache key value delete dialog */}
       <Dialog
         open={openConfirmCacheKeyValueDeleteDialogue}
         onOpenChange={(open) => {
@@ -528,15 +570,16 @@ function Workspace({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete A Script Key Value</DialogTitle>
+            <DialogTitle>Delete Generated Code</DialogTitle>
             <DialogDescription>
               <div className="w-full pb-2 pt-4 text-sm text-slate-400">
                 {deleteCacheKeyValue.isPending ? (
-                  "Deleting script key value..."
+                  "Deleting generated code..."
                 ) : (
                   <div className="flex w-full flex-col gap-2">
                     <div className="w-full">
-                      Are you sure you want to delete this script key value?
+                      Are you sure you want to delete the generated code for
+                      this code key value?
                     </div>
                     <div
                       className="max-w-[29rem] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-slate-400"
@@ -575,13 +618,7 @@ function Workspace({
       </Dialog>
 
       {/* header panel */}
-      <div
-        className="absolute left-6 right-6 top-8 h-20"
-        style={{ zIndex: rankedItems.header ?? 3 }}
-        onMouseDownCapture={() => {
-          promote("header");
-        }}
-      >
+      <div className="absolute left-6 right-6 top-8 z-40 h-20">
         <WorkflowHeader
           cacheKeyValue={cacheKeyValue}
           cacheKeyValues={cacheKeyValues}
@@ -625,13 +662,11 @@ function Workspace({
               workflowPanelState.content === "parameters"
             ) {
               closeWorkflowPanel();
-              promote("header");
             } else {
               setWorkflowPanelState({
                 active: true,
                 content: "parameters",
               });
-              promote("dropdown");
             }
           }}
           onSave={async () => {
@@ -660,24 +695,83 @@ function Workspace({
           }}
           onRun={() => {
             closeWorkflowPanel();
-            promote("header");
           }}
         />
       </div>
 
-      {/* sub panels */}
-      {workflowPanelState.active && (
+      {/* infinite canvas and sub panels when not in debug mode */}
+      {!showBrowser && (
+        <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
+          {/* infinite canvas */}
+          <FlowRenderer
+            nodes={nodes}
+            edges={edges}
+            setNodes={setNodes}
+            setEdges={setEdges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            initialTitle={initialTitle}
+            workflow={workflow}
+          />
+
+          {/* sub panels */}
+          {workflowPanelState.active && (
+            <div
+              className="absolute right-6 top-[8.5rem] z-30"
+              style={{
+                height:
+                  workflowPanelState.content === "nodeLibrary"
+                    ? "calc(100vh - 14rem)"
+                    : "unset",
+              }}
+            >
+              {workflowPanelState.content === "cacheKeyValues" && (
+                <WorkflowCacheKeyValuesPanel
+                  cacheKeyValues={cacheKeyValues}
+                  pending={cacheKeyValuesLoading}
+                  scriptKey={workflow.cache_key ?? "default"}
+                  onDelete={(cacheKeyValue) => {
+                    setToDeleteCacheKeyValue(cacheKeyValue);
+                    setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                  }}
+                  onPaginate={(page) => {
+                    setPage(page);
+                  }}
+                  onSelect={(cacheKeyValue) => {
+                    setCacheKeyValue(cacheKeyValue);
+                    setCacheKeyValueFilter("");
+                    closeWorkflowPanel();
+                  }}
+                />
+              )}
+              {workflowPanelState.content === "parameters" && (
+                <div className="z-30">
+                  <WorkflowParametersPanel />
+                </div>
+              )}
+              {workflowPanelState.content === "nodeLibrary" && (
+                <div className="z-30 h-full w-[25rem]">
+                  <WorkflowNodeLibraryPanel
+                    onNodeClick={(props) => {
+                      addNode(props);
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* sub panels when in debug mode */}
+      {showBrowser && workflowPanelState.active && (
         <div
-          className="absolute right-6 top-[8.5rem]"
+          className="absolute right-6 top-[8.5rem] z-30"
           style={{
             height:
               workflowPanelState.content === "nodeLibrary"
-                ? "calc(100vh - 9.5rem)"
+                ? "calc(100vh - 14rem)"
                 : "unset",
-            zIndex: rankedItems.dropdown ?? 2,
-          }}
-          onMouseDownCapture={() => {
-            promote("dropdown");
           }}
         >
           {workflowPanelState.content === "cacheKeyValues" && (
@@ -688,9 +782,6 @@ function Workspace({
               onDelete={(cacheKeyValue) => {
                 setToDeleteCacheKeyValue(cacheKeyValue);
                 setOpenConfirmCacheKeyValueDeleteDialogue(true);
-              }}
-              onMouseDownCapture={() => {
-                promote("dropdown");
               }}
               onPaginate={(page) => {
                 setPage(page);
@@ -703,17 +794,10 @@ function Workspace({
             />
           )}
           {workflowPanelState.content === "parameters" && (
-            <WorkflowParametersPanel
-              onMouseDownCapture={() => {
-                promote("dropdown");
-              }}
-            />
+            <WorkflowParametersPanel />
           )}
           {workflowPanelState.content === "nodeLibrary" && (
             <WorkflowNodeLibraryPanel
-              onMouseDownCapture={() => {
-                promote("dropdown");
-              }}
               onNodeClick={(props) => {
                 addNode(props);
               }}
@@ -722,109 +806,198 @@ function Workspace({
         </div>
       )}
 
+      {/* infinite canvas, browser, and timeline when in debug mode */}
       {showBrowser && (
-        <div
-          className="absolute right-6 top-[8.5rem] h-[calc(100vh-9.5rem)]"
-          style={{ zIndex: rankedItems.history ?? 1 }}
-          onMouseDownCapture={() => {
-            closeWorkflowPanel();
-            promote("history");
-          }}
-        >
-          <div className="pointer-events-none absolute right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end bg-slate-900">
-            <div className="pointer-events-auto relative flex h-full w-full flex-col items-start overflow-hidden rounded-xl border border-slate-700">
-              {workflowRunId && (
-                <SwitchBar
-                  className="m-2 border-none"
-                  onChange={(value) => setContent(value)}
-                  value={content}
-                  options={[
+        <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
+          <Splitter
+            className="splittah"
+            classNameLeft="flex items-center justify-center"
+            direction="vertical"
+            split={{ left: workflowWidth }}
+            onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
+          >
+            {/* infinite canvas */}
+            <div className="skyvern-split-left h-full w-full">
+              <FlowRenderer
+                hideBackground={true}
+                hideControls={true}
+                nodes={nodes}
+                edges={edges}
+                setNodes={setNodes}
+                setEdges={setEdges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                initialTitle={initialTitle}
+                workflow={workflow}
+                onContainerResize={containerResizeTrigger}
+              />
+            </div>
+
+            {/* browser & timeline */}
+            <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
+              <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
+                {/* VNC browser */}
+                {!activeDebugSession ||
+                  (activeDebugSession.vnc_streaming_supported && (
+                    <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                      <div key={reloadKey} className="w-full flex-1">
+                        {activeDebugSession &&
+                        activeDebugSession.browser_session_id &&
+                        !cycleBrowser.isPending ? (
+                          <BrowserStream
+                            interactive={interactor === "human"}
+                            browserSessionId={
+                              activeDebugSession.browser_session_id
+                            }
+                            showControlButtons={interactor === "human"}
+                            resizeTrigger={windowResizeTrigger}
+                          />
+                        ) : (
+                          <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
+                            Connecting to your browser...
+                            <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                          </div>
+                        )}
+                      </div>
+                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                        <div className="flex items-center gap-2">
+                          <GlobeIcon /> Live Browser
+                        </div>
+                        {showBreakoutButton && (
+                          <BreakoutButton onClick={() => breakout()} />
+                        )}
+                        <div
+                          className={cn("ml-auto flex items-center gap-2", {
+                            "mr-16": !blockLabel,
+                          })}
+                        >
+                          {showPowerButton && (
+                            <PowerButton onClick={() => cycle()} />
+                          )}
+                          <ReloadButton
+                            isReloading={isReloading}
+                            onClick={() => reload()}
+                          />
+                        </div>
+                      </footer>
+                    </div>
+                  ))}
+
+                {/* Screenshot browser} */}
+                {activeDebugSession &&
+                  !activeDebugSession.vnc_streaming_supported && (
+                    <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                      <div className="aspect-video w-full">
+                        <WorkflowRunStream alwaysShowStream={true} />
+                      </div>
+                    </div>
+                  )}
+
+                {/* timeline */}
+                <div
+                  className={cn(
+                    "z-20 h-full w-[5rem] overflow-visible",
                     {
-                      label: "Actions",
-                      value: "actions",
+                      "skyvern-animate-nudge": nudge,
                     },
                     {
-                      label: "Inputs",
-                      value: "inputs",
+                      "pointer-events-none hidden w-[0px] overflow-hidden":
+                        !blockLabel,
                     },
-                    {
-                      label: "Outputs",
-                      value: "outputs",
-                    },
-                  ]}
-                />
-              )}
-              <div className="h-full w-full overflow-hidden overflow-y-auto">
-                {(!workflowRunId || content === "actions") && <DebuggerRun />}
-                {workflowRunId && content === "inputs" && (
-                  <DebuggerPostRunParameters />
-                )}
-                {workflowRunId && content === "outputs" && (
-                  <DebuggerRunOutput />
-                )}
+                  )}
+                  onMouseEnter={() => {
+                    if (timelineMode === "narrow") {
+                      return;
+                    }
+
+                    setNudge(true);
+                  }}
+                  onMouseLeave={() => {
+                    if (timelineMode === "narrow") {
+                      return;
+                    }
+
+                    setNudge(false);
+                  }}
+                >
+                  <div
+                    className={cn(
+                      "group relative h-full w-[25rem] translate-x-[-20.5rem] bg-[#020617] transition-all",
+                      {
+                        "translate-x-[0rem]": timelineMode === "narrow",
+                        group: timelineMode === "narrow",
+                      },
+                    )}
+                    onClick={() => {
+                      if (timelineMode === "narrow") {
+                        setTimelineMode("wide");
+                      }
+                    }}
+                  >
+                    {/* timeline wide */}
+                    <div
+                      className={cn(
+                        "pointer-events-none absolute left-[0.5rem] right-0 top-0 flex h-full w-[400px] flex-col items-end justify-end opacity-0 transition-all duration-1000",
+                        {
+                          "opacity-100": timelineMode === "wide",
+                        },
+                      )}
+                    >
+                      <div
+                        className={cn(
+                          "pointer-events-none relative flex h-full w-full flex-col items-start overflow-hidden bg-[#020617]",
+                          { "pointer-events-auto": timelineMode === "wide" },
+                        )}
+                      >
+                        <DebuggerRun />
+                      </div>
+                    </div>
+
+                    {/* divider */}
+                    <div className="vertical-line-gradient absolute left-0 top-0 h-full w-[2px]"></div>
+
+                    {/* slide nudge ghost */}
+                    <div
+                      className={cn(
+                        "slide-nudge-ghost vertical-line-gradient absolute left-0 top-0 h-full w-[2rem] opacity-0 transition-opacity",
+                        {
+                          "skyvern-animate-ghost": nudge,
+                        },
+                      )}
+                    />
+
+                    {/* slide indicator */}
+                    <div
+                      className="absolute left-0 top-0 z-20 flex h-full items-center justify-center p-1 opacity-30 transition-opacity hover:opacity-100 group-hover:opacity-100"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTimelineMode(
+                          timelineMode === "wide" ? "narrow" : "wide",
+                        );
+                      }}
+                    >
+                      {timelineMode === "narrow" && <ChevronLeftIcon />}
+                      {timelineMode === "wide" && <ChevronRightIcon />}
+                    </div>
+
+                    {/* timeline narrow */}
+                    <div
+                      className={cn(
+                        "delay-[300ms] pointer-events-none absolute left-0 top-0 h-full w-[6rem] rounded-l-lg opacity-0 transition-all duration-1000",
+                        {
+                          "pointer-events-auto opacity-100":
+                            timelineMode === "narrow",
+                        },
+                      )}
+                    >
+                      <DebuggerRunMinimal />
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
+          </Splitter>
         </div>
-      )}
-
-      {/* infinite canvas */}
-      <FlowRenderer
-        nodes={nodes}
-        edges={edges}
-        setNodes={setNodes}
-        setEdges={setEdges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        initialTitle={initialTitle}
-        workflow={workflow}
-        onMouseDownCapture={() => promote("infiniteCanvas")}
-        zIndex={rankedItems.infiniteCanvas}
-      />
-
-      {/* browser */}
-      {showBrowser && (
-        <FloatingWindow
-          title={browserTitle}
-          bounded={false}
-          initialPosition={initialBrowserPosition}
-          initialWidth={initialWidth}
-          initialHeight={initialHeight}
-          showBreakoutButton={activeDebugSession !== null}
-          showMaximizeButton={true}
-          showMinimizeButton={true}
-          showPowerButton={blockLabel === undefined && showPowerButton}
-          showReloadButton={true}
-          zIndex={rankedItems.browserWindow ?? 4}
-          // --
-          onBreakout={handleOnBreakout}
-          onCycle={handleOnCycle}
-          onFocus={() => promote("browserWindow")}
-          onMinimize={() => {
-            setHideControlButtons(true);
-          }}
-          onMaximize={() => {
-            setHideControlButtons(false);
-          }}
-          onRestore={() => {
-            setHideControlButtons(false);
-          }}
-        >
-          {activeDebugSession &&
-          activeDebugSession.browser_session_id &&
-          !cycleBrowser.isPending ? (
-            <BrowserStream
-              interactive={false}
-              browserSessionId={activeDebugSession.browser_session_id}
-              showControlButtons={!hideControlButtons}
-            />
-          ) : (
-            <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
-              Connecting to your browser...
-              <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
-            </div>
-          )}
-        </FloatingWindow>
       )}
     </div>
   );

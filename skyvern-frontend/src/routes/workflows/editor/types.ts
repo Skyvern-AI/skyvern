@@ -24,6 +24,16 @@ export type OnePasswordCredential = {
   itemId: string;
 };
 
+export type AzureVaultCredential = {
+  key: string;
+  description?: string | null;
+  parameterType: "credential";
+  vaultName: string;
+  usernameKey: string;
+  passwordKey: string;
+  totpSecretKey: string | null;
+};
+
 export function parameterIsBitwardenCredential(
   parameter: CredentialParameterState,
 ): parameter is BitwardenLoginCredential {
@@ -42,10 +52,21 @@ export function parameterIsOnePasswordCredential(
   return "vaultId" in parameter && "itemId" in parameter;
 }
 
+export function parameterIsAzureVaultCredential(
+  parameter: CredentialParameterState,
+): parameter is AzureVaultCredential {
+  return (
+    "vaultName" in parameter &&
+    "usernameKey" in parameter &&
+    "passwordKey" in parameter
+  );
+}
+
 export type CredentialParameterState =
   | BitwardenLoginCredential
   | SkyvernCredential
-  | OnePasswordCredential;
+  | OnePasswordCredential
+  | AzureVaultCredential;
 
 export type ParametersState = Array<
   | {

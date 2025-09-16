@@ -88,13 +88,21 @@ async def _authenticate_helper(authorization: str) -> Organization:
 
 async def get_current_user_id(
     authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> str:
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid credentials",
-        )
-    return await _authenticate_user_helper(authorization)
+    if authorization:
+        return await _authenticate_user_helper(authorization)
+
+    if x_api_key and x_user_agent == "skyvern-ui":
+        organization = await _get_current_org_cached(x_api_key, app.DATABASE)
+        if organization:
+            return f"{organization.organization_id}_user"
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Invalid credentials",
+    )
 
 
 async def get_current_user_id_with_authentication(

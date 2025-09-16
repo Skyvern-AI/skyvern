@@ -102,14 +102,14 @@ async def _current_viewpoint_screenshot_helper(
 
 
 async def _scrolling_screenshots_helper(
-    skyvern_page: SkyvernFrame,
+    page: Page,
     url: str | None = None,
     draw_boxes: bool = False,
     max_number: int = SettingsManager.get_settings().MAX_NUM_SCREENSHOTS,
     mode: ScreenshotMode = ScreenshotMode.DETAILED,
 ) -> tuple[list[bytes], list[int]]:
     # page is the main frame and the index must be 0
-    assert isinstance(skyvern_page.frame, Page)
+    skyvern_page = await SkyvernFrame.create_instance(frame=page)
     frame = "main.frame"
     frame_index = 0
 
@@ -139,7 +139,7 @@ async def _scrolling_screenshots_helper(
                 await skyvern_page.build_tree_from_body(frame_name=frame, frame_index=frame_index)
                 initial_scroll_height = scroll_height
 
-            screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame, mode=mode)
+            screenshot = await _current_viewpoint_screenshot_helper(page=page, mode=mode)
             screenshots.append(screenshot)
             positions.append(int(scroll_y_px))
             scroll_y_px_old = scroll_y_px
@@ -167,7 +167,7 @@ async def _scrolling_screenshots_helper(
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
 
         LOG.debug("Page is not scrollable", url=url, num_screenshots=len(screenshots))
-        screenshot = await _current_viewpoint_screenshot_helper(page=skyvern_page.frame, mode=mode)
+        screenshot = await _current_viewpoint_screenshot_helper(page=page, mode=mode)
         screenshots.append(screenshot)
         positions.append(0)
 
@@ -270,7 +270,7 @@ class SkyvernFrame:
             x, y = await skyvern_frame.get_scroll_x_y()
             async with asyncio.timeout(timeout):
                 screenshots, positions = await _scrolling_screenshots_helper(
-                    skyvern_page=skyvern_frame, mode=mode, max_number=scrolling_number
+                    page=page, mode=mode, max_number=scrolling_number
                 )
                 images = []
 
@@ -310,7 +310,7 @@ class SkyvernFrame:
             )
         finally:
             if x is not None and y is not None:
-                await skyvern_frame.scroll_to_x_y(x, y)
+                await skyvern_frame.safe_scroll_to_x_y(x, y)
 
     @staticmethod
     @TraceManager.traced_async(ignore_inputs=["page"])
@@ -324,9 +324,8 @@ class SkyvernFrame:
         if not scroll:
             return [await _current_viewpoint_screenshot_helper(page=page, mode=ScreenshotMode.DETAILED)]
 
-        skyvern_frame = await SkyvernFrame.create_instance(frame=page)
         screenshots, _ = await _scrolling_screenshots_helper(
-            skyvern_page=skyvern_frame,
+            page=page,
             url=url,
             max_number=max_number,
             draw_boxes=draw_boxes,
@@ -365,6 +364,12 @@ class SkyvernFrame:
     async def scroll_to_x_y(self, x: int, y: int) -> None:
         js_script = "([x, y]) => scrollToXY(x, y)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[x, y])
+
+    async def safe_scroll_to_x_y(self, x: int, y: int) -> None:
+        try:
+            await self.scroll_to_x_y(x, y)
+        except Exception:
+            LOG.warning("Failed to scroll to x, y, ignore it", x=x, y=y, exc_info=True)
 
     async def scroll_to_element_bottom(self, element: ElementHandle, page_by_page: bool = False) -> None:
         js_script = "([element, page_by_page]) => scrollToElementBottom(element, page_by_page)"
@@ -523,7 +528,7 @@ class SkyvernFrame:
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
             await self.wait_for_animation_end(timeout_ms=timeout_ms)
         except Exception:
-            LOG.info("Failed to wait for animation end, but ignore it", exc_info=True)
+            LOG.debug("Failed to wait for animation end, but ignore it", exc_info=True)
             return
 
     async def wait_for_animation_end(self, timeout_ms: float = 3000) -> None:

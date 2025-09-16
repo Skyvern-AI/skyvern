@@ -2,6 +2,13 @@ import { getClient } from "@/api/AxiosClient";
 import { Handle, Node, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { StartNode } from "./types";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
+import {
   Accordion,
   AccordionContent,
   AccordionItem,
@@ -23,9 +30,7 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
-import { OrgWalled } from "@/components/Orgwalled";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
-import { NodeActionMenu } from "@/routes/workflows/editor/nodes/NodeActionMenu";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import {
@@ -37,6 +42,7 @@ import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { cn } from "@/util/utils";
+import { LightningBoltIcon } from "@radix-ui/react-icons";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
@@ -76,6 +82,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
     useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
+    aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
   });
 
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -153,19 +160,21 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
             )}
           >
             <div className="relative">
-              <div className="absolute right-0 top-0">
+              <div className="absolute right-[-0.5rem] top-[-0.25rem]">
                 <div>
-                  <div className="rounded p-1 hover:bg-muted">
-                    <NodeActionMenu
-                      isDeletable={false}
-                      isScriptable={true}
-                      showScriptText="Show All Scripts"
-                      onShowScript={showAllScripts}
-                    />
-                  </div>
+                  <Button variant="link" size="icon" onClick={showAllScripts}>
+                    <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                        </TooltipTrigger>
+                        <TooltipContent>Show all code</TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </Button>
                 </div>
               </div>
-              <header className="mb-4">Start</header>
+              <header className="mb-6 mt-2">Start</header>
               <Separator />
               <Accordion
                 type="single"
@@ -215,11 +224,12 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
-                      <OrgWalled className="flex flex-col gap-4">
+
+                      <div className="flex flex-col gap-4">
                         <div className="space-y-2">
                           <div className="flex items-center gap-2">
-                            <Label>Generate Script</Label>
-                            <HelpTooltip content="Generate & use cached scripts for faster execution." />
+                            <Label>Generate Code</Label>
+                            <HelpTooltip content="Generate & use cached code for faster execution." />
                             <Switch
                               className="ml-auto"
                               checked={inputs.useScriptCache}
@@ -230,23 +240,41 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           </div>
                         </div>
                         {inputs.useScriptCache && (
-                          <div className="space-y-2">
-                            <div className="flex gap-2">
-                              <Label>Script Key (optional)</Label>
+                          <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
+                            <div className="space-y-2">
+                              <div className="flex gap-2">
+                                <Label>Code Key (optional)</Label>
+                                <HelpTooltip content="A static or dynamic key for directing code generation." />
+                              </div>
+                              <WorkflowBlockInputTextarea
+                                nodeId={id}
+                                onChange={(value) => {
+                                  const v = value.length ? value : null;
+                                  handleChange("scriptCacheKey", v);
+                                }}
+                                value={inputs.scriptCacheKey ?? ""}
+                                placeholder={
+                                  placeholders["scripts"]["scriptKey"]
+                                }
+                                className="nopan text-xs"
+                              />
                             </div>
-                            <WorkflowBlockInputTextarea
-                              nodeId={id}
-                              onChange={(value) => {
-                                const v = value.length ? value : null;
-                                handleChange("scriptCacheKey", v);
-                              }}
-                              value={inputs.scriptCacheKey ?? ""}
-                              placeholder={placeholders["scripts"]["scriptKey"]}
-                              className="nopan text-xs"
-                            />
+                            <div className="space-y-2">
+                              <div className="flex items-center gap-2">
+                                <Label>Fallback To AI On Failure</Label>
+                                <HelpTooltip content="If cached code fails, fallback to AI." />
+                                <Switch
+                                  className="ml-auto"
+                                  checked={inputs.aiFallback}
+                                  onCheckedChange={(value) => {
+                                    handleChange("aiFallback", value);
+                                  }}
+                                />
+                              </div>
+                            </div>
                           </div>
                         )}
-                      </OrgWalled>
+                      </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
                           <Label>Save &amp; Reuse Session</Label>

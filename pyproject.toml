@@ -83,6 +83,7 @@ openpyxl = "^3.1.5"
 pandas = "^2.3.1"
 azure-identity = "^1.24.0"
 azure-keyvault = "^4.2.0"
+dramatiq = {version = "^1.18.0", extras = ["asyncio"]}
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"

@@ -18,7 +18,15 @@ Reply in JSON format with the following keys:
             "label": str, // the label of the option if any. MAKE SURE YOU USE THIS LABEL TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION LABEL HERE
             "index": int, // the index corresponding to the option index under the select element.
             "value": str // the value of the option. MAKE SURE YOU USE THIS VALUE TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION VALUE HERE
-        },
+        }{% if parse_select_feature_enabled %},
+        "context": { // Extract the following detailed information from the "reasoning", and double-check the information by analysing the HTML elements.
+            "thought": str, // A string to describe how you double-check the context information to ensure the accuracy.
+            "field": str, // Which field is this action intended to fill out?
+            "is_required": bool, // True if this is a required field, otherwise false.
+            "is_search_bar": bool, // True if the element to take the action is a search bar, otherwise false.
+            "is_location_input": bool, // True if the element is asking user to input where he lives, otherwise false. For example, it is asking for location, or address, or other similar information. Output False if it only requires ZIP code or postal code.
+            "is_date_related": bool, // True if the field is related to date input or select, otherwise false.
+        }{% endif %}
     }]
 }
 

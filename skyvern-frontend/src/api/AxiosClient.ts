@@ -13,6 +13,7 @@ const client = axios.create({
   baseURL: apiV1BaseUrl,
   headers: {
     "Content-Type": "application/json",
+    "x-user-agent": "skyvern-ui",
     "x-api-key": envCredential,
   },
 });
@@ -21,6 +22,7 @@ const v2Client = axios.create({
   baseURL: apiV2BaseUrl,
   headers: {
     "Content-Type": "application/json",
+    "x-user-agent": "skyvern-ui",
     "x-api-key": envCredential,
   },
 });
@@ -29,6 +31,7 @@ const clientSansApiV1 = axios.create({
   baseURL: apiSansApiV1BaseUrl,
   headers: {
     "Content-Type": "application/json",
+    "x-user-agent": "skyvern-ui",
     "x-api-key": envCredential,
   },
 });

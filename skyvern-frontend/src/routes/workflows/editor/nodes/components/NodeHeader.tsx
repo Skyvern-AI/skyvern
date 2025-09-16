@@ -1,15 +1,17 @@
 import { AxiosError } from "axios";
 import { ReloadIcon, PlayIcon, StopIcon } from "@radix-ui/react-icons";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
-import { ProxyLocation } from "@/api/types";
+import { ProxyLocation, Status } from "@/api/types";
 import { Timer } from "@/components/Timer";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useOnChange } from "@/hooks/useOnChange";
+import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
@@ -23,6 +25,7 @@ import {
   type WorkflowApiResponse,
 } from "@/routes/workflows/types/workflowTypes";
 import { getInitialValues } from "@/routes/workflows/utils";
+import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
@@ -54,6 +57,7 @@ interface Props {
 
 type Payload = Record<string, unknown> & {
   block_labels: string[];
+  block_outputs: Record<string, unknown>;
   browser_session_id: string | null;
   extra_http_headers: Record<string, string> | null;
   max_screenshot_scrolls: number | null;
@@ -67,6 +71,7 @@ type Payload = Record<string, unknown> & {
 
 const getPayload = (opts: {
   blockLabel: string;
+  blockOutputs: Record<string, unknown>;
   browserSessionId: string | null;
   parameters: Record<string, unknown>;
   totpIdentifier: string | null;
@@ -109,6 +114,7 @@ const getPayload = (opts: {
 
   const payload: Payload = {
     block_labels: [opts.blockLabel],
+    block_outputs: opts.blockOutputs,
     browser_session_id: opts.browserSessionId,
     extra_http_headers: extraHttpHeaders,
     max_screenshot_scrolls: opts.workflowSettings.maxScreenshotScrollingTimes,
@@ -138,6 +144,7 @@ function NodeHeader({
     workflowPermanentId,
     workflowRunId,
   } = useParams();
+  const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
@@ -177,6 +184,48 @@ function NodeHeader({
         3500
       : null;
 
+  const [workflowRunStatus, setWorkflowRunStatus] = useState(
+    workflowRun?.status,
+  );
+  const { getAutoplay, setAutoplay } = useAutoplayStore();
+
+  useEffect(() => {
+    if (!debugSession) {
+      return;
+    }
+
+    const details = getAutoplay();
+
+    if (
+      workflowPermanentId === details.wpid &&
+      blockLabel === details.blockLabel
+    ) {
+      setAutoplay(null, null);
+      setTimeout(() => {
+        runBlock.mutateAsync();
+      }, 100);
+    }
+
+    // on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debugSession]);
+
+  useEffect(() => {
+    setWorkflowRunStatus(workflowRun?.status);
+  }, [workflowRun, setWorkflowRunStatus]);
+
+  useOnChange(workflowRunStatus, (newValue, oldValue) => {
+    if (!thisBlockIsTargetted) {
+      return;
+    }
+
+    if (newValue !== oldValue && oldValue && newValue === Status.Completed) {
+      queryClient.invalidateQueries({
+        queryKey: ["block-outputs", workflowPermanentId],
+      });
+    }
+  });
+
   useEffect(() => {
     if (!workflowRun || !workflowPermanentId || !workflowRunId) {
       return;
@@ -202,6 +251,7 @@ function NodeHeader({
       }
     }
   }, [
+    queryClient,
     urlBlockLabel,
     navigate,
     workflowPermanentId,
@@ -226,6 +276,10 @@ function NodeHeader({
       }
 
       if (!debugSession) {
+        // TODO: kind of redundant; investigate if this is necessary; either
+        // Sentry's log should output to the console, or Sentry should just
+        // gather native console.error output.
+        console.error("Run block: there is no debug session, yet");
         log.error("Run block: there is no debug session, yet");
         toast({
           variant: "destructive",
@@ -256,6 +310,8 @@ function NodeHeader({
 
       const body = getPayload({
         blockLabel,
+        blockOutputs:
+          blockOutputsStore.getOutputsWithOverrides(workflowPermanentId),
         browserSessionId: debugSession.browser_session_id,
         parameters,
         totpIdentifier,
@@ -463,8 +519,10 @@ function NodeHeader({
               ) : (
                 <PlayIcon
                   className={cn("size-6", {
-                    "fill-gray-500 text-gray-500":
-                      workflowRunIsRunningOrQueued || !workflowPermanentId,
+                    "pointer-events-none fill-gray-500 text-gray-500":
+                      workflowRunIsRunningOrQueued ||
+                      !workflowPermanentId ||
+                      debugSession === undefined,
                   })}
                   onClick={() => {
                     handleOnPlay();

@@ -20,6 +20,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.schemas.run_blocks import CredentialType, LoginRequest
 from skyvern.schemas.runs import ProxyLocation, RunType, WorkflowRunRequest, WorkflowRunResponse
 from skyvern.schemas.workflows import (
+    AzureVaultCredentialParameterYAML,
     BitwardenLoginCredentialParameterYAML,
     LoginBlockYAML,
     OnePasswordCredentialParameterYAML,
@@ -63,7 +64,7 @@ If login is completed, you're successful."""
             }
         ],
     },
-    description="Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password",
+    description="Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault",
     summary="Login Task",
 )
 async def login(
@@ -128,6 +129,28 @@ async def login(
                 key=parameter_key,
                 vault_id=login_request.onepassword_vault_id,
                 item_id=login_request.onepassword_item_id,
+            )
+        ]
+    elif login_request.credential_type == CredentialType.azure_vault:
+        if not login_request.azure_vault_name:
+            raise HTTPException(
+                status_code=400, detail="azure_vault_name is required to login with Azure Vault credential"
+            )
+        if not login_request.azure_vault_username_key:
+            raise HTTPException(
+                status_code=400, detail="azure_vault_username_key is required to login with Azure Vault credential"
+            )
+        if not login_request.azure_vault_password_key:
+            raise HTTPException(
+                status_code=400, detail="azure_vault_password_key is required to login with Azure Vault credential"
+            )
+        yaml_parameters = [
+            AzureVaultCredentialParameterYAML(
+                key=parameter_key,
+                vault_name=login_request.azure_vault_name,
+                username_key=login_request.azure_vault_username_key,
+                password_key=login_request.azure_vault_password_key,
+                totp_secret_key=login_request.azure_vault_totp_secret_key,
             )
         ]
 
