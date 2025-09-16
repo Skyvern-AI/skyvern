@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 
 import typer
@@ -37,4 +38,5 @@ async def start_services(server_only: bool = False) -> None:
 
     except Exception as e:
         console.print(f"[bold red]Error starting services: {str(e)}[/bold red]")
+        logging.error("Startup failed", exc_info=True)
         raise typer.Exit(1)
