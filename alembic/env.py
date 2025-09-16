@@ -1,7 +1,7 @@
 import asyncio
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -97,4 +97,9 @@ else:
     else:
         # Already running loop -> schedule task and await it
         print("Alembic: schedule task")
-        loop.create_task(async_main())
+        import concurrent.futures
+
+        # Use a ThreadPoolExecutor to run the async function in a new thread
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, async_main())
+            future.result()  # This blocks until completion

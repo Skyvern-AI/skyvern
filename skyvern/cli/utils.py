@@ -1,6 +1,7 @@
 import asyncio
-import sys
 import logging
+import sys
+
 import typer
 
 from skyvern.cli.console import console
