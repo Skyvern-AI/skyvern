@@ -297,7 +297,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                           onChange={(value) => {
                             handleChange("errorCodeMapping", value);
                           }}
-                          className="nowheel nopan"
+                          className="nopan"
                           fontSize={8}
                         />
                       </div>

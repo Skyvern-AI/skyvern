@@ -56,7 +56,7 @@ function useCacheKeyValuesQuery({
 
       return result;
     },
-    enabled: !!workflowPermanentId,
+    enabled: !!workflowPermanentId && !!cacheKey && cacheKey.length > 0,
     placeholderData: keepPreviousData,
     staleTime: 5 * 60 * 1000,
   });

@@ -372,6 +372,16 @@ class BlockRunRequest(WorkflowRunRequest):
         description="Labels of the blocks to execute",
         examples=["block_1", "block_2"],
     )
+    block_outputs: dict[str, Any] | None = Field(
+        default=None,
+        # NOTE(jdo): this is either the last output of the block for a given
+        # org_id/user_id, or an override supplied by the user
+        description="Any active outputs of blocks in a workflow being debugged",
+    )
+
+
+class ScriptRunResponse(BaseModel):
+    ai_fallback_triggered: bool = False
 
 
 class BaseRunResponse(BaseModel):
@@ -412,6 +422,10 @@ class BaseRunResponse(BaseModel):
     max_screenshot_scrolls: int | None = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot",
+    )
+    script_run: ScriptRunResponse | None = Field(
+        default=None,
+        description="The script run result",
     )
 
 

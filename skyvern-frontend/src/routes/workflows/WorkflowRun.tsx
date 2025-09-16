@@ -53,6 +53,8 @@ function WorkflowRun() {
     workflowPermanentId,
   });
 
+  const hasScript = false;
+
   const {
     data: workflowRun,
     isLoading: workflowRunIsLoading,
@@ -117,6 +119,26 @@ function WorkflowRun() {
     </h1>
   );
 
+  const failureTips: { match: (reason: string) => boolean; tip: string }[] = [
+    {
+      match: (reason) => reason.includes("Invalid master password"),
+      tip: "Tip: If inputting the master password via Docker Compose or in any container environment, make sure to double any dollar signs and do not surround it with quotes.",
+    },
+    // Add more tips as needed
+  ];
+
+  const failureReason = workflowRun?.failure_reason;
+
+  const matchedTips = failureReason
+    ? failureTips
+        .filter(({ match }) => match(failureReason))
+        .map(({ tip }, index) => (
+          <div key={index} className="text-sm italic text-red-700">
+            {tip}
+          </div>
+        ))
+    : null;
+
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div
       className="space-y-2 rounded-md border border-red-600 p-4"
@@ -126,6 +148,7 @@ function WorkflowRun() {
     >
       <div className="font-bold">Workflow Failure Reason</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
+      {matchedTips}
     </div>
   ) : null;
 
@@ -184,6 +207,32 @@ function WorkflowRun() {
       hasTaskv2Output ||
       webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
+
+  const switchBarOptions = [
+    {
+      label: "Overview",
+      to: "overview",
+    },
+    {
+      label: "Output",
+      to: "output",
+    },
+    {
+      label: "Parameters",
+      to: "parameters",
+    },
+    {
+      label: "Recording",
+      to: "recording",
+    },
+  ];
+
+  if (!hasScript) {
+    switchBarOptions.push({
+      label: "Code",
+      to: "code",
+    });
+  }
 
   return (
     <div className="space-y-8">
@@ -331,28 +380,7 @@ function WorkflowRun() {
         </div>
       )}
       {workflowFailureReason}
-      {!isEmbedded && (
-        <SwitchBarNavigation
-          options={[
-            {
-              label: "Overview",
-              to: "overview",
-            },
-            {
-              label: "Output",
-              to: "output",
-            },
-            {
-              label: "Parameters",
-              to: "parameters",
-            },
-            {
-              label: "Recording",
-              to: "recording",
-            },
-          ]}
-        />
-      )}
+      {!isEmbedded && <SwitchBarNavigation options={switchBarOptions} />}
       <div className="flex h-[42rem] gap-6">
         <div className="w-2/3">
           <Outlet />

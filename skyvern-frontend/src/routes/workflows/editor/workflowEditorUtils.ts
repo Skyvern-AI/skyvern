@@ -149,7 +149,7 @@ export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
 export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
   const maxNesting = maxNestingLevel(nodes);
   const nestingLevel = getNestingLevel(node, nodes);
-  return 600 + (maxNesting - nestingLevel) * 50;
+  return 450 + (maxNesting - nestingLevel) * 50;
 }
 
 function maxNestingLevel(nodes: Array<AppNode>): number {
@@ -705,6 +705,7 @@ function getElements(
       editable,
       useScriptCache: settings.useScriptCache,
       scriptCacheKey: settings.scriptCacheKey,
+      aiFallback: settings.aiFallback ?? true,
       label: "__start_block__",
       showCode: false,
     }),
@@ -1416,6 +1417,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     extraHttpHeaders: null,
     useScriptCache: false,
     scriptCacheKey: null,
+    aiFallback: true,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1435,6 +1437,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       extraHttpHeaders: data.extraHttpHeaders,
       useScriptCache: data.useScriptCache,
       scriptCacheKey: data.scriptCacheKey,
+      aiFallback: data.aiFallback,
     };
   }
   return defaultSettings;
@@ -1800,6 +1803,16 @@ function convertParametersToParameterYAML(
             parameter_type: WorkflowParameterTypes.OnePassword,
             vault_id: parameter.vault_id,
             item_id: parameter.item_id,
+          };
+        }
+        case WorkflowParameterTypes.Azure_Vault_Credential: {
+          return {
+            ...base,
+            parameter_type: WorkflowParameterTypes.Azure_Vault_Credential,
+            vault_name: parameter.vault_name,
+            username_key: parameter.username_key,
+            password_key: parameter.password_key,
+            totp_secret_key: parameter.totp_secret_key,
           };
         }
       }

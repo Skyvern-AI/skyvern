@@ -40,12 +40,14 @@ class AsyncAWSClient:
         aws_secret_access_key: str | None = None,
         region_name: str | None = None,
         endpoint_url: str | None = None,
+        profile_name: str | None = None,
     ) -> None:
         self.region_name = region_name or settings.AWS_REGION
         self._endpoint_url = endpoint_url
         self.session = aioboto3.Session(
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
+            profile_name=profile_name,
         )
 
     def _ecs_client(self) -> ECSClient:
@@ -203,6 +205,16 @@ class AsyncAWSClient:
                 LOG.exception("S3 download failed", uri=uri)
             return None
 
+    async def delete_file(self, uri: str, log_exception: bool = True) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
+        try:
+            async with self._s3_client() as client:
+                parsed_uri = S3Uri(uri)
+                await client.delete_object(Bucket=parsed_uri.bucket, Key=parsed_uri.key)
+        except Exception:
+            if log_exception:
+                LOG.exception("S3 delete failed", uri=uri)
+
     async def get_object_info(self, uri: str) -> dict:
         async with self._s3_client() as client:
             parsed_uri = S3Uri(uri)
@@ -265,6 +277,65 @@ class AsyncAWSClient:
                     for obj in page["Contents"]:
                         object_keys.append(obj["Key"])
             return object_keys
+
+    async def delete_files(self, bucket: str, keys: list[str]) -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_objects.html
+        """
+        Delete multiple objects from S3 bucket.
+
+        Args:
+            bucket: The S3 bucket name
+            keys: List of object keys to delete
+        """
+        if not keys:
+            return
+
+        try:
+            async with self._s3_client() as client:
+                # Format the objects for the delete_objects call
+                objects = [{"Key": key} for key in keys]
+
+                response = await client.delete_objects(
+                    Bucket=bucket,
+                    Delete={
+                        "Objects": objects,
+                        "Quiet": False,  # Set to True to suppress response details
+                    },
+                )
+
+                # Log any errors that occurred during deletion
+                if "Errors" in response:
+                    for error in response["Errors"]:
+                        LOG.error(
+                            "Failed to delete object from S3",
+                            bucket=bucket,
+                            key=error.get("Key"),
+                            code=error.get("Code"),
+                            message=error.get("Message"),
+                        )
+        except Exception as e:
+            LOG.exception("Failed to delete files from S3", bucket=bucket, keys_count=len(keys))
+            raise e
+
+    async def restore_object(self, bucket: str, key: str, days: int = 1, tier: str = "Standard") -> None:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/restore_object.html
+        """
+        Restore an archived S3 object from GLACIER storage class.
+
+        Args:
+            bucket: The S3 bucket name
+            key: The S3 object key
+            days: Number of days to keep the restored object available (default: 1)
+            tier: Restoration tier - "Standard" (3-5 hours) or "Expedited" (1-5 minutes)
+        """
+        try:
+            async with self._s3_client() as client:
+                await client.restore_object(
+                    Bucket=bucket, Key=key, RestoreRequest={"Days": days, "GlacierJobParameters": {"Tier": tier}}
+                )
+        except Exception as e:
+            LOG.exception("Failed to restore S3 object", bucket=bucket, key=key, tier=tier)
+            raise e
 
     async def run_task(
         self,

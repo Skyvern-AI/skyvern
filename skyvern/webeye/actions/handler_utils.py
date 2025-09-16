@@ -31,7 +31,8 @@ async def input_sequentially(locator: Locator, text: str, timeout: float = setti
         await locator.fill(text[: length - TEXT_PRESS_MAX_LENGTH], timeout=timeout)
         text = text[length - TEXT_PRESS_MAX_LENGTH :]
 
-    await locator.press_sequentially(text, delay=TEXT_INPUT_DELAY, timeout=timeout)
+    for char in text:
+        await locator.type(char, delay=TEXT_INPUT_DELAY, timeout=timeout)
 
 
 async def keypress(page: Page, keys: list[str], hold: bool = False, duration: float = 0) -> None:

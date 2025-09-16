@@ -19,6 +19,7 @@ class ParameterType(StrEnum):
     BITWARDEN_SENSITIVE_INFORMATION = "bitwarden_sensitive_information"
     BITWARDEN_CREDIT_CARD_DATA = "bitwarden_credit_card_data"
     ONEPASSWORD = "onepassword"
+    AZURE_VAULT_CREDENTIAL = "azure_vault_credential"
     OUTPUT = "output"
     CREDENTIAL = "credential"
     AZURE_SECRET = "azure_secret"
@@ -154,6 +155,21 @@ class OnePasswordCredentialParameter(Parameter):
     deleted_at: datetime | None = None
 
 
+class AzureVaultCredentialParameter(Parameter):
+    parameter_type: Literal[ParameterType.AZURE_VAULT_CREDENTIAL] = ParameterType.AZURE_VAULT_CREDENTIAL
+
+    azure_vault_credential_parameter_id: str
+    workflow_id: str
+    vault_name: str
+    username_key: str
+    password_key: str
+    totp_secret_key: str | None = None
+
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
+
+
 class WorkflowParameterType(StrEnum):
     STRING = "string"
     INTEGER = "integer"
@@ -232,6 +248,7 @@ ParameterSubclasses = Union[
     BitwardenSensitiveInformationParameter,
     BitwardenCreditCardDataParameter,
     OnePasswordCredentialParameter,
+    AzureVaultCredentialParameter,
     OutputParameter,
     CredentialParameter,
 ]

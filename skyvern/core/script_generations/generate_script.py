@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import keyword
+import re
 from typing import Any
 
 import libcst as cst
@@ -31,6 +32,7 @@ from skyvern.core.script_generations.generate_workflow_parameters import (
     hydrate_input_text_actions_with_field_names,
 )
 from skyvern.forge import app
+from skyvern.schemas.workflows import FileStorageType
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
@@ -39,6 +41,50 @@ LOG = structlog.get_logger(__name__)
 # --------------------------------------------------------------------- #
 # 1. helpers                                                            #
 # --------------------------------------------------------------------- #
+
+
+def sanitize_variable_name(name: str) -> str:
+    """
+    Sanitize a string to be a valid Python variable name.
+
+    - Converts to snake_case
+    - Removes invalid characters
+    - Ensures it doesn't start with a number
+    - Handles Python keywords by appending underscore
+    - Removes empty spaces
+    """
+    # Remove leading/trailing whitespace and replace internal spaces with underscores
+    name = name.strip().replace(" ", "_")
+
+    # Convert to snake_case: handle camelCase and PascalCase
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+
+    # Remove any characters that aren't alphanumeric or underscore
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+    # Convert to lowercase
+    name = name.lower()
+
+    # Remove consecutive underscores
+    name = re.sub(r"_+", "_", name)
+
+    # Remove leading/trailing underscores
+    name = name.strip("_")
+
+    # Ensure it doesn't start with a number
+    if name and name[0].isdigit():
+        name = f"param_{name}"
+
+    # Handle empty string or invalid names
+    if not name or name == "_":
+        name = "param"
+
+    # Handle Python keywords
+    if keyword.iskeyword(name):
+        name = f"{name}_"
+
+    return name
+
 
 ACTION_MAP = {
     "click": "click",
@@ -82,7 +128,9 @@ def _value(value: Any) -> cst.BaseExpression:
     """Convert simple Python objects to CST expressions."""
     if isinstance(value, str):
         if "\n" in value:
-            return cst.SimpleString('"""' + value.replace('"""', '\\"\\"\\"') + '"""')
+            # For multi-line strings, use repr() which handles all escaping properly
+            # This will use triple quotes when appropriate and escape them when needed
+            return cst.SimpleString(repr(value))
         return cst.SimpleString(repr(value))
     if isinstance(value, (int, float, bool)) or value is None:
         return cst.parse_expression(repr(value))
@@ -103,8 +151,10 @@ def _value(value: Any) -> cst.BaseExpression:
     return cst.SimpleString(repr(str(value)))
 
 
-def _render_value(prompt_text: str) -> cst.BaseExpression:
+def _render_value(prompt_text: str | None = None) -> cst.BaseExpression:
     """Create a prompt value with template rendering logic if needed."""
+    if not prompt_text:
+        return cst.SimpleString("")
     if "{{" in prompt_text and "}}" in prompt_text:
         # Generate code for: render_template(prompt_text)
         return cst.Call(
@@ -126,12 +176,12 @@ def _generate_text_call(text_value: str, intention: str, parameter_key: str) -> 
                 last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
             ),
             args=[
-                # First positional argument: context.generated_parameters['parameter_key']
+                # First positional argument: context.parameters['parameter_key']
                 cst.Arg(
                     value=cst.Subscript(
                         value=cst.Attribute(
                             value=cst.Name("context"),
-                            attr=cst.Name("generated_parameters"),
+                            attr=cst.Name("parameters"),
                         ),
                         slice=[cst.SubscriptElement(slice=cst.Index(value=_value(parameter_key)))],
                     ),
@@ -221,7 +271,7 @@ def _make_decorator(block_label: str, block: dict[str, Any]) -> cst.Decorator:
     )
 
 
-def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
+def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output: bool = False) -> cst.BaseStatement:
     """
     Turn one Action dict into:
 
@@ -247,20 +297,21 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
         )
 
     if method in ["type", "fill"]:
-        # Get intention from action
-        intention = act.get("intention") or act.get("reasoning") or ""
-
-        # Use generate_text call if field_name is available, otherwise fallback to direct value
+        # Use context.parameters if field_name is available, otherwise fallback to direct value
         if act.get("field_name"):
-            text_value = _generate_text_call(
-                text_value=act["text"], intention=intention, parameter_key=act["field_name"]
+            text_value = cst.Subscript(
+                value=cst.Attribute(
+                    value=cst.Name("context"),
+                    attr=cst.Name("parameters"),
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
             )
         else:
             text_value = _value(act["text"])
 
         args.append(
             cst.Arg(
-                keyword=cst.Name("text"),
+                keyword=cst.Name("value"),
                 value=text_value,
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
@@ -268,16 +319,103 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
                 ),
             )
         )
-    elif method == "select_option":
         args.append(
             cst.Arg(
-                keyword=cst.Name("option"),
-                value=_value(act["option"]["value"]),
+                keyword=cst.Name("ai_infer"),
+                value=cst.Name("True"),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
                 ),
-            ),
+            )
+        )
+        if act.get("totp_code_required"):
+            if task.get("totp_identifier"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=_value(task.get("totp_identifier")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            if task.get("totp_url"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_url"),
+                        value=_value(task.get("totp_verification_url")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+    elif method == "select_option":
+        option = act.get("option", {})
+        value = option.get("value")
+        if value:
+            if act.get("field_name"):
+                option_value = cst.Subscript(
+                    value=cst.Attribute(
+                        value=cst.Name("context"),
+                        attr=cst.Name("parameters"),
+                    ),
+                    slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
+                )
+            else:
+                option_value = _value(value)
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("value"),
+                    value=option_value,
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                ),
+            )
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("ai_infer"),
+                    value=cst.Name("True"),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+    elif method == "upload_file":
+        if act.get("field_name"):
+            file_url_value = cst.Subscript(
+                value=cst.Attribute(
+                    value=cst.Name("context"),
+                    attr=cst.Name("parameters"),
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
+            )
+        else:
+            file_url_value = _value(act["file_url"])
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("files"),
+                value=file_url_value,
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("ai_infer"),
+                value=cst.Name("True"),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
         )
     elif method == "wait":
         args.append(
@@ -294,13 +432,25 @@ def _action_to_stmt(act: dict[str, Any], assign_to_output: bool = False) -> cst.
         args.append(
             cst.Arg(
                 keyword=cst.Name("prompt"),
-                value=_value(act["data_extraction_goal"]),
+                value=_render_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
                 ),
             )
         )
+        if act.get("data_extraction_schema"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("schema"),
+                    value=_value(act["data_extraction_schema"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                    comma=cst.Comma(),
+                )
+            )
 
     args.extend(
         [
@@ -360,7 +510,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
 
         # For extraction blocks, assign extract action results to output variable
         assign_to_output = is_extraction_block and act["action_type"] == "extract"
-        body_stmts.append(_action_to_stmt(act, assign_to_output=assign_to_output))
+        body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output))
 
     # For extraction blocks, add return output statement if we have actions
     if is_extraction_block and any(
@@ -396,12 +546,12 @@ def _build_model(workflow: dict[str, Any]) -> cst.ClassDef:
     """
     ann_lines: list[cst.BaseStatement] = []
 
-    for p in workflow["workflow_definition"]["parameters"]:
-        if p["parameter_type"] != "workflow":
+    for parameter in workflow["workflow_definition"]["parameters"]:
+        if parameter["parameter_type"] != "workflow":
             continue
 
         ann = cst.AnnAssign(
-            target=cst.Name(p["key"]),
+            target=cst.Name(sanitize_variable_name(parameter["key"])),
             annotation=cst.Annotation(cst.Name("str")),
             value=None,
         )
@@ -462,7 +612,7 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
+            value=_render_value(block.get("navigation_goal") or ""),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -476,14 +626,19 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("download_suffix"),
-            value=_render_value(block.get("download_suffix", "")),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
+    ]
+    if block.get("download_suffix"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("download_suffix"),
+                value=_render_value(block.get("download_suffix")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    args.append(
         cst.Arg(
             keyword=cst.Name("cache_key"),
             value=_value(block_title),
@@ -491,8 +646,8 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
                 indent=True,
             ),
             comma=cst.Comma(),
-        ),
-    ]
+        )
+    )
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
@@ -560,6 +715,14 @@ def _build_extract_statement(block_title: str, block: dict[str, Any]) -> cst.Sim
         cst.Arg(
             keyword=cst.Name("prompt"),
             value=_render_value(block.get("data_extraction_goal", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("schema"),
+            value=_value(block.get("data_schema", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -648,6 +811,14 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
             ),
         ),
         cst.Arg(
+            keyword=cst.Name("recipients"),
+            value=_value(block.get("recipients", [])),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
             keyword=cst.Name("subject"),
             value=_value(block.get("subject", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
@@ -663,17 +834,18 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
+        # TODO: support file attachments?
+        # cst.Arg(
+        #     keyword=cst.Name("file_attachments"),
+        #     value=_value(block.get("file_attachments", [])),
+        #     whitespace_after_arg=cst.ParenthesizedWhitespace(
+        #         indent=True,
+        #         last_line=cst.SimpleWhitespace(INDENT),
+        #     ),
+        # ),
         cst.Arg(
-            keyword=cst.Name("recipients"),
-            value=_value(block.get("recipients", [])),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("attach_downloaded_files"),
-            value=_value(block.get("attach_downloaded_files", False)),
+            keyword=cst.Name("label"),
+            value=_value(block.get("label", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -784,6 +956,14 @@ def _build_goto_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             value=_value(block.get("url", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
             ),
             comma=cst.Comma(),
         ),
@@ -799,6 +979,342 @@ def _build_goto_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     )
 
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.run_code statement."""
+    args = [
+        cst.Arg(
+            keyword=cst.Name("code"),
+            value=_value(block.get("code", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("parameters"),
+            value=_value(block.get("parameters", None)),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+            ),
+            comma=cst.Comma(),
+        ),
+    ]
+
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("run_code")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.upload_file statement."""
+    args = [
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("parameters"),
+            value=_value(block.get("parameters", None)),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("storage_type"),
+            value=_value(str(block.get("storage_type", FileStorageType.S3))),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+    ]
+    for key in [
+        "s3_bucket",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "region_name",
+        "azure_storage_account_name",
+        "azure_storage_account_key",
+        "azure_blob_container_name",
+        "path",
+    ]:
+        if block.get(key) is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name(key),
+                    value=_value(block.get(key, "")),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+    _mark_last_arg_as_comma(args)
+
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("upload_file")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.parse_file statement."""
+    args = [
+        cst.Arg(
+            keyword=cst.Name("file_url"),
+            value=_value(block.get("file_url", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("file_type"),
+            value=_value(str(block.get("file_type"))),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+    ]
+
+    # Add optional parameters if they exist
+    if block.get("json_schema") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("schema"),
+                value=_value(block.get("json_schema")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("label") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    _mark_last_arg_as_comma(args)
+
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("parse_file")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _build_http_request_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.http_request statement."""
+    args = [
+        cst.Arg(
+            keyword=cst.Name("method"),
+            value=_value(block.get("method", "GET")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("url"),
+            value=_value(block.get("url", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+    ]
+
+    # Add optional parameters if they exist
+    if block.get("headers") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("headers"),
+                value=_value(block.get("headers")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("body") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("body"),
+                value=_value(block.get("body")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("timeout") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("timeout"),
+                value=_value(block.get("timeout")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("follow_redirects") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("follow_redirects"),
+                value=_value(block.get("follow_redirects")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("label") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    _mark_last_arg_as_comma(args)
+
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("http_request")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.prompt statement."""
+    args = [
+        cst.Arg(
+            keyword=cst.Name("prompt"),
+            value=_render_value(block.get("prompt", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+    ]
+
+    # Add optional parameters if they exist
+    if block.get("json_schema") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("schema"),
+                value=_value(block.get("json_schema")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("label") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("parameters") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("parameters"),
+                value=_value(block.get("parameters")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+            )
+        )
+
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("prompt")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
+    if not args:
+        return
+
+    last_arg = args.pop()
+    new_arg = cst.Arg(
+        keyword=last_arg.keyword,
+        value=last_arg.value,
+        comma=cst.Comma(),
+        whitespace_after_arg=cst.ParenthesizedWhitespace(
+            indent=True,
+        ),
+    )
+    args.append(new_arg)
 
 
 def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list[cst.Arg]:
@@ -903,13 +1419,21 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
         elif block_type == "send_email":
             stmt = _build_send_email_statement(block)
         elif block_type == "text_prompt":
-            stmt = _build_validate_statement(block)
+            stmt = _build_prompt_statement(block)
         elif block_type == "wait":
             stmt = _build_wait_statement(block)
         elif block_type == "for_loop":
             stmt = _build_for_loop_statement(block_title, block)
         elif block_type == "goto_url":
             stmt = _build_goto_statement(block)
+        elif block_type == "code":
+            stmt = _build_code_statement(block)
+        elif block_type == "file_upload":
+            stmt = _build_file_upload_statement(block)
+        elif block_type == "file_url_parser":
+            stmt = _build_file_url_parser_statement(block)
+        elif block_type == "http_request":
+            stmt = _build_http_request_statement(block)
         else:
             # Default case for unknown block types
             stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
@@ -917,26 +1441,26 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
         body.append(stmt)
 
     # Add a final validation step if not already present
-    has_validation = any(block.get("block_type") == "text_prompt" for block in blocks)
-    has_task_blocks = any(block.get("block_type") in SCRIPT_TASK_BLOCKS for block in blocks)
-    if not has_validation and not has_task_blocks:
-        # Build the final validation statement using LibCST components
-        args = [
-            cst.Arg(
-                keyword=cst.Name("prompt"),
-                value=cst.SimpleString(
-                    '"Your goal is to validate that the workflow completed successfully. COMPLETE if successful, TERMINATE if there are issues."'
-                ),
-            ),
-        ]
+    # has_validation = any(block.get("block_type") == "text_prompt" for block in blocks)
+    # has_task_blocks = any(block.get("block_type") in SCRIPT_TASK_BLOCKS for block in blocks)
+    # if not has_validation and not has_task_blocks:
+    #     # Build the final validation statement using LibCST components
+    #     args = [
+    #         cst.Arg(
+    #             keyword=cst.Name("prompt"),
+    #             value=cst.SimpleString(
+    #                 '"Your goal is to validate that the workflow completed successfully. COMPLETE if successful, TERMINATE if there are issues."'
+    #             ),
+    #         ),
+    #     ]
 
-        call = cst.Call(
-            func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("validate")),
-            args=args,
-        )
+    #     call = cst.Call(
+    #         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("validate")),
+    #         args=args,
+    #     )
 
-        validation_stmt = cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
-        body.append(validation_stmt)
+    #     validation_stmt = cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+    #     body.append(validation_stmt)
 
     params = cst.Parameters(
         params=[
@@ -963,42 +1487,6 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
                         ),
                     )
                 ),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("title"),
-                annotation=cst.Annotation(cst.Name("str")),
-                default=_value(wf_req.get("title", "")),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("webhook_url"),
-                annotation=cst.Annotation(cst.parse_expression("str | None")),
-                default=_value(wf_req.get("webhook_url")),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("totp_url"),
-                annotation=cst.Annotation(cst.parse_expression("str | None")),
-                default=_value(wf_req.get("totp_url")),
-                whitespace_after_param=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            Param(
-                name=cst.Name("totp_identifier"),
-                annotation=cst.Annotation(cst.parse_expression("str | None")),
-                default=_value(wf_req.get("totp_identifier")),
                 whitespace_after_param=cst.ParenthesizedWhitespace(),
                 comma=cst.Comma(),
             ),
@@ -1174,9 +1662,6 @@ async def generate_workflow_script(
     module_body = [
         *start_block_body,
         *block_fns,
-        cst.EmptyLine(),
-        cst.EmptyLine(),
-        cst.parse_statement("if __name__ == '__main__':\n    asyncio.run(run_workflow())"),
     ]
 
     module = cst.Module(body=module_body)
@@ -1187,7 +1672,7 @@ async def generate_workflow_script(
 
 
 async def create_script_block(
-    block_code: str,
+    block_code: str | bytes,
     script_revision_id: str,
     script_id: str,
     organization_id: str,
@@ -1205,6 +1690,7 @@ async def create_script_block(
         block_name: Optional custom name for the block (defaults to function name)
         block_description: Optional description for the block
     """
+    block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
         # Step 3: Create script block in database
         script_block = await app.DATABASE.create_script_block(
@@ -1225,7 +1711,7 @@ async def create_script_block(
             script_id=script_id,
             script_version=1,  # Assuming version 1 for now
             file_path=file_path,
-            data=block_code.encode("utf-8"),
+            data=block_code_bytes,
         )
 
         # Create script file record
@@ -1236,8 +1722,8 @@ async def create_script_block(
             file_path=file_path,
             file_name=file_name,
             file_type="file",
-            content_hash=f"sha256:{hashlib.sha256(block_code.encode('utf-8')).hexdigest()}",
-            file_size=len(block_code.encode("utf-8")),
+            content_hash=f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}",
+            file_size=len(block_code_bytes),
             mime_type="text/x-python",
             artifact_id=artifact_id,
         )

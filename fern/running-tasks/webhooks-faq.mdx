@@ -28,8 +28,15 @@ The webhook request body is a JSON object with the following fields:
    "screenshot_urls": "URLs of the last three screenshots. The first one in the list is the latest screenshot.",
    "failure_reason": "The reason for the failure if any",
    "app_url": "The URL to the run in the Skyvern app",
+   "browser_session_id": "The ID of the browser session",
+   "max_screenshot_scrolls": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot",
+   "run_request": "The original request parameters used to start this task or workflow run",
+   "script_run": "The script run result containing information like whether AI fallback is triggered when the script fails",
    "created_at": "The timestamp when the run was created",
    "modified_at": "The timestamp when the run was last modified",
+   "queued_at": "The timestamp when the run was queued",
+   "started_at": "The timestamp when the run started",
+   "finished_at": "The timestamp when the run finished"
 }
 ```
 For detailed schema, please refer to the [Run Response](/api-reference/api-reference/agent/get-run#response).

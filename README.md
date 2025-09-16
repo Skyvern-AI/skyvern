@@ -44,6 +44,14 @@ If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.c
 
 ## Install & Run
 
+Dependencies needed:
+- [Python 3.11.x](https://www.python.org/downloads/), works with 3.12, not ready yet for 3.13
+- [NodeJS & NPM](https://nodejs.org/en/download/)
+
+Additionally, for Windows:
+- [Rust](https://rustup.rs/)
+- VS Code with C++ dev tools and Windows SDK
+
 ### 1. Install Skyvern
 
 ```bash
@@ -51,6 +59,7 @@ pip install skyvern
 ```
 
 ### 2. Run Skyvern
+This is most helpful for first time run (db setup, db migrations etc).
 
 ```bash
 skyvern quickstart
@@ -60,7 +69,7 @@ skyvern quickstart
 
 #### UI (Recommended)
 
-Start the Skyvern service and UI
+Start the Skyvern service and UI (when DB is up and running)
 
 ```bash
 skyvern run all
@@ -388,20 +397,6 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 <p align="center">
   <img src="fern/images/geico_shu_recording_cropped.gif"/>
 </p>
-
-# Contributor Setup
-For a complete local environment CLI Installation
-```bash
-pip install -e .
-```
-The following command sets up your development environment to use pre-commit (our commit hook handler)
-```
-skyvern quickstart contributors
-```
-
-
-1. Navigate to `http://localhost:8080` in your browser to start using the UI
-   *The Skyvern CLI supports Windows, WSL, macOS, and Linux environments.*
 
 # Documentation
 

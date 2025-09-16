@@ -6,6 +6,7 @@ import structlog
 from litellm import ConfigDict
 from pydantic import BaseModel, Field
 
+from skyvern.errors.errors import UserDefinedError
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger()
@@ -17,15 +18,6 @@ class ActionStatus(StrEnum):
     skipped = "skipped"
     failed = "failed"
     completed = "completed"
-
-
-class UserDefinedError(BaseModel):
-    error_code: str
-    reasoning: str
-    confidence_float: float = Field(..., ge=0, le=1)
-
-    def __repr__(self) -> str:
-        return f"{self.reasoning}(error_code={self.error_code}, confidence_float={self.confidence_float})"
 
 
 class SelectOption(BaseModel):
@@ -91,6 +83,7 @@ class Action(BaseModel):
     download: bool | None = None
     is_upload_file_tag: bool | None = None
     text: str | None = None
+    input_or_select_context: InputOrSelectContext | None = None
     option: SelectOption | None = None
     is_checked: bool | None = None
     verified: bool = False
@@ -171,9 +164,10 @@ class ClickAction(WebAction):
 class InputTextAction(WebAction):
     action_type: ActionType = ActionType.INPUT_TEXT
     text: str
+    totp_code_required: bool = False
 
     def __repr__(self) -> str:
-        return f"InputTextAction(element_id={self.element_id}, text={self.text}, tool_call_id={self.tool_call_id})"
+        return f"InputTextAction(element_id={self.element_id}, text={self.text}, context={self.input_or_select_context}, tool_call_id={self.tool_call_id})"
 
 
 class UploadFileAction(WebAction):
@@ -207,7 +201,7 @@ class SelectOptionAction(WebAction):
     option: SelectOption
 
     def __repr__(self) -> str:
-        return f"SelectOptionAction(element_id={self.element_id}, option={self.option})"
+        return f"SelectOptionAction(element_id={self.element_id}, option={self.option}, context={self.input_or_select_context})"
 
 
 ###
@@ -242,7 +236,7 @@ class CompleteAction(DecisiveAction):
 class ExtractAction(Action):
     action_type: ActionType = ActionType.EXTRACT
     data_extraction_goal: str | None = None
-    data_extraction_schema: dict[str, Any] | None = None
+    data_extraction_schema: dict[str, Any] | list | str | None = None
 
 
 class ScrollAction(Action):

@@ -1,4 +1,3 @@
-import { SwitchBar } from "@/components/SwitchBar";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -28,6 +27,7 @@ import {
   parameterIsSkyvernCredential,
   parameterIsOnePasswordCredential,
   ParametersState,
+  parameterIsAzureVaultCredential,
 } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
@@ -82,14 +82,19 @@ function WorkflowParameterEditPanel({
   const isOnePasswordCredential =
     initialValues.parameterType === "onepassword" &&
     parameterIsOnePasswordCredential(initialValues);
+  const isAzureVaultCredential =
+    initialValues.parameterType === "credential" &&
+    parameterIsAzureVaultCredential(initialValues);
   const [credentialType, setCredentialType] = useState<
-    "bitwarden" | "skyvern" | "onepassword"
+    "bitwarden" | "skyvern" | "onepassword" | "azurevault"
   >(
     isBitwardenCredential
       ? "bitwarden"
       : isOnePasswordCredential
         ? "onepassword"
-        : "skyvern",
+        : isAzureVaultCredential
+          ? "azurevault"
+          : "skyvern",
   );
   const [urlParameterKey, setUrlParameterKey] = useState(
     isBitwardenCredential ? initialValues.urlParameterKey ?? "" : "",
@@ -162,6 +167,19 @@ function WorkflowParameterEditPanel({
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
     useState(isBitwardenCredential ? initialValues.itemId ?? "" : "");
+
+  const [azureVaultName, setAzureVaultName] = useState(
+    isAzureVaultCredential ? initialValues.vaultName : "",
+  );
+  const [azureUsernameKey, setAzureUsernameKey] = useState(
+    isAzureVaultCredential ? initialValues.usernameKey : "",
+  );
+  const [azurePasswordKey, setAzurePasswordKey] = useState(
+    isAzureVaultCredential ? initialValues.passwordKey : "",
+  );
+  const [azureTotpSecretKey, setAzureTotpKey] = useState(
+    isAzureVaultCredential ? initialValues.totpSecretKey ?? "" : "",
+  );
 
   return (
     <ScrollArea>
@@ -269,19 +287,37 @@ function WorkflowParameterEditPanel({
             </>
           )}
           {type === "credential" && (
-            <SwitchBar
-              value={credentialType}
-              onChange={(value) => {
-                setCredentialType(
-                  value as "bitwarden" | "skyvern" | "onepassword",
-                );
-              }}
-              options={[
-                { label: "Skyvern", value: "skyvern" },
-                { label: "Bitwarden", value: "bitwarden" },
-                { label: "1Password", value: "onepassword" },
-              ]}
-            />
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  Credential Type
+                </Label>
+                <Select
+                  value={credentialType}
+                  onValueChange={(value) => {
+                    setCredentialType(
+                      value as
+                        | "bitwarden"
+                        | "skyvern"
+                        | "onepassword"
+                        | "azurevault",
+                    );
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select a type" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectItem value="skyvern">Skyvern</SelectItem>
+                      <SelectItem value="bitwarden">Bitwarden</SelectItem>
+                      <SelectItem value="onepassword">1Password</SelectItem>
+                      <SelectItem value="azurevault">Azure Vault</SelectItem>
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </div>
+            </>
           )}
           {type === "credential" && credentialType === "bitwarden" && (
             <>
@@ -326,6 +362,41 @@ function WorkflowParameterEditPanel({
                 <Input
                   value={opItemId}
                   onChange={(e) => setOpItemId(e.target.value)}
+                />
+              </div>
+            </>
+          )}
+          {type === "credential" && credentialType === "azurevault" && (
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Vault Name</Label>
+                <Input
+                  value={azureVaultName}
+                  onChange={(e) => setAzureVaultName(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Username Key</Label>
+                <Input
+                  autoComplete="off"
+                  value={azureUsernameKey}
+                  onChange={(e) => setAzureUsernameKey(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">Password Key</Label>
+                <Input
+                  value={azurePasswordKey}
+                  onChange={(e) => setAzurePasswordKey(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-slate-300">
+                  TOTP Secret Key
+                </Label>
+                <Input
+                  value={azureTotpSecretKey}
+                  onChange={(e) => setAzureTotpKey(e.target.value)}
                 />
               </div>
             </>
@@ -482,6 +553,31 @@ function WorkflowParameterEditPanel({
                     vaultId,
                     itemId: opItemId,
                     description,
+                  });
+                }
+                if (type === "credential" && credentialType === "azurevault") {
+                  if (
+                    azureVaultName.trim() === "" ||
+                    azureUsernameKey.trim() === "" ||
+                    azurePasswordKey.trim() === ""
+                  ) {
+                    toast({
+                      variant: "destructive",
+                      title: "Failed to add parameter",
+                      description:
+                        "Azure Vault Name, Username Key and Password Key are required",
+                    });
+                    return;
+                  }
+                  onSave({
+                    key,
+                    parameterType: "credential",
+                    vaultName: azureVaultName,
+                    usernameKey: azureUsernameKey,
+                    passwordKey: azurePasswordKey,
+                    totpSecretKey:
+                      azureTotpSecretKey === "" ? null : azureTotpSecretKey,
+                    description: description,
                   });
                 }
                 if (type === "secret" || type === "creditCardData") {

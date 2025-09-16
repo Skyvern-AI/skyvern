@@ -14,11 +14,18 @@ class OnePasswordConstants(StrEnum):
     TOTP = "OP_TOTP"  # Special value to indicate a TOTP code
 
 
+class AzureVaultConstants(StrEnum):
+    """Constants for Azure Vault integration."""
+
+    TOTP = "AZ_TOTP"  # Special value to indicate a TOTP code
+
+
 def parse_totp_secret(totp_secret: str) -> str:
     if not totp_secret:
         return ""
 
-    totp_secret_no_whitespace = "".join(totp_secret.split())
+    totp_secret_no_dashe = "".join(totp_secret.split("-"))
+    totp_secret_no_whitespace = "".join(totp_secret_no_dashe.split())
     try:
         # to verify if it's a valid TOTP secret
         pyotp.TOTP(totp_secret_no_whitespace).byte_secret()

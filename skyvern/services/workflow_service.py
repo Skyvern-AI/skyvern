@@ -1,3 +1,5 @@
+import typing as t
+
 import structlog
 from fastapi import BackgroundTasks, Request
 
@@ -69,6 +71,7 @@ async def run_workflow(
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
     block_labels: list[str] | None = None,
+    block_outputs: dict[str, t.Any] | None = None,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -86,10 +89,12 @@ async def run_workflow(
         organization=organization,
         workflow_id=workflow_run.workflow_id,
         workflow_run_id=workflow_run.workflow_run_id,
+        workflow_permanent_id=workflow_run.workflow_permanent_id,
         max_steps_override=max_steps,
         browser_session_id=workflow_request.browser_session_id,
         api_key=api_key,
         block_labels=block_labels,
+        block_outputs=block_outputs,
     )
 
     return workflow_run

@@ -44,6 +44,7 @@ type Props = {
   workflow?: {
     run: WorkflowRunStatusApiResponse;
   };
+  resizeTrigger?: number;
   // --
   onClose?: () => void;
 };
@@ -54,6 +55,7 @@ function BrowserStream({
   showControlButtons = undefined,
   task = undefined,
   workflow = undefined,
+  resizeTrigger,
   // --
   onClose,
 }: Props) {
@@ -291,6 +293,19 @@ function BrowserStream({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interactive, isCommandConnected, userIsControlling]);
 
+  // Effect to handle window resize trigger for NoVNC canvas
+  useEffect(() => {
+    if (!resizeTrigger || !canvasContainer || !rfbRef.current) {
+      return;
+    }
+
+    // const originalDisplay = canvasContainer.style.display;
+    // canvasContainer.style.display = "none";
+    // canvasContainer.offsetHeight;
+    // canvasContainer.style.display = originalDisplay;
+    // window.dispatchEvent(new Event("resize"));
+  }, [resizeTrigger, canvasContainer]);
+
   // Effect to show toast when task or workflow reaches a final state based on hook updates
   useEffect(() => {
     const run = task ? task.run : workflow ? workflow.run : null;
@@ -328,13 +343,16 @@ function BrowserStream({
 
   return (
     <div
-      className={cn("browser-stream", {
-        "user-is-controlling": theUserIsControlling,
-      })}
+      className={cn(
+        "browser-stream relative flex items-center justify-center",
+        {
+          "user-is-controlling": theUserIsControlling,
+        },
+      )}
       ref={setCanvasContainerRef}
     >
       {isVncConnected && (
-        <div className="overlay z-10 flex items-center justify-center">
+        <div className="overlay z-10 flex items-center justify-center overflow-hidden">
           {showControlButtons && (
             <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
               <Button
@@ -369,7 +387,7 @@ function BrowserStream({
         </div>
       )}
       {!isVncConnected && (
-        <div className="flex h-full w-full flex-col items-center justify-center gap-2 pb-2 pt-4 text-sm text-slate-400">
+        <div className="absolute left-0 top-1/2 flex aspect-video w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
           <RotateThrough interval={7 * 1000}>
             <span>Hm, working on the connection...</span>
             <span>Hang tight, we're almost there...</span>

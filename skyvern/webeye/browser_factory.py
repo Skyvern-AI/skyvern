@@ -656,12 +656,22 @@ class BrowserState:
             LOG.info("browser context is created")
 
         if await self.get_working_page() is None:
+            page: Page | None = None
+            use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
-                page = self.browser_context.pages[0]
-                await self.set_working_page(page, 0)
-            else:
+                pages = [
+                    http_page
+                    for http_page in self.browser_context.pages
+                    if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
+                ]
+                if len(pages) > 0:
+                    page = pages[0]
+                    use_existing_page = True
+            if page is None:
                 page = await self.browser_context.new_page()
-                await self.set_working_page(page, 0)
+
+            await self.set_working_page(page, 0)
+            if not use_existing_page:
                 await self._close_all_other_pages()
 
             if url:

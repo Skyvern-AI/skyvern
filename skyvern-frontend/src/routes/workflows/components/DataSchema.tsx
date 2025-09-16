@@ -40,7 +40,7 @@ function DataSchema({ value, onChange }: Props) {
           onChange={() => {
             // TODO
           }}
-          className="nowheel nopan"
+          className="nopan"
           fontSize={8}
         />
       </div>

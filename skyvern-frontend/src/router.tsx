@@ -13,6 +13,7 @@ import { TaskDetails } from "./routes/tasks/detail/TaskDetails";
 import { TaskParameters } from "./routes/tasks/detail/TaskParameters";
 import { TaskRecording } from "./routes/tasks/detail/TaskRecording";
 import { TasksPage } from "./routes/tasks/list/TasksPage";
+import { Debugger } from "@/routes/workflows/debugger/Debugger";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
@@ -23,6 +24,7 @@ import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/Workfl
 import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
+import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode";
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
 
 const router = createBrowserRouter([
@@ -110,11 +112,11 @@ const router = createBrowserRouter([
               },
               {
                 path: "debug",
-                element: <WorkflowEditor />,
+                element: <Debugger />,
               },
               {
                 path: ":workflowRunId/:blockLabel/debug",
-                element: <WorkflowEditor />,
+                element: <Debugger />,
               },
               {
                 path: "edit",
@@ -156,6 +158,12 @@ const router = createBrowserRouter([
                   {
                     path: "recording",
                     element: <WorkflowRunRecording />,
+                  },
+                  {
+                    path: "code",
+                    element: (
+                      <WorkflowRunCode showCacheKeyValueSelector={true} />
+                    ),
                   },
                 ],
               },

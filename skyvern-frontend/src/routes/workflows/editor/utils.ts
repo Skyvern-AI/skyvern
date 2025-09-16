@@ -81,6 +81,19 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
         };
       } else if (
         parameter.parameter_type ===
+        WorkflowParameterTypes.Azure_Vault_Credential
+      ) {
+        return {
+          key: parameter.key,
+          parameterType: WorkflowEditorParameterTypes.Credential,
+          vaultName: parameter.vault_name,
+          usernameKey: parameter.username_key,
+          passwordKey: parameter.password_key,
+          totpSecretKey: parameter.totp_secret_key,
+          description: parameter.description,
+        };
+      } else if (
+        parameter.parameter_type ===
         WorkflowParameterTypes.Bitwarden_Login_Credential
       ) {
         return {
@@ -98,12 +111,16 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
 };
 
 /**
- * Attempt to construct a valid cache key value from the workflow parameters.
+ * Attempt to construct a valid code key value from the workflow parameters.
  */
 const constructCacheKeyValue = (
-  cacheKey: string,
-  workflow: WorkflowApiResponse,
+  codeKey: string,
+  workflow?: WorkflowApiResponse,
 ) => {
+  if (!workflow) {
+    return "";
+  }
+
   const workflowParameters = getInitialParameters(workflow)
     .filter((p) => p.parameterType === "workflow")
     .reduce(
@@ -119,14 +136,14 @@ const constructCacheKeyValue = (
       continue;
     }
 
-    cacheKey = cacheKey.replace(`{{${name}}}`, value.toString());
+    codeKey = codeKey.replace(`{{${name}}}`, value.toString());
   }
 
-  if (cacheKey.includes("{") || cacheKey.includes("}")) {
+  if (codeKey.includes("{") || codeKey.includes("}")) {
     return "";
   }
 
-  return cacheKey;
+  return codeKey;
 };
 
 export { constructCacheKeyValue, getInitialParameters };

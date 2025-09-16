@@ -50,7 +50,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.runs import ProxyLocation, ScriptRunResponse
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
@@ -264,6 +264,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
         generate_script=workflow_model.generate_script,
+        ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
     )
 
@@ -302,6 +303,9 @@ def convert_to_workflow_run(
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
         extra_http_headers=workflow_run_model.extra_http_headers,
         browser_address=workflow_run_model.browser_address,
+        script_run=ScriptRunResponse.model_validate(workflow_run_model.script_run)
+        if workflow_run_model.script_run
+        else None,
     )
 
 

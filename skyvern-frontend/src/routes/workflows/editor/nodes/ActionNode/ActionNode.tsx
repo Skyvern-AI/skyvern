@@ -267,7 +267,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                             }
                             handleChange("errorCodeMapping", value);
                           }}
-                          className="nowheel nopan"
+                          className="nopan"
                           fontSize={8}
                         />
                       </div>

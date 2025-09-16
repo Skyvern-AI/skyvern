@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from skyvern.webeye.actions.actions import Action, UserDefinedError
+from skyvern.errors.errors import UserDefinedError
+from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.responses import ActionResult
 
 

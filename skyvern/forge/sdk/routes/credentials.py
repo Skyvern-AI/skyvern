@@ -32,9 +32,11 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenService
 LOG = structlog.get_logger()
 
 
-async def parse_totp_code(content: str) -> str | None:
+async def parse_totp_code(content: str, organization_id: str) -> str | None:
     prompt = prompt_engine.load_prompt("parse-verification-code", content=content)
-    code_resp = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, prompt_name="parse-verification-code")
+    code_resp = await app.SECONDARY_LLM_API_HANDLER(
+        prompt=prompt, prompt_name="parse-verification-code", organization_id=organization_id
+    )
     LOG.info("TOTP Code Parser Response", code_resp=code_resp)
     return code_resp.get("code", None)
 
@@ -58,7 +60,8 @@ async def parse_totp_code(content: str) -> str | None:
     include_in_schema=False,
 )
 async def send_totp_code(
-    data: TOTPCodeCreate, curr_org: Organization = Depends(org_auth_service.get_current_org)
+    data: TOTPCodeCreate,
+    curr_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TOTPCode:
     LOG.info(
         "Saving TOTP code",
@@ -72,7 +75,7 @@ async def send_totp_code(
     code: str | None = content
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
     if len(content) > 10:
-        code = await parse_totp_code(content)
+        code = await parse_totp_code(content, curr_org.organization_id)
     if not code:
         LOG.error(
             "Failed to parse totp code",

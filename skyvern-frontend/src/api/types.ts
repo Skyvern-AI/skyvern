@@ -296,6 +296,7 @@ export type DebugSessionApiResponse = {
   workflow_permanent_id: string | null;
   created_at: string;
   modified_at: string;
+  vnc_streaming_supported: boolean | null;
 };
 
 export type WorkflowRunApiResponse = {
@@ -303,6 +304,7 @@ export type WorkflowRunApiResponse = {
   failure_reason: string | null;
   modified_at: string;
   proxy_location: ProxyLocation | null;
+  script_run: boolean | null;
   status: Status;
   title?: string;
   webhook_callback_url: string;
