@@ -33,7 +33,46 @@ Traditional approaches to browser automations required writing custom scripts fo
 
 Instead of only relying on code-defined XPath interactions, Skyvern relies on Vision LLMs to learn and interact with the websites.
 
-Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyvern](#real-world-examples-of-skyvern)
+# How it works
+Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
+
+Skyvern uses a swarm of agents to comprehend a website, and plan and execute its actions:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="fern/images/skyvern_2_0_system_diagram.png" />
+  <img src="fern/images/skyvern_2_0_system_diagram.png" />
+</picture>
+
+This approach has a few advantages:
+
+1. Skyvern can operate on websites it's never seen before, as it's able to map visual elements to actions necessary to complete a workflow, without any customized code
+1. Skyvern is resistant to website layout changes, as there are no pre-determined XPaths or other selectors our system is looking for while trying to navigate
+1. Skyvern is able to take a single workflow and apply it to a large number of websites, as it's able to reason through the interactions necessary to complete the workflow
+1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
+    1. If you wanted to get an auto insurance quote from Geico, the answer to a common question "Were you eligible to drive at 18?" could be inferred from the driver receiving their license at age 16
+    1. If you were doing competitor analysis, it's understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
+
+A detailed technical report can be found [here](https://blog.skyvern.com/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
+
+# Demo
+<!-- Redo demo -->
+https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
+
+# Performance & Evaluation
+
+Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://blog.skyvern.com/web-bench-a-new-way-to-compare-ai-browser-agents/)
+
+<p align="center">
+  <img src="fern/images/performance/webbench_overall.png"/>
+</p>
+
+## Performance on WRITE tasks (eg filling out forms, logging in, downloading files, etc)
+
+Skyvern is the best performing agent on WRITE tasks (eg filling out forms, logging in, downloading files, etc), which is primarily used for RPA (Robotic Process Automation) adjacent tasks.
+
+<p align="center">
+  <img src="fern/images/performance/webbench_write.png"/>
+</p>
 
 # Quickstart
 
@@ -101,47 +140,6 @@ skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API K
 task = await skyvern.run_task(prompt="Find the top post on hackernews today")
 print(task)
 ```
-
-# How it works
-Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
-
-Skyvern uses a swarm of agents to comprehend a website, and plan and execute its actions:
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="fern/images/skyvern_2_0_system_diagram.png" />
-  <img src="fern/images/skyvern_2_0_system_diagram.png" />
-</picture>
-
-This approach has a few advantages:
-
-1. Skyvern can operate on websites it's never seen before, as it's able to map visual elements to actions necessary to complete a workflow, without any customized code
-1. Skyvern is resistant to website layout changes, as there are no pre-determined XPaths or other selectors our system is looking for while trying to navigate
-1. Skyvern is able to take a single workflow and apply it to a large number of websites, as it's able to reason through the interactions necessary to complete the workflow
-1. Skyvern leverages LLMs to reason through interactions to ensure we can cover complex situations. Examples include:
-    1. If you wanted to get an auto insurance quote from Geico, the answer to a common question "Were you eligible to drive at 18?" could be inferred from the driver receiving their license at age 16
-    1. If you were doing competitor analysis, it's understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
-
-A detailed technical report can be found [here](https://blog.skyvern.com/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
-
-# Demo
-<!-- Redo demo -->
-https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
-
-# Performance & Evaluation
-
-Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://blog.skyvern.com/web-bench-a-new-way-to-compare-ai-browser-agents/)
-
-<p align="center">
-  <img src="fern/images/performance/webbench_overall.png"/>
-</p>
-
-## Performance on WRITE tasks (eg filling out forms, logging in, downloading files, etc)
-
-Skyvern is the best performing agent on WRITE tasks (eg filling out forms, logging in, downloading files, etc), which is primarily used for RPA (Robotic Process Automation) adjacent tasks.
-
-<p align="center">
-  <img src="fern/images/performance/webbench_write.png"/>
-</p>
 
 ## Advanced Usage
 
@@ -280,20 +278,21 @@ For example, if you wanted to download all invoices newer than January 1st, you 
 Another example is if you wanted to automate purchasing products from an e-commerce store, you could create a workflow that first navigated to the desired product, then added it to a cart. Second, it would navigate to the cart and validate the cart state. Finally, it would go through the checkout process to purchase the items.
 
 Supported workflow features include:
-1. Navigation
-1. Action
+1. Browser Task
+1. Browser Action
 1. Data Extraction
-1. Loops
+1. Validation
+1. For Loops
 1. File parsing
-1. Uploading files to block storage
 1. Sending emails
 1. Text Prompts
-1. Tasks (general)
+1. HTTP Request Block
+1. Custom Code Block
+1. Uploading files to block storage
 1. (Coming soon) Conditionals
-1. (Coming soon) Custom Code Block
 
 <p align="center">
-  <img src="fern/images/invoice_downloading_workflow_example.png"/>
+  <img src="fern/images/block_example_v2.png"/>
 </p>
 
 ## Livestreaming
