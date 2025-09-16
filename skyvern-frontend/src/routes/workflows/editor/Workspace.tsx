@@ -143,7 +143,7 @@ function Workspace({
       ? ""
       : cacheKeyValueParam
         ? cacheKeyValueParam
-        : constructCacheKeyValue(cacheKey, workflow),
+        : constructCacheKeyValue({ codeKey: cacheKey, workflow }),
   );
 
   useEffect(() => {
