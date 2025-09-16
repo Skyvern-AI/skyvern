@@ -23,11 +23,15 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, ExtractAction, SelectOption
+from skyvern.webeye.actions.actions import Action, ActionStatus, ExtractAction, InputTextAction, SelectOption
+from skyvern.webeye.actions.handler import handle_input_text_action, handle_select_option_action
+from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
 LOG = structlog.get_logger()
+SELECT_OPTION_GOAL = """- The intention to select an option: {intention}.
+- The overall goal that the user wants to achieve: {prompt}."""
 
 
 class Driver(StrEnum):
@@ -50,6 +54,12 @@ class ActionCall:
     meta: ActionMetadata
     result: Any | None = None  # populated after execution
     error: Exception | None = None  # populated if failed
+
+
+async def _get_element_id_by_xpath(xpath: str, page: Page) -> str | None:
+    locator = page.locator(f"xpath={xpath}")
+    element_id = await locator.get_attribute("unique_id")
+    return element_id
 
 
 class SkyvernPage:
@@ -208,17 +218,20 @@ class SkyvernPage:
             # Create action record. TODO: store more action fields
             kwargs = kwargs or {}
             # we're using "value" instead of "text" for input text actions interface
-            text = kwargs.get("value", "")
-            option_value = kwargs.get("option")
-            select_option = SelectOption(value=option_value) if option_value else None
+            text = None
+            select_option = None
             response: str | None = kwargs.get("response")
+            file_url = kwargs.get("file_url")
             if not response:
                 if action_type == ActionType.INPUT_TEXT:
                     text = str(call_result)
                     response = text
                 elif action_type == ActionType.SELECT_OPTION:
-                    if select_option:
-                        response = select_option.value
+                    option_value = str(call_result) or ""
+                    select_option = SelectOption(value=option_value)
+                    response = option_value
+                elif action_type == ActionType.UPLOAD_FILE:
+                    file_url = str(call_result)
 
             action = Action(
                 element_id="",
@@ -234,6 +247,7 @@ class SkyvernPage:
                 reasoning=f"Auto-generated action for {action_type.value}",
                 text=text,
                 option=select_option,
+                file_url=file_url,
                 response=response,
                 created_by="script",
             )
@@ -283,7 +297,8 @@ class SkyvernPage:
             if screenshot:
                 # Create a minimal Step object for artifact creation
                 step = await app.DATABASE.get_step(
-                    context.task_id, context.step_id, organization_id=context.organization_id
+                    context.step_id,
+                    organization_id=context.organization_id,
                 )
                 if not step:
                     return
@@ -415,17 +430,24 @@ class SkyvernPage:
         context = skyvern_context.current()
         value = value or ""
         transformed_value = value
+        element_id: str | None = None
+        organization_id = context.organization_id if context else None
+        task_id = context.task_id if context else None
+        step_id = context.step_id if context else None
+        workflow_run_id = context.workflow_run_id if context else None
+        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
         if ai_infer and intention:
             try:
                 prompt = context.prompt if context else None
                 # Build the element tree of the current page for the prompt
                 # clean up empty data values
                 data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
-                if (totp_identifier or totp_url) and context and context.organization_id and context.task_id:
+                if (totp_identifier or totp_url) and context and organization_id and task_id:
                     verification_code = await poll_verification_code(
-                        organization_id=context.organization_id,
-                        task_id=context.task_id,
-                        workflow_run_id=context.workflow_run_id,
+                        organization_id=organization_id,
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
                         totp_identifier=totp_identifier,
                         totp_verification_url=totp_url,
                     )
@@ -439,6 +461,10 @@ class SkyvernPage:
                         else:
                             data = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
 
+                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+                self.scraped_page = refreshed_page
+                # get the element_id by the xpath
+                element_id = await _get_element_id_by_xpath(xpath, self.page)
                 payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
                 script_generation_input_text_prompt = prompt_engine.load_prompt(
                     template="script-generation-input-text-generatiion",
@@ -449,7 +475,7 @@ class SkyvernPage:
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                     prompt=script_generation_input_text_prompt,
                     prompt_name="script-generation-input-text-generatiion",
-                    organization_id=context.organization_id if context else None,
+                    organization_id=organization_id,
                 )
                 value = json_response.get("answer", value)
             except Exception:
@@ -458,39 +484,119 @@ class SkyvernPage:
         if context and context.workflow_run_id:
             transformed_value = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, value)
 
-        locator = self.page.locator(f"xpath={xpath}")
-        await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
+        if element_id and organization_id and task and step:
+            action = InputTextAction(
+                element_id=element_id,
+                text=value,
+                status=ActionStatus.pending,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                task_id=task_id,
+                step_id=context.step_id if context else None,
+                reasoning=intention,
+                intention=intention,
+                response=value,
+            )
+            await handle_input_text_action(action, self.page, self.scraped_page, task, step)
+        else:
+            locator = self.page.locator(f"xpath={xpath}")
+            await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
         return value
 
     @action_wrap(ActionType.UPLOAD_FILE)
     async def upload_file(
-        self, xpath: str, file_path: str, intention: str | None = None, data: str | dict[str, Any] | None = None
-    ) -> None:
-        # if self.generate_response:
-        #     # TODO: regenerate file_path and xpath
-        #     pass
-        file = await download_file(file_path)
-        await self.page.set_input_files(xpath, file)
+        self,
+        xpath: str,
+        files: str,
+        ai_infer: bool = False,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> str:
+        if ai_infer and intention:
+            try:
+                context = skyvern_context.current()
+                prompt = context.prompt if context else None
+                data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
+                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                script_generation_file_url_prompt = prompt_engine.load_prompt(
+                    template="script-generation-file-url-generation",
+                    intention=intention,
+                    data=payload_str,
+                    goal=prompt,
+                )
+                json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                    prompt=script_generation_file_url_prompt,
+                    prompt_name="script-generation-file-url-generation",
+                    organization_id=context.organization_id if context else None,
+                )
+                files = json_response.get("answer", files)
+            except Exception:
+                LOG.exception(f"Failed to adapt value for input text action on xpath={xpath}, file={files}")
+        file_path = await download_file(files)
+        locator = self.page.locator(f"xpath={xpath}")
+        await locator.set_input_files(file_path)
+        return files
 
     @action_wrap(ActionType.SELECT_OPTION)
     async def select_option(
         self,
         xpath: str,
-        option: str,
+        value: str,
+        ai_infer: bool = False,
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> None:
-        # if self.generate_response:
-        #     # TODO: regenerate option
-        #     pass
-        locator = self.page.locator(f"xpath={xpath}")
-        try:
-            await locator.click(timeout=timeout)
-        except Exception:
-            print("Failed to click before select action")
-            return
-        await locator.select_option(option, timeout=timeout)
+    ) -> str:
+        option_value = value or ""
+        context = skyvern_context.current()
+        if context and context.task_id and context.step_id and context.organization_id:
+            task = await app.DATABASE.get_task(context.task_id, organization_id=context.organization_id)
+            step = await app.DATABASE.get_step(context.step_id, organization_id=context.organization_id)
+            if ai_infer and intention and task and step:
+                try:
+                    prompt = context.prompt if context else None
+                    data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
+                    payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                    refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+                    self.scraped_page = refreshed_page
+                    element_tree = refreshed_page.build_element_tree()
+                    merged_goal = SELECT_OPTION_GOAL.format(intention=intention, prompt=prompt)
+                    single_select_prompt = prompt_engine.load_prompt(
+                        template="single-select-action",
+                        navigation_payload_str=payload_str,
+                        navigation_goal=merged_goal,
+                        current_url=self.page.url,
+                        elements=element_tree,
+                        local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+                    )
+                    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(
+                        prompt=single_select_prompt,
+                        prompt_name="single-select-action",
+                        organization_id=context.organization_id if context else None,
+                    )
+                    actions = parse_actions(task, step.step_id, step.order, self.scraped_page, json_response["actions"])
+                    if actions:
+                        action = actions[0]
+                        if not action.option:
+                            raise ValueError("SelectOptionAction requires an 'option' field")
+                        option_value = action.option.value or action.option.label or ""
+                        await handle_select_option_action(
+                            action=action,
+                            page=self.page,
+                            scraped_page=self.scraped_page,
+                            task=task,
+                            step=step,
+                        )
+                    else:
+                        LOG.exception(
+                            f"Failed to parse actions for select option action on xpath={xpath}, value={value}"
+                        )
+                except Exception:
+                    LOG.exception(f"Failed to adapt value for select option action on xpath={xpath}, value={value}")
+        else:
+            locator = self.page.locator(f"xpath={xpath}")
+            await locator.select_option(option_value, timeout=timeout)
+        return option_value
 
     @action_wrap(ActionType.WAIT)
     async def wait(
@@ -556,7 +662,8 @@ class SkyvernPage:
         step = None
         if context and context.organization_id and context.task_id and context.step_id:
             step = await app.DATABASE.get_step(
-                task_id=context.task_id, step_id=context.step_id, organization_id=context.organization_id
+                step_id=context.step_id,
+                organization_id=context.organization_id,
             )
 
         result = await app.EXTRACTION_LLM_API_HANDLER(

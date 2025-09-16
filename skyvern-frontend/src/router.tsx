@@ -24,6 +24,7 @@ import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/Workfl
 import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
 import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
+import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode";
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
 
 const router = createBrowserRouter([
@@ -157,6 +158,12 @@ const router = createBrowserRouter([
                   {
                     path: "recording",
                     element: <WorkflowRunRecording />,
+                  },
+                  {
+                    path: "code",
+                    element: (
+                      <WorkflowRunCode showCacheKeyValueSelector={true} />
+                    ),
                   },
                 ],
               },

@@ -115,8 +115,12 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
  */
 const constructCacheKeyValue = (
   codeKey: string,
-  workflow: WorkflowApiResponse,
+  workflow?: WorkflowApiResponse,
 ) => {
+  if (!workflow) {
+    return "";
+  }
+
   const workflowParameters = getInitialParameters(workflow)
     .filter((p) => p.parameterType === "workflow")
     .reduce(

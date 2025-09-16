@@ -353,15 +353,69 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                     )
                 )
     elif method == "select_option":
+        option = act.get("option", {})
+        value = option.get("value")
+        if value:
+            if act.get("field_name"):
+                option_value = cst.Subscript(
+                    value=cst.Attribute(
+                        value=cst.Name("context"),
+                        attr=cst.Name("parameters"),
+                    ),
+                    slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
+                )
+            else:
+                option_value = _value(value)
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("value"),
+                    value=option_value,
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                ),
+            )
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("ai_infer"),
+                    value=cst.Name("True"),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+    elif method == "upload_file":
+        if act.get("field_name"):
+            file_url_value = cst.Subscript(
+                value=cst.Attribute(
+                    value=cst.Name("context"),
+                    attr=cst.Name("parameters"),
+                ),
+                slice=[cst.SubscriptElement(slice=cst.Index(value=_value(act["field_name"])))],
+            )
+        else:
+            file_url_value = _value(act["file_url"])
         args.append(
             cst.Arg(
-                keyword=cst.Name("option"),
-                value=_value(act["option"]["value"]),
+                keyword=cst.Name("files"),
+                value=file_url_value,
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
                 ),
-            ),
+            )
+        )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("ai_infer"),
+                value=cst.Name("True"),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
         )
     elif method == "wait":
         args.append(

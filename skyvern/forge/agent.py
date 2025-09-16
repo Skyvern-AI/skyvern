@@ -80,9 +80,8 @@ from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, 
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services import run_service
+from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
-from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -1669,7 +1668,7 @@ class ForgeAgent:
         )
         scroll = True
         llm_key_override = task.llm_key
-        if await is_cua_task(task=task):
+        if await service_utils.is_cua_task(task=task):
             scroll = False
             llm_key_override = None
 
@@ -2709,7 +2708,7 @@ class ForgeAgent:
                 steps_results.append(step_result)
 
             scroll = True
-            if await is_cua_task(task=task):
+            if await service_utils.is_cua_task(task=task):
                 scroll = False
 
             screenshots: list[bytes] = []
@@ -2971,7 +2970,7 @@ class ForgeAgent:
                 verification_code_check=False,
             )
             llm_key_override = task.llm_key
-            if await is_cua_task(task=task):
+            if await service_utils.is_cua_task(task=task):
                 llm_key_override = None
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 llm_key_override, default=app.LLM_API_HANDLER

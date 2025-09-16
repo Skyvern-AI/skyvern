@@ -36,7 +36,7 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
-import { NodeFooter } from "../components/NodeFooter";
+import { NodeTabs } from "../components/NodeTabs";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -278,7 +278,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
               </AccordionContent>
             </AccordionItem>
           </Accordion>
-          <NodeFooter blockLabel={label} />
+          <NodeTabs blockLabel={label} />
         </div>
       </div>
       <BlockCodeEditor blockLabel={label} blockType={type} script={script} />

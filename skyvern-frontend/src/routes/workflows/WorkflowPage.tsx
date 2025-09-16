@@ -1,3 +1,6 @@
+import { LightningBoltIcon } from "@radix-ui/react-icons";
+
+import { Tip } from "@/components/Tip";
 import { Status } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
@@ -129,34 +132,50 @@ function WorkflowPage() {
                   <TableCell colSpan={3}>No workflow runs found</TableCell>
                 </TableRow>
               ) : (
-                workflowRuns?.map((workflowRun) => (
-                  <TableRow
-                    key={workflowRun.workflow_run_id}
-                    onClick={(event) => {
-                      if (event.ctrlKey || event.metaKey) {
-                        window.open(
-                          window.location.origin +
-                            `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
-                          "_blank",
-                          "noopener,noreferrer",
+                workflowRuns?.map((workflowRun) => {
+                  const workflowRunId =
+                    workflowRun.script_run === true ? (
+                      <div className="flex items-center gap-2">
+                        <Tip content="Ran with code">
+                          <LightningBoltIcon className="text-[gold]" />
+                        </Tip>
+                        <span>{workflowRun.workflow_run_id ?? ""}</span>
+                      </div>
+                    ) : (
+                      workflowRun.workflow_run_id ?? ""
+                    );
+
+                  return (
+                    <TableRow
+                      key={workflowRun.workflow_run_id}
+                      onClick={(event) => {
+                        if (event.ctrlKey || event.metaKey) {
+                          window.open(
+                            window.location.origin +
+                              `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
+                            "_blank",
+                            "noopener,noreferrer",
+                          );
+                          return;
+                        }
+                        navigate(
+                          `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
                         );
-                        return;
-                      }
-                      navigate(
-                        `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
-                      );
-                    }}
-                    className="cursor-pointer"
-                  >
-                    <TableCell>{workflowRun.workflow_run_id}</TableCell>
-                    <TableCell>
-                      <StatusBadge status={workflowRun.status} />
-                    </TableCell>
-                    <TableCell title={basicTimeFormat(workflowRun.created_at)}>
-                      {basicLocalTimeFormat(workflowRun.created_at)}
-                    </TableCell>
-                  </TableRow>
-                ))
+                      }}
+                      className="cursor-pointer"
+                    >
+                      <TableCell>{workflowRunId}</TableCell>
+                      <TableCell>
+                        <StatusBadge status={workflowRun.status} />
+                      </TableCell>
+                      <TableCell
+                        title={basicTimeFormat(workflowRun.created_at)}
+                      >
+                        {basicLocalTimeFormat(workflowRun.created_at)}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })
               )}
             </TableBody>
           </Table>

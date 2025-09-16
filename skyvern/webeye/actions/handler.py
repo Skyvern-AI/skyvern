@@ -69,8 +69,8 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
+from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
-from skyvern.services.task_v1_service import is_cua_task
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
@@ -3599,7 +3599,7 @@ async def extract_information_for_navigation_goal(
     )
 
     llm_key_override = task.llm_key
-    if await is_cua_task(task=task):
+    if await service_utils.is_cua_task(task=task):
         # CUA tasks should use the default data extraction llm key
         llm_key_override = None
 

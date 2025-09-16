@@ -326,7 +326,7 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
-    async def get_step(self, task_id: str, step_id: str, organization_id: str | None = None) -> Step | None:
+    async def get_step(self, step_id: str, organization_id: str | None = None) -> Step | None:
         try:
             async with self.Session() as session:
                 if step := (
@@ -588,7 +588,7 @@ class AgentDB:
                         step.cached_token_count = incremental_cached_tokens + (step.cached_token_count or 0)
 
                     await session.commit()
-                    updated_step = await self.get_step(task_id, step_id, organization_id)
+                    updated_step = await self.get_step(step_id, organization_id)
                     if not updated_step:
                         raise NotFoundError("Step not found")
                     return updated_step
