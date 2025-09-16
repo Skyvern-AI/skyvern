@@ -1,4 +1,7 @@
 import styles from "./RunHistory.module.css";
+import { LightningBoltIcon } from "@radix-ui/react-icons";
+
+import { Tip } from "@/components/Tip";
 import { Status, Task, WorkflowRunApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
@@ -173,6 +176,19 @@ function RunHistory() {
                       </TableRow>
                     );
                   }
+
+                  const workflowTitle =
+                    (run as any).script_run === true ? (
+                      <div className="flex items-center gap-2">
+                        <span title="Ran with code">
+                          <LightningBoltIcon className="text-[gold]" />
+                        </span>
+                        <span>{run.workflow_title ?? ""}</span>
+                      </div>
+                    ) : (
+                      run.workflow_title ?? ""
+                    );
+
                   return (
                     <TableRow
                       key={run.workflow_run_id}
@@ -194,7 +210,7 @@ function RunHistory() {
                         className="max-w-0 truncate"
                         title={run.workflow_title ?? undefined}
                       >
-                        {run.workflow_title ?? ""}
+                        {workflowTitle}
                       </TableCell>
                       <TableCell>
                         <StatusBadge status={run.status} />

@@ -19,7 +19,7 @@ interface Props {
   blockLabel: string;
 }
 
-function NodeFooter({ blockLabel }: Props) {
+function NodeTabs({ blockLabel }: Props) {
   const { blockLabel: urlBlockLabel } = useParams();
   const blockOutput = useBlockOutputStore((state) => state.outputs[blockLabel]);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -61,46 +61,61 @@ function NodeFooter({ blockLabel }: Props) {
           </div>
         </div>
       </div>
-      <div className="relative flex w-full overflow-visible bg-[pink]">
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div
-                className={cn(
-                  "absolute bottom-[-2.25rem] right-[-0.75rem] flex h-[2.5rem] w-[2.5rem] items-center justify-center gap-2 rounded-[50%] bg-slate-elevation3 p-2",
-                  {
-                    "opacity-100 outline outline-2 outline-slate-300":
-                      thisBlockIsTargetted,
-                  },
-                )}
-              >
-                <Button
-                  variant="link"
-                  size="sm"
+      <div
+        className={cn(
+          "absolute right-[-1rem] top-0 h-[6rem] w-[2rem] overflow-visible",
+          { "top-[2.5rem]": thisBlockIsTargetted },
+        )}
+      >
+        <div className="relative flex h-full w-full items-start justify-center gap-1 overflow-visible">
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div
                   className={cn(
-                    "p-0 opacity-80 hover:translate-y-[-1px] hover:opacity-100 active:translate-y-[0px]",
-                    { "opacity-100": isExpanded },
+                    "flex h-[2.5rem] w-[2.5rem] min-w-[2.5rem] rotate-[-90deg] items-center justify-center gap-2 rounded-[50%] bg-slate-elevation3 p-2",
+                    {
+                      "opacity-100 outline outline-2 outline-slate-300":
+                        thisBlockIsTargetted,
+                    },
+                    {
+                      "hover:translate-x-[1px] active:translate-x-[0px]":
+                        blockOutput,
+                    },
                   )}
-                  onClick={() => {
-                    setIsExpanded(!isExpanded);
-                  }}
                 >
-                  {isExpanded ? (
-                    <CrossCircledIcon className="scale-[110%]" />
-                  ) : (
-                    <OutputIcon className="scale-[80%]" />
-                  )}
-                </Button>
-              </div>
-            </TooltipTrigger>
-            <TooltipContent>
-              {isExpanded ? "Close Outputs" : "Open Outputs"}
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+                  <Button
+                    variant="link"
+                    size="sm"
+                    disabled={!blockOutput}
+                    className={cn("p-0 opacity-80 hover:opacity-100", {
+                      "opacity-100": isExpanded,
+                    })}
+                    onClick={() => {
+                      setIsExpanded(!isExpanded);
+                    }}
+                  >
+                    {isExpanded ? (
+                      <CrossCircledIcon className="scale-[110%]" />
+                    ) : (
+                      <OutputIcon className="scale-[80%]" />
+                    )}
+                  </Button>
+                </div>
+              </TooltipTrigger>
+              <TooltipContent>
+                {!blockOutput
+                  ? "No outputs. Run block first."
+                  : isExpanded
+                    ? "Close Outputs"
+                    : "Open Outputs"}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        </div>
       </div>
     </>
   );
 }
 
-export { NodeFooter };
+export { NodeTabs };
