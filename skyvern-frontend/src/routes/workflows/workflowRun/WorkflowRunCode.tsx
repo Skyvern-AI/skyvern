@@ -18,57 +18,11 @@ import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValu
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
-import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 
 interface Props {
   showCacheKeyValueSelector?: boolean;
 }
-
-const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
-  if (!workflow) {
-    return [];
-  }
-
-  const blockLabels = workflow.workflow_definition.blocks.map(
-    (block) => block.label,
-  );
-
-  return blockLabels;
-};
-
-const getCommentForBlockWithoutCode = (blockLabel: string) => {
-  return `
-  # If the "Generate Code" option is turned on for this workflow when it runs, AI will execute block '${blockLabel}', and generate code for it.
-`;
-};
-
-const getCode = (
-  orderedBlockLabels: string[],
-  blockScripts?: {
-    [blockName: string]: string;
-  },
-): string[] => {
-  const blockCode: string[] = [];
-  const startBlockCode = blockScripts?.__start_block__;
-
-  if (startBlockCode) {
-    blockCode.push(startBlockCode);
-  }
-
-  for (const blockLabel of orderedBlockLabels) {
-    const code = blockScripts?.[blockLabel];
-
-    if (!code) {
-      blockCode.push(getCommentForBlockWithoutCode(blockLabel));
-      continue;
-    }
-
-    blockCode.push(`${code}
-`);
-  }
-
-  return blockCode;
-};
 
 function WorkflowRunCode(props?: Props) {
   const showCacheKeyValueSelector = props?.showCacheKeyValueSelector ?? false;
