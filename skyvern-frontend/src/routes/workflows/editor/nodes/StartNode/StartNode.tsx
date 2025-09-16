@@ -2,13 +2,6 @@ import { getClient } from "@/api/AxiosClient";
 import { Handle, Node, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { StartNode } from "./types";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { Button } from "@/components/ui/button";
-import {
   Accordion,
   AccordionContent,
   AccordionItem,
@@ -42,7 +35,6 @@ import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { cn } from "@/util/utils";
-import { LightningBoltIcon } from "@radix-ui/react-icons";
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
@@ -115,19 +107,20 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     );
   }
 
-  function showAllScripts() {
-    for (const node of reactFlowInstance.getNodes()) {
-      const label = node.data.label;
+  // NOTE(jdo): keeping for reference; we seem to revert stuff all the time
+  // function showAllScripts() {
+  //   for (const node of reactFlowInstance.getNodes()) {
+  //     const label = node.data.label;
 
-      label &&
-        nodeIsFlippable(node) &&
-        typeof label === "string" &&
-        toggleScriptForNodeCallback({
-          label,
-          show: true,
-        });
-    }
-  }
+  //     label &&
+  //       nodeIsFlippable(node) &&
+  //       typeof label === "string" &&
+  //       toggleScriptForNodeCallback({
+  //         label,
+  //         show: true,
+  //       });
+  //   }
+  // }
 
   function hideAllScripts() {
     for (const node of reactFlowInstance.getNodes()) {
@@ -160,20 +153,6 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
             )}
           >
             <div className="relative">
-              <div className="absolute right-[-0.5rem] top-[-0.25rem]">
-                <div>
-                  <Button variant="link" size="icon" onClick={showAllScripts}>
-                    <TooltipProvider>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-                        </TooltipTrigger>
-                        <TooltipContent>Show all code</TooltipContent>
-                      </Tooltip>
-                    </TooltipProvider>
-                  </Button>
-                </div>
-              </div>
               <header className="mb-6 mt-2">Start</header>
               <Separator />
               <Accordion
