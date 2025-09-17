@@ -124,6 +124,7 @@ class Settings(BaseSettings):
     PARSE_SELECT_LLM_KEY: str | None = None
     EXTRACTION_LLM_KEY: str | None = None
     CHECK_USER_GOAL_LLM_KEY: str | None = None
+    AUTO_COMPLETION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
