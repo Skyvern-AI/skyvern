@@ -42,7 +42,7 @@ jobs:
               echo "GIT_USERNAME=Jonathan Dobson" >> $GITHUB_OUTPUT
               ;;
             pedrohsdb)
-              echo "GH_PAT=${{ secrets.PEDROHSDB_GH_PAT }}" >> $GITHUB_OUTPUT
+              echo "GH_PAT=${{ secrets.PEDROHSDB_GH_PAT_FINE }}" >> $GITHUB_OUTPUT
               echo "GIT_EMAIL=pedro@skyvern.com" >> $GITHUB_OUTPUT
               echo "GIT_USERNAME=pedrohsdb" >> $GITHUB_OUTPUT
               ;;
