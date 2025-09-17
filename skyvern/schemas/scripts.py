@@ -154,3 +154,8 @@ class ScriptBlocksResponse(BaseModel):
 class ScriptBlocksRequest(BaseModel):
     cache_key_value: str
     cache_key: str | None = None
+
+
+class ScriptStatus(StrEnum):
+    published = "published"
+    draft = "draft"
