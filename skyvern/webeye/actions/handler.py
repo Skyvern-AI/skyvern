@@ -753,7 +753,7 @@ async def handle_sequential_click_for_dropdown(
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
-    response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
+    response = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt,
         step=step,
         prompt_name="check-user-goal",
