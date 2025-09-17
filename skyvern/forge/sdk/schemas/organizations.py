@@ -21,14 +21,27 @@ class Organization(BaseModel):
     modified_at: datetime
 
 
-class OrganizationAuthToken(BaseModel):
+class OrganizationAuthTokenBase(BaseModel):
     id: str
     organization_id: str
     token_type: OrganizationAuthTokenType
-    token: str
     valid: bool
     created_at: datetime
     modified_at: datetime
+
+
+class OrganizationAuthToken(OrganizationAuthTokenBase):
+    token: str
+
+
+class AzureOrganizationAuthToken(OrganizationAuthTokenBase):
+    # TODO (Stas): add docs
+    class AzureClientSecretCredential(BaseModel):
+        tenant_id: str
+        client_id: str
+        client_secret: str
+
+    credential: AzureClientSecretCredential
 
 
 class CreateOnePasswordTokenRequest(BaseModel):
@@ -48,6 +61,22 @@ class CreateOnePasswordTokenResponse(BaseModel):
         ...,
         description="The created or updated 1Password service account token",
     )
+
+
+class AzureClientSecretCredentialResponse(BaseModel):
+    """Response model for Azure ClientSecretCredential operations."""
+
+    token: AzureOrganizationAuthToken = Field(
+        ...,
+        description="The created or updated Azure ClientSecretCredential",
+    )
+
+
+class CreateAzureClientSecretCredentialRequest(BaseModel):
+    """Request model for creating or updating an Azure ClientSecretCredential."""
+
+    # TODO (Stas): add docs
+    credential: AzureOrganizationAuthToken.AzureClientSecretCredential
 
 
 class GetOrganizationsResponse(BaseModel):

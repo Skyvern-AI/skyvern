@@ -21,6 +21,8 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredentialResponse,
 )
 from skyvern.forge.sdk.schemas.organizations import (
+    AzureClientSecretCredentialResponse,
+    CreateAzureClientSecretCredentialRequest,
     CreateOnePasswordTokenRequest,
     CreateOnePasswordTokenResponse,
     Organization,
@@ -477,4 +479,108 @@ async def update_onepassword_token(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to create or update OnePassword service account token: {str(e)}",
+        )
+
+
+@base_router.get(
+    "/credentials/azure_client_secret_credential/get",
+    response_model=AzureClientSecretCredentialResponse,
+    summary="Get Azure Client Secret Credential",
+    description="Retrieves the current Azure Client Secret Credential for the organization.",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/azure_client_secret_credential/get/",
+    response_model=AzureClientSecretCredentialResponse,
+    include_in_schema=False,
+)
+async def get_azure_client_secret_credential(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> AzureClientSecretCredentialResponse:
+    """
+    Get the current Azure Client Secret Credential for the organization.
+    """
+    try:
+        auth_token = await app.DATABASE.get_valid_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.azure_client_secret_credential,
+        )
+        if not auth_token:
+            raise HTTPException(
+                status_code=404,
+                detail="No Azure Client Secret Credential found for this organization",
+            )
+
+        return AzureClientSecretCredentialResponse(token=auth_token)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        LOG.error(
+            "Failed to get Azure Client Secret Credential",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get Azure Client Secret Credential: {str(e)}",
+        )
+
+
+@base_router.post(
+    "/credentials/azure_client_secret_credential/create",
+    response_model=AzureClientSecretCredentialResponse,
+    summary="Create or update Azure Client Secret Credential",
+    description="Creates or updates a Azure Client Secret Credential for the current organization. Only one valid record is allowed per organization.",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/credentials/azure_client_secret_credential/create/",
+    response_model=AzureClientSecretCredentialResponse,
+    include_in_schema=False,
+)
+async def update_azure_client_secret_credential(
+    request: CreateAzureClientSecretCredentialRequest,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> AzureClientSecretCredentialResponse:
+    """
+    Create or update an Azure Client Secret Credential for the current organization.
+
+    This endpoint ensures only one valid Azure Client Secret Credential exists per organization.
+    If a valid token already exists, it will be invalidated before creating the new one.
+    """
+    try:
+        # Invalidate any existing valid Azure Client Secret Credential for this organization
+        await app.DATABASE.invalidate_org_auth_tokens(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.azure_client_secret_credential,
+        )
+
+        # Create the new token
+        auth_token = await app.DATABASE.create_org_auth_token(
+            organization_id=current_org.organization_id,
+            token_type=OrganizationAuthTokenType.azure_client_secret_credential,
+            token=request.credential,
+            encrypted_method=None, # TODO (Stas): implement encryption
+        )
+
+        LOG.info(
+            "Created or updated Azure Client Secret Credential",
+            organization_id=current_org.organization_id,
+            token_id=auth_token.id,
+        )
+
+        return AzureClientSecretCredentialResponse(token=auth_token)
+
+    except Exception as e:
+        LOG.error(
+            "Failed to create or update Azure Client Secret Credential",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create or update Azure Client Secret Credential: {str(e)}",
         )
