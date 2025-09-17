@@ -3723,7 +3723,8 @@ async def _get_input_or_select_context(
         action_reasoning=action.reasoning,
         element_id=action.element_id,
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
+    # Use centralized parse-select handler (set at init or via scripts)
+    json_response = await app.PARSE_SELECT_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
     json_response["intention"] = action.intention
