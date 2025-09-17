@@ -8673,6 +8673,17 @@
         "title": "ScriptFileCreate",
         "description": "Model representing a file in a script."
       },
+      "ScriptRunResponse": {
+        "properties": {
+          "ai_fallback_triggered": {
+            "type": "boolean",
+            "title": "Ai Fallback Triggered",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ScriptRunResponse"
+      },
       "SelectOption": {
         "properties": {
           "label": {
@@ -10082,6 +10093,17 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
+          },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
           },
           "run_type": {
             "type": "string",
@@ -13232,6 +13254,17 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
+          },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
           },
           "run_type": {
             "type": "string",
