@@ -1461,7 +1461,7 @@ async def wrapper():
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
             if browser_state:
                 LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
         else:
