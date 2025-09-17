@@ -893,7 +893,9 @@ class WorkflowScriptModel(Base):
     __tablename__ = "workflow_scripts"
     __table_args__ = (
         Index("idx_workflow_scripts_org_created", "organization_id", "created_at"),
-        Index("idx_workflow_scripts_wpid_cache_key_value", "workflow_permanent_id", "cache_key_value"),
+        Index(
+            "idx_workflow_scripts_wpid_cache_key_value", "workflow_permanent_id", "cache_key_value", "workflow_run_id"
+        ),
     )
 
     workflow_script_id = Column(String, primary_key=True, default=generate_workflow_script_id)
@@ -904,6 +906,7 @@ class WorkflowScriptModel(Base):
     workflow_run_id = Column(String, nullable=True)
     cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
     cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
+    status = Column(String, nullable=True, default="published")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
