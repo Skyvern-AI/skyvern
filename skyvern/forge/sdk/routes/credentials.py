@@ -562,7 +562,7 @@ async def update_azure_client_secret_credential(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
             token=request.credential,
-            encrypted_method=None, # TODO (Stas): implement encryption
+            encrypted_method=None,  # TODO (Stas): implement encryption
         )
 
         LOG.info(
