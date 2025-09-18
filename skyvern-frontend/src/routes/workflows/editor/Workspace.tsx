@@ -379,7 +379,7 @@ function Workspace({
       const client = await getClient(credentialGetter, "sans-api-v1");
       const encodedCacheKeyValue = encodeURIComponent(cacheKeyValue);
       return client.delete(
-        `/scripts/${workflowPermanentId}/value/?cache-key-value=${encodedCacheKeyValue}`,
+        `/scripts/${workflowPermanentId}/value?cache-key-value=${encodedCacheKeyValue}`,
       );
     },
     onSuccess: () => {
