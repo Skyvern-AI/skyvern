@@ -79,6 +79,7 @@ class Workflow(BaseModel):
     generate_script: bool = False
     ai_fallback: bool = False
     cache_key: str | None = None
+    run_sequentially: bool | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -136,6 +137,7 @@ class WorkflowRun(BaseModel):
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
+    job_id: str | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None

@@ -247,6 +247,7 @@ class WorkflowModel(Base):
     generate_script = Column(Boolean, default=False, nullable=False)
     ai_fallback = Column(Boolean, default=False, nullable=False)
     cache_key = Column(String, nullable=True)
+    run_sequentially = Column(Boolean, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -284,6 +285,7 @@ class WorkflowRunModel(Base):
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
+    job_id = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
