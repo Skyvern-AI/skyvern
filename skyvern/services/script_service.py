@@ -47,6 +47,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import CreateScriptResponse, FileEncoding, FileNode, ScriptFileCreate
 from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
+from functools import lru_cache
 
 LOG = structlog.get_logger(__name__)
 jinja_sandbox_env = SandboxedEnvironment()
@@ -1513,7 +1514,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     TODO: complete this function so that block code shares the same template rendering logic
     """
     template_data = data or {}
-    jinja_template = jinja_sandbox_env.from_string(template)
+    jinja_template = _get_compiled_template(template)
     context = skyvern_context.current()
     if context and context.workflow_run_id:
         workflow_run_id = context.workflow_run_id
@@ -1767,3 +1768,8 @@ async def prompt(
         browser_session_id=block_validation_output.browser_session_id,
     )
     return result.output_parameter_value
+
+
+@lru_cache(maxsize=128)
+def _get_compiled_template(template: str):
+    return jinja_sandbox_env.from_string(template)
