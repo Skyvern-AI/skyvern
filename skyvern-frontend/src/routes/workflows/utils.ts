@@ -91,12 +91,6 @@ export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
   return blockLabels;
 };
 
-const getCommentForBlockWithoutCode = (blockLabel: string) => {
-  return `
-  # block '${blockLabel}' code goes here
-`;
-};
-
 export const getCode = (
   orderedBlockLabels: string[],
   blockScripts?: {
@@ -114,7 +108,6 @@ export const getCode = (
     const code = blockScripts?.[blockLabel];
 
     if (!code) {
-      blockCode.push(getCommentForBlockWithoutCode(blockLabel));
       continue;
     }
 

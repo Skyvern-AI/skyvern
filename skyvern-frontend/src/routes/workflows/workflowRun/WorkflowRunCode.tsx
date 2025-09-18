@@ -54,7 +54,7 @@ function WorkflowRunCode(props?: Props) {
     pollIntervalMs: !isFinalized ? 3000 : undefined,
   });
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScripts).join("");
+  const code = getCode(orderedBlockLabels, blockScripts).join("").trim();
 
   useEffect(() => {
     setCacheKeyValue(
