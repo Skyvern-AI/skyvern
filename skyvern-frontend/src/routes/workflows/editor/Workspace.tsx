@@ -1,11 +1,13 @@
 import { AxiosError } from "axios";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, MutableRefObject } from "react";
 import { nanoid } from "nanoid";
 import {
   ChevronRightIcon,
   ChevronLeftIcon,
   GlobeIcon,
   ReloadIcon,
+  CheckIcon,
+  CopyIcon,
 } from "@radix-ui/react-icons";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useEdgesState, useNodesState, Edge } from "@xyflow/react";
@@ -42,6 +44,7 @@ import {
 import { toast } from "@/components/ui/use-toast";
 import { BrowserStream } from "@/components/BrowserStream";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
+import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -50,6 +53,7 @@ import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
+import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 
 import { cn } from "@/util/utils";
 
@@ -69,7 +73,6 @@ import {
   startNode,
 } from "./workflowEditorUtils";
 import { constructCacheKeyValue } from "./utils";
-
 import "./workspace-styles.css";
 
 const Constants = {
@@ -89,6 +92,26 @@ export type AddNodeProps = {
   parent?: string;
   connectingEdgeType: string;
 };
+
+interface Dom {
+  splitLeft: MutableRefObject<HTMLInputElement | null>;
+}
+
+function CopyText({ text }: { text: string }) {
+  const [wasCopied, setWasCopied] = useState(false);
+
+  function handleCopy(code: string) {
+    navigator.clipboard.writeText(code);
+    setWasCopied(true);
+    setTimeout(() => setWasCopied(false), 2000);
+  }
+
+  return (
+    <Button size="icon" variant="link" onClick={() => handleCopy(text)}>
+      {wasCopied ? <CheckIcon /> : <CopyIcon />}
+    </Button>
+  );
+}
 
 function Workspace({
   initialNodes,
@@ -143,8 +166,17 @@ function Workspace({
       ? ""
       : cacheKeyValueParam
         ? cacheKeyValueParam
-        : constructCacheKeyValue(cacheKey, workflow),
+        : constructCacheKeyValue({ codeKey: cacheKey, workflow }),
   );
+
+  const [showAllCode, setShowAllCode] = useState(false);
+  const [leftSideLayoutMode, setLeftSideLayoutMode] = useState<
+    "single" | "side-by-side"
+  >("single");
+
+  const dom: Dom = {
+    splitLeft: useRef<HTMLInputElement>(null),
+  };
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -400,6 +432,32 @@ function Workspace({
     };
   }, [debugSession, shouldFetchDebugSession, workflowPermanentId, queryClient]);
 
+  useEffect(() => {
+    const splitLeft = dom.splitLeft.current;
+
+    if (!splitLeft) {
+      return;
+    }
+
+    const parent = splitLeft.parentElement;
+
+    if (!parent) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      setLeftSideLayoutMode(
+        parent.offsetWidth < 1100 ? "single" : "side-by-side",
+      );
+    });
+
+    observer.observe(parent);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [dom.splitLeft]);
+
   function doLayout(nodes: Array<AppNode>, edges: Array<Edge>) {
     const layoutedElements = layout(nodes, edges);
     setNodes(layoutedElements.nodes);
@@ -507,6 +565,9 @@ function Workspace({
       openCacheKeyValuesPanel();
     }
   }
+
+  const orderedBlockLabels = getOrderedBlockLabels(workflow);
+  const code = getCode(orderedBlockLabels, blockScripts).join("");
 
   return (
     <div className="relative h-full w-full">
@@ -631,6 +692,7 @@ function Workspace({
             workflowPanelState.active &&
             workflowPanelState.content === "parameters"
           }
+          showAllCode={showAllCode}
           workflow={workflow}
           onCacheKeyValueAccept={(v) => {
             setCacheKeyValue(v ?? "");
@@ -695,6 +757,9 @@ function Workspace({
           }}
           onRun={() => {
             closeWorkflowPanel();
+          }}
+          onShowAllCodeClick={() => {
+            setShowAllCode(!showAllCode);
           }}
         />
       </div>
@@ -806,7 +871,7 @@ function Workspace({
         </div>
       )}
 
-      {/* infinite canvas, browser, and timeline when in debug mode */}
+      {/* code, infinite canvas, browser, and timeline when in debug mode */}
       {showBrowser && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
@@ -816,21 +881,64 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* infinite canvas */}
-            <div className="skyvern-split-left h-full w-full">
-              <FlowRenderer
-                hideBackground={true}
-                hideControls={true}
-                nodes={nodes}
-                edges={edges}
-                setNodes={setNodes}
-                setEdges={setEdges}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                initialTitle={initialTitle}
-                workflow={workflow}
-                onContainerResize={containerResizeTrigger}
-              />
+            {/* code and infinite canvas */}
+            <div className="relative h-full w-full">
+              <div
+                className={cn(
+                  "skyvern-split-left flex h-full w-[200%] translate-x-[-50%] transition-none duration-300",
+                  {
+                    "w-[100%] translate-x-0":
+                      leftSideLayoutMode === "side-by-side",
+                  },
+                  {
+                    "translate-x-0": showAllCode,
+                  },
+                )}
+                ref={dom.splitLeft}
+              >
+                {/* code */}
+                <div
+                  className={cn("h-full w-[50%]", {
+                    "w-[0%]":
+                      leftSideLayoutMode === "side-by-side" && !showAllCode,
+                  })}
+                >
+                  <div className="relative mt-[8.5rem] w-full p-6 pr-5 pt-0">
+                    <div className="absolute right-[1.25rem] top-0 z-20">
+                      <CopyText text={code} />
+                    </div>
+                    <CodeEditor
+                      className="w-full overflow-y-scroll"
+                      language="python"
+                      value={code}
+                      lineWrap={false}
+                      readOnly
+                      fontSize={10}
+                    />
+                  </div>
+                </div>
+                {/* infinite canvas */}
+                <div
+                  className={cn("h-full w-[50%]", {
+                    "w-[100%]":
+                      leftSideLayoutMode === "side-by-side" && !showAllCode,
+                  })}
+                >
+                  <FlowRenderer
+                    hideBackground={true}
+                    hideControls={true}
+                    nodes={nodes}
+                    edges={edges}
+                    setNodes={setNodes}
+                    setEdges={setEdges}
+                    onNodesChange={onNodesChange}
+                    onEdgesChange={onEdgesChange}
+                    initialTitle={initialTitle}
+                    workflow={workflow}
+                    onContainerResize={containerResizeTrigger}
+                  />
+                </div>
+              </div>
             </div>
 
             {/* browser & timeline */}

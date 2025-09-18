@@ -753,7 +753,7 @@ async def handle_sequential_click_for_dropdown(
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
-    response = await app.SECONDARY_LLM_API_HANDLER(
+    response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
         step=step,
         prompt_name="check-user-goal",
@@ -2323,7 +2323,7 @@ async def choose_auto_completion_dropdown(
             step_id=step.step_id,
             task_id=task.task_id,
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(
+        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
             prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
         )
         element_id = json_response.get("id", "")
@@ -3723,7 +3723,8 @@ async def _get_input_or_select_context(
         action_reasoning=action.reasoning,
         element_id=action.element_id,
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
+    # Use centralized parse-select handler (set at init or via scripts)
+    json_response = await app.PARSE_SELECT_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
     json_response["intention"] = action.intention

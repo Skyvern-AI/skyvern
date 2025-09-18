@@ -247,6 +247,7 @@ export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "login",
   "navigation",
   "task",
+  "task_v2",
   "validation",
 ]);
 
