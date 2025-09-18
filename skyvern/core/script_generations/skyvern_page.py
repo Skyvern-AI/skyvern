@@ -779,8 +779,10 @@ class ScriptRunContextManager:
     def set_cached_fn(self, cache_key: str, fn: Callable) -> None:
         self.cached_fns[cache_key] = fn
 
-    def get_cached_fn(self, cache_key: str) -> Callable | None:
-        return self.cached_fns.get(cache_key)
+    def get_cached_fn(self, cache_key: str | None = None) -> Callable | None:
+        if cache_key:
+            return self.cached_fns.get(cache_key)
+        return None
 
 
 script_run_context_manager = ScriptRunContextManager()

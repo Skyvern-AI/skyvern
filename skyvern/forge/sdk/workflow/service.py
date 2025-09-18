@@ -2620,6 +2620,7 @@ class WorkflowService:
                 workflow=codegen_input.workflow,
                 blocks=codegen_input.workflow_blocks,
                 actions_by_task=codegen_input.actions_by_task,
+                task_v2_child_blocks=codegen_input.task_v2_child_blocks,
                 organization_id=workflow.organization_id,
                 script_id=created_script.script_id,
                 script_revision_id=created_script.script_revision_id,
