@@ -7,7 +7,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import libcst as cst
 import structlog
@@ -29,16 +29,20 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import (
+    ActionBlock,
     CodeBlock,
+    ExtractionBlock,
+    FileDownloadBlock,
     FileParserBlock,
     FileUploadBlock,
     HttpRequestBlock,
+    LoginBlock,
     SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
     UrlBlock,
 )
-from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
+from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import CreateScriptResponse, FileEncoding, FileNode, ScriptFileCreate
@@ -438,7 +442,16 @@ async def _record_output_parameter_value(
     # get the output_paramter
     output_parameter = workflow.get_output_parameter(label)
     if not output_parameter:
-        return
+        # NOT sure if this is legit hack to create output parameter like this
+        label = label or f"block_{uuid.uuid4()}"
+        output_parameter = OutputParameter(
+            output_parameter_id=str(uuid.uuid4()),
+            key=f"{label}_output",
+            workflow_id=workflow_id,
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+            parameter_type=ParameterType.OUTPUT,
+        )
 
     await workflow_run_context.register_output_parameter_value_post_execution(
         parameter=output_parameter,
@@ -527,14 +540,9 @@ async def _update_workflow_block(
         )
 
 
-async def _run_cached_function(cache_key: str) -> Any:
-    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
-    if cached_fn:
-        # TODO: handle exceptions here and fall back to AI run in case of error
-        run_context = script_run_context_manager.ensure_run_context()
-        return await cached_fn(page=run_context.page, context=run_context)
-    else:
-        raise Exception(f"Cache key {cache_key} not found")
+async def _run_cached_function(cached_fn: Callable) -> Any:
+    run_context = script_run_context_manager.ensure_run_context()
+    return await cached_fn(page=run_context.page, context=run_context)
 
 
 async def _fallback_to_ai_run(
@@ -623,13 +631,15 @@ async def _fallback_to_ai_run(
         # get the output_paramter
         output_parameter = workflow.get_output_parameter(cache_key)
         if not output_parameter:
-            LOG.exception(
-                "Output parameter not found for the workflow",
+            # NOT sure if this is legit hack to create output parameter like this
+            output_parameter = OutputParameter(
+                output_parameter_id=str(uuid.uuid4()),
+                key=f"{cache_key}_output",
                 workflow_id=workflow_id,
-                workflow_permanent_id=workflow_permanent_id,
-                workflow_run_id=workflow_run_id,
+                created_at=datetime.now(),
+                modified_at=datetime.now(),
+                parameter_type=ParameterType.OUTPUT,
             )
-            return
         LOG.info(
             "Script starting to fallback to AI run",
             cache_key=cache_key,
@@ -1026,21 +1036,27 @@ async def run_task(
     max_steps: int | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
+    label: str | None = None,
     cache_key: str | None = None,
+    engine: RunEngine = RunEngine.skyvern_v1,
+    model: dict[str, Any] | None = None,
 ) -> None:
-    # Auto-create workflow block run and task if workflow_run_id is available
-    workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
-        block_type=BlockType.TASK,
-        prompt=prompt,
-        url=url,
-    )
-    # set the prompt in the RunContext
-    context = skyvern_context.ensure_context()
-    context.prompt = prompt
+    cache_key = cache_key or label
+    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
 
-    if cache_key:
+    context: skyvern_context.SkyvernContext | None = None
+    if cache_key and cached_fn:
+        # Auto-create workflow block run and task if workflow_run_id is available
+        workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
+            block_type=BlockType.TASK,
+            prompt=prompt,
+            url=url,
+        )
+        # set the prompt in the RunContext
+        context = skyvern_context.ensure_context()
+        context.prompt = prompt
         try:
-            await _run_cached_function(cache_key)
+            await _run_cached_function(cached_fn)
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -1069,39 +1085,52 @@ async def run_task(
             # clear the prompt in the RunContext
             context.prompt = None
     else:
-        if workflow_run_block_id:
-            await _update_workflow_block(
-                workflow_run_block_id,
-                BlockStatus.failed,
-                task_id=task_id,
-                task_status=TaskStatus.failed,
-                step_id=step_id,
-                step_status=StepStatus.failed,
-                failure_reason="Cache key is required",
-            )
-        context.prompt = None
-        raise Exception("Cache key is required to run task block in a script")
+        block_validation_output = await _validate_and_get_output_parameter(label)
+        task_block = TaskBlock(
+            label=block_validation_output.label,
+            output_parameter=block_validation_output.output_parameter,
+            url=url,
+            navigation_goal=prompt,
+            max_steps_per_run=max_steps,
+            totp_identifier=totp_identifier,
+            totp_verification_url=totp_url,
+            include_action_history_in_verification=True,
+            engine=RunEngine.skyvern_v1,
+        )
+        await task_block.execute_safe(
+            workflow_run_id=block_validation_output.workflow_run_id,
+            organization_id=block_validation_output.organization_id,
+            browser_session_id=block_validation_output.browser_session_id,
+        )
 
 
 async def download(
     prompt: str,
     url: str | None = None,
+    complete_on_download: bool = True,
     max_steps: int | None = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+    label: str | None = None,
     cache_key: str | None = None,
 ) -> None:
-    # Auto-create workflow block run and task if workflow_run_id is available
-    workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
-        block_type=BlockType.FILE_DOWNLOAD,
-        prompt=prompt,
-        url=url,
-    )
-    # set the prompt in the RunContext
-    context = skyvern_context.ensure_context()
-    context.prompt = prompt
+    cache_key = cache_key or label
+    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
 
-    if cache_key:
+    context: skyvern_context.SkyvernContext | None
+    if cache_key and cached_fn:
+        # Auto-create workflow block run and task if workflow_run_id is available
+        workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
+            block_type=BlockType.FILE_DOWNLOAD,
+            prompt=prompt,
+            url=url,
+        )
+        # set the prompt in the RunContext
+        context = skyvern_context.ensure_context()
+        context.prompt = prompt
+
         try:
-            await _run_cached_function(cache_key)
+            await _run_cached_function(cached_fn)
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -1121,25 +1150,31 @@ async def download(
                 prompt=prompt,
                 url=url,
                 max_steps=max_steps,
-                complete_on_download=True,
+                complete_on_download=complete_on_download,
                 error=e,
                 workflow_run_block_id=workflow_run_block_id,
             )
         finally:
             context.prompt = None
     else:
-        if workflow_run_block_id:
-            await _update_workflow_block(
-                workflow_run_block_id,
-                BlockStatus.failed,
-                task_id=task_id,
-                task_status=TaskStatus.failed,
-                step_id=step_id,
-                step_status=StepStatus.failed,
-                failure_reason="Cache key is required",
-            )
-        context.prompt = None
-        raise Exception("Cache key is required to run task block in a script")
+        block_validation_output = await _validate_and_get_output_parameter(label)
+        file_download_block = FileDownloadBlock(
+            label=block_validation_output.label,
+            output_parameter=block_validation_output.output_parameter,
+            url=url,
+            complete_on_download=complete_on_download,
+            navigation_goal=prompt,
+            max_steps_per_run=max_steps,
+            totp_identifier=totp_identifier,
+            totp_verification_url=totp_url,
+            include_action_history_in_verification=True,
+            engine=RunEngine.skyvern_v1,
+        )
+        await file_download_block.execute_safe(
+            workflow_run_id=block_validation_output.workflow_run_id,
+            organization_id=block_validation_output.organization_id,
+            browser_session_id=block_validation_output.browser_session_id,
+        )
 
 
 async def action(
@@ -1148,21 +1183,25 @@ async def action(
     max_steps: int | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
+    label: str | None = None,
     cache_key: str | None = None,
 ) -> None:
-    # Auto-create workflow block run and task if workflow_run_id is available
-    workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
-        block_type=BlockType.ACTION,
-        prompt=prompt,
-        url=url,
-    )
-    # set the prompt in the RunContext
-    context = skyvern_context.ensure_context()
-    context.prompt = prompt
+    context: skyvern_context.SkyvernContext | None
+    cache_key = cache_key or label
+    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    if cache_key and cached_fn:
+        # Auto-create workflow block run and task if workflow_run_id is available
+        workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
+            block_type=BlockType.ACTION,
+            prompt=prompt,
+            url=url,
+        )
+        # set the prompt in the RunContext
+        context = skyvern_context.ensure_context()
+        context.prompt = prompt
 
-    if cache_key:
         try:
-            await _run_cached_function(cache_key)
+            await _run_cached_function(cached_fn)
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -1190,18 +1229,21 @@ async def action(
         finally:
             context.prompt = None
     else:
-        if workflow_run_block_id:
-            await _update_workflow_block(
-                workflow_run_block_id,
-                BlockStatus.failed,
-                task_id=task_id,
-                task_status=TaskStatus.failed,
-                step_id=step_id,
-                step_status=StepStatus.failed,
-                failure_reason="Cache key is required",
-            )
-        context.prompt = None
-        raise Exception("Cache key is required to run task block in a script")
+        block_validation_output = await _validate_and_get_output_parameter(label)
+        action_block = ActionBlock(
+            label=block_validation_output.label,
+            output_parameter=block_validation_output.output_parameter,
+            url=url,
+            navigation_goal=prompt,
+            max_steps_per_run=max_steps,
+            totp_identifier=totp_identifier,
+            totp_verification_url=totp_url,
+        )
+        await action_block.execute_safe(
+            workflow_run_id=block_validation_output.workflow_run_id,
+            organization_id=block_validation_output.organization_id,
+            browser_session_id=block_validation_output.browser_session_id,
+        )
 
 
 async def login(
@@ -1210,21 +1252,24 @@ async def login(
     max_steps: int | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
+    label: str | None = None,
     cache_key: str | None = None,
 ) -> None:
-    # Auto-create workflow block run and task if workflow_run_id is available
-    workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
-        block_type=BlockType.LOGIN,
-        prompt=prompt,
-        url=url,
-    )
-    # set the prompt in the RunContext
-    context = skyvern_context.ensure_context()
-    context.prompt = prompt
-
-    if cache_key:
+    context: skyvern_context.SkyvernContext | None
+    cache_key = cache_key or label
+    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    if cache_key and cached_fn:
+        # Auto-create workflow block run and task if workflow_run_id is available
+        workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
+            block_type=BlockType.LOGIN,
+            prompt=prompt,
+            url=url,
+        )
+        # set the prompt in the RunContext
+        context = skyvern_context.ensure_context()
+        context.prompt = prompt
         try:
-            await _run_cached_function(cache_key)
+            await _run_cached_function(cached_fn)
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -1252,18 +1297,21 @@ async def login(
         finally:
             context.prompt = None
     else:
-        if workflow_run_block_id:
-            await _update_workflow_block(
-                workflow_run_block_id,
-                BlockStatus.failed,
-                task_id=task_id,
-                task_status=TaskStatus.failed,
-                step_id=step_id,
-                step_status=StepStatus.failed,
-                failure_reason="Cache key is required",
-            )
-        context.prompt = None
-        raise Exception("Cache key is required to run task block in a script")
+        block_validation_output = await _validate_and_get_output_parameter(label)
+        login_block = LoginBlock(
+            label=block_validation_output.label,
+            output_parameter=block_validation_output.output_parameter,
+            url=url,
+            navigation_goal=prompt,
+            max_steps_per_run=max_steps,
+            totp_identifier=totp_identifier,
+            totp_verification_url=totp_url,
+        )
+        await login_block.execute_safe(
+            workflow_run_id=block_validation_output.workflow_run_id,
+            organization_id=block_validation_output.organization_id,
+            browser_session_id=block_validation_output.browser_session_id,
+        )
 
 
 async def extract(
@@ -1271,23 +1319,27 @@ async def extract(
     schema: dict[str, Any] | list | str | None = None,
     url: str | None = None,
     max_steps: int | None = None,
+    label: str | None = None,
     cache_key: str | None = None,
 ) -> dict[str, Any] | list | str | None:
-    # Auto-create workflow block run and task if workflow_run_id is available
-    workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
-        block_type=BlockType.EXTRACTION,
-        prompt=prompt,
-        schema=schema,
-        url=url,
-    )
-    # set the prompt in the RunContext
-    context = skyvern_context.ensure_context()
-    context.prompt = prompt
     output: dict[str, Any] | list | str | None = None
 
-    if cache_key:
+    context: skyvern_context.SkyvernContext | None
+    cache_key = cache_key or label
+    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    if cache_key and cached_fn:
+        # Auto-create workflow block run and task if workflow_run_id is available
+        workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
+            block_type=BlockType.EXTRACTION,
+            prompt=prompt,
+            schema=schema,
+            url=url,
+        )
+        # set the prompt in the RunContext
+        context = skyvern_context.ensure_context()
+        context.prompt = prompt
         try:
-            output = cast(dict[str, Any] | list | str | None, await _run_cached_function(cache_key))
+            output = cast(dict[str, Any] | list | str | None, await _run_cached_function(cached_fn))
 
             # Update block status to completed if workflow block was created
             if workflow_run_block_id:
@@ -1318,18 +1370,21 @@ async def extract(
         finally:
             context.prompt = None
     else:
-        if workflow_run_block_id:
-            await _update_workflow_block(
-                workflow_run_block_id,
-                BlockStatus.failed,
-                task_id=task_id,
-                task_status=TaskStatus.failed,
-                step_id=step_id,
-                step_status=StepStatus.failed,
-                failure_reason="Cache key is required",
-            )
-        context.prompt = None
-        raise Exception("Cache key is required to run task block in a script")
+        block_validation_output = await _validate_and_get_output_parameter(label)
+        extraction_block = ExtractionBlock(
+            label=block_validation_output.label,
+            url=url,
+            data_extraction_goal=prompt,
+            max_steps_per_run=max_steps,
+            data_schema=schema,
+            output_parameter=block_validation_output.output_parameter,
+        )
+        block_result = await extraction_block.execute_safe(
+            workflow_run_id=block_validation_output.workflow_run_id,
+            organization_id=block_validation_output.organization_id,
+            browser_session_id=block_validation_output.browser_session_id,
+        )
+        return block_result.output_parameter_value
 
 
 async def wait(seconds: int) -> None:
@@ -1441,8 +1496,19 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
         workflow_run_id = context.workflow_run_id
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
         template_data.update(workflow_run_context.values)
+        if template in template_data:
+            return template_data[template]
 
     return jinja_template.render(template_data)
+
+
+def render_list(template: str, data: dict[str, Any] | None = None) -> list[str]:
+    rendered_value = render_template(template, data)
+    list_value = eval(rendered_value)
+    if isinstance(list_value, list):
+        return list_value
+    else:
+        return [list_value]
 
 
 # Non-task-based blocks
@@ -1476,7 +1542,15 @@ async def _validate_and_get_output_parameter(label: str | None = None) -> BlockV
     label = label or f"block_{uuid.uuid4()}"
     output_parameter = workflow.get_output_parameter(label)
     if not output_parameter:
-        raise Exception("Output parameter not found")
+        # NOT sure if this is legit hack to create output parameter like this
+        output_parameter = OutputParameter(
+            output_parameter_id=str(uuid.uuid4()),
+            key=f"{label}_output",
+            workflow_id=workflow_id,
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+            parameter_type=ParameterType.OUTPUT,
+        )
     return BlockValidationOutput(
         label=label,
         output_parameter=output_parameter,

@@ -39,6 +39,7 @@ from skyvern.services.script_service import (  # noqa: E402
     login,  # noqa: E402
     parse_file,  # noqa: E402
     prompt,  # noqa: E402
+    render_list,  # noqa: E402
     render_template,  # noqa: E402
     run_code,  # noqa: E402
     run_script,  # noqa: E402
@@ -63,6 +64,7 @@ __all__ = [
     "login",
     "parse_file",
     "prompt",
+    "render_list",
     "render_template",
     "run_code",
     "run_script",
