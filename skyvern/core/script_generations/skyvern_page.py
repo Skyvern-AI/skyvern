@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any, Callable, Literal
 
 import structlog
+from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 
 from skyvern.config import settings
@@ -29,6 +30,7 @@ from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
+jinja_sandbox_env = SandboxedEnvironment()
 LOG = structlog.get_logger()
 SELECT_OPTION_GOAL = """- The intention to select an option: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
@@ -60,6 +62,25 @@ async def _get_element_id_by_xpath(xpath: str, page: Page) -> str | None:
     locator = page.locator(f"xpath={xpath}")
     element_id = await locator.get_attribute("unique_id")
     return element_id
+
+
+def render_template(template: str, data: dict[str, Any] | None = None) -> str:
+    """
+    Refer to  Block.format_block_parameter_template_from_workflow_run_context
+
+    TODO: complete this function so that block code shares the same template rendering logic
+    """
+    template_data = data or {}
+    jinja_template = jinja_sandbox_env.from_string(template)
+    context = skyvern_context.current()
+    if context and context.workflow_run_id:
+        workflow_run_id = context.workflow_run_id
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        template_data.update(workflow_run_context.values)
+        if template in template_data:
+            return template_data[template]
+
+    return jinja_template.render(template_data)
 
 
 class SkyvernPage:
@@ -195,6 +216,7 @@ class SkyvernPage:
         return decorator
 
     async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
+        url = render_template(url)
         await self.page.goto(
             url,
             timeout=timeout,
@@ -779,8 +801,10 @@ class ScriptRunContextManager:
     def set_cached_fn(self, cache_key: str, fn: Callable) -> None:
         self.cached_fns[cache_key] = fn
 
-    def get_cached_fn(self, cache_key: str) -> Callable | None:
-        return self.cached_fns.get(cache_key)
+    def get_cached_fn(self, cache_key: str | None = None) -> Callable | None:
+        if cache_key:
+            return self.cached_fns.get(cache_key)
+        return None
 
 
 script_run_context_manager = ScriptRunContextManager()
