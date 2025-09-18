@@ -75,6 +75,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
     aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
+    runSequentially: data.withWorkflowSettings ? data.runSequentially : false,
   });
 
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -253,6 +254,19 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                             </div>
                           </div>
                         )}
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Label>Run Sequentially</Label>
+                          <HelpTooltip content="Run the workflow in a sequential order" />
+                          <Switch
+                            className="ml-auto"
+                            checked={inputs.runSequentially}
+                            onCheckedChange={(value) => {
+                              handleChange("runSequentially", value);
+                            }}
+                          />
+                        </div>
                       </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">

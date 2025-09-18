@@ -708,6 +708,7 @@ function getElements(
       aiFallback: settings.aiFallback ?? true,
       label: "__start_block__",
       showCode: false,
+      runSequentially: settings.runSequentially,
     }),
   );
 
@@ -1418,6 +1419,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     useScriptCache: false,
     scriptCacheKey: null,
     aiFallback: true,
+    runSequentially: false,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1438,6 +1440,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       useScriptCache: data.useScriptCache,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
+      runSequentially: data.runSequentially,
     };
   }
   return defaultSettings;
