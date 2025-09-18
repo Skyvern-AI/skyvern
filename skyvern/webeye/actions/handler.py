@@ -536,7 +536,7 @@ async def handle_click_action(
                     if (element.hasAttribute('unique_id')) {
                         return element.getAttribute('unique_id');
                     }
-                    
+
                     // If no unique_id attribute is found, return null
                     return null;
                 }
@@ -550,8 +550,8 @@ async def handle_click_action(
         LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
         if element_id:
             if skyvern_element := await dom.safe_get_skyvern_element_by_id(element_id):
-                await skyvern_element.navigate_to_a_href(page=page)
-                return [ActionSuccess()]
+                if await skyvern_element.navigate_to_a_href(page=page):
+                    return [ActionSuccess()]
 
         if action.repeat == 1:
             await page.mouse.click(x=action.x, y=action.y, button=action.button)
