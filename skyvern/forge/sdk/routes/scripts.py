@@ -485,12 +485,12 @@ async def get_workflow_cache_key_values(
 
 
 @base_router.delete(
-    "/scripts/{workflow_permanent_id}/value/{cache_key_value}",
+    "/scripts/{workflow_permanent_id}/value",
     include_in_schema=False,
 )
 async def delete_workflow_cache_key_value(
     workflow_permanent_id: str,
-    cache_key_value: str,
+    cache_key_value: str = Query(alias="cache-key-value"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, str]:
     """Delete a specific cache key value for a workflow."""
