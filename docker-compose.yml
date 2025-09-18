@@ -50,17 +50,19 @@ services:
     # OpenAI Support:
     # If you want to use OpenAI as your LLM provider, uncomment the following lines and fill in your OpenAI API key.
     # - ENABLE_OPENAI=true
-    # - LLM_KEY=OPENAI_GPT4O
+    # - LLM_KEY=gpt-4o                               # Direct litellm model name (recommended)
+    # - LLM_KEY=OPENAI_GPT4O                          # Or use registered Skyvern key
     # - OPENAI_API_KEY=<your_openai_key>
     #  Gemini Support:
     # Gemini is a new LLM provider that is currently in beta. You can use it by uncommenting the following lines and filling in your Gemini API key.
-    # - LLM_KEY=GEMINI
+    # - LLM_KEY=gemini/gemini-2.5-pro                 # Direct litellm model name (recommended)
+    # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW                # Or use registered Skyvern key
     # - ENABLE_GEMINI=true
     # - GEMINI_API_KEY=YOUR_GEMINI_KEY
-    # - LLM_KEY=GEMINI_2.5_PRO_PREVIEW_03_25
     # If you want to use other LLM provider, like azure and anthropic:
     # - ENABLE_ANTHROPIC=true
-    # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET
+    # - LLM_KEY=anthropic/claude-3-5-sonnet-latest    # Direct litellm model name (recommended)
+    # - LLM_KEY=ANTHROPIC_CLAUDE3.5_SONNET            # Or use registered Skyvern key
     # - ANTHROPIC_API_KEY=<your_anthropic_key>
     # Microsoft Azure OpenAI support:
     # If you'd like to use Microsoft Azure OpenAI as your managed LLM service integration with Skyvern, use the environment variables below.

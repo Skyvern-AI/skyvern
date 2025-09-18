@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     # LLM Configuration #
     #####################
     # ACTIVE LLM PROVIDER
-    LLM_KEY: str = "OPENAI_GPT4O"  # This is the model name
+    LLM_KEY: str = "gpt-4o"  # This can now be a direct litellm model name or a registered Skyvern key
     LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
