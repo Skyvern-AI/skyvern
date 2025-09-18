@@ -1,3 +1,11 @@
+import { AxiosError } from "axios";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { useEffect, useState } from "react";
+import { useForm } from "react-hook-form";
+import { useNavigate, useParams } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { z } from "zod";
+
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
@@ -16,6 +24,15 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { toast } from "@/components/ui/use-toast";
@@ -23,20 +40,27 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useSyncFormFieldToStorage } from "@/hooks/useSyncFormFieldToStorage";
 import { useLocalStorageFormDefault } from "@/hooks/useLocalStorageFormDefault";
-import { apiBaseUrl } from "@/util/env";
+import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
-import { useForm } from "react-hook-form";
-import { useNavigate, useParams } from "react-router-dom";
-import { z } from "zod";
+import { apiBaseUrl, lsKeys } from "@/util/env";
+import { cn } from "@/util/utils";
+
+import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
+import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
-import { AxiosError } from "axios";
-import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
-import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
-import { lsKeys } from "@/util/env";
+
+// Utility function to omit specified keys from an object
+function omit<T extends Record<string, unknown>, K extends keyof T>(
+  obj: T,
+  keys: K[],
+): Omit<T, K> {
+  const result = { ...obj };
+  keys.forEach((key) => delete result[key]);
+  return result;
+}
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -89,6 +113,8 @@ type RunWorkflowRequestBody = {
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   browser_address?: string | null;
+  run_with?: "agent" | "code";
+  ai_fallback?: boolean;
 };
 
 function getRunWorkflowRequestBody(
@@ -102,6 +128,8 @@ function getRunWorkflowRequestBody(
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
+    runWithCode,
+    aiFallback,
     ...parameters
   } = values;
 
@@ -117,6 +145,8 @@ function getRunWorkflowRequestBody(
     proxy_location: proxyLocation,
     browser_session_id: bsi,
     browser_address: cdpAddress,
+    run_with: runWithCode === true ? "code" : "agent",
+    ai_fallback: aiFallback ?? true,
   };
 
   if (maxScreenshotScrolls) {
@@ -146,6 +176,8 @@ type RunWorkflowFormType = Record<string, unknown> & {
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
+  runWithCode: boolean | null;
+  aiFallback: boolean | null;
 };
 
 function RunWorkflowForm({
@@ -172,9 +204,12 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
+      runWithCode: false,
+      aiFallback: true,
     },
   });
   const apiCredential = useApiCredential();
+  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
   useSyncFormFieldToStorage(form, "browserSessionId", lsKeys.browserSessionId);
 
@@ -213,6 +248,53 @@ function RunWorkflowForm({
     },
   });
 
+  const [runParameters, setRunParameters] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  const [cacheKeyValue, setCacheKeyValue] = useState<string>("");
+  const cacheKey = workflow?.cache_key ?? "default";
+
+  useEffect(() => {
+    if (!runParameters) {
+      setCacheKeyValue("");
+      return;
+    }
+
+    const ckv = constructCacheKeyValueFromParameters({
+      codeKey: cacheKey,
+      parameters: runParameters,
+    });
+
+    setCacheKeyValue(ckv);
+  }, [cacheKey, runParameters]);
+
+  const { data: blockScripts } = useBlockScriptsQuery({
+    cacheKey,
+    cacheKeyValue,
+    workflowPermanentId,
+  });
+
+  const [runWithCodeIsEnabled, setRunWithCodeIsEnabled] = useState(false);
+
+  useEffect(() => {
+    setRunWithCodeIsEnabled(Object.keys(blockScripts ?? {}).length > 0);
+  }, [blockScripts]);
+
+  useEffect(() => {
+    onChange(form.getValues());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form]);
+
+  // if we're coming from debugger, block scripts may already be cached; let's ensure we bust it
+  // on mount
+  useEffect(() => {
+    queryClient.invalidateQueries({
+      queryKey: ["block-scripts"],
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function onSubmit(values: RunWorkflowFormType) {
     const {
       webhookCallbackUrl,
@@ -221,8 +303,16 @@ function RunWorkflowForm({
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
+      runWithCode,
+      aiFallback,
       ...parameters
     } = values;
+
+    const actuallyRunWithCode = !runWithCodeIsEnabled ? false : runWithCode;
+    const actuallyFallbackToAi =
+      !form.getValues().runWithCode || !runWithCodeIsEnabled
+        ? false
+        : aiFallback;
 
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
@@ -236,12 +326,41 @@ function RunWorkflowForm({
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
+      runWithCode: actuallyRunWithCode,
+      aiFallback: actuallyFallbackToAi,
     });
+  }
+
+  function onChange(values: RunWorkflowFormType) {
+    const parameters = omit(values, [
+      "webhookCallbackUrl",
+      "proxyLocation",
+      "browserSessionId",
+      "maxScreenshotScrolls",
+      "extraHttpHeaders",
+      "cdpAddress",
+      "runWithCode",
+    ]);
+
+    const parsedParameters = parseValuesForWorkflowRun(
+      parameters,
+      workflowParameters,
+    );
+
+    setRunParameters(parsedParameters);
+  }
+
+  if (!workflowPermanentId || !workflow) {
+    return <div>Invalid workflow</div>;
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+      <form
+        onChange={form.handleSubmit(onChange)}
+        onSubmit={form.handleSubmit(onSubmit)}
+        className="space-y-8"
+      >
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
             <h1 className="text-lg">Input Parameters</h1>
@@ -404,32 +523,97 @@ function RunWorkflowForm({
             }}
           />
           <FormField
-            key="browserSessionId"
+            key="runWithCode"
             control={form.control}
-            name="browserSessionId"
+            name="runWithCode"
             render={({ field }) => {
               return (
                 <FormItem>
-                  <div className="flex gap-16">
+                  <div
+                    className={cn("flex gap-16", {
+                      "opacity-50": !runWithCodeIsEnabled,
+                    })}
+                  >
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          Browser Session ID
+                          Run With
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          Use a persistent browser session to maintain state and
-                          enable browser interaction.
+                          In a past run, code was generated with the input
+                          parameters you've specified above. Choose to run this
+                          workflow with that generated code, or with the Skyvern
+                          Agent.
                         </h2>
                       </div>
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
-                        <Input
-                          {...field}
-                          placeholder="pbs_xxx"
+                        <Select
+                          disabled={!runWithCodeIsEnabled}
                           value={
-                            field.value === null ? "" : (field.value as string)
+                            !runWithCodeIsEnabled
+                              ? "ai"
+                              : field.value
+                                ? "code"
+                                : "ai"
                           }
+                          onValueChange={(v) =>
+                            field.onChange(v === "code" ? true : false)
+                          }
+                        >
+                          <SelectTrigger className="w-48">
+                            <SelectValue placeholder="Run Method" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="ai">Skyvern Agent</SelectItem>
+                            <SelectItem value="code">Code</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </FormControl>
+                      <FormMessage />
+                    </div>
+                  </div>
+                </FormItem>
+              );
+            }}
+          />
+
+          <FormField
+            key="aiFallback"
+            control={form.control}
+            name="aiFallback"
+            render={({ field }) => {
+              return (
+                <FormItem>
+                  <div
+                    className={cn("flex gap-16", {
+                      "opacity-50":
+                        !form.getValues().runWithCode || !runWithCodeIsEnabled,
+                    })}
+                  >
+                    <FormLabel>
+                      <div className="w-72">
+                        <div className="flex items-center gap-2 text-lg">
+                          AI Fallback (self-healing)
+                        </div>
+                        <h2 className="text-sm text-slate-400">
+                          If the run fails when using code, turn this on to have
+                          AI attempt to fix the issue and regenerate the code.
+                        </h2>
+                      </div>
+                    </FormLabel>
+                    <div className="w-full space-y-2">
+                      <FormControl>
+                        <Switch
+                          checked={
+                            !form.getValues().runWithCode ||
+                            !runWithCodeIsEnabled
+                              ? false
+                              : (field.value as boolean)
+                          }
+                          onCheckedChange={field.onChange}
+                          disabled={!form.getValues().runWithCode}
                         />
                       </FormControl>
                       <FormMessage />
@@ -451,6 +635,44 @@ function RunWorkflowForm({
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
                 <div className="space-y-8 pt-5">
+                  <FormField
+                    key="browserSessionId"
+                    control={form.control}
+                    name="browserSessionId"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Browser Session ID
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  Use a persistent browser session to maintain
+                                  state and enable browser interaction.
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder="pbs_xxx"
+                                  value={
+                                    field.value === null
+                                      ? ""
+                                      : (field.value as string)
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
                   <FormField
                     key="cdpAddress"
                     control={form.control}
@@ -570,6 +792,7 @@ function RunWorkflowForm({
             </AccordionItem>
           </Accordion>
         </div>
+
         <div className="flex justify-end gap-2">
           <CopyApiCommandDropdown
             getOptions={() => {
