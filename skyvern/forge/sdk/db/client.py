@@ -984,7 +984,7 @@ class AgentDB:
         encrypted_token = ""
 
         if encrypted_method is not None:
-            encrypted_token = await encryptor.encrypt(token, encrypted_method)
+            encrypted_token = await encryptor.encrypt(plaintext_token, encrypted_method)
             plaintext_token = ""
 
         async with self.Session() as session:
