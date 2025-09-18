@@ -393,6 +393,7 @@ class ActionHandler:
     ) -> list[ActionResult]:
         LOG.info("Handling action", action=action)
         actions_result: list[ActionResult] = []
+        llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
         try:
             if action.action_type in ActionHandler._handled_action_types:
                 invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
@@ -411,28 +412,6 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
-                llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                if not results or not isinstance(actions_result[-1], ActionSuccess):
-                    if llm_caller and action.tool_call_id:
-                        # add failure message to the llm caller
-                        tool_call_result = {
-                            "type": "tool_result",
-                            "tool_use_id": action.tool_call_id,
-                            "content": "Tool execution failed",
-                        }
-                        llm_caller.add_tool_result(tool_call_result)
-                        LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
-                    return actions_result
-
-                if llm_caller and action.tool_call_id:
-                    tool_call_result = {
-                        "type": "tool_result",
-                        "tool_use_id": action.tool_call_id,
-                        "content": "Tool executed successfully",
-                    }
-                    LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
-                    llm_caller.add_tool_result(tool_call_result)
-
                 # do the teardown
                 teardown = ActionHandler._teardown_action_types.get(action.action_type)
                 if teardown:
@@ -470,16 +449,30 @@ class ActionHandler:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
         finally:
+            tool_result_content = ""
+
             if actions_result and isinstance(actions_result[-1], ActionSuccess):
                 action.status = ActionStatus.completed
+                tool_result_content = "Tool executed successfully"
             elif actions_result and isinstance(actions_result[-1], ActionAbort):
                 action.status = ActionStatus.skipped
+                tool_result_content = "Tool executed successfully"
             else:
+                tool_result_content = "Tool execution failed"
                 # either actions_result is empty or the last action is a failure
                 if not actions_result:
                     LOG.warning("Action failed to execute, setting status to failed", action=action)
                 action.status = ActionStatus.failed
+
             await app.DATABASE.create_action(action=action)
+
+            if llm_caller and action.tool_call_id:
+                tool_call_result = {
+                    "type": "tool_result",
+                    "tool_use_id": action.tool_call_id,
+                    "content": tool_result_content,
+                }
+                llm_caller.add_tool_result(tool_call_result)
 
         return actions_result
 
@@ -556,8 +549,8 @@ async def handle_click_action(
         )
         LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
         if element_id:
-            skyvern_element = await dom.get_skyvern_element_by_id(element_id)
-            if await skyvern_element.navigate_to_a_href(page=page):
+            if skyvern_element := await dom.safe_get_skyvern_element_by_id(element_id):
+                await skyvern_element.navigate_to_a_href(page=page)
                 return [ActionSuccess()]
 
         if action.repeat == 1:
