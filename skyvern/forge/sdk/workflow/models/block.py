@@ -2061,6 +2061,9 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
                     or self.azure_storage_account_key
                 )
+                if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
+                    raise ValueError("Azure Storage is not configured")
+
                 azure_client = AsyncAzureStorageClient(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,

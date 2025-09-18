@@ -343,11 +343,16 @@ class WorkflowRunContext:
         self,
         parameter: AzureSecretParameter,
     ) -> None:
-        azure_vault_client = AsyncAzureVaultClient.create_default()
+        vault_name = settings.AZURE_STORAGE_ACCOUNT_NAME
+        if vault_name is None:
+            LOG.error("AZURE_STORAGE_ACCOUNT_NAME is not configured, cannot register Azure secret parameter value")
+            raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+
         # If the parameter is an Azure secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
-        secret_value = await azure_vault_client.get_secret(parameter.azure_key, settings.AZURE_STORAGE_ACCOUNT_NAME)
+        azure_vault_client = AsyncAzureVaultClient.create_default()
+        secret_value = await azure_vault_client.get_secret(parameter.azure_key, vault_name)
         if secret_value is not None:
             random_secret_id = self.generate_random_secret_id()
             self.secrets[random_secret_id] = secret_value
@@ -903,7 +908,7 @@ class WorkflowRunContext:
             return jinja_sandbox_env.from_string(parameter_value).render(self.values)
 
     @staticmethod
-    async def _get_azure_vault_client_for_organization(organization) -> AsyncAzureVaultClient:
+    async def _get_azure_vault_client_for_organization(organization: Organization) -> AsyncAzureVaultClient:
         org_auth_token = await app.DATABASE.get_valid_org_auth_token(
             organization.organization_id, OrganizationAuthTokenType.azure_client_secret_credential
         )
