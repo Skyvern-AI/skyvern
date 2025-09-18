@@ -906,3 +906,10 @@ class DomUtil:
         hash_value = self.scraped_page.id_to_element_hash.get(element_id, "")
 
         return SkyvernElement(locator, frame_content, element, hash_value)
+
+    async def safe_get_skyvern_element_by_id(self, element_id: str) -> SkyvernElement | None:
+        try:
+            return await self.get_skyvern_element_by_id(element_id)
+        except Exception:
+            LOG.warning("Failed to get skyvern element by id", element_id=element_id, exc_info=True)
+            return None

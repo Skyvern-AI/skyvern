@@ -54,7 +54,7 @@ function WorkflowRunCode(props?: Props) {
     pollIntervalMs: !isFinalized ? 3000 : undefined,
   });
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScripts).join("");
+  const code = getCode(orderedBlockLabels, blockScripts).join("").trim();
 
   useEffect(() => {
     setCacheKeyValue(
@@ -118,7 +118,7 @@ function WorkflowRunCode(props?: Props) {
 
   return (
     <div className="flex h-full w-full flex-col items-end justify-center gap-2">
-      <div className="flex w-[20rem] gap-4">
+      <div className="flex w-full justify-end gap-4">
         <div className="flex items-center justify-around gap-2">
           <Label className="w-[7rem]">Code Key Value</Label>
           <HelpTooltip
@@ -134,7 +134,7 @@ function WorkflowRunCode(props?: Props) {
           value={cacheKeyValue}
           onValueChange={(v: string) => setCacheKeyValue(v)}
         >
-          <SelectTrigger>
+          <SelectTrigger className="max-w-[15rem] [&>span]:text-ellipsis">
             <SelectValue placeholder="Code Key Value" />
           </SelectTrigger>
           <SelectContent>

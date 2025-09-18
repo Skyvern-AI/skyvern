@@ -122,6 +122,7 @@ const useWorkflowSave = () => {
           blocks: saveData.blocks,
         },
         is_saved_task: saveData.workflow.is_saved_task,
+        run_sequentially: saveData.settings.runSequentially,
       };
 
       const yaml = convertToYAML(requestBody);

@@ -530,6 +530,7 @@ export type WorkflowApiResponse = {
   generate_script: boolean;
   cache_key: string | null;
   ai_fallback: boolean | null;
+  run_sequentially: boolean | null;
 };
 
 export type WorkflowSettings = {
@@ -542,6 +543,7 @@ export type WorkflowSettings = {
   useScriptCache: boolean;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
+  runSequentially: boolean;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

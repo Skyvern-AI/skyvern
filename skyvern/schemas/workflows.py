@@ -517,6 +517,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     generate_script: bool = False
     ai_fallback: bool = False
     cache_key: str | None = None
+    run_sequentially: bool = False
 
 
 class WorkflowRequest(BaseModel):

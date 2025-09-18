@@ -646,6 +646,7 @@ class WorkflowService:
         generate_script: bool = False,
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
+        run_sequentially: bool = False,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -667,6 +668,7 @@ class WorkflowService:
             generate_script=generate_script,
             cache_key=cache_key,
             ai_fallback=False if ai_fallback is None else ai_fallback,
+            run_sequentially=run_sequentially,
         )
 
     async def create_workflow_from_prompt(
@@ -1742,6 +1744,7 @@ class WorkflowService:
                     generate_script=request.generate_script,
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
+                    run_sequentially=request.run_sequentially,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1762,6 +1765,7 @@ class WorkflowService:
                     generate_script=request.generate_script,
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
+                    run_sequentially=request.run_sequentially,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id
@@ -2620,6 +2624,7 @@ class WorkflowService:
                 workflow=codegen_input.workflow,
                 blocks=codegen_input.workflow_blocks,
                 actions_by_task=codegen_input.actions_by_task,
+                task_v2_child_blocks=codegen_input.task_v2_child_blocks,
                 organization_id=workflow.organization_id,
                 script_id=created_script.script_id,
                 script_revision_id=created_script.script_revision_id,
