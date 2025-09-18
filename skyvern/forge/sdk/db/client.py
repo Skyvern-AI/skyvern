@@ -3181,6 +3181,7 @@ class AgentDB:
         runnable_type: str | None = None,
         runnable_id: str | None = None,
         timeout_minutes: int | None = None,
+        proxy_location: ProxyLocation | None = ProxyLocation.RESIDENTIAL,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         try:
@@ -3190,6 +3191,7 @@ class AgentDB:
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
                     timeout_minutes=timeout_minutes,
+                    proxy_location=proxy_location,
                 )
                 session.add(browser_session)
                 await session.commit()

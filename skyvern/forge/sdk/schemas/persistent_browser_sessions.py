@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
+from skyvern.schemas.runs import ProxyLocation
+
 FINAL_STATUSES = ("completed", "failed")
 
 
@@ -20,6 +22,7 @@ class PersistentBrowserSession(BaseModel):
     ip_address: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None
+    proxy_location: ProxyLocation | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime
