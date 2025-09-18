@@ -266,6 +266,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         generate_script=workflow_model.generate_script,
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
+        run_sequentially=workflow_model.run_sequentially,
     )
 
 
@@ -303,6 +304,7 @@ def convert_to_workflow_run(
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
         extra_http_headers=workflow_run_model.extra_http_headers,
         browser_address=workflow_run_model.browser_address,
+        job_id=workflow_run_model.job_id,
         script_run=ScriptRunResponse.model_validate(workflow_run_model.script_run)
         if workflow_run_model.script_run
         else None,
