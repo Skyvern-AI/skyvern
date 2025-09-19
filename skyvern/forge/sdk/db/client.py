@@ -107,7 +107,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
-from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
+from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
@@ -4088,6 +4088,7 @@ class AgentDB:
         workflow_permanent_id: str,
         cache_key_value: str,
         cache_key: str | None = None,
+        statuses: list[ScriptStatus] | None = None,
     ) -> list[Script]:
         """Get latest script versions linked to a workflow by a specific cache_key_value."""
         try:
@@ -4103,6 +4104,9 @@ class AgentDB:
 
                 if cache_key is not None:
                     ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
+
+                if statuses is not None and len(statuses) > 0:
+                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.status.in_(statuses))
 
                 # Latest version per script_id within the org and not deleted
                 latest_versions_subquery = (

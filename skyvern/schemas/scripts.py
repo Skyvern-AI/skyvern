@@ -154,6 +154,7 @@ class ScriptBlocksResponse(BaseModel):
 class ScriptBlocksRequest(BaseModel):
     cache_key_value: str
     cache_key: str | None = None
+    status: ScriptStatus | None = None
 
 
 class ScriptStatus(StrEnum):

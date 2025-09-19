@@ -120,7 +120,7 @@ const constructCacheKeyValue = (opts: {
   workflowRun?: WorkflowRunStatusApiResponse;
 }) => {
   const { workflow, workflowRun } = opts;
-  let codeKey = opts.codeKey;
+  const codeKey = opts.codeKey;
 
   if (!workflow) {
     return "";
@@ -138,7 +138,20 @@ const constructCacheKeyValue = (opts: {
           {} as Record<string, unknown>,
         );
 
-  for (const [name, value] of Object.entries(workflowParameters)) {
+  return constructCacheKeyValueFromParameters({
+    codeKey,
+    parameters: workflowParameters,
+  });
+};
+
+const constructCacheKeyValueFromParameters = (opts: {
+  codeKey: string;
+  parameters: Record<string, unknown>;
+}) => {
+  const parameters = opts.parameters;
+  let codeKey = opts.codeKey;
+
+  for (const [name, value] of Object.entries(parameters)) {
     if (value === null || value === undefined || value === "") {
       continue;
     }
@@ -153,4 +166,8 @@ const constructCacheKeyValue = (opts: {
   return codeKey;
 };
 
-export { constructCacheKeyValue, getInitialParameters };
+export {
+  constructCacheKeyValue,
+  constructCacheKeyValueFromParameters,
+  getInitialParameters,
+};
