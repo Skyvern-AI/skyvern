@@ -273,6 +273,7 @@ function RunWorkflowForm({
     cacheKey,
     cacheKeyValue,
     workflowPermanentId,
+    status: "published",
   });
 
   const [runWithCodeIsEnabled, setRunWithCodeIsEnabled] = useState(false);
