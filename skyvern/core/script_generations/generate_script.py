@@ -2,20 +2,11 @@
 """
 Generate a runnable Skyvern workflow script.
 
-Example
--------
-generated_code = generate_workflow_script(
-    file_name="workflow.py",
-    workflow_run_request=workflow_run_request,
-    workflow=workflow,
-    tasks=tasks,
-    actions_by_task=actions_by_task,
-)
-Path("workflow.py").write_text(src)
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import keyword
 import re
@@ -1602,7 +1593,7 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
 # --------------------------------------------------------------------- #
 
 
-async def generate_workflow_script(
+async def generate_workflow_script_python_code(
     *,
     file_name: str,
     workflow_run_request: dict[str, Any],
@@ -1614,6 +1605,7 @@ async def generate_workflow_script(
     run_id: str | None = None,
     script_id: str | None = None,
     script_revision_id: str | None = None,
+    pending: bool = False,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
@@ -1685,16 +1677,15 @@ async def generate_workflow_script(
         if script_id and script_revision_id and organization_id:
             try:
                 block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
-                block_description = f"Generated block for task: {block_name}"
                 temp_module = cst.Module(body=[block_fn_def])
                 block_code = temp_module.code
-                await create_script_block(
+                await create_or_update_script_block(
                     block_code=block_code,
                     script_revision_id=script_revision_id,
                     script_id=script_id,
                     organization_id=organization_id,
-                    block_name=block_name,
-                    block_description=block_description,
+                    block_label=block_name,
+                    update=pending,
                 )
             except Exception as e:
                 LOG.error("Failed to create script block", error=str(e), exc_info=True)
@@ -1737,15 +1728,13 @@ async def generate_workflow_script(
                 task_v2_block_code = temp_module.code
 
                 block_name = task_v2.get("label") or task_v2.get("title") or f"task_v2_{idx}"
-                block_description = f"Generated task_v2 block with child functions: {block_name}"
 
-                await create_script_block(
+                await create_or_update_script_block(
                     block_code=task_v2_block_code,
                     script_revision_id=script_revision_id,
                     script_id=script_id,
                     organization_id=organization_id,
-                    block_name=block_name,
-                    block_description=block_description,
+                    block_label=block_name,
                 )
             except Exception as e:
                 LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
@@ -1805,13 +1794,13 @@ async def generate_workflow_script(
             start_block_module = cst.Module(body=start_block_body)
             start_block_code = start_block_module.code
 
-            await create_script_block(
+            await create_or_update_script_block(
                 block_code=start_block_code,
                 script_revision_id=script_revision_id,
                 script_id=script_id,
                 organization_id=organization_id,
-                block_name=settings.WORKFLOW_START_BLOCK_LABEL,
-                block_description="Start block containing imports, model classes, and run function",
+                block_label=settings.WORKFLOW_START_BLOCK_LABEL,
+                update=pending,
             )
         except Exception as e:
             LOG.error("Failed to create __start_block__", error=str(e), exc_info=True)
@@ -1830,69 +1819,92 @@ async def generate_workflow_script(
     return module.code
 
 
-async def create_script_block(
+async def create_or_update_script_block(
     block_code: str | bytes,
     script_revision_id: str,
     script_id: str,
     organization_id: str,
-    block_name: str,
-    block_description: str | None = None,
+    block_label: str,
+    update: bool = False,
 ) -> None:
     """
     Create a script block in the database and save the block code to a script file.
+    If update is True, the script block will be updated instead of created.
 
     Args:
         block_code: The code to save
         script_revision_id: The script revision ID
         script_id: The script ID
         organization_id: The organization ID
-        block_name: Optional custom name for the block (defaults to function name)
-        block_description: Optional description for the block
+        block_label: Optional custom name for the block (defaults to function name)
+        update: Whether to update the script block instead of creating a new one
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
         # Step 3: Create script block in database
-        script_block = await app.DATABASE.create_script_block(
-            script_revision_id=script_revision_id,
-            script_id=script_id,
-            organization_id=organization_id,
-            script_block_label=block_name,
-        )
+        script_block = None
+        if update:
+            script_block = await app.DATABASE.get_script_block_by_label(
+                organization_id=organization_id,
+                script_revision_id=script_revision_id,
+                script_block_label=block_label,
+            )
+        if not script_block:
+            script_block = await app.DATABASE.create_script_block(
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                script_block_label=block_label,
+            )
 
         # Step 4: Create script file for the block
         # Generate a unique filename for the block
-        file_name = f"{block_name}.skyvern"
+        file_name = f"{block_label}.skyvern"
         file_path = f"blocks/{file_name}"
 
         # Create artifact and upload to S3
-        artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
-            organization_id=organization_id,
-            script_id=script_id,
-            script_version=1,  # Assuming version 1 for now
-            file_path=file_path,
-            data=block_code_bytes,
-        )
+        artifact_id = None
+        if update and script_block.script_file_id:
+            script_file = await app.DATABASE.get_script_file_by_id(
+                script_revision_id,
+                script_block.script_file_id,
+                organization_id,
+            )
+            if script_file and script_file.artifact_id:
+                artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                if artifact:
+                    asyncio.create_task(app.STORAGE.store_artifact(artifact, block_code_bytes))
+            else:
+                LOG.error("Script file or artifact not found", script_file_id=script_block.script_file_id)
+        else:
+            artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                organization_id=organization_id,
+                script_id=script_id,
+                script_version=1,  # Assuming version 1 for now
+                file_path=file_path,
+                data=block_code_bytes,
+            )
 
-        # Create script file record
-        script_file = await app.DATABASE.create_script_file(
-            script_revision_id=script_revision_id,
-            script_id=script_id,
-            organization_id=organization_id,
-            file_path=file_path,
-            file_name=file_name,
-            file_type="file",
-            content_hash=f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}",
-            file_size=len(block_code_bytes),
-            mime_type="text/x-python",
-            artifact_id=artifact_id,
-        )
+            # Create script file record
+            script_file = await app.DATABASE.create_script_file(
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                file_path=file_path,
+                file_name=file_name,
+                file_type="file",
+                content_hash=f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}",
+                file_size=len(block_code_bytes),
+                mime_type="text/x-python",
+                artifact_id=artifact_id,
+            )
 
-        # update script block with script file id
-        await app.DATABASE.update_script_block(
-            script_block_id=script_block.script_block_id,
-            organization_id=organization_id,
-            script_file_id=script_file.file_id,
-        )
+            # update script block with script file id
+            await app.DATABASE.update_script_block(
+                script_block_id=script_block.script_block_id,
+                organization_id=organization_id,
+                script_file_id=script_file.file_id,
+            )
 
     except Exception as e:
         # Log error but don't fail the entire generation process

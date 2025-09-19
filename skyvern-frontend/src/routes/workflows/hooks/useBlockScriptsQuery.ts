@@ -8,6 +8,8 @@ type Props = {
   cacheKeyValue?: string;
   workflowPermanentId?: string;
   pollIntervalMs?: number;
+  status?: string;
+  workflowRunId?: string;
 };
 
 function useBlockScriptsQuery({
@@ -15,6 +17,8 @@ function useBlockScriptsQuery({
   cacheKeyValue,
   workflowPermanentId,
   pollIntervalMs,
+  status,
+  workflowRunId,
 }: Props) {
   const credentialGetter = useCredentialGetter();
 
@@ -25,6 +29,8 @@ function useBlockScriptsQuery({
       cacheKey,
       cacheKeyValue,
       pollIntervalMs,
+      status,
+      workflowRunId,
     ],
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
@@ -33,6 +39,8 @@ function useBlockScriptsQuery({
         .post<ScriptBlocksResponse>(`/scripts/${workflowPermanentId}/blocks`, {
           cache_key: cacheKey ?? "",
           cache_key_value: cacheKeyValue ?? "",
+          status: status ?? "published",
+          workflow_run_id: workflowRunId ?? null,
         })
         .then((response) => response.data);
 

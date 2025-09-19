@@ -15,6 +15,7 @@ class SkyvernContext:
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
+    root_workflow_run_id: str | None = None
     task_v2_id: str | None = None
     max_steps_override: int | None = None
     browser_session_id: str | None = None
