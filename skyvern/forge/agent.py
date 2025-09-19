@@ -27,12 +27,19 @@ from skyvern.constants import (
     ScrapeType,
 )
 from skyvern.core.totp import poll_verification_code
-from skyvern.errors.errors import ReachMaxRetriesError, ReachMaxStepsError, UserDefinedError
+from skyvern.errors.errors import (
+    GetTOTPVerificationCodeError,
+    ReachMaxRetriesError,
+    ReachMaxStepsError,
+    TimeoutGetTOTPVerificationCodeError,
+    UserDefinedError,
+)
 from skyvern.exceptions import (
     BrowserSessionNotFound,
     BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
+    FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
     FailedToSendWebhook,
@@ -1012,6 +1019,21 @@ class ForgeAgent:
                                 action_order=0,
                                 reasoning="No TOTP verification code found. Going to terminate.",
                                 intention="No TOTP verification code found. Going to terminate.",
+                                errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
+                            )
+                        ]
+                    except FailedToGetTOTPVerificationCode as e:
+                        actions = [
+                            TerminateAction(
+                                reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                organization_id=task.organization_id,
+                                workflow_run_id=task.workflow_run_id,
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                action_order=0,
+                                errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
                             )
                         ]
 

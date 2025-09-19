@@ -72,7 +72,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       ? data.maxScreenshotScrolls
       : null,
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
-    useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
+    useScriptCache: data.withWorkflowSettings ? data.useScriptCache : true, // TODO(jdo/always-generate): set to false
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
     aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
     runSequentially: data.withWorkflowSettings ? data.runSequentially : false,
@@ -211,11 +211,14 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                             <Label>Generate Code</Label>
                             <HelpTooltip content="Generate & use cached code for faster execution." />
                             <Switch
+                              disabled={true} // TODO(jdo/always-generate): remove
                               className="ml-auto"
-                              checked={inputs.useScriptCache}
-                              onCheckedChange={(value) => {
-                                handleChange("useScriptCache", value);
-                              }}
+                              checked={true} // TODO(jdo/always-generate): set to `inputs.useScriptCache`
+                              onCheckedChange={
+                                (/*value*/) => {
+                                  // handleChange("useScriptCache", value); // TODO(jdo/always-generate): put back
+                                }
+                              }
                             />
                           </div>
                         </div>
