@@ -248,10 +248,6 @@ async def deploy_script(
     description="Run a script",
     tags=["Scripts"],
 )
-@base_router.post(
-    "/scripts/{script_id}/run/",
-    include_in_schema=False,
-)
 async def run_script(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -279,11 +275,6 @@ async def run_script(
 
 @base_router.post(
     "/scripts/{workflow_permanent_id}/blocks",
-    include_in_schema=False,
-    response_model=ScriptBlocksResponse,
-)
-@base_router.post(
-    "/scripts/{workflow_permanent_id}/blocks/",
     include_in_schema=False,
     response_model=ScriptBlocksResponse,
 )
@@ -441,11 +432,6 @@ async def get_workflow_script_blocks(
     include_in_schema=False,
     response_model=ScriptCacheKeyValuesResponse,
 )
-@base_router.get(
-    "/scripts/{workflow_permanent_id}/{cache_key}/values/",
-    include_in_schema=False,
-    response_model=ScriptCacheKeyValuesResponse,
-)
 async def get_workflow_cache_key_values(
     workflow_permanent_id: str,
     cache_key: str,
@@ -503,10 +489,6 @@ async def get_workflow_cache_key_values(
 
 @base_router.delete(
     "/scripts/{workflow_permanent_id}/value",
-    include_in_schema=False,
-)
-@base_router.delete(
-    "/scripts/{workflow_permanent_id}/value/",
     include_in_schema=False,
 )
 async def delete_workflow_cache_key_value(
