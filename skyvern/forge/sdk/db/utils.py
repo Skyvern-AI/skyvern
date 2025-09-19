@@ -202,7 +202,6 @@ async def convert_to_organization_auth_token(
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
 
     if token_type == OrganizationAuthTokenType.azure_client_secret_credential:
-        # TODO (Stas): handle parse error?
         credential = AzureOrganizationAuthToken.AzureClientSecretCredential.parse_raw(token)
         return AzureOrganizationAuthToken(
             id=org_auth_token.id,

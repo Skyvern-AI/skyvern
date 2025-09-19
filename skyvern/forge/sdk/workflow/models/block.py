@@ -34,6 +34,7 @@ from skyvern.constants import (
     MAX_UPLOAD_FILE_COUNT,
 )
 from skyvern.exceptions import (
+    AzureConfigurationError,
     ContextParameterValueNotFound,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -2062,7 +2063,7 @@ class FileUploadBlock(Block):
                     or self.azure_storage_account_key
                 )
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
-                    raise ValueError("Azure Storage is not configured")
+                    raise AzureConfigurationError("Azure Storage is not configured")
 
                 azure_client = AsyncAzureStorageClient(
                     storage_account_name=actual_azure_storage_account_name,

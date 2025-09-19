@@ -7,6 +7,7 @@ from onepassword.client import Client as OnePasswordClient
 
 from skyvern.config import settings
 from skyvern.exceptions import (
+    AzureConfigurationError,
     BitwardenBaseError,
     CredentialParameterNotFoundError,
     SkyvernException,
@@ -346,7 +347,7 @@ class WorkflowRunContext:
         vault_name = settings.AZURE_STORAGE_ACCOUNT_NAME
         if vault_name is None:
             LOG.error("AZURE_STORAGE_ACCOUNT_NAME is not configured, cannot register Azure secret parameter value")
-            raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+            raise AzureConfigurationError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
 
         # If the parameter is an Azure secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
@@ -516,18 +517,26 @@ class WorkflowRunContext:
 
         azure_vault_client = await self._get_azure_vault_client_for_organization(organization)
 
-        secret_login = await azure_vault_client.get_secret(username_key, vault_name)
+        secret_username = await azure_vault_client.get_secret(username_key, vault_name)
+        if not secret_username:
+            raise ValueError(f"Azure Vault username not found by key: {username_key}")
+
         secret_password = await azure_vault_client.get_secret(password_key, vault_name)
+        if not secret_password:
+            raise ValueError(f"Azure Vault password not found by key: {password_key}")
+
         if totp_secret_key:
             totp_secret = await azure_vault_client.get_secret(totp_secret_key, vault_name)
+            if not totp_secret:
+                raise ValueError(f"Azure Vault TOTP not found key: {totp_secret_key}")
         else:
             totp_secret = None
 
-        if secret_login is not None and secret_password is not None:
+        if secret_username is not None and secret_password is not None:
             random_secret_id = self.generate_random_secret_id()
             # login secret
             username_secret_id = f"{random_secret_id}_username"
-            self.secrets[username_secret_id] = secret_login
+            self.secrets[username_secret_id] = secret_username
             # password secret
             password_secret_id = f"{random_secret_id}_password"
             self.secrets[password_secret_id] = secret_password

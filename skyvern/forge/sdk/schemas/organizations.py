@@ -35,7 +35,8 @@ class OrganizationAuthToken(OrganizationAuthTokenBase):
 
 
 class AzureOrganizationAuthToken(OrganizationAuthTokenBase):
-    # TODO (Stas): add docs
+    """Represents OrganizationAuthToken for Azure; defined by 3 fields: tenant_id, client_id, and client_secret"""
+
     class AzureClientSecretCredential(BaseModel):
         tenant_id: str
         client_id: str
@@ -75,7 +76,6 @@ class AzureClientSecretCredentialResponse(BaseModel):
 class CreateAzureClientSecretCredentialRequest(BaseModel):
     """Request model for creating or updating an Azure ClientSecretCredential."""
 
-    # TODO (Stas): add docs
     credential: AzureOrganizationAuthToken.AzureClientSecretCredential
 
 

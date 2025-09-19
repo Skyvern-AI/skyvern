@@ -558,7 +558,7 @@ async def update_azure_client_secret_credential(
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
         )
 
-        # Create the new token
+        # Create the new Azure token
         auth_token = await app.DATABASE.create_org_auth_token(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
