@@ -199,7 +199,7 @@ class SkyvernPage:
                 finally:
                     skyvern_page._record(call)
                     # Auto-create action after execution
-                    await skyvern_page._create_action_before_execution(
+                    await skyvern_page._create_action_after_execution(
                         action_type=action,
                         intention=intention,
                         status=action_status,
@@ -222,7 +222,7 @@ class SkyvernPage:
             timeout=timeout,
         )
 
-    async def _create_action_before_execution(
+    async def _create_action_after_execution(
         self,
         action_type: ActionType,
         intention: str = "",
@@ -295,6 +295,7 @@ class SkyvernPage:
 
             created_action = await app.DATABASE.create_action(action)
             context.action_order += 1
+
             return created_action
 
         except Exception:

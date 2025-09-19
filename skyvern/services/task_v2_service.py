@@ -466,6 +466,8 @@ async def run_task_v2_helper(
 
     context: skyvern_context.SkyvernContext | None = skyvern_context.current()
     current_run_id = context.run_id if context and context.run_id else task_v2_id
+    # task v2 can be nested inside a workflow run, so we need to use the root workflow run id
+    root_workflow_run_id = context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
     enable_parse_select_in_extract = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_PARSE_SELECT_IN_EXTRACT",
         current_run_id,
@@ -476,6 +478,7 @@ async def run_task_v2_helper(
             organization_id=organization_id,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
+            root_workflow_run_id=root_workflow_run_id,
             request_id=request_id,
             task_v2_id=task_v2_id,
             run_id=current_run_id,

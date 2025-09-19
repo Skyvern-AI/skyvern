@@ -107,7 +107,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.runs import ProxyLocation, RunEngine, RunType
-from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus
+from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile, ScriptStatus, WorkflowScript
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import BlockStatus, BlockType, WorkflowStatus
 from skyvern.webeye.actions.actions import Action
@@ -4039,6 +4039,44 @@ class AgentDB:
 
             return convert_to_script_file(script_file) if script_file else None
 
+    async def get_script_file_by_path(
+        self,
+        script_revision_id: str,
+        file_path: str,
+        organization_id: str,
+    ) -> ScriptFile | None:
+        async with self.Session() as session:
+            script_file = (
+                await session.scalars(
+                    select(ScriptFileModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(file_path=file_path)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return convert_to_script_file(script_file) if script_file else None
+
+    async def update_script_file(
+        self,
+        script_file_id: str,
+        organization_id: str,
+        artifact_id: str | None = None,
+    ) -> ScriptFile:
+        async with self.Session() as session:
+            script_file = (
+                await session.scalars(
+                    select(ScriptFileModel).filter_by(file_id=script_file_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if script_file:
+                if artifact_id:
+                    script_file.artifact_id = artifact_id
+                await session.commit()
+                await session.refresh(script_file)
+                return convert_to_script_file(script_file)
+            else:
+                raise NotFoundError("Script file not found")
+
     async def get_script_block(
         self,
         script_block_id: str,
@@ -4049,6 +4087,23 @@ class AgentDB:
                 await session.scalars(
                     select(ScriptBlockModel)
                     .filter_by(script_block_id=script_block_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            return convert_to_script_block(record) if record else None
+
+    async def get_script_block_by_label(
+        self,
+        organization_id: str,
+        script_revision_id: str,
+        script_block_label: str,
+    ) -> ScriptBlock | None:
+        async with self.Session() as session:
+            record = (
+                await session.scalars(
+                    select(ScriptBlockModel)
+                    .filter_by(script_revision_id=script_revision_id)
+                    .filter_by(script_block_label=script_block_label)
                     .filter_by(organization_id=organization_id)
                 )
             ).first()
@@ -4080,6 +4135,7 @@ class AgentDB:
         cache_key_value: str,
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
+        status: ScriptStatus = ScriptStatus.published,
     ) -> None:
         """Create a workflow->script cache mapping entry."""
         try:
@@ -4092,6 +4148,7 @@ class AgentDB:
                     workflow_run_id=workflow_run_id,
                     cache_key=cache_key,
                     cache_key_value=cache_key_value,
+                    status=status,
                 )
                 session.add(record)
                 await session.commit()
@@ -4102,12 +4159,32 @@ class AgentDB:
             LOG.error("UnexpectedError", exc_info=True)
             raise
 
+    async def get_workflow_script(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+        statuses: list[ScriptStatus] | None = None,
+    ) -> WorkflowScript | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowScriptModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(workflow_permanent_id=workflow_permanent_id)
+                .filter_by(workflow_run_id=workflow_run_id)
+            )
+            if statuses:
+                query = query.filter(WorkflowScriptModel.status.in_(statuses))
+            workflow_script_model = (await session.scalars(query)).first()
+            return WorkflowScript.model_validate(workflow_script_model) if workflow_script_model else None
+
     async def get_workflow_scripts_by_cache_key_value(
         self,
         *,
         organization_id: str,
         workflow_permanent_id: str,
         cache_key_value: str,
+        workflow_run_id: str | None = None,
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
     ) -> list[Script]:
@@ -4122,6 +4199,10 @@ class AgentDB:
                     .where(WorkflowScriptModel.cache_key_value == cache_key_value)
                     .where(WorkflowScriptModel.deleted_at.is_(None))
                 )
+                if workflow_run_id:
+                    ws_script_ids_subquery = ws_script_ids_subquery.where(
+                        WorkflowScriptModel.workflow_run_id == workflow_run_id
+                    )
 
                 if cache_key is not None:
                     ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
@@ -4174,6 +4255,7 @@ class AgentDB:
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
                     .filter_by(cache_key=cache_key)
                     .filter_by(deleted_at=None)
+                    .filter_by(status="published")
                 )
 
                 if filter:
@@ -4205,6 +4287,7 @@ class AgentDB:
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
                     .filter_by(cache_key=cache_key)
                     .filter_by(deleted_at=None)
+                    .filter_by(status="published")
                     .offset((page - 1) * page_size)
                     .limit(page_size)
                 )
@@ -4213,45 +4296,6 @@ class AgentDB:
                     query = query.filter(WorkflowScriptModel.cache_key_value.contains(filter))
 
                 return (await session.scalars(query)).all()
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
-
-    async def create_workflow_cache_key_value(
-        self,
-        organization_id: str,
-        workflow_permanent_id: str,
-        cache_key: str,
-        cache_key_value: str,
-        script_id: str,
-        workflow_id: str | None = None,
-        workflow_run_id: str | None = None,
-    ) -> str:
-        """
-        Insert a new cache key value for a workflow.
-
-        Returns the workflow_script_id of the created record.
-        """
-        try:
-            async with self.Session() as session:
-                workflow_script = WorkflowScriptModel(
-                    script_id=script_id,
-                    organization_id=organization_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run_id,
-                    cache_key=cache_key,
-                    cache_key_value=cache_key_value,
-                )
-
-                session.add(workflow_script)
-                await session.commit()
-                await session.refresh(workflow_script)
-
-                return workflow_script.workflow_script_id
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

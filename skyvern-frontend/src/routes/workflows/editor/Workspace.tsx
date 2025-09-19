@@ -214,6 +214,7 @@ function Workspace({
     cacheKey,
     cacheKeyValue,
     workflowPermanentId,
+    status: "published",
   });
 
   const { data: cacheKeyValues, isLoading: cacheKeyValuesLoading } =
