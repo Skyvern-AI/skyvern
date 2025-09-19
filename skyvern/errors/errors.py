@@ -17,6 +17,9 @@ class SkyvernDefinedError(BaseModel):
     def __repr__(self) -> str:
         return f"{self.reasoning}(error_code={self.error_code})"
 
+    def to_user_defined_error(self) -> UserDefinedError:
+        return UserDefinedError(error_code=self.error_code, reasoning=self.reasoning, confidence_float=1.0)
+
 
 class ReachMaxStepsError(SkyvernDefinedError):
     error_code: str = "REACH_MAX_STEPS"
@@ -26,3 +29,19 @@ class ReachMaxStepsError(SkyvernDefinedError):
 class ReachMaxRetriesError(SkyvernDefinedError):
     error_code: str = "REACH_MAX_RETRIES"
     reasoning: str = "The agent has reached the maximum number of retries. It might be an issue with the agent. Please reach out to the Skyvern team for support."
+
+
+class GetTOTPVerificationCodeError(SkyvernDefinedError):
+    error_code: str = "OTP_ERROR"
+    reasoning: str = (
+        "Failed to get TOTP verification code. Please confirm the TOTP functionality is working correctly on your side."
+    )
+
+    def __init__(self, *, reason: str | None = None) -> None:
+        reasoning = f"Failed to get TOTP verification code. Reason: {reason}" if reason else self.reasoning
+        super().__init__(reasoning=reasoning)
+
+
+class TimeoutGetTOTPVerificationCodeError(SkyvernDefinedError):
+    error_code: str = "OTP_TIMEOUT"
+    reasoning: str = "Timeout getting TOTP verification code."
