@@ -1848,7 +1848,9 @@ async def get_workflow(
         "x-fern-sdk-method-name": "get_workflow_versions",
     },
 )
-@legacy_base_router.get("/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False)
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False
+)
 async def get_workflow_versions(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
