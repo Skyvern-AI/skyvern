@@ -673,6 +673,8 @@ class WorkflowService:
         extra_http_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
         max_steps: int | None = None,
+        generate_script: bool = True,
+        ai_fallback: bool = True,
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -714,6 +716,8 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            generate_script=generate_script,
+            ai_fallback=ai_fallback,
         )
 
         return new_workflow
