@@ -153,6 +153,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     useScriptCache: version.generate_script,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
+    runSequentially: version.run_sequentially ?? false,
   };
 
   // Deep clone the blocks to ensure complete isolation from main editor
@@ -281,17 +282,25 @@ function WorkflowComparisonRenderer({
 }
 
 function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
-  const blocks1 = version1.workflow_definition?.blocks || [];
-  const blocks2 = version2.workflow_definition?.blocks || [];
-  const comparisons = compareWorkflowBlocks(blocks1, blocks2);
+  const comparisons = useMemo(() => {
+    const blocks1 = version1?.workflow_definition?.blocks || [];
+    const blocks2 = version2?.workflow_definition?.blocks || [];
+    return compareWorkflowBlocks(blocks1, blocks2);
+  }, [
+    version1?.workflow_definition?.blocks,
+    version2?.workflow_definition?.blocks,
+  ]);
 
   // Statistics
-  const stats = {
-    identical: comparisons.filter((c) => c.status === "identical").length,
-    modified: comparisons.filter((c) => c.status === "modified").length,
-    added: comparisons.filter((c) => c.status === "added").length,
-    removed: comparisons.filter((c) => c.status === "removed").length,
-  };
+  const stats = useMemo(
+    () => ({
+      identical: comparisons.filter((c) => c.status === "identical").length,
+      modified: comparisons.filter((c) => c.status === "modified").length,
+      added: comparisons.filter((c) => c.status === "added").length,
+      removed: comparisons.filter((c) => c.status === "removed").length,
+    }),
+    [comparisons],
+  );
 
   // Create color mapping for block identifiers
   const getComparisonColor = (
@@ -310,23 +319,30 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
     }
   };
 
-  // Create maps for each version's block colors
-  const version1BlockColors = new Map<string, string>();
-  const version2BlockColors = new Map<string, string>();
+  // Create memoized maps for each version's block colors
+  const { version1BlockColors, version2BlockColors } = useMemo(() => {
+    const v1Colors = new Map<string, string>();
+    const v2Colors = new Map<string, string>();
 
-  comparisons.forEach((comparison) => {
-    const color = getComparisonColor(comparison.status);
+    comparisons.forEach((comparison) => {
+      const color = getComparisonColor(comparison.status);
 
-    // For version1 blocks
-    if (comparison.leftBlock) {
-      version1BlockColors.set(comparison.identifier, color);
-    }
+      // For version1 blocks
+      if (comparison.leftBlock) {
+        v1Colors.set(comparison.identifier, color);
+      }
 
-    // For version2 blocks
-    if (comparison.rightBlock) {
-      version2BlockColors.set(comparison.identifier, color);
-    }
-  });
+      // For version2 blocks
+      if (comparison.rightBlock) {
+        v2Colors.set(comparison.identifier, color);
+      }
+    });
+
+    return {
+      version1BlockColors: v1Colors,
+      version2BlockColors: v2Colors,
+    };
+  }, [comparisons]);
 
   return (
     <div className="flex h-full w-full flex-col rounded-lg bg-slate-elevation2">
@@ -361,6 +377,7 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
           {/* Version 1 Column */}
           <ReactFlowProvider>
             <WorkflowComparisonRenderer
+              key={`k1-${version1.workflow_id}v${version1.version}`}
               version={version1}
               onSelectState={onSelectState}
               blockColors={version1BlockColors}
@@ -370,6 +387,7 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
           {/* Version 2 Column */}
           <ReactFlowProvider>
             <WorkflowComparisonRenderer
+              key={`k2-${version2.workflow_id}v${version2.version}`}
               version={version2}
               onSelectState={onSelectState}
               blockColors={version2BlockColors}

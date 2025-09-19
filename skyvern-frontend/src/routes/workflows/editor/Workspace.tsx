@@ -572,6 +572,53 @@ function Workspace({
     }
   }
 
+  // Centralized function to manage comparison and panel states
+  function clearComparisonViewAndShowFreshIfActive(active: boolean) {
+    setWorkflowPanelState({
+      active,
+      content: "history",
+      data: {
+        showComparison: false,
+        version1: undefined,
+        version2: undefined,
+      },
+    });
+  }
+
+  function toggleHistoryPanel() {
+    // Capture current state before making changes
+    const wasInComparisonMode = workflowPanelState.data?.showComparison;
+    const isHistoryPanelOpen =
+      workflowPanelState.active && workflowPanelState.content === "history";
+
+    // Always reset code view when toggling history
+    setShowAllCode(false);
+
+    if (wasInComparisonMode || isHistoryPanelOpen) {
+      // If in comparison mode or history panel is open, close it
+      clearComparisonViewAndShowFreshIfActive(false);
+    } else {
+      // Open history panel fresh
+      clearComparisonViewAndShowFreshIfActive(true);
+    }
+  }
+
+  function toggleCodeView() {
+    // Check comparison state BEFORE clearing it
+    const wasInComparisonMode = workflowPanelState.data?.showComparison;
+
+    // Always clear comparison state first
+    clearComparisonViewAndShowFreshIfActive(false);
+
+    if (wasInComparisonMode) {
+      // If we were in comparison mode, exit it and show code
+      setShowAllCode(true);
+    } else {
+      // Normal toggle when not in comparison mode
+      setShowAllCode(!showAllCode);
+    }
+  }
+
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
   const code = getCode(orderedBlockLabels, blockScripts).join("");
 
@@ -595,7 +642,6 @@ function Workspace({
         active: true,
         content: "history", // Keep history panel active
         data: {
-          ...workflowPanelState.data,
           version1: JSON.parse(JSON.stringify(version1)),
           version2: JSON.parse(JSON.stringify(version2)),
           showComparison: true, // Add flag to show comparison
@@ -640,6 +686,7 @@ function Workspace({
       useScriptCache: selectedVersion.generate_script,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
+      runSequentially: selectedVersion.run_sequentially ?? false,
     };
 
     const elements = getElements(
@@ -652,7 +699,6 @@ function Workspace({
     setNodes(elements.nodes);
     setEdges(elements.edges);
   };
->>>>>>> 1ee5c931 (Feature: added Workflow Comparison)
 
   return (
     <div className="relative h-full w-full">
@@ -843,35 +889,8 @@ function Workspace({
           onRun={() => {
             closeWorkflowPanel();
           }}
-          onShowAllCodeClick={() => {
-            setShowAllCode(!showAllCode);
-          }}
-          onHistory={() => {
-            if (
-              workflowPanelState.active &&
-              workflowPanelState.content === "history"
-            ) {
-              // Close panel and clear comparison data
-              setWorkflowPanelState({
-                active: false,
-                content: "history",
-                data: {
-                  showComparison: false,
-                  version1: undefined,
-                  version2: undefined,
-                },
-              });
-            } else {
-              setWorkflowPanelState({
-                active: true,
-                content: "history",
-                data: {
-                  // Clear any existing comparison when opening fresh
-                  showComparison: false,
-                },
-              });
-            }
-          }}
+          onShowAllCodeClick={toggleCodeView}
+          onHistory={toggleHistoryPanel}
         />
       </div>
 
@@ -890,6 +909,7 @@ function Workspace({
               }}
             >
               <WorkflowComparisonPanel
+                key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
                 version1={workflowPanelState.data.version1}
                 version2={workflowPanelState.data.version2}
                 onSelectState={handleSelectState}
@@ -1024,13 +1044,13 @@ function Workspace({
               workflowPanelState.data?.version1 &&
               workflowPanelState.data?.version2 ? (
                 <div
-                  className="absolute left-6 top-[9.5rem]"
+                  className="absolute inset-0 top-[8.5rem] p-6"
                   style={{
-                    width: "calc(100% - 32rem)",
                     height: "calc(100vh - 14.5rem)",
                   }}
                 >
                   <WorkflowComparisonPanel
+                    key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
                     version1={workflowPanelState.data.version1}
                     version2={workflowPanelState.data.version2}
                     onSelectState={handleSelectState}
