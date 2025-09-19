@@ -1176,6 +1176,7 @@ class ForgeAgent:
                     # set verified to True will skip the completion verification
                     action.verified = True
                 results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
                     results,
@@ -1318,6 +1319,7 @@ class ForgeAgent:
                         complete_results = await ActionHandler.handle_action(
                             scraped_page, task, step, working_page, complete_action
                         )
+                        await app.AGENT_FUNCTION.post_action_execution()
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
 
@@ -1337,6 +1339,7 @@ class ForgeAgent:
                 extract_results = await ActionHandler.handle_action(
                     scraped_page, task, step, working_page, extract_action
                 )
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
 
             # If no action errors return the agent state and output
