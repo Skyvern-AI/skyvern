@@ -15,7 +15,7 @@ LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
 
 
-async def generate_or_update_draft_workflow_script(
+async def generate_or_update_pending_workflow_script(
     workflow_run: WorkflowRun,
     workflow: Workflow,
 ) -> None:
@@ -44,7 +44,7 @@ async def generate_or_update_draft_workflow_script(
         workflow=workflow,
         script=script,
         rendered_cache_key_value=rendered_cache_key_value,
-        draft=True,
+        pending=True,
     )
 
 
@@ -111,7 +111,7 @@ async def generate_workflow_script(
     workflow: Workflow,
     script: Script,
     rendered_cache_key_value: str,
-    draft: bool = False,
+    pending: bool = False,
 ) -> None:
     try:
         LOG.info(
@@ -135,7 +135,7 @@ async def generate_workflow_script(
             organization_id=workflow.organization_id,
             script_id=script.script_id,
             script_revision_id=script.script_revision_id,
-            draft=draft,
+            pending=pending,
         )
     except Exception:
         LOG.error("Failed to generate workflow script source", exc_info=True)
@@ -160,21 +160,21 @@ async def generate_workflow_script(
         script_id=script.script_id,
         script_version=script.version,
         script_revision_id=script.script_revision_id,
-        draft=draft,
+        pending=pending,
     )
 
     # check if an existing drfat workflow script exists for this workflow run
-    existing_draft_workflow_script = None
+    existing_pending_workflow_script = None
     status = ScriptStatus.published
-    if draft:
+    if pending:
         status = ScriptStatus.pending
-        existing_draft_workflow_script = await app.DATABASE.get_workflow_script(
+        existing_pending_workflow_script = await app.DATABASE.get_workflow_script(
             organization_id=workflow.organization_id,
             workflow_permanent_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run.workflow_run_id,
             statuses=[status],
         )
-    if not existing_draft_workflow_script:
+    if not existing_pending_workflow_script:
         # Record the workflow->script mapping for cache lookup
         await app.DATABASE.create_workflow_script(
             organization_id=workflow.organization_id,

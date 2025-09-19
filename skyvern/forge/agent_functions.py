@@ -641,7 +641,7 @@ class AgentFunction:
             root_workflow_run_id=context.root_workflow_run_id,
             organization_id=context.organization_id,
         )
-        await workflow_script_service.generate_or_update_draft_workflow_script(
+        await workflow_script_service.generate_or_update_pending_workflow_script(
             workflow_run=workflow_run,
             workflow=workflow,
         )
