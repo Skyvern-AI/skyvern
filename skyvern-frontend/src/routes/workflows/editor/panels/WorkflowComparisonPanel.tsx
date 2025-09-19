@@ -153,6 +153,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     useScriptCache: version.generate_script,
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
+    runSequentially: version.run_sequentially ?? false,
   };
 
   // Deep clone the blocks to ensure complete isolation from main editor

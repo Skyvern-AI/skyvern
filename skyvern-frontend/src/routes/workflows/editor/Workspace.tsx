@@ -841,10 +841,9 @@ function Workspace({
           onRun={() => {
             closeWorkflowPanel();
           }}
-<<<<<<< HEAD
           onShowAllCodeClick={() => {
             setShowAllCode(!showAllCode);
-=======
+          }}
           onHistory={() => {
             if (
               workflowPanelState.active &&
@@ -870,7 +869,6 @@ function Workspace({
                 },
               });
             }
->>>>>>> 1ee5c931 (Feature: added Workflow Comparison)
           }}
         />
       </div>
@@ -1018,7 +1016,6 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-<<<<<<< HEAD
             {/* code and infinite canvas */}
             <div className="relative h-full w-full">
               <div
@@ -1077,7 +1074,7 @@ function Workspace({
                   />
                 </div>
               </div>
-=======
+            </div>
             {/* infinite canvas or comparison view */}
             <div className="skyvern-split-left h-full w-full">
               {workflowPanelState.data?.showComparison &&
@@ -1111,13 +1108,10 @@ function Workspace({
                   onContainerResize={containerResizeTrigger}
                 />
               )}
->>>>>>> 1ee5c931 (Feature: added Workflow Comparison)
             </div>
 
             {/* browser & timeline */}
             <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
-<<<<<<< HEAD
-=======
               {/* sub panels */}
               {workflowPanelState.active && (
                 <div
@@ -1170,7 +1164,6 @@ function Workspace({
               )}
 
               {/* browser & timeline */}
->>>>>>> 1ee5c931 (Feature: added Workflow Comparison)
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
                 {/* VNC browser */}
                 {!activeDebugSession ||
