@@ -2130,6 +2130,10 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
     is_saved_task: workflow.is_saved_task,
+    generate_script: workflow.generate_script,
+    cache_key: workflow.cache_key,
+    ai_fallback: workflow.ai_fallback ?? undefined,
+    run_sequentially: workflow.run_sequentially ?? undefined,
   };
 }
 
