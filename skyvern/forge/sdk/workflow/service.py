@@ -746,6 +746,23 @@ class WorkflowService:
 
         return workflow
 
+    async def get_workflow_versions_by_permanent_id(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str | None = None,
+        exclude_deleted: bool = True,
+    ) -> list[Workflow]:
+        """
+        Get all versions of a workflow by its permanent ID.
+        Returns an empty list if no workflow is found with that permanent ID.
+        """
+        workflows = await app.DATABASE.get_workflow_versions_by_permanent_id(
+            workflow_permanent_id,
+            organization_id=organization_id,
+            exclude_deleted=exclude_deleted,
+        )
+        return workflows
+
     async def get_block_outputs_for_debug_session(
         self,
         workflow_permanent_id: str,
