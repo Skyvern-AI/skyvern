@@ -528,7 +528,7 @@ class WorkflowRunContext:
         if totp_secret_key:
             totp_secret = await azure_vault_client.get_secret(totp_secret_key, vault_name)
             if not totp_secret:
-                raise ValueError(f"Azure Vault TOTP not found key: {totp_secret_key}")
+                raise ValueError(f"Azure Vault TOTP not found by key: {totp_secret_key}")
         else:
             totp_secret = None
 
