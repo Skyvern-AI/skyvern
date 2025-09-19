@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from skyvern.constants import SCROLL_AMOUNT_MULTIPLIER
 from skyvern.core.totp import poll_verification_code
-from skyvern.exceptions import NoTOTPVerificationCodeFound, UnsupportedActionType
+from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
@@ -824,6 +824,13 @@ async def generate_cua_fallback_actions(
                 )
             except NoTOTPVerificationCodeFound:
                 reasoning_suffix = "No verification code found"
+                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+            except FailedToGetTOTPVerificationCode as e:
+                reasoning_suffix = f"Failed to get verification code. Reason: {e.reason}"
                 reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
                 action = TerminateAction(
                     reasoning=reasoning,
