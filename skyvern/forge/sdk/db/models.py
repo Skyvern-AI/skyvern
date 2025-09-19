@@ -286,6 +286,7 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True)
+    run_with = Column(String, nullable=True)  # 'agent' or 'code'
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
