@@ -1605,7 +1605,7 @@ async def generate_workflow_script_python_code(
     run_id: str | None = None,
     script_id: str | None = None,
     script_revision_id: str | None = None,
-    draft: bool = False,
+    pending: bool = False,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
@@ -1685,7 +1685,7 @@ async def generate_workflow_script_python_code(
                     script_id=script_id,
                     organization_id=organization_id,
                     block_label=block_name,
-                    update=draft,
+                    update=pending,
                 )
             except Exception as e:
                 LOG.error("Failed to create script block", error=str(e), exc_info=True)
@@ -1800,7 +1800,7 @@ async def generate_workflow_script_python_code(
                 script_id=script_id,
                 organization_id=organization_id,
                 block_label=settings.WORKFLOW_START_BLOCK_LABEL,
-                update=draft,
+                update=pending,
             )
         except Exception as e:
             LOG.error("Failed to create __start_block__", error=str(e), exc_info=True)

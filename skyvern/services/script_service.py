@@ -58,7 +58,7 @@ async def build_file_tree(
     script_id: str,
     script_version: int,
     script_revision_id: str,
-    draft: bool = False,
+    pending: bool = False,
 ) -> dict[str, FileNode]:
     """Build a hierarchical file tree from a list of files and upload the files to s3 with the same tree structure."""
     file_tree: dict[str, FileNode] = {}
@@ -71,7 +71,7 @@ async def build_file_tree(
 
         # Create artifact and upload to S3
         try:
-            if draft:
+            if pending:
                 # get the script file object
                 script_file = await app.DATABASE.get_script_file_by_path(
                     script_revision_id=script_revision_id,

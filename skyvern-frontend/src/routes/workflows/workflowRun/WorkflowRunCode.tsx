@@ -52,7 +52,7 @@ function WorkflowRunCode(props?: Props) {
     cacheKeyValue,
     workflowPermanentId,
     pollIntervalMs: !isFinalized ? 3000 : undefined,
-    status: "draft",
+    status: "pending",
     workflowRunId: workflowRun?.workflow_run_id,
   });
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -87,7 +87,7 @@ function WorkflowRunCode(props?: Props) {
         cacheKey,
         cacheKeyValue,
         undefined,
-        "draft",
+        "pending",
         workflowRun?.workflow_run_id,
       ],
     });
