@@ -208,8 +208,8 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                       <div className="flex flex-col gap-4">
                         <div className="space-y-2">
                           <div className="flex items-center gap-2">
-                            <Label>Generate Code</Label>
-                            <HelpTooltip content="Generate & use cached code for faster execution." />
+                            <Label>Run Cached Code</Label>
+                            <HelpTooltip content="If code has been cached, run the workflow using code for faster execution." />
                             <Switch
                               className="ml-auto"
                               checked={inputs.useScriptCache}
