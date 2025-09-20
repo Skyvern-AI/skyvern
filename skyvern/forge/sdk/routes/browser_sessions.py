@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import Depends, HTTPException, Path
 from fastapi.responses import ORJSONResponse
 
@@ -45,7 +47,7 @@ async def create_browser_session(
         timeout_minutes=browser_session_request.timeout,
         proxy_location=browser_session_request.proxy_location,
     )
-    return BrowserSessionResponse.from_browser_session(browser_session)
+    return await BrowserSessionResponse.from_browser_session(browser_session)
 
 
 @base_router.post(
@@ -116,7 +118,7 @@ async def get_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    return BrowserSessionResponse.from_browser_session(browser_session)
+    return await BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
 
 
 @base_router.get(
@@ -145,4 +147,9 @@ async def get_browser_sessions(
     """Get all active browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
-    return [BrowserSessionResponse.from_browser_session(browser_session) for browser_session in browser_sessions]
+    return await asyncio.gather(
+        *[
+            BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+            for browser_session in browser_sessions
+        ]
+    )

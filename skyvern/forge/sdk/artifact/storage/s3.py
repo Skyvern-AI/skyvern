@@ -203,6 +203,36 @@ class S3Storage(BaseStorage):
             f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
         ]
 
+    async def get_shared_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        object_keys = await self.list_downloaded_files_in_browser_session(organization_id, browser_session_id)
+        if len(object_keys) == 0:
+            return []
+
+        file_infos: list[FileInfo] = []
+        for key in object_keys:
+            # Get metadata (including checksum)
+            metadata = await self.async_client.get_file_metadata(key, log_exception=False)
+
+            # Create FileInfo object
+            filename = os.path.basename(key)
+            checksum = metadata.get("sha256_checksum") if metadata else None
+
+            # Get presigned URL
+            presigned_urls = await self.async_client.create_presigned_urls([key])
+            if not presigned_urls:
+                continue
+
+            file_info = FileInfo(
+                url=presigned_urls[0],
+                checksum=checksum,
+                filename=metadata.get("original_filename", filename) if metadata else filename,
+            )
+            file_infos.append(file_info)
+
+        return file_infos
+
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
