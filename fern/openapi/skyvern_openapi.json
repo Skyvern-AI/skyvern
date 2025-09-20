@@ -4504,6 +4504,17 @@
             "title": "Timeout",
             "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
             "default": 60
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n"
           }
         },
         "type": "object",
@@ -8673,6 +8684,17 @@
         "title": "ScriptFileCreate",
         "description": "Model representing a file in a script."
       },
+      "ScriptRunResponse": {
+        "properties": {
+          "ai_fallback_triggered": {
+            "type": "boolean",
+            "title": "Ai Fallback Triggered",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ScriptRunResponse"
+      },
       "SelectOption": {
         "properties": {
           "label": {
@@ -10082,6 +10104,17 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
+          },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
           },
           "run_type": {
             "type": "string",
@@ -11826,6 +11859,17 @@
             ],
             "title": "Cache Key"
           },
+          "run_sequentially": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Sequentially"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -11997,6 +12041,11 @@
               }
             ],
             "title": "Cache Key"
+          },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
           }
         },
         "type": "object",
@@ -13232,6 +13281,17 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
+          },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
           },
           "run_type": {
             "type": "string",
