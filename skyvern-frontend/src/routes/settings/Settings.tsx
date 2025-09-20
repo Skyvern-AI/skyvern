@@ -17,6 +17,7 @@ import {
 import { envCredential } from "@/util/env";
 import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
+import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 
 function Settings() {
   const { environment, organization, setEnvironment, setOrganization } =
@@ -85,6 +86,15 @@ function Settings() {
         </CardHeader>
         <CardContent className="p-8">
           <OnePasswordTokenForm />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b-2">
+          <CardTitle className="text-lg">Azure Integration</CardTitle>
+          <CardDescription>Manage your Azure integration</CardDescription>
+        </CardHeader>
+        <CardContent className="p-8">
+          <AzureClientSecretCredentialTokenForm />
         </CardContent>
       </Card>
     </div>
