@@ -112,6 +112,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
               "bg-slate-950 outline outline-2 outline-slate-300":
                 thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader

@@ -1,14 +1,24 @@
 import { create } from "zustand";
+import { WorkflowVersion } from "@/routes/workflows/hooks/useWorkflowVersionsQuery";
 
 type WorkflowPanelState = {
   active: boolean;
-  content: "cacheKeyValues" | "parameters" | "nodeLibrary";
+  content:
+    | "cacheKeyValues"
+    | "parameters"
+    | "nodeLibrary"
+    | "history"
+    | "comparison";
   data?: {
     previous?: string | null;
     next?: string | null;
     parent?: string;
     connectingEdgeType?: string;
     disableLoop?: boolean;
+    // For comparison panel
+    version1?: WorkflowVersion;
+    version2?: WorkflowVersion;
+    showComparison?: boolean;
   };
 };
 

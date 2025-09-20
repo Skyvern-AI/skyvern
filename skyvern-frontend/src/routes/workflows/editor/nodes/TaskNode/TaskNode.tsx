@@ -119,6 +119,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
               "bg-slate-950 outline outline-2 outline-slate-300":
                 thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader
