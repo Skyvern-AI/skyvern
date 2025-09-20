@@ -50,7 +50,7 @@ const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
   description: "",
   ai_fallback: true,
-  generate_script: true,
+  generate_script: false,
   workflow_definition: {
     blocks: [],
     parameters: [],
