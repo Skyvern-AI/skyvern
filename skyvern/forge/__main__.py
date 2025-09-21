@@ -15,10 +15,18 @@ if __name__ == "__main__":
     load_dotenv()
 
     reload = settings.ENV == "local"
+
+    # Configure reload settings
     uvicorn.run(
         "skyvern.forge.api_app:app",
         host="0.0.0.0",
         port=port,
         log_level="info",
         reload=reload,
+        reload_excludes=[
+            f"{settings.TEMP_PATH}/*.py",
+            f"{settings.TEMP_PATH}/**/*.py",
+            f"{settings.TEMP_PATH}/*",
+            f"{settings.TEMP_PATH}/**",
+        ],
     )

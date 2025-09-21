@@ -1700,6 +1700,7 @@ class AgentDB:
         webhook_failure_reason: str | None = None,
         ai_fallback_triggered: bool | None = None,
         job_id: str | None = None,
+        run_with: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1722,6 +1723,8 @@ class AgentDB:
                     workflow_run.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
                 if job_id:
                     workflow_run.job_id = job_id
+                if run_with:
+                    workflow_run.run_with = run_with
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)

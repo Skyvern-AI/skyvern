@@ -61,8 +61,6 @@ async def get_workflow_script(
     cache_key = workflow.cache_key or ""
     rendered_cache_key_value = ""
 
-    if not workflow.generate_script:
-        return None, rendered_cache_key_value
     if block_labels:
         # Do not generate script or run script if block_labels is provided
         return None, rendered_cache_key_value
