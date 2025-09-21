@@ -250,13 +250,6 @@ async def execute_script(
     browser_session_id: str | None = None,
     background_tasks: BackgroundTasks | None = None,
 ) -> None:
-    # TODO: assume the script only has one ScriptFile called main.py
-    # step 1: get the script revision
-    # step 2: get the script files
-    # step 3: copy the script files to the local directory
-    # step 4: execute the script
-    # step 5: TODO: close all the browser instances
-
     # step 1: get the script revision
     script = await app.DATABASE.get_script(
         script_id=script_id,
@@ -282,7 +275,7 @@ async def execute_script(
         file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
         if not file_content:
             continue
-        file_path = os.path.join(script.script_id, file.file_path)
+        file_path = os.path.join(settings.TEMP_PATH, script.script_id, file.file_path)
         # create the directory if it doesn't exist
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
@@ -310,7 +303,7 @@ async def execute_script(
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
         LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
 
-    script_path = os.path.join(script.script_id, "main.py")
+    script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
     if background_tasks:
         # Execute asynchronously in background
         background_tasks.add_task(
