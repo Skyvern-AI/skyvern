@@ -321,27 +321,49 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
     <div className="flex h-full w-full flex-col rounded-lg bg-slate-elevation2">
       {/* Header */}
       <div className="flex-shrink-0 p-4 pb-3">
-        {/* Main title row with workflow names */}
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-xl font-semibold">
-            {version1.title} Version {version1.version}
+        {/* 3x3 Grid Layout */}
+        <div className="grid grid-cols-3 gap-4">
+          {/* Row 1: Workflow Names and Title */}
+          <h2 className="text-center text-xl font-semibold">
+            {version1.title}
           </h2>
-          <h3 className="text-lg font-medium text-muted-foreground">
+          <h3 className="text-center text-lg font-medium text-muted-foreground">
             Version Comparison
           </h3>
-          <h2 className="text-xl font-semibold">
-            {version2.title} Version {version2.version}
+          <h2 className="text-center text-xl font-semibold">
+            {version2.title}
           </h2>
-        </div>
 
-        {/* Version details and buttons */}
-        <div className="grid grid-cols-2 gap-4">
-          {/* Version 1 Details */}
-          <div className="flex items-center justify-center gap-3">
-            <div className="text-sm text-muted-foreground">
-              Version {version1.version} •{" "}
-              {new Date(version1.modified_at).toLocaleDateString()}
+          {/* Row 2: Version Details and Statistics */}
+          <div className="text-center text-sm text-muted-foreground">
+            [Version {version1.version}] •{" "}
+            {new Date(version1.modified_at).toLocaleDateString()}
+          </div>
+          <div className="flex justify-center gap-3 text-sm">
+            <div className="flex items-center gap-1">
+              <div className="h-3 w-3 rounded-full bg-green-300"></div>
+              <span>Identical ({stats.identical})</span>
             </div>
+            <div className="flex items-center gap-1">
+              <div className="h-3 w-3 rounded-full bg-yellow-400"></div>
+              <span>Modified ({stats.modified})</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <div className="h-3 w-3 rounded-full bg-orange-700"></div>
+              <span>Added ({stats.added})</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <div className="h-3 w-3 rounded-full bg-orange-700"></div>
+              <span>Removed ({stats.removed})</span>
+            </div>
+          </div>
+          <div className="text-center text-sm text-muted-foreground">
+            [Version {version2.version}] •{" "}
+            {new Date(version2.modified_at).toLocaleDateString()}
+          </div>
+
+          {/* Row 3: Select Buttons */}
+          <div className="flex justify-center">
             {onSelectState && (
               <Button
                 size="sm"
@@ -352,13 +374,8 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
               </Button>
             )}
           </div>
-
-          {/* Version 2 Details */}
-          <div className="flex items-center justify-center gap-3">
-            <div className="text-sm text-muted-foreground">
-              Version {version2.version} •{" "}
-              {new Date(version2.modified_at).toLocaleDateString()}
-            </div>
+          <div></div>
+          <div className="flex justify-center">
             {onSelectState && (
               <Button
                 size="sm"
@@ -368,26 +385,6 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
                 Select this variant
               </Button>
             )}
-          </div>
-        </div>
-
-        {/* Statistics */}
-        <div className="mt-4 flex justify-center gap-3 text-sm">
-          <div className="flex items-center gap-1">
-            <div className="h-3 w-3 rounded-full bg-green-300"></div>
-            <span>Identical ({stats.identical})</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <div className="h-3 w-3 rounded-full bg-yellow-400"></div>
-            <span>Modified ({stats.modified})</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <div className="h-3 w-3 rounded-full bg-orange-700"></div>
-            <span>Added ({stats.added})</span>
-          </div>
-          <div className="flex items-center gap-1">
-            <div className="h-3 w-3 rounded-full bg-orange-700"></div>
-            <span>Removed ({stats.removed})</span>
           </div>
         </div>
       </div>
