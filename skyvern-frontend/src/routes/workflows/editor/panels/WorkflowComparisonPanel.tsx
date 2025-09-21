@@ -1,5 +1,4 @@
 import { useCallback, useMemo } from "react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -171,7 +170,6 @@ function getWorkflowElements(version: WorkflowVersion) {
 
 function WorkflowComparisonRenderer({
   version,
-  onSelectState,
   blockColors,
 }: {
   version: WorkflowVersion;
@@ -239,45 +237,19 @@ function WorkflowComparisonRenderer({
   );
 
   return (
-    <div className="h-full w-full">
-      <div className="mb-3 flex flex-col items-center justify-center gap-2">
-        <div className="text-center">
-          <div className="mb-1 flex items-center justify-center gap-2">
-            <Badge variant="secondary">
-              {version.title}, version: {version.version}
-            </Badge>
-            <Badge variant="secondary">
-              {version.workflow_definition?.blocks?.length || 0} block
-              {(version.workflow_definition?.blocks?.length || 0) !== 1
-                ? "s"
-                : ""}
-            </Badge>
-            {onSelectState && (
-              <Button
-                size="sm"
-                onClick={() => onSelectState(version)}
-                className="text-xs"
-              >
-                Select this state
-              </Button>
-            )}
-          </div>
-        </div>
-      </div>
-      <div className="h-[calc(100%-4rem)] rounded-lg border bg-white">
-        <FlowRenderer
-          hideBackground={false}
-          hideControls={true}
-          nodes={nodes}
-          edges={edges}
-          setNodes={setNodes}
-          setEdges={setEdges}
-          onNodesChange={handleNodesChange}
-          onEdgesChange={handleEdgesChange}
-          initialTitle={version.title}
-          workflow={version}
-        />
-      </div>
+    <div className="h-full w-full rounded-lg border bg-white">
+      <FlowRenderer
+        hideBackground={false}
+        hideControls={true}
+        nodes={nodes}
+        edges={edges}
+        setNodes={setNodes}
+        setEdges={setEdges}
+        onNodesChange={handleNodesChange}
+        onEdgesChange={handleEdgesChange}
+        initialTitle={version.title}
+        workflow={version}
+      />
     </div>
   );
 }
@@ -349,8 +321,58 @@ function WorkflowComparisonPanel({ version1, version2, onSelectState }: Props) {
     <div className="flex h-full w-full flex-col rounded-lg bg-slate-elevation2">
       {/* Header */}
       <div className="flex-shrink-0 p-4 pb-3">
-        <h2 className="mb-2 text-lg font-semibold">Version Comparison</h2>
-        <div className="flex gap-3 text-sm">
+        {/* Main title row with workflow names */}
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-xl font-semibold">
+            {version1.title} Version {version1.version}
+          </h2>
+          <h3 className="text-lg font-medium text-muted-foreground">
+            Version Comparison
+          </h3>
+          <h2 className="text-xl font-semibold">
+            {version2.title} Version {version2.version}
+          </h2>
+        </div>
+
+        {/* Version details and buttons */}
+        <div className="grid grid-cols-2 gap-4">
+          {/* Version 1 Details */}
+          <div className="flex items-center justify-center gap-3">
+            <div className="text-sm text-muted-foreground">
+              Version {version1.version} •{" "}
+              {new Date(version1.modified_at).toLocaleDateString()}
+            </div>
+            {onSelectState && (
+              <Button
+                size="sm"
+                onClick={() => onSelectState(version1)}
+                className="text-xs"
+              >
+                Select this variant
+              </Button>
+            )}
+          </div>
+
+          {/* Version 2 Details */}
+          <div className="flex items-center justify-center gap-3">
+            <div className="text-sm text-muted-foreground">
+              Version {version2.version} •{" "}
+              {new Date(version2.modified_at).toLocaleDateString()}
+            </div>
+            {onSelectState && (
+              <Button
+                size="sm"
+                onClick={() => onSelectState(version2)}
+                className="text-xs"
+              >
+                Select this variant
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {/* Statistics */}
+        <div className="mt-4 flex justify-center gap-3 text-sm">
           <div className="flex items-center gap-1">
             <div className="h-3 w-3 rounded-full bg-green-300"></div>
             <span>Identical ({stats.identical})</span>
