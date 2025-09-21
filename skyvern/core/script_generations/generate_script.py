@@ -1813,9 +1813,6 @@ async def generate_workflow_script_python_code(
     ]
 
     module = cst.Module(body=module_body)
-
-    with open(file_name, "w") as f:
-        f.write(module.code)
     return module.code
 
 
