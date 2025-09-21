@@ -17,7 +17,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
-from skyvern.core.script_generations.generate_script import _build_block_fn, create_script_block
+from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.skyvern_page import script_run_context_manager
 from skyvern.exceptions import ScriptNotFound, WorkflowRunNotFound
 from skyvern.forge import app
@@ -45,10 +45,10 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.scripts import CreateScriptResponse, FileEncoding, FileNode, ScriptFileCreate
+from skyvern.schemas.scripts import CreateScriptResponse, FileEncoding, FileNode, ScriptFileCreate, ScriptStatus
 from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
 
-LOG = structlog.get_logger(__name__)
+LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
 
 
@@ -58,6 +58,7 @@ async def build_file_tree(
     script_id: str,
     script_version: int,
     script_revision_id: str,
+    pending: bool = False,
 ) -> dict[str, FileNode]:
     """Build a hierarchical file tree from a list of files and upload the files to s3 with the same tree structure."""
     file_tree: dict[str, FileNode] = {}
@@ -70,33 +71,94 @@ async def build_file_tree(
 
         # Create artifact and upload to S3
         try:
-            artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
-                organization_id=organization_id,
-                script_id=script_id,
-                script_version=script_version,
-                file_path=file.path,
-                data=content_bytes,
-            )
-            LOG.debug(
-                "Created script file artifact",
-                artifact_id=artifact_id,
-                file_path=file.path,
-                script_id=script_id,
-                script_version=script_version,
-            )
-            # create a script file record
-            await app.DATABASE.create_script_file(
-                script_revision_id=script_revision_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                file_path=file.path,
-                file_name=file.path.split("/")[-1],
-                file_type="file",
-                content_hash=f"sha256:{content_hash}",
-                file_size=file_size,
-                mime_type=file.mime_type,
-                artifact_id=artifact_id,
-            )
+            if pending:
+                # get the script file object
+                script_file = await app.DATABASE.get_script_file_by_path(
+                    script_revision_id=script_revision_id,
+                    file_path=file.path,
+                    organization_id=organization_id,
+                )
+                if script_file:
+                    if not script_file.artifact_id:
+                        LOG.error(
+                            "Failed to update file. An existing script file has no artifact id",
+                            script_file_id=script_file.file_id,
+                        )
+                        continue
+                    artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                    if artifact:
+                        # override the actual file in the storage
+                        asyncio.create_task(app.STORAGE.store_artifact(artifact, content_bytes))
+                    else:
+                        artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                            organization_id=organization_id,
+                            script_id=script_id,
+                            script_version=script_version,
+                            file_path=file.path,
+                            data=content_bytes,
+                        )
+                        # update the artifact_id in the script file
+                        await app.DATABASE.update_script_file(
+                            script_file_id=script_file.file_id,
+                            organization_id=organization_id,
+                            artifact_id=artifact_id,
+                        )
+                else:
+                    artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                        organization_id=organization_id,
+                        script_id=script_id,
+                        script_version=script_version,
+                        file_path=file.path,
+                        data=content_bytes,
+                    )
+                    LOG.debug(
+                        "Created script file artifact",
+                        artifact_id=artifact_id,
+                        file_path=file.path,
+                        script_id=script_id,
+                        script_version=script_version,
+                    )
+                    # create a script file record
+                    await app.DATABASE.create_script_file(
+                        script_revision_id=script_revision_id,
+                        script_id=script_id,
+                        organization_id=organization_id,
+                        file_path=file.path,
+                        file_name=file.path.split("/")[-1],
+                        file_type="file",
+                        content_hash=f"sha256:{content_hash}",
+                        file_size=file_size,
+                        mime_type=file.mime_type,
+                        artifact_id=artifact_id,
+                    )
+            else:
+                artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    script_version=script_version,
+                    file_path=file.path,
+                    data=content_bytes,
+                )
+                LOG.debug(
+                    "Created script file artifact",
+                    artifact_id=artifact_id,
+                    file_path=file.path,
+                    script_id=script_id,
+                    script_version=script_version,
+                )
+                # create a script file record
+                await app.DATABASE.create_script_file(
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    file_path=file.path,
+                    file_name=file.path.split("/")[-1],
+                    file_type="file",
+                    content_hash=f"sha256:{content_hash}",
+                    file_size=file_size,
+                    mime_type=file.mime_type,
+                    artifact_id=artifact_id,
+                )
         except Exception:
             LOG.exception(
                 "Failed to create script file artifact",
@@ -188,13 +250,6 @@ async def execute_script(
     browser_session_id: str | None = None,
     background_tasks: BackgroundTasks | None = None,
 ) -> None:
-    # TODO: assume the script only has one ScriptFile called main.py
-    # step 1: get the script revision
-    # step 2: get the script files
-    # step 3: copy the script files to the local directory
-    # step 4: execute the script
-    # step 5: TODO: close all the browser instances
-
     # step 1: get the script revision
     script = await app.DATABASE.get_script(
         script_id=script_id,
@@ -220,7 +275,7 @@ async def execute_script(
         file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
         if not file_content:
             continue
-        file_path = os.path.join(script.script_id, file.file_path)
+        file_path = os.path.join(settings.TEMP_PATH, script.script_id, file.file_path)
         # create the directory if it doesn't exist
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
@@ -248,7 +303,7 @@ async def execute_script(
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
         LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
 
-    script_path = os.path.join(script.script_id, "main.py")
+    script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
     if background_tasks:
         # Execute asynchronously in background
         background_tasks.add_task(
@@ -794,6 +849,7 @@ async def _regenerate_script_block_after_ai_fallback(
             workflow_permanent_id=workflow.workflow_permanent_id,
             cache_key_value=cache_key_value,
             cache_key=workflow.cache_key,
+            statuses=[ScriptStatus.published],
         )
 
         if not existing_scripts:
@@ -898,12 +954,12 @@ async def _regenerate_script_block_after_ai_fallback(
                 )
                 continue
 
-            await create_script_block(
+            await create_or_update_script_block(
                 block_code=block_file_content,
                 script_revision_id=new_script.script_revision_id,
                 script_id=new_script.script_id,
                 organization_id=organization_id,
-                block_name=existing_block.script_block_label,
+                block_label=existing_block.script_block_label,
             )
             block_file_content_bytes = (
                 block_file_content if isinstance(block_file_content, bytes) else block_file_content.encode("utf-8")

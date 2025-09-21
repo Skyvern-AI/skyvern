@@ -3064,6 +3064,9 @@ class TaskV2Block(Block):
         finally:
             context: skyvern_context.SkyvernContext | None = skyvern_context.current()
             current_run_id = context.run_id if context and context.run_id else workflow_run_id
+            root_workflow_run_id = (
+                context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
+            )
             skyvern_context.set(
                 skyvern_context.SkyvernContext(
                     organization_id=organization_id,
@@ -3071,6 +3074,7 @@ class TaskV2Block(Block):
                     workflow_id=workflow_run.workflow_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
+                    root_workflow_run_id=root_workflow_run_id,
                     run_id=current_run_id,
                     browser_session_id=browser_session_id,
                     max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,

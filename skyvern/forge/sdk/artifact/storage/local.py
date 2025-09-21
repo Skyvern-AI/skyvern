@@ -215,6 +215,11 @@ class LocalStorage(BaseStorage):
     ) -> list[str]:
         return []
 
+    async def get_shared_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        return []
+
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:

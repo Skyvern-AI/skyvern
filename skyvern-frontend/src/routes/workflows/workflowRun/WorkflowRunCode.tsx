@@ -52,6 +52,8 @@ function WorkflowRunCode(props?: Props) {
     cacheKeyValue,
     workflowPermanentId,
     pollIntervalMs: !isFinalized ? 3000 : undefined,
+    status: "pending",
+    workflowRunId: workflowRun?.workflow_run_id,
   });
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
   const code = getCode(orderedBlockLabels, blockScripts).join("").trim();
@@ -79,7 +81,15 @@ function WorkflowRunCode(props?: Props) {
 
   useEffect(() => {
     queryClient.invalidateQueries({
-      queryKey: ["block-scripts", workflowPermanentId, cacheKey, cacheKeyValue],
+      queryKey: [
+        "block-scripts",
+        workflowPermanentId,
+        cacheKey,
+        cacheKeyValue,
+        undefined,
+        "pending",
+        workflowRun?.workflow_run_id,
+      ],
     });
   }, [queryClient, workflowRun, workflowPermanentId, cacheKey, cacheKeyValue]);
 

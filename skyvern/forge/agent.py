@@ -27,12 +27,19 @@ from skyvern.constants import (
     ScrapeType,
 )
 from skyvern.core.totp import poll_verification_code
-from skyvern.errors.errors import ReachMaxRetriesError, ReachMaxStepsError, UserDefinedError
+from skyvern.errors.errors import (
+    GetTOTPVerificationCodeError,
+    ReachMaxRetriesError,
+    ReachMaxStepsError,
+    TimeoutGetTOTPVerificationCodeError,
+    UserDefinedError,
+)
 from skyvern.exceptions import (
     BrowserSessionNotFound,
     BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
+    FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
     FailedToSendWebhook,
@@ -1012,6 +1019,21 @@ class ForgeAgent:
                                 action_order=0,
                                 reasoning="No TOTP verification code found. Going to terminate.",
                                 intention="No TOTP verification code found. Going to terminate.",
+                                errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
+                            )
+                        ]
+                    except FailedToGetTOTPVerificationCode as e:
+                        actions = [
+                            TerminateAction(
+                                reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                organization_id=task.organization_id,
+                                workflow_run_id=task.workflow_run_id,
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                action_order=0,
+                                errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
                             )
                         ]
 
@@ -1154,6 +1176,7 @@ class ForgeAgent:
                     # set verified to True will skip the completion verification
                     action.verified = True
                 results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
                     results,
@@ -1296,6 +1319,7 @@ class ForgeAgent:
                         complete_results = await ActionHandler.handle_action(
                             scraped_page, task, step, working_page, complete_action
                         )
+                        await app.AGENT_FUNCTION.post_action_execution()
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
 
@@ -1315,6 +1339,7 @@ class ForgeAgent:
                 extract_results = await ActionHandler.handle_action(
                     scraped_page, task, step, working_page, extract_action
                 )
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
 
             # If no action errors return the agent state and output

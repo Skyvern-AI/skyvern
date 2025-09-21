@@ -6,6 +6,22 @@ authors = ["Skyvern AI <info@skyvern.com>"]
 readme = "README.md"
 packages = [{ include = "skyvern" }, { include = "alembic" }]
 
+include = [
+    { path = "skyvern-frontend", format = "sdist" },
+    { path = "skyvern-frontend/src", format = ["sdist", "wheel"] },
+    { path = "skyvern-frontend/public", format = ["sdist", "wheel"] },
+    { path = "skyvern-frontend/package.json", format = ["sdist", "wheel"] },
+    { path = "skyvern-frontend/package-lock.json", format = ["sdist", "wheel"] },
+    { path = "skyvern-frontend/*.config.*", format = ["sdist", "wheel"] },
+    { path = "skyvern-frontend/*.html", format = ["sdist", "wheel"] },
+    { path = "skyvern-frontend/*.md", format = ["sdist", "wheel"] }
+]
+
+exclude = [
+    { path = "skyvern-frontend/node_modules", format = ["sdist", "wheel"] },
+    { path = "skyvern-frontend/dist", format = ["sdist", "wheel"] }
+]
+
 [tool.poetry.dependencies]
 azure-storage-blob = ">=12.26.0"
 python = ">=3.11,<3.14"
