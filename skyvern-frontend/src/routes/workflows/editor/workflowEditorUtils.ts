@@ -2182,6 +2182,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     } catch {
       errors.push(`${node.data.label}: Error messages is not valid JSON.`);
     }
+    // Validate Task data schema JSON when enabled (value different from "null")
+    if (node.data.dataSchema && node.data.dataSchema !== "null") {
+      try {
+        JSON.parse(node.data.dataSchema);
+      } catch {
+        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+      }
+    }
   });
 
   const validationNodes = nodes.filter(isValidationNode);
@@ -2212,6 +2220,14 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+    // Validate Extraction data schema JSON when enabled (value different from "null")
+    if (node.data.dataSchema && node.data.dataSchema !== "null") {
+      try {
+        JSON.parse(node.data.dataSchema);
+      } catch {
+        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+      }
     }
   });
 
