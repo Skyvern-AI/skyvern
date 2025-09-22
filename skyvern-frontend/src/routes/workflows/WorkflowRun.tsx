@@ -1,10 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
-import {
-  SwitchBarNavigation,
-  type SwitchBarNavigationOption,
-} from "@/components/SwitchBarNavigation";
+import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -22,7 +19,6 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { apiBaseUrl } from "@/util/env";
 import {
-  CodeIcon,
   FileIcon,
   Pencil2Icon,
   PlayIcon,
@@ -64,8 +60,6 @@ function WorkflowRun() {
     isLoading: workflowRunIsLoading,
     isFetched,
   } = useWorkflowRunQuery();
-
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
 
@@ -214,7 +208,7 @@ function WorkflowRun() {
       webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
-  const switchBarOptions: SwitchBarNavigationOption[] = [
+  const switchBarOptions = [
     {
       label: "Overview",
       to: "overview",
@@ -233,18 +227,10 @@ function WorkflowRun() {
     },
   ];
 
-  const isGeneratingCode = !isFinalized && workflow?.generate_script === true;
-
   if (!hasScript) {
     switchBarOptions.push({
       label: "Code",
       to: "code",
-      icon:
-        isFinalized || !isGeneratingCode ? (
-          <CodeIcon className="inline-block size-5" />
-        ) : (
-          <ReloadIcon className="inline-block size-5 animate-spin" />
-        ),
     });
   }
 

@@ -8,7 +8,7 @@ type Props = {
   cacheKeyValue?: string;
   workflowPermanentId?: string;
   pollIntervalMs?: number;
-  status?: "pending" | "published";
+  status?: string;
   workflowRunId?: string;
 };
 

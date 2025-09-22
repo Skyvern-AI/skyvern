@@ -4,7 +4,6 @@ import { NavLink, useSearchParams } from "react-router-dom";
 type Option = {
   label: string;
   to: string;
-  icon?: React.ReactNode;
 };
 
 type Props = {
@@ -24,18 +23,13 @@ function SwitchBarNavigation({ options }: Props) {
             key={option.to}
             className={({ isActive }) => {
               return cn(
-                "flex cursor-pointer items-center justify-center rounded-sm px-3 py-2 text-center hover:bg-slate-700",
+                "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
                 {
                   "bg-slate-700": isActive,
                 },
               );
             }}
           >
-            {option.icon && (
-              <span className="mr-1 flex items-center justify-center">
-                {option.icon}
-              </span>
-            )}
             {option.label}
           </NavLink>
         );
@@ -44,4 +38,4 @@ function SwitchBarNavigation({ options }: Props) {
   );
 }
 
-export { SwitchBarNavigation, type Option as SwitchBarNavigationOption };
+export { SwitchBarNavigation };
