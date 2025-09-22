@@ -1,16 +1,9 @@
 interface AnimatedWaveProps {
   text: string;
   className?: string;
-  duration?: string;
-  waveHeight?: string;
 }
 
-export function AnimatedWave({
-  text,
-  className = "",
-  duration = "1.3s",
-  waveHeight = "4px",
-}: AnimatedWaveProps) {
+export function AnimatedWave({ text, className = "" }: AnimatedWaveProps) {
   const characters = text.split("");
 
   return (
@@ -21,7 +14,7 @@ export function AnimatedWave({
             transform: translateY(0px);
           }
           50% {
-            transform: translateY(-${waveHeight});
+            transform: translateY(-4px);
           }
         }
         .animate-wave {
@@ -35,7 +28,7 @@ export function AnimatedWave({
             className="animate-wave inline-block"
             style={{
               animationDelay: `${index * 0.1}s`,
-              animationDuration: duration,
+              animationDuration: "1.3s",
               animationIterationCount: "infinite",
               animationTimingFunction: "ease-in-out",
             }}
