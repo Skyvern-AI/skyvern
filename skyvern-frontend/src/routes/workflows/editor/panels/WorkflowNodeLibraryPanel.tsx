@@ -243,14 +243,12 @@ const nodeLibraryItems: Array<{
 ];
 
 type Props = {
-  name?: string;
   onMouseDownCapture?: () => void;
   onNodeClick: (props: AddNodeProps) => void;
   first?: boolean;
 };
 
 function WorkflowNodeLibraryPanel({
-  name,
   onMouseDownCapture,
   onNodeClick,
   first,
@@ -325,7 +323,7 @@ function WorkflowNodeLibraryPanel({
       <div className="flex h-full flex-col space-y-4">
         <header className="space-y-2">
           <div className="flex justify-between">
-            <h1 className="text-lg">{name || "Block Library"}</h1>
+            <h1 className="text-lg">Block Library</h1>
             {!first && (
               <Cross2Icon
                 className="size-6 cursor-pointer"
