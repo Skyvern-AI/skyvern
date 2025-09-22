@@ -1102,7 +1102,6 @@ function Workspace({
             {workflowPanelState.content === "parameters" && (
               <WorkflowParametersPanel />
             )}
-
           </div>
         )}
 
