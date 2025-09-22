@@ -91,6 +91,9 @@ class BrowserSessionResponse(BaseModel):
                     "Timeout getting downloaded files", browser_session_id=browser_session.persistent_browser_session_id
                 )
 
+            # Sort downloaded files by modified_at in descending order (newest first)
+            downloaded_files.sort(key=lambda x: x.modified_at or datetime.min, reverse=True)
+
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
