@@ -1178,7 +1178,9 @@ async def handle_input_text_action(
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
-            skyvern_element = blocking_element
+            if await blocking_element.is_editable():
+                skyvern_element = blocking_element
+                tag_name = blocking_element.get_tag_name()
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",

@@ -285,6 +285,17 @@ class SkyvernElement:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         return await skyvern_frame.get_element_visible(await self.get_element_handler())
 
+    async def is_editable(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
+        try:
+            return await self.get_locator().is_editable(timeout=timeout)
+        except Exception:
+            LOG.info(
+                "Failed to check element editable, considering it's not editable",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            return False
+
     async def is_parent_of(self, target: ElementHandle) -> bool:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         return await skyvern_frame.is_parent(await self.get_element_handler(), target)
