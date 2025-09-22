@@ -1791,7 +1791,9 @@ async def handle_terminate_action(
     step: Step,
 ) -> list[ActionResult]:
     if task.error_code_mapping:
-        action.errors = await extract_user_defined_errors(task=task, step=step, scraped_page=scraped_page)
+        action.errors = await extract_user_defined_errors(
+            task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+        )
     return [ActionSuccess()]
 
 
@@ -1833,7 +1835,9 @@ async def handle_complete_action(
         action.verified = True
 
         if task.error_code_mapping:
-            action.errors = await extract_user_defined_errors(task=task, step=step, scraped_page=scraped_page)
+            action.errors = await extract_user_defined_errors(
+                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+            )
 
         if not task.data_extraction_goal and verification_result.thoughts:
             await app.DATABASE.update_task(
@@ -3729,7 +3733,9 @@ async def _get_input_or_select_context(
     return input_or_select_context
 
 
-async def extract_user_defined_errors(task: Task, step: Step, scraped_page: ScrapedPage) -> list[UserDefinedError]:
+async def extract_user_defined_errors(
+    task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
+) -> list[UserDefinedError]:
     action_history = await get_action_history(task=task, current_step=step)
     scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
     prompt = prompt_engine.load_prompt(
@@ -3741,6 +3747,7 @@ async def extract_user_defined_errors(task: Task, step: Step, scraped_page: Scra
         action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        reasoning=reasoning,
     )
     json_response = await app.EXTRACTION_LLM_API_HANDLER(
         prompt=prompt,
