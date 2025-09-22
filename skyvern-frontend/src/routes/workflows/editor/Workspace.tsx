@@ -1018,13 +1018,6 @@ function Workspace({
           {workflowPanelState.content === "parameters" && (
             <WorkflowParametersPanel />
           )}
-          {workflowPanelState.content === "nodeLibrary" && (
-            <WorkflowNodeLibraryPanel
-              onNodeClick={(props) => {
-                addNode(props);
-              }}
-            />
-          )}
         </div>
       )}
 
