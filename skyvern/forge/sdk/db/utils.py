@@ -30,7 +30,12 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step, StepStatus
-from skyvern.forge.sdk.schemas.organizations import AzureOrganizationAuthToken, Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.organizations import (
+    AzureClientSecretCredential,
+    AzureOrganizationAuthToken,
+    Organization,
+    OrganizationAuthToken,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -202,7 +207,7 @@ async def convert_to_organization_auth_token(
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
 
     if token_type == OrganizationAuthTokenType.azure_client_secret_credential:
-        credential = AzureOrganizationAuthToken.AzureClientSecretCredential.parse_raw(token)
+        credential = AzureClientSecretCredential.model_validate_json(token)
         return AzureOrganizationAuthToken(
             id=org_auth_token.id,
             organization_id=org_auth_token.organization_id,

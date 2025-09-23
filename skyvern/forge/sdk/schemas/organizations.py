@@ -34,13 +34,14 @@ class OrganizationAuthToken(OrganizationAuthTokenBase):
     token: str
 
 
+class AzureClientSecretCredential(BaseModel):
+    tenant_id: str
+    client_id: str
+    client_secret: str
+
+
 class AzureOrganizationAuthToken(OrganizationAuthTokenBase):
     """Represents OrganizationAuthToken for Azure; defined by 3 fields: tenant_id, client_id, and client_secret"""
-
-    class AzureClientSecretCredential(BaseModel):
-        tenant_id: str
-        client_id: str
-        client_secret: str
 
     credential: AzureClientSecretCredential
 
@@ -76,7 +77,7 @@ class AzureClientSecretCredentialResponse(BaseModel):
 class CreateAzureClientSecretCredentialRequest(BaseModel):
     """Request model for creating or updating an Azure ClientSecretCredential."""
 
-    credential: AzureOrganizationAuthToken.AzureClientSecretCredential
+    credential: AzureClientSecretCredential
 
 
 class GetOrganizationsResponse(BaseModel):

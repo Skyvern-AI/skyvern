@@ -79,7 +79,12 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
-from skyvern.forge.sdk.schemas.organizations import AzureOrganizationAuthToken, Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.organizations import (
+    AzureClientSecretCredential,
+    AzureOrganizationAuthToken,
+    Organization,
+    OrganizationAuthToken,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
@@ -969,11 +974,11 @@ class AgentDB:
         self,
         organization_id: str,
         token_type: OrganizationAuthTokenType,
-        token: str | AzureOrganizationAuthToken.AzureClientSecretCredential,
+        token: str | AzureClientSecretCredential,
         encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken:
         if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
-            if not isinstance(token, AzureOrganizationAuthToken.AzureClientSecretCredential):
+            if not isinstance(token, AzureClientSecretCredential):
                 raise TypeError("Expected AzureClientSecretCredential for this token_type")
             plaintext_token = token.json()
         else:

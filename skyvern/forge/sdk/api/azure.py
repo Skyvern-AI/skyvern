@@ -3,7 +3,7 @@ from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.keyvault.secrets.aio import SecretClient
 from azure.storage.blob.aio import BlobServiceClient
 
-from skyvern.forge.sdk.schemas.organizations import AzureOrganizationAuthToken
+from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential
 
 LOG = structlog.get_logger()
 
@@ -38,7 +38,7 @@ class AsyncAzureVaultClient:
     @classmethod
     def create_from_client_secret(
         cls,
-        credential: AzureOrganizationAuthToken.AzureClientSecretCredential,
+        credential: AzureClientSecretCredential,
     ) -> "AsyncAzureVaultClient":
         cred = ClientSecretCredential(
             tenant_id=credential.tenant_id,
