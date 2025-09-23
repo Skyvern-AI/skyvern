@@ -212,8 +212,15 @@ class S3Storage(BaseStorage):
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
+            metadata = {}
+            modified_at: datetime | None = None
             # Get metadata (including checksum)
-            metadata = await self.async_client.get_file_metadata(key, log_exception=False)
+            try:
+                object_info = await self.async_client.get_object_info(key)
+                metadata = object_info.get("Metadata", {})
+                modified_at = object_info.get("LastModified")
+            except Exception:
+                LOG.exception("Object info retrieval failed", uri=key)
 
             # Create FileInfo object
             filename = os.path.basename(key)
@@ -228,6 +235,7 @@ class S3Storage(BaseStorage):
                 url=presigned_urls[0],
                 checksum=checksum,
                 filename=metadata.get("original_filename", filename) if metadata else filename,
+                modified_at=modified_at,
             )
             file_infos.append(file_info)
 

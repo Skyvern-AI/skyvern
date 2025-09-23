@@ -157,6 +157,7 @@ class TaskV2Request(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
     generate_script: bool = False
+    ai_fallback: bool = False
 
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod

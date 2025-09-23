@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -7,3 +9,4 @@ class FileInfo(BaseModel):
     url: str = Field(..., description="URL to access the file")
     checksum: str | None = Field(None, description="SHA-256 checksum of the file")
     filename: str | None = Field(None, description="Original filename")
+    modified_at: datetime | None = Field(None, description="Modified time of the file")
