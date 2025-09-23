@@ -19,7 +19,7 @@ export function useAzureClientCredentialToken() {
       queryFn: async () => {
         const client = await getClient(credentialGetter, "sans-api-v1");
         return await client
-          .get("/credentials/azure_client_secret_credential/get")
+          .get("/credentials/azure_credential/get")
           .then((response) => response.data.token)
           .catch(() => null);
       },
@@ -29,7 +29,7 @@ export function useAzureClientCredentialToken() {
     mutationFn: async (data: CreateAzureClientSecretCredentialRequest) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       return await client
-        .post("/credentials/azure_client_secret_credential/create", data)
+        .post("/credentials/azure_credential/create", data)
         .then(
           (response) => response.data as AzureClientSecretCredentialResponse,
         );

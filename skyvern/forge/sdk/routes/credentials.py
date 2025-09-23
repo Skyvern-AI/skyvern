@@ -483,14 +483,14 @@ async def update_onepassword_token(
 
 
 @base_router.get(
-    "/credentials/azure_client_secret_credential/get",
+    "/credentials/azure_credential/get",
     response_model=AzureClientSecretCredentialResponse,
     summary="Get Azure Client Secret Credential",
     description="Retrieves the current Azure Client Secret Credential for the organization.",
     include_in_schema=False,
 )
 @base_router.get(
-    "/credentials/azure_client_secret_credential/get/",
+    "/credentials/azure_credential/get/",
     response_model=AzureClientSecretCredentialResponse,
     include_in_schema=False,
 )
@@ -529,14 +529,14 @@ async def get_azure_client_secret_credential(
 
 
 @base_router.post(
-    "/credentials/azure_client_secret_credential/create",
+    "/credentials/azure_credential/create",
     response_model=AzureClientSecretCredentialResponse,
     summary="Create or update Azure Client Secret Credential",
     description="Creates or updates a Azure Client Secret Credential for the current organization. Only one valid record is allowed per organization.",
     include_in_schema=False,
 )
 @base_router.post(
-    "/credentials/azure_client_secret_credential/create/",
+    "/credentials/azure_credential/create/",
     response_model=AzureClientSecretCredentialResponse,
     include_in_schema=False,
 )
