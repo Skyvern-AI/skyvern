@@ -51,6 +51,7 @@ class BrowserSessionResponse(BaseModel):
     downloaded_files: list[FileInfo] | None = Field(
         None, description="The list of files downloaded by the browser session"
     )
+    recordings: list[FileInfo] | None = Field(None, description="The list of video recordings from the browser session")
     started_at: datetime | None = Field(None, description="Timestamp when the session was started")
     completed_at: datetime | None = Field(None, description="Timestamp when the session was completed")
     created_at: datetime = Field(
@@ -79,6 +80,7 @@ class BrowserSessionResponse(BaseModel):
             f"/app/downloads/{browser_session.organization_id}/{browser_session.persistent_browser_session_id}"
         )
         downloaded_files: list[FileInfo] = []
+        recordings: list[FileInfo] = []
         if storage:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
@@ -91,8 +93,21 @@ class BrowserSessionResponse(BaseModel):
                     "Timeout getting downloaded files", browser_session_id=browser_session.persistent_browser_session_id
                 )
 
+            try:
+                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                    recordings = await storage.get_shared_recordings_in_browser_session(
+                        organization_id=browser_session.organization_id,
+                        browser_session_id=browser_session.persistent_browser_session_id,
+                    )
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "Timeout getting recordings", browser_session_id=browser_session.persistent_browser_session_id
+                )
+
             # Sort downloaded files by modified_at in descending order (newest first)
             downloaded_files.sort(key=lambda x: x.modified_at or datetime.min, reverse=True)
+            # Sort recordings by modified_at in descending order (newest first)
+            recordings.sort(key=lambda x: x.modified_at or datetime.min, reverse=True)
 
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
@@ -110,4 +125,5 @@ class BrowserSessionResponse(BaseModel):
             deleted_at=browser_session.deleted_at,
             download_path=download_path,
             downloaded_files=downloaded_files,
+            recordings=recordings,
         )

@@ -225,6 +225,16 @@ class LocalStorage(BaseStorage):
     ) -> list[str]:
         return []
 
+    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
+        """List all recording files for a browser session (not implemented for local storage)."""
+        return []
+
+    async def get_shared_recordings_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        """Get recording files with URLs for a browser session (not implemented for local storage)."""
+        return []
+
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
         download_dir = get_download_dir(run_id=run_id)
         file_infos: list[FileInfo] = []
