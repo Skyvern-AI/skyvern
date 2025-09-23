@@ -1,7 +1,5 @@
 from pydantic import BaseModel
 
-from skyvern.config import settings
-from skyvern.forge.sdk.encrypt.aes import AES
 from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod
 
 
@@ -26,7 +24,3 @@ class Encryptor(BaseModel):
 
 
 encryptor = Encryptor()
-
-encryptor.add_encrypt_method(
-    AES(secret_key=settings.ENCRYPTOR_AES_SECRET_KEY, iv=settings.ENCRYPTOR_AES_IV, salt=settings.ENCRYPTOR_AES_SALT)
-)

@@ -980,7 +980,7 @@ class AgentDB:
         if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
             if not isinstance(token, AzureClientSecretCredential):
                 raise TypeError("Expected AzureClientSecretCredential for this token_type")
-            plaintext_token = token.json()
+            plaintext_token = token.model_dump_json()
         else:
             if not isinstance(token, str):
                 raise TypeError("Expected str token for this token_type")

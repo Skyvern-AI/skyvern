@@ -4,7 +4,6 @@ from fastapi import Body, Depends, HTTPException, Path, Query
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.encrypt import EncryptMethod
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE,
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD,
@@ -563,7 +562,6 @@ async def update_azure_client_secret_credential(
             organization_id=current_org.organization_id,
             token_type=OrganizationAuthTokenType.azure_client_secret_credential,
             token=request.credential,
-            encrypted_method=EncryptMethod.AES,
         )
 
         LOG.info(
