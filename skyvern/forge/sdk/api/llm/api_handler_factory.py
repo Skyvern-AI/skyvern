@@ -47,6 +47,128 @@ class LLMCallStats(BaseModel):
 
 class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
+    _thinking_budget_settings: dict[str, int] | None = None
+
+    @staticmethod
+    def _apply_thinking_budget_optimization(
+        parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
+    ) -> None:
+        """Apply thinking budget optimization based on model type and LiteLLM reasoning support."""
+        # Compute a safe model label and a representative model for capability checks
+        model_label = getattr(llm_config, "model_name", None)
+        if model_label is None and isinstance(llm_config, LLMRouterConfig):
+            model_label = getattr(llm_config, "main_model_group", "router")
+        check_model = model_label
+        if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
+            try:
+                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
+            except Exception:
+                check_model = model_label
+        try:
+            # Early return if model doesn't support reasoning
+            if check_model and not litellm.supports_reasoning(model=check_model):
+                LOG.info(
+                    "Thinking budget optimization not supported for model",
+                    prompt_name=prompt_name,
+                    budget=new_budget,
+                    model=model_label,
+                )
+                return
+
+            # Apply optimization based on model type
+            model_label_lower = (model_label or "").lower()
+            if "gemini" in model_label_lower:
+                # Gemini models use the exact integer budget value
+                LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+                    parameters, new_budget, llm_config, prompt_name
+                )
+            elif "anthropic" in model_label_lower or "claude" in model_label_lower:
+                # Anthropic/Claude models use "low" for all budget values (per LiteLLM constants)
+                LLMAPIHandlerFactory._apply_anthropic_thinking_optimization(
+                    parameters, new_budget, llm_config, prompt_name
+                )
+            else:
+                # Other reasoning-capable models (Deepseek, etc.) - use "low" for all budget values
+                parameters["reasoning_effort"] = "low"
+                LOG.info(
+                    "Applied thinking budget optimization (reasoning_effort)",
+                    prompt_name=prompt_name,
+                    budget=new_budget,
+                    reasoning_effort="low",
+                    model=model_label,
+                )
+
+        except (AttributeError, KeyError, TypeError) as e:
+            LOG.warning(
+                "Failed to apply thinking budget optimization",
+                prompt_name=prompt_name,
+                budget=new_budget,
+                model=model_label,
+                error=str(e),
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _apply_anthropic_thinking_optimization(
+        parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
+    ) -> None:
+        """Apply thinking optimization for Anthropic/Claude models."""
+        if llm_config.reasoning_effort is not None:
+            # Use reasoning_effort if configured in LLM config - always use "low" per LiteLLM constants
+            parameters["reasoning_effort"] = "low"
+            # Get safe model label for logging
+            model_label = getattr(llm_config, "model_name", None)
+            if model_label is None and isinstance(llm_config, LLMRouterConfig):
+                model_label = getattr(llm_config, "main_model_group", "router")
+
+            LOG.info(
+                "Applied thinking budget optimization (reasoning_effort)",
+                prompt_name=prompt_name,
+                budget=new_budget,
+                reasoning_effort="low",
+                model=model_label,
+            )
+        else:
+            # Use thinking parameter with budget_tokens for Anthropic models
+            if "thinking" in parameters and isinstance(parameters["thinking"], dict):
+                parameters["thinking"]["budget_tokens"] = new_budget
+            else:
+                parameters["thinking"] = {"budget_tokens": new_budget, "type": "enabled"}
+            # Get safe model label for logging
+            model_label = getattr(llm_config, "model_name", None)
+            if model_label is None and isinstance(llm_config, LLMRouterConfig):
+                model_label = getattr(llm_config, "main_model_group", "router")
+
+            LOG.info(
+                "Applied thinking budget optimization (thinking)",
+                prompt_name=prompt_name,
+                budget=new_budget,
+                model=model_label,
+            )
+
+    @staticmethod
+    def _apply_gemini_thinking_optimization(
+        parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
+    ) -> None:
+        """Apply thinking optimization for Gemini models using exact integer budget value."""
+        if "thinking" in parameters and isinstance(parameters["thinking"], dict):
+            parameters["thinking"]["budget_tokens"] = new_budget
+        else:
+            thinking_payload: dict[str, Any] = {"budget_tokens": new_budget}
+            if settings.GEMINI_INCLUDE_THOUGHT:
+                thinking_payload["type"] = "enabled"
+            parameters["thinking"] = thinking_payload
+        # Get safe model label for logging
+        model_label = getattr(llm_config, "model_name", None)
+        if model_label is None and isinstance(llm_config, LLMRouterConfig):
+            model_label = getattr(llm_config, "main_model_group", "router")
+
+        LOG.info(
+            "Applied thinking budget optimization (budget_tokens)",
+            prompt_name=prompt_name,
+            budget=new_budget,
+            model=model_label,
+        )
 
     @staticmethod
     def get_override_llm_api_handler(override_llm_key: str | None, *, default: LLMAPIHandler) -> LLMAPIHandler:
@@ -118,6 +240,16 @@ class LLMAPIHandlerFactory:
 
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+            # Apply thinking budget optimization if settings are available
+            if (
+                LLMAPIHandlerFactory._thinking_budget_settings
+                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
+            ):
+                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    parameters, new_budget, llm_config, prompt_name
+                )
 
             context = skyvern_context.current()
             if context and len(context.hashed_href_map) > 0:
@@ -323,6 +455,16 @@ class LLMAPIHandlerFactory:
             if llm_config.litellm_params:  # type: ignore
                 active_parameters.update(llm_config.litellm_params)  # type: ignore
 
+            # Apply thinking budget optimization if settings are available
+            if (
+                LLMAPIHandlerFactory._thinking_budget_settings
+                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
+            ):
+                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    active_parameters, new_budget, llm_config, prompt_name
+                )
+
             context = skyvern_context.current()
             if context and len(context.hashed_href_map) > 0:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
@@ -374,6 +516,7 @@ class LLMAPIHandlerFactory:
                     model=model_name,
                     messages=messages,
                     timeout=settings.LLM_CONFIG_TIMEOUT,
+                    drop_params=True,  # Drop unsupported parameters gracefully
                     **active_parameters,
                 )
             except litellm.exceptions.APIError as e:
@@ -533,6 +676,13 @@ class LLMAPIHandlerFactory:
         if llm_key in cls._custom_handlers:
             raise DuplicateCustomLLMProviderError(llm_key)
         cls._custom_handlers[llm_key] = handler
+
+    @classmethod
+    def set_thinking_budget_settings(cls, settings: dict[str, int] | None) -> None:
+        """Set thinking budget optimization settings for the current task/workflow."""
+        cls._thinking_budget_settings = settings
+        if settings:
+            LOG.info("Thinking budget optimization settings applied", settings=settings)
 
 
 class LLMCaller:
@@ -800,7 +950,12 @@ class LLMCaller:
             return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
         return await litellm.acompletion(
-            model=self.llm_config.model_name, messages=messages, tools=tools, timeout=timeout, **active_parameters
+            model=self.llm_config.model_name,
+            messages=messages,
+            tools=tools,
+            timeout=timeout,
+            drop_params=True,  # Drop unsupported parameters gracefully
+            **active_parameters,
         )
 
     async def _call_anthropic(
