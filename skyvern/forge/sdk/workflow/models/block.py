@@ -34,6 +34,7 @@ from skyvern.constants import (
     MAX_UPLOAD_FILE_COUNT,
 )
 from skyvern.exceptions import (
+    AzureConfigurationError,
     ContextParameterValueNotFound,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -44,7 +45,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureClient
+from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -2061,7 +2062,10 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
                     or self.azure_storage_account_key
                 )
-                azure_client = AsyncAzureClient(
+                if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
+                    raise AzureConfigurationError("Azure Storage is not configured")
+
+                azure_client = AsyncAzureStorageClient(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,
                 )
