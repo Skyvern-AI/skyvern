@@ -191,4 +191,4 @@ class WorkflowRunResponseBase(BaseModel):
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
-    errors: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] | None = None
