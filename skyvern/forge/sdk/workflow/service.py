@@ -180,6 +180,7 @@ class WorkflowService:
             workflow_id=workflow_id,
             organization_id=organization.organization_id,
             parent_workflow_run_id=parent_workflow_run_id,
+            sequential_key=workflow.sequential_key,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -637,6 +638,7 @@ class WorkflowService:
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
         run_sequentially: bool = False,
+        sequential_key: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -659,6 +661,7 @@ class WorkflowService:
             cache_key=cache_key,
             ai_fallback=False if ai_fallback is None else ai_fallback,
             run_sequentially=run_sequentially,
+            sequential_key=sequential_key,
         )
 
     async def create_workflow_from_prompt(
@@ -942,6 +945,7 @@ class WorkflowService:
         workflow_id: str,
         organization_id: str,
         parent_workflow_run_id: str | None = None,
+        sequential_key: str | None = None,
     ) -> WorkflowRun:
         # validate the browser session id
         if workflow_request.browser_session_id:
@@ -965,6 +969,7 @@ class WorkflowService:
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             extra_http_headers=workflow_request.extra_http_headers,
             browser_address=workflow_request.browser_address,
+            sequential_key=sequential_key,
         )
 
     async def _update_workflow_run_status(
@@ -1763,6 +1768,7 @@ class WorkflowService:
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
+                    sequential_key=request.sequential_key,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1784,6 +1790,7 @@ class WorkflowService:
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
+                    sequential_key=request.sequential_key,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id

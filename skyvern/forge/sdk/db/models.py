@@ -248,6 +248,7 @@ class WorkflowModel(Base):
     ai_fallback = Column(Boolean, default=False, nullable=False)
     cache_key = Column(String, nullable=True)
     run_sequentially = Column(Boolean, nullable=True)
+    sequential_key = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -286,6 +287,7 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True)
+    sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
 
     queued_at = Column(DateTime, nullable=True)
