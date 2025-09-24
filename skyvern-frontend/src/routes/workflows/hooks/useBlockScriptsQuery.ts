@@ -8,7 +8,7 @@ type Props = {
   cacheKeyValue?: string;
   workflowPermanentId?: string;
   pollIntervalMs?: number;
-  status?: string;
+  status?: "pending" | "published";
   workflowRunId?: string;
 };
 
@@ -28,7 +28,6 @@ function useBlockScriptsQuery({
       workflowPermanentId,
       cacheKey,
       cacheKeyValue,
-      pollIntervalMs,
       status,
       workflowRunId,
     ],
