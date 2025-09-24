@@ -56,6 +56,7 @@ class BaseExperimentationProvider(ABC):
                 LOG.info("Feature payload is found", flag=feature_name, distinct_id=distinct_id)
         return self.payload_map[feature_name][distinct_id]
 
+
 class NoOpExperimentationProvider(BaseExperimentationProvider):
     def is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
         return False
