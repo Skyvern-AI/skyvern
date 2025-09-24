@@ -1416,6 +1416,10 @@ class WorkflowService:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
+        errors: list[dict[str, Any]] = []
+        for task in workflow_run_tasks:
+            errors.extend(task.errors)
+
         total_steps = None
         total_cost = None
         if include_cost:
@@ -1461,6 +1465,7 @@ class WorkflowService:
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,
             script_run=workflow_run.script_run,
+            errors=errors,
         )
 
     async def clean_up_workflow(
