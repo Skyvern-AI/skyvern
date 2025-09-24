@@ -1,5 +1,11 @@
 import { AxiosError } from "axios";
-import { useEffect, useRef, useState, MutableRefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  MutableRefObject,
+} from "react";
 import { nanoid } from "nanoid";
 import {
   ChevronRightIcon,
@@ -300,6 +306,33 @@ function Workspace({
     closeWorkflowPanel();
   });
 
+  // Centralized function to manage comparison and panel states
+  const clearComparisonViewAndShowFreshIfActive = useCallback(
+    (active: boolean) => {
+      setWorkflowPanelState({
+        active,
+        content: "history",
+        data: {
+          showComparison: false,
+          version1: undefined,
+          version2: undefined,
+        },
+      });
+    },
+    [setWorkflowPanelState],
+  );
+
+  // Clear comparison view when switching between browser mode and editor mode
+  useEffect(() => {
+    if (workflowPanelState.data?.showComparison) {
+      clearComparisonViewAndShowFreshIfActive(false);
+      setShowAllCode(false);
+    }
+    // We intentionally omit workflowPanelState.data?.showComparison from deps
+    // to avoid clearing comparison immediately when it's set
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showBrowser, clearComparisonViewAndShowFreshIfActive]);
+
   useMountEffect(() => {
     const closePanelsWhenEscapeIsPressed = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -570,19 +603,6 @@ function Workspace({
     } else {
       openCacheKeyValuesPanel();
     }
-  }
-
-  // Centralized function to manage comparison and panel states
-  function clearComparisonViewAndShowFreshIfActive(active: boolean) {
-    setWorkflowPanelState({
-      active,
-      content: "history",
-      data: {
-        showComparison: false,
-        version1: undefined,
-        version2: undefined,
-      },
-    });
   }
 
   function toggleHistoryPanel() {
@@ -895,39 +915,26 @@ function Workspace({
         />
       </div>
 
-      {/* infinite canvas and sub panels when not in debug mode */}
-      {!showBrowser && (
+      {/* comparison view (takes precedence over both browser and non-browser modes) */}
+      {workflowPanelState.data?.showComparison &&
+      workflowPanelState.data?.version1 &&
+      workflowPanelState.data?.version2 ? (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
-          {/* infinite canvas or comparison view */}
-          {workflowPanelState.data?.showComparison &&
-          workflowPanelState.data?.version1 &&
-          workflowPanelState.data?.version2 ? (
-            <div
-              className="absolute left-6 top-[6rem]"
-              style={{
-                width: "calc(100% - 32rem)",
-                height: "calc(100vh - 11rem)",
-              }}
-            >
-              <WorkflowComparisonPanel
-                key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
-                version1={workflowPanelState.data.version1}
-                version2={workflowPanelState.data.version2}
-                onSelectState={handleSelectState}
-              />
-            </div>
-          ) : (
-            <FlowRenderer
-              nodes={nodes}
-              edges={edges}
-              setNodes={setNodes}
-              setEdges={setEdges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              initialTitle={initialTitle}
-              workflow={workflow}
+          {/* comparison view */}
+          <div
+            className="absolute left-6 top-[6rem]"
+            style={{
+              width: "calc(100% - 32rem)",
+              height: "calc(100vh - 11rem)",
+            }}
+          >
+            <WorkflowComparisonPanel
+              key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
+              version1={workflowPanelState.data.version1}
+              version2={workflowPanelState.data.version2}
+              onSelectState={handleSelectState}
             />
-          )}
+          </div>
 
           {/* sub panels */}
           {workflowPanelState.active && (
@@ -984,46 +991,122 @@ function Workspace({
             </div>
           )}
         </div>
+      ) : (
+        <>
+          {/* infinite canvas and sub panels when not in debug mode */}
+          {!showBrowser && (
+            <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
+              {/* infinite canvas */}
+              <FlowRenderer
+                nodes={nodes}
+                edges={edges}
+                setNodes={setNodes}
+                setEdges={setEdges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                initialTitle={initialTitle}
+                workflow={workflow}
+              />
+
+              {/* sub panels */}
+              {workflowPanelState.active && (
+                <div
+                  className="absolute right-6 top-[8.5rem] z-30"
+                  style={{
+                    height:
+                      workflowPanelState.content === "nodeLibrary"
+                        ? "calc(100vh - 14rem)"
+                        : "unset",
+                  }}
+                >
+                  {workflowPanelState.content === "cacheKeyValues" && (
+                    <WorkflowCacheKeyValuesPanel
+                      cacheKeyValues={cacheKeyValues}
+                      pending={cacheKeyValuesLoading}
+                      scriptKey={workflow.cache_key ?? "default"}
+                      onDelete={(cacheKeyValue) => {
+                        setToDeleteCacheKeyValue(cacheKeyValue);
+                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                      }}
+                      onPaginate={(page) => {
+                        setPage(page);
+                      }}
+                      onSelect={(cacheKeyValue) => {
+                        setCacheKeyValue(cacheKeyValue);
+                        setCacheKeyValueFilter("");
+                        closeWorkflowPanel();
+                      }}
+                    />
+                  )}
+                  {workflowPanelState.content === "parameters" && (
+                    <div className="z-30">
+                      <WorkflowParametersPanel />
+                    </div>
+                  )}
+                  {workflowPanelState.content === "history" && (
+                    <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-[calc(100vh-14rem)]">
+                      <WorkflowHistoryPanel
+                        workflowPermanentId={workflowPermanentId!}
+                        onCompare={handleCompareVersions}
+                      />
+                    </div>
+                  )}
+                  {workflowPanelState.content === "nodeLibrary" && (
+                    <div className="z-30 h-full w-[25rem]">
+                      <WorkflowNodeLibraryPanel
+                        onNodeClick={(props) => {
+                          addNode(props);
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
 
       {/* sub panels when in debug mode */}
-      {showBrowser && workflowPanelState.active && (
-        <div
-          className="absolute right-6 top-[8.5rem] z-30"
-          style={{
-            height:
-              workflowPanelState.content === "nodeLibrary"
-                ? "calc(100vh - 14rem)"
-                : "unset",
-          }}
-        >
-          {workflowPanelState.content === "cacheKeyValues" && (
-            <WorkflowCacheKeyValuesPanel
-              cacheKeyValues={cacheKeyValues}
-              pending={cacheKeyValuesLoading}
-              scriptKey={workflow.cache_key ?? "default"}
-              onDelete={(cacheKeyValue) => {
-                setToDeleteCacheKeyValue(cacheKeyValue);
-                setOpenConfirmCacheKeyValueDeleteDialogue(true);
-              }}
-              onPaginate={(page) => {
-                setPage(page);
-              }}
-              onSelect={(cacheKeyValue) => {
-                setCacheKeyValue(cacheKeyValue);
-                setCacheKeyValueFilter("");
-                closeWorkflowPanel();
-              }}
-            />
-          )}
-          {workflowPanelState.content === "parameters" && (
-            <WorkflowParametersPanel />
-          )}
-        </div>
-      )}
+      {showBrowser &&
+        !workflowPanelState.data?.showComparison &&
+        workflowPanelState.active && (
+          <div
+            className="absolute right-6 top-[8.5rem] z-30"
+            style={{
+              height:
+                workflowPanelState.content === "nodeLibrary"
+                  ? "calc(100vh - 14rem)"
+                  : "unset",
+            }}
+          >
+            {workflowPanelState.content === "cacheKeyValues" && (
+              <WorkflowCacheKeyValuesPanel
+                cacheKeyValues={cacheKeyValues}
+                pending={cacheKeyValuesLoading}
+                scriptKey={workflow.cache_key ?? "default"}
+                onDelete={(cacheKeyValue) => {
+                  setToDeleteCacheKeyValue(cacheKeyValue);
+                  setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                }}
+                onPaginate={(page) => {
+                  setPage(page);
+                }}
+                onSelect={(cacheKeyValue) => {
+                  setCacheKeyValue(cacheKeyValue);
+                  setCacheKeyValueFilter("");
+                  closeWorkflowPanel();
+                }}
+              />
+            )}
+            {workflowPanelState.content === "parameters" && (
+              <WorkflowParametersPanel />
+            )}
+          </div>
+        )}
 
       {/* code, infinite canvas, browser, and timeline when in debug mode */}
-      {showBrowser && (
+      {showBrowser && !workflowPanelState.data?.showComparison && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
             className="splittah"
@@ -1032,82 +1115,64 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* code and infinite canvas or comparison view */}
+            {/* code and infinite canvas */}
             <div className="relative h-full w-full">
-              {workflowPanelState.data?.showComparison &&
-              workflowPanelState.data?.version1 &&
-              workflowPanelState.data?.version2 ? (
+              <div
+                className={cn(
+                  "skyvern-split-left flex h-full w-[200%] translate-x-[-50%] transition-none duration-300",
+                  {
+                    "w-[100%] translate-x-0":
+                      leftSideLayoutMode === "side-by-side",
+                  },
+                  {
+                    "translate-x-0": showAllCode,
+                  },
+                )}
+                ref={dom.splitLeft}
+              >
+                {/* code */}
                 <div
-                  className="absolute inset-0 top-[8.5rem] p-6"
-                  style={{
-                    height: "calc(100vh - 14.5rem)",
-                  }}
+                  className={cn("h-full w-[50%]", {
+                    "w-[0%]":
+                      leftSideLayoutMode === "side-by-side" && !showAllCode,
+                  })}
                 >
-                  <WorkflowComparisonPanel
-                    key={`${workflowPanelState.data.version1.workflow_id}v${workflowPanelState.data.version1.version}-${workflowPanelState.data.version2.workflow_id}v${workflowPanelState.data.version2.version}`}
-                    version1={workflowPanelState.data.version1}
-                    version2={workflowPanelState.data.version2}
-                    onSelectState={handleSelectState}
-                  />
-                </div>
-              ) : (
-                <div
-                  className={cn(
-                    "skyvern-split-left flex h-full w-[200%] translate-x-[-50%] transition-none duration-300",
-                    {
-                      "w-[100%] translate-x-0":
-                        leftSideLayoutMode === "side-by-side",
-                    },
-                    {
-                      "translate-x-0": showAllCode,
-                    },
-                  )}
-                  ref={dom.splitLeft}
-                >
-                  {/* code */}
-                  <div
-                    className={cn("h-full w-[50%]", {
-                      "w-[0%]":
-                        leftSideLayoutMode === "side-by-side" && !showAllCode,
-                    })}
-                  >
-                    <div className="relative mt-[8.5rem] w-full p-6 pr-5 pt-0">
-                      <div className="absolute right-[1.25rem] top-0 z-20">
-                        <CopyText text={code} />
-                      </div>
-                      <CodeEditor
-                        className="w-full overflow-y-scroll"
-                        language="python"
-                        value={code}
-                        lineWrap={false}
-                        readOnly
-                        fontSize={10}
-                      />
+                  <div className="relative mt-[8.5rem] w-full p-6 pr-5 pt-0">
+                    <div className="absolute right-[1.25rem] top-0 z-20">
+                      <CopyText text={code} />
                     </div>
-                  </div>
-                  {/* infinite canvas */}
-                  <div
-                    className={cn("h-full w-[50%]", {
-                      "w-[100%]":
-                        leftSideLayoutMode === "side-by-side" && !showAllCode,
-                    })}
-                  >
-                    <FlowRenderer
-                      hideBackground={true}
-                      hideControls={true}
-                      nodes={nodes}
-                      edges={edges}
-                      setNodes={setNodes}
-                      setEdges={setEdges}
-                      onNodesChange={onNodesChange}
-                      onEdgesChange={onEdgesChange}
-                      initialTitle={initialTitle}
-                      workflow={workflow}
-                      onContainerResize={containerResizeTrigger}
+                    <CodeEditor
+                      className="w-full overflow-y-scroll"
+                      language="python"
+                      value={code}
+                      lineWrap={false}
+                      readOnly
+                      fontSize={10}
                     />
                   </div>
                 </div>
-              )}
+                {/* infinite canvas */}
+                <div
+                  className={cn("h-full w-[50%]", {
+                    "w-[100%]":
+                      leftSideLayoutMode === "side-by-side" && !showAllCode,
+                  })}
+                >
+                  <FlowRenderer
+                    hideBackground={true}
+                    hideControls={true}
+                    nodes={nodes}
+                    edges={edges}
+                    setNodes={setNodes}
+                    setEdges={setEdges}
+                    onNodesChange={onNodesChange}
+                    onEdgesChange={onEdgesChange}
+                    initialTitle={initialTitle}
+                    workflow={workflow}
+                    onContainerResize={containerResizeTrigger}
+                  />
+                </div>
+              </div>
             </div>
 
             {/* browser & timeline */}
