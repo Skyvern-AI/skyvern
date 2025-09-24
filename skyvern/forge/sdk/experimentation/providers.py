@@ -53,9 +53,8 @@ class BaseExperimentationProvider(ABC):
             payload = self.get_payload(feature_name, distinct_id, properties)
             self.payload_map[feature_name][distinct_id] = payload
             if payload:
-                LOG.info("Feature payload is found", flag=feature_name, distinct_id=distinct_id, payload=payload)
+                LOG.info("Feature payload is found", flag=feature_name, distinct_id=distinct_id)
         return self.payload_map[feature_name][distinct_id]
-
 
 class NoOpExperimentationProvider(BaseExperimentationProvider):
     def is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
