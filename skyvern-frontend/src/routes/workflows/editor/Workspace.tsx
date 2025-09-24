@@ -8,12 +8,12 @@ import {
 } from "react";
 import { nanoid } from "nanoid";
 import {
+  CheckIcon,
   ChevronRightIcon,
   ChevronLeftIcon,
+  CopyIcon,
   GlobeIcon,
   ReloadIcon,
-  CheckIcon,
-  CopyIcon,
 } from "@radix-ui/react-icons";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useEdgesState, useNodesState, Edge } from "@xyflow/react";
@@ -123,6 +123,8 @@ function CopyText({ text }: { text: string }) {
     </Button>
   );
 }
+
+export { CopyText };
 
 function Workspace({
   initialNodes,
