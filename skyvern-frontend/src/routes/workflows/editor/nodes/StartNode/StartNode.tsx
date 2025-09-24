@@ -76,6 +76,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
     aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
     runSequentially: data.withWorkflowSettings ? data.runSequentially : false,
+    sequentialKey: data.withWorkflowSettings ? data.sequentialKey : null,
   });
 
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -253,18 +254,40 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         </div>
                         {/* )} */}
                       </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Run Sequentially</Label>
-                          <HelpTooltip content="Run the workflow in a sequential order" />
-                          <Switch
-                            className="ml-auto"
-                            checked={inputs.runSequentially}
-                            onCheckedChange={(value) => {
-                              handleChange("runSequentially", value);
-                            }}
-                          />
+                      <div className="flex flex-col gap-4">
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            <Label>Run Sequentially</Label>
+                            <HelpTooltip content="Run the workflow in a sequential order" />
+                            <Switch
+                              className="ml-auto"
+                              checked={inputs.runSequentially}
+                              onCheckedChange={(value) => {
+                                handleChange("runSequentially", value);
+                              }}
+                            />
+                          </div>
                         </div>
+                        {inputs.runSequentially && (
+                          <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
+                            <div className="space-y-2">
+                              <div className="flex gap-2">
+                                <Label>Sequential Key (optional)</Label>
+                                <HelpTooltip content="A static or dynamic key for directing sequential workflow execution." />
+                              </div>
+                              <WorkflowBlockInputTextarea
+                                nodeId={id}
+                                onChange={(value) => {
+                                  const v = value.length ? value : null;
+                                  handleChange("sequentialKey", v);
+                                }}
+                                value={inputs.sequentialKey ?? ""}
+                                placeholder={placeholders["sequentialKey"]}
+                                className="nopan text-xs"
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">

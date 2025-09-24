@@ -183,4 +183,5 @@ export const placeholders = {
   scripts: {
     scriptKey: "my-{{param1}}-{{param2}}-key",
   },
+  sequentialKey: "my-{{param1}}-{{param2}}-sequential",
 };

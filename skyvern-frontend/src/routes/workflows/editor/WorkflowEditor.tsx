@@ -66,6 +66,7 @@ function WorkflowEditor() {
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     runSequentially: workflow.run_sequentially ?? false,
+    sequentialKey: workflow.sequential_key ?? null,
   };
 
   const elements = getElements(
