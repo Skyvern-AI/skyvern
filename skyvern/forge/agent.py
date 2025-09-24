@@ -2816,7 +2816,7 @@ class ForgeAgent:
                 max_retries=max_retries,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_response = await app.LLM_API_HANDLER(
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt,
                 screenshots=screenshots,
                 step=step,
