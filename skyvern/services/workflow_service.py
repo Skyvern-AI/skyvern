@@ -138,4 +138,5 @@ async def get_workflow_run_response(
             browser_address=workflow_run.browser_address,
             # TODO: add browser session id
         ),
+        errors=workflow_run_resp.errors,
     )
