@@ -1592,6 +1592,7 @@ class WorkflowService:
                 totp_url=workflow_run.totp_verification_url or None,
                 totp_identifier=workflow_run.totp_identifier,
             ),
+            errors=workflow_run_status_response.errors,
         )
         payload_dict = json.loads(workflow_run_status_response.model_dump_json())
         workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
