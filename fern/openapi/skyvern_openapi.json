@@ -5834,6 +5834,19 @@
             ],
             "title": "Filename",
             "description": "Original filename"
+          },
+          "modified_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At",
+            "description": "Modified time of the file"
           }
         },
         "type": "object",
