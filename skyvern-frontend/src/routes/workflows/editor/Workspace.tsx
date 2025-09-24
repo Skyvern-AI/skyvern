@@ -350,13 +350,20 @@ function Workspace({
   });
 
   // Add window resize listener to trigger NoVNC canvas resize
+  // invalidate block scripts (so we always fetch latest on mount)
   useEffect(() => {
     const handleResize = () => {
       setWindowResizeTrigger((prev) => prev + 1);
     };
 
     window.addEventListener("resize", handleResize);
+
+    queryClient.invalidateQueries({
+      queryKey: ["block-scripts"],
+    });
+
     return () => window.removeEventListener("resize", handleResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
