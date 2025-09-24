@@ -687,6 +687,7 @@ function Workspace({
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
+      sequentialKey: selectedVersion.sequential_key ?? null,
     };
 
     const elements = getElements(

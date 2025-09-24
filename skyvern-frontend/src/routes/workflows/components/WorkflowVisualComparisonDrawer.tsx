@@ -128,6 +128,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
     runSequentially: version.run_sequentially ?? false,
+    sequentialKey: version.sequential_key ?? null,
   };
 
   return getElements(

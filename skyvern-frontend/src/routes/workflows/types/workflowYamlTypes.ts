@@ -18,6 +18,7 @@ export type WorkflowCreateYAMLRequest = {
   cache_key?: string | null;
   ai_fallback?: boolean;
   run_sequentially?: boolean;
+  sequential_key?: string | null;
 };
 
 export type WorkflowDefinitionYAML = {
