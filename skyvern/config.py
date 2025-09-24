@@ -368,6 +368,10 @@ class Settings(BaseSettings):
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
+                "gemini-2.5-flash-lite": {
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+                    "label": "Gemini 2.5 Flash Lite",
+                },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
                 "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
@@ -395,6 +399,10 @@ class Settings(BaseSettings):
                 "gemini-2.5-flash-preview-05-20": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
+                },
+                "gemini-2.5-flash-lite": {
+                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+                    "label": "Gemini 2.5 Flash Lite",
                 },
                 "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
                 "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
