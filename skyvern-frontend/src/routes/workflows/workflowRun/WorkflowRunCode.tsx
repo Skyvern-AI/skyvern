@@ -19,6 +19,7 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
+import { cn } from "@/util/utils";
 
 interface Props {
   showCacheKeyValueSelector?: boolean;
@@ -47,16 +48,40 @@ function WorkflowRunCode(props?: Props) {
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
   const parameters = workflowRun?.parameters;
 
-  const { data: blockScripts } = useBlockScriptsQuery({
+  const [hasPublishedCode, setHasPublishedCode] = useState(false);
+
+  const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
     workflowPermanentId,
-    pollIntervalMs: !isFinalized ? 3000 : undefined,
+    pollIntervalMs: !hasPublishedCode && !isFinalized ? 3000 : undefined,
     status: "pending",
     workflowRunId: workflowRun?.workflow_run_id,
   });
+
+  const { data: blockScriptsPublished } = useBlockScriptsQuery({
+    cacheKey,
+    cacheKeyValue,
+    workflowPermanentId,
+    status: "published",
+    workflowRunId: workflowRun?.workflow_run_id,
+  });
+
+  useEffect(() => {
+    const keys = Object.keys(blockScriptsPublished ?? {});
+    setHasPublishedCode(keys.length > 0);
+  }, [blockScriptsPublished, setHasPublishedCode]);
+
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScripts).join("").trim();
+
+  const code = getCode(
+    orderedBlockLabels,
+    hasPublishedCode ? blockScriptsPublished : blockScriptsPending,
+  )
+    .join("")
+    .trim();
+
+  const isGeneratingCode = !isFinalized && !hasPublishedCode;
 
   useEffect(() => {
     setCacheKeyValue(
@@ -93,7 +118,7 @@ function WorkflowRunCode(props?: Props) {
     });
   }, [queryClient, workflowRun, workflowPermanentId, cacheKey, cacheKeyValue]);
 
-  if (code.length === 0) {
+  if (code.length === 0 && !isGeneratingCode) {
     return (
       <div className="flex items-center justify-center bg-slate-elevation3 p-8">
         No code has been generated yet.
@@ -166,7 +191,9 @@ function WorkflowRunCode(props?: Props) {
         </Select>
       </div>
       <CodeEditor
-        className="h-full w-full overflow-y-scroll"
+        className={cn("h-full w-full overflow-y-scroll", {
+          "animate-pulse": isGeneratingCode,
+        })}
         language="python"
         value={code}
         lineWrap={false}
