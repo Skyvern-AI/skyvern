@@ -1711,6 +1711,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             data_extraction_schema=task_v2.extracted_information_schema,
             error_code_mapping=task_v2.error_code_mapping,
         ),
+        errors=workflow_run_resp.errors if workflow_run_resp else None,
     )
 
 

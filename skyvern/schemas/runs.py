@@ -427,6 +427,10 @@ class BaseRunResponse(BaseModel):
         default=None,
         description="The script run result",
     )
+    errors: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="The errors for the run",
+    )
 
 
 class TaskRunResponse(BaseRunResponse):

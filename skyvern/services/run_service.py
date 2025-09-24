@@ -69,6 +69,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
                 error_code_mapping=task_v1_response.request.error_code_mapping,
                 max_screenshot_scrolls=task_v1_response.request.max_screenshot_scrolls,
             ),
+            errors=task_v1_response.errors,
         )
     elif run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)

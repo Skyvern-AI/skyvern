@@ -709,6 +709,7 @@ function getElements(
       label: "__start_block__",
       showCode: false,
       runSequentially: settings.runSequentially,
+      sequentialKey: settings.sequentialKey,
     }),
   );
 
@@ -1420,6 +1421,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     scriptCacheKey: null,
     aiFallback: true,
     runSequentially: false,
+    sequentialKey: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1441,6 +1443,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
       runSequentially: data.runSequentially,
+      sequentialKey: data.sequentialKey,
     };
   }
   return defaultSettings;
@@ -2134,6 +2137,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
     run_sequentially: workflow.run_sequentially ?? undefined,
+    sequential_key: workflow.sequential_key ?? undefined,
   };
 }
 

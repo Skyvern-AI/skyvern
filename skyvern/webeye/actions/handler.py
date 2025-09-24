@@ -1836,11 +1836,6 @@ async def handle_complete_action(
         )
         action.verified = True
 
-        if task.error_code_mapping:
-            action.errors = await extract_user_defined_errors(
-                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
-            )
-
         if not task.data_extraction_goal and verification_result.thoughts:
             await app.DATABASE.update_task(
                 task.task_id,
