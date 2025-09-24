@@ -472,11 +472,11 @@ function PromptBox() {
           return (
             <ExampleCasePill
               key={example.key}
-              exampleId={example.key}
               icon={example.icon}
               label={example.label}
-              prompt={example.prompt}
-              version={selectValue}
+              onClick={() => {
+                generateWorkflowMutation.mutate(example.prompt);
+              }}
             />
           );
         })}
