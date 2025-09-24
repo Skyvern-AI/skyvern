@@ -1,5 +1,3 @@
-import os
-
 import structlog
 import uvicorn
 from dotenv import load_dotenv
@@ -19,16 +17,6 @@ if __name__ == "__main__":
     reload = settings.ENV == "local"
 
     # Configure reload settings
-    # Convert TEMP_PATH to relative path if it's absolute to avoid pathlib.glob() issues
-    temp_path_for_excludes = (
-        os.path.relpath(settings.TEMP_PATH) if os.path.isabs(settings.TEMP_PATH) else settings.TEMP_PATH
-    )
-    artifact_path_for_excludes = (
-        os.path.relpath(settings.ARTIFACT_STORAGE_PATH)
-        if os.path.isabs(settings.ARTIFACT_STORAGE_PATH)
-        else settings.ARTIFACT_STORAGE_PATH
-    )
-
     uvicorn.run(
         "skyvern.forge.api_app:app",
         host="0.0.0.0",
@@ -36,7 +24,9 @@ if __name__ == "__main__":
         log_level="info",
         reload=reload,
         reload_excludes=[
-            f"{temp_path_for_excludes}/**/*.py",
-            f"{artifact_path_for_excludes}/{settings.ENV}/**/scripts/**/**/*.py",
+            f"{settings.TEMP_PATH}/*.py",
+            f"{settings.TEMP_PATH}/**/*.py",
+            f"{settings.TEMP_PATH}/*",
+            f"{settings.TEMP_PATH}/**",
         ],
     )
