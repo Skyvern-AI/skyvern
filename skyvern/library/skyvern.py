@@ -402,6 +402,7 @@ class Skyvern(AsyncSkyvern):
             error_code_mapping=error_code_mapping,
             proxy_location=proxy_location,
             max_steps=max_steps,
+            browser_session_id=browser_session_id,
             user_agent=user_agent,
         )
 
