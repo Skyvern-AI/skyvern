@@ -573,6 +573,7 @@ class AISuggestionModel(Base):
 
 class TOTPCodeModel(Base):
     __tablename__ = "totp_codes"
+    __table_args__ = (Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),)
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
     totp_identifier = Column(String, nullable=False, index=True)
@@ -622,7 +623,10 @@ class ActionModel(Base):
 
 class WorkflowRunBlockModel(Base):
     __tablename__ = "workflow_run_blocks"
-    __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
+    __table_args__ = (
+        Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),
+        Index("ix_workflow_run_blocks_org_created_at", "organization_id", "created_at"),
+    )
 
     workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
     workflow_run_id = Column(String, nullable=False)
@@ -672,7 +676,10 @@ class WorkflowRunBlockModel(Base):
 
 class TaskV2Model(Base):
     __tablename__ = "observer_cruises"
-    __table_args__ = (Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),)
+    __table_args__ = (
+        Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),
+        Index("ix_observer_cruises_org_created_at", "organization_id", "created_at"),
+    )
 
     # observer_cruise_id is the task_id for task v2
     observer_cruise_id = Column(String, primary_key=True, default=generate_task_v2_id)
@@ -710,7 +717,10 @@ class TaskV2Model(Base):
 
 class ThoughtModel(Base):
     __tablename__ = "observer_thoughts"
-    __table_args__ = (Index("observer_cruise_index", "organization_id", "observer_cruise_id"),)
+    __table_args__ = (
+        Index("observer_cruise_index", "organization_id", "observer_cruise_id"),
+        Index("ix_observer_thoughts_org_created_at", "organization_id", "created_at"),
+    )
 
     observer_thought_id = Column(String, primary_key=True, default=generate_thought_id)
     organization_id = Column(String, nullable=True)
@@ -763,6 +773,7 @@ class TaskRunModel(Base):
     __table_args__ = (
         Index("task_run_org_url_index", "organization_id", "url_hash", "cached"),
         Index("task_run_org_run_id_index", "organization_id", "run_id"),
+        Index("ix_task_runs_org_created_at", "organization_id", "created_at"),
     )
 
     task_run_id = Column(String, primary_key=True, default=generate_task_run_id)
