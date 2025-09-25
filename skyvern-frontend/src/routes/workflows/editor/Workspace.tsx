@@ -854,7 +854,6 @@ function Workspace({
             workflowPanelState.content === "parameters"
           }
           showAllCode={showAllCode}
-          workflow={workflow}
           onCacheKeyValueAccept={(v) => {
             setCacheKeyValue(v ?? "");
             setCacheKeyValueFilter("");
