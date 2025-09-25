@@ -2192,11 +2192,6 @@ async function getHoverStylesMap() {
             // Get base selector without :hover
             const baseSelector = hoverPart.replace(/:hover/g, "").trim();
 
-            // Skip invalid selectors
-            if (!isValidCSSSelector(baseSelector)) {
-              continue;
-            }
-
             // Get or create styles object for this selector
             let styles = hoverMap.get(baseSelector) || {};
 
