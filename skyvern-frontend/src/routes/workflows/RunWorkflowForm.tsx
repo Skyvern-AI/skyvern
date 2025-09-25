@@ -45,7 +45,6 @@ import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { apiBaseUrl, lsKeys } from "@/util/env";
-import { cn } from "@/util/utils";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -276,10 +275,10 @@ function RunWorkflowForm({
     status: "published",
   });
 
-  const [runWithCodeIsEnabled, setRunWithCodeIsEnabled] = useState(false);
+  const [hasCode, setHasCode] = useState(false);
 
   useEffect(() => {
-    setRunWithCodeIsEnabled(Object.keys(blockScripts ?? {}).length > 0);
+    setHasCode(Object.keys(blockScripts ?? {}).length > 0);
   }, [blockScripts]);
 
   useEffect(() => {
@@ -309,12 +308,6 @@ function RunWorkflowForm({
       ...parameters
     } = values;
 
-    const actuallyRunWithCode = !runWithCodeIsEnabled ? false : runWithCode;
-    const actuallyFallbackToAi =
-      !form.getValues().runWithCode || !runWithCodeIsEnabled
-        ? false
-        : aiFallback;
-
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
       workflowParameters,
@@ -327,8 +320,8 @@ function RunWorkflowForm({
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
-      runWithCode: actuallyRunWithCode,
-      aiFallback: actuallyFallbackToAi,
+      runWithCode,
+      aiFallback,
     });
   }
 
@@ -530,35 +523,39 @@ function RunWorkflowForm({
             render={({ field }) => {
               return (
                 <FormItem>
-                  <div
-                    className={cn("flex gap-16", {
-                      "opacity-50": !runWithCodeIsEnabled,
-                    })}
-                  >
+                  <div className="flex gap-16">
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
                           Run With
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          In a past run, code was generated with the input
-                          parameters you've specified above. Choose to run this
-                          workflow with that generated code, or with the Skyvern
-                          Agent.
+                          {field.value ? (
+                            hasCode ? (
+                              <span>
+                                Run this workflow with generated code.
+                              </span>
+                            ) : (
+                              <span>
+                                Run this workflow with generated code (after it
+                                is first generated).
+                              </span>
+                            )
+                          ) : hasCode ? (
+                            <span>
+                              Run this workflow with AI. (Even though it has
+                              generated code.)
+                            </span>
+                          ) : (
+                            <span>Run this workflow with AI.</span>
+                          )}
                         </h2>
                       </div>
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
                         <Select
-                          disabled={!runWithCodeIsEnabled}
-                          value={
-                            !runWithCodeIsEnabled
-                              ? "ai"
-                              : field.value
-                                ? "code"
-                                : "ai"
-                          }
+                          value={field.value ? "code" : "ai"}
                           onValueChange={(v) =>
                             field.onChange(v === "code" ? true : false)
                           }
@@ -587,34 +584,24 @@ function RunWorkflowForm({
             render={({ field }) => {
               return (
                 <FormItem>
-                  <div
-                    className={cn("flex gap-16", {
-                      "opacity-50":
-                        !form.getValues().runWithCode || !runWithCodeIsEnabled,
-                    })}
-                  >
+                  <div className="flex gap-16">
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
                           AI Fallback (self-healing)
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          If the run fails when using code, turn this on to have
-                          AI attempt to fix the issue and regenerate the code.
+                          If the run fails when running with code, keep this on
+                          to have AI attempt to fix the issue and regenerate the
+                          code.
                         </h2>
                       </div>
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
                         <Switch
-                          checked={
-                            !form.getValues().runWithCode ||
-                            !runWithCodeIsEnabled
-                              ? false
-                              : (field.value as boolean)
-                          }
+                          checked={field.value ?? true}
                           onCheckedChange={field.onChange}
-                          disabled={!form.getValues().runWithCode}
                         />
                       </FormControl>
                       <FormMessage />
