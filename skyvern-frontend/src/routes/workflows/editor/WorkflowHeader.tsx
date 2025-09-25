@@ -30,7 +30,6 @@ import { useDebugStore } from "@/store/useDebugStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
-import { WorkflowApiResponse } from "../types/workflowTypes";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
 
 interface Dom {
@@ -44,7 +43,6 @@ type Props = {
   parametersPanelOpen: boolean;
   saving: boolean;
   showAllCode: boolean;
-  workflow: WorkflowApiResponse;
   onCacheKeyValueAccept: (cacheKeyValue: string | null) => void;
   onCacheKeyValuesBlurred: (cacheKeyValue: string | null) => void;
   onCacheKeyValuesFilter: (cacheKeyValue: string) => void;
@@ -64,7 +62,6 @@ function WorkflowHeader({
   parametersPanelOpen,
   saving,
   showAllCode,
-  workflow,
   onCacheKeyValueAccept,
   onCacheKeyValuesBlurred,
   onCacheKeyValuesFilter,
@@ -135,8 +132,7 @@ function WorkflowHeader({
         />
       </div>
       <div className="flex h-full items-center justify-end gap-4">
-        {user && workflow.generate_script && (
-          // (cacheKeyValues?.total_count ?? 0) > 0 && (
+        {user && (cacheKeyValues?.total_count ?? 0) > 0 && (
           <>
             {debugStore.isDebugMode && (
               <Button

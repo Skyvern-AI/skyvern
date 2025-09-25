@@ -192,6 +192,9 @@ function RunWorkflowForm({
     lsKeys.browserSessionId,
     (initialValues.browserSessionId as string | undefined) ?? null,
   );
+  const apiCredential = useApiCredential();
+  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+
   const form = useForm<RunWorkflowFormType>({
     defaultValues: {
       ...initialValues,
@@ -203,12 +206,10 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
-      runWithCode: false,
-      aiFallback: true,
+      runWithCode: workflow?.generate_script ?? false,
+      aiFallback: workflow?.ai_fallback ?? true,
     },
   });
-  const apiCredential = useApiCredential();
-  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
   useSyncFormFieldToStorage(form, "browserSessionId", lsKeys.browserSessionId);
 

@@ -7,6 +7,13 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useEffect, useState } from "react";
 import { ProxyLocation } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
@@ -205,23 +212,46 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
-
-                      <div className="flex flex-col gap-4">
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-2">
-                            <Label>Run Cached Code</Label>
-                            <HelpTooltip content="If code has been cached, run the workflow using code for faster execution." />
-                            <Switch
-                              className="ml-auto"
-                              checked={inputs.useScriptCache}
-                              onCheckedChange={(value) => {
-                                handleChange("useScriptCache", value);
+                      <div className="flex flex-col gap-4 rounded-md bg-slate-elevation5 p-4 pl-4">
+                        <div className="flex flex-col gap-4">
+                          <div className="flex justify-between">
+                            <div className="flex items-center gap-2">
+                              <Label>Run With</Label>
+                              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
+                            </div>
+                            <Select
+                              value={!inputs.useScriptCache ? "ai" : "code"}
+                              onValueChange={(value) => {
+                                handleChange(
+                                  "useScriptCache",
+                                  value === "code",
+                                );
                               }}
-                            />
+                            >
+                              <SelectTrigger className="w-48">
+                                <SelectValue placeholder="Run Method" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="ai">
+                                  Skyvern Agent
+                                </SelectItem>
+                                <SelectItem value="code">Code</SelectItem>
+                              </SelectContent>
+                            </Select>
                           </div>
-                        </div>
-                        {/* {inputs.useScriptCache && (  .. // TODO(jdo/always-generate): put back */}
-                        <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
+                          <div className="space-y-2">
+                            <div className="flex items-center gap-2">
+                              <Label>AI Fallback (self-healing)</Label>
+                              <HelpTooltip content="If a run with code fails, fallback to AI and regenerate the code." />
+                              <Switch
+                                className="ml-auto"
+                                checked={inputs.aiFallback}
+                                onCheckedChange={(value) => {
+                                  handleChange("aiFallback", value);
+                                }}
+                              />
+                            </div>
+                          </div>
                           <div className="space-y-2">
                             <div className="flex gap-2">
                               <Label>Code Key (optional)</Label>
@@ -237,19 +267,6 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               placeholder={placeholders["scripts"]["scriptKey"]}
                               className="nopan text-xs"
                             />
-                          </div>
-                          <div className="space-y-2">
-                            <div className="flex items-center gap-2">
-                              <Label>Fallback To AI On Failure</Label>
-                              <HelpTooltip content="If cached code fails, fallback to AI." />
-                              <Switch
-                                className="ml-auto"
-                                checked={inputs.aiFallback}
-                                onCheckedChange={(value) => {
-                                  handleChange("aiFallback", value);
-                                }}
-                              />
-                            </div>
                           </div>
                         </div>
                         {/* )} */}
