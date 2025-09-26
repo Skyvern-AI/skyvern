@@ -1891,7 +1891,7 @@ class ForgeAgent:
         browser_state: BrowserState,
         scrape_type: ScrapeType,
         engine: RunEngine,
-    ) -> tuple[ScrapedPage, str, bool]:
+    ) -> ScrapedPage:
         if scrape_type == ScrapeType.NORMAL:
             pass
 
@@ -1948,7 +1948,7 @@ class ForgeAgent:
         use_caching = False
         for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
             try:
-                scraped_page, extract_action_prompt, use_caching = await self._scrape_with_type(
+                scraped_page = await self._scrape_with_type(
                     task=task,
                     step=step,
                     browser_state=browser_state,
