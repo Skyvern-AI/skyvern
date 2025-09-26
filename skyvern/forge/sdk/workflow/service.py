@@ -2204,8 +2204,8 @@ class WorkflowService:
                 terminate_criterion=block_yaml.terminate_criterion,
                 error_code_mapping=block_yaml.error_code_mapping,
                 continue_on_failure=block_yaml.continue_on_failure,
-                # only need one step for validation block
-                max_steps_per_run=1,
+                # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
+                max_steps_per_run=2,
                 model=block_yaml.model,
             )
 
