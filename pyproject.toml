@@ -103,7 +103,7 @@ dramatiq = {version = "^1.18.0", extras = ["asyncio"]}
 
 [tool.poetry.group.dev.dependencies]
 isort = "^5.13.2"
-mypy = "^1.4.1"
+mypy = "^1.18.2"
 flake8 = "^6.0.0"
 types-requests = "^2.31.0.2"
 pytest = "^7.4.0"
