@@ -1,6 +1,6 @@
 import asyncio
 
-from fastapi import Depends, HTTPException, Path
+from fastapi import Depends, HTTPException, Path, Query
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
@@ -16,6 +16,38 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest
 from skyvern.webeye.schemas import BrowserSessionResponse
+
+
+@base_router.get(
+    "/browser_sessions/history",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/browser_sessions/history/",
+    include_in_schema=False,
+)
+async def get_browser_sessions_all(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(1, ge=1, description="Page number for pagination"),
+    page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
+) -> list[BrowserSessionResponse]:
+    """Get all browser sessions for the organization"""
+    analytics.capture("skyvern-oss-agent-browser-sessions-get-all")
+
+    browser_sessions = await app.DATABASE.get_persistent_browser_sessions_history(
+        current_org.organization_id,
+        page=page,
+        page_size=page_size,
+    )
+
+    responses = await asyncio.gather(
+        *[
+            BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+            for browser_session in browser_sessions
+        ]
+    )
+
+    return responses
 
 
 @base_router.post(
