@@ -200,7 +200,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 
 async def convert_to_organization_auth_token(
-    org_auth_token: OrganizationAuthTokenModel, token_type: OrganizationAuthTokenType
+    org_auth_token: OrganizationAuthTokenModel, token_type: str
 ) -> OrganizationAuthToken | AzureOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:

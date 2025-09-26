@@ -364,7 +364,8 @@ class WorkflowRunContext:
         self, parameter: OnePasswordCredentialParameter, organization: Organization
     ) -> None:
         org_auth_token = await app.DATABASE.get_valid_org_auth_token(
-            organization.organization_id, OrganizationAuthTokenType.onepassword_service_account
+            organization.organization_id,
+            OrganizationAuthTokenType.onepassword_service_account.value,
         )
         token = settings.OP_SERVICE_ACCOUNT_TOKEN
         if org_auth_token:
@@ -919,7 +920,7 @@ class WorkflowRunContext:
     @staticmethod
     async def _get_azure_vault_client_for_organization(organization: Organization) -> AsyncAzureVaultClient:
         org_auth_token = await app.DATABASE.get_valid_org_auth_token(
-            organization.organization_id, OrganizationAuthTokenType.azure_client_secret_credential
+            organization.organization_id, OrganizationAuthTokenType.azure_client_secret_credential.value
         )
         if org_auth_token:
             azure_vault_client = AsyncAzureVaultClient.create_from_client_secret(org_auth_token.credential)

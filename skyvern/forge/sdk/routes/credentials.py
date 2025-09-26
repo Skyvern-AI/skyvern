@@ -400,7 +400,7 @@ async def get_onepassword_token(
     try:
         auth_token = await app.DATABASE.get_valid_org_auth_token(
             organization_id=current_org.organization_id,
-            token_type=OrganizationAuthTokenType.onepassword_service_account,
+            token_type=OrganizationAuthTokenType.onepassword_service_account.value,
         )
         if not auth_token:
             raise HTTPException(
@@ -503,7 +503,7 @@ async def get_azure_client_secret_credential(
     try:
         auth_token = await app.DATABASE.get_valid_org_auth_token(
             organization_id=current_org.organization_id,
-            token_type=OrganizationAuthTokenType.azure_client_secret_credential,
+            token_type=OrganizationAuthTokenType.azure_client_secret_credential.value,
         )
         if not auth_token:
             raise HTTPException(
