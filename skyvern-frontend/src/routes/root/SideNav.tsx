@@ -7,6 +7,7 @@ import {
   GearIcon,
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
+import { KeyIcon } from "@/components/icons/KeyIcon.tsx";
 
 function SideNav() {
   const { collapsed } = useSidebarStore();
@@ -44,6 +45,11 @@ function SideNav() {
             label: "Settings",
             to: "/settings",
             icon: <GearIcon className="size-6" />,
+          },
+          {
+            label: "Credentials",
+            to: "/credentials",
+            icon: <KeyIcon className="size-6" />,
           },
         ]}
       />

@@ -34,7 +34,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.services.credentials import parse_totp_secret
 
 LOG = structlog.get_logger()
-BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
+BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 11001}"
 
 
 class BitwardenItemType(IntEnum):

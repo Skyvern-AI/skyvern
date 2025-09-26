@@ -114,10 +114,11 @@ services:
     # Bitwarden Settings
     # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
     # - BITWARDEN_SERVER=http://localhost  # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
-    # - BITWARDEN_SERVER_PORT=8002 # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
-    # - BITWARDEN_CLIENT_ID=FILL_ME_IN_PLEASE
-    # - BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
-    # - BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
+    # - BITWARDEN_SERVER_PORT=11001 # IF YOU ARE SELF HOSTING BITWARDEN AND USE THIS COMPOSE FILE, PORT IS 11001 UNLESS CHANGED
+    # - SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID=FILL_ME_IN_PLEASE
+    # - SKYVERN_AUTH_BITWARDEN_CLIENT_ID=FILL_ME_IN_PLEASE
+    # - SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
+    # - SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
 
     # 1Password Integration
     # If you are looking to integrate Skyvern with 1Password, you can use the following environment variables.
@@ -158,3 +159,16 @@ services:
     depends_on:
       skyvern:
         condition: service_healthy
+
+  # uncomment for local usage of `vaultwarden` - see more at: https://github.com/dani-garcia/vaultwarden
+#  vaultwarden:
+#    image: vaultwarden/server:latest-alpine
+#    container_name: vaultwarden
+#    restart: unless-stopped
+#    environment:
+#      # DOMAIN: "https://vaultwarden.example.com"  # required when using a reverse proxy; your domain; vaultwarden needs to know it's https to work properly with attachments
+#      SIGNUPS_ALLOWED: "true" # Deactivate this with "false" after you have created your account so that no strangers can register
+#    volumes:
+#      - ~/vw-data/:/data/ # the path before the : can be changed
+#    ports:
+#      - 11001:80 # you can replace the 11001 with your preferred port
