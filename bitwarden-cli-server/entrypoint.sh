@@ -1,20 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# Debug: Print current working directory and user
-log() {
-    echo -e "\033[0;34m[$(date +'%Y-%m-%d %H:%M:%S')]\033[0m $1"
-}
-
-log "Starting entrypoint script..."
-log "Current user: $(whoami)"
-log "Current directory: $(pwd)"
-log "Environment check:"
-log "  BW_HOST: ${BW_HOST:-'NOT SET'}"
-log "  BW_CLIENTID: ${BW_CLIENTID:0:20}... (first 20 chars)"
-log "  BW_CLIENTSECRET: ${BW_CLIENTSECRET:0:10}... (first 10 chars)"
-log "  BW_PASSWORD: $([ -n "${BW_PASSWORD:-}" ] && echo 'SET' || echo 'NOT SET')"
-
 # Color codes for better logging
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,6 +24,15 @@ log_warning() {
 log_error() {
     echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1"
 }
+
+log "Starting entrypoint script..."
+log "Current user: $(whoami)"
+log "Current directory: $(pwd)"
+log "Environment check:"
+log "  BW_HOST: ${BW_HOST:-'NOT SET'}"
+log "  BW_CLIENTID: ${BW_CLIENTID:0:20}... (first 20 chars)"
+log "  BW_CLIENTSECRET: ${BW_CLIENTSECRET:0:10}... (first 10 chars)"
+log "  BW_PASSWORD: $([ -n "${BW_PASSWORD:-}" ] && echo 'SET' || echo 'NOT SET')"
 
 # Check required environment variables
 if [[ -z "${BW_HOST:-}" ]]; then
