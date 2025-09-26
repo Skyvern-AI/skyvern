@@ -4163,6 +4163,21 @@
             "title": "Downloaded Files",
             "description": "The list of files downloaded by the browser session"
           },
+          "recordings": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FileInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recordings",
+            "description": "The list of video recordings from the browser session"
+          },
           "started_at": {
             "anyOf": [
               {
@@ -10156,6 +10171,22 @@
             ],
             "description": "The script run result"
           },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors",
+            "description": "The errors for the run"
+          },
           "run_type": {
             "type": "string",
             "enum": [
@@ -11910,6 +11941,17 @@
             ],
             "title": "Run Sequentially"
           },
+          "sequential_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Key"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -12086,6 +12128,17 @@
             "type": "boolean",
             "title": "Run Sequentially",
             "default": false
+          },
+          "sequential_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Key"
           }
         },
         "type": "object",
@@ -13332,6 +13385,22 @@
               }
             ],
             "description": "The script run result"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors",
+            "description": "The errors for the run"
           },
           "run_type": {
             "type": "string",
