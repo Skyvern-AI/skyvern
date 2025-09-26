@@ -160,7 +160,7 @@ services:
       skyvern:
         condition: service_healthy
 
-  # uncomment for local usage of `vaultwarden` - see more at: https://github.com/dani-garcia/vaultwarden
+# uncomment for local usage of `vaultwarden` - see more at: https://github.com/dani-garcia/vaultwarden
 #  vaultwarden:
 #    image: vaultwarden/server:latest-alpine
 #    container_name: vaultwarden
