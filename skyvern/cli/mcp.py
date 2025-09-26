@@ -20,7 +20,7 @@ async def setup_local_organization() -> str:
     organization = await skyvern_agent.get_organization()
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
         organization_id=organization.organization_id,
-        token_type=OrganizationAuthTokenType.api,
+        token_type=OrganizationAuthTokenType.api.value,
     )
     return org_auth_token.token if org_auth_token else ""
 

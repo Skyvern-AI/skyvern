@@ -1723,7 +1723,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         return
     api_key = await app.DATABASE.get_valid_org_auth_token(
         organization_id,
-        OrganizationAuthTokenType.api,
+        OrganizationAuthTokenType.api.value,
     )
     if not api_key:
         LOG.warning(

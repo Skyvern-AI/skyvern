@@ -874,22 +874,23 @@ class AgentDB:
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal[OrganizationAuthTokenType.api, OrganizationAuthTokenType.onepassword_service_account],
+        token_type: Literal["api", "onepassword_service_account"],
     ) -> OrganizationAuthToken | None: ...
 
     @overload
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal[OrganizationAuthTokenType.azure_client_secret_credential],
+        token_type: Literal["azure_client_secret_credential"],
     ) -> AzureOrganizationAuthToken | None: ...
 
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: OrganizationAuthTokenType,
+        token_type: Literal["api", "onepassword_service_account", "azure_client_secret_credential"],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
         try:
+            print("lol")
             async with self.Session() as session:
                 if token := (
                     await session.scalars(
