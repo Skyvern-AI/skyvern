@@ -4,7 +4,7 @@ metadata:
   name: skyvern-frontend
   namespace: skyvern
 spec:
-  type: ClusterIP # Or LoadBalancer
+  type: ClusterIP  # Or LoadBalancer
   ports:
     - name: http
       port: 8080

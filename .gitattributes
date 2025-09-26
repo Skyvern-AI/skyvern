@@ -1,0 +1,27 @@
+# Set default behavior to automatically normalize line endings
+* text=auto
+
+# Force Unix LF line endings for shell scripts
+*.sh text eol=lf
+bitwarden-cli-server/entrypoint.sh text eol=lf
+
+# Force Unix LF line endings for Python files
+*.py text eol=lf
+
+# Force Unix LF line endings for Docker files
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+
+# Force Unix LF line endings for YAML and config files
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary

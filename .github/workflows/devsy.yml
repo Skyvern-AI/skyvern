@@ -34,10 +34,10 @@ jobs:
   run-devsy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write # Required for OIDC token generation
-      contents: write # Required for creating commits and branches if token exchange fails
-      pull-requests: write # Required for creating and updating PRs if token exchange fails
-      issues: read # Required for reading issue information if token exchange fails
+      id-token: write  # Required for OIDC token generation
+      contents: write  # Required for creating commits and branches if token exchange fails
+      pull-requests: write  # Required for creating and updating PRs if token exchange fails
+      issues: read  # Required for reading issue information if token exchange fails
     outputs:
       conclusion: ${{ steps.devsy.outputs.conclusion }}
       pr_number: ${{ steps.devsy.outputs.pr_number }}
