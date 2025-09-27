@@ -367,7 +367,7 @@ class SkyvernPage:
         """
         new_xpath = xpath
 
-        if intention and data:
+        if intention:
             try:
                 # Build the element tree of the current page for the prompt
                 context = skyvern_context.ensure_context()

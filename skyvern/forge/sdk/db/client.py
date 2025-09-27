@@ -1697,6 +1697,7 @@ class AgentDB:
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         sequential_key: str | None = None,
+        run_with: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1715,6 +1716,7 @@ class AgentDB:
                     extra_http_headers=extra_http_headers,
                     browser_address=browser_address,
                     sequential_key=sequential_key,
+                    run_with=run_with,
                 )
                 session.add(workflow_run)
                 await session.commit()
