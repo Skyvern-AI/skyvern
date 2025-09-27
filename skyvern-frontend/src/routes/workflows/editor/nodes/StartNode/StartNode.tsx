@@ -7,6 +7,13 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useEffect, useState } from "react";
 import { ProxyLocation } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
@@ -33,7 +40,6 @@ import {
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import { useUiStore } from "@/store/UiStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { cn } from "@/util/utils";
 
@@ -77,33 +83,14 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
     aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
     runSequentially: data.withWorkflowSettings ? data.runSequentially : false,
+    sequentialKey: data.withWorkflowSettings ? data.sequentialKey : null,
   });
 
-  const { highlightGenerateCodeToggle, setHighlightGenerateCodeToggle } =
-    useUiStore();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
-  const [expandWorkflowSettings, setExpandWorkflowSettings] = useState(false);
-
-  useEffect(() => {
-    const tm = setTimeout(() => {
-      if (highlightGenerateCodeToggle) {
-        setExpandWorkflowSettings(true);
-        rerender.bump();
-
-        setTimeout(() => {
-          setHighlightGenerateCodeToggle(false);
-        }, 3000);
-      }
-    }, 200);
-
-    return () => clearTimeout(tm);
-    // onMount only
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -158,10 +145,6 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     }
   }
 
-  const defaultWorkflowSettings = expandWorkflowSettings
-    ? "settings"
-    : undefined;
-
   if (data.withWorkflowSettings) {
     return (
       <Flippable facing={facing} preserveFrontsideHeight={true}>
@@ -184,12 +167,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
               <Accordion
                 type="single"
                 collapsible
-                value={defaultWorkflowSettings}
-                defaultValue={defaultWorkflowSettings}
-                onValueChange={(value) => {
-                  setExpandWorkflowSettings(value === "settings");
-                  rerender.bump();
-                }}
+                onValueChange={() => rerender.bump()}
               >
                 <AccordionItem value="settings" className="mt-4 border-b-0">
                   <AccordionTrigger className="py-2">
@@ -234,29 +212,46 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
-
-                      <div className="flex flex-col gap-4">
-                        <div className="space-y-2">
-                          <div
-                            className={cn("flex items-center gap-2", {
-                              "animate-pulse rounded-md bg-yellow-600/20":
-                                highlightGenerateCodeToggle,
-                            })}
-                          >
-                            <Label>Generate Code</Label>
-                            <HelpTooltip content="If code has been cached, run the workflow using code for faster execution." />
-                            <Switch
-                              disabled={inputs.useScriptCache === true} // TODO(jdo/always-generate): remove
-                              className="ml-auto"
-                              checked={inputs.useScriptCache}
-                              onCheckedChange={(value) => {
-                                handleChange("useScriptCache", value);
+                      <div className="flex flex-col gap-4 rounded-md bg-slate-elevation5 p-4 pl-4">
+                        <div className="flex flex-col gap-4">
+                          <div className="flex justify-between">
+                            <div className="flex items-center gap-2">
+                              <Label>Run With</Label>
+                              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
+                            </div>
+                            <Select
+                              value={!inputs.useScriptCache ? "ai" : "code"}
+                              onValueChange={(value) => {
+                                handleChange(
+                                  "useScriptCache",
+                                  value === "code",
+                                );
                               }}
-                            />
+                            >
+                              <SelectTrigger className="w-48">
+                                <SelectValue placeholder="Run Method" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="ai">
+                                  Skyvern Agent
+                                </SelectItem>
+                                <SelectItem value="code">Code</SelectItem>
+                              </SelectContent>
+                            </Select>
                           </div>
-                        </div>
-                        {/* {inputs.useScriptCache && (  .. // TODO(jdo/always-generate): put back */}
-                        <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
+                          <div className="space-y-2">
+                            <div className="flex items-center gap-2">
+                              <Label>AI Fallback (self-healing)</Label>
+                              <HelpTooltip content="If a run with code fails, fallback to AI and regenerate the code." />
+                              <Switch
+                                className="ml-auto"
+                                checked={inputs.aiFallback}
+                                onCheckedChange={(value) => {
+                                  handleChange("aiFallback", value);
+                                }}
+                              />
+                            </div>
+                          </div>
                           <div className="space-y-2">
                             <div className="flex gap-2">
                               <Label>Code Key (optional)</Label>
@@ -273,34 +268,43 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               className="nopan text-xs"
                             />
                           </div>
-                          <div className="space-y-2">
-                            <div className="flex items-center gap-2">
-                              <Label>Fallback To AI On Failure</Label>
-                              <HelpTooltip content="If cached code fails, fallback to AI." />
-                              <Switch
-                                className="ml-auto"
-                                checked={inputs.aiFallback}
-                                onCheckedChange={(value) => {
-                                  handleChange("aiFallback", value);
-                                }}
-                              />
-                            </div>
-                          </div>
                         </div>
                         {/* )} */}
                       </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Run Sequentially</Label>
-                          <HelpTooltip content="Run the workflow in a sequential order" />
-                          <Switch
-                            className="ml-auto"
-                            checked={inputs.runSequentially}
-                            onCheckedChange={(value) => {
-                              handleChange("runSequentially", value);
-                            }}
-                          />
+                      <div className="flex flex-col gap-4">
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            <Label>Run Sequentially</Label>
+                            <HelpTooltip content="Run the workflow in a sequential order" />
+                            <Switch
+                              className="ml-auto"
+                              checked={inputs.runSequentially}
+                              onCheckedChange={(value) => {
+                                handleChange("runSequentially", value);
+                              }}
+                            />
+                          </div>
                         </div>
+                        {inputs.runSequentially && (
+                          <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
+                            <div className="space-y-2">
+                              <div className="flex gap-2">
+                                <Label>Sequential Key (optional)</Label>
+                                <HelpTooltip content="A static or dynamic key for directing sequential workflow execution." />
+                              </div>
+                              <WorkflowBlockInputTextarea
+                                nodeId={id}
+                                onChange={(value) => {
+                                  const v = value.length ? value : null;
+                                  handleChange("sequentialKey", v);
+                                }}
+                                value={inputs.sequentialKey ?? ""}
+                                placeholder={placeholders["sequentialKey"]}
+                                className="nopan text-xs"
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">

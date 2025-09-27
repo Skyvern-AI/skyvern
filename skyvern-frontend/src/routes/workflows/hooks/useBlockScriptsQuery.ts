@@ -28,7 +28,6 @@ function useBlockScriptsQuery({
       workflowPermanentId,
       cacheKey,
       cacheKeyValue,
-      pollIntervalMs,
       status,
       workflowRunId,
     ],

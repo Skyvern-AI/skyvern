@@ -180,6 +180,7 @@ class WorkflowService:
             workflow_id=workflow_id,
             organization_id=organization.organization_id,
             parent_workflow_run_id=parent_workflow_run_id,
+            sequential_key=workflow.sequential_key,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -637,6 +638,7 @@ class WorkflowService:
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
         run_sequentially: bool = False,
+        sequential_key: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -659,6 +661,7 @@ class WorkflowService:
             cache_key=cache_key,
             ai_fallback=False if ai_fallback is None else ai_fallback,
             run_sequentially=run_sequentially,
+            sequential_key=sequential_key,
         )
 
     async def create_workflow_from_prompt(
@@ -942,6 +945,7 @@ class WorkflowService:
         workflow_id: str,
         organization_id: str,
         parent_workflow_run_id: str | None = None,
+        sequential_key: str | None = None,
     ) -> WorkflowRun:
         # validate the browser session id
         if workflow_request.browser_session_id:
@@ -965,6 +969,7 @@ class WorkflowService:
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             extra_http_headers=workflow_request.extra_http_headers,
             browser_address=workflow_request.browser_address,
+            sequential_key=sequential_key,
         )
 
     async def _update_workflow_run_status(
@@ -1416,6 +1421,10 @@ class WorkflowService:
                     extracted_information.extend(WorkflowService._collect_extracted_information(output.value))
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
 
+        errors: list[dict[str, Any]] = []
+        for task in workflow_run_tasks:
+            errors.extend(task.errors)
+
         total_steps = None
         total_cost = None
         if include_cost:
@@ -1461,6 +1470,7 @@ class WorkflowService:
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,
             script_run=workflow_run.script_run,
+            errors=errors,
         )
 
     async def clean_up_workflow(
@@ -1582,6 +1592,7 @@ class WorkflowService:
                 totp_url=workflow_run.totp_verification_url or None,
                 totp_identifier=workflow_run.totp_identifier,
             ),
+            errors=workflow_run_status_response.errors,
         )
         payload_dict = json.loads(workflow_run_status_response.model_dump_json())
         workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
@@ -1758,6 +1769,7 @@ class WorkflowService:
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
+                    sequential_key=request.sequential_key,
                 )
             else:
                 workflow = await self.create_workflow(
@@ -1779,6 +1791,7 @@ class WorkflowService:
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
+                    sequential_key=request.sequential_key,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = workflow.workflow_id
@@ -2191,8 +2204,8 @@ class WorkflowService:
                 terminate_criterion=block_yaml.terminate_criterion,
                 error_code_mapping=block_yaml.error_code_mapping,
                 continue_on_failure=block_yaml.continue_on_failure,
-                # only need one step for validation block
-                max_steps_per_run=1,
+                # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
+                max_steps_per_run=2,
                 model=block_yaml.model,
             )
 

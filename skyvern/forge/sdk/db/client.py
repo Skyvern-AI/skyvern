@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Sequence
+from typing import Any, List, Literal, Sequence, overload
 
 import structlog
 from sqlalchemy import and_, asc, delete, distinct, func, or_, pool, select, tuple_, update
@@ -79,7 +79,12 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
-from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.organizations import (
+    AzureClientSecretCredential,
+    AzureOrganizationAuthToken,
+    Organization,
+    OrganizationAuthToken,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
@@ -865,12 +870,27 @@ class AgentDB:
             await session.refresh(organization)
             return Organization.model_validate(organization)
 
+    @overload
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: OrganizationAuthTokenType,
-    ) -> OrganizationAuthToken | None:
+        token_type: Literal["api", "onepassword_service_account"],
+    ) -> OrganizationAuthToken | None: ...
+
+    @overload
+    async def get_valid_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: Literal["azure_client_secret_credential"],
+    ) -> AzureOrganizationAuthToken | None: ...
+
+    async def get_valid_org_auth_token(
+        self,
+        organization_id: str,
+        token_type: Literal["api", "onepassword_service_account", "azure_client_secret_credential"],
+    ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
         try:
+            print("lol")
             async with self.Session() as session:
                 if token := (
                     await session.scalars(
@@ -881,7 +901,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).first():
-                    return await convert_to_organization_auth_token(token)
+                    return await convert_to_organization_auth_token(token, token_type)
                 else:
                     return None
         except SQLAlchemyError:
@@ -907,7 +927,7 @@ class AgentDB:
                         .order_by(OrganizationAuthTokenModel.created_at.desc())
                     )
                 ).all()
-                return [await convert_to_organization_auth_token(token) for token in tokens]
+                return [await convert_to_organization_auth_token(token, token_type) for token in tokens]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -941,7 +961,7 @@ class AgentDB:
                 if valid is not None:
                     query = query.filter_by(valid=valid)
                 if token_obj := (await session.scalars(query)).first():
-                    return await convert_to_organization_auth_token(token_obj)
+                    return await convert_to_organization_auth_token(token_obj, token_type)
                 else:
                     return None
         except SQLAlchemyError:
@@ -955,14 +975,22 @@ class AgentDB:
         self,
         organization_id: str,
         token_type: OrganizationAuthTokenType,
-        token: str,
+        token: str | AzureClientSecretCredential,
         encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken:
-        plaintext_token = token
+        if token_type is OrganizationAuthTokenType.azure_client_secret_credential:
+            if not isinstance(token, AzureClientSecretCredential):
+                raise TypeError("Expected AzureClientSecretCredential for this token_type")
+            plaintext_token = token.model_dump_json()
+        else:
+            if not isinstance(token, str):
+                raise TypeError("Expected str token for this token_type")
+            plaintext_token = token
+
         encrypted_token = ""
 
         if encrypted_method is not None:
-            encrypted_token = await encryptor.encrypt(token, encrypted_method)
+            encrypted_token = await encryptor.encrypt(plaintext_token, encrypted_method)
             plaintext_token = ""
 
         async with self.Session() as session:
@@ -977,7 +1005,7 @@ class AgentDB:
             await session.commit()
             await session.refresh(auth_token)
 
-        return await convert_to_organization_auth_token(auth_token)
+        return await convert_to_organization_auth_token(auth_token, token_type)
 
     async def invalidate_org_auth_tokens(
         self,
@@ -1372,6 +1400,7 @@ class AgentDB:
         ai_fallback: bool = False,
         cache_key: str | None = None,
         run_sequentially: bool = False,
+        sequential_key: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1393,6 +1422,7 @@ class AgentDB:
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
                 run_sequentially=run_sequentially,
+                sequential_key=sequential_key,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1666,6 +1696,7 @@ class AgentDB:
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        sequential_key: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1683,6 +1714,7 @@ class AgentDB:
                     max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                     extra_http_headers=extra_http_headers,
                     browser_address=browser_address,
+                    sequential_key=sequential_key,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1701,6 +1733,7 @@ class AgentDB:
         ai_fallback_triggered: bool | None = None,
         job_id: str | None = None,
         run_with: str | None = None,
+        sequential_key: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1725,6 +1758,8 @@ class AgentDB:
                     workflow_run.job_id = job_id
                 if run_with:
                     workflow_run.run_with = run_with
+                if sequential_key:
+                    workflow_run.sequential_key = sequential_key
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -1799,6 +1834,7 @@ class AgentDB:
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
+        sequential_key: str | None = None,
     ) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
@@ -1806,6 +1842,8 @@ class AgentDB:
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
                 query = query.filter_by(status=WorkflowRunStatus.queued)
+                if sequential_key:
+                    query = query.filter_by(sequential_key=sequential_key)
                 query = query.order_by(WorkflowRunModel.modified_at.desc())
                 workflow_run = (await session.scalars(query)).first()
                 return convert_to_workflow_run(workflow_run) if workflow_run else None
@@ -1817,6 +1855,7 @@ class AgentDB:
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
+        sequential_key: str | None = None,
     ) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
@@ -1824,6 +1863,8 @@ class AgentDB:
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
                 query = query.filter_by(status=WorkflowRunStatus.running)
+                if sequential_key:
+                    query = query.filter_by(sequential_key=sequential_key)
                 query = query.filter(
                     WorkflowRunModel.started_at.isnot(None)
                 )  # filter out workflow runs that does not have a started_at timestamp

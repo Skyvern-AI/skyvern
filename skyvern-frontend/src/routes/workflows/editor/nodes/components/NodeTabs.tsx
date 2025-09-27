@@ -13,6 +13,7 @@ import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { BlockOutputs } from "@/routes/workflows/components/BlockOutputs";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
+import { useDebugStore } from "@/store/useDebugStore";
 import { cn } from "@/util/utils";
 
 interface Props {
@@ -22,6 +23,7 @@ interface Props {
 function NodeTabs({ blockLabel }: Props) {
   const { blockLabel: urlBlockLabel } = useParams();
   const blockOutput = useBlockOutputStore((state) => state.outputs[blockLabel]);
+  const debugStore = useDebugStore();
   const [isExpanded, setIsExpanded] = useState(false);
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -34,6 +36,10 @@ function NodeTabs({ blockLabel }: Props) {
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
 
   if (thisBlockIsPlaying) {
+    return null;
+  }
+
+  if (!debugStore.isDebugMode) {
     return null;
   }
 

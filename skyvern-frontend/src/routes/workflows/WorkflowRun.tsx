@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -42,6 +43,9 @@ import { cn } from "@/util/utils";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
+import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -57,7 +61,7 @@ function WorkflowRun() {
     workflowPermanentId,
   });
 
-  const hasScript = false;
+  const cacheKey = workflow?.cache_key ?? "";
 
   const {
     data: workflowRun,
@@ -66,6 +70,42 @@ function WorkflowRun() {
   } = useWorkflowRunQuery();
 
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
+
+  const [hasPublishedCode, setHasPublishedCode] = useState(false);
+
+  const [cacheKeyValue, setCacheKeyValue] = useState(
+    cacheKey === ""
+      ? ""
+      : constructCacheKeyValue({ codeKey: cacheKey, workflow, workflowRun }),
+  );
+
+  const { data: cacheKeyValues } = useCacheKeyValuesQuery({
+    cacheKey,
+    debounceMs: 100,
+    page: 1,
+    workflowPermanentId,
+  });
+
+  useEffect(() => {
+    setCacheKeyValue(
+      constructCacheKeyValue({ codeKey: cacheKey, workflow, workflowRun }) ??
+        cacheKeyValues?.values[0],
+    );
+  }, [cacheKey, cacheKeyValues, setCacheKeyValue, workflow, workflowRun]);
+
+  const { data: blockScriptsPublished } = useBlockScriptsQuery({
+    cacheKey,
+    cacheKeyValue,
+    workflowPermanentId,
+    pollIntervalMs: !hasPublishedCode && !isFinalized ? 3000 : undefined,
+    status: "published",
+    workflowRunId: workflowRun?.workflow_run_id,
+  });
+
+  useEffect(() => {
+    const keys = Object.keys(blockScriptsPublished ?? {});
+    setHasPublishedCode(keys.length > 0);
+  }, [blockScriptsPublished, setHasPublishedCode]);
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
 
@@ -214,6 +254,8 @@ function WorkflowRun() {
       webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
 
+  const isGeneratingCode = !isFinalized && !hasPublishedCode;
+
   const switchBarOptions: SwitchBarNavigationOption[] = [
     {
       label: "Overview",
@@ -231,22 +273,16 @@ function WorkflowRun() {
       label: "Recording",
       to: "recording",
     },
-  ];
-
-  const isGeneratingCode = !isFinalized && workflow?.generate_script === true;
-
-  if (!hasScript) {
-    switchBarOptions.push({
+    {
       label: "Code",
       to: "code",
-      icon:
-        isFinalized || !isGeneratingCode ? (
-          <CodeIcon className="inline-block size-5" />
-        ) : (
-          <ReloadIcon className="inline-block size-5 animate-spin" />
-        ),
-    });
-  }
+      icon: !isGeneratingCode ? (
+        <CodeIcon className="inline-block size-5" />
+      ) : (
+        <ReloadIcon className="inline-block size-5 animate-spin" />
+      ),
+    },
+  ];
 
   return (
     <div className="space-y-8">

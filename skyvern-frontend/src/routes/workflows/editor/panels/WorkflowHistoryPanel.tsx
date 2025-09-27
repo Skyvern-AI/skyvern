@@ -101,6 +101,27 @@ function WorkflowHistoryPanel({ workflowPermanentId, onCompare }: Props) {
         </p>
       </div>
 
+      {/* Compare Buttons */}
+      <div className="flex-shrink-0 px-4 pb-3">
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            className="flex-1"
+            onClick={() => handleCompare("json")}
+            disabled={!canCompare || isLoading}
+          >
+            JSON Diff
+          </Button>
+          <Button
+            className="flex-1"
+            onClick={() => handleCompare("visual")}
+            disabled={!canCompare || isLoading}
+          >
+            Visual Compare
+          </Button>
+        </div>
+      </div>
+
       <Separator />
 
       {/* Version List */}
@@ -166,29 +187,6 @@ function WorkflowHistoryPanel({ workflowPermanentId, onCompare }: Props) {
           )}
         </div>
       </ScrollArea>
-
-      <Separator />
-
-      {/* Footer */}
-      <div className="flex-shrink-0 p-4 pt-3">
-        <div className="flex gap-2">
-          <Button
-            variant="secondary"
-            className="flex-1"
-            onClick={() => handleCompare("json")}
-            disabled={!canCompare || isLoading}
-          >
-            JSON Diff
-          </Button>
-          <Button
-            className="flex-1"
-            onClick={() => handleCompare("visual")}
-            disabled={!canCompare || isLoading}
-          >
-            Visual Compare
-          </Button>
-        </div>
-      </div>
     </div>
   );
 }

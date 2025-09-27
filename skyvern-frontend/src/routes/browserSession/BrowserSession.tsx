@@ -5,11 +5,17 @@ import { useQuery } from "@tanstack/react-query";
 import { getClient } from "@/api/AxiosClient";
 import { BrowserStream } from "@/components/BrowserStream";
 import { LogoMinimized } from "@/components/LogoMinimized";
+import { SwitchBar } from "@/components/SwitchBar";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { BrowserSessionVideo } from "./BrowserSessionVideo";
+import { cn } from "@/util/utils";
+
+type TabName = "stream" | "videos";
 
 function BrowserSession() {
   const { browserSessionId } = useParams();
   const [hasBrowserSession, setHasBrowserSession] = useState(false);
+  const [activeTab, setActiveTab] = useState<TabName>("stream");
 
   const credentialGetter = useCredentialGetter();
 
@@ -19,12 +25,14 @@ function BrowserSession() {
       const client = await getClient(credentialGetter, "sans-api-v1");
 
       try {
-        await client.get(`/browser_sessions/${browserSessionId}`);
+        const response = await client.get(
+          `/browser_sessions/${browserSessionId}`,
+        );
         setHasBrowserSession(true);
-        return true;
+        return response.data;
       } catch (error) {
         setHasBrowserSession(false);
-        return false;
+        return null;
       }
     },
   });
@@ -60,12 +68,43 @@ function BrowserSession() {
             <div className="text-xl">browser session</div>
           </div>
         </div>
-        <div className="min-h-0 w-full flex-1 rounded-lg border p-4">
-          <BrowserStream
-            browserSessionId={browserSessionId}
-            interactive={false}
-            showControlButtons={true}
-          />
+
+        {/* Tab Navigation */}
+        <SwitchBar
+          className="mb-2 border-none"
+          onChange={(value) => setActiveTab(value as TabName)}
+          value={activeTab}
+          options={[
+            {
+              label: "Stream",
+              value: "stream",
+              helpText: "The live stream of the browser session (if active).",
+            },
+            {
+              label: "Recordings",
+              value: "videos",
+              helpText: "All recordings of this browser session.",
+            },
+          ]}
+        />
+
+        {/* Tab Content */}
+        <div className="relative min-h-0 w-full flex-1 rounded-lg border p-4">
+          <div
+            className={cn(
+              "absolute left-0 top-0 z-10 flex h-full w-full items-center justify-center",
+              {
+                hidden: activeTab !== "stream",
+              },
+            )}
+          >
+            <BrowserStream
+              browserSessionId={browserSessionId}
+              interactive={false}
+              showControlButtons={true}
+            />
+          </div>
+          {activeTab === "videos" && <BrowserSessionVideo />}
         </div>
       </div>
     </div>

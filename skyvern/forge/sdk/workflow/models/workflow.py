@@ -80,6 +80,7 @@ class Workflow(BaseModel):
     ai_fallback: bool = False
     cache_key: str | None = None
     run_sequentially: bool | None = None
+    sequential_key: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -139,6 +140,7 @@ class WorkflowRun(BaseModel):
     run_with: str | None = None
     script_run: ScriptRunResponse | None = None
     job_id: str | None = None
+    sequential_key: str | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -191,3 +193,4 @@ class WorkflowRunResponseBase(BaseModel):
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
+    errors: list[dict[str, Any]] | None = None

@@ -1711,6 +1711,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             data_extraction_schema=task_v2.extracted_information_schema,
             error_code_mapping=task_v2.error_code_mapping,
         ),
+        errors=workflow_run_resp.errors if workflow_run_resp else None,
     )
 
 
@@ -1722,7 +1723,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         return
     api_key = await app.DATABASE.get_valid_org_auth_token(
         organization_id,
-        OrganizationAuthTokenType.api,
+        OrganizationAuthTokenType.api.value,
     )
     if not api_key:
         LOG.warning(

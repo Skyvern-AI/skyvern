@@ -30,7 +30,12 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step, StepStatus
-from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken
+from skyvern.forge.sdk.schemas.organizations import (
+    AzureClientSecretCredential,
+    AzureOrganizationAuthToken,
+    Organization,
+    OrganizationAuthToken,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -195,21 +200,33 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
 
 
 async def convert_to_organization_auth_token(
-    org_auth_token: OrganizationAuthTokenModel,
-) -> OrganizationAuthToken:
+    org_auth_token: OrganizationAuthTokenModel, token_type: str
+) -> OrganizationAuthToken | AzureOrganizationAuthToken:
     token = org_auth_token.token
     if org_auth_token.encrypted_token and org_auth_token.encrypted_method:
         token = await encryptor.decrypt(org_auth_token.encrypted_token, EncryptMethod(org_auth_token.encrypted_method))
 
-    return OrganizationAuthToken(
-        id=org_auth_token.id,
-        organization_id=org_auth_token.organization_id,
-        token_type=OrganizationAuthTokenType(org_auth_token.token_type),
-        token=token,
-        valid=org_auth_token.valid,
-        created_at=org_auth_token.created_at,
-        modified_at=org_auth_token.modified_at,
-    )
+    if token_type == OrganizationAuthTokenType.azure_client_secret_credential:
+        credential = AzureClientSecretCredential.model_validate_json(token)
+        return AzureOrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            credential=credential,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
+    else:
+        return OrganizationAuthToken(
+            id=org_auth_token.id,
+            organization_id=org_auth_token.organization_id,
+            token_type=OrganizationAuthTokenType(org_auth_token.token_type),
+            token=token,
+            valid=org_auth_token.valid,
+            created_at=org_auth_token.created_at,
+            modified_at=org_auth_token.modified_at,
+        )
 
 
 def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = False) -> Artifact:
@@ -267,6 +284,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
         run_sequentially=workflow_model.run_sequentially,
+        sequential_key=workflow_model.sequential_key,
     )
 
 
@@ -305,6 +323,7 @@ def convert_to_workflow_run(
         extra_http_headers=workflow_run_model.extra_http_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
+        sequential_key=workflow_run_model.sequential_key,
         script_run=ScriptRunResponse.model_validate(workflow_run_model.script_run)
         if workflow_run_model.script_run
         else None,

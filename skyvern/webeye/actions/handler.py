@@ -1178,7 +1178,9 @@ async def handle_input_text_action(
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
-            skyvern_element = blocking_element
+            if await blocking_element.is_editable():
+                skyvern_element = blocking_element
+                tag_name = blocking_element.get_tag_name()
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -1833,11 +1835,6 @@ async def handle_complete_action(
             workflow_run_id=task.workflow_run_id,
         )
         action.verified = True
-
-        if task.error_code_mapping:
-            action.errors = await extract_user_defined_errors(
-                task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
-            )
 
         if not task.data_extraction_goal and verification_result.thoughts:
             await app.DATABASE.update_task(
