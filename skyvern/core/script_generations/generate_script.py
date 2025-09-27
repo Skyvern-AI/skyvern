@@ -168,57 +168,6 @@ def _render_value(
         return _value(prompt_text)
 
 
-def _generate_text_call(text_value: str, intention: str, parameter_key: str) -> cst.BaseExpression:
-    """Create a generate_text function call CST expression."""
-    return cst.Await(
-        expression=cst.Call(
-            func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("generate_text")),
-            whitespace_before_args=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
-            ),
-            args=[
-                # First positional argument: context.parameters['parameter_key']
-                cst.Arg(
-                    value=cst.Subscript(
-                        value=cst.Attribute(
-                            value=cst.Name("context"),
-                            attr=cst.Name("parameters"),
-                        ),
-                        slice=[cst.SubscriptElement(slice=cst.Index(value=_value(parameter_key)))],
-                    ),
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(
-                        indent=True,
-                        last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
-                    ),
-                ),
-                # intention keyword argument
-                cst.Arg(
-                    keyword=cst.Name("intention"),
-                    value=_value(intention),
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(
-                        indent=True,
-                        last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
-                    ),
-                ),
-                # data keyword argument
-                cst.Arg(
-                    keyword=cst.Name("data"),
-                    value=cst.Attribute(
-                        value=cst.Name("context"),
-                        attr=cst.Name("parameters"),
-                    ),
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(
-                        indent=True,
-                        last_line=cst.SimpleWhitespace(INDENT),
-                    ),
-                    comma=cst.Comma(),
-                ),
-            ],
-        )
-    )
-
-
 # --------------------------------------------------------------------- #
 # 2. utility builders                                                   #
 # --------------------------------------------------------------------- #
@@ -434,7 +383,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         args.append(
             cst.Arg(
                 keyword=cst.Name("prompt"),
-                value=_render_value(act["data_extraction_goal"]),
+                value=_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -459,14 +408,6 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
             cst.Arg(
                 keyword=cst.Name("intention"),
                 value=_value(act.get("intention") or act.get("reasoning") or ""),
-                whitespace_after_arg=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            cst.Arg(
-                keyword=cst.Name("data"),
-                value=cst.Attribute(value=cst.Name("context"), attr=cst.Name("parameters")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
                 comma=cst.Comma(),
             ),
@@ -646,7 +587,7 @@ def _build_download_statement(
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal") or "", data_variable_name=data_variable_name),
+            value=_value(block.get("navigation_goal") or ""),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -657,7 +598,7 @@ def _build_download_statement(
         args.append(
             cst.Arg(
                 keyword=cst.Name("download_suffix"),
-                value=_render_value(block.get("download_suffix"), data_variable_name=data_variable_name),
+                value=_value(block.get("download_suffix")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -694,7 +635,7 @@ def _build_action_statement(
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", ""), data_variable_name=data_variable_name),
+            value=_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -746,7 +687,7 @@ def _build_extract_statement(
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("data_extraction_goal", ""), data_variable_name=data_variable_name),
+            value=_value(block.get("data_extraction_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -870,7 +811,7 @@ def _build_validate_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
+            value=_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -898,6 +839,14 @@ def _build_wait_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             value=_value(block.get("wait_sec", 1)),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
             ),
             comma=cst.Comma(),
         ),
@@ -920,7 +869,7 @@ def _build_goto_statement(block: dict[str, Any], data_variable_name: str | None 
     args = [
         cst.Arg(
             keyword=cst.Name("url"),
-            value=_render_value(block.get("url", ""), data_variable_name=data_variable_name),
+            value=_value(block.get("url", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1212,7 +1161,7 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("prompt", "")),
+            value=_value(block.get("prompt", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1275,7 +1224,7 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
 
     An example of a for loop statement:
     ```
-    for current_value in context.parameters["urls"]:
+    async for current_value in skyvern.loop(context.parameters["urls"]):
         await skyvern.goto(
             url=current_value,
             label="block_4",
@@ -1309,28 +1258,28 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     body_statements = []
 
     # Add loop_data assignment as the first statement
-    loop_data_variable_name = "loop_data"
-    loop_data_assignment = cst.SimpleStatementLine(
-        [
-            cst.Assign(
-                targets=[cst.AssignTarget(target=cst.Name(loop_data_variable_name))],
-                value=cst.Dict(
-                    [cst.DictElement(key=cst.SimpleString('"current_value"'), value=cst.Name("current_value"))]
-                ),
-            )
-        ]
-    )
-    body_statements.append(loop_data_assignment)
-
     for loop_block in loop_blocks:
-        stmt = _build_block_statement(loop_block, data_variable_name=loop_data_variable_name)
+        stmt = _build_block_statement(loop_block)
         body_statements.append(stmt)
 
-    # Create the for loop
+    # create skyvern.loop(loop_over_parameter_key, label=block_title)
+    loop_call_args = [cst.Arg(keyword=cst.Name("values"), value=_value(loop_over_parameter_key))]
+    if block.get("complete_if_empty"):
+        loop_call_args.append(
+            cst.Arg(keyword=cst.Name("complete_if_empty"), value=_value(block.get("complete_if_empty")))
+        )
+    loop_call_args.append(cst.Arg(keyword=cst.Name("label"), value=_value(block_title)))
+    loop_call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("loop")),
+        args=loop_call_args,
+    )
+
+    # Create the async for loop
     for_loop = cst.For(
         target=target,
-        iter=_render_value(loop_over_parameter_key, render_func_name="render_list"),
+        iter=loop_call,
         body=cst.IndentedBlock(body=body_statements),
+        asynchronous=cst.Asynchronous(),
         whitespace_after_for=cst.SimpleWhitespace(" "),
         whitespace_before_in=cst.SimpleWhitespace(" "),
         whitespace_after_in=cst.SimpleWhitespace(" "),
@@ -1405,7 +1354,7 @@ def __build_base_task_statement(
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(prompt, data_variable_name=data_variable_name),
+            value=_value(prompt),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1416,7 +1365,7 @@ def __build_base_task_statement(
         args.append(
             cst.Arg(
                 keyword=cst.Name("url"),
-                value=_render_value(block.get("url", "")),
+                value=_value(block.get("url", "")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1439,7 +1388,7 @@ def __build_base_task_statement(
         args.append(
             cst.Arg(
                 keyword=cst.Name("totp_identifier"),
-                value=_render_value(block.get("totp_identifier", "")),
+                value=_value(block.get("totp_identifier", "")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1450,7 +1399,7 @@ def __build_base_task_statement(
         args.append(
             cst.Arg(
                 keyword=cst.Name("totp_url"),
-                value=_render_value(block.get("totp_verification_url", "")),
+                value=_value(block.get("totp_verification_url", "")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
