@@ -64,13 +64,29 @@ async def _get_element_id_by_xpath(xpath: str, page: Page) -> str | None:
     return element_id
 
 
+def _get_context_data(data: str | dict[str, Any] | None = None) -> dict[str, Any] | str | None:
+    context = skyvern_context.current()
+    global_context_data = context.script_run_parameters if context else None
+    if not data:
+        return global_context_data
+    result: dict[str, Any] | str | None
+    if isinstance(data, dict):
+        result = {k: v for k, v in data.items() if v}
+        if global_context_data:
+            result.update(global_context_data)
+    else:
+        global_context_data_str = json.dumps(global_context_data) if global_context_data else ""
+        result = f"{data}\n{global_context_data_str}"
+    return result
+
+
 def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     """
     Refer to  Block.format_block_parameter_template_from_workflow_run_context
 
     TODO: complete this function so that block code shares the same template rendering logic
     """
-    template_data = data or {}
+    template_data = data.copy() if data else {}
     jinja_template = jinja_sandbox_env.from_string(template)
     context = skyvern_context.current()
     if context and context.workflow_run_id:
@@ -355,7 +371,7 @@ class SkyvernPage:
             try:
                 # Build the element tree of the current page for the prompt
                 context = skyvern_context.ensure_context()
-                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                payload_str = _get_context_data(data)
                 refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                 element_tree = refreshed_page.build_element_tree()
                 single_click_prompt = prompt_engine.load_prompt(
@@ -463,9 +479,7 @@ class SkyvernPage:
         if ai_infer and intention:
             try:
                 prompt = context.prompt if context else None
-                # Build the element tree of the current page for the prompt
-                # clean up empty data values
-                data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
+                data = _get_context_data(data)
                 if (totp_identifier or totp_url) and context and organization_id and task_id:
                     verification_code = await poll_verification_code(
                         organization_id=organization_id,
@@ -488,11 +502,10 @@ class SkyvernPage:
                 self.scraped_page = refreshed_page
                 # get the element_id by the xpath
                 element_id = await _get_element_id_by_xpath(xpath, self.page)
-                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
                 script_generation_input_text_prompt = prompt_engine.load_prompt(
                     template="script-generation-input-text-generatiion",
                     intention=intention,
-                    data=payload_str,
+                    data=data,
                     goal=prompt,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
@@ -539,12 +552,11 @@ class SkyvernPage:
             try:
                 context = skyvern_context.current()
                 prompt = context.prompt if context else None
-                data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
-                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                data = _get_context_data(data)
                 script_generation_file_url_prompt = prompt_engine.load_prompt(
                     template="script-generation-file-url-generation",
                     intention=intention,
-                    data=payload_str,
+                    data=data,
                     goal=prompt,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
@@ -578,15 +590,14 @@ class SkyvernPage:
             if ai_infer and intention and task and step:
                 try:
                     prompt = context.prompt if context else None
-                    data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
-                    payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                    data = _get_context_data(data)
                     refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                     self.scraped_page = refreshed_page
                     element_tree = refreshed_page.build_element_tree()
                     merged_goal = SELECT_OPTION_GOAL.format(intention=intention, prompt=prompt)
                     single_select_prompt = prompt_engine.load_prompt(
                         template="single-select-action",
-                        navigation_payload_str=payload_str,
+                        navigation_payload_str=data,
                         navigation_goal=merged_goal,
                         current_url=self.page.url,
                         elements=element_tree,

@@ -918,14 +918,14 @@ class ForLoopBlock(Block):
 
         return context_parameters
 
-    async def get_loop_over_parameter_values(
+    async def get_values_from_loop_variable_reference(
         self,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None = None,
     ) -> list[Any]:
-        # parse the value from self.loop_variable_reference and then from self.loop_over
+        parameter_value = None
         if self.loop_variable_reference:
             LOG.debug("Processing loop variable reference", loop_variable_reference=self.loop_variable_reference)
 
@@ -1029,6 +1029,26 @@ class ForLoopBlock(Block):
                     raise FailedToFormatJinjaStyleParameter(value_template, str(e))
                 parameter_value = json.loads(value_json)
 
+        if isinstance(parameter_value, list):
+            return parameter_value
+        else:
+            return [parameter_value]
+
+    async def get_loop_over_parameter_values(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+    ) -> list[Any]:
+        # parse the value from self.loop_variable_reference and then from self.loop_over
+        if self.loop_variable_reference:
+            return await self.get_values_from_loop_variable_reference(
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
         elif self.loop_over is not None:
             if isinstance(self.loop_over, WorkflowParameter):
                 parameter_value = workflow_run_context.get_value(self.loop_over.key)
@@ -1165,6 +1185,7 @@ class ForLoopBlock(Block):
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
+            # context parameter has been deprecated. However, it's still used by task v2 - we should migrate away from it.
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
