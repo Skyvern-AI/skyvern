@@ -34,9 +34,9 @@ from skyvern.services.script_service import (  # noqa: E402
     download,  # noqa: E402
     extract,  # noqa: E402
     http_request,  # noqa: E402
-    generate_text,  # noqa: E402
     goto,  # noqa: E402
     login,  # noqa: E402
+    loop,  # noqa: E402
     parse_file,  # noqa: E402
     prompt,  # noqa: E402
     render_list,  # noqa: E402
@@ -59,9 +59,9 @@ __all__ = [
     "download",
     "extract",
     "http_request",
-    "generate_text",
     "goto",
     "login",
+    "loop",
     "parse_file",
     "prompt",
     "render_list",

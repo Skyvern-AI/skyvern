@@ -26,6 +26,7 @@ async def setup(
                 parameter = parameters_in_workflow_context[key]
                 if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     parameters[key] = workflow_run_context.values[key]
+        context.script_run_parameters.update(parameters)
     skyvern_page = await SkyvernPage.create(browser_session_id=browser_session_id)
     run_context = RunContext(
         parameters=parameters,
