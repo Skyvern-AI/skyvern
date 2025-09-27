@@ -26,6 +26,7 @@ class WorkflowRequestBody(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
+    run_with: str | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
