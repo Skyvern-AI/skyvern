@@ -12,11 +12,12 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { helpTooltips } from "@/routes/workflows/editor/helpContent";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { AutoResizingTextarea } from "../AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "../ui/button";
 import { AxiosError } from "axios";
 import { toast } from "../ui/use-toast";
+import { cn } from "@/util/utils";
 
 type Props = {
   value: string;
@@ -34,6 +35,42 @@ function WorkflowDataSchemaInputGroup({
   const credentialGetter = useCredentialGetter();
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
+
+  function computeJsonError(
+    jsonText: string,
+  ): { message: string; line?: number; column?: number } | null {
+    try {
+      JSON.parse(jsonText);
+      return null;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Invalid JSON";
+      // Try to extract position and compute line/column for friendlier feedback
+      const match = message.match(/position\s+(\d+)/i);
+      if (!match) {
+        return { message };
+      }
+      const pos = Number(match[1]);
+      if (Number.isNaN(pos)) {
+        return { message };
+      }
+      let line = 1;
+      let col = 1;
+      for (let i = 0; i < Math.min(pos, jsonText.length); i++) {
+        if (jsonText[i] === "\n") {
+          line += 1;
+          col = 1;
+        } else {
+          col += 1;
+        }
+      }
+      return { message, line, column: col };
+    }
+  }
+
+  const jsonError = useMemo(() => {
+    if (value === "null") return null;
+    return computeJsonError(value);
+  }, [value]);
 
   const getDataSchemaSuggestionMutation = useMutation({
     mutationFn: async () => {
@@ -121,13 +158,27 @@ function WorkflowDataSchemaInputGroup({
               )}
             </div>
           ) : null}
-          <CodeEditor
-            language="json"
-            value={value}
-            onChange={onChange}
-            className="nopan"
-            fontSize={8}
-          />
+          <div
+            className={cn(
+              "rounded-md",
+              jsonError ? "ring-1 ring-red-500" : undefined,
+            )}
+          >
+            <CodeEditor
+              language="json"
+              value={value}
+              onChange={onChange}
+              className="nopan"
+              fontSize={8}
+            />
+          </div>
+          {jsonError && (
+            <div className="text-xs text-red-400">
+              {jsonError.line && jsonError.column
+                ? `Invalid JSON (${jsonError.line}:${jsonError.column}) — ${jsonError.message}`
+                : `Invalid JSON — ${jsonError.message}`}
+            </div>
+          )}
         </div>
       )}
     </div>
