@@ -635,7 +635,7 @@ class WorkflowService:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         extra_http_headers: dict[str, str] | None = None,
-        generate_script: bool = False,
+        run_with: str | None = None,
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
         run_sequentially: bool = False,
@@ -658,7 +658,7 @@ class WorkflowService:
             is_saved_task=is_saved_task,
             status=status,
             extra_http_headers=extra_http_headers,
-            generate_script=generate_script,
+            run_with=run_with,
             cache_key=cache_key,
             ai_fallback=False if ai_fallback is None else ai_fallback,
             run_sequentially=run_sequentially,
@@ -677,7 +677,7 @@ class WorkflowService:
         extra_http_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
         max_steps: int | None = None,
-        generate_script: bool = True,
+        run_with: str | None = None,
         ai_fallback: bool = True,
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
@@ -720,7 +720,7 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
-            generate_script=generate_script,
+            run_with=run_with,
             ai_fallback=ai_fallback,
         )
 
@@ -1776,7 +1776,7 @@ class WorkflowService:
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
-                    generate_script=request.generate_script,
+                    run_with=request.run_with,
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
@@ -1798,7 +1798,7 @@ class WorkflowService:
                     extra_http_headers=request.extra_http_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
-                    generate_script=request.generate_script,
+                    run_with=request.run_with,
                     cache_key=request.cache_key,
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
@@ -2417,7 +2417,7 @@ class WorkflowService:
         proxy_location: ProxyLocation | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        generate_script: bool = False,
+        run_with: str | None = None,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
         """
@@ -2434,7 +2434,7 @@ class WorkflowService:
             status=status,
             max_screenshot_scrolls=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
-            generate_script=generate_script,
+            run_with=run_with,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=organization,
@@ -2600,8 +2600,6 @@ class WorkflowService:
     ) -> bool:
         if workflow_run.run_with == "code":
             return True
-        if workflow_run.run_with == "agent":
-            return False
-        if workflow.generate_script:
+        if workflow.run_with == "code":
             return True
         return False
