@@ -25,19 +25,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install Project Dependencies
+      - name: Install uv
         run: |
-          python -m pip install --upgrade pip
-          pip install poetry
-          poetry install --all-extras
-          poetry add codeflash
-      - name: create test dir
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync project dependencies
         run: |
-          mkdir -p codeflash-tests
+          uv sync --group dev
+      - name: Install Codeflash into venv
+        run: |
+          uv pip install codeflash
+      - name: Create test dir
+        run: mkdir -p codeflash-tests
       - name: Run Codeflash to optimize code
-        run: |
-          poetry env use python
-          poetry run codeflash
+        run: uv run codeflash
       - name: remove test dir
         run: |-
           rm -rf codeflash-tests
