@@ -108,7 +108,7 @@ interface Dom {
   splitLeft: MutableRefObject<HTMLInputElement | null>;
 }
 
-function CopyText({ text }: { text: string }) {
+function CopyText({ className, text }: { className?: string; text: string }) {
   const [wasCopied, setWasCopied] = useState(false);
 
   function handleCopy(code: string) {
@@ -118,7 +118,15 @@ function CopyText({ text }: { text: string }) {
   }
 
   return (
-    <Button size="icon" variant="link" onClick={() => handleCopy(text)}>
+    <Button
+      className={className}
+      size="icon"
+      variant="link"
+      onClick={(e) => {
+        e.stopPropagation();
+        handleCopy(text);
+      }}
+    >
       {wasCopied ? <CheckIcon /> : <CopyIcon />}
     </Button>
   );
