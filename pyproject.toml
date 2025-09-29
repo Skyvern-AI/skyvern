@@ -113,30 +113,29 @@ packages = ["skyvern", "alembic"]
 include = [
     "skyvern",
     "alembic",
-    "skyvern-frontend",
-    "skyvern-frontend/src",
-    "skyvern-frontend/public",
-    "skyvern-frontend/package.json",
-    "skyvern-frontend/package-lock.json",
-    "skyvern-frontend/*.config.*",
-    "skyvern-frontend/*.html",
-    "skyvern-frontend/*.md",
 ]
-
 exclude = [
     "skyvern-frontend/node_modules",
     "skyvern-frontend/dist",
 ]
+[tool.hatch.build.targets.sdist.force-include]
+"skyvern-frontend" = "skyvern-frontend"
 
 [tool.hatch.build.targets.wheel]
 include = [
     "skyvern",
     "alembic",
 ]
-exclude = [
-    "skyvern-frontend/node_modules",
-    "skyvern-frontend/dist",
-]
+[tool.hatch.build.targets.wheel.force-include]
+"skyvern-frontend/src" = "skyvern-frontend/src"
+"skyvern-frontend/public" = "skyvern-frontend/public"
+"skyvern-frontend/package.json" = "skyvern-frontend/package.json"
+"skyvern-frontend/package-lock.json" = "skyvern-frontend/package-lock.json"
+"skyvern-frontend/postcss.config.js" = "skyvern-frontend/postcss.config.js"
+"skyvern-frontend/tailwind.config.js" = "skyvern-frontend/tailwind.config.js"
+"skyvern-frontend/vite.config.ts" = "skyvern-frontend/vite.config.ts"
+"skyvern-frontend/index.html" = "skyvern-frontend/index.html"
+"skyvern-frontend/README.md" = "skyvern-frontend/README.md"
 
 [build-system]
 requires = ["hatchling"]
