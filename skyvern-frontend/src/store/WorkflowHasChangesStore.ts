@@ -114,7 +114,7 @@ const useWorkflowSave = () => {
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
-        generate_script: saveData.settings.useScriptCache,
+        run_with: saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,
         workflow_definition: {

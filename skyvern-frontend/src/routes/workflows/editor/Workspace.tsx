@@ -720,7 +720,7 @@ function Workspace({
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
         : null,
-      useScriptCache: selectedVersion.generate_script,
+      runWith: selectedVersion.run_with,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
