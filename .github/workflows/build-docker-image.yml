@@ -6,7 +6,7 @@ env:
   AWS_REGION: us-east-1
   ECR_BACKEND_REPOSITORY: skyvern
   ECR_UI_REPOSITORY: skyvern-ui
-  REGISTRY_ALIAS: skyvern  # t6d4b5t4 
+  REGISTRY_ALIAS: skyvern # t6d4b5t4 
   DOCKERHUB_USERNAME: skyvern
 jobs:
   run-ci:
