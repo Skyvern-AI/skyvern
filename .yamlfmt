@@ -7,4 +7,4 @@ formatter:
   type: basic
   indent: 2
   include_document_start: false
-  pad_line_comments: 2
+  pad_line_comments: 1
