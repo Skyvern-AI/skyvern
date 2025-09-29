@@ -140,6 +140,9 @@ class WorkflowRunContext:
         self.secrets: dict[str, Any] = {}
         self._aws_client = aws_client
 
+        # Pre-initialize a single empty BlockMetadata object to avoid per-call dict allocation in get_block_metadata
+        self._empty_block_metadata: BlockMetadata = {}
+
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
 
@@ -169,7 +172,8 @@ class WorkflowRunContext:
     def get_block_metadata(self, label: str | None) -> BlockMetadata:
         if label is None:
             label = ""
-        return self.blocks_metadata.get(label, BlockMetadata())
+        # Use the pre-allocated empty dict to avoid creating a new dict instance on every miss
+        return self.blocks_metadata.get(label, self._empty_block_metadata)
 
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
         """
