@@ -2,11 +2,10 @@ FROM python:3.11 AS requirements-stage
 # Run `skyvern init llm` before building to generate the .env file
 
 WORKDIR /tmp
-RUN pip install poetry
-RUN poetry self add poetry-plugin-export
+RUN curl -LsSf https://astral.sh/uv/install.sh
 COPY ./pyproject.toml /tmp/pyproject.toml
-COPY ./poetry.lock /tmp/poetry.lock
-RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
+COPY ./uv.lock /tmp/uv.lock
+RUN uv export --no-hashes --output-file requirements.txt
 
 FROM python:3.11-slim-bookworm
 WORKDIR /app
