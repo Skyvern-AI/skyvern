@@ -1544,7 +1544,7 @@ async def run_script(
 def _render_template_with_label(template: str, label: str | None = None) -> str:
     template_data = {}
     context = skyvern_context.current()
-    if context and context.workflow_run_id and label:
+    if context and context.workflow_run_id:
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(label)
         template_data = workflow_run_context.values.copy()

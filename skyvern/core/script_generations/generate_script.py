@@ -775,15 +775,14 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        # TODO: support file attachments?
-        # cst.Arg(
-        #     keyword=cst.Name("file_attachments"),
-        #     value=_value(block.get("file_attachments", [])),
-        #     whitespace_after_arg=cst.ParenthesizedWhitespace(
-        #         indent=True,
-        #         last_line=cst.SimpleWhitespace(INDENT),
-        #     ),
-        # ),
+        cst.Arg(
+            keyword=cst.Name("file_attachments"),
+            value=_value(block.get("file_attachments", [])),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
         cst.Arg(
             keyword=cst.Name("label"),
             value=_value(block.get("label", "")),

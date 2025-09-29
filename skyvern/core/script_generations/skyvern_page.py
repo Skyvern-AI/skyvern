@@ -80,6 +80,35 @@ def _get_context_data(data: str | dict[str, Any] | None = None) -> dict[str, Any
     return result
 
 
+def _render_template_with_label(template: str, label: str | None = None) -> str:
+    template_data = {}
+    context = skyvern_context.current()
+    if context and context.workflow_run_id:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+        block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(label)
+        template_data = workflow_run_context.values.copy()
+        if label in template_data:
+            current_value = template_data[label]
+            if isinstance(current_value, dict):
+                block_reference_data.update(current_value)
+            else:
+                LOG.warning(
+                    f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
+                )
+
+        if label:
+            template_data[label] = block_reference_data
+
+        # inject the forloop metadata as global variables
+        if "current_index" in block_reference_data:
+            template_data["current_index"] = block_reference_data["current_index"]
+        if "current_item" in block_reference_data:
+            template_data["current_item"] = block_reference_data["current_item"]
+        if "current_value" in block_reference_data:
+            template_data["current_value"] = block_reference_data["current_value"]
+    return render_template(template, data=template_data)
+
+
 def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     """
     Refer to  Block.format_block_parameter_template_from_workflow_run_context
@@ -118,6 +147,7 @@ class SkyvernPage:
         self.scraped_page = scraped_page
         self.page = page
         self._record = recorder or (lambda ac: None)
+        self.current_label: str | None = None
 
     @classmethod
     async def _get_or_create_browser_state(cls, browser_session_id: str | None = None) -> BrowserState:
@@ -681,6 +711,7 @@ class SkyvernPage:
         tz_info = datetime.now(tz=timezone.utc).tzinfo
         if context and context.tz_info:
             tz_info = context.tz_info
+        prompt = _render_template_with_label(prompt, label=self.current_label)
         extract_information_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
