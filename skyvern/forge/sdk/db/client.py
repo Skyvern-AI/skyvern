@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, asc, case, delete, distinct, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -878,7 +878,7 @@ class AgentDB:
     ) -> OrganizationAuthToken | None: ...
 
     @overload
-    async def get_valid_org_auth_token(
+    async def get_valid_org_auth_token(  # type: ignore
         self,
         organization_id: str,
         token_type: Literal["azure_client_secret_credential"],
@@ -3200,6 +3200,50 @@ class AgentDB:
                     .filter(
                         PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=active_hours)
                     )
+                )
+                sessions = result.scalars().all()
+                return [PersistentBrowserSession.model_validate(session) for session in sessions]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_persistent_browser_sessions_history(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        lookback_hours: int = 24 * 7,
+    ) -> list[PersistentBrowserSession]:
+        """Get persistent browser sessions history for an organization."""
+        try:
+            async with self.Session() as session:
+                open_first = case(
+                    (
+                        and_(
+                            PersistentBrowserSessionModel.started_at.is_not(None),
+                            PersistentBrowserSessionModel.completed_at.is_(None),
+                        ),
+                        0,  # open
+                    ),
+                    else_=1,  # not open
+                )
+
+                result = await session.execute(
+                    select(PersistentBrowserSessionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(deleted_at=None)
+                    .filter(
+                        PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=lookback_hours)
+                    )
+                    .order_by(
+                        open_first.asc(),  # open sessions first
+                        PersistentBrowserSessionModel.created_at.desc(),  # then newest within each group
+                    )
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
                 )
                 sessions = result.scalars().all()
                 return [PersistentBrowserSession.model_validate(session) for session in sessions]
