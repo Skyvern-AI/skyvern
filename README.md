@@ -397,6 +397,19 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
   <img src="fern/images/geico_shu_recording_cropped.gif"/>
 </p>
 
+# Contributor Setup
+Make sure to have [uv](https://docs.astral.sh/uv/getting-started/installation/) installed.
+1. Run this to create your virtual environment (`.venv`)
+    ```bash
+    uv sync --group dev
+    ```
+2. Perform initial server configuration
+    ```bash
+    uv run skyvern quickstart
+    ```
+3. Navigate to `http://localhost:8080` in your browser to start using the UI
+   *The Skyvern CLI supports Windows, WSL, macOS, and Linux environments.*
+
 # Documentation
 
 More extensive documentation can be found on our [📕 docs page](https://docs.skyvern.com). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
