@@ -245,6 +245,7 @@ class WorkflowModel(Base):
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
+    run_with = Column(String, nullable=True)  # 'agent' or 'code'
     ai_fallback = Column(Boolean, default=False, nullable=False)
     cache_key = Column(String, nullable=True)
     run_sequentially = Column(Boolean, nullable=True)
@@ -704,7 +705,8 @@ class TaskV2Model(Base):
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
-    generate_script = Column(Boolean, nullable=False, default=False)
+    generate_script = Column(Boolean, default=False, nullable=False)
+    run_with = Column(String, nullable=True)  # 'agent' or 'code'
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)

@@ -514,7 +514,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
-    generate_script: bool = False
+    run_with: str | None = None
     ai_fallback: bool = False
     cache_key: str | None = None
     run_sequentially: bool = False
