@@ -166,7 +166,9 @@ class WorkflowRunContext:
             return
         self.blocks_metadata[label] = metadata
 
-    def get_block_metadata(self, label: str) -> BlockMetadata:
+    def get_block_metadata(self, label: str | None) -> BlockMetadata:
+        if label is None:
+            label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
 
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
