@@ -83,6 +83,8 @@ class WorkflowRunContext:
             aws_client=aws_client,
         )
 
+        workflow_run_context.organization_id = organization.organization_id
+
         for parameter, run_parameter in workflow_parameter_tuples:
             if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                 await workflow_run_context.register_secret_workflow_parameter_value(
@@ -142,6 +144,9 @@ class WorkflowRunContext:
             # values sometimes will be overwritten by the block execution itself
             workflow_run_context.parameters[context_parameter.key] = context_parameter
 
+        # Compute once and cache whether secrets should be included in templates
+        workflow_run_context.include_secrets_in_templates = workflow_run_context._should_include_secrets_in_templates()
+
         return workflow_run_context
 
     def __init__(
@@ -161,6 +166,8 @@ class WorkflowRunContext:
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
         self._aws_client = aws_client
+        self.organization_id: str | None = None
+        self.include_secrets_in_templates: bool = False
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -192,6 +199,17 @@ class WorkflowRunContext:
         if label is None:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
+
+    def _should_include_secrets_in_templates(self) -> bool:
+        """
+        Check if secrets should be included in template formatting based on experimentation provider.
+        This check is done once per workflow run context to avoid repeated calls.
+        """
+        return app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "CODE_BLOCK_ENABLED",
+            self.workflow_run_id,
+            properties={"organization_id": self.organization_id},
+        )
 
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
         """
