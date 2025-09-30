@@ -25,9 +25,10 @@ def cached(cache_key: str) -> Callable:
         async def wrapper(page: SkyvernPage, context: RunContext, *args: Any, **kwargs: Any) -> Any:
             # Store the function in context.cached_fns
             page.current_label = cache_key
-            result = await func(page, context, *args, **kwargs)
-            page.current_label = None
-            return result
+            try:
+                return await func(page, context, *args, **kwargs)
+            finally:
+                page.current_label = None
 
         return wrapper
 
