@@ -1557,7 +1557,8 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
                     f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
                 )
 
-        template_data[label] = block_reference_data
+        if label:
+            template_data[label] = block_reference_data
 
         # inject the forloop metadata as global variables
         if "current_index" in block_reference_data:
