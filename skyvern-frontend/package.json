@@ -13,6 +13,7 @@
     "precommit": "lint-staged",
     "run-artifact-server": "node artifactServer.js",
     "serve": "npm run build && node localServer.js",
+    "test": "vitest run",
     "start": "npm run serve & npm run run-artifact-server"
   },
   "dependencies": {
@@ -93,7 +94,8 @@
     "prettier-plugin-tailwindcss": "^0.6.5",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.5.3",
-    "vite": "^5.4.19"
+    "vite": "^5.4.19",
+    "vitest": "^3.2.4"
   },
   "lint-staged": {
     "src/**/*.{js,jsx,ts,tsx}": [
