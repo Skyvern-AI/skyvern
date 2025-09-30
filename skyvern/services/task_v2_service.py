@@ -154,7 +154,7 @@ async def initialize_task_v2(
     totp_identifier: str | None = None,
     totp_verification_url: str | None = None,
     webhook_callback_url: str | None = None,
-    publish_workflow: bool = True,
+    publish_workflow: bool = False,
     parent_workflow_run_id: str | None = None,
     extracted_information_schema: dict | list | str | None = None,
     error_code_mapping: dict | None = None,
