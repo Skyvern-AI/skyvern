@@ -13,6 +13,7 @@
     "precommit": "lint-staged",
     "run-artifact-server": "node artifactServer.js",
     "serve": "npm run build && node localServer.js",
+    "test": "vitest run",
     "start": "npm run serve & npm run run-artifact-server"
   },
   "dependencies": {
