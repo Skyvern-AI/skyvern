@@ -210,7 +210,9 @@ class TaskBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
@@ -287,6 +289,7 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
+    azure_folder_path: str | None = None
     path: str | None = None
 
 
@@ -343,7 +346,9 @@ class ActionBlockYAML(BlockYAML):
     max_retries: int = 0
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
@@ -361,7 +366,9 @@ class NavigationBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
@@ -420,7 +427,9 @@ class FileDownloadBlockYAML(BlockYAML):
     max_retries: int = 0
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False

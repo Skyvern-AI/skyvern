@@ -320,6 +320,9 @@ class WorkflowService:
             await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
                 organization,
                 workflow_run_id,
+                workflow.title,
+                workflow.workflow_id,
+                workflow.workflow_permanent_id,
                 wp_wps_tuples,
                 workflow_output_parameters,
                 context_parameters,

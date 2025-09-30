@@ -489,7 +489,9 @@ async def run_task_v2_helper(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-    await _set_up_workflow_context(workflow_id, workflow_run_id, organization)
+
+    workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
+    await _set_up_workflow_context(workflow, workflow_run_id, organization)
 
     url = str(task_v2.url)
     user_prompt = task_v2.prompt
@@ -1010,16 +1012,21 @@ async def handle_block_result(
     )
 
 
-async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str, organization: Organization) -> None:
+async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, organization: Organization) -> None:
     """
     TODO: see if we could remove this function as we can just set an empty workflow context
     """
     # Get all <workflow parameter, workflow run parameter> tuples
     wp_wps_tuples = await app.WORKFLOW_SERVICE.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
-    workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(workflow_id=workflow_id)
+    workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(
+        workflow_id=workflow.workflow_id
+    )
     await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
         organization,
         workflow_run_id,
+        workflow.title,
+        workflow.workflow_id,
+        workflow.workflow_permanent_id,
         wp_wps_tuples,
         workflow_output_parameters,
         [],
