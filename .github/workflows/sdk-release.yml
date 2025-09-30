@@ -46,6 +46,7 @@ jobs:
       # If you wanted to use multiple Python versions, you'd have specify a matrix in the job and
       # reference the matrixe python version here.
       - name: Setup Python
+        id: setup-python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
