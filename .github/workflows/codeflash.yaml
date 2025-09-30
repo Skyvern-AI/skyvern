@@ -22,12 +22,13 @@ jobs:
         with:
           fetch-depth: 0
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Sync project dependencies
         run: |
           uv sync --group dev
