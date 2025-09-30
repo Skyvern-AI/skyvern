@@ -11909,10 +11909,16 @@
             ],
             "title": "Extra Http Headers"
           },
-          "generate_script": {
-            "type": "boolean",
-            "title": "Generate Script",
-            "default": false
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With"
           },
           "ai_fallback": {
             "type": "boolean",
@@ -12103,10 +12109,16 @@
             "$ref": "#/components/schemas/WorkflowStatus",
             "default": "published"
           },
-          "generate_script": {
-            "type": "boolean",
-            "title": "Generate Script",
-            "default": false
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With"
           },
           "ai_fallback": {
             "type": "boolean",
