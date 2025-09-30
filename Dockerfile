@@ -2,7 +2,7 @@ FROM python:3.11 AS requirements-stage
 # Run `skyvern init llm` before building to generate the .env file
 
 WORKDIR /tmp
-RUN curl -LsSf https://astral.sh/uv/install.sh
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 COPY ./pyproject.toml /tmp/pyproject.toml
 COPY ./uv.lock /tmp/uv.lock
 RUN uv export --no-hashes --output-file requirements.txt
