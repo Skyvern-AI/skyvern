@@ -2,17 +2,20 @@ FROM python:3.11 AS requirements-stage
 # Run `skyvern init llm` before building to generate the .env file
 
 WORKDIR /tmp
-RUN pip install poetry
-RUN poetry self add poetry-plugin-export
+# Install uv for faster dependency resolution and installation
+RUN pip install uv
 COPY ./pyproject.toml /tmp/pyproject.toml
 COPY ./poetry.lock /tmp/poetry.lock
-RUN poetry export -f requirements.txt --output requirements.txt --without-hashes
+# Generate requirements.txt using uv from pyproject.toml for faster builds
+RUN uv pip compile pyproject.toml --output-file requirements.txt --generate-hashes
 
 FROM python:3.11-slim-bookworm
 WORKDIR /app
 COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+# Install uv for faster package installation
+RUN pip install uv
+# Use uv for faster parallel package installation with hash verification
+RUN uv pip install --system --no-cache -r requirements.txt
 RUN playwright install-deps
 RUN playwright install
 RUN apt-get install -y xauth x11-apps netpbm gpg ca-certificates && apt-get clean
