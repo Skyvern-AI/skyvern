@@ -545,7 +545,17 @@ class ForgeAgent:
                             # Fallback to random filename if no download_suffix provided
                             random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
                             final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
-                        rename_file(os.path.join(workflow_download_directory, file), final_file_name + file_extension)
+
+                        # Check if file with this name already exists
+                        target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+                        counter = 1
+                        while os.path.exists(target_path):
+                            # If file exists, append counter to filename
+                            final_file_name = f"{final_file_name}_{counter}"
+                            target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+                            counter += 1
+
+                        rename_file(os.path.join(workflow_download_directory, file), target_path)
 
                     LOG.info(
                         "Task marked as completed due to download",
