@@ -1114,6 +1114,7 @@ async def run_task(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    download_suffix: str | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
     label: str | None = None,
@@ -1133,6 +1134,7 @@ async def run_task(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1190,6 +1192,7 @@ async def download(
     prompt: str,
     url: str | None = None,
     complete_on_download: bool = True,
+    download_suffix: str | None = None,
     max_steps: int | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
@@ -1198,7 +1201,6 @@ async def download(
 ) -> None:
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
-
     context: skyvern_context.SkyvernContext | None
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
@@ -1208,6 +1210,7 @@ async def download(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1265,6 +1268,7 @@ async def action(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    download_suffix: str | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
     label: str | None = None,
@@ -1281,6 +1285,7 @@ async def action(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1346,12 +1351,14 @@ async def login(
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
+        # render template with label
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.LOGIN,
             prompt=prompt,
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1424,6 +1431,7 @@ async def extract(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1546,27 +1554,27 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
     context = skyvern_context.current()
     if context and context.workflow_run_id:
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
-        block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(label)
         template_data = workflow_run_context.values.copy()
-        if label in template_data:
-            current_value = template_data[label]
-            if isinstance(current_value, dict):
-                block_reference_data.update(current_value)
-            else:
-                LOG.warning(
-                    f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
-                )
-
         if label:
+            block_reference_data = workflow_run_context.get_block_metadata(label)
+            if label in template_data:
+                current_value = template_data[label]
+                if isinstance(current_value, dict):
+                    block_reference_data.update(current_value)
+                else:
+                    LOG.warning(
+                        f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
+                    )
+
             template_data[label] = block_reference_data
 
-        # inject the forloop metadata as global variables
-        if "current_index" in block_reference_data:
-            template_data["current_index"] = block_reference_data["current_index"]
-        if "current_item" in block_reference_data:
-            template_data["current_item"] = block_reference_data["current_item"]
-        if "current_value" in block_reference_data:
-            template_data["current_value"] = block_reference_data["current_value"]
+            # inject the forloop metadata as global variables
+            if "current_index" in block_reference_data:
+                template_data["current_index"] = block_reference_data["current_index"]
+            if "current_item" in block_reference_data:
+                template_data["current_item"] = block_reference_data["current_item"]
+            if "current_value" in block_reference_data:
+                template_data["current_value"] = block_reference_data["current_value"]
     return render_template(template, data=template_data)
 
 
