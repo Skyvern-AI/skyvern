@@ -58,6 +58,10 @@ class WorkflowRunContext:
         cls,
         aws_client: AsyncAWSClient,
         organization: Organization,
+        workflow_run_id: str,
+        workflow_title: str,
+        workflow_id: str,
+        workflow_permanent_id: str,
         workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
         workflow_output_parameters: list[OutputParameter],
         context_parameters: list[ContextParameter],
@@ -71,7 +75,14 @@ class WorkflowRunContext:
         block_outputs: dict[str, Any] | None = None,
     ) -> Self:
         # key is label name
-        workflow_run_context = cls(aws_client=aws_client)
+        workflow_run_context = cls(
+            workflow_title=workflow_title,
+            workflow_id=workflow_id,
+            workflow_permanent_id=workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            aws_client=aws_client,
+        )
+
         for parameter, run_parameter in workflow_parameter_tuples:
             if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                 await workflow_run_context.register_secret_workflow_parameter_value(
@@ -133,7 +144,18 @@ class WorkflowRunContext:
 
         return workflow_run_context
 
-    def __init__(self, aws_client: AsyncAWSClient) -> None:
+    def __init__(
+        self,
+        workflow_title: str,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+        aws_client: AsyncAWSClient,
+    ) -> None:
+        self.workflow_title = workflow_title
+        self.workflow_id = workflow_id
+        self.workflow_permanent_id = workflow_permanent_id
+        self.workflow_run_id = workflow_run_id
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
@@ -166,7 +188,9 @@ class WorkflowRunContext:
             return
         self.blocks_metadata[label] = metadata
 
-    def get_block_metadata(self, label: str) -> BlockMetadata:
+    def get_block_metadata(self, label: str | None) -> BlockMetadata:
+        if label is None:
+            label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
 
     def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
@@ -951,6 +975,9 @@ class WorkflowContextManager:
         self,
         organization: Organization,
         workflow_run_id: str,
+        workflow_title: str,
+        workflow_id: str,
+        workflow_permanent_id: str,
         workflow_parameter_tuples: list[tuple[WorkflowParameter, "WorkflowRunParameter"]],
         workflow_output_parameters: list[OutputParameter],
         context_parameters: list[ContextParameter],
@@ -965,6 +992,10 @@ class WorkflowContextManager:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
             organization,
+            workflow_run_id,
+            workflow_title,
+            workflow_id,
+            workflow_permanent_id,
             workflow_parameter_tuples,
             workflow_output_parameters,
             context_parameters,

@@ -79,7 +79,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       ? data.maxScreenshotScrolls
       : null,
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
-    useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
+    runWith: data.withWorkflowSettings ? data.runWith : "agent",
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
     aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
     runSequentially: data.withWorkflowSettings ? data.runSequentially : false,
@@ -220,12 +220,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
                             </div>
                             <Select
-                              value={!inputs.useScriptCache ? "ai" : "code"}
+                              value={inputs.runWith ?? "agent"}
                               onValueChange={(value) => {
-                                handleChange(
-                                  "useScriptCache",
-                                  value === "code",
-                                );
+                                handleChange("runWith", value);
                               }}
                             >
                               <SelectTrigger className="w-48">

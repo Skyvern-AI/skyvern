@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, asc, case, delete, distinct, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -878,7 +878,7 @@ class AgentDB:
     ) -> OrganizationAuthToken | None: ...
 
     @overload
-    async def get_valid_org_auth_token(
+    async def get_valid_org_auth_token(  # type: ignore
         self,
         organization_id: str,
         token_type: Literal["azure_client_secret_credential"],
@@ -1396,7 +1396,7 @@ class AgentDB:
         version: int | None = None,
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
-        generate_script: bool = False,
+        run_with: str | None = None,
         ai_fallback: bool = False,
         cache_key: str | None = None,
         run_sequentially: bool = False,
@@ -1418,7 +1418,7 @@ class AgentDB:
                 model=model,
                 is_saved_task=is_saved_task,
                 status=status,
-                generate_script=generate_script,
+                run_with=run_with,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
                 run_sequentially=run_sequentially,
@@ -1625,7 +1625,7 @@ class AgentDB:
         description: str | None = None,
         workflow_definition: dict[str, Any] | None = None,
         version: int | None = None,
-        generate_script: bool | None = None,
+        run_with: str | None = None,
         cache_key: str | None = None,
     ) -> Workflow:
         try:
@@ -1644,8 +1644,8 @@ class AgentDB:
                         workflow.workflow_definition = workflow_definition
                     if version is not None:
                         workflow.version = version
-                    if generate_script is not None:
-                        workflow.generate_script = generate_script
+                    if run_with is not None:
+                        workflow.run_with = run_with
                     if cache_key is not None:
                         workflow.cache_key = cache_key
                     await session.commit()
@@ -2795,7 +2795,7 @@ class AgentDB:
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
-        generate_script: bool = False,
+        run_with: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2815,7 +2815,7 @@ class AgentDB:
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
-                generate_script=generate_script,
+                run_with=run_with,
             )
             session.add(new_task_v2)
             await session.commit()
@@ -3200,6 +3200,50 @@ class AgentDB:
                     .filter(
                         PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=active_hours)
                     )
+                )
+                sessions = result.scalars().all()
+                return [PersistentBrowserSession.model_validate(session) for session in sessions]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_persistent_browser_sessions_history(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        lookback_hours: int = 24 * 7,
+    ) -> list[PersistentBrowserSession]:
+        """Get persistent browser sessions history for an organization."""
+        try:
+            async with self.Session() as session:
+                open_first = case(
+                    (
+                        and_(
+                            PersistentBrowserSessionModel.started_at.is_not(None),
+                            PersistentBrowserSessionModel.completed_at.is_(None),
+                        ),
+                        0,  # open
+                    ),
+                    else_=1,  # not open
+                )
+
+                result = await session.execute(
+                    select(PersistentBrowserSessionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(deleted_at=None)
+                    .filter(
+                        PersistentBrowserSessionModel.created_at > datetime.utcnow() - timedelta(hours=lookback_hours)
+                    )
+                    .order_by(
+                        open_first.asc(),  # open sessions first
+                        PersistentBrowserSessionModel.created_at.desc(),  # then newest within each group
+                    )
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
                 )
                 sessions = result.scalars().all()
                 return [PersistentBrowserSession.model_validate(session) for session in sessions]

@@ -279,23 +279,25 @@ function WorkflowHeader({
                 <TooltipContent>Save</TooltipContent>
               </Tooltip>
             </TooltipProvider>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    size="icon"
-                    variant="tertiary"
-                    className="size-10 min-w-[2.5rem]"
-                    onClick={() => {
-                      onHistory?.();
-                    }}
-                  >
-                    <ClockIcon className="size-6" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>History</TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            {!workflowRunIsRunningOrQueued && (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="icon"
+                      variant="tertiary"
+                      className="size-10 min-w-[2.5rem]"
+                      onClick={() => {
+                        onHistory?.();
+                      }}
+                    >
+                      <ClockIcon className="size-6" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>History</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
             <Button variant="tertiary" size="lg" onClick={onParametersClick}>
               <span className="mr-2">Parameters</span>
               {parametersPanelOpen ? (

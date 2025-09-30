@@ -108,7 +108,7 @@ interface Dom {
   splitLeft: MutableRefObject<HTMLInputElement | null>;
 }
 
-function CopyText({ text }: { text: string }) {
+function CopyText({ className, text }: { className?: string; text: string }) {
   const [wasCopied, setWasCopied] = useState(false);
 
   function handleCopy(code: string) {
@@ -118,7 +118,15 @@ function CopyText({ text }: { text: string }) {
   }
 
   return (
-    <Button size="icon" variant="link" onClick={() => handleCopy(text)}>
+    <Button
+      className={className}
+      size="icon"
+      variant="link"
+      onClick={(e) => {
+        e.stopPropagation();
+        handleCopy(text);
+      }}
+    >
       {wasCopied ? <CheckIcon /> : <CopyIcon />}
     </Button>
   );
@@ -712,7 +720,7 @@ function Workspace({
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
         : null,
-      useScriptCache: selectedVersion.generate_script,
+      runWith: selectedVersion.run_with,
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,

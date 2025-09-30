@@ -196,6 +196,7 @@ class Block(BaseModel, abc.ABC):
 
         template_data[self.label] = block_reference_data
 
+        # TODO (suchintan): This is pretty hacky - we should have a standard way to initialize the workflow run context
         # inject the forloop metadata as global variables
         if "current_index" in block_reference_data:
             template_data["current_index"] = block_reference_data["current_index"]
@@ -203,6 +204,16 @@ class Block(BaseModel, abc.ABC):
             template_data["current_item"] = block_reference_data["current_item"]
         if "current_value" in block_reference_data:
             template_data["current_value"] = block_reference_data["current_value"]
+
+        # Initialize workflow-level parameters
+        if "workflow_title" not in template_data:
+            template_data["workflow_title"] = workflow_run_context.workflow_title
+        if "workflow_id" not in template_data:
+            template_data["workflow_id"] = workflow_run_context.workflow_id
+        if "workflow_permanent_id" not in template_data:
+            template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
+        if "workflow_run_id" not in template_data:
+            template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
         return template.render(template_data)
 
@@ -1933,6 +1944,7 @@ class FileUploadBlock(Block):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+
         if self.s3_bucket:
             self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
                 self.s3_bucket, workflow_run_context
@@ -1959,14 +1971,14 @@ class FileUploadBlock(Block):
             )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
-        s3_suffix = f"{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
-        if not self.path:
-            return f"s3://{self.s3_bucket}/{s3_suffix}"
-        return f"s3://{self.s3_bucket}/{self.path}/{s3_suffix}"
+        folder_path = self.path or f"{workflow_run_id}"
+        s3_suffix = f"{uuid.uuid4()}_{Path(path).name}"
+        return f"s3://{self.s3_bucket}/{folder_path}/{s3_suffix}"
 
     def _get_azure_blob_uri(self, workflow_run_id: str, file_path: str) -> str:
         blob_name = Path(file_path).name
-        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{workflow_run_id}/{uuid.uuid4()}_{blob_name}"
+        folder_path = self.path or workflow_run_id
+        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{folder_path}/{uuid.uuid4()}_{blob_name}"
 
     async def execute(
         self,

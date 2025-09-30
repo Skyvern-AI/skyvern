@@ -1,5 +1,5 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
-import { BrowserSession } from "@/routes/browserSession/BrowserSession";
+import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 import { PageLayout } from "./components/PageLayout";
 import { DiscoverPage } from "./routes/discover/DiscoverPage";
 import { HistoryPage } from "./routes/history/HistoryPage";

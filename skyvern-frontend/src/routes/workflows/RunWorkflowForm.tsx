@@ -206,7 +206,7 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
-      runWithCode: workflow?.generate_script ?? false,
+      runWithCode: workflow?.run_with === "code",
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
