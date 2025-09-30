@@ -136,6 +136,11 @@ include = [
 "skyvern-frontend/vite.config.ts" = "skyvern-frontend/vite.config.ts"
 "skyvern-frontend/index.html" = "skyvern-frontend/index.html"
 "skyvern-frontend/README.md" = "skyvern-frontend/README.md"
+"skyvern-frontend/.env.example" = "skyvern-frontend/.env.example"
+"skyvern-frontend/artifactServer.js" = "skyvern-frontend/artifactServer.js"
+"skyvern-frontend/localServer.js" = "skyvern-frontend/localServer.js"
+"skyvern-frontend/tsconfig.json" = "skyvern-frontend/tsconfig.json"
+"skyvern-frontend/tsconfig.node.json" = "skyvern-frontend/tsconfig.node.json"
 
 [build-system]
 requires = ["hatchling"]
