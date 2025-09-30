@@ -538,11 +538,14 @@ class ForgeAgent:
                             )
                             continue
 
-                        random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-                        random_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
                         if task_block.download_suffix:
-                            random_file_name = f"{random_file_name}-{task_block.download_suffix}"
-                        rename_file(os.path.join(workflow_download_directory, file), random_file_name + file_extension)
+                            # Use download_suffix as the complete filename (without extension)
+                            final_file_name = task_block.download_suffix
+                        else:
+                            # Fallback to random filename if no download_suffix provided
+                            random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                            final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
+                        rename_file(os.path.join(workflow_download_directory, file), final_file_name + file_extension)
 
                     LOG.info(
                         "Task marked as completed due to download",
