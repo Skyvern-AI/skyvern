@@ -1008,6 +1008,7 @@ async def run_block(
         user_id=user_id,
         browser_session_id=browser_session_id,
         block_outputs=block_run_request.block_outputs,
+        code_gen=block_run_request.code_gen,
     )
 
     return BlockRunResponse(
