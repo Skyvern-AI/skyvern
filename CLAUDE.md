@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Development Commands
 
 ### Python Backend Commands
-- **Install dependencies**: `poetry install`
+- **Install dependencies**: `uv sync`
 - **Run Skyvern service**: `skyvern run all` (starts both backend and UI)
 - **Run backend only**: `skyvern run server`
 - **Run UI only**: `skyvern run ui`
@@ -67,7 +67,7 @@ Skyvern is a browser automation platform that uses LLMs and computer vision to i
 
 ### Environment Setup
 - Requires Python 3.11+ and Node.js
-- Uses Poetry for Python dependency management
+- Uses UV for Python dependency management
 - PostgreSQL database (managed via Docker or local install)
 - Browser dependencies installed via Playwright
 

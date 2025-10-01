@@ -18,10 +18,11 @@ from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.skyvern_page import script_run_context_manager
-from skyvern.exceptions import ScriptNotFound, WorkflowRunNotFound
+from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TaskBlock,
     TextPromptBlock,
     UrlBlock,
+    ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -1114,6 +1116,7 @@ async def run_task(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    download_suffix: str | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
     label: str | None = None,
@@ -1133,6 +1136,7 @@ async def run_task(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1190,6 +1194,7 @@ async def download(
     prompt: str,
     url: str | None = None,
     complete_on_download: bool = True,
+    download_suffix: str | None = None,
     max_steps: int | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
@@ -1198,7 +1203,6 @@ async def download(
 ) -> None:
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
-
     context: skyvern_context.SkyvernContext | None
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
@@ -1208,6 +1212,7 @@ async def download(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1265,6 +1270,7 @@ async def action(
     prompt: str,
     url: str | None = None,
     max_steps: int | None = None,
+    download_suffix: str | None = None,
     totp_identifier: str | None = None,
     totp_url: str | None = None,
     label: str | None = None,
@@ -1281,6 +1287,7 @@ async def action(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1318,6 +1325,7 @@ async def action(
         action_block = ActionBlock(
             label=block_validation_output.label,
             output_parameter=block_validation_output.output_parameter,
+            task_type=TaskType.action,
             url=url,
             navigation_goal=prompt,
             max_steps_per_run=max_steps,
@@ -1346,12 +1354,14 @@ async def login(
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
+        # render template with label
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.LOGIN,
             prompt=prompt,
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1424,6 +1434,7 @@ async def extract(
             url=url,
             label=cache_key,
         )
+        prompt = _render_template_with_label(prompt, cache_key)
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
@@ -1475,6 +1486,36 @@ async def extract(
             browser_session_id=block_validation_output.browser_session_id,
         )
         return block_result.output_parameter_value
+
+
+async def validate(
+    complete_criterion: str | None = None,
+    terminate_criterion: str | None = None,
+    error_code_mapping: dict[str, str] | None = None,
+    label: str | None = None,
+) -> None:
+    """Validate function that behaves like a ValidationBlock"""
+    if not complete_criterion and not terminate_criterion:
+        raise Exception("Both complete criterion and terminate criterion are empty")
+
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    validation_block = ValidationBlock(
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        task_type=TaskType.validation,
+        complete_criterion=complete_criterion,
+        terminate_criterion=terminate_criterion,
+        error_code_mapping=error_code_mapping,
+        max_steps_per_run=2,
+    )
+    result = await validation_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+    if result.status == BlockStatus.terminated:
+        raise ScriptTerminationException(result.failure_reason)
 
 
 async def wait(seconds: int, label: str | None = None) -> None:
@@ -1546,27 +1587,27 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
     context = skyvern_context.current()
     if context and context.workflow_run_id:
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
-        block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(label)
         template_data = workflow_run_context.values.copy()
-        if label in template_data:
-            current_value = template_data[label]
-            if isinstance(current_value, dict):
-                block_reference_data.update(current_value)
-            else:
-                LOG.warning(
-                    f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
-                )
-
         if label:
+            block_reference_data = workflow_run_context.get_block_metadata(label)
+            if label in template_data:
+                current_value = template_data[label]
+                if isinstance(current_value, dict):
+                    block_reference_data.update(current_value)
+                else:
+                    LOG.warning(
+                        f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
+                    )
+
             template_data[label] = block_reference_data
 
-        # inject the forloop metadata as global variables
-        if "current_index" in block_reference_data:
-            template_data["current_index"] = block_reference_data["current_index"]
-        if "current_item" in block_reference_data:
-            template_data["current_item"] = block_reference_data["current_item"]
-        if "current_value" in block_reference_data:
-            template_data["current_value"] = block_reference_data["current_value"]
+            # inject the forloop metadata as global variables
+            if "current_index" in block_reference_data:
+                template_data["current_index"] = block_reference_data["current_index"]
+            if "current_item" in block_reference_data:
+                template_data["current_item"] = block_reference_data["current_item"]
+            if "current_value" in block_reference_data:
+                template_data["current_value"] = block_reference_data["current_value"]
     return render_template(template, data=template_data)
 
 

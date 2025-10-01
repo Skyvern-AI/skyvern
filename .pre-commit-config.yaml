@@ -105,6 +105,12 @@ repos:
         types: [javascript]
   - repo: local
     hooks:
+      - id: vitest-type-check
+        name: vitest
+        entry: bash -c 'cd skyvern-frontend && ([ -d node_modules ] || npm ci) && npm run test'
+        language: system
+        pass_filenames: false
+        files: ^skyvern-frontend/
       - id: alembic-check
         name: Alembic Check
         entry: ./run_alembic_check.sh

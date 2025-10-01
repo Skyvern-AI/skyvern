@@ -17,6 +17,7 @@ import { AutoResizingTextarea } from "../AutoResizingTextarea/AutoResizingTextar
 import { Button } from "../ui/button";
 import { AxiosError } from "axios";
 import { toast } from "../ui/use-toast";
+import { TSON } from "@/util/tson";
 import { cn } from "@/util/utils";
 
 type Props = {
@@ -36,41 +37,12 @@ function WorkflowDataSchemaInputGroup({
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
 
-  function computeJsonError(
-    jsonText: string,
-  ): { message: string; line?: number; column?: number } | null {
-    try {
-      JSON.parse(jsonText);
-      return null;
-    } catch (e) {
-      const message = e instanceof Error ? e.message : "Invalid JSON";
-      // Try to extract position and compute line/column for friendlier feedback
-      const match = message.match(/position\s+(\d+)/i);
-      if (!match) {
-        return { message };
-      }
-      const pos = Number(match[1]);
-      if (Number.isNaN(pos)) {
-        return { message };
-      }
-      let line = 1;
-      let col = 1;
-      for (let i = 0; i < Math.min(pos, jsonText.length); i++) {
-        if (jsonText[i] === "\n") {
-          line += 1;
-          col = 1;
-        } else {
-          col += 1;
-        }
-      }
-      return { message, line, column: col };
-    }
-  }
-
-  const jsonError = useMemo(() => {
+  const tsonResult = useMemo(() => {
     if (value === "null") return null;
-    return computeJsonError(value);
+    return TSON.parse(value);
   }, [value]);
+
+  console.log({ tsonResult });
 
   const getDataSchemaSuggestionMutation = useMutation({
     mutationFn: async () => {
@@ -161,7 +133,9 @@ function WorkflowDataSchemaInputGroup({
           <div
             className={cn(
               "rounded-md",
-              jsonError ? "ring-1 ring-red-500" : undefined,
+              tsonResult && !tsonResult.success
+                ? "ring-1 ring-red-500"
+                : undefined,
             )}
           >
             <CodeEditor
@@ -172,12 +146,8 @@ function WorkflowDataSchemaInputGroup({
               fontSize={8}
             />
           </div>
-          {jsonError && (
-            <div className="text-xs text-red-400">
-              {jsonError.line && jsonError.column
-                ? `Invalid JSON (${jsonError.line}:${jsonError.column}) — ${jsonError.message}`
-                : `Invalid JSON — ${jsonError.message}`}
-            </div>
+          {tsonResult !== null && !tsonResult.success && tsonResult.error && (
+            <div className="text-xs text-red-400">{tsonResult.error}</div>
           )}
         </div>
       )}

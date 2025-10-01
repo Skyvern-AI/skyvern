@@ -1698,6 +1698,7 @@ class AgentDB:
         browser_address: str | None = None,
         sequential_key: str | None = None,
         run_with: str | None = None,
+        debug_session_id: str | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1717,6 +1718,7 @@ class AgentDB:
                     browser_address=browser_address,
                     sequential_key=sequential_key,
                     run_with=run_with,
+                    debug_session_id=debug_session_id,
                 )
                 session.add(workflow_run)
                 await session.commit()

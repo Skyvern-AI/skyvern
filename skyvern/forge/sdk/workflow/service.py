@@ -17,6 +17,7 @@ from skyvern.exceptions import (
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
+    ScriptTerminationException,
     SkyvernException,
     WorkflowNotFound,
     WorkflowRunNotFound,
@@ -148,6 +149,7 @@ class WorkflowService:
         version: int | None = None,
         max_steps_override: int | None = None,
         parent_workflow_run_id: str | None = None,
+        debug_session_id: str | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -181,6 +183,7 @@ class WorkflowService:
             organization_id=organization.organization_id,
             parent_workflow_run_id=parent_workflow_run_id,
             sequential_key=workflow.sequential_key,
+            debug_session_id=debug_session_id,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -950,6 +953,7 @@ class WorkflowService:
         organization_id: str,
         parent_workflow_run_id: str | None = None,
         sequential_key: str | None = None,
+        debug_session_id: str | None = None,
     ) -> WorkflowRun:
         # validate the browser session id
         if workflow_request.browser_session_id:
@@ -975,6 +979,7 @@ class WorkflowService:
             browser_address=workflow_request.browser_address,
             sequential_key=sequential_key,
             run_with=workflow_request.run_with,
+            debug_session_id=debug_session_id,
         )
 
     async def _update_workflow_run_status(
@@ -2518,14 +2523,26 @@ class WorkflowService:
             parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
 
             # Execute the script using script_service
-            await script_service.execute_script(
-                script_id=script_id,
-                organization_id=organization.organization_id,
-                parameters=parameters,
-                workflow_run_id=workflow_run.workflow_run_id,
-                browser_session_id=browser_session_id,
-                background_tasks=None,  # Execute synchronously
-            )
+            try:
+                await script_service.execute_script(
+                    script_id=script_id,
+                    organization_id=organization.organization_id,
+                    parameters=parameters,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    background_tasks=None,  # Execute synchronously
+                )
+            except ScriptTerminationException as e:
+                LOG.info(
+                    "Script terminated, marking workflow run as terminated",
+                    failure_reason=e.message,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                workflow_run = await self.mark_workflow_run_as_terminated(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason=e.message,
+                )
+                return workflow_run
 
             # Mark workflow run as completed
             workflow_run = await self.mark_workflow_run_as_completed(

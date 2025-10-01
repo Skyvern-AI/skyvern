@@ -1,136 +1,150 @@
-[tool.poetry]
+[project]
 name = "skyvern"
 version = "0.2.16"
 description = ""
-authors = ["Skyvern AI <info@skyvern.com>"]
+authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
+requires-python = ">=3.11,<3.14"
 readme = "README.md"
-packages = [{ include = "skyvern" }, { include = "alembic" }]
 
+dependencies = [
+    "azure-storage-blob>=12.26.0",
+    "python-dotenv>=1.0.0,<2",
+    "openai>=1.68.2",
+    "sqlalchemy[mypy]>=2.0.29,<3",
+    "aiohttp>=3.8.5,<4",
+    "python-multipart>=0.0.18,<0.0.19",
+    "toml>=0.10.2,<0.11",
+    "jinja2>=3.1.2,<4",
+    "uvicorn[standard]>=0.24.0.post1,<0.25",
+    "litellm>=1.75.8",
+    "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
+    "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
+    "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
+    "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
+    "pillow>=10.1.0,<11",
+    "starlette-context>=0.3.6,<0.4",
+    "ddtrace>=2.3.2,<3",
+    "pydantic>=2.5.2,<3",
+    "pydantic-settings>=2.1.0,<3",
+    "fastapi>=0.115.4,<0.116",
+    "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
+    "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13' and python_version < '3.14'",
+    "alembic>=1.12.1,<2",
+    "python-jose[cryptography]>=3.4.0,<4",
+    "cachetools>=5.3.2,<6",
+    "aioboto3>=14.3.0,<15",
+    "asyncache>=0.3.1,<0.4",
+    "orjson>=3.9.10,<4",
+    "structlog>=23.2.0,<24",
+    "typer>=0.16.0",
+    "types-toml>=0.10.8.7,<0.11",
+    "httpx[socks]>=0.27.0",
+    "filetype>=1.2.0,<2",
+    "redis>=5.0.3,<6",
+    "onnxruntime>=1.20.0,<1.23.0 ; python_version >= '3.12' and python_version < '3.14'",
+    "onnxruntime<1.17 ; python_version >= '3.11' and python_version < '3.12'",
+    "aioredlock>=0.7.3,<0.8",
+    "stripe>=9.7.0,<10",
+    "tldextract>=5.1.2,<6",
+    "websockets~=12.0",
+    "email-validator>=2.2.0,<3",
+    "temporalio>=1.6.0,<2",
+    "requests-toolbelt>=1.0.0,<2",
+    "rich[jupyter]>=13.7.0,<14",
+    "posthog>=3.7.0,<4",
+    "aiofiles>=24.1.0,<25",
+    "pyotp>=2.9.0,<3",
+    "asyncpg>=0.30.0,<0.31",
+    "json-repair>=0.34.0,<0.35",
+    "pypdf>=5.1.0,<6",
+    "fastmcp>=2.10.1,<3",
+    "psutil>=7.0.0",
+    "tiktoken>=0.9.0",
+    "anthropic>=0.50.0,<0.51",
+    "google-cloud-aiplatform>=1.90.0,<2",
+    "alive-progress>=3.2.0,<4",
+    "colorama>=0.4.6,<0.5",
+    "onepassword-sdk==0.3.0",
+    "types-boto3[full]>=1.38.31,<2",
+    "lark>=1.2.2,<2",
+    "libcst>=1.8.2,<2",
+    "curlparser>=0.1.0,<0.2",
+    "lmnr[all]>=0.7.0,<0.8",
+    "openpyxl>=3.1.5,<4",
+    "pandas>=2.3.1,<3",
+    "azure-identity>=1.24.0,<2",
+    "azure-keyvault>=4.2.0,<5",
+    "dramatiq[asyncio]>=1.18.0,<2",
+]
+
+[dependency-groups]
+dev = [
+    "isort>=5.13.2,<6",
+    "mypy>=1.18.2,<2",
+    "flake8>=6.0.0,<7",
+    "types-requests>=2.31.0.2,<3",
+    "pytest>=7.4.0,<8",
+    "pytest-asyncio>=0.21.1,<0.22",
+    "watchdog>=3.0.0,<4",
+    "mock>=5.1.0,<6",
+    "autoflake>=2.2.0,<3",
+    "pydevd-pycharm>=233.6745.319,<234",
+    "ipython>=8.17.2,<9",
+    "typer>=0.16.0,<0.17",
+    "ipykernel>=6.26.0,<7",
+    "notebook>=7.0.6,<8",
+    "freezegun>=1.2.2,<2",
+    "snoop>=0.4.3,<0.5",
+    "rich[jupyter]>=13.7.0,<14",
+    "fpdf>=1.7.2,<2",
+    "pypdf>=5.0.1,<6",
+    "twine>=6.1.0,<7",
+    "build>=1.2.2.post1,<2",
+    "pre-commit>=4.2.0,<5",
+    "ruff>=0.11.12,<0.12",
+    "aiosqlite>=0.21.0,<0.22",
+    "moto[s3, server]>=5.1.5,<6",
+]
+
+[tool.hatch.build]
+packages = ["skyvern", "alembic"]
+
+[tool.hatch.build.targets.sdist]
 include = [
-    { path = "skyvern-frontend", format = "sdist" },
-    { path = "skyvern-frontend/src", format = ["sdist", "wheel"] },
-    { path = "skyvern-frontend/public", format = ["sdist", "wheel"] },
-    { path = "skyvern-frontend/package.json", format = ["sdist", "wheel"] },
-    { path = "skyvern-frontend/package-lock.json", format = ["sdist", "wheel"] },
-    { path = "skyvern-frontend/*.config.*", format = ["sdist", "wheel"] },
-    { path = "skyvern-frontend/*.html", format = ["sdist", "wheel"] },
-    { path = "skyvern-frontend/*.md", format = ["sdist", "wheel"] }
+    "skyvern",
+    "alembic",
 ]
-
 exclude = [
-    { path = "skyvern-frontend/node_modules", format = ["sdist", "wheel"] },
-    { path = "skyvern-frontend/dist", format = ["sdist", "wheel"] }
+    "skyvern-frontend/node_modules",
+    "skyvern-frontend/dist",
 ]
+[tool.hatch.build.targets.sdist.force-include]
+"skyvern-frontend" = "skyvern-frontend"
 
-[tool.poetry.dependencies]
-azure-storage-blob = ">=12.26.0"
-python = ">=3.11,<3.14"
-python-dotenv = "^1.0.0"
-openai = ">=1.68.2"
-sqlalchemy = {extras = ["mypy"], version = "^2.0.29"}
-aiohttp = "^3.8.5"
-python-multipart = "^0.0.18"
-toml = "^0.10.2"
-jinja2 = "^3.1.2"
-uvicorn = {extras = ["standard"], version = "^0.24.0.post1"}
-litellm = ">=1.75.8"
-playwright = [
-    {version = ">1.46.0", python = ">=3.12,<3.14"},
-    {version = "=1.46.0", python = ">=3.11,<3.12"}
+[tool.hatch.build.targets.wheel]
+include = [
+    "skyvern",
+    "alembic",
 ]
-greenlet = [
-    {version = ">3.0.3", python = ">=3.12,<3.14"},
-    {version = "=3.0.3", python = ">=3.11,<3.12"}
-]
-pillow = "^10.1.0"
-starlette-context = "^0.3.6"
-ddtrace = "^2.3.2"
-pydantic = "^2.5.2"
-pydantic-settings = "^2.1.0"
-fastapi = "^0.115.4"
-psycopg = [
-    {version = "3.1.18", extras = ["binary", "pool"], python = ">=3.11, <3.13"},
-    {version = ">=3.2.2,<3.3.0", extras = ["binary", "pool"], python = ">=3.13, <3.14"}
-]
-alembic = "^1.12.1"
-python-jose = {extras = ["cryptography"], version = "^3.4.0"}
-cachetools = "^5.3.2"
-aioboto3 = "^14.3.0"
-asyncache = "^0.3.1"
-orjson = "^3.9.10"
-structlog = "^23.2.0"
-typer = ">=0.16.0"
-types-toml = "^0.10.8.7"
-httpx = {version = ">=0.27.0", extras = ["socks"]}
-filetype = "^1.2.0"
-redis = "^5.0.3"
-onnxruntime = [
-    { version = ">=1.20.0,<1.23.0", python = ">=3.12, <3.14"},
-    { version = "<1.17", python = ">=3.11, <3.12"}
-]
-aioredlock = "^0.7.3"
-stripe = "^9.7.0"
-tldextract = "^5.1.2"
-websockets = "^12.0"
-email-validator = "^2.2.0"
-temporalio = "^1.6.0"
-requests-toolbelt = "^1.0.0"
-rich = {extras = ["jupyter"], version = "^13.7.0"}
-posthog = "^3.7.0"
-aiofiles = "^24.1.0"
-pyotp = "^2.9.0"
-asyncpg = "^0.30.0"
-json-repair = "^0.34.0"
-pypdf = "^5.1.0"
-fastmcp = "^2.10.1"
-psutil = ">=7.0.0"
-tiktoken = ">=0.9.0"
-anthropic = "^0.50.0"
-google-cloud-aiplatform = "^1.90.0"
-alive-progress = "^3.2.0"
-colorama = "^0.4.6"
-onepassword-sdk = "0.3.0"
-types-boto3 = {extras = ["full"], version = "^1.38.31"}
-lark = "^1.2.2"
-libcst = "^1.8.2"
-curlparser = "^0.1.0"
-lmnr = {extras = ["all"], version = "^0.7.0"}
-openpyxl = "^3.1.5"
-pandas = "^2.3.1"
-azure-identity = "^1.24.0"
-azure-keyvault = "^4.2.0"
-dramatiq = {version = "^1.18.0", extras = ["asyncio"]}
-
-[tool.poetry.group.dev.dependencies]
-isort = "^5.13.2"
-mypy = "^1.18.2"
-flake8 = "^6.0.0"
-types-requests = "^2.31.0.2"
-pytest = "^7.4.0"
-pytest-asyncio = "^0.21.1"
-watchdog = "^3.0.0"
-mock = "^5.1.0"
-autoflake = "^2.2.0"
-pydevd-pycharm = "^233.6745.319"
-ipython = "^8.17.2"
-typer = "^0.16.0"
-ipykernel = "^6.26.0"
-notebook = "^7.0.6"
-freezegun = "^1.2.2"
-snoop = "^0.4.3"
-rich = {extras = ["jupyter"], version = "^13.7.0"}
-fpdf = "^1.7.2"
-pypdf = "^5.0.1"
-twine = "^6.1.0"
-build = "^1.2.2.post1"
-pre-commit = "^4.2.0"
-ruff = "^0.11.12"
-aiosqlite = "^0.21.0"
-moto = {extras = ["s3", "server"], version = "^5.1.5"}
+[tool.hatch.build.targets.wheel.force-include]
+"skyvern-frontend/src" = "skyvern-frontend/src"
+"skyvern-frontend/public" = "skyvern-frontend/public"
+"skyvern-frontend/package.json" = "skyvern-frontend/package.json"
+"skyvern-frontend/package-lock.json" = "skyvern-frontend/package-lock.json"
+"skyvern-frontend/postcss.config.js" = "skyvern-frontend/postcss.config.js"
+"skyvern-frontend/tailwind.config.js" = "skyvern-frontend/tailwind.config.js"
+"skyvern-frontend/vite.config.ts" = "skyvern-frontend/vite.config.ts"
+"skyvern-frontend/index.html" = "skyvern-frontend/index.html"
+"skyvern-frontend/README.md" = "skyvern-frontend/README.md"
+"skyvern-frontend/.env.example" = "skyvern-frontend/.env.example"
+"skyvern-frontend/artifactServer.js" = "skyvern-frontend/artifactServer.js"
+"skyvern-frontend/localServer.js" = "skyvern-frontend/localServer.js"
+"skyvern-frontend/tsconfig.json" = "skyvern-frontend/tsconfig.json"
+"skyvern-frontend/tsconfig.node.json" = "skyvern-frontend/tsconfig.node.json"
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.ruff]
 exclude = [
@@ -183,10 +197,10 @@ skip = ["webeye/actions/__init__.py", "forge/sdk/__init__.py"]
 [tool.mypy]
 plugins = "sqlalchemy.ext.mypy.plugin"
 
-[tool.poetry.scripts]
+[project.scripts]
 skyvern = "skyvern.cli.commands:cli_app"
 
-[tool.codeflash]                                                                                                                                                                                                                                                                                                             
+[tool.codeflash]
 # All paths are relative to this pyproject.toml's directory.                                                                                                                                                                                                                                                                 
 module-root = "skyvern"                                                                                                                                                                                                                                                                                                      
 tests-root = "codeflash-tests"                                                                                                                                                                                                                                                                                                         

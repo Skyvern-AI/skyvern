@@ -185,6 +185,8 @@ class Block(BaseModel, abc.ABC):
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
+        if workflow_run_context.include_secrets_in_templates:
+            template_data.update(workflow_run_context.secrets)
         if self.label in template_data:
             current_value = template_data[self.label]
             if isinstance(current_value, dict):
