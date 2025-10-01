@@ -1699,6 +1699,7 @@ class AgentDB:
         sequential_key: str | None = None,
         run_with: str | None = None,
         debug_session_id: str | None = None,
+        ai_fallback: bool | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1719,6 +1720,7 @@ class AgentDB:
                     sequential_key=sequential_key,
                     run_with=run_with,
                     debug_session_id=debug_session_id,
+                    ai_fallback=ai_fallback,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1738,6 +1740,7 @@ class AgentDB:
         job_id: str | None = None,
         run_with: str | None = None,
         sequential_key: str | None = None,
+        ai_fallback: bool | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1764,6 +1767,8 @@ class AgentDB:
                     workflow_run.run_with = run_with
                 if sequential_key:
                     workflow_run.sequential_key = sequential_key
+                if ai_fallback is not None:
+                    workflow_run.ai_fallback = ai_fallback
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -4449,6 +4454,41 @@ class AgentDB:
                 await session.commit()
 
                 return result.rowcount > 0
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def delete_workflow_scripts_by_permanent_id(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> int:
+        """
+        Soft delete all published workflow scripts for a workflow permanent id by setting deleted_at timestamp.
+
+        Returns True if any records were deleted, False otherwise.
+        """
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        and_(
+                            WorkflowScriptModel.organization_id == organization_id,
+                            WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                            WorkflowScriptModel.deleted_at.is_(None),
+                        )
+                    )
+                    .values(deleted_at=datetime.now(timezone.utc))
+                )
+
+                result = await session.execute(stmt)
+                await session.commit()
+
+                return result.rowcount
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

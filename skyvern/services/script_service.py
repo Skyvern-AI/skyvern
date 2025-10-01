@@ -700,7 +700,16 @@ async def _fallback_to_ai_run(
         workflow = await app.DATABASE.get_workflow(workflow_id=context.workflow_id, organization_id=organization_id)
         if not workflow:
             return
-        if not workflow.ai_fallback:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        if not workflow_run:
+            return
+        # Use workflow_run.ai_fallback if explicitly set, otherwise fall back to workflow.ai_fallback
+        effective_ai_fallback = (
+            workflow_run.ai_fallback if workflow_run.ai_fallback is not None else workflow.ai_fallback
+        )
+        if not effective_ai_fallback:
             LOG.info(
                 "AI fallback is not enabled for the workflow",
                 workflow_id=workflow_id,
