@@ -509,7 +509,7 @@ class SkyvernPage:
         if ai_infer and intention:
             try:
                 prompt = context.prompt if context else None
-                data = _get_context_data(data)
+                data = data or {}
                 if (totp_identifier or totp_url) and context and organization_id and task_id:
                     verification_code = await poll_verification_code(
                         organization_id=organization_id,
@@ -535,7 +535,6 @@ class SkyvernPage:
                 script_generation_input_text_prompt = prompt_engine.load_prompt(
                     template="script-generation-input-text-generatiion",
                     intention=intention,
-                    data=data,
                     goal=prompt,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
@@ -620,7 +619,8 @@ class SkyvernPage:
             if ai_infer and intention and task and step:
                 try:
                     prompt = context.prompt if context else None
-                    data = _get_context_data(data)
+                    # data = _get_context_data(data)
+                    data = data or {}
                     refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                     self.scraped_page = refreshed_page
                     element_tree = refreshed_page.build_element_tree()

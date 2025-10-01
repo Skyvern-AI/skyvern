@@ -1350,6 +1350,18 @@ def __build_base_task_statement(
 ) -> list[cst.Arg]:
     block_type = block.get("block_type")
     prompt = block.get("prompt") if block_type == "task_v2" else block.get("navigation_goal")
+    # add parameters to prompt
+    parameters = block.get("parameters", [])
+    navigation_payload = {}
+    # make all parameters as jinja2 template parameters in the generated code
+    for parameter in parameters:
+        parameter_key = parameter["key"]
+        navigation_payload[parameter_key] = "{{" + parameter_key + "}}"
+
+    if navigation_payload:
+        prompt = prompt or ""
+        prompt = f"{prompt}\n{navigation_payload}"
+
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
