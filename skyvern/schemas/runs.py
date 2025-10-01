@@ -378,6 +378,10 @@ class BlockRunRequest(WorkflowRunRequest):
         # org_id/user_id, or an override supplied by the user
         description="Any active outputs of blocks in a workflow being debugged",
     )
+    code_gen: bool | None = Field(
+        default=False,
+        description="Whether to generate colde for blocks that support it",
+    )
     debug_session_id: str | None = Field(
         default=None,
         description="ID of the debug session to use for this block run",

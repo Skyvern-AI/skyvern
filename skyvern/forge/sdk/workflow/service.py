@@ -273,6 +273,7 @@ class WorkflowService:
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
+        code_gen: bool | None = None,
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
@@ -400,6 +401,7 @@ class WorkflowService:
                     workflow=workflow,
                     workflow_run=workflow_run,
                     block_labels=block_labels,
+                    code_gen=code_gen,
                 )
             else:
                 LOG.info(
@@ -2580,9 +2582,18 @@ class WorkflowService:
         workflow: Workflow,
         workflow_run: WorkflowRun,
         block_labels: list[str] | None = None,
+        code_gen: bool | None = None,
     ) -> None:
-        if block_labels:
-            # Do not generate script if block_labels is provided
+        LOG.info(
+            "Generate script?",
+            block_labels=block_labels,
+            code_gen=code_gen,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+
+        if block_labels and not code_gen:
+            # Do not generate script if block_labels is provided, and an explicit code_gen
+            # request is not made
             return None
 
         existing_script, rendered_cache_key_value = await workflow_script_service.get_workflow_script(
