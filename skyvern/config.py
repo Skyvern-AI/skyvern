@@ -334,7 +334,7 @@ class Settings(BaseSettings):
     TRACE_PROVIDER_API_KEY: str = "fillmein"
 
     # Debug Session Settings
-    DEBUG_SESSION_TIMEOUT_MINUTES: int = 60 * 4
+    DEBUG_SESSION_TIMEOUT_MINUTES: int = 20
     """
     The timeout for a persistent browser session backing a debug session,
     in minutes.

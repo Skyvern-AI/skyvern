@@ -1,13 +1,19 @@
-import {
-  ExternalLinkIcon,
-  GlobeIcon,
-  PlusIcon,
-  ReloadIcon,
-} from "@radix-ui/react-icons";
-import { useSearchParams } from "react-router-dom";
+import { GlobeIcon, PlusIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
-import { HelpTooltip } from "@/components/HelpTooltip";
+import { ProxyLocation } from "@/api/types";
 import { Button } from "@/components/ui/button";
+import {
+  Drawer,
+  DrawerContent,
+  DrawerDescription,
+  DrawerHeader,
+  DrawerTitle,
+} from "@/components/ui/drawer";
+import { HelpTooltip } from "@/components/HelpTooltip";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Pagination,
   PaginationContent,
@@ -16,6 +22,7 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
+import { ProxySelector } from "@/components/ProxySelector";
 import {
   Table,
   TableBody,
@@ -57,7 +64,16 @@ function sessionIsOpen(browserSession: BrowserSession): boolean {
 }
 
 function BrowserSessions() {
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+  const [sessionOptions, setSessionOptions] = useState<{
+    proxyLocation: ProxyLocation;
+    timeoutMinutes: number;
+  }>({
+    proxyLocation: ProxyLocation.Residential,
+    timeoutMinutes: 60,
+  });
 
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -97,12 +113,19 @@ function BrowserSessions() {
     !nextPageBrowserSessions ||
     nextPageBrowserSessions.length === 0;
 
-  function handleRowClick(browserSessionId: string) {
-    window.open(
-      window.location.origin + `/browser-session/${browserSessionId}`,
-      "_blank",
-      "noopener,noreferrer",
-    );
+  function handleRowClick(
+    e: React.MouseEvent<HTMLTableRowElement>,
+    browserSessionId: string,
+  ) {
+    if (e.ctrlKey || e.metaKey) {
+      window.open(
+        window.location.origin + `/browser-session/${browserSessionId}`,
+        "_blank",
+        "noopener,noreferrer",
+      );
+    } else {
+      navigate(`/browser-session/${browserSessionId}`);
+    }
   }
 
   return (
@@ -126,10 +149,7 @@ function BrowserSessions() {
             <Button
               disabled={createBrowserSessionMutation.isPending}
               onClick={() => {
-                createBrowserSessionMutation.mutate({
-                  proxyLocation: null,
-                  timeout: null,
-                });
+                setIsDrawerOpen(true);
               }}
             >
               {createBrowserSessionMutation.isPending ? (
@@ -167,7 +187,6 @@ function BrowserSessions() {
                 <TableHead className="w-1/2 truncate text-slate-400">
                   CDP Url
                 </TableHead>
-                <TableHead className="w-[2.5rem] rounded-tr-lg"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -196,10 +215,16 @@ function BrowserSessions() {
                     "wss://session-staging.skyvern.com/pbs_442960015326262218/devtools/browser/f01f27e1-182b-4a33-9017-4c1146d3eb3e";
 
                   return (
-                    <TableRow key={browserSession.browser_session_id}>
+                    <TableRow
+                      key={browserSession.browser_session_id}
+                      className="cursor-pointer hover:bg-slate-elevation2"
+                      onClick={(e) => {
+                        handleRowClick(e, browserSession.browser_session_id);
+                      }}
+                    >
                       <TableCell>
-                        <div className="flex items-center">
-                          <div className="flex-1 truncate opacity-75">
+                        <div className="flex items-center font-mono text-sm">
+                          <div className="truncate opacity-75">
                             {browserSession.browser_session_id}
                           </div>
                           <CopyText
@@ -237,10 +262,8 @@ function BrowserSessions() {
                           : "-"}
                       </TableCell>
                       <TableCell>
-                        <div className="flex items-center">
-                          <div className="flex-1 truncate opacity-75">
-                            {cdpUrl}
-                          </div>
+                        <div className="flex items-center font-mono text-sm">
+                          <div className="truncate opacity-75">{cdpUrl}</div>
                           {cdpUrl !== "-" ? (
                             <CopyText
                               className="opacity-75 hover:opacity-100"
@@ -248,14 +271,6 @@ function BrowserSessions() {
                             />
                           ) : null}
                         </div>
-                      </TableCell>
-                      <TableCell
-                        className="cursor-pointer"
-                        onClick={() => {
-                          handleRowClick(browserSession.browser_session_id);
-                        }}
-                      >
-                        <ExternalLinkIcon className="inline size-4" />
                       </TableCell>
                     </TableRow>
                   );
@@ -317,6 +332,80 @@ function BrowserSessions() {
           </div>
         </div>
       </div>
+
+      {/* create new session options */}
+      <Drawer
+        direction="right"
+        open={isDrawerOpen}
+        onOpenChange={setIsDrawerOpen}
+      >
+        <DrawerContent className="bottom-2 right-0 top-2 mt-0 h-full w-96 rounded border-0 p-6">
+          <DrawerHeader>
+            <DrawerTitle>Create Browser Session</DrawerTitle>
+            <DrawerDescription>
+              Create a new browser session to interact with websites, or run
+              workflows in.
+              <div className="mt-8 flex flex-col gap-4">
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    <Label>Proxy Location</Label>
+                    <HelpTooltip content="Route Skyvern through one of our available proxies." />
+                  </div>
+                  <ProxySelector
+                    value={sessionOptions.proxyLocation}
+                    onChange={(value) => {
+                      setSessionOptions({
+                        ...sessionOptions,
+                        proxyLocation: value,
+                      });
+                    }}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Label>Timeout (Minutes)</Label>
+                    <HelpTooltip content="Duration to keep the browser session open. Automatically extends as it is used." />
+                  </div>
+                  <Input
+                    value={sessionOptions.timeoutMinutes}
+                    placeholder="timeout (minutes)"
+                    onChange={(event) => {
+                      const value =
+                        event.target.value === ""
+                          ? null
+                          : Number(event.target.value);
+
+                      if (value) {
+                        setSessionOptions({
+                          ...sessionOptions,
+                          timeoutMinutes: value,
+                        });
+                      }
+                    }}
+                  />
+                </div>
+                <Button
+                  disabled={createBrowserSessionMutation.isPending}
+                  className="mt-6 w-full"
+                  onClick={() => {
+                    createBrowserSessionMutation.mutate({
+                      proxyLocation: sessionOptions.proxyLocation,
+                      timeout: sessionOptions.timeoutMinutes,
+                    });
+                  }}
+                >
+                  {createBrowserSessionMutation.isPending ? (
+                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <PlusIcon className="mr-2 h-4 w-4" />
+                  )}
+                  Create
+                </Button>
+              </div>
+            </DrawerDescription>
+          </DrawerHeader>
+        </DrawerContent>
+      </Drawer>
     </div>
   );
 }

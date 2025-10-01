@@ -313,7 +313,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     </div>
                   </div>
                   <Separator />
-                  <div className="flex items-center justify-between">
+                  <div className="space-y-2">
                     <div className="flex gap-2">
                       <Label className="text-xs font-normal text-slate-300">
                         File Name
@@ -322,14 +322,14 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                         content={helpTooltips["download"]["fileSuffix"]}
                       />
                     </div>
-                    <Input
-                      type="text"
-                      placeholder={placeholders["download"]["downloadSuffix"]}
-                      className="nopan w-52 text-xs"
-                      value={inputs.downloadSuffix ?? ""}
-                      onChange={(event) => {
-                        handleChange("downloadSuffix", event.target.value);
+                    <WorkflowBlockInputTextarea
+                      nodeId={id}
+                      onChange={(value) => {
+                        handleChange("downloadSuffix", value);
                       }}
+                      value={inputs.downloadSuffix ?? ""}
+                      placeholder={placeholders["download"]["downloadSuffix"]}
+                      className="nopan text-xs"
                     />
                   </div>
                   <Separator />

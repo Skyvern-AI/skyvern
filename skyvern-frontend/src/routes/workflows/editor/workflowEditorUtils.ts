@@ -2,6 +2,9 @@ import Dagre from "@dagrejs/dagre";
 import type { Node } from "@xyflow/react";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
+
+import { TSON } from "@/util/tson";
+
 import {
   WorkflowBlockType,
   WorkflowBlockTypes,
@@ -2188,10 +2191,12 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
     // Validate Task data schema JSON when enabled (value different from "null")
     if (node.data.dataSchema && node.data.dataSchema !== "null") {
-      try {
-        JSON.parse(node.data.dataSchema);
-      } catch {
-        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+      const result = TSON.parse(node.data.dataSchema);
+
+      if (!result.success) {
+        errors.push(
+          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+        );
       }
     }
   });
@@ -2227,10 +2232,12 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
     // Validate Extraction data schema JSON when enabled (value different from "null")
     if (node.data.dataSchema && node.data.dataSchema !== "null") {
-      try {
-        JSON.parse(node.data.dataSchema);
-      } catch {
-        errors.push(`${node.data.label}: Data schema is not valid JSON.`);
+      const result = TSON.parse(node.data.dataSchema);
+
+      if (!result.success) {
+        errors.push(
+          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+        );
       }
     }
   });

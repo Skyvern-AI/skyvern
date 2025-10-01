@@ -4,7 +4,7 @@ from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocation
 
 MIN_TIMEOUT = 5
-MAX_TIMEOUT = 60 * 4  # 4 hours
+MAX_TIMEOUT = 60 * 24  # 24 hours
 DEFAULT_TIMEOUT = 60
 
 
