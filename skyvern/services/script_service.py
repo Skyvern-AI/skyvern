@@ -18,10 +18,11 @@ from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.skyvern_page import script_run_context_manager
-from skyvern.exceptions import ScriptNotFound, WorkflowRunNotFound
+from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TaskBlock,
     TextPromptBlock,
     UrlBlock,
+    ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -1323,6 +1325,7 @@ async def action(
         action_block = ActionBlock(
             label=block_validation_output.label,
             output_parameter=block_validation_output.output_parameter,
+            task_type=TaskType.action,
             url=url,
             navigation_goal=prompt,
             max_steps_per_run=max_steps,
@@ -1483,6 +1486,36 @@ async def extract(
             browser_session_id=block_validation_output.browser_session_id,
         )
         return block_result.output_parameter_value
+
+
+async def validate(
+    complete_criterion: str | None = None,
+    terminate_criterion: str | None = None,
+    error_code_mapping: dict[str, str] | None = None,
+    label: str | None = None,
+) -> None:
+    """Validate function that behaves like a ValidationBlock"""
+    if not complete_criterion and not terminate_criterion:
+        raise Exception("Both complete criterion and terminate criterion are empty")
+
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    validation_block = ValidationBlock(
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        task_type=TaskType.validation,
+        complete_criterion=complete_criterion,
+        terminate_criterion=terminate_criterion,
+        error_code_mapping=error_code_mapping,
+        max_steps_per_run=2,
+    )
+    result = await validation_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+    if result.status == BlockStatus.terminated:
+        raise ScriptTerminationException(result.failure_reason)
 
 
 async def wait(seconds: int, label: str | None = None) -> None:

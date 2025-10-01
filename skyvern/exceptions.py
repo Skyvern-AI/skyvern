@@ -794,3 +794,11 @@ class AzureBaseError(SkyvernException):
 class AzureConfigurationError(AzureBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error in Azure configuration: {message}")
+
+
+###### Script Exceptions ######
+
+
+class ScriptTerminationException(SkyvernException):
+    def __init__(self, reason: str | None = None) -> None:
+        super().__init__(reason)
