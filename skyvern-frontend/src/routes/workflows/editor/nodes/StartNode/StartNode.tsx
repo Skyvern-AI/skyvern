@@ -105,6 +105,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     if (!data.editable) {
       return;
     }
+
+    if (inputs[key as keyof typeof inputs] === value) {
+      return;
+    }
+
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
@@ -324,7 +329,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         <KeyValueInput
                           value={inputs.extraHttpHeaders ?? null}
                           onChange={(val) =>
-                            handleChange("extraHttpHeaders", val)
+                            handleChange("extraHttpHeaders", val || "{}")
                           }
                           addButtonText="Add Header"
                         />
