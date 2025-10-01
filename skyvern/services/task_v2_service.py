@@ -812,6 +812,7 @@ async def run_task_v2_helper(
             organization=organization,
             request=workflow_create_request,
             workflow_permanent_id=workflow.workflow_permanent_id,
+            delete_script=False,
         )
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 

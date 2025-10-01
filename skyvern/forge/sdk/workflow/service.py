@@ -924,6 +924,7 @@ class WorkflowService:
         title: str | None = None,
         description: str | None = None,
         workflow_definition: WorkflowDefinition | None = None,
+        delete_script: bool = True,
     ) -> Workflow:
         if workflow_definition:
             workflow_definition.validate()
@@ -947,7 +948,8 @@ class WorkflowService:
 
         # Check if workflow definition changed and delete published workflow scripts if so
         if (
-            workflow_definition
+            delete_script
+            and workflow_definition
             and previous_workflow
             and organization_id
             and _get_workflow_definition_without_dates(previous_workflow.workflow_definition)
@@ -1849,6 +1851,7 @@ class WorkflowService:
         organization: Organization,
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
+        delete_script: bool = True,
     ) -> Workflow:
         organization_id = organization.organization_id
         LOG.info(
@@ -2094,6 +2097,7 @@ class WorkflowService:
                 workflow_id=workflow.workflow_id,
                 organization_id=organization_id,
                 workflow_definition=workflow_definition,
+                delete_script=delete_script,
             )
             LOG.info(
                 f"Created workflow from request, title: {request.title}",
