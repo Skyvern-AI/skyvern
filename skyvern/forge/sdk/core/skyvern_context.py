@@ -48,6 +48,7 @@ class SkyvernContext:
     Example output value:
     {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}
     """
+    published_workflow_script_id: str | None = None
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"

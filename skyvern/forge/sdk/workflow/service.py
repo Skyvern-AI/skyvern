@@ -337,7 +337,6 @@ class WorkflowService:
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
-        skyvern_context.current()
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
@@ -407,6 +406,9 @@ class WorkflowService:
 
         # Check if there's a related workflow script that should be used instead
         workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
+        current_context = skyvern_context.current()
+        if workflow_script and current_context:
+            current_context.published_workflow_script_id = workflow_script.script_id
         is_script_run = self.should_run_script(workflow, workflow_run)
         if workflow_script and is_script_run:
             LOG.info(

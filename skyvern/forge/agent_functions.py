@@ -20,6 +20,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
+from skyvern.services import workflow_script_service
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
@@ -621,7 +622,12 @@ class AgentFunction:
         If this is a workflow running environment, generate the
         """
         context = skyvern_context.current()
-        if not context or not context.root_workflow_run_id or not context.organization_id:
+        if (
+            not context
+            or not context.root_workflow_run_id
+            or not context.organization_id
+            or context.published_workflow_script_id
+        ):
             return
         root_workflow_run_id = context.root_workflow_run_id
         organization_id = context.organization_id
@@ -640,11 +646,11 @@ class AgentFunction:
             root_workflow_run_id=context.root_workflow_run_id,
             organization_id=context.organization_id,
         )
-        # NOTE(jdo): we are commenting this out for now as it is causing issues with workflow runs
-        # await workflow_script_service.generate_or_update_pending_workflow_script(
-        #     workflow_run=workflow_run,
-        #     workflow=workflow,
-        # )
+
+        await workflow_script_service.generate_or_update_pending_workflow_script(
+            workflow_run=workflow_run,
+            workflow=workflow,
+        )
 
     async def post_action_execution(self) -> None:
         asyncio.create_task(self._post_action_execution())
