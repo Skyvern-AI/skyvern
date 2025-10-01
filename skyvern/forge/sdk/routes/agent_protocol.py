@@ -991,7 +991,7 @@ async def run_block(
         organization=organization,
         template=template,
         workflow_permanent_id=block_run_request.workflow_id,
-        workflow_run_request=block_run_request,
+        block_run_request=block_run_request,
     )
 
     browser_session_id = block_run_request.browser_session_id

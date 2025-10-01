@@ -10,7 +10,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
-from skyvern.schemas.runs import WorkflowRunRequest
+from skyvern.schemas.runs import BlockRunRequest
 from skyvern.services import workflow_service
 
 LOG = structlog.get_logger()
@@ -20,20 +20,20 @@ async def ensure_workflow_run(
     organization: Organization,
     template: bool,
     workflow_permanent_id: str,
-    workflow_run_request: WorkflowRunRequest,
+    block_run_request: BlockRunRequest,
     x_max_steps_override: int | None = None,
 ) -> WorkflowRun:
     context = skyvern_context.ensure_context()
 
     legacy_workflow_request = WorkflowRequestBody(
-        data=workflow_run_request.parameters,
-        proxy_location=workflow_run_request.proxy_location,
-        webhook_callback_url=workflow_run_request.webhook_url,
-        totp_identifier=workflow_run_request.totp_identifier,
-        totp_verification_url=workflow_run_request.totp_url,
-        browser_session_id=workflow_run_request.browser_session_id,
-        max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
-        extra_http_headers=workflow_run_request.extra_http_headers,
+        data=block_run_request.parameters,
+        proxy_location=block_run_request.proxy_location,
+        webhook_callback_url=block_run_request.webhook_url,
+        totp_identifier=block_run_request.totp_identifier,
+        totp_verification_url=block_run_request.totp_url,
+        browser_session_id=block_run_request.browser_session_id,
+        max_screenshot_scrolls=block_run_request.max_screenshot_scrolls,
+        extra_http_headers=block_run_request.extra_http_headers,
     )
 
     workflow_run = await workflow_service.prepare_workflow(
@@ -44,6 +44,7 @@ async def ensure_workflow_run(
         version=None,
         max_steps=x_max_steps_override,
         request_id=context.request_id,
+        debug_session_id=block_run_request.debug_session_id,
     )
 
     return workflow_run
