@@ -763,11 +763,7 @@ function isHoverPointerElement(element, hoverStylesMap) {
         }
       }
       if (shouldMatch || selector.includes(tagName)) {
-        if (
-          isValidCSSSelector(selector) &&
-          element.matches(selector) &&
-          styles.cursor === "pointer"
-        ) {
+        if (element.matches(selector) && styles.cursor === "pointer") {
           return true;
         }
       }
@@ -2196,11 +2192,6 @@ async function getHoverStylesMap() {
             // Get base selector without :hover
             const baseSelector = hoverPart.replace(/:hover/g, "").trim();
 
-            // Skip invalid CSS selectors
-            if (!isValidCSSSelector(baseSelector)) {
-              continue;
-            }
-
             // Get or create styles object for this selector
             let styles = hoverMap.get(baseSelector) || {};
 
@@ -2213,16 +2204,13 @@ async function getHoverStylesMap() {
             // store it in a special format
             if (parts.length > 1) {
               const fullSelector = selector;
-              // Skip if the full selector is invalid
-              if (isValidCSSSelector(fullSelector)) {
-                styles["__nested__"] = styles["__nested__"] || [];
-                styles["__nested__"].push({
-                  selector: fullSelector,
-                  styles: Object.fromEntries(
-                    [...rule.style].map((prop) => [prop, rule.style[prop]]),
-                  ),
-                });
-              }
+              styles["__nested__"] = styles["__nested__"] || [];
+              styles["__nested__"].push({
+                selector: fullSelector,
+                styles: Object.fromEntries(
+                  [...rule.style].map((prop) => [prop, rule.style[prop]]),
+                ),
+              });
             }
 
             // only need the style which includes the cursor attribute.
