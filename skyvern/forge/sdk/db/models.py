@@ -290,6 +290,7 @@ class WorkflowRunModel(Base):
     job_id = Column(String, nullable=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    debug_session_id: Column = Column(String, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
