@@ -4455,3 +4455,38 @@ class AgentDB:
         except Exception:
             LOG.error("UnexpectedError", exc_info=True)
             raise
+
+    async def delete_workflow_scripts_by_permanent_id(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> int:
+        """
+        Soft delete all published workflow scripts for a workflow permanent id by setting deleted_at timestamp.
+
+        Returns True if any records were deleted, False otherwise.
+        """
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    update(WorkflowScriptModel)
+                    .where(
+                        and_(
+                            WorkflowScriptModel.organization_id == organization_id,
+                            WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                            WorkflowScriptModel.deleted_at.is_(None),
+                        )
+                    )
+                    .values(deleted_at=datetime.now(timezone.utc))
+                )
+
+                result = await session.execute(stmt)
+                await session.commit()
+
+                return result.rowcount
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
