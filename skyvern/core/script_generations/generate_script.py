@@ -805,18 +805,62 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_validate_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_validate_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.validate statement."""
-    args = [
-        cst.Arg(
-            keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal", "")),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
-    ]
+    args = []
+
+    # Add complete_criterion if it exists
+    if block.get("complete_criterion") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("complete_criterion"),
+                value=_value(block.get("complete_criterion")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add terminate_criterion if it exists
+    if block.get("terminate_criterion") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("terminate_criterion"),
+                value=_value(block.get("terminate_criterion")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add error_code_mapping if it exists
+    if block.get("error_code_mapping") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("error_code_mapping"),
+                value=_value(block.get("error_code_mapping")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add label if it exists
+    if block.get("label") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+            )
+        )
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("validate")),
@@ -1465,6 +1509,8 @@ def _build_block_statement(block: dict[str, Any], data_variable_name: str | None
             stmt = _build_extract_statement(block_title, block, data_variable_name)
         elif block_type == "navigation":
             stmt = _build_navigate_statement(block_title, block, data_variable_name)
+    elif block_type == "validation":
+        stmt = _build_validate_statement(block_title, block, data_variable_name)
     elif block_type == "task_v2":
         stmt = _build_run_task_statement(block_title, block, data_variable_name)
     elif block_type == "send_email":

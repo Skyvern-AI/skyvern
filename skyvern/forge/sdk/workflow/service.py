@@ -17,6 +17,7 @@ from skyvern.exceptions import (
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
+    ScriptTerminationException,
     SkyvernException,
     WorkflowNotFound,
     WorkflowRunNotFound,
@@ -2522,14 +2523,26 @@ class WorkflowService:
             parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
 
             # Execute the script using script_service
-            await script_service.execute_script(
-                script_id=script_id,
-                organization_id=organization.organization_id,
-                parameters=parameters,
-                workflow_run_id=workflow_run.workflow_run_id,
-                browser_session_id=browser_session_id,
-                background_tasks=None,  # Execute synchronously
-            )
+            try:
+                await script_service.execute_script(
+                    script_id=script_id,
+                    organization_id=organization.organization_id,
+                    parameters=parameters,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    background_tasks=None,  # Execute synchronously
+                )
+            except ScriptTerminationException as e:
+                LOG.info(
+                    "Script terminated, marking workflow run as terminated",
+                    failure_reason=e.message,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                workflow_run = await self.mark_workflow_run_as_terminated(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    failure_reason=e.message,
+                )
+                return workflow_run
 
             # Mark workflow run as completed
             workflow_run = await self.mark_workflow_run_as_completed(
