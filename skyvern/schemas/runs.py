@@ -358,6 +358,14 @@ class WorkflowRunRequest(BaseModel):
         description="The CDP address for the workflow run.",
         examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
+    ai_fallback: bool | None = Field(
+        default=None,
+        description="Whether to fallback to AI if the workflow run fails.",
+    )
+    run_with: str | None = Field(
+        default=None,
+        description="Whether to run the workflow with agent or code.",
+    )
 
     @field_validator("webhook_url", "totp_url")
     @classmethod

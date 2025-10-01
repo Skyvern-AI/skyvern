@@ -27,6 +27,7 @@ class WorkflowRequestBody(BaseModel):
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
+    ai_fallback: bool | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -143,6 +144,7 @@ class WorkflowRun(BaseModel):
     script_run: ScriptRunResponse | None = None
     job_id: str | None = None
     sequential_key: str | None = None
+    ai_fallback: bool | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None

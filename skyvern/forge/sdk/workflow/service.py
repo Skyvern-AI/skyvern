@@ -241,6 +241,8 @@ class WorkflowService:
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+            ai_fallback=workflow_request.ai_fallback,
+            run_with=workflow_request.run_with,
         )
         context: skyvern_context.SkyvernContext | None = skyvern_context.current()
         current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
@@ -1071,6 +1073,7 @@ class WorkflowService:
             sequential_key=sequential_key,
             run_with=workflow_request.run_with,
             debug_session_id=debug_session_id,
+            ai_fallback=workflow_request.ai_fallback,
         )
 
     async def _update_workflow_run_status(
@@ -1079,12 +1082,14 @@ class WorkflowService:
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
         run_with: str | None = None,
+        ai_fallback: bool | None = None,
     ) -> WorkflowRun:
         workflow_run = await app.DATABASE.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=status,
             failure_reason=failure_reason,
             run_with=run_with,
+            ai_fallback=ai_fallback,
         )
         if status in [WorkflowRunStatus.completed, WorkflowRunStatus.failed, WorkflowRunStatus.terminated]:
             start_time = (

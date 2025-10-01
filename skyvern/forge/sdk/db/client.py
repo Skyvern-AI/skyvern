@@ -1699,6 +1699,7 @@ class AgentDB:
         sequential_key: str | None = None,
         run_with: str | None = None,
         debug_session_id: str | None = None,
+        ai_fallback: bool | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1719,6 +1720,7 @@ class AgentDB:
                     sequential_key=sequential_key,
                     run_with=run_with,
                     debug_session_id=debug_session_id,
+                    ai_fallback=ai_fallback,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1738,6 +1740,7 @@ class AgentDB:
         job_id: str | None = None,
         run_with: str | None = None,
         sequential_key: str | None = None,
+        ai_fallback: bool | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1764,6 +1767,8 @@ class AgentDB:
                     workflow_run.run_with = run_with
                 if sequential_key:
                     workflow_run.sequential_key = sequential_key
+                if ai_fallback is not None:
+                    workflow_run.ai_fallback = ai_fallback
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
