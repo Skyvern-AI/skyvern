@@ -131,7 +131,6 @@ def _get_workflow_definition_without_dates(workflow_definition: WorkflowDefiniti
         "output_parameter_id",
         "workflow_id",
         "workflow_parameter_id",
-        "",
     ]
 
     # Use BFS to recursively remove fields from all nested objects
