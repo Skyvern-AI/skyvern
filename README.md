@@ -410,6 +410,18 @@ Make sure to have [uv](https://docs.astral.sh/uv/getting-started/installation/) 
 3. Navigate to `http://localhost:8080` in your browser to start using the UI
    *The Skyvern CLI supports Windows, WSL, macOS, and Linux environments.*
 
+# Using SQLite
+1. Configure `DATABASE_STRING='sqlite+aiosqlite:///./skyvern.db'` in `.env` 
+2. Init the database 
+    ```bash
+    uv run alembic -c alembic-sqlite.ini upgrade head
+    ```
+3. Create organization
+    ```bash
+    uv run python scripts/create_organization.py Skyvern.local
+    ```
+4. Configure `token` from the previous step as `SKYVERN_API_KEY` in `.env` and `skyvern-frontend/.env` files
+
 # Documentation
 
 More extensive documentation can be found on our [📕 docs page](https://docs.skyvern.com). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
