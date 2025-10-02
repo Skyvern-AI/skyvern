@@ -73,6 +73,7 @@ const getPayload = (opts: {
   blockLabel: string;
   blockOutputs: Record<string, unknown>;
   browserSessionId: string | null;
+  codeGen: boolean | null;
   parameters: Record<string, unknown>;
   totpIdentifier: string | null;
   totpUrl: string | null;
@@ -116,6 +117,7 @@ const getPayload = (opts: {
     block_labels: [opts.blockLabel],
     block_outputs: opts.blockOutputs,
     browser_session_id: opts.browserSessionId,
+    code_gen: opts.codeGen,
     extra_http_headers: extraHttpHeaders,
     max_screenshot_scrolls: opts.workflowSettings.maxScreenshotScrollingTimes,
     parameters: opts.parameters,
@@ -202,7 +204,7 @@ function NodeHeader({
     ) {
       setAutoplay(null, null);
       setTimeout(() => {
-        runBlock.mutateAsync();
+        runBlock.mutateAsync({ codeGen: true });
       }, 100);
     }
 
@@ -260,7 +262,7 @@ function NodeHeader({
   ]);
 
   const runBlock = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (opts?: { codeGen: boolean }) => {
       closeWorkflowPanel();
 
       await saveWorkflow.mutateAsync();
@@ -313,6 +315,7 @@ function NodeHeader({
         blockOutputs:
           blockOutputsStore.getOutputsWithOverrides(workflowPermanentId),
         browserSessionId: debugSession.browser_session_id,
+        codeGen: opts?.codeGen ?? false,
         parameters,
         totpIdentifier,
         totpUrl,
@@ -452,7 +455,7 @@ function NodeHeader({
   });
 
   const handleOnPlay = () => {
-    runBlock.mutate();
+    runBlock.mutate({ codeGen: false });
   };
 
   const handleOnCancel = () => {
