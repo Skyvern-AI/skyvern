@@ -274,7 +274,7 @@ function PromptBox() {
                     value="v2-code"
                     className="relative overflow-hidden border-2 border-yellow-500/50 bg-gradient-to-r from-yellow-500/10 via-yellow-400/10 to-amber-400/10 hover:bg-slate-800"
                   >
-                    <div className="absolute inset-0 animate-shimmer bg-gradient-to-r from-transparent via-yellow-400/20 to-transparent" />
+                    <div className="animate-shimmer absolute inset-0 bg-gradient-to-r from-transparent via-yellow-400/20 to-transparent" />
                     <div className="relative flex items-center gap-2 space-y-2">
                       <div className="flex-1">
                         <div className="flex items-center gap-2">
