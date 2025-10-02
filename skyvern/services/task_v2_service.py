@@ -770,26 +770,6 @@ async def run_task_v2_helper(
                     failure_reason=f"Unsupported task block type gets generated: {task_type}",
                 )
                 break
-
-        # generate the extraction task
-        block_result = await block.execute_safe(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            code_gen=code_gen,
-        )
-        task_history_record["status"] = str(block_result.status)
-        if block_result.failure_reason:
-            task_history_record["reason"] = block_result.failure_reason
-
-        extracted_data = _get_extracted_data_from_block_result(
-            block_result,
-            task_type,
-            task_v2_id=task_v2_id,
-            workflow_run_id=workflow_run_id,
-        )
-        if extracted_data is not None:
-            task_history_record["extracted_data"] = extracted_data
-        task_history.append(task_history_record)
         # refresh workflow
         yaml_blocks.extend(block_yaml_list)
         yaml_parameters.extend(parameter_yaml_list)
@@ -816,6 +796,25 @@ async def run_task_v2_helper(
         )
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
+        # generate the extraction task
+        block_result = await block.execute_safe(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            code_gen=code_gen,
+        )
+        task_history_record["status"] = str(block_result.status)
+        if block_result.failure_reason:
+            task_history_record["reason"] = block_result.failure_reason
+
+        extracted_data = _get_extracted_data_from_block_result(
+            block_result,
+            task_type,
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+        )
+        if extracted_data is not None:
+            task_history_record["extracted_data"] = extracted_data
+        task_history.append(task_history_record)
         # execute the extraction task
         workflow_run = await handle_block_result(
             task_v2_id,
