@@ -51,6 +51,12 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_ZA = "RESIDENTIAL_ZA"
     RESIDENTIAL_AR = "RESIDENTIAL_AR"
     RESIDENTIAL_AU = "RESIDENTIAL_AU"
+    RESIDENTIAL_BR = "RESIDENTIAL_BR"
+    RESIDENTIAL_TR = "RESIDENTIAL_TR"
+    RESIDENTIAL_CA = "RESIDENTIAL_CA"
+    RESIDENTIAL_MX = "RESIDENTIAL_MX"
+    RESIDENTIAL_IT = "RESIDENTIAL_IT"
+    RESIDENTIAL_NL = "RESIDENTIAL_NL"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
@@ -83,6 +89,12 @@ class ProxyLocation(StrEnum):
             cls.RESIDENTIAL_ZA,
             cls.RESIDENTIAL_AR,
             cls.RESIDENTIAL_AU,
+            cls.RESIDENTIAL_BR,
+            cls.RESIDENTIAL_TR,
+            cls.RESIDENTIAL_CA,
+            cls.RESIDENTIAL_MX,
+            cls.RESIDENTIAL_IT,
+            cls.RESIDENTIAL_NL,
         }
 
     @staticmethod
@@ -100,6 +112,12 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_ZA: 2000,
             ProxyLocation.RESIDENTIAL_AR: 2000,
             ProxyLocation.RESIDENTIAL_AU: 2000,
+            ProxyLocation.RESIDENTIAL_BR: 2000,
+            ProxyLocation.RESIDENTIAL_TR: 2000,
+            ProxyLocation.RESIDENTIAL_CA: 2000,
+            ProxyLocation.RESIDENTIAL_MX: 2000,
+            ProxyLocation.RESIDENTIAL_IT: 2000,
+            ProxyLocation.RESIDENTIAL_NL: 2000,
         }
         return counts.get(proxy_location, 10000)
 
@@ -118,6 +136,12 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_ZA: "ZA",
             ProxyLocation.RESIDENTIAL_AR: "AR",
             ProxyLocation.RESIDENTIAL_AU: "AU",
+            ProxyLocation.RESIDENTIAL_BR: "BR",
+            ProxyLocation.RESIDENTIAL_TR: "TR",
+            ProxyLocation.RESIDENTIAL_CA: "CA",
+            ProxyLocation.RESIDENTIAL_MX: "MX",
+            ProxyLocation.RESIDENTIAL_IT: "IT",
+            ProxyLocation.RESIDENTIAL_NL: "NL",
         }
         return mapping.get(proxy_location, "US")
 
@@ -176,6 +200,24 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
 
     if proxy_location == ProxyLocation.RESIDENTIAL_AU:
         return ZoneInfo("Australia/Sydney")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_BR:
+        return ZoneInfo("America/Sao_Paulo")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_TR:
+        return ZoneInfo("Europe/Istanbul")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_CA:
+        return ZoneInfo("America/Toronto")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_MX:
+        return ZoneInfo("America/Mexico_City")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_IT:
+        return ZoneInfo("Europe/Rome")
+
+    if proxy_location == ProxyLocation.RESIDENTIAL_NL:
+        return ZoneInfo("Europe/Amsterdam")
 
     if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
         return ZoneInfo("America/New_York")

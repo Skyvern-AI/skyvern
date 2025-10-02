@@ -43,6 +43,12 @@ export const ProxyLocation = {
   ResidentialZA: "RESIDENTIAL_ZA",
   ResidentialAR: "RESIDENTIAL_AR",
   ResidentialAU: "RESIDENTIAL_AU",
+  ResidentialBR: "RESIDENTIAL_BR",
+  ResidentialTR: "RESIDENTIAL_TR",
+  ResidentialCA: "RESIDENTIAL_CA",
+  ResidentialMX: "RESIDENTIAL_MX",
+  ResidentialIT: "RESIDENTIAL_IT",
+  ResidentialNL: "RESIDENTIAL_NL",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;

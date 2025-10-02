@@ -2367,7 +2367,7 @@ async def new_debug_session(
     new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_location=ProxyLocation.RESIDENTIAL,
     )
 
     debug_session = await app.DATABASE.create_debug_session(
