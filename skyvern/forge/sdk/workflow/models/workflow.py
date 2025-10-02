@@ -145,6 +145,7 @@ class WorkflowRun(BaseModel):
     job_id: str | None = None
     sequential_key: str | None = None
     ai_fallback: bool | None = None
+    code_gen: bool | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
