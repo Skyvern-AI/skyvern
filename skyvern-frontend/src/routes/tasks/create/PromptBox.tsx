@@ -29,6 +29,7 @@ import {
   PaperPlaneIcon,
   Pencil1Icon,
   ReloadIcon,
+  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
@@ -109,7 +110,9 @@ const exampleCases = [
 function PromptBox() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState<"v1" | "v2">("v2"); // Observer is the default
+  const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">(
+    "v2-code",
+  ); // v2-code is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
@@ -147,9 +150,6 @@ function PromptBox() {
           proxy_location: proxyLocation,
           totp_identifier: totpIdentifier,
           max_screenshot_scrolls: maxScreenshotScrolls,
-          publish_workflow: publishWorkflow,
-          run_with: "code",
-          ai_fallback: true,
           extracted_information_schema: dataSchema
             ? (() => {
                 try {
@@ -228,12 +228,26 @@ function PromptBox() {
               />
               <Select
                 value={selectValue}
-                onValueChange={(value: "v1" | "v2") => {
+                onValueChange={(value: "v1" | "v2" | "v2-code") => {
                   setSelectValue(value);
                 }}
               >
                 <SelectTrigger className="w-48 focus:ring-0">
-                  <SelectValue />
+                  {selectValue === "v2-code" ? (
+                    <div className="relative z-10 flex w-full flex-col items-center">
+                      <div className="flex items-center gap-1">
+                        <LightningBoltIcon className="size-4 shrink-0 text-yellow-400" />
+                        <div className="font-normal text-white">
+                          Skyvern 2.0
+                        </div>
+                      </div>
+                      <div className="self-start pl-7 text-xs font-semibold text-yellow-400">
+                        with code
+                      </div>
+                    </div>
+                  ) : (
+                    <SelectValue className="relative z-10" />
+                  )}
                 </SelectTrigger>
                 <SelectContent className="border-slate-500 bg-slate-elevation3">
                   <CustomSelectItem value="v1">
@@ -253,6 +267,25 @@ function PromptBox() {
                       </div>
                       <div className="text-xs text-slate-400">
                         Best for complex tasks
+                      </div>
+                    </div>
+                  </CustomSelectItem>
+                  <CustomSelectItem
+                    value="v2-code"
+                    className="relative overflow-hidden border-2 border-yellow-500/50 bg-gradient-to-r from-yellow-500/10 via-yellow-400/10 to-amber-400/10 hover:bg-slate-800"
+                  >
+                    <div className="absolute inset-0 animate-shimmer bg-gradient-to-r from-transparent via-yellow-400/20 to-transparent" />
+                    <div className="relative flex items-center gap-2 space-y-2">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <SelectItemText className="animate-pulse bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text font-bold text-transparent">
+                            Skyvern 2.0
+                          </SelectItemText>
+                          <LightningBoltIcon className="size-4 animate-bounce text-yellow-400" />
+                        </div>
+                        <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text text-xs font-semibold text-transparent">
+                          with code
+                        </div>
                       </div>
                     </div>
                   </CustomSelectItem>
