@@ -567,6 +567,7 @@ async def create_workflow_from_prompt(
             extra_http_headers=data.extra_http_headers,
             max_iterations=x_max_iterations_override,
             max_steps=x_max_steps_override,
+            status=WorkflowStatus.published if data.publish_workflow else WorkflowStatus.auto_generated,
             run_with=data.run_with,
             ai_fallback=data.ai_fallback,
         )

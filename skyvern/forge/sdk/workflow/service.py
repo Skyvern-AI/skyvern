@@ -736,6 +736,7 @@ class WorkflowService:
         extra_http_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
         max_steps: int | None = None,
+        status: WorkflowStatus = WorkflowStatus.auto_generated,
         run_with: str | None = None,
         ai_fallback: bool = True,
     ) -> Workflow:
@@ -779,6 +780,7 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            status=status,
             run_with=run_with,
             ai_fallback=ai_fallback,
         )
