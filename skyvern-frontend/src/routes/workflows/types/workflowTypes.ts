@@ -524,6 +524,7 @@ export type WorkflowApiResponse = {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_screenshot_scrolls: number | null;
+  status: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
