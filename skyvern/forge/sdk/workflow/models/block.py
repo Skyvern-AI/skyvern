@@ -1983,13 +1983,24 @@ class FileUploadBlock(Block):
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         folder_path = self.path or f"{workflow_run_id}"
+        # Remove trailing slash from folder_path to avoid double slashes
+        folder_path = folder_path.rstrip("/")
+        # Remove any empty path segments to avoid double slashes
+        folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
         s3_suffix = f"{uuid.uuid4()}_{Path(path).name}"
         return f"s3://{self.s3_bucket}/{folder_path}/{s3_suffix}"
 
-    def _get_azure_blob_uri(self, workflow_run_id: str, file_path: str) -> str:
-        blob_name = Path(file_path).name
+    def _get_azure_blob_name(self, workflow_run_id: str, file_path: str) -> str:
+        blob_name = f"{uuid.uuid4()}_{Path(file_path).name}"
         folder_path = self.path or workflow_run_id
-        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{folder_path}/{uuid.uuid4()}_{blob_name}"
+        # Remove trailing slash from folder_path to avoid double slashes
+        folder_path = folder_path.rstrip("/")
+        # Remove any empty path segments to avoid double slashes
+        folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
+        return folder_path + "/" + blob_name
+
+    def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
+        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
 
     async def execute(
         self,
@@ -2115,8 +2126,9 @@ class FileUploadBlock(Block):
                     storage_account_key=actual_azure_storage_account_key,
                 )
                 for file_path in files_to_upload:
-                    blob_name = Path(file_path).name
-                    azure_uri = self._get_azure_blob_uri(workflow_run_id, file_path)
+                    LOG.info("FileUploadBlock: Uploading file to Azure Blob Storage", file_path=file_path)
+                    blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
+                    azure_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
                     uploaded_uris.append(azure_uri)
                     await azure_client.upload_file_from_path(
                         container_name=self.azure_blob_container_name or "", blob_name=blob_name, file_path=file_path
