@@ -328,6 +328,7 @@ def convert_to_workflow_run(
         if workflow_run_model.script_run
         else None,
         run_with=workflow_run_model.run_with,
+        code_gen=workflow_run_model.code_gen,
     )
 
 

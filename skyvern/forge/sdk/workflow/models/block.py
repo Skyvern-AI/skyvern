@@ -238,7 +238,6 @@ class Block(BaseModel, abc.ABC):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         pass
@@ -296,7 +295,6 @@ class Block(BaseModel, abc.ABC):
         parent_workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
@@ -346,7 +344,6 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
-                code_gen=code_gen,
                 **kwargs,
             )
         except Exception as e:
@@ -503,7 +500,6 @@ class BaseTaskBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1311,7 +1307,6 @@ class ForLoopBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1489,7 +1484,6 @@ async def wrapper():
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
@@ -1656,7 +1650,6 @@ class TextPromptBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # Validate block execution
@@ -1741,7 +1734,6 @@ class DownloadToS3Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -1830,7 +1822,6 @@ class UploadToS3Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -2008,7 +1999,6 @@ class FileUploadBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -2426,7 +2416,6 @@ class SendEmailBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -2662,7 +2651,6 @@ class FileParserBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -2802,7 +2790,6 @@ class PDFParserBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -2903,7 +2890,6 @@ class WaitBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
@@ -2948,7 +2934,6 @@ class ValidationBlock(BaseTaskBlock):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         task_order, _ = await self.get_task_order(workflow_run_id, 0)
@@ -3051,7 +3036,6 @@ class TaskV2Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus  # noqa: PLC0415
@@ -3123,7 +3107,6 @@ class TaskV2Block(Block):
                 request_id=None,
                 max_steps_override=self.max_steps,
                 browser_session_id=browser_session_id,
-                code_gen=code_gen,
             )
         finally:
             context: skyvern_context.SkyvernContext | None = skyvern_context.current()
@@ -3241,7 +3224,6 @@ class HttpRequestBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         """Execute the HTTP request and return the response"""
