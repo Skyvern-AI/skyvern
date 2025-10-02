@@ -1700,6 +1700,7 @@ class AgentDB:
         run_with: str | None = None,
         debug_session_id: str | None = None,
         ai_fallback: bool | None = None,
+        code_gen: bool | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1721,6 +1722,7 @@ class AgentDB:
                     run_with=run_with,
                     debug_session_id=debug_session_id,
                     ai_fallback=ai_fallback,
+                    code_gen=code_gen,
                 )
                 session.add(workflow_run)
                 await session.commit()

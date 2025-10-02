@@ -197,6 +197,7 @@ class WorkflowService:
         max_steps_override: int | None = None,
         parent_workflow_run_id: str | None = None,
         debug_session_id: str | None = None,
+        code_gen: bool | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -231,6 +232,7 @@ class WorkflowService:
             parent_workflow_run_id=parent_workflow_run_id,
             sequential_key=workflow.sequential_key,
             debug_session_id=debug_session_id,
+            code_gen=code_gen,
         )
         LOG.info(
             f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
@@ -243,6 +245,7 @@ class WorkflowService:
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             ai_fallback=workflow_request.ai_fallback,
             run_with=workflow_request.run_with,
+            code_gen=code_gen,
         )
         context: skyvern_context.SkyvernContext | None = skyvern_context.current()
         current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
@@ -322,7 +325,6 @@ class WorkflowService:
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
@@ -407,8 +409,11 @@ class WorkflowService:
         # Check if there's a related workflow script that should be used instead
         workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
         current_context = skyvern_context.current()
-        if workflow_script and current_context:
-            current_context.published_workflow_script_id = workflow_script.script_id
+        if current_context:
+            if workflow_script:
+                current_context.generate_script = False
+            if workflow_run.code_gen:
+                current_context.generate_script = True
         is_script_run = self.should_run_script(workflow, workflow_run)
         if workflow_script and is_script_run:
             LOG.info(
@@ -452,7 +457,6 @@ class WorkflowService:
                     workflow=workflow,
                     workflow_run=workflow_run,
                     block_labels=block_labels,
-                    code_gen=code_gen,
                 )
             else:
                 LOG.info(
@@ -736,6 +740,7 @@ class WorkflowService:
         extra_http_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
         max_steps: int | None = None,
+        status: WorkflowStatus = WorkflowStatus.auto_generated,
         run_with: str | None = None,
         ai_fallback: bool = True,
     ) -> Workflow:
@@ -779,6 +784,7 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            status=status,
             run_with=run_with,
             ai_fallback=ai_fallback,
         )
@@ -1051,6 +1057,7 @@ class WorkflowService:
         parent_workflow_run_id: str | None = None,
         sequential_key: str | None = None,
         debug_session_id: str | None = None,
+        code_gen: bool | None = None,
     ) -> WorkflowRun:
         # validate the browser session id
         if workflow_request.browser_session_id:
@@ -1078,6 +1085,7 @@ class WorkflowService:
             run_with=workflow_request.run_with,
             debug_session_id=debug_session_id,
             ai_fallback=workflow_request.ai_fallback,
+            code_gen=code_gen,
         )
 
     async def _update_workflow_run_status(
@@ -2682,8 +2690,8 @@ class WorkflowService:
         workflow: Workflow,
         workflow_run: WorkflowRun,
         block_labels: list[str] | None = None,
-        code_gen: bool | None = None,
     ) -> None:
+        code_gen = workflow_run.code_gen
         LOG.info(
             "Generate script?",
             block_labels=block_labels,

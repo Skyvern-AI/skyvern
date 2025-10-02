@@ -567,6 +567,7 @@ async def create_workflow_from_prompt(
             extra_http_headers=data.extra_http_headers,
             max_iterations=x_max_iterations_override,
             max_steps=x_max_steps_override,
+            status=WorkflowStatus.published if data.publish_workflow else WorkflowStatus.auto_generated,
             run_with=data.run_with,
             ai_fallback=data.ai_fallback,
         )
@@ -1008,7 +1009,6 @@ async def run_block(
         user_id=user_id,
         browser_session_id=browser_session_id,
         block_outputs=block_run_request.block_outputs,
-        code_gen=block_run_request.code_gen,
     )
 
     return BlockRunResponse(
@@ -2366,7 +2366,7 @@ async def new_debug_session(
     new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        proxy_location=ProxyLocation.RESIDENTIAL,
     )
 
     debug_session = await app.DATABASE.create_debug_session(

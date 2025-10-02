@@ -547,6 +547,7 @@ class ForgeAgent:
                             final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
 
                         # Check if file with this name already exists
+                        final_file_name = final_file_name
                         target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
                         counter = 1
                         while os.path.exists(target_path):
@@ -555,7 +556,7 @@ class ForgeAgent:
                             target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
                             counter += 1
 
-                        rename_file(os.path.join(workflow_download_directory, file), target_path)
+                        rename_file(os.path.join(workflow_download_directory, file), final_file_name + file_extension)
 
                     LOG.info(
                         "Task marked as completed due to download",

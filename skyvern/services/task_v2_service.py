@@ -306,7 +306,6 @@ async def run_task_v2(
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
-    code_gen: bool | None = None,
 ) -> TaskV2:
     organization_id = organization.organization_id
     try:
@@ -335,7 +334,6 @@ async def run_task_v2(
             request_id=request_id,
             max_steps_override=max_steps_override,
             browser_session_id=browser_session_id,
-            code_gen=code_gen,
         )
     except TaskTerminationError as e:
         task_v2 = await mark_task_v2_as_terminated(
@@ -392,7 +390,6 @@ async def run_task_v2_helper(
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
-    code_gen: bool | None = None,
 ) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
     task_v2_id = task_v2.observer_cruise_id
@@ -770,26 +767,6 @@ async def run_task_v2_helper(
                     failure_reason=f"Unsupported task block type gets generated: {task_type}",
                 )
                 break
-
-        # generate the extraction task
-        block_result = await block.execute_safe(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            code_gen=code_gen,
-        )
-        task_history_record["status"] = str(block_result.status)
-        if block_result.failure_reason:
-            task_history_record["reason"] = block_result.failure_reason
-
-        extracted_data = _get_extracted_data_from_block_result(
-            block_result,
-            task_type,
-            task_v2_id=task_v2_id,
-            workflow_run_id=workflow_run_id,
-        )
-        if extracted_data is not None:
-            task_history_record["extracted_data"] = extracted_data
-        task_history.append(task_history_record)
         # refresh workflow
         yaml_blocks.extend(block_yaml_list)
         yaml_parameters.extend(parameter_yaml_list)
@@ -816,6 +793,24 @@ async def run_task_v2_helper(
         )
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
+        # generate the extraction task
+        block_result = await block.execute_safe(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        task_history_record["status"] = str(block_result.status)
+        if block_result.failure_reason:
+            task_history_record["reason"] = block_result.failure_reason
+
+        extracted_data = _get_extracted_data_from_block_result(
+            block_result,
+            task_type,
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+        )
+        if extracted_data is not None:
+            task_history_record["extracted_data"] = extracted_data
+        task_history.append(task_history_record)
         # execute the extraction task
         workflow_run = await handle_block_result(
             task_v2_id,
@@ -905,11 +900,10 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
-                if task_v2.run_with == "code" or code_gen:  # TODO(jdo): not sure about this one...
+                if task_v2.run_with == "code":
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
-                        code_gen=code_gen,
                     )
                 break
 
