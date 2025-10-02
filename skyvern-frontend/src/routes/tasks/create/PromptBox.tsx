@@ -150,6 +150,9 @@ function PromptBox() {
           proxy_location: proxyLocation,
           totp_identifier: totpIdentifier,
           max_screenshot_scrolls: maxScreenshotScrolls,
+          publish_workflow: publishWorkflow,
+          run_with: "code",
+          ai_fallback: true,
           extracted_information_schema: dataSchema
             ? (() => {
                 try {

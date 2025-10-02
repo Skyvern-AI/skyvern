@@ -122,6 +122,7 @@ const useWorkflowSave = () => {
           blocks: saveData.blocks,
         },
         is_saved_task: saveData.workflow.is_saved_task,
+        status: saveData.workflow.status,
         run_sequentially: saveData.settings.runSequentially,
         sequential_key: saveData.settings.sequentialKey,
       };

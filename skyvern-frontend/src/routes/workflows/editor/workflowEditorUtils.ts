@@ -2136,6 +2136,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
     is_saved_task: workflow.is_saved_task,
+    status: workflow.status,
     run_with: workflow.run_with,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
