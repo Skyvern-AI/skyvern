@@ -2673,6 +2673,25 @@ class AgentDB:
             await session.refresh(new_action)
             return Action.model_validate(new_action)
 
+    async def update_action_reasoning(
+        self,
+        organization_id: str,
+        action_id: str,
+        reasoning: str,
+    ) -> Action:
+        async with self.Session() as session:
+            action = (
+                await session.scalars(
+                    select(ActionModel).filter_by(action_id=action_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if action:
+                action.reasoning = reasoning
+                await session.commit()
+                await session.refresh(action)
+                return Action.model_validate(action)
+            raise NotFoundError(f"Action {action_id}")
+
     async def retrieve_action_plan(self, task: Task) -> list[Action]:
         async with self.Session() as session:
             subquery = (
