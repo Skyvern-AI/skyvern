@@ -33,6 +33,16 @@ import { TaskFormSection } from "./TaskFormSection";
 import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
 import { OrganizationApiResponse, ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogClose,
+} from "@/components/ui/dialog";
+import { AnimatedWave } from "@/components/AnimatedWave";
 
 type Props = {
   initialValues: SavedTaskFormValues;
@@ -119,6 +129,9 @@ function SavedTaskForm({ initialValues }: Props) {
     "base",
   ]);
   const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
+  const [openWorkflowDefinitionChangeDialogue, setOpenWorkflowDefinitionChangeDialogue] =
+    useState(false);
+  const [pendingSaveValues, setPendingSaveValues] = useState<SavedTaskFormValues | null>(null);
 
   const { data: organizations } = useQuery<Array<OrganizationApiResponse>>({
     queryKey: ["organizations"],
@@ -128,6 +141,19 @@ function SavedTaskForm({ initialValues }: Props) {
         .get("/organizations")
         .then((response) => response.data.organizations);
     },
+  });
+
+  // Fetch the original workflow to compare for definition changes
+  const { data: originalWorkflow } = useQuery({
+    queryKey: ["savedTasks", template],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      return client
+        .get(`/workflows/${template}`)
+        .then((response) => response.data);
+    },
+    enabled: !!template,
+    refetchOnWindowFocus: false,
   });
 
   const organization = organizations?.[0];
@@ -254,8 +280,61 @@ function SavedTaskForm({ initialValues }: Props) {
     createAndSaveTaskMutation.mutate(values);
   }
 
+  function checkWorkflowDefinitionChanged(values: SavedTaskFormValues): boolean {
+    if (!originalWorkflow) {
+      return false;
+    }
+
+    const normalizeDefinition = (def: any) => {
+      const fieldsToRemove = [
+        "created_at",
+        "modified_at",
+        "deleted_at",
+        "output_parameter_id",
+        "workflow_id",
+        "workflow_parameter_id",
+      ];
+      
+      const removeFields = (obj: any): any => {
+        if (Array.isArray(obj)) {
+          return obj.map(removeFields);
+        } else if (obj !== null && typeof obj === "object") {
+          const newObj: any = {};
+          for (const [key, value] of Object.entries(obj)) {
+            if (!fieldsToRemove.includes(key)) {
+              newObj[key] = removeFields(value);
+            }
+          }
+          return newObj;
+        }
+        return obj;
+      };
+
+      return JSON.stringify(removeFields(def));
+    };
+
+    const newDefinition = createTaskTemplateRequestObject(values).workflow_definition;
+    const originalDefinition = originalWorkflow.workflow_definition;
+
+    return normalizeDefinition(newDefinition) !== normalizeDefinition(originalDefinition);
+  }
+
   function handleSave(values: SavedTaskFormValues) {
+    const definitionChanged = checkWorkflowDefinitionChanged(values);
+    if (definitionChanged) {
+      setPendingSaveValues(values);
+      setOpenWorkflowDefinitionChangeDialogue(true);
+      return;
+    }
     saveTaskMutation.mutate(values);
+  }
+
+  function confirmSave() {
+    if (pendingSaveValues) {
+      saveTaskMutation.mutate(pendingSaveValues);
+      setPendingSaveValues(null);
+      setOpenWorkflowDefinitionChangeDialogue(false);
+    }
   }
 
   function isActive(section: Section) {
@@ -777,6 +856,70 @@ function SavedTaskForm({ initialValues }: Props) {
           </Button>
         </div>
       </form>
+
+      {/* workflow definition change warning dialog */}
+      <Dialog
+        open={openWorkflowDefinitionChangeDialogue}
+        onOpenChange={(open) => {
+          if (!open && saveTaskMutation.isPending) {
+            return;
+          }
+          setOpenWorkflowDefinitionChangeDialogue(open);
+          if (!open) {
+            setPendingSaveValues(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Workflow Definition Changed</DialogTitle>
+            <DialogDescription>
+              <div className="pb-2 pt-4 text-sm text-slate-400">
+                {saveTaskMutation.isPending ? (
+                  <>
+                    Saving changes and deleting published workflow scripts...
+                    <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                  </>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    <p>
+                      You have made changes to the task template definition.
+                    </p>
+                    <p className="font-semibold text-orange-400">
+                      All published workflow scripts will be deleted when you save these changes.
+                    </p>
+                    <p>
+                      This ensures generated code stays in sync with your task template structure.
+                      Do you want to continue?
+                    </p>
+                  </div>
+                )}
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {!saveTaskMutation.isPending && (
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+            )}
+            <Button
+              variant="default"
+              onClick={confirmSave}
+              disabled={saveTaskMutation.isPending}
+            >
+              {saveTaskMutation.isPending ? (
+                <>
+                  Saving...
+                  <ReloadIcon className="ml-2 size-4 animate-spin" />
+                </>
+              ) : (
+                "Save and Delete Scripts"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Form>
   );
 }

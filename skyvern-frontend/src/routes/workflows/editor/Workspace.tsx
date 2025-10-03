@@ -58,6 +58,7 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
+  useCheckWorkflowDefinitionChanged,
 } from "@/store/WorkflowHasChangesStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 
@@ -155,12 +156,15 @@ function Workspace({
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const saveWorkflow = useWorkflowSave();
+  const checkWorkflowDefinitionChanged = useCheckWorkflowDefinitionChanged();
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
   const interactor = workflowRun && isFinalized === false ? "agent" : "human";
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
+    useState(false);
+  const [openWorkflowDefinitionChangeDialogue, setOpenWorkflowDefinitionChangeDialogue] =
     useState(false);
   const [toDeleteCacheKeyValue, setToDeleteCacheKeyValue] = useState<
     string | null
@@ -847,6 +851,76 @@ function Workspace({
         </DialogContent>
       </Dialog>
 
+      {/* workflow definition change warning dialog */}
+      <Dialog
+        open={openWorkflowDefinitionChangeDialogue}
+        onOpenChange={(open) => {
+          if (!open && saveWorkflow.isPending) {
+            return;
+          }
+          setOpenWorkflowDefinitionChangeDialogue(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Workflow Definition Changed</DialogTitle>
+            <DialogDescription>
+              <div className="pb-2 pt-4 text-sm text-slate-400">
+                {saveWorkflow.isPending ? (
+                  <>
+                    Saving changes and deleting published workflow scripts...
+                    <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
+                  </>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    <p>
+                      You have made changes to the workflow definition (blocks or parameters).
+                    </p>
+                    <p className="font-semibold text-orange-400">
+                      All published workflow scripts will be deleted when you save these changes.
+                    </p>
+                    <p>
+                      This ensures generated code stays in sync with your workflow structure.
+                      Do you want to continue?
+                    </p>
+                  </div>
+                )}
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            {!saveWorkflow.isPending && (
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+            )}
+            <Button
+              variant="default"
+              onClick={async () => {
+                await saveWorkflow.mutateAsync();
+
+                queryClient.invalidateQueries({
+                  queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
+                });
+
+                setCacheKeyValueFilter("");
+                setOpenWorkflowDefinitionChangeDialogue(false);
+              }}
+              disabled={saveWorkflow.isPending}
+            >
+              {saveWorkflow.isPending ? (
+                <>
+                  Saving...
+                  <ReloadIcon className="ml-2 size-4 animate-spin" />
+                </>
+              ) : (
+                "Save and Delete Scripts"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* header panel */}
       <div className="absolute left-6 right-6 top-8 z-40 h-20">
         <WorkflowHeader
@@ -915,6 +989,15 @@ function Workspace({
               });
               return;
             }
+            
+            // Check if workflow definition has changed
+            const definitionChanged = checkWorkflowDefinitionChanged();
+            if (definitionChanged) {
+              // Show confirmation dialog
+              setOpenWorkflowDefinitionChangeDialogue(true);
+              return;
+            }
+            
             await saveWorkflow.mutateAsync();
 
             queryClient.invalidateQueries({

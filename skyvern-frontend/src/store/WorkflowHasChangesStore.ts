@@ -28,15 +28,54 @@ type WorkflowHasChangesStore = {
   getSaveData: () => SaveData | null;
   hasChanges: boolean;
   saveIsPending: boolean;
+  workflowDefinitionChanged: boolean;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
+  setWorkflowDefinitionChanged: (changed: boolean) => void;
 };
+
+/**
+ * Helper function to normalize workflow definition for comparison
+ * Removes fields that shouldn't affect equality (similar to backend's _get_workflow_definition_without_dates)
+ */
+function normalizeWorkflowDefinition(definition: {
+  parameters: Array<ParameterYAML>;
+  blocks: Array<BlockYAML>;
+}): string {
+  const fieldsToRemove = [
+    "created_at",
+    "modified_at",
+    "deleted_at",
+    "output_parameter_id",
+    "workflow_id",
+    "workflow_parameter_id",
+  ];
+
+  const removeFields = (obj: any): any => {
+    if (Array.isArray(obj)) {
+      return obj.map(removeFields);
+    } else if (obj !== null && typeof obj === "object") {
+      const newObj: any = {};
+      for (const [key, value] of Object.entries(obj)) {
+        if (!fieldsToRemove.includes(key)) {
+          newObj[key] = removeFields(value);
+        }
+      }
+      return newObj;
+    }
+    return obj;
+  };
+
+  const normalized = removeFields(definition);
+  return JSON.stringify(normalized);
+}
 
 const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   return {
     hasChanges: false,
     saveIsPending: false,
+    workflowDefinitionChanged: false,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
@@ -47,8 +86,43 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     setSaveIsPending: (isPending: boolean) => {
       set({ saveIsPending: isPending });
     },
+    setWorkflowDefinitionChanged: (changed: boolean) => {
+      set({ workflowDefinitionChanged: changed });
+    },
   };
 });
+
+/**
+ * Hook to check if workflow definition has changed compared to the original
+ */
+const useCheckWorkflowDefinitionChanged = () => {
+  const { getSaveData, setWorkflowDefinitionChanged } =
+    useWorkflowHasChangesStore();
+
+  const checkDefinitionChanged = () => {
+    const saveData = getSaveData();
+    if (!saveData) {
+      setWorkflowDefinitionChanged(false);
+      return false;
+    }
+
+    const currentDefinition = normalizeWorkflowDefinition({
+      parameters: saveData.parameters,
+      blocks: saveData.blocks,
+    });
+
+    const originalDefinition = normalizeWorkflowDefinition({
+      parameters: saveData.workflow.workflow_definition.parameters,
+      blocks: saveData.workflow.workflow_definition.blocks,
+    });
+
+    const changed = currentDefinition !== originalDefinition;
+    setWorkflowDefinitionChanged(changed);
+    return changed;
+  };
+
+  return checkDefinitionChanged;
+};
 
 const useWorkflowSave = () => {
   const credentialGetter = useCredentialGetter();
@@ -186,5 +260,6 @@ const useWorkflowSave = () => {
 export {
   useWorkflowSave,
   useWorkflowHasChangesStore,
+  useCheckWorkflowDefinitionChanged,
   type SaveData as WorkflowSaveData,
 };
