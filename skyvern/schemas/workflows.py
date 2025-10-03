@@ -525,7 +525,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str | None = None
     ai_fallback: bool = False
-    cache_key: str | None = None
+    cache_key: str = "default"
     run_sequentially: bool = False
     sequential_key: str | None = None
 
