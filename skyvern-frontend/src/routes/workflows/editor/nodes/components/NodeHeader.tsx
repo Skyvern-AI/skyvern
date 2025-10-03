@@ -73,6 +73,7 @@ const getPayload = (opts: {
   blockLabel: string;
   blockOutputs: Record<string, unknown>;
   browserSessionId: string | null;
+  debugSessionId: string;
   codeGen: boolean | null;
   parameters: Record<string, unknown>;
   totpIdentifier: string | null;
@@ -117,6 +118,7 @@ const getPayload = (opts: {
     block_labels: [opts.blockLabel],
     block_outputs: opts.blockOutputs,
     browser_session_id: opts.browserSessionId,
+    debug_session_id: opts.debugSessionId,
     code_gen: opts.codeGen,
     extra_http_headers: extraHttpHeaders,
     max_screenshot_scrolls: opts.workflowSettings.maxScreenshotScrollingTimes,
@@ -315,6 +317,7 @@ function NodeHeader({
         blockOutputs:
           blockOutputsStore.getOutputsWithOverrides(workflowPermanentId),
         browserSessionId: debugSession.browser_session_id,
+        debugSessionId: debugSession.debug_session_id,
         codeGen: opts?.codeGen ?? false,
         parameters,
         totpIdentifier,
