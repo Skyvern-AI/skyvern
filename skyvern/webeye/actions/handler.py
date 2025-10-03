@@ -3451,6 +3451,20 @@ async def normal_select(
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
+    try:
+        await locator.click(
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception as e:
+        LOG.info(
+            "Failed to click before select action",
+            exc_info=True,
+            action=action,
+            locator=locator,
+        )
+        action_result.append(ActionFailure(e))
+        return action_result
+
     if not is_success and value is not None:
         try:
             # click by value (if it matches)
