@@ -268,6 +268,55 @@ class SkyvernPage:
             timeout=timeout,
         )
 
+    async def _update_action_reasoning(
+        self,
+        action_id: str,
+        organization_id: str,
+        action_type: ActionType,
+        intention: str = "",
+        text: str | None = None,
+        select_option: SelectOption | None = None,
+        file_url: str | None = None,
+        data_extraction_goal: str | None = None,
+        data_extraction_schema: dict[str, Any] | list | str | None = None,
+    ) -> str:
+        """Generate user-facing reasoning for an action using the secondary LLM."""
+        reasoning = f"Auto-generated action for {action_type.value}"
+        try:
+            context = skyvern_context.current()
+            if not context or not context.organization_id:
+                return f"Auto-generated action for {action_type.value}"
+
+            # Build the prompt with available context
+            prompt = prompt_engine.load_prompt(
+                template="generate-action-reasoning",
+                action_type=action_type.value,
+                intention=intention,
+                text=text,
+                select_option=select_option.value if select_option else None,
+                file_url=file_url,
+                data_extraction_goal=data_extraction_goal,
+                data_extraction_schema=data_extraction_schema,
+            )
+
+            # Call secondary LLM to generate reasoning
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt,
+                prompt_name="generate-action-reasoning",
+                organization_id=context.organization_id,
+            )
+
+            reasoning = json_response.get("reasoning", f"Auto-generated action for {action_type.value}")
+
+        except Exception:
+            LOG.warning("Failed to generate action reasoning, using fallback", action_type=action_type)
+        await app.DATABASE.update_action_reasoning(
+            organization_id=organization_id,
+            action_id=action_id,
+            reasoning=reasoning,
+        )
+        return reasoning
+
     async def _create_action_after_execution(
         self,
         action_type: ActionType,
@@ -312,14 +361,17 @@ class SkyvernPage:
                 step_order=0,  # Will be updated by the system if needed
                 action_order=context.action_order,  # Will be updated by the system if needed
                 intention=intention,
-                reasoning=f"Auto-generated action for {action_type.value}",
                 text=text,
                 option=select_option,
                 file_url=file_url,
                 response=response,
                 created_by="script",
             )
+            data_extraction_goal = None
+            data_extraction_schema = None
             if action_type == ActionType.EXTRACT:
+                data_extraction_goal = kwargs.get("prompt")
+                data_extraction_schema = kwargs.get("schema")
                 action = ExtractAction(
                     element_id="",
                     action_type=action_type,
@@ -331,15 +383,29 @@ class SkyvernPage:
                     step_order=0,
                     action_order=context.action_order,
                     intention=intention,
-                    reasoning=f"Auto-generated action for {action_type.value}",
-                    data_extraction_goal=kwargs.get("prompt"),
-                    data_extraction_schema=kwargs.get("schema"),
+                    data_extraction_goal=data_extraction_goal,
+                    data_extraction_schema=data_extraction_schema,
                     option=select_option,
                     response=response,
                     created_by="script",
                 )
 
             created_action = await app.DATABASE.create_action(action)
+            # Generate user-facing reasoning using secondary LLM
+            asyncio.create_task(
+                self._update_action_reasoning(
+                    action_id=str(created_action.action_id),
+                    organization_id=str(context.organization_id),
+                    action_type=action_type,
+                    intention=intention,
+                    text=text,
+                    select_option=select_option,
+                    file_url=file_url,
+                    data_extraction_goal=data_extraction_goal,
+                    data_extraction_schema=data_extraction_schema,
+                )
+            )
+
             context.action_order += 1
 
             return created_action
