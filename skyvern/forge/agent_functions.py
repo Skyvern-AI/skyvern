@@ -626,7 +626,7 @@ class AgentFunction:
             not context
             or not context.root_workflow_run_id
             or not context.organization_id
-            or context.published_workflow_script_id
+            or not context.generate_script
         ):
             return
         root_workflow_run_id = context.root_workflow_run_id

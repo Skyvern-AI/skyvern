@@ -292,6 +292,7 @@ class WorkflowRunModel(Base):
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
     ai_fallback = Column(Boolean, nullable=True)
+    code_gen = Column(Boolean, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)

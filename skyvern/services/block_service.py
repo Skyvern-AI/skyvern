@@ -45,6 +45,7 @@ async def ensure_workflow_run(
         max_steps=x_max_steps_override,
         request_id=context.request_id,
         debug_session_id=block_run_request.debug_session_id,
+        code_gen=block_run_request.code_gen,
     )
 
     return workflow_run
@@ -62,7 +63,6 @@ async def execute_blocks(
     user_id: str,
     browser_session_id: str | None = None,
     block_outputs: dict[str, t.Any] | None = None,
-    code_gen: bool | None = None,
 ) -> None:
     """
     Runs one or more blocks of a workflow.
@@ -115,5 +115,4 @@ async def execute_blocks(
         api_key=api_key,
         block_labels=block_labels,
         block_outputs=block_outputs,
-        code_gen=code_gen,
     )

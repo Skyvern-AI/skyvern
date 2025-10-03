@@ -48,7 +48,6 @@ class AsyncExecutor(abc.ABC):
         browser_session_id: str | None,
         block_labels: list[str] | None,
         block_outputs: dict[str, Any] | None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> None:
         pass
@@ -154,7 +153,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
         browser_session_id: str | None,
         block_labels: list[str] | None,
         block_outputs: dict[str, Any] | None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> None:
         if background_tasks:
@@ -175,7 +173,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 browser_session_id=browser_session_id,
                 block_labels=block_labels,
                 block_outputs=block_outputs,
-                code_gen=code_gen,
             )
         else:
             LOG.warning("Background tasks not enabled, skipping workflow execution")
