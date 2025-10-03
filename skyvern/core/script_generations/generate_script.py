@@ -1741,6 +1741,7 @@ async def generate_workflow_script_python_code(
                     script_id=script_id,
                     organization_id=organization_id,
                     block_label=block_name,
+                    update=pending,
                 )
             except Exception as e:
                 LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
@@ -1845,13 +1846,11 @@ async def create_or_update_script_block(
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
         # Step 3: Create script block in database
-        script_block = None
-        if update:
-            script_block = await app.DATABASE.get_script_block_by_label(
-                organization_id=organization_id,
-                script_revision_id=script_revision_id,
-                script_block_label=block_label,
-            )
+        script_block = await app.DATABASE.get_script_block_by_label(
+            organization_id=organization_id,
+            script_revision_id=script_revision_id,
+            script_block_label=block_label,
+        )
         if not script_block:
             script_block = await app.DATABASE.create_script_block(
                 script_revision_id=script_revision_id,

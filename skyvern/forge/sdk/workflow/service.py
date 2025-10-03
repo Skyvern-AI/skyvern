@@ -249,6 +249,9 @@ class WorkflowService:
         )
         context: skyvern_context.SkyvernContext | None = skyvern_context.current()
         current_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
+        root_workflow_run_id = (
+            context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run.workflow_run_id
+        )
         skyvern_context.set(
             SkyvernContext(
                 organization_id=organization.organization_id,
@@ -256,7 +259,7 @@ class WorkflowService:
                 request_id=request_id,
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
-                root_workflow_run_id=workflow_run.workflow_run_id,
+                root_workflow_run_id=root_workflow_run_id,
                 run_id=current_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 max_steps_override=max_steps_override,
