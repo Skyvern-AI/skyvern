@@ -164,8 +164,10 @@ function Workspace({
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
-  const [openWorkflowDefinitionChangeDialogue, setOpenWorkflowDefinitionChangeDialogue] =
-    useState(false);
+  const [
+    openWorkflowDefinitionChangeDialogue,
+    setOpenWorkflowDefinitionChangeDialogue,
+  ] = useState(false);
   const [toDeleteCacheKeyValue, setToDeleteCacheKeyValue] = useState<
     string | null
   >(null);
@@ -874,14 +876,16 @@ function Workspace({
                 ) : (
                   <div className="flex flex-col gap-3">
                     <p>
-                      You have made changes to the workflow definition (blocks or parameters).
+                      You have made changes to the workflow definition (blocks
+                      or parameters).
                     </p>
                     <p className="font-semibold text-orange-400">
-                      All published workflow scripts will be deleted when you save these changes.
+                      All published workflow scripts will be deleted when you
+                      save these changes.
                     </p>
                     <p>
-                      This ensures generated code stays in sync with your workflow structure.
-                      Do you want to continue?
+                      This ensures generated code stays in sync with your
+                      workflow structure. Do you want to continue?
                     </p>
                   </div>
                 )}
@@ -989,7 +993,7 @@ function Workspace({
               });
               return;
             }
-            
+
             // Check if workflow definition has changed
             const definitionChanged = checkWorkflowDefinitionChanged();
             if (definitionChanged) {
@@ -997,7 +1001,7 @@ function Workspace({
               setOpenWorkflowDefinitionChangeDialogue(true);
               return;
             }
-            
+
             await saveWorkflow.mutateAsync();
 
             queryClient.invalidateQueries({

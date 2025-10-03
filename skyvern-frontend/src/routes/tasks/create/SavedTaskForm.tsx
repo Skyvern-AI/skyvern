@@ -129,9 +129,12 @@ function SavedTaskForm({ initialValues }: Props) {
     "base",
   ]);
   const [showAdvancedBaseContent, setShowAdvancedBaseContent] = useState(false);
-  const [openWorkflowDefinitionChangeDialogue, setOpenWorkflowDefinitionChangeDialogue] =
-    useState(false);
-  const [pendingSaveValues, setPendingSaveValues] = useState<SavedTaskFormValues | null>(null);
+  const [
+    openWorkflowDefinitionChangeDialogue,
+    setOpenWorkflowDefinitionChangeDialogue,
+  ] = useState(false);
+  const [pendingSaveValues, setPendingSaveValues] =
+    useState<SavedTaskFormValues | null>(null);
 
   const { data: organizations } = useQuery<Array<OrganizationApiResponse>>({
     queryKey: ["organizations"],
@@ -280,11 +283,14 @@ function SavedTaskForm({ initialValues }: Props) {
     createAndSaveTaskMutation.mutate(values);
   }
 
-  function checkWorkflowDefinitionChanged(values: SavedTaskFormValues): boolean {
+  function checkWorkflowDefinitionChanged(
+    values: SavedTaskFormValues,
+  ): boolean {
     if (!originalWorkflow) {
       return false;
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const normalizeDefinition = (def: any) => {
       const fieldsToRemove = [
         "created_at",
@@ -294,11 +300,13 @@ function SavedTaskForm({ initialValues }: Props) {
         "workflow_id",
         "workflow_parameter_id",
       ];
-      
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const removeFields = (obj: any): any => {
         if (Array.isArray(obj)) {
           return obj.map(removeFields);
         } else if (obj !== null && typeof obj === "object") {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const newObj: any = {};
           for (const [key, value] of Object.entries(obj)) {
             if (!fieldsToRemove.includes(key)) {
@@ -313,10 +321,14 @@ function SavedTaskForm({ initialValues }: Props) {
       return JSON.stringify(removeFields(def));
     };
 
-    const newDefinition = createTaskTemplateRequestObject(values).workflow_definition;
+    const newDefinition =
+      createTaskTemplateRequestObject(values).workflow_definition;
     const originalDefinition = originalWorkflow.workflow_definition;
 
-    return normalizeDefinition(newDefinition) !== normalizeDefinition(originalDefinition);
+    return (
+      normalizeDefinition(newDefinition) !==
+      normalizeDefinition(originalDefinition)
+    );
   }
 
   function handleSave(values: SavedTaskFormValues) {
@@ -886,11 +898,12 @@ function SavedTaskForm({ initialValues }: Props) {
                       You have made changes to the task template definition.
                     </p>
                     <p className="font-semibold text-orange-400">
-                      All published workflow scripts will be deleted when you save these changes.
+                      All published workflow scripts will be deleted when you
+                      save these changes.
                     </p>
                     <p>
-                      This ensures generated code stays in sync with your task template structure.
-                      Do you want to continue?
+                      This ensures generated code stays in sync with your task
+                      template structure. Do you want to continue?
                     </p>
                   </div>
                 )}

@@ -39,10 +39,8 @@ type WorkflowHasChangesStore = {
  * Helper function to normalize workflow definition for comparison
  * Removes fields that shouldn't affect equality (similar to backend's _get_workflow_definition_without_dates)
  */
-function normalizeWorkflowDefinition(definition: {
-  parameters: Array<ParameterYAML>;
-  blocks: Array<BlockYAML>;
-}): string {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function normalizeWorkflowDefinition(definition: any): string {
   const fieldsToRemove = [
     "created_at",
     "modified_at",
@@ -52,10 +50,12 @@ function normalizeWorkflowDefinition(definition: {
     "workflow_parameter_id",
   ];
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const removeFields = (obj: any): any => {
     if (Array.isArray(obj)) {
       return obj.map(removeFields);
     } else if (obj !== null && typeof obj === "object") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const newObj: any = {};
       for (const [key, value] of Object.entries(obj)) {
         if (!fieldsToRemove.includes(key)) {
