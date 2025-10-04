@@ -440,7 +440,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
 
 
 def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> FunctionDef:
-    name = block.get("label") or _safe_name(block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     body_stmts: list[cst.BaseStatement] = []
     is_extraction_block = block.get("block_type") == "extraction"
 
@@ -482,7 +482,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
 
 def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, Any]]) -> FunctionDef:
     """Build a cached function for task_v2 blocks that calls child workflow sub-tasks."""
-    name = block.get("label") or _safe_name(block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     body_stmts: list[cst.BaseStatement] = []
 
     # Add calls to child workflow sub-tasks
