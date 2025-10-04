@@ -3,6 +3,7 @@ import { ThemeProvider } from "@/components/ThemeProvider";
 import { router } from "./router";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { queryClient } from "./api/QueryClient";
+import { MissingApiKeyBanner } from "@/components/MissingApiKeyBanner";
 
 import { PostHogProvider } from "posthog-js/react";
 import { LoggingContext, loggingStub } from "@/store/LoggingContext";
@@ -30,6 +31,7 @@ function App() {
         >
           <QueryClientProvider client={queryClient}>
             <ThemeProvider defaultTheme="dark">
+              <MissingApiKeyBanner />
               <RouterProvider router={router} />
             </ThemeProvider>
           </QueryClientProvider>
