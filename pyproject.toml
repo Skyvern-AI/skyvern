@@ -75,6 +75,7 @@ dependencies = [
     "azure-identity>=1.24.0,<2",
     "azure-keyvault>=4.2.0,<5",
     "dramatiq[asyncio]>=1.18.0,<2",
+    "aiosqlite>=0.21.0",
 ]
 
 [dependency-groups]
