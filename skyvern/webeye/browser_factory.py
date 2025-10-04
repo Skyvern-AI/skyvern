@@ -262,10 +262,17 @@ class BrowserContextFactory:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         try:
-            creator = cls._creators.get(browser_type)
-            if not creator:
-                raise UnknownBrowserType(browser_type)
-            browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            browser_address = kwargs.get("browser_address")
+            if browser_address:
+                browser_context, browser_artifacts, cleanup_func = await _connect_to_cdp_browser(
+                    playwright,
+                    remote_browser_url=str(browser_address),
+                )
+            else:
+                creator = cls._creators.get(browser_type)
+                if not creator:
+                    raise UnknownBrowserType(browser_type)
+                browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
 
@@ -550,13 +557,20 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
+    return await _connect_to_cdp_browser(playwright, settings.BROWSER_REMOTE_DEBUGGING_URL, extra_http_headers)
+
+
+async def _connect_to_cdp_browser(
+        playwright: Playwright,
+        remote_browser_url: str,
+        extra_http_headers: dict[str, str] | None = None,
+) -> tuple[BrowserContext, BrowserArtifacts, None]:
     browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
     )
 
-    remote_browser_url = settings.BROWSER_REMOTE_DEBUGGING_URL
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
 
