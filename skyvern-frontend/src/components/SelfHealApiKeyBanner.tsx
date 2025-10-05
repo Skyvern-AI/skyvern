@@ -116,21 +116,27 @@ function SelfHealApiKeyBanner() {
           {copy.title}
         </AlertTitle>
         <AlertDescription className="space-y-3 text-center text-sm leading-6">
-          <p>
-            {copy.description} Update <code>VITE_SKYVERN_API_KEY</code> in{" "}
-            <code className="mx-1">skyvern-frontend/.env</code>
-            by running <code>skyvern init</code> or click the button below to
-            regenerate it automatically.
-          </p>
-          <div className="flex justify-center">
-            <Button
-              onClick={handleRepair}
-              disabled={isRepairing}
-              variant="secondary"
-            >
-              {isRepairing ? "Regenerating…" : "Regenerate API key"}
-            </Button>
-          </div>
+          {bannerStatus !== "error" ? (
+            <>
+              <p>
+                {copy.description} Update <code>VITE_SKYVERN_API_KEY</code> in{" "}
+                <code className="mx-1">skyvern-frontend/.env</code>
+                by running <code>skyvern init</code> or click the button below
+                to regenerate it automatically.
+              </p>
+              <div className="flex justify-center">
+                <Button
+                  onClick={handleRepair}
+                  disabled={isRepairing}
+                  variant="secondary"
+                >
+                  {isRepairing ? "Regenerating…" : "Regenerate API key"}
+                </Button>
+              </div>
+            </>
+          ) : (
+            <p>{copy.description}</p>
+          )}
           {statusMessage ? (
             <p className="text-xs text-slate-200">{statusMessage}</p>
           ) : null}
