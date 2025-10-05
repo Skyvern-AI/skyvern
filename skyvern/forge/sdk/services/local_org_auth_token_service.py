@@ -29,7 +29,7 @@ def _write_env(path: Path, key: str, value: str) -> None:
 
 
 def fingerprint_token(value: str) -> str:
-    return f"{value[:6]}…{value[-4:]}" if len(value) > 12 else value
+    return f"{value[:6]}…{value[-4:]}" if len(value) > 12 else "[redacted -- token too short]"
 
 
 async def ensure_local_org() -> Organization:
