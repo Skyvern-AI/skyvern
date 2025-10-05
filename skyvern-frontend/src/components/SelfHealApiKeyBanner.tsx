@@ -52,7 +52,7 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
   }
 }
 
-function MissingApiKeyBanner() {
+function SelfHealApiKeyBanner() {
   const diagnosticsQuery = useAuthDiagnostics();
   const [isRepairing, setIsRepairing] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -146,4 +146,4 @@ function MissingApiKeyBanner() {
   );
 }
 
-export { MissingApiKeyBanner };
+export { SelfHealApiKeyBanner };
