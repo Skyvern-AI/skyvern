@@ -20,10 +20,6 @@ SKYVERN_LOCAL_ORG = "Skyvern-local"
 SKYVERN_LOCAL_DOMAIN = "skyvern.local"
 
 
-def fingerprint_token(value: str) -> str:
-    return f"{value[:6]}…{value[-4:]}" if len(value) > 12 else value
-
-
 def _write_env(path: Path, key: str, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
@@ -32,13 +28,8 @@ def _write_env(path: Path, key: str, value: str) -> None:
     LOG.info(".env written", path=(str(path)), key=key)
 
 
-def write_env_files(api_key: str) -> None:
-    """Persist the API key into the root and frontend .env files and update runtime state."""
-    _write_env(ROOT_ENV_PATH, "SKYVERN_API_KEY", api_key)
-    _write_env(FRONTEND_ENV_PATH, "VITE_SKYVERN_API_KEY", api_key)
-    settings.SKYVERN_API_KEY = api_key
-    os.environ["SKYVERN_API_KEY"] = api_key
-    os.environ["VITE_SKYVERN_API_KEY"] = api_key
+def fingerprint_token(value: str) -> str:
+    return f"{value[:6]}…{value[-4:]}" if len(value) > 12 else value
 
 
 async def ensure_local_org() -> Organization:
@@ -72,7 +63,10 @@ async def regenerate_local_api_key() -> tuple[str, str]:
         token_type=OrganizationAuthTokenType.api,
     )
 
-    write_env_files(api_key)
+    _write_env(ROOT_ENV_PATH, "SKYVERN_API_KEY", api_key)
+    _write_env(FRONTEND_ENV_PATH, "VITE_SKYVERN_API_KEY", api_key)
+    settings.SKYVERN_API_KEY = api_key
+    os.environ["SKYVERN_API_KEY"] = api_key
 
     LOG.info(
         "Local API key regenerated",
