@@ -2,7 +2,7 @@ import { useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { apiBaseUrl } from "@/util/env";
+import { getClient } from "@/api/AxiosClient";
 import {
   AuthStatusValue,
   useAuthDiagnostics,
@@ -87,21 +87,12 @@ function MissingApiKeyBanner() {
     setStatusMessage(null);
     setErrorMessage(null);
     try {
-      const repairUrl = apiBaseUrl
-        ? `${apiBaseUrl.replace(/\/$/, "")}/internal/auth/repair`
-        : "/internal/auth/repair";
-      const response = await fetch(repairUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(
-          payload.detail ?? payload.message ?? "Unable to repair API key",
-        );
-      }
-      const fingerprint = payload.fingerprint
-        ? ` (fingerprint ${payload.fingerprint})`
+      const client = await getClient(null);
+      const response = await client.post<{ fingerprint?: string }>(
+        "/internal/auth/repair",
+      );
+      const fingerprint = response.data.fingerprint
+        ? ` (fingerprint ${response.data.fingerprint})`
         : "";
       setStatusMessage(
         `API key regenerated${fingerprint}. The UI should reload automatically due to an .env update...`,
