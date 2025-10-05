@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import ipaddress
 from enum import Enum
 from typing import Any, NamedTuple
