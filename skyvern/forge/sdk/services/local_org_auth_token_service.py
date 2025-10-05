@@ -55,17 +55,10 @@ async def ensure_local_org() -> Organization:
     )
 
 
-async def regenerate_local_api_key(
-    organization_id: str | None = None,
-    *,
-    write_env: bool = True,
-) -> tuple[str, str]:
-    """Create a fresh API key for the local organization and optionally update env files."""
-    if organization_id is None:
-        organization = await ensure_local_org()
-        org_id = organization.organization_id
-    else:
-        org_id = organization_id
+async def regenerate_local_api_key() -> tuple[str, str]:
+    """Create a fresh API key for the local organization and persist it to env files."""
+    organization = await ensure_local_org()
+    org_id = organization.organization_id
 
     await app.DATABASE.invalidate_org_auth_tokens(
         organization_id=org_id,
@@ -79,8 +72,7 @@ async def regenerate_local_api_key(
         token_type=OrganizationAuthTokenType.api,
     )
 
-    if write_env:
-        write_env_files(api_key)
+    write_env_files(api_key)
 
     LOG.info(
         "Local API key regenerated",
