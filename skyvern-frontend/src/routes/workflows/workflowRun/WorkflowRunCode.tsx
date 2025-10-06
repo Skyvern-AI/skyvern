@@ -153,18 +153,19 @@ function WorkflowRunCode(props?: Props) {
 
   return (
     <div className="flex h-full w-full flex-col items-end justify-center gap-2">
-      <div className="flex w-full justify-end gap-4">
-        <div className="flex items-center justify-around gap-2">
-          <Label className="w-[7rem]">Code Key Value</Label>
-          <HelpTooltip
-            content={
-              !isFinalized
-                ? "The code key value the generated code is being stored under."
-                : "Which generated (& cached) code to view."
-            }
-          />
-        </div>
-        {cacheKeyValueSet.size > 0 ? (
+      {cacheKeyValueSet.size > 0 ? (
+        <div className="flex w-full justify-end gap-4">
+          <div className="flex items-center justify-around gap-2">
+            <Label className="w-[7rem]">Code Key Value</Label>
+            <HelpTooltip
+              content={
+                !isFinalized
+                  ? "The code key value the generated code is being stored under."
+                  : "Which generated (& cached) code to view."
+              }
+            />
+          </div>
+
           <Select
             disabled={!isFinalized}
             value={cacheKeyValue}
@@ -176,22 +177,28 @@ function WorkflowRunCode(props?: Props) {
             <SelectContent>
               {Array.from(cacheKeyValueSet)
                 .sort()
-                .map((value) => {
+                .map((value, i) => {
+                  const v = value
+                    ? value.length === 0
+                      ? "default"
+                      : value
+                    : "default";
+
                   return (
-                    <SelectItem key={value} value={value}>
+                    <SelectItem key={`${v}-${i}`} value={v}>
                       {value === cacheKeyValueForWorkflowRun &&
                       isFinalized === true ? (
-                        <span className="underline">{value}</span>
+                        <span className="underline">{v}</span>
                       ) : (
-                        value
+                        v
                       )}
                     </SelectItem>
                   );
                 })}
             </SelectContent>
           </Select>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
       <CodeEditor
         className={cn("h-full w-full overflow-y-scroll", {
           "animate-pulse": isGeneratingCode,
