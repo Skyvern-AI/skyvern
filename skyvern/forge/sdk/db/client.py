@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
@@ -1422,7 +1423,7 @@ class AgentDB:
                 status=status,
                 run_with=run_with,
                 ai_fallback=ai_fallback,
-                cache_key=cache_key,
+                cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
             )
