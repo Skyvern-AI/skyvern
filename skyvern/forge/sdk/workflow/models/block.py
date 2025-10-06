@@ -422,6 +422,7 @@ class BaseTaskBlock(Block):
     cache_actions: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
+    download_timeout: float | None = None  # minutes
 
     def get_all_parameters(
         self,
@@ -631,6 +632,7 @@ class BaseTaskBlock(Block):
                         failure_reason=str(e),
                     )
                     raise e
+
                 try:
                     # add screenshot artifact for the first task
                     screenshot = await browser_state.take_fullpage_screenshot(

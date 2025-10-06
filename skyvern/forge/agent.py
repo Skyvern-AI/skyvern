@@ -18,6 +18,7 @@ from playwright.async_api import Page
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
+    BROWSER_DOWNLOAD_TIMEOUT,
     BROWSER_DOWNLOADING_SUFFIX,
     DEFAULT_MAX_SCREENSHOT_SCROLLS,
     GET_DOWNLOADED_FILES_TIMEOUT,
@@ -199,6 +200,7 @@ class ForgeAgent:
             extra_http_headers=workflow_run.extra_http_headers,
             browser_address=workflow_run.browser_address,
             browser_session_id=workflow_run.browser_session_id,
+            download_timeout=task_block.download_timeout,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -217,6 +219,7 @@ class ForgeAgent:
             organization_id=task.organization_id,
             status=TaskStatus.running,
         )
+
         step = await app.DATABASE.create_step(
             task.task_id,
             order=0,
@@ -500,7 +503,10 @@ class ForgeAgent:
                         step_id=step.step_id,
                     )
                     try:
-                        await wait_for_download_finished(downloading_files=downloading_files)
+                        await wait_for_download_finished(
+                            downloading_files=downloading_files,
+                            timeout=task_block.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
+                        )
                     except DownloadFileMaxWaitingTime as e:
                         LOG.warning(
                             "There're several long-time downloading files, these files might be broken",

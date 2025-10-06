@@ -113,6 +113,11 @@ class TaskBase(BaseModel):
         description="The CDP address for the task.",
         examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
+    download_timeout: float | None = Field(
+        default=None,
+        description="The maximum time to wait for downloads to complete, in minutes. If not set, defaults to BROWSER_DOWNLOAD_TIMEOUT minutes.",
+        examples=[15.0],
+    )
 
 
 class TaskRequest(TaskBase):
