@@ -402,6 +402,7 @@ function convertToNode(
           cacheActions: block.cache_actions,
           maxStepsOverride: block.max_steps_per_run ?? null,
           engine: block.engine ?? RunEngine.SkyvernV1,
+          downloadTimeout: block.download_timeout ?? null, // seconds
         },
       };
     }
@@ -1213,6 +1214,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
         engine: node.data.engine,
+        download_timeout: node.data.downloadTimeout, // seconds
       };
     }
     case "sendEmail": {
@@ -1991,6 +1993,7 @@ function convertBlocksToBlockYAML(
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
           engine: block.engine,
+          download_timeout: null, // seconds
         };
         return blockYaml;
       }
