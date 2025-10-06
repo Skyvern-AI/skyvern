@@ -2490,6 +2490,7 @@ class WorkflowService:
                 cache_actions=block_yaml.cache_actions,
                 complete_on_download=True,
                 complete_verification=True,
+                download_timeout=block_yaml.download_timeout,
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(

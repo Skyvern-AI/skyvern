@@ -17,6 +17,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
+    BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
     REPO_ROOT_DIR,
     SKYVERN_ID_ATTR,
@@ -864,7 +865,7 @@ async def handle_click_to_download_file_action(
             "Checking if there is any new files after click",
             download_dir=download_dir,
         )
-        async with asyncio.timeout(BROWSER_DOWNLOAD_MAX_WAIT_TIME):
+        async with asyncio.timeout(task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME):
             while True:
                 list_files_after = list_files_in_directory(download_dir)
                 if task.browser_session_id:
@@ -913,7 +914,9 @@ async def handle_click_to_download_file_action(
         workflow_run_id=task.workflow_run_id,
     )
     try:
-        await wait_for_download_finished(downloading_files=downloading_files)
+        await wait_for_download_finished(
+            downloading_files=downloading_files, timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
+        )
     except DownloadFileMaxWaitingTime as e:
         LOG.warning(
             "There're several long-time downloading files, these files might be broken",
@@ -3450,6 +3453,20 @@ async def normal_select(
     json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
+
+    try:
+        await locator.click(
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception as e:
+        LOG.info(
+            "Failed to click before select action",
+            exc_info=True,
+            action=action,
+            locator=locator,
+        )
+        action_result.append(ActionFailure(e))
+        return action_result
 
     if not is_success and value is not None:
         try:

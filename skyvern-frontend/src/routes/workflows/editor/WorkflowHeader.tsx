@@ -40,6 +40,7 @@ type Props = {
   cacheKeyValue: string | null;
   cacheKeyValues: CacheKeyValuesResponse | undefined;
   cacheKeyValuesPanelOpen: boolean;
+  isGeneratingCode?: boolean;
   parametersPanelOpen: boolean;
   saving: boolean;
   showAllCode: boolean;
@@ -59,6 +60,7 @@ function WorkflowHeader({
   cacheKeyValue,
   cacheKeyValues,
   cacheKeyValuesPanelOpen,
+  isGeneratingCode,
   parametersPanelOpen,
   saving,
   showAllCode,
@@ -132,76 +134,88 @@ function WorkflowHeader({
         />
       </div>
       <div className="flex h-full items-center justify-end gap-4">
-        {user && (cacheKeyValues?.total_count ?? 0) > 0 && (
-          <>
-            {debugStore.isDebugMode && (
-              <Button
-                className="pl-2 pr-3"
-                size="lg"
-                variant={!showAllCode ? "tertiary" : "default"}
-                onClick={handleShowAllCode}
+        {user &&
+          !isGeneratingCode &&
+          (cacheKeyValues?.total_count ?? 0) > 0 && (
+            <>
+              {debugStore.isDebugMode && (
+                <Button
+                  className="pl-2 pr-3"
+                  size="lg"
+                  variant={!showAllCode ? "tertiary" : "default"}
+                  onClick={handleShowAllCode}
+                >
+                  <CodeIcon className="mr-2 h-6 w-6" />
+                  Show Code
+                </Button>
+              )}
+              <div
+                tabIndex={1}
+                className="flex max-w-[10rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
               >
-                <CodeIcon className="mr-2 h-6 w-6" />
-                Show Code
-              </Button>
-            )}
-            <div
-              tabIndex={1}
-              className="flex max-w-[10rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
-            >
-              <Input
-                ref={dom.input}
-                className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
-                onChange={(e) => {
-                  setChosenCacheKeyValue(e.target.value);
-                  onCacheKeyValuesFilter(e.target.value);
-                }}
-                onMouseDown={() => {
-                  if (!cacheKeyValuesPanelOpen) {
-                    onCacheKeyValuesClick();
-                  }
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    const numFiltered = cacheKeyValues?.values?.length ?? 0;
-
-                    if (numFiltered === 1) {
-                      const first = cacheKeyValues?.values?.[0];
-                      if (first) {
-                        setChosenCacheKeyValue(first);
-                        onCacheKeyValueAccept(first);
-                      }
-                      return;
+                <Input
+                  ref={dom.input}
+                  className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
+                  onChange={(e) => {
+                    setChosenCacheKeyValue(e.target.value);
+                    onCacheKeyValuesFilter(e.target.value);
+                  }}
+                  onMouseDown={() => {
+                    if (!cacheKeyValuesPanelOpen) {
+                      onCacheKeyValuesClick();
                     }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      const numFiltered = cacheKeyValues?.values?.length ?? 0;
 
-                    setChosenCacheKeyValue(chosenCacheKeyValue);
-                    onCacheKeyValueAccept(chosenCacheKeyValue);
-                  }
-                  onCacheKeyValuesKeydown(e);
-                }}
-                placeholder="Code Key Value"
-                value={chosenCacheKeyValue ?? undefined}
-                onBlur={(e) => {
-                  onCacheKeyValuesBlurred(e.target.value);
-                  setChosenCacheKeyValue(e.target.value);
-                }}
-              />
-              {cacheKeyValuesPanelOpen ? (
-                <ChevronUpIcon
-                  className="h-6 w-6 cursor-pointer"
-                  onClick={onCacheKeyValuesClick}
-                />
-              ) : (
-                <ChevronDownIcon
-                  className="h-6 w-6 cursor-pointer"
-                  onClick={() => {
-                    dom.input.current?.focus();
-                    onCacheKeyValuesClick();
+                      if (numFiltered === 1) {
+                        const first = cacheKeyValues?.values?.[0];
+                        if (first) {
+                          setChosenCacheKeyValue(first);
+                          onCacheKeyValueAccept(first);
+                        }
+                        return;
+                      }
+
+                      setChosenCacheKeyValue(chosenCacheKeyValue);
+                      onCacheKeyValueAccept(chosenCacheKeyValue);
+                    }
+                    onCacheKeyValuesKeydown(e);
+                  }}
+                  placeholder="Code Key Value"
+                  value={chosenCacheKeyValue ?? undefined}
+                  onBlur={(e) => {
+                    onCacheKeyValuesBlurred(e.target.value);
+                    setChosenCacheKeyValue(e.target.value);
                   }}
                 />
-              )}
-            </div>
-          </>
+                {cacheKeyValuesPanelOpen ? (
+                  <ChevronUpIcon
+                    className="h-6 w-6 cursor-pointer"
+                    onClick={onCacheKeyValuesClick}
+                  />
+                ) : (
+                  <ChevronDownIcon
+                    className="h-6 w-6 cursor-pointer"
+                    onClick={() => {
+                      dom.input.current?.focus();
+                      onCacheKeyValuesClick();
+                    }}
+                  />
+                )}
+              </div>
+            </>
+          )}
+        {isGeneratingCode && (
+          <Button
+            className="size-10 min-w-[6rem]"
+            variant={!showAllCode ? "tertiary" : "default"}
+            onClick={handleShowAllCode}
+          >
+            <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+            Code
+          </Button>
         )}
         {isGlobalWorkflow ? (
           <Button

@@ -187,6 +187,28 @@ class Block(BaseModel, abc.ABC):
         template_data = workflow_run_context.values.copy()
         if workflow_run_context.include_secrets_in_templates:
             template_data.update(workflow_run_context.secrets)
+
+            # Create easier-to-access entries for credentials
+            # Look for credential parameters and create real_username/real_password entries
+            # First collect all credential parameters to avoid modifying dict during iteration
+            credential_params = []
+            for key, value in template_data.items():
+                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
+                    credential_params.append((key, value))
+
+            # Now add the real_username/real_password entries
+            for key, value in credential_params:
+                username_secret_id = value.get("username", "")
+                password_secret_id = value.get("password", "")
+
+                # Get the actual values from the secrets
+                real_username = template_data.get(username_secret_id, "")
+                real_password = template_data.get(password_secret_id, "")
+
+                # Add easier-to-access entries
+                template_data[f"{key}_real_username"] = real_username
+                template_data[f"{key}_real_password"] = real_password
+
         if self.label in template_data:
             current_value = template_data[self.label]
             if isinstance(current_value, dict):
@@ -400,6 +422,7 @@ class BaseTaskBlock(Block):
     cache_actions: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
+    download_timeout: float | None = None  # minutes
 
     def get_all_parameters(
         self,
@@ -609,6 +632,7 @@ class BaseTaskBlock(Block):
                         failure_reason=str(e),
                     )
                     raise e
+
                 try:
                     # add screenshot artifact for the first task
                     screenshot = await browser_state.take_fullpage_screenshot(

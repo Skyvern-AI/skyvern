@@ -433,6 +433,7 @@ class FileDownloadBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    download_timeout: float | None = None
 
 
 class UrlBlockYAML(BlockYAML):
@@ -525,7 +526,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str | None = None
     ai_fallback: bool = False
-    cache_key: str | None = None
+    cache_key: str | None = "default"
     run_sequentially: bool = False
     sequential_key: str | None = None
 
