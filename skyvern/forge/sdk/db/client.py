@@ -172,6 +172,7 @@ class AgentDB:
         extra_http_headers: dict[str, str] | None = None,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
+        download_timeout: float | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -203,6 +204,7 @@ class AgentDB:
                     extra_http_headers=extra_http_headers,
                     browser_session_id=browser_session_id,
                     browser_address=browser_address,
+                    download_timeout=download_timeout,
                 )
                 session.add(new_task)
                 await session.commit()
