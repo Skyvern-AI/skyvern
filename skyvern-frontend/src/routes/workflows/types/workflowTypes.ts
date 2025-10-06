@@ -478,6 +478,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   cache_actions: boolean;
   engine: RunEngine | null;
+  download_timeout: number | null; // seconds
 };
 
 export type PDFParserBlock = WorkflowBlockBase & {
