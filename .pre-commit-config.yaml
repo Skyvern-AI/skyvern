@@ -105,6 +105,12 @@ repos:
         types: [javascript]
   - repo: local
     hooks:
+      - id: frontend-precommit
+        name: Frontend Precommit (lint-staged)
+        entry: bash -c 'cd skyvern-frontend && npm run precommit'
+        language: system
+        files: ^skyvern-frontend/src/
+        pass_filenames: false
       - id: vitest-type-check
         name: vitest
         entry: bash -c 'cd skyvern-frontend && ([ -d node_modules ] || npm ci) && npm run test'
