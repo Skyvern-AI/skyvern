@@ -2218,33 +2218,46 @@ class ForgeAgent:
             return False
 
         try:
-            # Count input fields that could be for TOTP (more flexible than maxlength="1")
-            input_fields = [
-                element
-                for element in scraped_page.elements
-                if element.get("tagName", "").lower() == "input"
-                and element.get("attributes", {}).get("type", "text").lower() in ["text", "number", "tel"]
-            ]
+            elements = scraped_page.elements
+            # Optimize by using a single-loop and caching lookups
+            input_fields = []
+            has_maxlength_1 = False
+            has_numeric_patterns = False
 
-            # Check for multiple input fields (potential multi-field TOTP)
-            if len(input_fields) >= 4:
-                # Additional check: look for patterns that suggest multi-field TOTP
-                # Check if inputs are close together or have similar attributes
-                has_maxlength_1 = any(elem.get("attributes", {}).get("maxlength") == "1" for elem in input_fields)
+            for element in elements:
+                tag = element.get("tagName", "").lower()
+                if tag != "input":
+                    continue
 
-                # Check for input fields with numeric patterns (type="number", pattern for digits)
-                has_numeric_patterns = any(
-                    elem.get("attributes", {}).get("type") == "number"
-                    or elem.get("attributes", {}).get("pattern", "").isdigit()
-                    or "digit" in elem.get("attributes", {}).get("pattern", "").lower()
-                    for elem in input_fields
-                )
+                attrs = element.get("attributes", {})
+                type_val = attrs.get("type", "text").lower()
+                if type_val not in {"text", "number", "tel"}:
+                    continue
 
+                input_fields.append(element)
+
+                # Inline pattern checks to avoid generator overhead
+                if not has_maxlength_1 and attrs.get("maxlength") == "1":
+                    has_maxlength_1 = True
+                if not has_numeric_patterns:
+                    pattern = attrs.get("pattern", "")
+                    if type_val == "number" or (
+                        isinstance(pattern, str) and (pattern.isdigit() or "digit" in pattern.lower())
+                    ):
+                        has_numeric_patterns = True
+
+            len_input_fields = len(input_fields)
+            if len_input_fields >= 4:
                 if has_maxlength_1 or has_numeric_patterns:
                     return True
 
-            # Check for TOTP-related keywords in page content
-            page_text = scraped_page.html.lower() if scraped_page.html else ""
+            # Only process html to lower if needed
+            html = scraped_page.html
+            if html:
+                page_text = html.lower()
+            else:
+                page_text = ""
+
             totp_keywords = [
                 "verification code",
                 "authentication code",
@@ -2259,16 +2272,20 @@ class ForgeAgent:
                 "security number",
             ]
 
-            keyword_matches = sum(1 for keyword in totp_keywords if keyword in page_text)
+            # Instead of sum/generator, build a set of present keywords using substring search
+            matches = 0
+            for keyword in totp_keywords:
+                if keyword in page_text:
+                    matches += 1
 
-            # If we have multiple TOTP keywords and multiple input fields, likely TOTP
-            if keyword_matches >= 2 and len(input_fields) >= 6:
+            if matches >= 2 and len_input_fields >= 6:
                 return True
 
-            # Strong single keyword match with multiple inputs
             strong_keywords = ["verification code", "authentication code", "2fa", "two-factor"]
-            if any(keyword in page_text for keyword in strong_keywords) and len(input_fields) >= 3:
-                return True
+            if len_input_fields >= 3:
+                for keyword in strong_keywords:
+                    if keyword in page_text:
+                        return True
 
             return False
 
