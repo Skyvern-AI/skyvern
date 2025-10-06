@@ -164,31 +164,33 @@ function WorkflowRunCode(props?: Props) {
             }
           />
         </div>
-        <Select
-          disabled={!isFinalized}
-          value={cacheKeyValue}
-          onValueChange={(v: string) => setCacheKeyValue(v)}
-        >
-          <SelectTrigger className="max-w-[15rem] [&>span]:text-ellipsis">
-            <SelectValue placeholder="Code Key Value" />
-          </SelectTrigger>
-          <SelectContent>
-            {Array.from(cacheKeyValueSet)
-              .sort()
-              .map((value) => {
-                return (
-                  <SelectItem key={value} value={value}>
-                    {value === cacheKeyValueForWorkflowRun &&
-                    isFinalized === true ? (
-                      <span className="underline">{value}</span>
-                    ) : (
-                      value
-                    )}
-                  </SelectItem>
-                );
-              })}
-          </SelectContent>
-        </Select>
+        {cacheKeyValueSet.size > 0 ? (
+          <Select
+            disabled={!isFinalized}
+            value={cacheKeyValue}
+            onValueChange={(v: string) => setCacheKeyValue(v)}
+          >
+            <SelectTrigger className="max-w-[15rem] [&>span]:text-ellipsis">
+              <SelectValue placeholder="Code Key Value" />
+            </SelectTrigger>
+            <SelectContent>
+              {Array.from(cacheKeyValueSet)
+                .sort()
+                .map((value) => {
+                  return (
+                    <SelectItem key={value} value={value}>
+                      {value === cacheKeyValueForWorkflowRun &&
+                      isFinalized === true ? (
+                        <span className="underline">{value}</span>
+                      ) : (
+                        value
+                      )}
+                    </SelectItem>
+                  );
+                })}
+            </SelectContent>
+          </Select>
+        ) : null}
       </div>
       <CodeEditor
         className={cn("h-full w-full overflow-y-scroll", {
