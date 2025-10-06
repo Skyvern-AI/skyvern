@@ -17,7 +17,7 @@ repos:
     hooks:
       - id: check-python-version
         name: Check Python Version (3.11-3.13)
-        entry: python -c "import sys; assert (3,11) <= sys.version_info[:2] <= (3,13), f'Python {sys.version_info[:2]} not supported. Use Python 3.11-3.13'"
+        entry: uv run python -c "import sys; assert (3,11) <= sys.version_info[:2] <= (3,13), f'Python {sys.version_info[:2]} not supported. Use Python 3.11-3.13'"
         language: system
         pass_filenames: false
         always_run: true
