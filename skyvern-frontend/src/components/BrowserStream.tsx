@@ -115,7 +115,7 @@ function BrowserStream({
   });
 
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
-  const [userIsControlling, setUserIsControlling] = useState(interactive);
+  const [userIsControlling, setUserIsControlling] = useState(false);
   const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const prevVncConnectedRef = useRef<boolean>(false);
