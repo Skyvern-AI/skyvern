@@ -9,7 +9,7 @@
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "format": "prettier --write .",
     "preview": "vite preview",
-    "prepare": "cd .. && husky skyvern-frontend/.husky",
+    "prepare": "cd .. && command -v pre-commit >/dev/null 2>&1 && pre-commit install || echo 'pre-commit not installed, skipping hook setup'",
     "precommit": "lint-staged",
     "run-artifact-server": "node artifactServer.js",
     "serve": "npm run build && node localServer.js",
