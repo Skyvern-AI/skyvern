@@ -172,15 +172,20 @@ Updating, improving and correcting the documentation
 ## Styleguides
 
 ### Pre Commit Hooks
-Make sure to run the pre-commit hooks before committing your code. 
-This will help you to automatically format your code and catch cicd failures early.
+Make sure to install and run the pre-commit hooks before committing your code.
+This will help you to automatically format your code and catch CI/CD failures early.
 ```bash
 # Make sure `pre-commit` is installed
 pip install pre-commit
 
-# Run pre-commit hooks on files in your commit
+# Install the git hook scripts (one-time setup)
+pre-commit install
+
+# (Optional) Run pre-commit hooks manually on all files
 pre-commit run --all-files
 ```
+
+Once installed, the hooks will run automatically on `git commit`.
 
 ### Commit Messages
 <!-- TODO
