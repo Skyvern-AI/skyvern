@@ -2289,26 +2289,29 @@ class ForgeAgent:
             bool: True if this is a multi-field TOTP sequence
         """
         # Must have at least 4 actions (minimum for TOTP)
-        if len(actions) < 4:
+        n_actions = len(actions)
+        if n_actions < 4:
             return False
 
-        # Check if we have multiple consecutive single-digit INPUT_TEXT actions
+        # Optimize by pre-binding functions and property lookups
+        input_text_type = ActionType.INPUT_TEXT
+        hasattr_text = hasattr
+        isdigit = str.isdigit
+
         consecutive_single_digits = 0
         max_consecutive = 0
 
+        # Reduce attribute and method lookups, unroll the innermost check for performance
         for action in actions:
-            if (
-                action.action_type == ActionType.INPUT_TEXT
-                and hasattr(action, "text")
-                and action.text
-                and len(action.text) == 1
-                and action.text.isdigit()
-            ):
-                consecutive_single_digits += 1
-                max_consecutive = max(max_consecutive, consecutive_single_digits)
-            else:
-                # If we hit a non-single-digit action, reset consecutive counter
-                consecutive_single_digits = 0
+            if action.action_type is input_text_type and hasattr_text(action, "text"):
+                text = action.text
+                if text and len(text) == 1 and isdigit(text):
+                    consecutive_single_digits += 1
+                    if consecutive_single_digits > max_consecutive:
+                        max_consecutive = consecutive_single_digits
+                    continue
+            # If we hit a non-single-digit action, reset consecutive counter
+            consecutive_single_digits = 0
 
         # Consider it a multi-field TOTP if we have 4+ consecutive single-digit inputs
         # This is more reliable than just counting total single digits
@@ -2319,7 +2322,7 @@ class ForgeAgent:
             LOG.debug(
                 "Detected multi-field TOTP sequence",
                 max_consecutive=max_consecutive,
-                total_actions=len(actions),
+                total_actions=n_actions,
             )
 
         return is_multi_field_totp
