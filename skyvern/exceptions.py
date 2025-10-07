@@ -756,6 +756,11 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         )
 
 
+class CannotUpdateWorkflowDueToCodeCache(SkyvernException):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__(f"No confirmation for code cache deletion on {workflow_permanent_id}.")
+
+
 class APIKeyNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
         super().__init__(f"No valid API key token found for organization {organization_id}")
