@@ -124,7 +124,7 @@ class Skyvern(AsyncSkyvern):
     ) -> None:
         org_auth_token = await app.DATABASE.get_valid_org_auth_token(
             organization_id=organization.organization_id,
-            token_type=OrganizationAuthTokenType.api,
+            token_type=OrganizationAuthTokenType.api.value,
         )
 
         step = await app.DATABASE.create_step(
@@ -402,6 +402,7 @@ class Skyvern(AsyncSkyvern):
             error_code_mapping=error_code_mapping,
             proxy_location=proxy_location,
             max_steps=max_steps,
+            browser_session_id=browser_session_id,
             user_agent=user_agent,
         )
 

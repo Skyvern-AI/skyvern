@@ -14,8 +14,12 @@ export type WorkflowCreateYAMLRequest = {
   is_saved_task?: boolean;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
-  generate_script?: boolean;
+  status?: string | null;
+  run_with?: string | null;
   cache_key?: string | null;
+  ai_fallback?: boolean;
+  run_sequentially?: boolean;
+  sequential_key?: string | null;
 };
 
 export type WorkflowDefinitionYAML = {
@@ -30,6 +34,7 @@ export type ParameterYAML =
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
   | OnePasswordCredentialParameterYAML
+  | AzureVaultCredentialParameterYAML
   | ContextParameterYAML
   | OutputParameterYAML
   | CredentialParameterYAML;
@@ -87,6 +92,14 @@ export type OnePasswordCredentialParameterYAML = ParameterYAMLBase & {
   parameter_type: "onepassword";
   vault_id: string;
   item_id: string;
+};
+
+export type AzureVaultCredentialParameterYAML = ParameterYAMLBase & {
+  parameter_type: "azure_vault_credential";
+  vault_name: string;
+  username_key: string;
+  password_key: string;
+  totp_secret_key: string | null;
 };
 
 export type ContextParameterYAML = ParameterYAMLBase & {
@@ -256,6 +269,7 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   totp_identifier?: string | null;
   cache_actions: boolean;
   engine: RunEngine | null;
+  download_timeout?: number | null;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {

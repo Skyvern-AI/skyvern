@@ -124,6 +124,34 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def list_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
+        pass
+
+    @abstractmethod
+    async def list_downloading_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[str]:
+        pass
+
+    @abstractmethod
+    async def get_shared_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        pass
+
+    @abstractmethod
+    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
+        pass
+
+    @abstractmethod
+    async def get_shared_recordings_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        pass
+
+    @abstractmethod
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         pass
 

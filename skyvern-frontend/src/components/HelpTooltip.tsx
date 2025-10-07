@@ -7,14 +7,15 @@ import {
 } from "./ui/tooltip";
 
 type Props = {
+  className?: string;
   content: string;
 };
 
-function HelpTooltip({ content }: Props) {
+function HelpTooltip({ content, className }: Props) {
   return (
     <TooltipProvider>
       <Tooltip delayDuration={300}>
-        <TooltipTrigger asChild>
+        <TooltipTrigger className={className} asChild>
           <QuestionMarkCircledIcon className="size-4" />
         </TooltipTrigger>
         <TooltipContent className="max-w-[250px]">{content}</TooltipContent>

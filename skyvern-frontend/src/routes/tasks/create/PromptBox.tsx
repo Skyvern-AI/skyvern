@@ -1,10 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import {
-  Createv2TaskRequest,
-  TaskV2,
-  ProxyLocation,
-  TaskGenerationApiResponse,
-} from "@/api/types";
+import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
@@ -26,6 +21,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
   FileTextIcon,
@@ -33,12 +29,12 @@ import {
   PaperPlaneIcon,
   Pencil1Icon,
   ReloadIcon,
+  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { stringify as convertToYAML } from "yaml";
 import {
   generatePhoneNumber,
   generateUniqueEmail,
@@ -48,38 +44,7 @@ import {
   MAX_SCREENSHOT_SCROLLS_DEFAULT,
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
-
-function createTemplateTaskFromTaskGenerationParameters(
-  values: TaskGenerationApiResponse,
-) {
-  return {
-    title: values.suggested_title ?? "Untitled Task",
-    description: "",
-    is_saved_task: true,
-    webhook_callback_url: null,
-    proxy_location: "RESIDENTIAL",
-    workflow_definition: {
-      parameters: [
-        {
-          parameter_type: "workflow",
-          workflow_parameter_type: "json",
-          key: "navigation_payload",
-          default_value: JSON.stringify(values.navigation_payload),
-        },
-      ],
-      blocks: [
-        {
-          block_type: "task",
-          label: values.suggested_title ?? "Untitled Task",
-          url: values.url,
-          navigation_goal: values.navigation_goal,
-          data_extraction_goal: values.data_extraction_goal,
-          data_schema: values.extracted_information_schema,
-        },
-      ],
-    },
-  };
-}
+import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 const exampleCases = [
   {
@@ -145,7 +110,9 @@ const exampleCases = [
 function PromptBox() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState<"v1" | "v2">("v2"); // Observer is the default
+  const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">(
+    "v2-code",
+  ); // v2-code is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
@@ -156,6 +123,7 @@ function PromptBox() {
   );
   const [browserSessionId, setBrowserSessionId] = useState<string | null>(null);
   const [cdpAddress, setCdpAddress] = useState<string | null>(null);
+  const [generateScript, setGenerateScript] = useState(false);
   const [publishWorkflow, setPublishWorkflow] = useState(false);
   const [totpIdentifier, setTotpIdentifier] = useState("");
   const [maxStepsOverride, setMaxStepsOverride] = useState<string | null>(null);
@@ -165,21 +133,26 @@ function PromptBox() {
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [dataSchema, setDataSchema] = useState<string | null>(null);
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
+  const { setAutoplay } = useAutoplayStore();
 
-  const startObserverCruiseMutation = useMutation({
+  const generateWorkflowMutation = useMutation({
     mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter, "v2");
-      return client.post<Createv2TaskRequest, { data: TaskV2 }>(
-        "/tasks",
+      const client = await getClient(credentialGetter, "sans-api-v1");
+
+      const result = await client.post<
+        Createv2TaskRequest,
+        { data: WorkflowApiResponse }
+      >(
+        "/workflows/create-from-prompt",
         {
           user_prompt: prompt,
           webhook_callback_url: webhookCallbackUrl,
           proxy_location: proxyLocation,
-          browser_session_id: browserSessionId,
-          browser_address: cdpAddress,
           totp_identifier: totpIdentifier,
-          publish_workflow: publishWorkflow,
           max_screenshot_scrolls: maxScreenshotScrolls,
+          publish_workflow: publishWorkflow,
+          run_with: "code",
+          ai_fallback: true,
           extracted_information_schema: dataSchema
             ? (() => {
                 try {
@@ -205,76 +178,32 @@ function PromptBox() {
           },
         },
       );
+
+      return result;
     },
-    onSuccess: (response) => {
+    onSuccess: ({ data: workflow }) => {
       toast({
         variant: "success",
-        title: "Workflow Run Created",
-        description: `Workflow run created successfully.`,
+        title: "Workflow Created",
+        description: `Workflow created successfully.`,
       });
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
+
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
-      queryClient.invalidateQueries({
-        queryKey: ["runs"],
-      });
-      navigate(
-        `/workflows/${response.data.workflow_permanent_id}/${response.data.workflow_run_id}`,
-      );
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating workflow run from prompt",
-        description: error.message,
-      });
-    },
-  });
 
-  const getTaskFromPromptMutation = useMutation({
-    mutationFn: async (prompt: string) => {
-      const client = await getClient(credentialGetter);
-      return client
-        .post<
-          { prompt: string },
-          { data: TaskGenerationApiResponse }
-        >("/generate/task", { prompt })
-        .then((response) => response.data);
-    },
-    onError: (error: AxiosError) => {
-      const detail = (error.response?.data as { detail?: string })?.detail;
-      toast({
-        variant: "destructive",
-        title: "Error creating task from prompt",
-        description: detail ? detail : error.message,
-      });
-    },
-  });
+      const firstBlock = workflow.workflow_definition.blocks[0];
 
-  const saveTaskMutation = useMutation({
-    mutationFn: async (params: TaskGenerationApiResponse) => {
-      const client = await getClient(credentialGetter);
-      const templateTask =
-        createTemplateTaskFromTaskGenerationParameters(params);
-      const yaml = convertToYAML(templateTask);
-      return client.post("/workflows", yaml, {
-        headers: {
-          "Content-Type": "text/plain",
-        },
-      });
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["savedTasks"],
-      });
+      if (firstBlock) {
+        setAutoplay(workflow.workflow_permanent_id, firstBlock.label);
+      }
+
+      navigate(`/workflows/${workflow.workflow_permanent_id}/debug`);
     },
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Error saving task",
+        title: "Error creating workflow from prompt",
         description: error.message,
       });
     },
@@ -302,12 +231,26 @@ function PromptBox() {
               />
               <Select
                 value={selectValue}
-                onValueChange={(value: "v1" | "v2") => {
+                onValueChange={(value: "v1" | "v2" | "v2-code") => {
                   setSelectValue(value);
                 }}
               >
                 <SelectTrigger className="w-48 focus:ring-0">
-                  <SelectValue />
+                  {selectValue === "v2-code" ? (
+                    <div className="relative z-10 flex w-full flex-col items-center">
+                      <div className="flex items-center gap-1">
+                        <LightningBoltIcon className="size-4 shrink-0 text-yellow-400" />
+                        <div className="font-normal text-white">
+                          Skyvern 2.0
+                        </div>
+                      </div>
+                      <div className="self-start pl-7 text-xs font-semibold text-yellow-400">
+                        with code
+                      </div>
+                    </div>
+                  ) : (
+                    <SelectValue className="relative z-10" />
+                  )}
                 </SelectTrigger>
                 <SelectContent className="border-slate-500 bg-slate-elevation3">
                   <CustomSelectItem value="v1">
@@ -330,6 +273,25 @@ function PromptBox() {
                       </div>
                     </div>
                   </CustomSelectItem>
+                  <CustomSelectItem
+                    value="v2-code"
+                    className="relative overflow-hidden border-2 border-yellow-500/50 bg-gradient-to-r from-yellow-500/10 via-yellow-400/10 to-amber-400/10 hover:bg-slate-800"
+                  >
+                    <div className="animate-shimmer absolute inset-0 bg-gradient-to-r from-transparent via-yellow-400/20 to-transparent" />
+                    <div className="relative flex items-center gap-2 space-y-2">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <SelectItemText className="animate-pulse bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text font-bold text-transparent">
+                            Skyvern 2.0
+                          </SelectItemText>
+                          <LightningBoltIcon className="size-4 animate-bounce text-yellow-400" />
+                        </div>
+                        <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text text-xs font-semibold text-transparent">
+                          with code
+                        </div>
+                      </div>
+                    </div>
+                  </CustomSelectItem>
                 </SelectContent>
               </Select>
               <div className="flex items-center">
@@ -341,30 +303,21 @@ function PromptBox() {
                 />
               </div>
               <div className="flex items-center">
-                {startObserverCruiseMutation.isPending ||
-                getTaskFromPromptMutation.isPending ||
-                saveTaskMutation.isPending ? (
+                {generateWorkflowMutation.isPending ? (
                   <ReloadIcon className="size-6 animate-spin" />
                 ) : (
-                  <PaperPlaneIcon
-                    className="size-6 cursor-pointer"
-                    onClick={async () => {
-                      if (selectValue === "v2") {
-                        startObserverCruiseMutation.mutate(prompt);
-                        return;
-                      }
-                      const taskGenerationResponse =
-                        await getTaskFromPromptMutation.mutateAsync(prompt);
-                      await saveTaskMutation.mutateAsync(
-                        taskGenerationResponse,
-                      );
-                      navigate("/tasks/create/from-prompt", {
-                        state: {
-                          data: taskGenerationResponse,
-                        },
-                      });
-                    }}
-                  />
+                  <div className="flex items-center">
+                    {generateWorkflowMutation.isPending ? (
+                      <ReloadIcon className="size-6 animate-spin" />
+                    ) : (
+                      <PaperPlaneIcon
+                        className="size-6 cursor-pointer"
+                        onClick={async () => {
+                          generateWorkflowMutation.mutate(prompt);
+                        }}
+                      />
+                    )}
+                  </div>
                 )}
               </div>
             </div>
@@ -468,11 +421,28 @@ function PromptBox() {
                       />
                     </div>
                   </div>
+
+                  <div className="flex gap-16">
+                    <div className="w-48 shrink-0">
+                      <div className="text-sm">Generate Script</div>
+                      <div className="text-xs text-slate-400">
+                        Whether to generate scripts for this task run (on
+                        success).
+                      </div>
+                    </div>
+                    <Switch
+                      checked={generateScript}
+                      onCheckedChange={(checked) => {
+                        setGenerateScript(Boolean(checked));
+                      }}
+                    />
+                  </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Publish Workflow</div>
                       <div className="text-xs text-slate-400">
                         Whether to create a workflow alongside this task run.
+                        Will also be created if "Generate Scripts" is true.
                       </div>
                     </div>
                     <Switch
@@ -541,11 +511,11 @@ function PromptBox() {
           return (
             <ExampleCasePill
               key={example.key}
-              exampleId={example.key}
               icon={example.icon}
               label={example.label}
-              prompt={example.prompt}
-              version={selectValue}
+              onClick={() => {
+                generateWorkflowMutation.mutate(example.prompt);
+              }}
             />
           );
         })}

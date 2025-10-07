@@ -21,3 +21,8 @@
 .react-flow__handle-bottom {
   bottom: 3px;
 }
+
+.react-flow__attribution {
+  background-color: rgb(2 6 23);
+  color: white;
+}

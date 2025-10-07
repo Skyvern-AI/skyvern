@@ -975,6 +975,95 @@
         ]
       }
     },
+    "/v1/runs/{run_id}/timeline": {
+      "get": {
+        "tags": [
+          "Agent",
+          "Workflows"
+        ],
+        "summary": "Get run timeline",
+        "description": "Get timeline for a run (workflow run or task_v2 run)",
+        "operationId": "get_run_timeline_v1_runs__run_id__timeline_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the workflow run or task_v2 run.",
+              "examples": [
+                "wr_123",
+                "tsk_v2_123"
+              ],
+              "title": "Run Id"
+            },
+            "description": "The id of the workflow run or task_v2 run."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved run timeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRunTimeline"
+                  },
+                  "title": "Response Get Run Timeline V1 Runs  Run Id  Timeline Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Timeline not available for this run type"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_run_timeline",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Get timeline for a workflow run\ntimeline = await skyvern.get_run_timeline(run_id=\"wr_123\")\nprint(timeline)\n\n# Get timeline for a task_v2 run\ntimeline = await skyvern.get_run_timeline(run_id=\"tsk_v2_123\")\nprint(timeline)\n"
+              }
+            ]
+          }
+        ]
+      }
+    },
     "/v1/browser_sessions": {
       "post": {
         "tags": [
@@ -1705,7 +1794,7 @@
           "Agent"
         ],
         "summary": "Login Task",
-        "description": "Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password",
+        "description": "Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault",
         "operationId": "login_v1_run_tasks_login_post",
         "parameters": [
           {
@@ -2245,6 +2334,361 @@
         ],
         "title": "AWSSecretParameterYAML"
       },
+      "Action": {
+        "properties": {
+          "action_type": {
+            "$ref": "#/components/schemas/ActionType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ActionStatus",
+            "default": "pending"
+          },
+          "action_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Id"
+          },
+          "source_action_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Action Id"
+          },
+          "organization_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organization Id"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "step_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Id"
+          },
+          "step_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Order"
+          },
+          "action_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Order"
+          },
+          "confidence_float": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence Float"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning"
+          },
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          },
+          "element_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Element Id"
+          },
+          "skyvern_element_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skyvern Element Hash"
+          },
+          "skyvern_element_data": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skyvern Element Data"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Call Id"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/UserDefinedError"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors"
+          },
+          "data_extraction_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Goal"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "file_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Url"
+          },
+          "download": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download"
+          },
+          "is_upload_file_tag": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Upload File Tag"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "input_or_select_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InputOrSelectContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "option": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SelectOption"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "is_checked": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Checked"
+          },
+          "verified": {
+            "type": "boolean",
+            "title": "Verified",
+            "default": false
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "modified_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          }
+        },
+        "type": "object",
+        "required": [
+          "action_type"
+        ],
+        "title": "Action"
+      },
       "ActionBlock": {
         "properties": {
           "label": {
@@ -2423,6 +2867,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -2434,6 +2881,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -2501,6 +2949,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -2652,6 +3111,41 @@
           "label"
         ],
         "title": "ActionBlockYAML"
+      },
+      "ActionStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "skipped",
+          "failed",
+          "completed"
+        ],
+        "title": "ActionStatus"
+      },
+      "ActionType": {
+        "type": "string",
+        "enum": [
+          "click",
+          "input_text",
+          "upload_file",
+          "download_file",
+          "select_option",
+          "checkbox",
+          "wait",
+          "null_action",
+          "solve_captcha",
+          "terminate",
+          "complete",
+          "reload_page",
+          "extract",
+          "verification_code",
+          "scroll",
+          "keypress",
+          "move",
+          "drag",
+          "left_mouse"
+        ],
+        "title": "ActionType"
       },
       "Artifact": {
         "properties": {
@@ -2886,6 +3380,152 @@
           "modified_at"
         ],
         "title": "AzureSecretParameter"
+      },
+      "AzureVaultCredentialParameter": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "azure_vault_credential",
+            "title": "Parameter Type",
+            "default": "azure_vault_credential"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "azure_vault_credential_parameter_id": {
+            "type": "string",
+            "title": "Azure Vault Credential Parameter Id"
+          },
+          "workflow_id": {
+            "type": "string",
+            "title": "Workflow Id"
+          },
+          "vault_name": {
+            "type": "string",
+            "title": "Vault Name"
+          },
+          "username_key": {
+            "type": "string",
+            "title": "Username Key"
+          },
+          "password_key": {
+            "type": "string",
+            "title": "Password Key"
+          },
+          "totp_secret_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Secret Key"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "azure_vault_credential_parameter_id",
+          "workflow_id",
+          "vault_name",
+          "username_key",
+          "password_key",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "AzureVaultCredentialParameter"
+      },
+      "AzureVaultCredentialParameterYAML": {
+        "properties": {
+          "parameter_type": {
+            "type": "string",
+            "const": "azure_vault_credential",
+            "title": "Parameter Type",
+            "default": "azure_vault_credential"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "vault_name": {
+            "type": "string",
+            "title": "Vault Name"
+          },
+          "username_key": {
+            "type": "string",
+            "title": "Username Key"
+          },
+          "password_key": {
+            "type": "string",
+            "title": "Password Key"
+          },
+          "totp_secret_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Secret Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "vault_name",
+          "username_key",
+          "password_key"
+        ],
+        "title": "AzureVaultCredentialParameterYAML"
       },
       "BitwardenCreditCardDataParameter": {
         "properties": {
@@ -3381,6 +4021,32 @@
         ],
         "title": "BitwardenSensitiveInformationParameterYAML"
       },
+      "BlockType": {
+        "type": "string",
+        "enum": [
+          "task",
+          "task_v2",
+          "for_loop",
+          "code",
+          "text_prompt",
+          "download_to_s3",
+          "upload_to_s3",
+          "file_upload",
+          "send_email",
+          "file_url_parser",
+          "validation",
+          "action",
+          "navigation",
+          "extraction",
+          "login",
+          "wait",
+          "file_download",
+          "goto_url",
+          "pdf_parser",
+          "http_request"
+        ],
+        "title": "BlockType"
+      },
       "BrowserSessionResponse": {
         "properties": {
           "browser_session_id": {
@@ -3474,6 +4140,54 @@
             "examples": [
               "https://app.skyvern.com/browser-session/pbs_123456"
             ]
+          },
+          "vnc_streaming_supported": {
+            "type": "boolean",
+            "title": "Vnc Streaming Supported",
+            "description": "Whether the browser session supports VNC streaming",
+            "default": false
+          },
+          "download_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Path",
+            "description": "The path where the browser session downloads files"
+          },
+          "downloaded_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FileInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Downloaded Files",
+            "description": "The list of files downloaded by the browser session"
+          },
+          "recordings": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FileInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recordings",
+            "description": "The list of video recordings from the browser session"
           },
           "started_at": {
             "anyOf": [
@@ -3601,6 +4315,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -3612,6 +4329,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -3741,6 +4459,9 @@
                 "$ref": "#/components/schemas/OnePasswordCredentialParameter"
               },
               {
+                "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+              },
+              {
                 "$ref": "#/components/schemas/OutputParameter"
               },
               {
@@ -3826,7 +4547,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240,
+                "maximum": 1440,
                 "minimum": 5
               },
               {
@@ -3834,8 +4555,19 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.",
             "default": 60
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n"
           }
         },
         "type": "object",
@@ -4470,6 +5202,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -4481,6 +5216,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -4548,6 +5284,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -4851,6 +5598,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -4862,6 +5612,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -4929,6 +5680,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -5072,6 +5834,17 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -5120,6 +5893,19 @@
             ],
             "title": "Filename",
             "description": "Original filename"
+          },
+          "modified_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At",
+            "description": "Modified time of the file"
           }
         },
         "type": "object",
@@ -5579,6 +6365,17 @@
             ],
             "title": "Azure Blob Container Name"
           },
+          "azure_folder_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Folder Path"
+          },
           "path": {
             "anyOf": [
               {
@@ -5751,6 +6548,9 @@
                     "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                   },
                   {
+                    "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                  },
+                  {
                     "$ref": "#/components/schemas/OutputParameter"
                   },
                   {
@@ -5762,6 +6562,7 @@
                   "mapping": {
                     "aws_secret": "#/components/schemas/AWSSecretParameter",
                     "azure_secret": "#/components/schemas/AzureSecretParameter",
+                    "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                     "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                     "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                     "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -6055,6 +6856,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -6066,6 +6870,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -6190,6 +6995,78 @@
           "label"
         ],
         "title": "HttpRequestBlockYAML"
+      },
+      "InputOrSelectContext": {
+        "properties": {
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Field"
+          },
+          "is_required": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Required"
+          },
+          "is_search_bar": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Search Bar"
+          },
+          "is_location_input": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Location Input"
+          },
+          "is_date_related": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Date Related"
+          }
+        },
+        "type": "object",
+        "title": "InputOrSelectContext"
       },
       "LoginBlock": {
         "properties": {
@@ -6369,6 +7246,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -6380,6 +7260,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -6447,6 +7328,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -6802,6 +7694,54 @@
             ],
             "title": "Onepassword Item Id",
             "description": "1Password item ID"
+          },
+          "azure_vault_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Name",
+            "description": "Azure Vault Name"
+          },
+          "azure_vault_username_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Username Key",
+            "description": "Azure Vault username key"
+          },
+          "azure_vault_password_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Password Key",
+            "description": "Azure Vault password key"
+          },
+          "azure_vault_totp_secret_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Vault Totp Secret Key",
+            "description": "Azure Vault TOTP secret key"
           }
         },
         "type": "object",
@@ -6981,6 +7921,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -6992,6 +7935,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -7059,6 +8003,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -7719,6 +8674,12 @@
           "RESIDENTIAL_ZA",
           "RESIDENTIAL_AR",
           "RESIDENTIAL_AU",
+          "RESIDENTIAL_BR",
+          "RESIDENTIAL_TR",
+          "RESIDENTIAL_CA",
+          "RESIDENTIAL_MX",
+          "RESIDENTIAL_IT",
+          "RESIDENTIAL_NL",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -7860,6 +8821,56 @@
         ],
         "title": "ScriptFileCreate",
         "description": "Model representing a file in a script."
+      },
+      "ScriptRunResponse": {
+        "properties": {
+          "ai_fallback_triggered": {
+            "type": "boolean",
+            "title": "Ai Fallback Triggered",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ScriptRunResponse"
+      },
+      "SelectOption": {
+        "properties": {
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index"
+          }
+        },
+        "type": "object",
+        "title": "SelectOption"
       },
       "SendEmailBlock": {
         "properties": {
@@ -8463,6 +9474,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -8474,6 +9488,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -8541,6 +9556,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -9228,6 +10254,33 @@
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
           },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors",
+            "description": "The errors for the run"
+          },
           "run_type": {
             "type": "string",
             "enum": [
@@ -9503,6 +10556,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -9514,6 +10570,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -9621,6 +10678,242 @@
           "prompt"
         ],
         "title": "TextPromptBlockYAML"
+      },
+      "Thought": {
+        "properties": {
+          "thought_id": {
+            "type": "string",
+            "title": "Thought Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id"
+          },
+          "workflow_run_block_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Block Id"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          },
+          "workflow_permanent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Permanent Id"
+          },
+          "user_input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Input"
+          },
+          "observation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observation"
+          },
+          "thought": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thought"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "thought_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ThoughtType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "plan"
+          },
+          "thought_scenario": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ThoughtScenario"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "output": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "input_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Token Count"
+          },
+          "output_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Token Count"
+          },
+          "reasoning_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Token Count"
+          },
+          "cached_token_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Token Count"
+          },
+          "thought_cost": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thought Cost"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "thought_id",
+          "task_id",
+          "organization_id",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "Thought"
+      },
+      "ThoughtScenario": {
+        "type": "string",
+        "enum": [
+          "generate_plan",
+          "user_goal_check",
+          "failure_describe",
+          "summarization",
+          "generate_metadata",
+          "extract_loop_values",
+          "generate_task_in_loop",
+          "generate_general_task"
+        ],
+        "title": "ThoughtScenario"
+      },
+      "ThoughtType": {
+        "type": "string",
+        "enum": [
+          "plan",
+          "metadata",
+          "user_goal_check",
+          "internal_plan",
+          "failure_describe"
+        ],
+        "title": "ThoughtType"
       },
       "UploadToS3Block": {
         "properties": {
@@ -9891,6 +11184,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -9902,6 +11198,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -9969,6 +11266,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -10019,6 +11327,31 @@
           "url"
         ],
         "title": "UrlBlockYAML"
+      },
+      "UserDefinedError": {
+        "properties": {
+          "error_code": {
+            "type": "string",
+            "title": "Error Code"
+          },
+          "reasoning": {
+            "type": "string",
+            "title": "Reasoning"
+          },
+          "confidence_float": {
+            "type": "number",
+            "maximum": 1,
+            "minimum": 0,
+            "title": "Confidence Float"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error_code",
+          "reasoning",
+          "confidence_float"
+        ],
+        "title": "UserDefinedError"
       },
       "ValidationBlock": {
         "properties": {
@@ -10198,6 +11531,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -10209,6 +11545,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -10276,6 +11613,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -10468,6 +11816,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -10479,6 +11830,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -10673,9 +12025,20 @@
             ],
             "title": "Extra Http Headers"
           },
-          "generate_script": {
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With"
+          },
+          "ai_fallback": {
             "type": "boolean",
-            "title": "Generate Script",
+            "title": "Ai Fallback",
             "default": false
           },
           "cache_key": {
@@ -10688,6 +12051,28 @@
               }
             ],
             "title": "Cache Key"
+          },
+          "run_sequentially": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Sequentially"
+          },
+          "sequential_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Key"
           },
           "created_at": {
             "type": "string",
@@ -10840,9 +12225,20 @@
             "$ref": "#/components/schemas/WorkflowStatus",
             "default": "published"
           },
-          "generate_script": {
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With"
+          },
+          "ai_fallback": {
             "type": "boolean",
-            "title": "Generate Script",
+            "title": "Ai Fallback",
             "default": false
           },
           "cache_key": {
@@ -10854,7 +12250,24 @@
                 "type": "null"
               }
             ],
-            "title": "Cache Key"
+            "title": "Cache Key",
+            "default": "default"
+          },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
+          },
+          "sequential_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Key"
           }
         },
         "type": "object",
@@ -10894,6 +12307,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameter"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
                   "$ref": "#/components/schemas/OutputParameter"
                 },
                 {
@@ -10905,6 +12321,7 @@
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameter",
                   "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
@@ -11041,6 +12458,9 @@
                   "$ref": "#/components/schemas/OnePasswordCredentialParameterYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameterYAML"
+                },
+                {
                   "$ref": "#/components/schemas/WorkflowParameterYAML"
                 },
                 {
@@ -11057,6 +12477,7 @@
                 "propertyName": "parameter_type",
                 "mapping": {
                   "aws_secret": "#/components/schemas/AWSSecretParameterYAML",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameterYAML",
                   "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameterYAML",
                   "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameterYAML",
                   "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameterYAML",
@@ -11372,6 +12793,364 @@
         "type": "object",
         "title": "WorkflowRequest"
       },
+      "WorkflowRunBlock": {
+        "properties": {
+          "workflow_run_block_id": {
+            "type": "string",
+            "title": "Workflow Run Block Id"
+          },
+          "block_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Block Workflow Run Id"
+          },
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "parent_workflow_run_block_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Workflow Run Block Id"
+          },
+          "block_type": {
+            "$ref": "#/components/schemas/BlockType"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "navigation_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Goal"
+          },
+          "navigation_payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Payload"
+          },
+          "data_extraction_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Goal"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
+          },
+          "terminate_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminate Criterion"
+          },
+          "complete_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete Criterion"
+          },
+          "actions": {
+            "items": {
+              "$ref": "#/components/schemas/Action"
+            },
+            "type": "array",
+            "title": "Actions",
+            "default": []
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "include_action_history_in_verification": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Action History In Verification",
+            "default": false
+          },
+          "duration": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration"
+          },
+          "loop_values": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loop Values"
+          },
+          "current_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Value"
+          },
+          "current_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Index"
+          },
+          "recipients": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipients"
+          },
+          "attachments": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attachments"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_block_id",
+          "workflow_run_id",
+          "organization_id",
+          "block_type",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "WorkflowRunBlock"
+      },
       "WorkflowRunRequest": {
         "properties": {
           "workflow_id": {
@@ -11517,6 +13296,30 @@
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
             ]
+          },
+          "ai_fallback": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Fallback",
+            "description": "Whether to fallback to AI if the workflow run fails."
+          },
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With",
+            "description": "Whether to run the workflow with agent or code."
           }
         },
         "type": "object",
@@ -11725,6 +13528,33 @@
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
           },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors",
+            "description": "The errors for the run"
+          },
           "run_type": {
             "type": "string",
             "const": "workflow_run",
@@ -11753,6 +13583,66 @@
         ],
         "title": "WorkflowRunResponse"
       },
+      "WorkflowRunTimeline": {
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/WorkflowRunTimelineType"
+          },
+          "block": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunBlock"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "thought": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Thought"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRunTimeline"
+            },
+            "type": "array",
+            "title": "Children",
+            "default": []
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "WorkflowRunTimeline"
+      },
+      "WorkflowRunTimelineType": {
+        "type": "string",
+        "enum": [
+          "thought",
+          "block"
+        ],
+        "title": "WorkflowRunTimelineType"
+      },
       "WorkflowStatus": {
         "type": "string",
         "enum": [
@@ -11776,7 +13666,8 @@
         "enum": [
           "skyvern",
           "bitwarden",
-          "1password"
+          "1password",
+          "azure_vault"
         ],
         "title": "CredentialType"
       }

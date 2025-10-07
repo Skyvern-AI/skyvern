@@ -15,6 +15,7 @@ LOG = structlog.get_logger(__name__)
 
 # Initialize prompt engine
 prompt_engine = PromptEngine("skyvern")
+CUSTOM_FIELD_ACTIONS = [ActionType.INPUT_TEXT, ActionType.UPLOAD_FILE, ActionType.SELECT_OPTION]
 
 
 class GeneratedFieldMapping(BaseModel):
@@ -39,34 +40,45 @@ async def generate_workflow_parameters_schema(
         - field_mappings: Dictionary mapping action indices to field names for hydration
     """
     # Extract all input_text actions
-    input_actions = []
+    custom_field_actions = []
     action_index_map = {}
     action_counter = 1
 
     for task_id, actions in actions_by_task.items():
         for action in actions:
-            if action.get("action_type") == ActionType.INPUT_TEXT:
-                input_actions.append(
-                    {
-                        "text": action.get("text", ""),
-                        "intention": action.get("intention", ""),
-                        "task_id": task_id,
-                        "action_id": action.get("action_id", ""),
-                    }
-                )
-                action_index_map[f"action_index_{action_counter}"] = {
+            action_type = action.get("action_type", "")
+            if action_type not in CUSTOM_FIELD_ACTIONS:
+                continue
+
+            value = ""
+            if action_type == ActionType.INPUT_TEXT:
+                value = action.get("text", "")
+            elif action_type == ActionType.UPLOAD_FILE:
+                value = action.get("file_url", "")
+            elif action_type == ActionType.SELECT_OPTION:
+                value = action.get("option", "")
+            custom_field_actions.append(
+                {
+                    "action_type": action_type,
+                    "value": value,
+                    "intention": action.get("intention", ""),
                     "task_id": task_id,
                     "action_id": action.get("action_id", ""),
                 }
-                action_counter += 1
+            )
+            action_index_map[f"action_index_{action_counter}"] = {
+                "task_id": task_id,
+                "action_id": action.get("action_id", ""),
+            }
+            action_counter += 1
 
-    if not input_actions:
-        LOG.warning("No input_text actions found in workflow run")
+    if not custom_field_actions:
+        LOG.warning("No field_name_actions found in workflow run")
         return _generate_empty_schema(), {}
 
     # Generate field names using LLM
     try:
-        field_mapping = await _generate_field_names_with_llm(input_actions)
+        field_mapping = await _generate_field_names_with_llm(custom_field_actions)
 
         # Generate the Pydantic schema code
         schema_code = _generate_pydantic_schema(field_mapping.schema_fields)
@@ -86,7 +98,7 @@ async def generate_workflow_parameters_schema(
         return _generate_empty_schema(), {}
 
 
-async def _generate_field_names_with_llm(input_actions: List[Dict[str, Any]]) -> GeneratedFieldMapping:
+async def _generate_field_names_with_llm(custom_field_actions: List[Dict[str, Any]]) -> GeneratedFieldMapping:
     """
     Use LLM to generate field names from input actions.
 
@@ -96,9 +108,11 @@ async def _generate_field_names_with_llm(input_actions: List[Dict[str, Any]]) ->
     Returns:
         GeneratedFieldMapping with field mappings and schema definitions
     """
-    prompt = prompt_engine.load_prompt(template="generate-workflow-parameters", input_actions=input_actions)
+    prompt = prompt_engine.load_prompt(
+        template="generate-workflow-parameters", custom_field_actions=custom_field_actions
+    )
 
-    response = await app.LLM_API_HANDLER(prompt=prompt, prompt_name="generate-workflow-parameters")
+    response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, prompt_name="generate-workflow-parameters")
 
     return GeneratedFieldMapping.model_validate(response)
 
@@ -117,9 +131,6 @@ def _generate_pydantic_schema(schema_fields: Dict[str, Dict[str, str]]) -> str:
         return _generate_empty_schema()
 
     lines = [
-        "from pydantic import BaseModel, Field",
-        "",
-        "",
         "class GeneratedWorkflowParameters(BaseModel):",
         '    """Generated schema representing all input_text action values from the workflow run."""',
         "",
@@ -169,22 +180,22 @@ def hydrate_input_text_actions_with_field_names(
         for action in actions:
             action_copy = action.copy()
 
-            if action.get("action_type") == ActionType.INPUT_TEXT:
+            if action.get("action_type") in CUSTOM_FIELD_ACTIONS:
                 action_id = action.get("action_id", "")
                 mapping_key = f"{task_id}:{action_id}"
 
                 if mapping_key in field_mappings:
                     action_copy["field_name"] = field_mappings[mapping_key]
-                else:
-                    # Fallback field name if mapping not found
-                    intention = action.get("intention", "")
-                    if intention:
-                        # Simple field name generation from intention
-                        field_name = intention.lower().replace(" ", "_").replace("?", "").replace("'", "")
-                        field_name = "".join(c for c in field_name if c.isalnum() or c == "_")
-                        action_copy["field_name"] = field_name or "unknown_field"
-                    else:
-                        action_copy["field_name"] = "unknown_field"
+                # else:
+                #     # Fallback field name if mapping not found
+                #     intention = action.get("intention", "")
+                #     if intention:
+                #         # Simple field name generation from intention
+                #         field_name = intention.lower().replace(" ", "_").replace("?", "").replace("'", "")
+                #         field_name = "".join(c for c in field_name if c.isalnum() or c == "_")
+                #         action_copy["field_name"] = field_name or "unknown_field"
+                #     else:
+                #         action_copy["field_name"] = "unknown_field"
 
             updated_actions.append(action_copy)
 

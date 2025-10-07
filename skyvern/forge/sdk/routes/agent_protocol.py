@@ -82,6 +82,7 @@ from skyvern.schemas.runs import (
     CUA_ENGINES,
     BlockRunRequest,
     BlockRunResponse,
+    ProxyLocation,
     RunEngine,
     RunResponse,
     RunType,
@@ -525,6 +526,58 @@ async def create_workflow(
         raise FailedToCreateWorkflow(str(e))
 
 
+@base_router.post(
+    "/workflows/create-from-prompt",
+    include_in_schema=False,
+)
+async def create_workflow_from_prompt(
+    data: TaskV2Request,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+    x_max_iterations_override: Annotated[int | str | None, Header()] = None,
+    x_max_steps_override: Annotated[int | str | None, Header()] = None,
+) -> dict[str, Any]:
+    if x_max_iterations_override or x_max_steps_override:
+        LOG.info(
+            "Overriding max steps for workflow-from-prompt",
+            max_iterations_override=x_max_iterations_override,
+            max_steps_override=x_max_steps_override,
+        )
+    await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
+
+    if isinstance(x_max_iterations_override, str):
+        try:
+            x_max_iterations_override = int(x_max_iterations_override)
+        except ValueError:
+            x_max_iterations_override = None
+
+    if isinstance(x_max_steps_override, str):
+        try:
+            x_max_steps_override = int(x_max_steps_override)
+        except ValueError:
+            x_max_steps_override = None
+    try:
+        workflow = await app.WORKFLOW_SERVICE.create_workflow_from_prompt(
+            organization=organization,
+            user_prompt=data.user_prompt,
+            totp_identifier=data.totp_identifier,
+            totp_verification_url=data.totp_verification_url,
+            webhook_callback_url=data.webhook_callback_url,
+            proxy_location=data.proxy_location,
+            max_screenshot_scrolling_times=data.max_screenshot_scrolls,
+            extra_http_headers=data.extra_http_headers,
+            max_iterations=x_max_iterations_override,
+            max_steps=x_max_steps_override,
+            status=WorkflowStatus.published if data.publish_workflow else WorkflowStatus.auto_generated,
+            run_with=data.run_with,
+            ai_fallback=data.ai_fallback,
+        )
+    except Exception as e:
+        LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
+        raise FailedToCreateWorkflow(str(e))
+
+    return workflow.model_dump(by_alias=True)
+
+
 @legacy_base_router.put(
     "/workflows/{workflow_id}",
     openapi_extra={
@@ -920,6 +973,7 @@ async def run_block(
     background_tasks: BackgroundTasks,
     block_run_request: BlockRunRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str = Depends(org_auth_service.get_current_user_id),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> BlockRunResponse:
@@ -928,11 +982,17 @@ async def run_block(
     workflow_run_id.
     """
 
+    # NOTE(jdo): if you're running debugger locally, and you want to see the
+    # block runs happening (no temporal; no pbs), then uncomment these two
+    # lines; that'll make the block run happen in a new local browser instance.
+    # LOG.critical("REMOVING BROWSER SESSION ID")
+    # block_run_request.browser_session_id = None
+
     workflow_run = await block_service.ensure_workflow_run(
         organization=organization,
         template=template,
         workflow_permanent_id=block_run_request.workflow_id,
-        workflow_run_request=block_run_request,
+        block_run_request=block_run_request,
     )
 
     browser_session_id = block_run_request.browser_session_id
@@ -946,7 +1006,9 @@ async def run_block(
         workflow_run_id=workflow_run.workflow_run_id,
         workflow_permanent_id=workflow_run.workflow_permanent_id,
         organization=organization,
+        user_id=user_id,
         browser_session_id=browser_session_id,
+        block_outputs=block_run_request.block_outputs,
     )
 
     return BlockRunResponse(
@@ -1779,6 +1841,36 @@ async def get_workflow(
     )
 
 
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/versions",
+    response_model=list[Workflow],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_versions",
+    },
+)
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False
+)
+async def get_workflow_versions(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
+) -> list[Workflow]:
+    """
+    Get all versions of a workflow by its permanent ID.
+    """
+    analytics.capture("skyvern-oss-agent-workflow-versions-get")
+    if template:
+        if workflow_permanent_id not in await app.STORAGE.retrieve_global_workflows():
+            raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_permanent_id)
+
+    return await app.WORKFLOW_SERVICE.get_workflow_versions_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=None if template else current_org.organization_id,
+    )
+
+
 @legacy_base_router.post(
     "/suggest/{ai_suggestion_type}",
     include_in_schema=False,
@@ -1805,7 +1897,10 @@ async def suggest(
         )
 
         llm_response = await app.LLM_API_HANDLER(
-            prompt=llm_prompt, ai_suggestion=new_ai_suggestion, prompt_name="suggest-data-schema"
+            prompt=llm_prompt,
+            ai_suggestion=new_ai_suggestion,
+            prompt_name="suggest-data-schema",
+            organization_id=current_org.organization_id,
         )
         parsed_ai_suggestion = AISuggestionBase.model_validate(llm_response)
 
@@ -1891,7 +1986,7 @@ async def get_api_keys(
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")
     api_keys = []
-    org_auth_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)
+    org_auth_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api.value)
     if org_auth_token:
         api_keys.append(org_auth_token)
     return GetOrganizationAPIKeysResponse(api_keys=api_keys)
@@ -2271,6 +2366,7 @@ async def new_debug_session(
     new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+        proxy_location=ProxyLocation.RESIDENTIAL,
     )
 
     debug_session = await app.DATABASE.create_debug_session(
@@ -2278,6 +2374,7 @@ async def new_debug_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
+        vnc_streaming_supported=True if new_browser_session.ip_address else False,
     )
 
     LOG.info(
@@ -2290,3 +2387,22 @@ async def new_debug_session(
     )
 
     return debug_session
+
+
+@base_router.get(
+    "/debug-session/{workflow_permanent_id}/block-outputs",
+    response_model=dict[str, dict[str, Any]],
+    include_in_schema=False,
+)
+async def get_block_outputs_for_debug_session(
+    workflow_permanent_id: str,
+    version: int | None = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+) -> dict[str, dict[str, Any]]:
+    return await app.WORKFLOW_SERVICE.get_block_outputs_for_debug_session(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+        user_id=current_user_id,
+        version=version,
+    )

@@ -102,6 +102,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
               "bg-slate-950 outline outline-2 outline-slate-300":
                 thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -212,7 +213,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                             }
                             handleChange("errorCodeMapping", value);
                           }}
-                          className="nowheel nopan"
+                          className="nopan"
                           fontSize={8}
                         />
                       </div>

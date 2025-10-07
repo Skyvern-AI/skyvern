@@ -1,3 +1,5 @@
+import typing as t
+
 import structlog
 from fastapi import BackgroundTasks, Request
 
@@ -20,6 +22,8 @@ async def prepare_workflow(
     version: int | None = None,
     max_steps: int | None = None,
     request_id: str | None = None,
+    debug_session_id: str | None = None,
+    code_gen: bool | None = None,
 ) -> WorkflowRun:
     """
     Prepare a workflow to be run.
@@ -36,6 +40,8 @@ async def prepare_workflow(
         version=version,
         max_steps_override=max_steps,
         is_template_workflow=template,
+        debug_session_id=debug_session_id,
+        code_gen=code_gen,
     )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
@@ -69,6 +75,7 @@ async def run_workflow(
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
     block_labels: list[str] | None = None,
+    block_outputs: dict[str, t.Any] | None = None,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
         workflow_id=workflow_id,
@@ -91,6 +98,7 @@ async def run_workflow(
         browser_session_id=workflow_request.browser_session_id,
         api_key=api_key,
         block_labels=block_labels,
+        block_outputs=block_outputs,
     )
 
     return workflow_run
@@ -134,4 +142,5 @@ async def get_workflow_run_response(
             browser_address=workflow_run.browser_address,
             # TODO: add browser session id
         ),
+        errors=workflow_run_resp.errors,
     )

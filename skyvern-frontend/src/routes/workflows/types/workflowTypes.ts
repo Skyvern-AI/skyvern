@@ -72,6 +72,19 @@ export type OnePasswordCredentialParameter = WorkflowParameterBase & {
   deleted_at: string | null;
 };
 
+export type AzureVaultCredentialParameter = WorkflowParameterBase & {
+  parameter_type: "azure_vault_credential";
+  workflow_id: string;
+  azure_vault_credential_parameter_id: string;
+  vault_name: string;
+  username_key: string;
+  password_key: string;
+  totp_secret_key: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+};
+
 export type CredentialParameter = WorkflowParameterBase & {
   parameter_type: "credential";
   workflow_id: string;
@@ -130,6 +143,7 @@ export const WorkflowParameterTypes = {
   Bitwarden_Sensitive_Information: "bitwarden_sensitive_information",
   Bitwarden_Credit_Card_Data: "bitwarden_credit_card_data",
   OnePassword: "onepassword",
+  Azure_Vault_Credential: "azure_vault_credential",
   Credential: "credential",
 } as const;
 
@@ -145,6 +159,7 @@ export function isDisplayedInWorkflowEditor(
   | BitwardenLoginCredentialParameter
   | BitwardenSensitiveInformationParameter
   | OnePasswordCredentialParameter
+  | AzureVaultCredentialParameter
   | CredentialParameter {
   return (
     parameter.parameter_type === WorkflowParameterTypes.Workflow ||
@@ -156,6 +171,8 @@ export function isDisplayedInWorkflowEditor(
     parameter.parameter_type ===
       WorkflowParameterTypes.Bitwarden_Credit_Card_Data ||
     parameter.parameter_type === WorkflowParameterTypes.OnePassword ||
+    parameter.parameter_type ===
+      WorkflowParameterTypes.Azure_Vault_Credential ||
     parameter.parameter_type === WorkflowParameterTypes.Credential
   );
 }
@@ -168,6 +185,7 @@ export type Parameter =
   | BitwardenSensitiveInformationParameter
   | BitwardenCreditCardDataParameter
   | OnePasswordCredentialParameter
+  | AzureVaultCredentialParameter
   | AWSSecretParameter
   | CredentialParameter;
 
@@ -229,6 +247,7 @@ export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "login",
   "navigation",
   "task",
+  "task_v2",
   "validation",
 ]);
 
@@ -459,6 +478,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   cache_actions: boolean;
   engine: RunEngine | null;
+  download_timeout: number | null; // seconds
 };
 
 export type PDFParserBlock = WorkflowBlockBase & {
@@ -505,11 +525,15 @@ export type WorkflowApiResponse = {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_screenshot_scrolls: number | null;
+  status: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  generate_script: boolean;
+  run_with: string | null; // 'agent' or 'code'
   cache_key: string | null;
+  ai_fallback: boolean | null;
+  run_sequentially: boolean | null;
+  sequential_key: string | null;
 };
 
 export type WorkflowSettings = {
@@ -519,8 +543,11 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  useScriptCache: boolean;
+  runWith: string | null; // 'agent' or 'code'
   scriptCacheKey: string | null;
+  aiFallback: boolean | null;
+  runSequentially: boolean;
+  sequentialKey: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

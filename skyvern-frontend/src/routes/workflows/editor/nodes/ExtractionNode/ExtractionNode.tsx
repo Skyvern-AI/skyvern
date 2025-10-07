@@ -36,6 +36,7 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
+import { NodeTabs } from "../components/NodeTabs";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -103,10 +104,10 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
           className={cn(
             "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
             {
-              "pointer-events-none": thisBlockIsPlaying,
-              "bg-slate-950 outline outline-2 outline-slate-300":
-                thisBlockIsTargetted,
+              "pointer-events-none bg-slate-950": thisBlockIsPlaying,
+              "outline outline-2 outline-slate-300": thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -278,6 +279,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
               </AccordionContent>
             </AccordionItem>
           </Accordion>
+          <NodeTabs blockLabel={label} />
         </div>
       </div>
       <BlockCodeEditor blockLabel={label} blockType={type} script={script} />

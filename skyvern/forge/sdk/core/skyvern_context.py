@@ -1,5 +1,6 @@
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from playwright.async_api import Frame
@@ -15,6 +16,7 @@ class SkyvernContext:
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
+    root_workflow_run_id: str | None = None
     task_v2_id: str | None = None
     max_steps_override: int | None = None
     browser_session_id: str | None = None
@@ -27,14 +29,36 @@ class SkyvernContext:
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
     max_screenshot_scrolls: int | None = None
+
+    # feature flags
+    enable_parse_select_in_extract: bool = False
+    use_prompt_caching: bool = False
+    cached_static_prompt: str | None = None
+
+    # script run context
     script_id: str | None = None
     script_revision_id: str | None = None
+    action_order: int = 0
+    prompt: str | None = None
+    parent_workflow_run_block_id: str | None = None
+    loop_metadata: dict[str, Any] | None = None
+    loop_output_values: list[dict[str, Any]] | None = None
+    script_run_parameters: dict[str, Any] = field(default_factory=dict)
+    """
+    Example output value:
+    {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}
+    """
+    generate_script: bool = True
 
     def __repr__(self) -> str:
         return f"SkyvernContext(request_id={self.request_id}, organization_id={self.organization_id}, task_id={self.task_id}, step_id={self.step_id}, workflow_id={self.workflow_id}, workflow_run_id={self.workflow_run_id}, task_v2_id={self.task_v2_id}, max_steps_override={self.max_steps_override}, run_id={self.run_id})"
 
     def __str__(self) -> str:
         return self.__repr__()
+
+    def pop_totp_code(self, task_id: str) -> None:
+        if task_id in self.totp_codes:
+            self.totp_codes.pop(task_id)
 
 
 _context: ContextVar[SkyvernContext | None] = ContextVar(

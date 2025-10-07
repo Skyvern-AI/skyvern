@@ -50,6 +50,7 @@ import {
   ContextParameterYAML,
   CredentialParameterYAML,
   OnePasswordCredentialParameterYAML,
+  AzureVaultCredentialParameterYAML,
   ParameterYAML,
   WorkflowParameterYAML,
 } from "../types/workflowYamlTypes";
@@ -65,6 +66,7 @@ import {
   parameterIsSkyvernCredential,
   parameterIsOnePasswordCredential,
   parameterIsBitwardenCredential,
+  parameterIsAzureVaultCredential,
 } from "./types";
 import "./reactFlowOverrideStyles.css";
 import {
@@ -77,8 +79,9 @@ import {
   getWorkflowSettings,
   layout,
 } from "./workflowEditorUtils";
+import { getWorkflowErrors } from "./workflowEditorUtils";
+import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
-import { useUser } from "@/hooks/useUser";
 
 const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -91,6 +94,7 @@ function convertToParametersYAML(
   | BitwardenSensitiveInformationParameterYAML
   | BitwardenCreditCardDataParameterYAML
   | OnePasswordCredentialParameterYAML
+  | AzureVaultCredentialParameterYAML
   | CredentialParameterYAML
 > {
   return parameters
@@ -104,6 +108,7 @@ function convertToParametersYAML(
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
         | OnePasswordCredentialParameterYAML
+        | AzureVaultCredentialParameterYAML
         | CredentialParameterYAML
         | undefined => {
         if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
@@ -192,6 +197,16 @@ function convertToParametersYAML(
               vault_id: parameter.vaultId,
               item_id: parameter.itemId,
             };
+          } else if (parameterIsAzureVaultCredential(parameter)) {
+            return {
+              parameter_type: WorkflowParameterTypes.Azure_Vault_Credential,
+              key: parameter.key,
+              description: parameter.description || null,
+              vault_name: parameter.vaultName,
+              username_key: parameter.usernameKey,
+              password_key: parameter.passwordKey,
+              totp_secret_key: parameter.totpSecretKey,
+            };
           }
         }
         return undefined;
@@ -206,6 +221,7 @@ function convertToParametersYAML(
           | BitwardenSensitiveInformationParameterYAML
           | BitwardenCreditCardDataParameterYAML
           | OnePasswordCredentialParameterYAML
+          | AzureVaultCredentialParameterYAML
           | CredentialParameterYAML
           | undefined,
       ): param is
@@ -215,11 +231,14 @@ function convertToParametersYAML(
         | BitwardenSensitiveInformationParameterYAML
         | BitwardenCreditCardDataParameterYAML
         | OnePasswordCredentialParameterYAML
+        | AzureVaultCredentialParameterYAML
         | CredentialParameterYAML => param !== undefined,
     );
 }
 
 type Props = {
+  hideBackground?: boolean;
+  hideControls?: boolean;
   nodes: Array<AppNode>;
   edges: Array<Edge>;
   setNodes: (nodes: Array<AppNode>) => void;
@@ -232,9 +251,12 @@ type Props = {
   onDebuggableBlockCountChange?: (count: number) => void;
   onMouseDownCapture?: () => void;
   zIndex?: number;
+  onContainerResize?: number;
 };
 
 function FlowRenderer({
+  hideBackground = false,
+  hideControls = false,
   nodes,
   edges,
   setNodes,
@@ -247,17 +269,17 @@ function FlowRenderer({
   onDebuggableBlockCountChange,
   onMouseDownCapture,
   zIndex,
+  onContainerResize,
 }: Props) {
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
-  const user = useUser().get();
   const { title, initializeTitle } = useWorkflowTitleStore();
   // const [parameters] = useState<ParametersState>(initialParameters);
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const flowIsConstrained = debugStore.isDebugMode && Boolean(user);
+  const flowIsConstrained = debugStore.isDebugMode;
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -353,8 +375,25 @@ function FlowRenderer({
     setGetSaveDataRef.current(constructSaveData);
   }, [constructSaveData]);
 
-  async function handleSave() {
-    return await saveWorkflow.mutateAsync();
+  async function handleSave(): Promise<boolean> {
+    // Validate before saving; block if any workflow errors exist
+    const errors = getWorkflowErrors(nodes);
+    if (errors.length > 0) {
+      toast({
+        title: "Can not save workflow because of errors:",
+        description: (
+          <div className="space-y-2">
+            {errors.map((error) => (
+              <p key={error}>{error}</p>
+            ))}
+          </div>
+        ),
+        variant: "destructive",
+      });
+      return false;
+    }
+    await saveWorkflow.mutateAsync();
+    return true;
   }
 
   function deleteNode(id: string) {
@@ -483,21 +522,37 @@ function FlowRenderer({
 
   useAutoPan(editorElementRef, nodes);
 
+  useEffect(() => {
+    doLayout(nodes, edges);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onContainerResize]);
+
   const zoomLock = 1 as const;
   const yLockMax = 140 as const;
 
   /**
    * TODO(jdo): hack
+   *
+   * Locks the x position of the flow to an ideal x based on the ideal width
+   * of the flow. The ideal width is based on differently-width'd blocks.
    */
   const getXLock = () => {
-    return 24;
+    const rect = editorElementRef.current?.getBoundingClientRect();
+
+    if (!rect) {
+      return 24;
+    }
+
+    const width = rect.width;
+    const hasLoopBlock = nodes.some((node) => node.type === "loop");
+    const hasHttpBlock = nodes.some((node) => node.type === "http_request");
+    const idealWidth = hasHttpBlock ? 580 : hasLoopBlock ? 498 : 475;
+    const split = (width - idealWidth) / 2;
+
+    return Math.max(24, split);
   };
 
   useOnChange(debugStore.isDebugMode, (newValue) => {
-    if (!user) {
-      return;
-    }
-
     const xLock = getXLock();
 
     if (newValue) {
@@ -569,8 +624,10 @@ function FlowRenderer({
             </Button>
             <Button
               onClick={() => {
-                handleSave().then(() => {
-                  blocker.proceed?.();
+                handleSave().then((ok) => {
+                  if (ok) {
+                    blocker.proceed?.();
+                  }
                 });
               }}
               disabled={workflowChangesStore.saveIsPending}
@@ -648,7 +705,7 @@ function FlowRenderer({
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
-          colorMode="dark"
+          // colorMode="dark"
           fitView={true}
           fitViewOptions={{
             maxZoom: 1,
@@ -668,8 +725,10 @@ function FlowRenderer({
           zoomOnPinch={!flowIsConstrained}
           zoomOnScroll={!flowIsConstrained}
         >
-          <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
-          <Controls position="bottom-left" />
+          {!hideBackground && (
+            <Background variant={BackgroundVariant.Dots} bgColor="#020617" />
+          )}
+          {!hideControls && <Controls position="bottom-left" />}
         </ReactFlow>
       </BlockActionContext.Provider>
     </div>

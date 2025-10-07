@@ -12,11 +12,13 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { helpTooltips } from "@/routes/workflows/editor/helpContent";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { AutoResizingTextarea } from "../AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "../ui/button";
 import { AxiosError } from "axios";
 import { toast } from "../ui/use-toast";
+import { TSON } from "@/util/tson";
+import { cn } from "@/util/utils";
 
 type Props = {
   value: string;
@@ -34,6 +36,13 @@ function WorkflowDataSchemaInputGroup({
   const credentialGetter = useCredentialGetter();
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
+
+  const tsonResult = useMemo(() => {
+    if (value === "null") return null;
+    return TSON.parse(value);
+  }, [value]);
+
+  console.log({ tsonResult });
 
   const getDataSchemaSuggestionMutation = useMutation({
     mutationFn: async () => {
@@ -121,13 +130,25 @@ function WorkflowDataSchemaInputGroup({
               )}
             </div>
           ) : null}
-          <CodeEditor
-            language="json"
-            value={value}
-            onChange={onChange}
-            className="nowheel nopan"
-            fontSize={8}
-          />
+          <div
+            className={cn(
+              "rounded-md",
+              tsonResult && !tsonResult.success
+                ? "ring-1 ring-red-500"
+                : undefined,
+            )}
+          >
+            <CodeEditor
+              language="json"
+              value={value}
+              onChange={onChange}
+              className="nopan"
+              fontSize={8}
+            />
+          </div>
+          {tsonResult !== null && !tsonResult.success && tsonResult.error && (
+            <div className="text-xs text-red-400">{tsonResult.error}</div>
+          )}
         </div>
       )}
     </div>

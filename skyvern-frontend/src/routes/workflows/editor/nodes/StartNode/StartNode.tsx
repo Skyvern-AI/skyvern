@@ -7,6 +7,13 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useEffect, useState } from "react";
 import { ProxyLocation } from "@/api/types";
 import { useQuery } from "@tanstack/react-query";
@@ -23,9 +30,7 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
 import { KeyValueInput } from "@/components/KeyValueInput";
-import { OrgWalled } from "@/components/Orgwalled";
 import { placeholders } from "@/routes/workflows/editor/helpContent";
-import { NodeActionMenu } from "@/routes/workflows/editor/nodes/NodeActionMenu";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import {
@@ -74,8 +79,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
       ? data.maxScreenshotScrolls
       : null,
     extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
-    useScriptCache: data.withWorkflowSettings ? data.useScriptCache : false,
+    runWith: data.withWorkflowSettings ? data.runWith : "agent",
     scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
+    aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
+    runSequentially: data.withWorkflowSettings ? data.runSequentially : false,
+    sequentialKey: data.withWorkflowSettings ? data.sequentialKey : null,
   });
 
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -97,6 +105,11 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     if (!data.editable) {
       return;
     }
+
+    if (inputs[key as keyof typeof inputs] === value) {
+      return;
+    }
+
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
@@ -108,19 +121,20 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
     );
   }
 
-  function showAllScripts() {
-    for (const node of reactFlowInstance.getNodes()) {
-      const label = node.data.label;
+  // NOTE(jdo): keeping for reference; we seem to revert stuff all the time
+  // function showAllScripts() {
+  //   for (const node of reactFlowInstance.getNodes()) {
+  //     const label = node.data.label;
 
-      label &&
-        nodeIsFlippable(node) &&
-        typeof label === "string" &&
-        toggleScriptForNodeCallback({
-          label,
-          show: true,
-        });
-    }
-  }
+  //     label &&
+  //       nodeIsFlippable(node) &&
+  //       typeof label === "string" &&
+  //       toggleScriptForNodeCallback({
+  //         label,
+  //         show: true,
+  //       });
+  //   }
+  // }
 
   function hideAllScripts() {
     for (const node of reactFlowInstance.getNodes()) {
@@ -153,19 +167,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
             )}
           >
             <div className="relative">
-              <div className="absolute right-0 top-0">
-                <div>
-                  <div className="rounded p-1 hover:bg-muted">
-                    <NodeActionMenu
-                      isDeletable={false}
-                      isScriptable={true}
-                      showScriptText="Show All Scripts"
-                      onShowScript={showAllScripts}
-                    />
-                  </div>
-                </div>
-              </div>
-              <header className="mb-4">Start</header>
+              <header className="mb-6 mt-2">Start</header>
               <Separator />
               <Accordion
                 type="single"
@@ -215,24 +217,47 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           }}
                         />
                       </div>
-                      <OrgWalled className="flex flex-col gap-4">
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-2">
-                            <Label>Generate Script</Label>
-                            <HelpTooltip content="Generate & use cached scripts for faster execution." />
-                            <Switch
-                              className="ml-auto"
-                              checked={inputs.useScriptCache}
-                              onCheckedChange={(value) => {
-                                handleChange("useScriptCache", value);
+                      <div className="flex flex-col gap-4 rounded-md bg-slate-elevation5 p-4 pl-4">
+                        <div className="flex flex-col gap-4">
+                          <div className="flex justify-between">
+                            <div className="flex items-center gap-2">
+                              <Label>Run With</Label>
+                              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
+                            </div>
+                            <Select
+                              value={inputs.runWith ?? "agent"}
+                              onValueChange={(value) => {
+                                handleChange("runWith", value);
                               }}
-                            />
+                            >
+                              <SelectTrigger className="w-48">
+                                <SelectValue placeholder="Run Method" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="ai">
+                                  Skyvern Agent
+                                </SelectItem>
+                                <SelectItem value="code">Code</SelectItem>
+                              </SelectContent>
+                            </Select>
                           </div>
-                        </div>
-                        {inputs.useScriptCache && (
+                          <div className="space-y-2">
+                            <div className="flex items-center gap-2">
+                              <Label>AI Fallback (self-healing)</Label>
+                              <HelpTooltip content="If a run with code fails, fallback to AI and regenerate the code." />
+                              <Switch
+                                className="ml-auto"
+                                checked={inputs.aiFallback}
+                                onCheckedChange={(value) => {
+                                  handleChange("aiFallback", value);
+                                }}
+                              />
+                            </div>
+                          </div>
                           <div className="space-y-2">
                             <div className="flex gap-2">
-                              <Label>Script Key (optional)</Label>
+                              <Label>Code Key (optional)</Label>
+                              <HelpTooltip content="A static or dynamic key for directing code generation." />
                             </div>
                             <WorkflowBlockInputTextarea
                               nodeId={id}
@@ -245,8 +270,44 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               className="nopan text-xs"
                             />
                           </div>
+                        </div>
+                        {/* )} */}
+                      </div>
+                      <div className="flex flex-col gap-4">
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            <Label>Run Sequentially</Label>
+                            <HelpTooltip content="Run the workflow in a sequential order" />
+                            <Switch
+                              className="ml-auto"
+                              checked={inputs.runSequentially}
+                              onCheckedChange={(value) => {
+                                handleChange("runSequentially", value);
+                              }}
+                            />
+                          </div>
+                        </div>
+                        {inputs.runSequentially && (
+                          <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
+                            <div className="space-y-2">
+                              <div className="flex gap-2">
+                                <Label>Sequential Key (optional)</Label>
+                                <HelpTooltip content="A static or dynamic key for directing sequential workflow execution." />
+                              </div>
+                              <WorkflowBlockInputTextarea
+                                nodeId={id}
+                                onChange={(value) => {
+                                  const v = value.length ? value : null;
+                                  handleChange("sequentialKey", v);
+                                }}
+                                value={inputs.sequentialKey ?? ""}
+                                placeholder={placeholders["sequentialKey"]}
+                                className="nopan text-xs"
+                              />
+                            </div>
+                          </div>
                         )}
-                      </OrgWalled>
+                      </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
                           <Label>Save &amp; Reuse Session</Label>
@@ -268,7 +329,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                         <KeyValueInput
                           value={inputs.extraHttpHeaders ?? null}
                           onChange={(val) =>
-                            handleChange("extraHttpHeaders", val)
+                            handleChange("extraHttpHeaders", val || "{}")
                           }
                           addButtonText="Add Header"
                         />

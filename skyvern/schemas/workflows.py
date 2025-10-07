@@ -150,6 +150,14 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
     item_id: str
 
 
+class AzureVaultCredentialParameterYAML(ParameterYAML):
+    parameter_type: Literal[ParameterType.AZURE_VAULT_CREDENTIAL] = ParameterType.AZURE_VAULT_CREDENTIAL  # type: ignore
+    vault_name: str
+    username_key: str
+    password_key: str
+    totp_secret_key: str | None = None
+
+
 class WorkflowParameterYAML(ParameterYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -202,7 +210,9 @@ class TaskBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
@@ -279,6 +289,7 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
+    azure_folder_path: str | None = None
     path: str | None = None
 
 
@@ -335,7 +346,9 @@ class ActionBlockYAML(BlockYAML):
     max_retries: int = 0
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
@@ -353,7 +366,9 @@ class NavigationBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
@@ -412,10 +427,13 @@ class FileDownloadBlockYAML(BlockYAML):
     max_retries: int = 0
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
-    download_suffix: str | None = None
+    download_suffix: str | None = (
+        None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
+    )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    download_timeout: float | None = None
 
 
 class UrlBlockYAML(BlockYAML):
@@ -454,6 +472,7 @@ PARAMETER_YAML_SUBCLASSES = (
     | BitwardenSensitiveInformationParameterYAML
     | BitwardenCreditCardDataParameterYAML
     | OnePasswordCredentialParameterYAML
+    | AzureVaultCredentialParameterYAML
     | WorkflowParameterYAML
     | ContextParameterYAML
     | OutputParameterYAML
@@ -505,8 +524,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
-    generate_script: bool = False
-    cache_key: str | None = None
+    run_with: str | None = None
+    ai_fallback: bool = False
+    cache_key: str | None = "default"
+    run_sequentially: bool = False
+    sequential_key: str | None = None
 
 
 class WorkflowRequest(BaseModel):

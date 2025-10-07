@@ -12,6 +12,7 @@ from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddress
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, is_final_status
+from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserState
 
 LOG = structlog.get_logger()
@@ -237,6 +238,7 @@ class PersistentSessionsManager:
         runnable_id: str | None = None,
         runnable_type: str | None = None,
         timeout_minutes: int | None = None,
+        proxy_location: ProxyLocation | None = ProxyLocation.RESIDENTIAL,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
 
@@ -250,6 +252,7 @@ class PersistentSessionsManager:
             runnable_type=runnable_type,
             runnable_id=runnable_id,
             timeout_minutes=timeout_minutes,
+            proxy_location=proxy_location,
         )
 
         return browser_session_db
@@ -318,7 +321,7 @@ class PersistentSessionsManager:
                 session_id=browser_session_id,
             )
 
-        await self.database.mark_persistent_browser_session_deleted(browser_session_id, organization_id)
+        await self.database.close_persistent_browser_session(browser_session_id, organization_id)
 
     async def close_all_sessions(self, organization_id: str) -> None:
         """Close all browser sessions for an organization."""

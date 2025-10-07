@@ -1,7 +1,21 @@
+import { AxiosError } from "axios";
+import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { useEffect, useState } from "react";
+import { useForm } from "react-hook-form";
+import { useNavigate, useParams } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { z } from "zod";
+
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
 import { Button } from "@/components/ui/button";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 import {
   Form,
   FormControl,
@@ -10,6 +24,15 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { toast } from "@/components/ui/use-toast";
@@ -17,20 +40,26 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useSyncFormFieldToStorage } from "@/hooks/useSyncFormFieldToStorage";
 import { useLocalStorageFormDefault } from "@/hooks/useLocalStorageFormDefault";
-import { apiBaseUrl } from "@/util/env";
+import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
-import { useForm } from "react-hook-form";
-import { useNavigate, useParams } from "react-router-dom";
-import { z } from "zod";
+import { apiBaseUrl, lsKeys } from "@/util/env";
+
+import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
+import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
-import { AxiosError } from "axios";
-import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
-import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
-import { lsKeys } from "@/util/env";
+
+// Utility function to omit specified keys from an object
+function omit<T extends Record<string, unknown>, K extends keyof T>(
+  obj: T,
+  keys: K[],
+): Omit<T, K> {
+  const result = { ...obj };
+  keys.forEach((key) => delete result[key]);
+  return result;
+}
 
 type Props = {
   workflowParameters: Array<WorkflowParameter>;
@@ -83,6 +112,8 @@ type RunWorkflowRequestBody = {
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   browser_address?: string | null;
+  run_with?: "agent" | "code";
+  ai_fallback?: boolean;
 };
 
 function getRunWorkflowRequestBody(
@@ -96,6 +127,8 @@ function getRunWorkflowRequestBody(
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
+    runWithCode,
+    aiFallback,
     ...parameters
   } = values;
 
@@ -111,6 +144,8 @@ function getRunWorkflowRequestBody(
     proxy_location: proxyLocation,
     browser_session_id: bsi,
     browser_address: cdpAddress,
+    run_with: runWithCode === true ? "code" : "agent",
+    ai_fallback: aiFallback ?? true,
   };
 
   if (maxScreenshotScrolls) {
@@ -140,6 +175,8 @@ type RunWorkflowFormType = Record<string, unknown> & {
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
+  runWithCode: boolean | null;
+  aiFallback: boolean | null;
 };
 
 function RunWorkflowForm({
@@ -155,6 +192,9 @@ function RunWorkflowForm({
     lsKeys.browserSessionId,
     (initialValues.browserSessionId as string | undefined) ?? null,
   );
+  const apiCredential = useApiCredential();
+  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+
   const form = useForm<RunWorkflowFormType>({
     defaultValues: {
       ...initialValues,
@@ -166,9 +206,10 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
+      runWithCode: workflow?.run_with === "code",
+      aiFallback: workflow?.ai_fallback ?? true,
     },
   });
-  const apiCredential = useApiCredential();
 
   useSyncFormFieldToStorage(form, "browserSessionId", lsKeys.browserSessionId);
 
@@ -207,6 +248,54 @@ function RunWorkflowForm({
     },
   });
 
+  const [runParameters, setRunParameters] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  const [cacheKeyValue, setCacheKeyValue] = useState<string>("");
+  const cacheKey = workflow?.cache_key ?? "default";
+
+  useEffect(() => {
+    if (!runParameters) {
+      setCacheKeyValue("");
+      return;
+    }
+
+    const ckv = constructCacheKeyValueFromParameters({
+      codeKey: cacheKey,
+      parameters: runParameters,
+    });
+
+    setCacheKeyValue(ckv);
+  }, [cacheKey, runParameters]);
+
+  const { data: blockScripts } = useBlockScriptsQuery({
+    cacheKey,
+    cacheKeyValue,
+    workflowPermanentId,
+    status: "published",
+  });
+
+  const [hasCode, setHasCode] = useState(false);
+
+  useEffect(() => {
+    setHasCode(Object.keys(blockScripts ?? {}).length > 0);
+  }, [blockScripts]);
+
+  useEffect(() => {
+    onChange(form.getValues());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form]);
+
+  // if we're coming from debugger, block scripts may already be cached; let's ensure we bust it
+  // on mount
+  useEffect(() => {
+    queryClient.invalidateQueries({
+      queryKey: ["block-scripts"],
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function onSubmit(values: RunWorkflowFormType) {
     const {
       webhookCallbackUrl,
@@ -215,6 +304,8 @@ function RunWorkflowForm({
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
+      runWithCode,
+      aiFallback,
       ...parameters
     } = values;
 
@@ -230,12 +321,41 @@ function RunWorkflowForm({
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpAddress,
+      runWithCode,
+      aiFallback,
     });
+  }
+
+  function onChange(values: RunWorkflowFormType) {
+    const parameters = omit(values, [
+      "webhookCallbackUrl",
+      "proxyLocation",
+      "browserSessionId",
+      "maxScreenshotScrolls",
+      "extraHttpHeaders",
+      "cdpAddress",
+      "runWithCode",
+    ]);
+
+    const parsedParameters = parseValuesForWorkflowRun(
+      parameters,
+      workflowParameters,
+    );
+
+    setRunParameters(parsedParameters);
+  }
+
+  if (!workflowPermanentId || !workflow) {
+    return <div>Invalid workflow</div>;
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+      <form
+        onChange={form.handleSubmit(onChange)}
+        onSubmit={form.handleSubmit(onSubmit)}
+        className="space-y-8"
+      >
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
             <h1 className="text-lg">Input Parameters</h1>
@@ -311,7 +431,7 @@ function RunWorkflowForm({
 
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
-            <h1 className="text-lg">Advanced Settings</h1>
+            <h1 className="text-lg">Settings</h1>
           </header>
           <FormField
             key="webhookCallbackUrl"
@@ -398,9 +518,9 @@ function RunWorkflowForm({
             }}
           />
           <FormField
-            key="browserSessionId"
+            key="runWithCode"
             control={form.control}
-            name="browserSessionId"
+            name="runWithCode"
             render={({ field }) => {
               return (
                 <FormItem>
@@ -408,23 +528,47 @@ function RunWorkflowForm({
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          Browser Session ID
+                          Run With
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          Use a persistent browser session to maintain state and
-                          enable browser interaction.
+                          {field.value ? (
+                            hasCode ? (
+                              <span>
+                                Run this workflow with generated code.
+                              </span>
+                            ) : (
+                              <span>
+                                Run this workflow with generated code (after it
+                                is first generated).
+                              </span>
+                            )
+                          ) : hasCode ? (
+                            <span>
+                              Run this workflow with AI. (Even though it has
+                              generated code.)
+                            </span>
+                          ) : (
+                            <span>Run this workflow with AI.</span>
+                          )}
                         </h2>
                       </div>
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
-                        <Input
-                          {...field}
-                          placeholder="pbs_xxx"
-                          value={
-                            field.value === null ? "" : (field.value as string)
+                        <Select
+                          value={field.value ? "code" : "ai"}
+                          onValueChange={(v) =>
+                            field.onChange(v === "code" ? true : false)
                           }
-                        />
+                        >
+                          <SelectTrigger className="w-48">
+                            <SelectValue placeholder="Run Method" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="ai">Skyvern Agent</SelectItem>
+                            <SelectItem value="code">Code</SelectItem>
+                          </SelectContent>
+                        </Select>
                       </FormControl>
                       <FormMessage />
                     </div>
@@ -433,10 +577,11 @@ function RunWorkflowForm({
               );
             }}
           />
+
           <FormField
-            key="cdpAddress"
+            key="aiFallback"
             control={form.control}
-            name="cdpAddress"
+            name="aiFallback"
             render={({ field }) => {
               return (
                 <FormItem>
@@ -444,98 +589,20 @@ function RunWorkflowForm({
                     <FormLabel>
                       <div className="w-72">
                         <div className="flex items-center gap-2 text-lg">
-                          Browser Address
+                          AI Fallback (self-healing)
                         </div>
                         <h2 className="text-sm text-slate-400">
-                          The address of the Browser server to use for the
-                          workflow run.
+                          If the run fails when running with code, keep this on
+                          to have AI attempt to fix the issue and regenerate the
+                          code.
                         </h2>
                       </div>
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
-                        <Input
-                          {...field}
-                          placeholder="http://127.0.0.1:9222"
-                          value={
-                            field.value === null ? "" : (field.value as string)
-                          }
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </div>
-                  </div>
-                </FormItem>
-              );
-            }}
-          />
-          <FormField
-            key="extraHttpHeaders"
-            control={form.control}
-            name="extraHttpHeaders"
-            render={({ field }) => {
-              return (
-                <FormItem>
-                  <div className="flex gap-16">
-                    <FormLabel>
-                      <div className="w-72">
-                        <div className="flex items-center gap-2 text-lg">
-                          Extra HTTP Headers
-                        </div>
-                        <h2 className="text-sm text-slate-400">
-                          Specify some self defined HTTP requests headers in
-                          Dict format
-                        </h2>
-                      </div>
-                    </FormLabel>
-                    <div className="w-full space-y-2">
-                      <FormControl>
-                        <KeyValueInput
-                          value={field.value ?? ""}
-                          onChange={(val) => field.onChange(val)}
-                          addButtonText="Add Header"
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </div>
-                  </div>
-                </FormItem>
-              );
-            }}
-          />
-          <FormField
-            key="maxScreenshotScrolls"
-            control={form.control}
-            name="maxScreenshotScrolls"
-            render={({ field }) => {
-              return (
-                <FormItem>
-                  <div className="flex gap-16">
-                    <FormLabel>
-                      <div className="w-72">
-                        <div className="flex items-center gap-2 text-lg">
-                          Max Screenshot Scrolls
-                        </div>
-                        <h2 className="text-sm text-slate-400">
-                          {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
-                        </h2>
-                      </div>
-                    </FormLabel>
-                    <div className="w-full space-y-2">
-                      <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
-                          min={0}
-                          value={field.value ?? ""}
-                          placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
-                          onChange={(event) => {
-                            const value =
-                              event.target.value === ""
-                                ? null
-                                : Number(event.target.value);
-                            field.onChange(value);
-                          }}
+                        <Switch
+                          checked={field.value ?? true}
+                          onCheckedChange={field.onChange}
                         />
                       </FormControl>
                       <FormMessage />
@@ -546,6 +613,175 @@ function RunWorkflowForm({
             }}
           />
         </div>
+
+        <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
+          <Accordion type="single" collapsible>
+            <AccordionItem value="advanced" className="border-b-0">
+              <AccordionTrigger className="py-0">
+                <header>
+                  <h1 className="text-lg">Advanced Settings</h1>
+                </header>
+              </AccordionTrigger>
+              <AccordionContent className="pl-6 pr-1 pt-1">
+                <div className="space-y-8 pt-5">
+                  <FormField
+                    key="browserSessionId"
+                    control={form.control}
+                    name="browserSessionId"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Browser Session ID
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  Use a persistent browser session to maintain
+                                  state and enable browser interaction.
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder="pbs_xxx"
+                                  value={
+                                    field.value === null
+                                      ? ""
+                                      : (field.value as string)
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    key="cdpAddress"
+                    control={form.control}
+                    name="cdpAddress"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Browser Address
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  The address of the Browser server to use for
+                                  the workflow run.
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder="http://127.0.0.1:9222"
+                                  value={
+                                    field.value === null
+                                      ? ""
+                                      : (field.value as string)
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    key="extraHttpHeaders"
+                    control={form.control}
+                    name="extraHttpHeaders"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Extra HTTP Headers
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  Specify some self defined HTTP requests
+                                  headers in Dict format
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <KeyValueInput
+                                  value={field.value ?? ""}
+                                  onChange={(val) => field.onChange(val)}
+                                  addButtonText="Add Header"
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    key="maxScreenshotScrolls"
+                    control={form.control}
+                    name="maxScreenshotScrolls"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  Max Screenshot Scrolls
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="number"
+                                  min={0}
+                                  value={field.value ?? ""}
+                                  placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
+                                  onChange={(event) => {
+                                    const value =
+                                      event.target.value === ""
+                                        ? null
+                                        : Number(event.target.value);
+                                    field.onChange(value);
+                                  }}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        </div>
+
         <div className="flex justify-end gap-2">
           <CopyApiCommandDropdown
             getOptions={() => {

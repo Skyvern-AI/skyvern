@@ -119,6 +119,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
               "bg-slate-950 outline outline-2 outline-slate-300":
                 thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -326,7 +327,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                           onChange={(value) => {
                             handleChange("errorCodeMapping", value);
                           }}
-                          className="nowheel nopan"
+                          className="nopan"
                           fontSize={8}
                         />
                       </div>
@@ -416,7 +417,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                   <div className="flex items-center justify-between">
                     <div className="flex gap-2">
                       <Label className="text-xs font-normal text-slate-300">
-                        File Suffix
+                        File Name
                       </Label>
                       <HelpTooltip
                         content={helpTooltips["task"]["fileSuffix"]}

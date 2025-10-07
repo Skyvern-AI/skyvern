@@ -33,66 +33,6 @@ Traditional approaches to browser automations required writing custom scripts fo
 
 Instead of only relying on code-defined XPath interactions, Skyvern relies on Vision LLMs to learn and interact with the websites.
 
-Want to see examples of Skyvern in action? Jump to [#real-world-examples-of-skyvern](#real-world-examples-of-skyvern)
-
-# Quickstart
-
-## Skyvern Cloud
-[Skyvern Cloud](https://app.skyvern.com) is a managed cloud version of Skyvern that allows you to run Skyvern without worrying about the infrastructure. It allows you to run multiple Skyvern instances in parallel and comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solvers.
-
-If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.com) and create an account.
-
-## Install & Run
-
-### 1. Install Skyvern
-
-```bash
-pip install skyvern
-```
-
-### 2. Run Skyvern
-
-```bash
-skyvern quickstart
-```
-
-### 3. Run task
-
-#### UI (Recommended)
-
-Start the Skyvern service and UI
-
-```bash
-skyvern run all
-```
-
-Go to http://localhost:8080 and use the UI to run a task
-
-#### Code
-
-```python
-from skyvern import Skyvern
-
-skyvern = Skyvern()
-task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-print(task)
-```
-Skyvern starts running the task in a browser that pops up and closes it when the task is done. You will be able to view the task from http://localhost:8080/history
-
-You can also run a task on different targets:
-```python
-from skyvern import Skyvern
-
-# Run on Skyvern Cloud
-skyvern = Skyvern(api_key="SKYVERN API KEY")
-
-# Local Skyvern service
-skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API KEY")
-
-task = await skyvern.run_task(prompt="Find the top post on hackernews today")
-print(task)
-```
-
 # How it works
 Skyvern was inspired by the Task-Driven autonomous agent design popularized by [BabyAGI](https://github.com/yoheinakajima/babyagi) and [AutoGPT](https://github.com/Significant-Gravitas/AutoGPT) -- with one major bonus: we give Skyvern the ability to interact with websites using browser automation libraries like [Playwright](https://playwright.dev/).
 
@@ -133,6 +73,73 @@ Skyvern is the best performing agent on WRITE tasks (eg filling out forms, loggi
 <p align="center">
   <img src="fern/images/performance/webbench_write.png"/>
 </p>
+
+# Quickstart
+
+## Skyvern Cloud
+[Skyvern Cloud](https://app.skyvern.com) is a managed cloud version of Skyvern that allows you to run Skyvern without worrying about the infrastructure. It allows you to run multiple Skyvern instances in parallel and comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solvers.
+
+If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.com) and create an account.
+
+## Install & Run
+
+Dependencies needed:
+- [Python 3.11.x](https://www.python.org/downloads/), works with 3.12, not ready yet for 3.13
+- [NodeJS & NPM](https://nodejs.org/en/download/)
+
+Additionally, for Windows:
+- [Rust](https://rustup.rs/)
+- VS Code with C++ dev tools and Windows SDK
+
+### 1. Install Skyvern
+
+```bash
+pip install skyvern
+```
+
+### 2. Run Skyvern
+This is most helpful for first time run (db setup, db migrations etc).
+
+```bash
+skyvern quickstart
+```
+
+### 3. Run task
+
+#### UI (Recommended)
+
+Start the Skyvern service and UI (when DB is up and running)
+
+```bash
+skyvern run all
+```
+
+Go to http://localhost:8080 and use the UI to run a task
+
+#### Code
+
+```python
+from skyvern import Skyvern
+
+skyvern = Skyvern()
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
+Skyvern starts running the task in a browser that pops up and closes it when the task is done. You will be able to view the task from http://localhost:8080/history
+
+You can also run a task on different targets:
+```python
+from skyvern import Skyvern
+
+# Run on Skyvern Cloud
+skyvern = Skyvern(api_key="SKYVERN API KEY")
+
+# Local Skyvern service
+skyvern = Skyvern(base_url="http://localhost:8000", api_key="LOCAL SKYVERN API KEY")
+
+task = await skyvern.run_task(prompt="Find the top post on hackernews today")
+print(task)
+```
 
 ## Advanced Usage
 
@@ -271,20 +278,21 @@ For example, if you wanted to download all invoices newer than January 1st, you 
 Another example is if you wanted to automate purchasing products from an e-commerce store, you could create a workflow that first navigated to the desired product, then added it to a cart. Second, it would navigate to the cart and validate the cart state. Finally, it would go through the checkout process to purchase the items.
 
 Supported workflow features include:
-1. Navigation
-1. Action
+1. Browser Task
+1. Browser Action
 1. Data Extraction
-1. Loops
+1. Validation
+1. For Loops
 1. File parsing
-1. Uploading files to block storage
 1. Sending emails
 1. Text Prompts
-1. Tasks (general)
+1. HTTP Request Block
+1. Custom Code Block
+1. Uploading files to block storage
 1. (Coming soon) Conditionals
-1. (Coming soon) Custom Code Block
 
 <p align="center">
-  <img src="fern/images/invoice_downloading_workflow_example.png"/>
+  <img src="fern/images/block_example_v2.png"/>
 </p>
 
 ## Livestreaming
@@ -390,17 +398,16 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 </p>
 
 # Contributor Setup
-For a complete local environment CLI Installation
-```bash
-pip install -e .
-```
-The following command sets up your development environment to use pre-commit (our commit hook handler)
-```
-skyvern quickstart contributors
-```
-
-
-1. Navigate to `http://localhost:8080` in your browser to start using the UI
+Make sure to have [uv](https://docs.astral.sh/uv/getting-started/installation/) installed.
+1. Run this to create your virtual environment (`.venv`)
+    ```bash
+    uv sync --group dev
+    ```
+2. Perform initial server configuration
+    ```bash
+    uv run skyvern quickstart
+    ```
+3. Navigate to `http://localhost:8080` in your browser to start using the UI
    *The Skyvern CLI supports Windows, WSL, macOS, and Linux environments.*
 
 # Documentation

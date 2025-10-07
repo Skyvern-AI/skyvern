@@ -2,7 +2,7 @@ import { useState } from "react";
 
 /**
  * ```tsx
- * const { bump, key } = useRerender({ delay: 40,prefix: "my-prefix" });
+ * const { bump, key } = useRerender({ delay: 40, prefix: "my-prefix" });
  *
  * <div key={key}>...</div>
  *
@@ -17,17 +17,17 @@ const useRerender = ({
   delay?: number;
   prefix: string;
 }) => {
-  const [forceRenderKey, setForceRenderKey] = useState(`${prefix}-0`);
+  const [forceRenderKey, setForceRenderKey] = useState(0);
 
   const bump = () => {
     setTimeout(() => {
-      setForceRenderKey((prev) => `${prefix}-${prev + 1}`);
+      setForceRenderKey((prev) => prev + 1);
     }, delay);
   };
 
   return {
     bump,
-    key: forceRenderKey,
+    key: `${prefix}-${forceRenderKey}`,
   };
 };
 

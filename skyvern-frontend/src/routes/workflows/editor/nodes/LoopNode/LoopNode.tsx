@@ -102,6 +102,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                 "bg-slate-950 outline outline-2 outline-slate-300":
                   thisBlockIsTargetted,
               },
+              data.comparisonColor,
             )}
           >
             <NodeHeader

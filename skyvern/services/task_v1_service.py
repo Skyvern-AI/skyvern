@@ -14,7 +14,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
-from skyvern.schemas.runs import CUA_ENGINES, CUA_RUN_TYPES, RunEngine, RunType
+from skyvern.schemas.runs import RunEngine, RunType
 
 LOG = structlog.get_logger()
 
@@ -47,7 +47,9 @@ async def generate_task(user_prompt: str, organization: Organization) -> TaskGen
 
     llm_prompt = prompt_engine.load_prompt("generate-task", user_prompt=user_prompt)
     try:
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="generate-task")
+        llm_response = await app.LLM_API_HANDLER(
+            prompt=llm_prompt, prompt_name="generate-task", organization_id=organization.organization_id
+        )
         parsed_task_generation_obj = TaskGenerationBase.model_validate(llm_response)
 
         # generate a TaskGenerationModel
@@ -148,28 +150,3 @@ async def get_task_v1_response(task_id: str, organization_id: str | None = None)
     return await app.agent.build_task_response(
         task=task_obj, last_step=latest_step, failure_reason=failure_reason, need_browser_log=True
     )
-
-
-async def is_cua_task(
-    *,
-    task: Task,
-) -> bool:
-    """Return True if the run, engine, or task indicates a CUA task."""
-
-    if task.workflow_run_id:
-        # it's a task based block, should look up the block run to see if it's a CUA task
-        block = await app.DATABASE.get_workflow_run_block_by_task_id(
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-        )
-        if block.engine is not None and block.engine in CUA_ENGINES:
-            return True
-
-    run = await app.DATABASE.get_run(
-        run_id=task.task_id,
-        organization_id=task.organization_id,
-    )
-    if run and run.task_run_type in CUA_RUN_TYPES:
-        return True
-
-    return False

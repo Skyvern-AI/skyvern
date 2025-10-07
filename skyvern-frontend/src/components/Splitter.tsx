@@ -1,9 +1,73 @@
 import { useRef, useState, RefObject } from "react";
-import { useMountEffect } from "@/hooks/useMountEffect";
 import { cn } from "@/util/utils";
 import { useOnChange } from "@/hooks/useOnChange";
+import { useMountEffect } from "@/hooks/useMountEffect";
+
+function Handle({
+  direction,
+  isDragging,
+  onDoubleClick,
+}: {
+  direction: "vertical" | "horizontal";
+  isDragging: boolean;
+  onDoubleClick?: () => void;
+}) {
+  return (
+    <div
+      className={cn(
+        "absolute flex h-[1.25rem] w-[10px] flex-wrap items-center justify-center gap-[2px] bg-slate-800 pb-1 pt-1",
+        {
+          "cursor-col-resize": direction === "vertical",
+          "cursor-row-resize": direction === "horizontal",
+          "bg-slate-700": isDragging,
+        },
+      )}
+      onDoubleClick={() => onDoubleClick?.()}
+    >
+      <div className="flex w-full items-center justify-center gap-[0.15rem]">
+        <div
+          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
+            "bg-[#222]": isDragging,
+          })}
+        />
+        <div
+          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
+            "bg-[#222]": isDragging,
+          })}
+        />
+      </div>
+      <div className="flex w-full items-center justify-center gap-[0.15rem]">
+        <div
+          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
+            "bg-[#222]": isDragging,
+          })}
+        />
+        <div
+          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
+            "bg-[#222]": isDragging,
+          })}
+        />
+      </div>
+      <div className="flex w-full items-center justify-center gap-[0.15rem]">
+        <div
+          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
+            "bg-[#222]": isDragging,
+          })}
+        />
+        <div
+          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
+            "bg-[#222]": isDragging,
+          })}
+        />
+      </div>
+    </div>
+  );
+}
 
 interface Props {
+  className?: string;
+  classNameLeft?: string;
+  classNameRight?: string;
   /**
    * The direction of the splitter. If "vertical", the split bar is vertical,
    * etc.
@@ -38,6 +102,10 @@ interface Props {
    * key.
    */
   storageKey?: string;
+  /**
+   * Callback fired when the splitter is resized
+   */
+  onResize?: () => void;
 }
 
 type SizingTarget = "left" | "right" | "top" | "bottom";
@@ -196,7 +264,16 @@ const setStoredSizing = (
   localStorage.setItem(key, sizing);
 };
 
-function Splitter({ children, direction, split, storageKey }: Props) {
+function Splitter({
+  children,
+  className,
+  classNameLeft,
+  classNameRight,
+  direction,
+  split,
+  storageKey,
+  onResize,
+}: Props) {
   if (!Array.isArray(children) || children.length !== 2) {
     throw new Error("Splitter must have exactly two children");
   }
@@ -240,7 +317,9 @@ function Splitter({ children, direction, split, storageKey }: Props) {
       const newWidth = (newPixelPos / maxSize) * 100;
       const clampedWidth = Math.max(0, Math.min(newWidth, 100));
 
+      setIsClosed(false);
       setSplitPosition(clampedWidth);
+      onResize?.();
     };
 
     const onMouseUp = () => {
@@ -248,6 +327,7 @@ function Splitter({ children, direction, split, storageKey }: Props) {
       document.body.classList.remove("no-select-global");
       document.removeEventListener("mousemove", onMouseMove);
       document.removeEventListener("mouseup", onMouseUp);
+      onResize?.();
     };
 
     document.addEventListener("mousemove", onMouseMove);
@@ -255,6 +335,9 @@ function Splitter({ children, direction, split, storageKey }: Props) {
   };
 
   const [splitPosition, setSplitPosition] = useState<number>(50);
+  const [isClosed, setIsClosed] = useState(false);
+  const [closedSplitPosition, setClosedSplitPosition] =
+    useState<number>(splitPosition);
   const [isDragging, setIsDragging] = useState(false);
 
   useMountEffect(() => {
@@ -287,21 +370,51 @@ function Splitter({ children, direction, split, storageKey }: Props) {
     }
   });
 
+  /**
+   * A "snap" is:
+   * - if the splitter is not "closed", then "close it"
+   * - if the splitter is "closed", then "open it"
+   *
+   * "closed" depends on the `split` prop definition. For instance, if the
+   * `split` prop has `left` defined, then "closing" is the `left` side
+   * resizing down to 0.
+   *
+   * When "closing", the current splitPosition should be memorized and then
+   * returned to when an "open" happens.
+   */
+  const snap = () => {
+    if (isClosed) {
+      setSplitPosition(closedSplitPosition);
+    } else {
+      setClosedSplitPosition(splitPosition);
+      setSplitPosition(0);
+    }
+    setIsClosed(!isClosed);
+    onResize?.();
+  };
+
   return (
     <div
       className={cn(
         "splitter flex h-full w-full overflow-hidden",
         direction === "vertical" ? "flex-row" : "flex-col",
+        className || "",
       )}
       ref={containerRef}
     >
       {direction === "vertical" ? (
         <>
           <div
-            className={cn("left h-full", {
-              "pointer-events-none cursor-col-resize select-none opacity-80":
-                isDragging,
-            })}
+            className={cn(
+              "left h-full",
+              {
+                "pointer-events-none cursor-col-resize select-none opacity-80":
+                  isDragging,
+                "overflow-x-hidden": direction === "vertical",
+                "overflow-y-hidden": direction !== "vertical",
+              },
+              classNameLeft,
+            )}
             style={{
               width: `calc(${splitPosition}% - (${splitterThickness} / 2))`,
             }}
@@ -310,16 +423,34 @@ function Splitter({ children, direction, split, storageKey }: Props) {
           </div>
           <div
             className={cn(
-              "splitter-bar z-[0] h-full w-[5px] cursor-col-resize bg-[#ccc] opacity-10 hover:opacity-90",
+              "splitter-bar relative z-[0] flex h-full w-[10px] cursor-col-resize items-center justify-center opacity-50 hover:opacity-100",
               { "opacity-90": isDragging },
             )}
             onMouseDown={onMouseDown}
-          ></div>
+            onDoubleClick={snap}
+          >
+            <div
+              className={cn("h-full w-[2px] bg-slate-800", {
+                "bg-slate-700": isDragging,
+              })}
+            />
+            <Handle
+              direction={direction}
+              isDragging={isDragging}
+              onDoubleClick={snap}
+            />
+          </div>
           <div
-            className={cn("right h-full", {
-              "pointer-events-none cursor-col-resize select-none opacity-80":
-                isDragging,
-            })}
+            className={cn(
+              "right h-full",
+              {
+                "pointer-events-none cursor-col-resize select-none opacity-80":
+                  isDragging,
+                "overflow-x-hidden": direction === "vertical",
+                "overflow-y-hidden": direction !== "vertical",
+              },
+              classNameRight,
+            )}
             style={{
               width: `calc(100% - ${splitPosition}% - (${splitterThickness} / 2))`,
             }}
