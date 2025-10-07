@@ -433,6 +433,7 @@ class FileDownloadBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    download_timeout: float | None = None
 
 
 class UrlBlockYAML(BlockYAML):

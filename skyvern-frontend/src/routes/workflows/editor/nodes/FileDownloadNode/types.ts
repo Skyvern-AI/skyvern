@@ -15,6 +15,7 @@ export type FileDownloadNodeData = NodeBaseData & {
   totpIdentifier: string | null;
   engine: RunEngine | null;
   cacheActions: boolean;
+  downloadTimeout: number | null;
 };
 
 export type FileDownloadNode = Node<FileDownloadNodeData, "fileDownload">;
@@ -36,6 +37,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   cacheActions: false,
   engine: RunEngine.SkyvernV1,
   model: null,
+  downloadTimeout: null,
 } as const;
 
 export function isFileDownloadNode(node: Node): node is FileDownloadNode {

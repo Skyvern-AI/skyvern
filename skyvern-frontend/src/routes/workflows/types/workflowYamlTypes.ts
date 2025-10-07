@@ -269,6 +269,7 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   totp_identifier?: string | null;
   cache_actions: boolean;
   engine: RunEngine | null;
+  download_timeout?: number | null;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {

@@ -40,6 +40,7 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRerender } from "@/hooks/useRerender";
+import { BROWSER_DOWNLOAD_TIMEOUT_SECONDS } from "@/api/types";
 
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
@@ -74,6 +75,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
     totpIdentifier: data.totpIdentifier,
     engine: data.engine,
     model: data.model,
+    downloadTimeout: data.downloadTimeout,
   });
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
@@ -84,6 +86,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
     if (!editable) {
       return;
     }
+
     setInputs({ ...inputs, [key]: value });
     updateNodeData(id, { [key]: value });
   }
@@ -163,6 +166,32 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                 placeholder={navigationGoalPlaceholder}
                 className="nopan text-xs"
               />
+            </div>
+            <div className="space-y-2">
+              <div className="space-between flex items-center gap-2">
+                <Label className="text-xs text-slate-300">
+                  Download Timeout (sec)
+                </Label>
+                <HelpTooltip
+                  content={`The maximum time to wait for downloads to complete, in seconds. If not set, defaults to ${BROWSER_DOWNLOAD_TIMEOUT_SECONDS} seconds.`}
+                />
+
+                <Input
+                  className="ml-auto w-16 text-right"
+                  value={inputs.downloadTimeout ?? undefined}
+                  placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
+                  onChange={(event) => {
+                    const value =
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value);
+
+                    if (value) {
+                      handleChange("downloadTimeout", value);
+                    }
+                  }}
+                />
+              </div>
             </div>
             <div className="rounded-md bg-slate-800 p-2 text-xs text-slate-400">
               Once the file is downloaded, this block will complete.

@@ -486,3 +486,5 @@ export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
 export type PylonEmailHash = {
   hash: string;
 };
+
+export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 600 as const;
