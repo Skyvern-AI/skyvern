@@ -1439,6 +1439,7 @@ async def handle_input_text_action(
                     error_type=type(inc_error).__name__,
                     error_message=str(inc_error),
                 )
+                raise inc_error
         except Exception as inc_error:
             # Handle any other unexpected errors during incremental element processing
             LOG.warning(
