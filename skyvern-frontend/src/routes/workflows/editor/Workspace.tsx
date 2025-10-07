@@ -158,7 +158,6 @@ function Workspace({
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
-  const interactor = workflowRun && isFinalized === false ? "agent" : "human";
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -1273,11 +1272,11 @@ function Workspace({
                         activeDebugSession.browser_session_id &&
                         !cycleBrowser.isPending ? (
                           <BrowserStream
-                            interactive={interactor === "human"}
+                            interactive={true}
                             browserSessionId={
                               activeDebugSession.browser_session_id
                             }
-                            showControlButtons={interactor === "human"}
+                            showControlButtons={true}
                             resizeTrigger={windowResizeTrigger}
                           />
                         ) : (

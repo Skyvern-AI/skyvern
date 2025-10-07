@@ -2949,6 +2949,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -4536,7 +4547,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240,
+                "maximum": 1440,
                 "minimum": 5
               },
               {
@@ -4544,7 +4555,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -5273,6 +5284,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -5658,6 +5680,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -5801,6 +5834,17 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -6320,6 +6364,17 @@
               }
             ],
             "title": "Azure Blob Container Name"
+          },
+          "azure_folder_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Folder Path"
           },
           "path": {
             "anyOf": [
@@ -7273,6 +7328,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -7937,6 +8003,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -8597,6 +8674,12 @@
           "RESIDENTIAL_ZA",
           "RESIDENTIAL_AR",
           "RESIDENTIAL_AU",
+          "RESIDENTIAL_BR",
+          "RESIDENTIAL_TR",
+          "RESIDENTIAL_CA",
+          "RESIDENTIAL_MX",
+          "RESIDENTIAL_IT",
+          "RESIDENTIAL_NL",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -9473,6 +9556,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -11172,6 +11266,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -11508,6 +11613,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -12134,7 +12250,8 @@
                 "type": "null"
               }
             ],
-            "title": "Cache Key"
+            "title": "Cache Key",
+            "default": "default"
           },
           "run_sequentially": {
             "type": "boolean",
@@ -13179,6 +13296,30 @@
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
             ]
+          },
+          "ai_fallback": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Fallback",
+            "description": "Whether to fallback to AI if the workflow run fails."
+          },
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With",
+            "description": "Whether to run the workflow with agent or code."
           }
         },
         "type": "object",
