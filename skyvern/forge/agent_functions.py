@@ -20,6 +20,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
+from skyvern.services import workflow_script_service
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
@@ -615,3 +616,41 @@ class AgentFunction:
     async def validate_code_block(self, organization_id: str | None = None) -> None:
         if not settings.ENABLE_CODE_BLOCK:
             raise DisabledBlockExecutionError("CodeBlock is disabled")
+
+    async def _post_action_execution(self) -> None:
+        """
+        If this is a workflow running environment, generate the
+        """
+        context = skyvern_context.current()
+        if (
+            not context
+            or not context.root_workflow_run_id
+            or not context.organization_id
+            or not context.generate_script
+        ):
+            return
+        root_workflow_run_id = context.root_workflow_run_id
+        organization_id = context.organization_id
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=root_workflow_run_id, organization_id=organization_id
+        )
+        if not workflow_run:
+            return
+        workflow = await app.DATABASE.get_workflow(
+            workflow_id=workflow_run.workflow_id, organization_id=organization_id
+        )
+        if not workflow:
+            return
+        LOG.info(
+            "Post action execution",
+            root_workflow_run_id=context.root_workflow_run_id,
+            organization_id=context.organization_id,
+        )
+
+        await workflow_script_service.generate_or_update_pending_workflow_script(
+            workflow_run=workflow_run,
+            workflow=workflow,
+        )
+
+    async def post_action_execution(self) -> None:
+        asyncio.create_task(self._post_action_execution())

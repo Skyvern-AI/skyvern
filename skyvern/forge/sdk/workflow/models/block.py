@@ -34,6 +34,7 @@ from skyvern.constants import (
     MAX_UPLOAD_FILE_COUNT,
 )
 from skyvern.exceptions import (
+    AzureConfigurationError,
     ContextParameterValueNotFound,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -44,7 +45,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
-from skyvern.forge.sdk.api.azure import AsyncAzureClient
+from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -184,6 +185,30 @@ class Block(BaseModel, abc.ABC):
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
+        if workflow_run_context.include_secrets_in_templates:
+            template_data.update(workflow_run_context.secrets)
+
+            # Create easier-to-access entries for credentials
+            # Look for credential parameters and create real_username/real_password entries
+            # First collect all credential parameters to avoid modifying dict during iteration
+            credential_params = []
+            for key, value in template_data.items():
+                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
+                    credential_params.append((key, value))
+
+            # Now add the real_username/real_password entries
+            for key, value in credential_params:
+                username_secret_id = value.get("username", "")
+                password_secret_id = value.get("password", "")
+
+                # Get the actual values from the secrets
+                real_username = template_data.get(username_secret_id, "")
+                real_password = template_data.get(password_secret_id, "")
+
+                # Add easier-to-access entries
+                template_data[f"{key}_real_username"] = real_username
+                template_data[f"{key}_real_password"] = real_password
+
         if self.label in template_data:
             current_value = template_data[self.label]
             if isinstance(current_value, dict):
@@ -195,6 +220,7 @@ class Block(BaseModel, abc.ABC):
 
         template_data[self.label] = block_reference_data
 
+        # TODO (suchintan): This is pretty hacky - we should have a standard way to initialize the workflow run context
         # inject the forloop metadata as global variables
         if "current_index" in block_reference_data:
             template_data["current_index"] = block_reference_data["current_index"]
@@ -202,6 +228,16 @@ class Block(BaseModel, abc.ABC):
             template_data["current_item"] = block_reference_data["current_item"]
         if "current_value" in block_reference_data:
             template_data["current_value"] = block_reference_data["current_value"]
+
+        # Initialize workflow-level parameters
+        if "workflow_title" not in template_data:
+            template_data["workflow_title"] = workflow_run_context.workflow_title
+        if "workflow_id" not in template_data:
+            template_data["workflow_id"] = workflow_run_context.workflow_id
+        if "workflow_permanent_id" not in template_data:
+            template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
+        if "workflow_run_id" not in template_data:
+            template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
         return template.render(template_data)
 
@@ -386,6 +422,7 @@ class BaseTaskBlock(Block):
     cache_actions: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
+    download_timeout: float | None = None  # minutes
 
     def get_all_parameters(
         self,
@@ -595,6 +632,7 @@ class BaseTaskBlock(Block):
                         failure_reason=str(e),
                     )
                     raise e
+
                 try:
                     # add screenshot artifact for the first task
                     screenshot = await browser_state.take_fullpage_screenshot(
@@ -917,14 +955,14 @@ class ForLoopBlock(Block):
 
         return context_parameters
 
-    async def get_loop_over_parameter_values(
+    async def get_values_from_loop_variable_reference(
         self,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None = None,
     ) -> list[Any]:
-        # parse the value from self.loop_variable_reference and then from self.loop_over
+        parameter_value = None
         if self.loop_variable_reference:
             LOG.debug("Processing loop variable reference", loop_variable_reference=self.loop_variable_reference)
 
@@ -1028,6 +1066,26 @@ class ForLoopBlock(Block):
                     raise FailedToFormatJinjaStyleParameter(value_template, str(e))
                 parameter_value = json.loads(value_json)
 
+        if isinstance(parameter_value, list):
+            return parameter_value
+        else:
+            return [parameter_value]
+
+    async def get_loop_over_parameter_values(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+    ) -> list[Any]:
+        # parse the value from self.loop_variable_reference and then from self.loop_over
+        if self.loop_variable_reference:
+            return await self.get_values_from_loop_variable_reference(
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
         elif self.loop_over is not None:
             if isinstance(self.loop_over, WorkflowParameter):
                 parameter_value = workflow_run_context.get_value(self.loop_over.key)
@@ -1164,6 +1222,7 @@ class ForLoopBlock(Block):
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
+            # context parameter has been deprecated. However, it's still used by task v2 - we should migrate away from it.
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
             for context_parameter in context_parameters_with_value:
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
@@ -1461,7 +1520,7 @@ async def wrapper():
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id)
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
             if browser_state:
                 LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
         else:
@@ -1911,6 +1970,7 @@ class FileUploadBlock(Block):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.path:
             self.path = self.format_block_parameter_template_from_workflow_run_context(self.path, workflow_run_context)
+
         if self.s3_bucket:
             self.s3_bucket = self.format_block_parameter_template_from_workflow_run_context(
                 self.s3_bucket, workflow_run_context
@@ -1937,14 +1997,25 @@ class FileUploadBlock(Block):
             )
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
-        s3_suffix = f"{workflow_run_id}/{uuid.uuid4()}_{Path(path).name}"
-        if not self.path:
-            return f"s3://{self.s3_bucket}/{s3_suffix}"
-        return f"s3://{self.s3_bucket}/{self.path}/{s3_suffix}"
+        folder_path = self.path or f"{workflow_run_id}"
+        # Remove trailing slash from folder_path to avoid double slashes
+        folder_path = folder_path.rstrip("/")
+        # Remove any empty path segments to avoid double slashes
+        folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
+        s3_suffix = f"{uuid.uuid4()}_{Path(path).name}"
+        return f"s3://{self.s3_bucket}/{folder_path}/{s3_suffix}"
 
-    def _get_azure_blob_uri(self, workflow_run_id: str, file_path: str) -> str:
-        blob_name = Path(file_path).name
-        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{workflow_run_id}/{uuid.uuid4()}_{blob_name}"
+    def _get_azure_blob_name(self, workflow_run_id: str, file_path: str) -> str:
+        blob_name = f"{uuid.uuid4()}_{Path(file_path).name}"
+        folder_path = self.path or workflow_run_id
+        # Remove trailing slash from folder_path to avoid double slashes
+        folder_path = folder_path.rstrip("/")
+        # Remove any empty path segments to avoid double slashes
+        folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
+        return folder_path + "/" + blob_name
+
+    def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
+        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
 
     async def execute(
         self,
@@ -2061,13 +2132,17 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.azure_storage_account_key)
                     or self.azure_storage_account_key
                 )
-                azure_client = AsyncAzureClient(
+                if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
+                    raise AzureConfigurationError("Azure Storage is not configured")
+
+                azure_client = AsyncAzureStorageClient(
                     storage_account_name=actual_azure_storage_account_name,
                     storage_account_key=actual_azure_storage_account_key,
                 )
                 for file_path in files_to_upload:
-                    blob_name = Path(file_path).name
-                    azure_uri = self._get_azure_blob_uri(workflow_run_id, file_path)
+                    LOG.info("FileUploadBlock: Uploading file to Azure Blob Storage", file_path=file_path)
+                    blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
+                    azure_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
                     uploaded_uris.append(azure_uri)
                     await azure_client.upload_file_from_path(
                         container_name=self.azure_blob_container_name or "", blob_name=blob_name, file_path=file_path
@@ -3060,6 +3135,9 @@ class TaskV2Block(Block):
         finally:
             context: skyvern_context.SkyvernContext | None = skyvern_context.current()
             current_run_id = context.run_id if context and context.run_id else workflow_run_id
+            root_workflow_run_id = (
+                context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
+            )
             skyvern_context.set(
                 skyvern_context.SkyvernContext(
                     organization_id=organization_id,
@@ -3067,6 +3145,7 @@ class TaskV2Block(Block):
                     workflow_id=workflow_run.workflow_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
+                    root_workflow_run_id=root_workflow_run_id,
                     run_id=current_run_id,
                     browser_session_id=browser_session_id,
                     max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,

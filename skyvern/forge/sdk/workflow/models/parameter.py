@@ -8,7 +8,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.exceptions import InvalidWorkflowParameter
 
-RESERVED_PARAMETER_KEYS = ["current_item", "current_value", "current_index"]
+RESERVED_PARAMETER_KEYS = [
+    "current_item",
+    "current_value",
+    "current_index",
+    "workflow_title",
+    "workflow_id",
+    "workflow_permanent_id",
+    "workflow_run_id",
+]
 
 
 class ParameterType(StrEnum):

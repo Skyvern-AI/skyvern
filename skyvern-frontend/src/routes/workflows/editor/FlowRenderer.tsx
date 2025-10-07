@@ -79,6 +79,8 @@ import {
   getWorkflowSettings,
   layout,
 } from "./workflowEditorUtils";
+import { getWorkflowErrors } from "./workflowEditorUtils";
+import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 
 const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -373,8 +375,25 @@ function FlowRenderer({
     setGetSaveDataRef.current(constructSaveData);
   }, [constructSaveData]);
 
-  async function handleSave() {
-    return await saveWorkflow.mutateAsync();
+  async function handleSave(): Promise<boolean> {
+    // Validate before saving; block if any workflow errors exist
+    const errors = getWorkflowErrors(nodes);
+    if (errors.length > 0) {
+      toast({
+        title: "Can not save workflow because of errors:",
+        description: (
+          <div className="space-y-2">
+            {errors.map((error) => (
+              <p key={error}>{error}</p>
+            ))}
+          </div>
+        ),
+        variant: "destructive",
+      });
+      return false;
+    }
+    await saveWorkflow.mutateAsync();
+    return true;
   }
 
   function deleteNode(id: string) {
@@ -605,8 +624,10 @@ function FlowRenderer({
             </Button>
             <Button
               onClick={() => {
-                handleSave().then(() => {
-                  blocker.proceed?.();
+                handleSave().then((ok) => {
+                  if (ok) {
+                    blocker.proceed?.();
+                  }
                 });
               }}
               disabled={workflowChangesStore.saveIsPending}

@@ -26,6 +26,8 @@ class WorkflowRequestBody(BaseModel):
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
+    run_with: str | None = None
+    ai_fallback: bool | None = None
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -76,9 +78,11 @@ class Workflow(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
-    generate_script: bool = False
+    run_with: str | None = None
     ai_fallback: bool = False
     cache_key: str | None = None
+    run_sequentially: bool | None = None
+    sequential_key: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -123,6 +127,7 @@ class WorkflowRun(BaseModel):
     workflow_permanent_id: str
     organization_id: str
     browser_session_id: str | None = None
+    debug_session_id: str | None = None
     status: WorkflowRunStatus
     extra_http_headers: dict[str, str] | None = None
     proxy_location: ProxyLocation | None = None
@@ -135,7 +140,12 @@ class WorkflowRun(BaseModel):
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
+    run_with: str | None = None
     script_run: ScriptRunResponse | None = None
+    job_id: str | None = None
+    sequential_key: str | None = None
+    ai_fallback: bool | None = None
+    code_gen: bool | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -188,3 +198,4 @@ class WorkflowRunResponseBase(BaseModel):
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
+    errors: list[dict[str, Any]] | None = None

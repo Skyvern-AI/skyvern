@@ -22,7 +22,7 @@ export const fileUploadNodeDefaultData: FileUploadNodeData = {
   editable: true,
   storageType: "s3",
   label: "",
-  path: "",
+  path: "{{ workflow_run_id }}",
   s3Bucket: null,
   awsAccessKeyId: null,
   awsSecretAccessKey: null,

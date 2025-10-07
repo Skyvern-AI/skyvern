@@ -2,6 +2,9 @@ import Dagre from "@dagrejs/dagre";
 import type { Node } from "@xyflow/react";
 import { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
+
+import { TSON } from "@/util/tson";
+
 import {
   WorkflowBlockType,
   WorkflowBlockTypes,
@@ -399,6 +402,7 @@ function convertToNode(
           cacheActions: block.cache_actions,
           maxStepsOverride: block.max_steps_per_run ?? null,
           engine: block.engine ?? RunEngine.SkyvernV1,
+          downloadTimeout: block.download_timeout ?? null, // seconds
         },
       };
     }
@@ -703,11 +707,13 @@ function getElements(
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
       extraHttpHeaders: settings.extraHttpHeaders,
       editable,
-      useScriptCache: settings.useScriptCache,
+      runWith: settings.runWith,
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
       label: "__start_block__",
       showCode: false,
+      runSequentially: settings.runSequentially,
+      sequentialKey: settings.sequentialKey,
     }),
   );
 
@@ -1208,6 +1214,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
         engine: node.data.engine,
+        download_timeout: node.data.downloadTimeout, // seconds
       };
     }
     case "sendEmail": {
@@ -1415,9 +1422,11 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
-    useScriptCache: false,
+    runWith: "agent",
     scriptCacheKey: null,
     aiFallback: true,
+    runSequentially: false,
+    sequentialKey: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -1435,9 +1444,11 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       extraHttpHeaders: data.extraHttpHeaders,
-      useScriptCache: data.useScriptCache,
+      runWith: data.runWith,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
+      runSequentially: data.runSequentially,
+      sequentialKey: data.sequentialKey,
     };
   }
   return defaultSettings;
@@ -1982,6 +1993,7 @@ function convertBlocksToBlockYAML(
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
           engine: block.engine,
+          download_timeout: null, // seconds
         };
         return blockYaml;
       }
@@ -2127,6 +2139,12 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
     is_saved_task: workflow.is_saved_task,
+    status: workflow.status,
+    run_with: workflow.run_with,
+    cache_key: workflow.cache_key,
+    ai_fallback: workflow.ai_fallback ?? undefined,
+    run_sequentially: workflow.run_sequentially ?? undefined,
+    sequential_key: workflow.sequential_key ?? undefined,
   };
 }
 
@@ -2175,6 +2193,16 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     } catch {
       errors.push(`${node.data.label}: Error messages is not valid JSON.`);
     }
+    // Validate Task data schema JSON when enabled (value different from "null")
+    if (node.data.dataSchema && node.data.dataSchema !== "null") {
+      const result = TSON.parse(node.data.dataSchema);
+
+      if (!result.success) {
+        errors.push(
+          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+        );
+      }
+    }
   });
 
   const validationNodes = nodes.filter(isValidationNode);
@@ -2205,6 +2233,16 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   extractionNodes.forEach((node) => {
     if (node.data.dataExtractionGoal.length === 0) {
       errors.push(`${node.data.label}: Data extraction goal is required.`);
+    }
+    // Validate Extraction data schema JSON when enabled (value different from "null")
+    if (node.data.dataSchema && node.data.dataSchema !== "null") {
+      const result = TSON.parse(node.data.dataSchema);
+
+      if (!result.success) {
+        errors.push(
+          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
+        );
+      }
     }
   });
 

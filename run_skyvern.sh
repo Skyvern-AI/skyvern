@@ -10,7 +10,6 @@ if [ ! -f .env ]; then
   echo "Please add your api keys to the .env file."
 fi
 # shellcheck source=/dev/null
-source "$(poetry env info --path)/bin/activate"
-poetry install
+uv sync
 ./run_alembic_check.sh
-poetry run python -m skyvern.forge
+uv run python -m skyvern.forge

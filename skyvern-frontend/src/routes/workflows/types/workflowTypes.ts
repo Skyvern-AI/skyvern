@@ -247,6 +247,7 @@ export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "login",
   "navigation",
   "task",
+  "task_v2",
   "validation",
 ]);
 
@@ -477,6 +478,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   cache_actions: boolean;
   engine: RunEngine | null;
+  download_timeout: number | null; // seconds
 };
 
 export type PDFParserBlock = WorkflowBlockBase & {
@@ -523,12 +525,15 @@ export type WorkflowApiResponse = {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_screenshot_scrolls: number | null;
+  status: string | null;
   created_at: string;
   modified_at: string;
   deleted_at: string | null;
-  generate_script: boolean;
+  run_with: string | null; // 'agent' or 'code'
   cache_key: string | null;
   ai_fallback: boolean | null;
+  run_sequentially: boolean | null;
+  sequential_key: string | null;
 };
 
 export type WorkflowSettings = {
@@ -538,9 +543,11 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  useScriptCache: boolean;
+  runWith: string | null; // 'agent' or 'code'
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
+  runSequentially: boolean;
+  sequentialKey: string | null;
 };
 
 export type WorkflowModel = JsonObjectExtendable<{ model_name: string }>;

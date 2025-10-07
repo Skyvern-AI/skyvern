@@ -17,10 +17,124 @@ from skyvern.schemas.scripts import (
     ScriptBlocksRequest,
     ScriptBlocksResponse,
     ScriptCacheKeyValuesResponse,
+    ScriptStatus,
 )
-from skyvern.services import script_service
+from skyvern.services import script_service, workflow_script_service
 
 LOG = structlog.get_logger()
+
+
+async def get_script_blocks_response(
+    organization_id: str,
+    workflow_permanent_id: str,
+    script_revision_id: str,
+) -> ScriptBlocksResponse:
+    script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+        script_revision_id=script_revision_id,
+        organization_id=organization_id,
+    )
+
+    if not script_blocks:
+        LOG.info(
+            "No script block found for workflow",
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+            script_revision_id=script_revision_id,
+        )
+        return ScriptBlocksResponse(blocks={})
+
+    result: dict[str, str] = {}
+
+    # TODO(jdo): make concurrent to speed up
+    for script_block in script_blocks:
+        script_file_id = script_block.script_file_id
+
+        if not script_file_id:
+            LOG.info(
+                "No script file ID found for script block",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                script_revision_id=script_revision_id,
+                block_label=script_block.script_block_label,
+            )
+            continue
+
+        script_file = await app.DATABASE.get_script_file_by_id(
+            script_revision_id=script_revision_id,
+            file_id=script_file_id,
+            organization_id=organization_id,
+        )
+
+        if not script_file:
+            LOG.info(
+                "No script file found for script block",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                script_revision_id=script_revision_id,
+                block_label=script_block.script_block_label,
+                script_file_id=script_file_id,
+            )
+            continue
+
+        artifact_id = script_file.artifact_id
+
+        if not artifact_id:
+            LOG.info(
+                "No artifact ID found for script file",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                script_revision_id=script_revision_id,
+                block_label=script_block.script_block_label,
+                script_file_id=script_file_id,
+            )
+            continue
+
+        artifact = await app.DATABASE.get_artifact_by_id(
+            artifact_id,
+            organization_id,
+        )
+
+        if not artifact:
+            LOG.error(
+                "No artifact found for script file",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                script_revision_id=script_revision_id,
+                block_label=script_block.script_block_label,
+                script_file_id=script_file_id,
+                artifact_id=artifact_id,
+            )
+            continue
+
+        data = await app.STORAGE.retrieve_artifact(artifact)
+
+        if not data:
+            LOG.error(
+                "No data found for artifact",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                block_label=script_block.script_block_label,
+                script_revision_id=script_block.script_revision_id,
+                file_id=script_file_id,
+                artifact_id=artifact_id,
+            )
+            continue
+
+        try:
+            decoded_data = data.decode("utf-8")
+            result[script_block.script_block_label] = decoded_data
+        except UnicodeDecodeError:
+            LOG.error(
+                "File content is not valid UTF-8 text",
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                block_label=script_block.script_block_label,
+                script_revision_id=script_block.script_revision_id,
+                file_id=script_file_id,
+                artifact_id=artifact_id,
+            )
+            continue
+    return ScriptBlocksResponse(blocks=result)
 
 
 @base_router.post(
@@ -248,6 +362,10 @@ async def deploy_script(
     description="Run a script",
     tags=["Scripts"],
 )
+@base_router.post(
+    "/scripts/{script_id}/run/",
+    include_in_schema=False,
+)
 async def run_script(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -278,6 +396,11 @@ async def run_script(
     include_in_schema=False,
     response_model=ScriptBlocksResponse,
 )
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/blocks/",
+    include_in_schema=False,
+    response_model=ScriptBlocksResponse,
+)
 async def get_workflow_script_blocks(
     workflow_permanent_id: str,
     block_script_request: ScriptBlocksRequest,
@@ -293,14 +416,38 @@ async def get_workflow_script_blocks(
 
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
+    workflow_run_id = block_script_request.workflow_run_id
+    if workflow_run_id:
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=current_org.organization_id,
+        )
+        if not workflow_run:
+            workflow_run_id = None
+        else:
+            # find the published script if any and return that
+            published_script, _ = await workflow_script_service.get_workflow_script(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                status=ScriptStatus.published,
+            )
+            if published_script:
+                return await get_script_blocks_response(
+                    script_revision_id=published_script.script_revision_id,
+                    organization_id=current_org.organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
 
     cache_key = block_script_request.cache_key or workflow.cache_key or ""
+    status = block_script_request.status
 
     scripts = await app.DATABASE.get_workflow_scripts_by_cache_key_value(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
+        workflow_run_id=block_script_request.workflow_run_id,
         cache_key_value=cache_key_value,
         cache_key=cache_key,
+        statuses=[status] if status else None,
     )
 
     if not scripts:
@@ -314,118 +461,20 @@ async def get_workflow_script_blocks(
         return empty
 
     first_script = scripts[0]
-
-    script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
+    return await get_script_blocks_response(
         script_revision_id=first_script.script_revision_id,
         organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
     )
-
-    if not script_blocks:
-        LOG.info(
-            "No script block found for workflow",
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=current_org.organization_id,
-            script_revision_id=first_script.script_revision_id,
-        )
-        return empty
-
-    result: dict[str, str] = {}
-
-    # TODO(jdo): make concurrent to speed up
-    for script_block in script_blocks:
-        script_file_id = script_block.script_file_id
-
-        if not script_file_id:
-            LOG.info(
-                "No script file ID found for script block",
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=current_org.organization_id,
-                script_revision_id=first_script.script_revision_id,
-                block_label=script_block.script_block_label,
-            )
-            continue
-
-        script_file = await app.DATABASE.get_script_file_by_id(
-            script_revision_id=first_script.script_revision_id,
-            file_id=script_file_id,
-            organization_id=current_org.organization_id,
-        )
-
-        if not script_file:
-            LOG.info(
-                "No script file found for script block",
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=current_org.organization_id,
-                script_revision_id=first_script.script_revision_id,
-                block_label=script_block.script_block_label,
-                script_file_id=script_file_id,
-            )
-            continue
-
-        artifact_id = script_file.artifact_id
-
-        if not artifact_id:
-            LOG.info(
-                "No artifact ID found for script file",
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=current_org.organization_id,
-                script_revision_id=first_script.script_revision_id,
-                block_label=script_block.script_block_label,
-                script_file_id=script_file_id,
-            )
-            continue
-
-        artifact = await app.DATABASE.get_artifact_by_id(
-            artifact_id,
-            current_org.organization_id,
-        )
-
-        if not artifact:
-            LOG.error(
-                "No artifact found for script file",
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=current_org.organization_id,
-                script_revision_id=first_script.script_revision_id,
-                block_label=script_block.script_block_label,
-                script_file_id=script_file_id,
-                artifact_id=artifact_id,
-            )
-            continue
-
-        data = await app.STORAGE.retrieve_artifact(artifact)
-
-        if not data:
-            LOG.error(
-                "No data found for artifact",
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=current_org.organization_id,
-                block_label=script_block.script_block_label,
-                script_revision_id=script_block.script_revision_id,
-                file_id=script_file_id,
-                artifact_id=artifact_id,
-            )
-            continue
-
-        try:
-            decoded_data = data.decode("utf-8")
-            result[script_block.script_block_label] = decoded_data
-        except UnicodeDecodeError:
-            LOG.error(
-                "File content is not valid UTF-8 text",
-                workflow_permanent_id=workflow_permanent_id,
-                organization_id=current_org.organization_id,
-                block_label=script_block.script_block_label,
-                script_revision_id=script_block.script_revision_id,
-                file_id=script_file_id,
-                artifact_id=artifact_id,
-            )
-            continue
-
-    return ScriptBlocksResponse(blocks=result)
 
 
 @base_router.get(
     "/scripts/{workflow_permanent_id}/{cache_key}/values",
+    include_in_schema=False,
+    response_model=ScriptCacheKeyValuesResponse,
+)
+@base_router.get(
+    "/scripts/{workflow_permanent_id}/{cache_key}/values/",
     include_in_schema=False,
     response_model=ScriptCacheKeyValuesResponse,
 )
@@ -485,12 +534,16 @@ async def get_workflow_cache_key_values(
 
 
 @base_router.delete(
-    "/scripts/{workflow_permanent_id}/value/{cache_key_value}",
+    "/scripts/{workflow_permanent_id}/value",
+    include_in_schema=False,
+)
+@base_router.delete(
+    "/scripts/{workflow_permanent_id}/value/",
     include_in_schema=False,
 )
 async def delete_workflow_cache_key_value(
     workflow_permanent_id: str,
-    cache_key_value: str,
+    cache_key_value: str = Query(alias="cache-key-value"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, str]:
     """Delete a specific cache key value for a workflow."""

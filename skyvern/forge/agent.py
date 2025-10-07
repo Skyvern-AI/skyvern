@@ -18,6 +18,7 @@ from playwright.async_api import Page
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import (
+    BROWSER_DOWNLOAD_TIMEOUT,
     BROWSER_DOWNLOADING_SUFFIX,
     DEFAULT_MAX_SCREENSHOT_SCROLLS,
     GET_DOWNLOADED_FILES_TIMEOUT,
@@ -27,12 +28,19 @@ from skyvern.constants import (
     ScrapeType,
 )
 from skyvern.core.totp import poll_verification_code
-from skyvern.errors.errors import ReachMaxRetriesError, ReachMaxStepsError, UserDefinedError
+from skyvern.errors.errors import (
+    GetTOTPVerificationCodeError,
+    ReachMaxRetriesError,
+    ReachMaxStepsError,
+    TimeoutGetTOTPVerificationCodeError,
+    UserDefinedError,
+)
 from skyvern.exceptions import (
     BrowserSessionNotFound,
     BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
+    FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
     FailedToSendWebhook,
@@ -192,6 +200,7 @@ class ForgeAgent:
             extra_http_headers=workflow_run.extra_http_headers,
             browser_address=workflow_run.browser_address,
             browser_session_id=workflow_run.browser_session_id,
+            download_timeout=task_block.download_timeout,
         )
         LOG.info(
             "Created a new task for workflow run",
@@ -210,6 +219,7 @@ class ForgeAgent:
             organization_id=task.organization_id,
             status=TaskStatus.running,
         )
+
         step = await app.DATABASE.create_step(
             task.task_id,
             order=0,
@@ -493,7 +503,10 @@ class ForgeAgent:
                         step_id=step.step_id,
                     )
                     try:
-                        await wait_for_download_finished(downloading_files=downloading_files)
+                        await wait_for_download_finished(
+                            downloading_files=downloading_files,
+                            timeout=task_block.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
+                        )
                     except DownloadFileMaxWaitingTime as e:
                         LOG.warning(
                             "There're several long-time downloading files, these files might be broken",
@@ -531,11 +544,25 @@ class ForgeAgent:
                             )
                             continue
 
-                        random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
-                        random_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
                         if task_block.download_suffix:
-                            random_file_name = f"{random_file_name}-{task_block.download_suffix}"
-                        rename_file(os.path.join(workflow_download_directory, file), random_file_name + file_extension)
+                            # Use download_suffix as the complete filename (without extension)
+                            final_file_name = task_block.download_suffix
+                        else:
+                            # Fallback to random filename if no download_suffix provided
+                            random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                            final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
+
+                        # Check if file with this name already exists
+                        final_file_name = final_file_name
+                        target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+                        counter = 1
+                        while os.path.exists(target_path):
+                            # If file exists, append counter to filename
+                            final_file_name = f"{final_file_name}_{counter}"
+                            target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
+                            counter += 1
+
+                        rename_file(os.path.join(workflow_download_directory, file), final_file_name + file_extension)
 
                     LOG.info(
                         "Task marked as completed due to download",
@@ -922,6 +949,7 @@ class ForgeAgent:
             (
                 scraped_page,
                 extract_action_prompt,
+                use_caching,
             ) = await self.build_and_record_step_prompt(
                 task,
                 step,
@@ -983,6 +1011,12 @@ class ForgeAgent:
                     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                         llm_key_override, default=app.LLM_API_HANDLER
                     )
+                    # Add caching flag to context for monitoring
+                    if use_caching:
+                        context = skyvern_context.current()
+                        if context:
+                            context.use_prompt_caching = True
+
                     json_response = await llm_api_handler(
                         prompt=extract_action_prompt,
                         prompt_name="extract-actions",
@@ -1012,6 +1046,21 @@ class ForgeAgent:
                                 action_order=0,
                                 reasoning="No TOTP verification code found. Going to terminate.",
                                 intention="No TOTP verification code found. Going to terminate.",
+                                errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
+                            )
+                        ]
+                    except FailedToGetTOTPVerificationCode as e:
+                        actions = [
+                            TerminateAction(
+                                reasoning=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                intention=f"Failed to get TOTP verification code. Going to terminate. Reason: {e.reason}",
+                                organization_id=task.organization_id,
+                                workflow_run_id=task.workflow_run_id,
+                                task_id=task.task_id,
+                                step_id=step.step_id,
+                                step_order=step.order,
+                                action_order=0,
+                                errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
                             )
                         ]
 
@@ -1153,13 +1202,47 @@ class ForgeAgent:
                     # Do not verify the complete action when complete_verification is False
                     # set verified to True will skip the completion verification
                     action.verified = True
+
+                # Pass TOTP secret to handler for multi-field TOTP sequences
+                # Handler will generate TOTP at execution time
+                if (
+                    action.action_type == ActionType.INPUT_TEXT
+                    and self._is_multi_field_totp_sequence(actions)
+                    and (totp_secret := skyvern_context.ensure_context().totp_codes.get(f"{task.task_id}_secret"))
+                ):
+                    # Pass TOTP secret to handler for execution-time generation
+                    action.totp_timing_info = {
+                        "is_totp_sequence": True,
+                        "action_index": action_idx,
+                        "totp_secret": totp_secret,
+                        "is_retry": step.retry_index > 0,
+                    }
+
                 results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
                     results,
                 )
-                # wait random time between actions to avoid detection
-                await asyncio.sleep(random.uniform(0.5, 1.0))
+
+                # Determine wait time between actions
+                wait_time = random.uniform(0.5, 1.0)
+
+                # For multi-field TOTP sequences, use zero delay between all digits for fast execution
+                if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
+                    current_text = action.text if hasattr(action, "text") else None
+
+                    if current_text and len(current_text) == 1 and current_text.isdigit():
+                        # Zero delay between all TOTP digits for fast execution
+                        wait_time = 0.0
+                        LOG.debug(
+                            "TOTP: zero delay for digit",
+                            task_id=task.task_id,
+                            action_idx=action_idx,
+                            digit=current_text,
+                        )
+
+                await asyncio.sleep(wait_time)
                 await self.record_artifacts_after_action(task, step, browser_state, engine)
                 for result in results:
                     result.step_retry_number = step.retry_index
@@ -1256,6 +1339,21 @@ class ForgeAgent:
                 action_results=action_results,
             )
 
+            # Clean up TOTP cache after multi-field TOTP sequence completion
+            if self._is_multi_field_totp_sequence(actions):
+                context = skyvern_context.ensure_context()
+                cache_key = f"{task.task_id}_totp_cache"
+                if cache_key in context.totp_codes:
+                    context.totp_codes.pop(cache_key)
+                    LOG.debug(
+                        "Cleaned up TOTP cache after multi-field sequence completion",
+                        task_id=task.task_id,
+                    )
+
+                secret_key = f"{task.task_id}_secret"
+                if secret_key in context.totp_codes:
+                    context.totp_codes.pop(secret_key)
+
             # Check if Skyvern already returned a complete action, if so, don't run user goal check
             has_decisive_action = False
             if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
@@ -1296,6 +1394,7 @@ class ForgeAgent:
                         complete_results = await ActionHandler.handle_action(
                             scraped_page, task, step, working_page, complete_action
                         )
+                        await app.AGENT_FUNCTION.post_action_execution()
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
 
@@ -1315,6 +1414,7 @@ class ForgeAgent:
                 extract_results = await ActionHandler.handle_action(
                     scraped_page, task, step, working_page, extract_action
                 )
+                await app.AGENT_FUNCTION.post_action_execution()
                 detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
 
             # If no action errors return the agent state and output
@@ -1901,7 +2001,7 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         engine: RunEngine,
-    ) -> tuple[ScrapedPage, str]:
+    ) -> tuple[ScrapedPage, str, bool]:
         # start the async tasks while running scrape_website
         if engine not in CUA_ENGINES:
             self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
@@ -1912,6 +2012,8 @@ class ForgeAgent:
         # second time: try again the normal scrape, (stopping window loading before scraping barely helps, but causing problem)
         # third time: reload the page before scraping
         scraped_page: ScrapedPage | None = None
+        extract_action_prompt = ""
+        use_caching = False
         for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
             try:
                 scraped_page = await self._scrape_with_type(
@@ -1955,7 +2057,7 @@ class ForgeAgent:
         element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
         extract_action_prompt = ""
         if engine not in CUA_ENGINES:
-            extract_action_prompt = await self._build_extract_action_prompt(
+            extract_action_prompt, use_caching = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
@@ -1990,7 +2092,7 @@ class ForgeAgent:
             data=element_tree_in_prompt.encode(),
         )
 
-        return scraped_page, extract_action_prompt
+        return scraped_page, extract_action_prompt, use_caching
 
     async def _build_extract_action_prompt(
         self,
@@ -2000,7 +2102,7 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         verification_code_check: bool = False,
         expire_verification_code: bool = False,
-    ) -> str:
+    ) -> tuple[str, bool]:
         actions_and_results_str = await self._get_action_results(task)
 
         # Generate the extract action prompt
@@ -2011,7 +2113,7 @@ class ForgeAgent:
             await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else starting_url
         )
         final_navigation_payload = self._build_navigation_payload(
-            task, expire_verification_code=expire_verification_code
+            task, expire_verification_code=expire_verification_code, step=step, scraped_page=scraped_page
         )
 
         task_type = task.task_type if task.task_type else TaskType.general
@@ -2056,7 +2158,44 @@ class ForgeAgent:
 
         context = skyvern_context.ensure_context()
 
-        return load_prompt_with_elements(
+        # Check if prompt caching is enabled for extract-action
+        use_caching = False
+        if (
+            template == "extract-action"
+            and LLMAPIHandlerFactory._prompt_caching_settings
+            and LLMAPIHandlerFactory._prompt_caching_settings.get("extract-action", False)
+        ):
+            try:
+                # Try to load split templates for caching
+                static_prompt = prompt_engine.load_prompt(f"{template}-static")
+                dynamic_prompt = prompt_engine.load_prompt(
+                    f"{template}-dynamic",
+                    navigation_goal=navigation_goal,
+                    navigation_payload_str=json.dumps(final_navigation_payload),
+                    starting_url=starting_url,
+                    current_url=current_url,
+                    data_extraction_goal=task.data_extraction_goal,
+                    action_history=actions_and_results_str,
+                    error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                    local_datetime=datetime.now(context.tz_info).isoformat(),
+                    verification_code_check=verification_code_check,
+                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                    terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+                    parse_select_feature_enabled=context.enable_parse_select_in_extract,
+                )
+
+                # Store static prompt for caching and return dynamic prompt
+                context.cached_static_prompt = static_prompt
+                use_caching = True
+                LOG.info("Using cached prompt for extract-action", task_id=task.task_id)
+                return dynamic_prompt, use_caching
+
+            except Exception as e:
+                LOG.warning("Failed to load cached prompt templates, falling back to original", error=str(e))
+                # Fall through to original behavior
+
+        # Original behavior - load full prompt
+        full_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page,
             prompt_engine=prompt_engine,
             template_name=template,
@@ -2074,12 +2213,126 @@ class ForgeAgent:
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
         )
 
+        return full_prompt, use_caching
+
+    def _should_process_totp(self, scraped_page: ScrapedPage | None) -> bool:
+        """Detect TOTP pages by checking for multiple input fields or verification keywords."""
+        if not scraped_page:
+            return False
+
+        try:
+            # Count input fields that could be for TOTP (more flexible than maxlength="1")
+            input_fields = [
+                element
+                for element in scraped_page.elements
+                if element.get("tagName", "").lower() == "input"
+                and element.get("attributes", {}).get("type", "text").lower() in ["text", "number", "tel"]
+            ]
+
+            # Check for multiple input fields (potential multi-field TOTP)
+            if len(input_fields) >= 4:
+                # Additional check: look for patterns that suggest multi-field TOTP
+                # Check if inputs are close together or have similar attributes
+                has_maxlength_1 = any(elem.get("attributes", {}).get("maxlength") == "1" for elem in input_fields)
+
+                # Check for input fields with numeric patterns (type="number", pattern for digits)
+                has_numeric_patterns = any(
+                    elem.get("attributes", {}).get("type") == "number"
+                    or elem.get("attributes", {}).get("pattern", "").isdigit()
+                    or "digit" in elem.get("attributes", {}).get("pattern", "").lower()
+                    for elem in input_fields
+                )
+
+                if has_maxlength_1 or has_numeric_patterns:
+                    return True
+
+            # Check for TOTP-related keywords in page content
+            page_text = scraped_page.html.lower() if scraped_page.html else ""
+            totp_keywords = [
+                "verification code",
+                "authentication code",
+                "security code",
+                "2fa",
+                "two-factor",
+                "totp",
+                "authenticator",
+                "verification",
+                "enter code",
+                "verification number",
+                "security number",
+            ]
+
+            keyword_matches = sum(1 for keyword in totp_keywords if keyword in page_text)
+
+            # If we have multiple TOTP keywords and multiple input fields, likely TOTP
+            if keyword_matches >= 2 and len(input_fields) >= 6:
+                return True
+
+            # Strong single keyword match with multiple inputs
+            strong_keywords = ["verification code", "authentication code", "2fa", "two-factor"]
+            if any(keyword in page_text for keyword in strong_keywords) and len(input_fields) >= 3:
+                return True
+
+            return False
+
+        except Exception:
+            return False
+
+    def _is_multi_field_totp_sequence(self, actions: list) -> bool:
+        """
+        Check if the action sequence represents a multi-field TOTP input (6 single-digit fields).
+
+        Args:
+            actions: List of actions to analyze
+
+        Returns:
+            bool: True if this is a multi-field TOTP sequence
+        """
+        # Must have at least 4 actions (minimum for TOTP)
+        if len(actions) < 4:
+            return False
+
+        # Check if we have multiple consecutive single-digit INPUT_TEXT actions
+        consecutive_single_digits = 0
+        max_consecutive = 0
+
+        for action in actions:
+            if (
+                action.action_type == ActionType.INPUT_TEXT
+                and hasattr(action, "text")
+                and action.text
+                and len(action.text) == 1
+                and action.text.isdigit()
+            ):
+                consecutive_single_digits += 1
+                max_consecutive = max(max_consecutive, consecutive_single_digits)
+            else:
+                # If we hit a non-single-digit action, reset consecutive counter
+                consecutive_single_digits = 0
+
+        # Consider it a multi-field TOTP if we have 4+ consecutive single-digit inputs
+        # This is more reliable than just counting total single digits
+        # We use 4+ as the threshold to avoid false positives with single TOTP fields
+        is_multi_field_totp = max_consecutive >= 4
+
+        if is_multi_field_totp:
+            LOG.debug(
+                "Detected multi-field TOTP sequence",
+                max_consecutive=max_consecutive,
+                total_actions=len(actions),
+            )
+
+        return is_multi_field_totp
+
     def _build_navigation_payload(
         self,
         task: Task,
         expire_verification_code: bool = False,
+        step: Step | None = None,
+        scraped_page: ScrapedPage | None = None,
     ) -> dict[str, Any] | list | str | None:
         final_navigation_payload = task.navigation_payload
+
         current_context = skyvern_context.ensure_context()
         verification_code = current_context.totp_codes.get(task.task_id)
         if (task.totp_verification_url or task.totp_identifier) and verification_code:
@@ -2097,6 +2350,32 @@ class ForgeAgent:
                 )
             if expire_verification_code:
                 current_context.totp_codes.pop(task.task_id)
+
+        # Store TOTP secrets and provide placeholder TOTP for LLM to see format
+        # Only when on a TOTP page to avoid premature processing
+        if (
+            task.workflow_run_id
+            and step
+            and isinstance(final_navigation_payload, dict)
+            and self._should_process_totp(scraped_page)
+        ):
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
+
+            for key, value in list(final_navigation_payload.items()):
+                if isinstance(value, dict) and "totp" in value:
+                    totp_placeholder = value.get("totp")
+                    if totp_placeholder and isinstance(totp_placeholder, str):
+                        totp_secret_key = workflow_run_context.totp_secret_value_key(totp_placeholder)
+                        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+
+                        if totp_secret:
+                            # Store TOTP secret for handler to use during execution
+                            current_context = skyvern_context.ensure_context()
+                            current_context.totp_codes[f"{task.task_id}_secret"] = totp_secret
+
+                            # Send a placeholder TOTP for the LLM to see the format
+                            final_navigation_payload[key]["totp"] = "123456"
+
         return final_navigation_payload
 
     async def _get_action_results(self, task: Task, current_step: Step | None = None) -> str:
@@ -2791,7 +3070,7 @@ class ForgeAgent:
                 max_retries=max_retries,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
-            json_response = await app.LLM_API_HANDLER(
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt,
                 screenshots=screenshots,
                 step=step,
@@ -2962,7 +3241,7 @@ class ForgeAgent:
             current_context = skyvern_context.ensure_context()
             current_context.totp_codes[task.task_id] = verification_code
 
-            extract_action_prompt = await self._build_extract_action_prompt(
+            extract_action_prompt, use_caching = await self._build_extract_action_prompt(
                 task,
                 step,
                 browser_state,
@@ -2975,6 +3254,12 @@ class ForgeAgent:
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 llm_key_override, default=app.LLM_API_HANDLER
             )
+            # Add caching flag to context for monitoring
+            if use_caching:
+                context = skyvern_context.current()
+                if context:
+                    context.use_prompt_caching = True
+
             return await llm_api_handler(
                 prompt=extract_action_prompt,
                 step=step,

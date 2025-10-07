@@ -1,6 +1,6 @@
 instances:
-  - url: https://skyvern.docs.buildwithfern.com
-    custom-domain: https://docs.skyvern.com
+  - url: skyvern.docs.buildwithfern.com/docs
+    custom-domain: skyvern.com/docs
 title: Skyvern
 favicon: images/skyvern_favicon_small.png
 logo:
@@ -17,6 +17,7 @@ colors:
 analytics:
   posthog:
     api-key: ${POSTHOG_API_KEY}
+js: ./tracking.js
 layout:
   page-width: 1504px
   header-height: 75px
@@ -165,6 +166,7 @@ navigation:
               - POST /v1/runs/{run_id}/cancel
               - POST /v1/runs/{run_id}/retry_webhook
               - POST /v1/run/tasks/login
+              - GET /v1/runs/{run_id}/timeline
           - section: Workflows
             contents:
               - POST /v1/run/workflows
@@ -175,6 +177,7 @@ navigation:
               - POST /v1/workflows
               - POST /v1/workflows/{workflow_id}
               - POST /v1/workflows/{workflow_id}/delete
+              - GET /v1/runs/{run_id}/timeline
           - section: Browser Sessions
             contents:
               - POST /v1/browser_sessions

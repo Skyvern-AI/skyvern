@@ -2,20 +2,11 @@
 """
 Generate a runnable Skyvern workflow script.
 
-Example
--------
-generated_code = generate_workflow_script(
-    file_name="workflow.py",
-    workflow_run_request=workflow_run_request,
-    workflow=workflow,
-    tasks=tasks,
-    actions_by_task=actions_by_task,
-)
-Path("workflow.py").write_text(src)
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import keyword
 import re
@@ -151,70 +142,30 @@ def _value(value: Any) -> cst.BaseExpression:
     return cst.SimpleString(repr(str(value)))
 
 
-def _render_value(prompt_text: str | None = None) -> cst.BaseExpression:
+def _render_value(
+    prompt_text: str | None = None,
+    data_variable_name: str | None = None,
+    render_func_name: str = "render_template",
+) -> cst.BaseExpression:
     """Create a prompt value with template rendering logic if needed."""
     if not prompt_text:
         return cst.SimpleString("")
     if "{{" in prompt_text and "}}" in prompt_text:
-        # Generate code for: render_template(prompt_text)
+        args = [cst.Arg(value=_value(prompt_text))]
+        if data_variable_name:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("data"),
+                    value=cst.Name(data_variable_name),
+                )
+            )
         return cst.Call(
-            func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("render_template")),
-            args=[cst.Arg(value=_value(prompt_text))],
+            func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name(render_func_name)),
+            args=args,
         )
     else:
         # Return the prompt as a simple string value
         return _value(prompt_text)
-
-
-def _generate_text_call(text_value: str, intention: str, parameter_key: str) -> cst.BaseExpression:
-    """Create a generate_text function call CST expression."""
-    return cst.Await(
-        expression=cst.Call(
-            func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("generate_text")),
-            whitespace_before_args=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
-            ),
-            args=[
-                # First positional argument: context.parameters['parameter_key']
-                cst.Arg(
-                    value=cst.Subscript(
-                        value=cst.Attribute(
-                            value=cst.Name("context"),
-                            attr=cst.Name("parameters"),
-                        ),
-                        slice=[cst.SubscriptElement(slice=cst.Index(value=_value(parameter_key)))],
-                    ),
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(
-                        indent=True,
-                        last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
-                    ),
-                ),
-                # intention keyword argument
-                cst.Arg(
-                    keyword=cst.Name("intention"),
-                    value=_value(intention),
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(
-                        indent=True,
-                        last_line=cst.SimpleWhitespace(DOUBLE_INDENT),
-                    ),
-                ),
-                # data keyword argument
-                cst.Arg(
-                    keyword=cst.Name("data"),
-                    value=cst.Attribute(
-                        value=cst.Name("context"),
-                        attr=cst.Name("parameters"),
-                    ),
-                    whitespace_after_arg=cst.ParenthesizedWhitespace(
-                        indent=True,
-                        last_line=cst.SimpleWhitespace(INDENT),
-                    ),
-                    comma=cst.Comma(),
-                ),
-            ],
-        )
-    )
 
 
 # --------------------------------------------------------------------- #
@@ -432,7 +383,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         args.append(
             cst.Arg(
                 keyword=cst.Name("prompt"),
-                value=_render_value(act["data_extraction_goal"]),
+                value=_value(act["data_extraction_goal"]),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -457,14 +408,6 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
             cst.Arg(
                 keyword=cst.Name("intention"),
                 value=_value(act.get("intention") or act.get("reasoning") or ""),
-                whitespace_after_arg=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            ),
-            cst.Arg(
-                keyword=cst.Name("data"),
-                value=cst.Attribute(value=cst.Name("context"), attr=cst.Name("parameters")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
                 comma=cst.Comma(),
             ),
@@ -497,7 +440,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
 
 
 def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> FunctionDef:
-    name = block.get("label") or _safe_name(block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     body_stmts: list[cst.BaseStatement] = []
     is_extraction_block = block.get("block_type") == "extraction"
 
@@ -520,6 +463,34 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
     ):
         body_stmts.append(cst.parse_statement("return output"))
     elif not body_stmts:
+        body_stmts.append(cst.parse_statement("return None"))
+
+    return FunctionDef(
+        name=Name(name),
+        params=cst.Parameters(
+            params=[
+                Param(name=Name("page"), annotation=cst.Annotation(cst.Name("SkyvernPage"))),
+                Param(name=Name("context"), annotation=cst.Annotation(cst.Name("RunContext"))),
+            ]
+        ),
+        decorators=[_make_decorator(name, block)],
+        body=cst.IndentedBlock(body_stmts),
+        returns=None,
+        asynchronous=cst.Asynchronous(),
+    )
+
+
+def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, Any]]) -> FunctionDef:
+    """Build a cached function for task_v2 blocks that calls child workflow sub-tasks."""
+    name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    body_stmts: list[cst.BaseStatement] = []
+
+    # Add calls to child workflow sub-tasks
+    for child_block in child_blocks:
+        stmt = _build_block_statement(child_block)
+        body_stmts.append(stmt)
+
+    if not body_stmts:
         body_stmts.append(cst.parse_statement("return None"))
 
     return FunctionDef(
@@ -592,9 +563,11 @@ def _build_generated_model_from_schema(schema_code: str) -> cst.ClassDef | None:
 # --------------------------------------------------------------------- #
 
 
-def _build_run_task_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_run_task_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.run_task statement."""
-    args = __build_base_task_statement(block_title, block)
+    args = __build_base_task_statement(block_title, block, data_variable_name)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("run_task")),
         args=args,
@@ -607,20 +580,14 @@ def _build_run_task_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_download_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.download statement."""
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal") or ""),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("complete_on_download"),
-            value=_value(block.get("complete_on_download", False)),
+            value=_value(block.get("navigation_goal") or ""),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -631,7 +598,7 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
         args.append(
             cst.Arg(
                 keyword=cst.Name("download_suffix"),
-                value=_render_value(block.get("download_suffix")),
+                value=_value(block.get("download_suffix")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -661,19 +628,21 @@ def _build_download_statement(block_title: str, block: dict[str, Any]) -> cst.Si
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_action_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_action_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.action statement."""
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
+            value=_value(block.get("navigation_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
         cst.Arg(
-            keyword=cst.Name("cache_key"),
+            keyword=cst.Name("label"),
             value=_value(block_title),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
@@ -694,9 +663,11 @@ def _build_action_statement(block_title: str, block: dict[str, Any]) -> cst.Simp
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_login_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_login_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.login statement."""
-    args = __build_base_task_statement(block_title, block)
+    args = __build_base_task_statement(block_title, block, data_variable_name)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("login")),
         args=args,
@@ -709,12 +680,14 @@ def _build_login_statement(block_title: str, block: dict[str, Any]) -> cst.Simpl
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_extract_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_extract_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.extract statement."""
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("data_extraction_goal", "")),
+            value=_value(block.get("data_extraction_goal", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -729,7 +702,7 @@ def _build_extract_statement(block_title: str, block: dict[str, Any]) -> cst.Sim
             ),
         ),
         cst.Arg(
-            keyword=cst.Name("cache_key"),
+            keyword=cst.Name("label"),
             value=_value(block_title),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
@@ -750,43 +723,11 @@ def _build_extract_statement(block_title: str, block: dict[str, Any]) -> cst.Sim
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_navigate_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_navigate_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.navigate statement."""
-    args = [
-        cst.Arg(
-            keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("url"),
-            value=_value(block.get("url", "")),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("max_steps"),
-            value=_value(block.get("max_steps_per_run", settings.MAX_STEPS_PER_RUN)),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("cache_key"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
-    ]
-
+    args = __build_base_task_statement(block_title, block, data_variable_name)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("run_task")),
         args=args,
@@ -834,15 +775,14 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        # TODO: support file attachments?
-        # cst.Arg(
-        #     keyword=cst.Name("file_attachments"),
-        #     value=_value(block.get("file_attachments", [])),
-        #     whitespace_after_arg=cst.ParenthesizedWhitespace(
-        #         indent=True,
-        #         last_line=cst.SimpleWhitespace(INDENT),
-        #     ),
-        # ),
+        cst.Arg(
+            keyword=cst.Name("file_attachments"),
+            value=_value(block.get("file_attachments", [])),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
         cst.Arg(
             keyword=cst.Name("label"),
             value=_value(block.get("label", "")),
@@ -865,18 +805,62 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_validate_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_validate_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> cst.SimpleStatementLine:
     """Build a skyvern.validate statement."""
-    args = [
-        cst.Arg(
-            keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
-    ]
+    args = []
+
+    # Add complete_criterion if it exists
+    if block.get("complete_criterion") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("complete_criterion"),
+                value=_value(block.get("complete_criterion")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add terminate_criterion if it exists
+    if block.get("terminate_criterion") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("terminate_criterion"),
+                value=_value(block.get("terminate_criterion")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add error_code_mapping if it exists
+    if block.get("error_code_mapping") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("error_code_mapping"),
+                value=_value(block.get("error_code_mapping")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    # Add label if it exists
+    if block.get("label") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+            )
+        )
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("validate")),
@@ -898,6 +882,14 @@ def _build_wait_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             value=_value(block.get("wait_sec", 1)),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
             ),
             comma=cst.Comma(),
         ),
@@ -915,40 +907,7 @@ def _build_wait_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
-def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.SimpleStatementLine:
-    """Build a skyvern.for_loop statement."""
-    args = [
-        cst.Arg(
-            keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-        cst.Arg(
-            keyword=cst.Name("max_steps"),
-            value=_value(block.get("max_steps_per_run", settings.MAX_STEPS_PER_RUN)),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
-    ]
-
-    call = cst.Call(
-        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("for_loop")),
-        args=args,
-        whitespace_before_args=cst.ParenthesizedWhitespace(
-            indent=True,
-            last_line=cst.SimpleWhitespace(INDENT),
-        ),
-    )
-
-    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
-
-
-def _build_goto_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+def _build_goto_statement(block: dict[str, Any], data_variable_name: str | None = None) -> cst.SimpleStatementLine:
     """Build a skyvern.goto statement."""
     args = [
         cst.Arg(
@@ -1245,7 +1204,7 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("prompt", "")),
+            value=_value(block.get("prompt", "")),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1301,6 +1260,119 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
+def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.For:
+    """
+    Build a for loop statement.
+    All the blocks within the for loop block statement will run without cache_key.
+
+    An example of a for loop statement:
+    ```
+    async for current_value in skyvern.loop(context.parameters["urls"]):
+        await skyvern.goto(
+            url=current_value,
+            label="block_4",
+        )
+        await skyvern.extract(
+            prompt="Get a summary of the page",
+            schema={
+                  "type": "object",
+                  "properties": {
+                      "summary": {
+                          "type": "string",
+                          "description": "A concise summary of the main content or purpose of the page"
+                      }
+                  },
+                  "required": [
+                        "summary"
+                  ]
+             },
+             label="block_5",
+        )
+    ```
+    """
+    # Extract loop configuration
+    loop_over_parameter_key = block.get("loop_variable_reference", "")
+    loop_blocks = block.get("loop_blocks", [])
+
+    # Create the for loop target (current_value)
+    target = cst.Name("current_value")
+
+    # Build body statements from loop_blocks
+    body_statements = []
+
+    # Add loop_data assignment as the first statement
+    for loop_block in loop_blocks:
+        stmt = _build_block_statement(loop_block)
+        body_statements.append(stmt)
+
+    # create skyvern.loop(loop_over_parameter_key, label=block_title)
+    loop_call_args = [cst.Arg(keyword=cst.Name("values"), value=_value(loop_over_parameter_key))]
+    if block.get("complete_if_empty"):
+        loop_call_args.append(
+            cst.Arg(keyword=cst.Name("complete_if_empty"), value=_value(block.get("complete_if_empty")))
+        )
+    loop_call_args.append(cst.Arg(keyword=cst.Name("label"), value=_value(block_title)))
+    loop_call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("loop")),
+        args=loop_call_args,
+    )
+
+    # Create the async for loop
+    for_loop = cst.For(
+        target=target,
+        iter=loop_call,
+        body=cst.IndentedBlock(body=body_statements),
+        asynchronous=cst.Asynchronous(),
+        whitespace_after_for=cst.SimpleWhitespace(" "),
+        whitespace_before_in=cst.SimpleWhitespace(" "),
+        whitespace_after_in=cst.SimpleWhitespace(" "),
+        whitespace_before_colon=cst.SimpleWhitespace(""),
+    )
+
+    return for_loop
+
+
+def _build_goto_statement_for_loop(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.goto statement for use within loops, handling current_value template."""
+    url_value = block.get("url", "")
+
+    # Handle {{current_value}} template by replacing it with the current_value variable
+    if url_value == "{{current_value}}":
+        url_expr = cst.Name("current_value")
+    else:
+        url_expr = _value(url_value)
+
+    args = [
+        cst.Arg(
+            keyword=cst.Name("url"),
+            value=url_expr,
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+            ),
+            comma=cst.Comma(),
+        ),
+    ]
+
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("goto")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
 def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
     if not args:
         return
@@ -1317,11 +1389,27 @@ def _mark_last_arg_as_comma(args: list[cst.Arg]) -> None:
     args.append(new_arg)
 
 
-def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list[cst.Arg]:
+def __build_base_task_statement(
+    block_title: str, block: dict[str, Any], data_variable_name: str | None = None
+) -> list[cst.Arg]:
+    block_type = block.get("block_type")
+    prompt = block.get("prompt") if block_type == "task_v2" else block.get("navigation_goal")
+    # add parameters to prompt
+    parameters = block.get("parameters", [])
+    navigation_payload = {}
+    # make all parameters as jinja2 template parameters in the generated code
+    for parameter in parameters:
+        parameter_key = parameter["key"]
+        navigation_payload[parameter_key] = "{{" + parameter_key + "}}"
+
+    if navigation_payload:
+        prompt = prompt or ""
+        prompt = f"{prompt}\n{navigation_payload}"
+
     args = [
         cst.Arg(
             keyword=cst.Name("prompt"),
-            value=_render_value(block.get("navigation_goal", "")),
+            value=_value(prompt),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1332,18 +1420,19 @@ def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list
         args.append(
             cst.Arg(
                 keyword=cst.Name("url"),
-                value=_render_value(block.get("url", "")),
+                value=_value(block.get("url", "")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
                 ),
             )
         )
-    if block.get("max_steps_per_run"):
+    max_steps = block.get("max_steps") if block_type == "task_v2" else block.get("max_steps_per_run")
+    if max_steps:
         args.append(
             cst.Arg(
                 keyword=cst.Name("max_steps"),
-                value=_render_value(block.get("max_steps_per_run", settings.MAX_STEPS_PER_RUN)),
+                value=_value(max_steps or settings.MAX_STEPS_PER_RUN),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1354,7 +1443,7 @@ def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list
         args.append(
             cst.Arg(
                 keyword=cst.Name("totp_identifier"),
-                value=_render_value(block.get("totp_identifier", "")),
+                value=_value(block.get("totp_identifier", "")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1365,7 +1454,18 @@ def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list
         args.append(
             cst.Arg(
                 keyword=cst.Name("totp_url"),
-                value=_render_value(block.get("totp_verification_url", "")),
+                value=_value(block.get("totp_verification_url", "")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("block_type") == "task_v2":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("engine"),
+                value=_value("skyvern-2.0"),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1374,7 +1474,7 @@ def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list
         )
     args.append(
         cst.Arg(
-            keyword=cst.Name("cache_key"),
+            keyword=cst.Name("label"),
             value=_value(block_title),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
@@ -1390,6 +1490,54 @@ def __build_base_task_statement(block_title: str, block: dict[str, Any]) -> list
 # --------------------------------------------------------------------- #
 
 
+def _build_block_statement(block: dict[str, Any], data_variable_name: str | None = None) -> cst.SimpleStatementLine:
+    """Build a block statement."""
+    block_type = block.get("block_type")
+    block_title = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
+
+    if block_type in SCRIPT_TASK_BLOCKS:
+        # For task blocks, call the custom function with cache_key
+        if block_type == "task":
+            stmt = _build_run_task_statement(block_title, block, data_variable_name)
+        elif block_type == "file_download":
+            stmt = _build_download_statement(block_title, block, data_variable_name)
+        elif block_type == "action":
+            stmt = _build_action_statement(block_title, block, data_variable_name)
+        elif block_type == "login":
+            stmt = _build_login_statement(block_title, block, data_variable_name)
+        elif block_type == "extraction":
+            stmt = _build_extract_statement(block_title, block, data_variable_name)
+        elif block_type == "navigation":
+            stmt = _build_navigate_statement(block_title, block, data_variable_name)
+    elif block_type == "validation":
+        stmt = _build_validate_statement(block_title, block, data_variable_name)
+    elif block_type == "task_v2":
+        stmt = _build_run_task_statement(block_title, block, data_variable_name)
+    elif block_type == "send_email":
+        stmt = _build_send_email_statement(block)
+    elif block_type == "text_prompt":
+        stmt = _build_prompt_statement(block)
+    elif block_type == "wait":
+        stmt = _build_wait_statement(block)
+    elif block_type == "for_loop":
+        stmt = _build_for_loop_statement(block_title, block)
+    elif block_type == "goto_url":
+        stmt = _build_goto_statement(block, data_variable_name)
+    elif block_type == "code":
+        stmt = _build_code_statement(block)
+    elif block_type == "file_upload":
+        stmt = _build_file_upload_statement(block)
+    elif block_type == "file_url_parser":
+        stmt = _build_file_url_parser_statement(block)
+    elif block_type == "http_request":
+        stmt = _build_http_request_statement(block)
+    else:
+        # Default case for unknown block types
+        stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
+
+    return stmt
+
+
 def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> FunctionDef:
     body = [
         cst.parse_statement(
@@ -1399,68 +1547,8 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
     ]
 
     for block in blocks:
-        block_type = block.get("block_type")
-        block_title = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
-
-        if block_type in SCRIPT_TASK_BLOCKS:
-            # For task blocks, call the custom function with cache_key
-            if block_type == "task":
-                stmt = _build_run_task_statement(block_title, block)
-            elif block_type == "file_download":
-                stmt = _build_download_statement(block_title, block)
-            elif block_type == "action":
-                stmt = _build_action_statement(block_title, block)
-            elif block_type == "login":
-                stmt = _build_login_statement(block_title, block)
-            elif block_type == "extraction":
-                stmt = _build_extract_statement(block_title, block)
-            elif block_type == "navigation":
-                stmt = _build_navigate_statement(block_title, block)
-        elif block_type == "send_email":
-            stmt = _build_send_email_statement(block)
-        elif block_type == "text_prompt":
-            stmt = _build_prompt_statement(block)
-        elif block_type == "wait":
-            stmt = _build_wait_statement(block)
-        elif block_type == "for_loop":
-            stmt = _build_for_loop_statement(block_title, block)
-        elif block_type == "goto_url":
-            stmt = _build_goto_statement(block)
-        elif block_type == "code":
-            stmt = _build_code_statement(block)
-        elif block_type == "file_upload":
-            stmt = _build_file_upload_statement(block)
-        elif block_type == "file_url_parser":
-            stmt = _build_file_url_parser_statement(block)
-        elif block_type == "http_request":
-            stmt = _build_http_request_statement(block)
-        else:
-            # Default case for unknown block types
-            stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
-
+        stmt = _build_block_statement(block)
         body.append(stmt)
-
-    # Add a final validation step if not already present
-    # has_validation = any(block.get("block_type") == "text_prompt" for block in blocks)
-    # has_task_blocks = any(block.get("block_type") in SCRIPT_TASK_BLOCKS for block in blocks)
-    # if not has_validation and not has_task_blocks:
-    #     # Build the final validation statement using LibCST components
-    #     args = [
-    #         cst.Arg(
-    #             keyword=cst.Name("prompt"),
-    #             value=cst.SimpleString(
-    #                 '"Your goal is to validate that the workflow completed successfully. COMPLETE if successful, TERMINATE if there are issues."'
-    #             ),
-    #         ),
-    #     ]
-
-    #     call = cst.Call(
-    #         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("validate")),
-    #         args=args,
-    #     )
-
-    #     validation_stmt = cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
-    #     body.append(validation_stmt)
 
     params = cst.Parameters(
         params=[
@@ -1511,17 +1599,19 @@ def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> Funct
 # --------------------------------------------------------------------- #
 
 
-async def generate_workflow_script(
+async def generate_workflow_script_python_code(
     *,
     file_name: str,
     workflow_run_request: dict[str, Any],
     workflow: dict[str, Any],
     blocks: list[dict[str, Any]],
     actions_by_task: dict[str, list[dict[str, Any]]],
+    task_v2_child_blocks: dict[str, list[dict[str, Any]]] | None = None,
     organization_id: str | None = None,
     run_id: str | None = None,
     script_id: str | None = None,
     script_revision_id: str | None = None,
+    pending: bool = False,
 ) -> str:
     """
     Build a LibCST Module and emit .code (PEP-8-formatted source).
@@ -1575,34 +1665,99 @@ async def generate_workflow_script(
 
     # --- blocks ---------------------------------------------------------
     block_fns = []
-    task_blocks = [block for block in blocks if block["block_type"] in SCRIPT_TASK_BLOCKS]
-    length_of_tasks = len(task_blocks)
+    task_v1_blocks = [block for block in blocks if block["block_type"] in SCRIPT_TASK_BLOCKS]
+    task_v2_blocks = [block for block in blocks if block["block_type"] == "task_v2"]
 
-    # Create script first if organization_id is provided
-    for idx, task in enumerate(task_blocks):
+    if task_v2_child_blocks is None:
+        task_v2_child_blocks = {}
+
+    # Handle task v1 blocks (excluding child blocks of task_v2)
+    for idx, task in enumerate(task_v1_blocks):
+        # Skip if this is a child block of a task_v2 block
+        if task.get("parent_task_v2_label"):
+            continue
+
         block_fn_def = _build_block_fn(task, actions_by_task.get(task.get("task_id", ""), []))
 
         # Create script block if we have script context
         if script_id and script_revision_id and organization_id:
             try:
                 block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
-                block_description = f"Generated block for task: {block_name}"
                 temp_module = cst.Module(body=[block_fn_def])
                 block_code = temp_module.code
-                await create_script_block(
+                await create_or_update_script_block(
                     block_code=block_code,
                     script_revision_id=script_revision_id,
                     script_id=script_id,
                     organization_id=organization_id,
-                    block_name=block_name,
-                    block_description=block_description,
+                    block_label=block_name,
+                    update=pending,
                 )
             except Exception as e:
                 LOG.error("Failed to create script block", error=str(e), exc_info=True)
                 # Continue without script block creation if it fails
 
         block_fns.append(block_fn_def)
-        if idx < length_of_tasks - 1:
+        if idx < len(task_v1_blocks) - 1:
+            block_fns.append(cst.EmptyLine())
+            block_fns.append(cst.EmptyLine())
+
+    # Handle task_v2 blocks
+    for idx, task_v2 in enumerate(task_v2_blocks):
+        task_v2_label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
+        child_blocks = task_v2_child_blocks.get(task_v2_label, [])
+
+        # Create the task_v2 function
+        task_v2_fn_def = _build_task_v2_block_fn(task_v2, child_blocks)
+
+        # Create script block for task_v2 that includes both the main function and child functions
+        if script_id and script_revision_id and organization_id:
+            try:
+                # Build the complete module for this task_v2 block
+                task_v2_block_body = [task_v2_fn_def]
+
+                # Add child block functions
+                for child_block in child_blocks:
+                    if (
+                        child_block.get("block_type") in SCRIPT_TASK_BLOCKS
+                        and child_block.get("block_type") != "task_v2"
+                    ):
+                        child_fn_def = _build_block_fn(
+                            child_block, actions_by_task.get(child_block.get("task_id", ""), [])
+                        )
+                        task_v2_block_body.append(cst.EmptyLine())
+                        task_v2_block_body.append(cst.EmptyLine())
+                        task_v2_block_body.append(child_fn_def)
+
+                # Create the complete module for this task_v2 block
+                temp_module = cst.Module(body=task_v2_block_body)
+                task_v2_block_code = temp_module.code
+
+                block_name = task_v2.get("label") or task_v2.get("title") or f"task_v2_{idx}"
+
+                await create_or_update_script_block(
+                    block_code=task_v2_block_code,
+                    script_revision_id=script_revision_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    block_label=block_name,
+                    update=pending,
+                )
+            except Exception as e:
+                LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
+                # Continue without script block creation if it fails
+
+        block_fns.append(task_v2_fn_def)
+
+        # Create individual functions for child blocks
+        for child_block in child_blocks:
+            if child_block.get("block_type") in SCRIPT_TASK_BLOCKS and child_block.get("block_type") != "task_v2":
+                child_fn_def = _build_block_fn(child_block, actions_by_task.get(child_block.get("task_id", ""), []))
+                block_fns.append(cst.EmptyLine())
+                block_fns.append(cst.EmptyLine())
+                block_fns.append(child_fn_def)
+
+        if idx < len(task_v2_blocks) - 1:
             block_fns.append(cst.EmptyLine())
             block_fns.append(cst.EmptyLine())
 
@@ -1646,13 +1801,13 @@ async def generate_workflow_script(
             start_block_module = cst.Module(body=start_block_body)
             start_block_code = start_block_module.code
 
-            await create_script_block(
+            await create_or_update_script_block(
                 block_code=start_block_code,
                 script_revision_id=script_revision_id,
                 script_id=script_id,
                 organization_id=organization_id,
-                block_name=settings.WORKFLOW_START_BLOCK_LABEL,
-                block_description="Start block containing imports, model classes, and run function",
+                block_label=settings.WORKFLOW_START_BLOCK_LABEL,
+                update=pending,
             )
         except Exception as e:
             LOG.error("Failed to create __start_block__", error=str(e), exc_info=True)
@@ -1665,75 +1820,93 @@ async def generate_workflow_script(
     ]
 
     module = cst.Module(body=module_body)
-
-    with open(file_name, "w") as f:
-        f.write(module.code)
     return module.code
 
 
-async def create_script_block(
+async def create_or_update_script_block(
     block_code: str | bytes,
     script_revision_id: str,
     script_id: str,
     organization_id: str,
-    block_name: str,
-    block_description: str | None = None,
+    block_label: str,
+    update: bool = False,
 ) -> None:
     """
     Create a script block in the database and save the block code to a script file.
+    If update is True, the script block will be updated instead of created.
 
     Args:
         block_code: The code to save
         script_revision_id: The script revision ID
         script_id: The script ID
         organization_id: The organization ID
-        block_name: Optional custom name for the block (defaults to function name)
-        block_description: Optional description for the block
+        block_label: Optional custom name for the block (defaults to function name)
+        update: Whether to update the script block instead of creating a new one
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
         # Step 3: Create script block in database
-        script_block = await app.DATABASE.create_script_block(
-            script_revision_id=script_revision_id,
-            script_id=script_id,
+        script_block = await app.DATABASE.get_script_block_by_label(
             organization_id=organization_id,
-            script_block_label=block_name,
+            script_revision_id=script_revision_id,
+            script_block_label=block_label,
         )
+        if not script_block:
+            script_block = await app.DATABASE.create_script_block(
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                script_block_label=block_label,
+            )
 
         # Step 4: Create script file for the block
         # Generate a unique filename for the block
-        file_name = f"{block_name}.skyvern"
+        file_name = f"{block_label}.skyvern"
         file_path = f"blocks/{file_name}"
 
         # Create artifact and upload to S3
-        artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
-            organization_id=organization_id,
-            script_id=script_id,
-            script_version=1,  # Assuming version 1 for now
-            file_path=file_path,
-            data=block_code_bytes,
-        )
+        artifact_id = None
+        if update and script_block.script_file_id:
+            script_file = await app.DATABASE.get_script_file_by_id(
+                script_revision_id,
+                script_block.script_file_id,
+                organization_id,
+            )
+            if script_file and script_file.artifact_id:
+                artifact = await app.DATABASE.get_artifact_by_id(script_file.artifact_id, organization_id)
+                if artifact:
+                    asyncio.create_task(app.STORAGE.store_artifact(artifact, block_code_bytes))
+            else:
+                LOG.error("Script file or artifact not found", script_file_id=script_block.script_file_id)
+        else:
+            artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+                organization_id=organization_id,
+                script_id=script_id,
+                script_version=1,  # Assuming version 1 for now
+                file_path=file_path,
+                data=block_code_bytes,
+            )
 
-        # Create script file record
-        script_file = await app.DATABASE.create_script_file(
-            script_revision_id=script_revision_id,
-            script_id=script_id,
-            organization_id=organization_id,
-            file_path=file_path,
-            file_name=file_name,
-            file_type="file",
-            content_hash=f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}",
-            file_size=len(block_code_bytes),
-            mime_type="text/x-python",
-            artifact_id=artifact_id,
-        )
+            # Create script file record
+            script_file = await app.DATABASE.create_script_file(
+                script_revision_id=script_revision_id,
+                script_id=script_id,
+                organization_id=organization_id,
+                file_path=file_path,
+                file_name=file_name,
+                file_type="file",
+                content_hash=f"sha256:{hashlib.sha256(block_code_bytes).hexdigest()}",
+                file_size=len(block_code_bytes),
+                mime_type="text/x-python",
+                artifact_id=artifact_id,
+            )
 
-        # update script block with script file id
-        await app.DATABASE.update_script_block(
-            script_block_id=script_block.script_block_id,
-            organization_id=organization_id,
-            script_file_id=script_file.file_id,
-        )
+            # update script block with script file id
+            await app.DATABASE.update_script_block(
+                script_block_id=script_block.script_block_id,
+                organization_id=organization_id,
+                script_file_id=script_file.file_id,
+            )
 
     except Exception as e:
         # Log error but don't fail the entire generation process

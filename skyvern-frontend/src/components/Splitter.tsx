@@ -341,30 +341,21 @@ function Splitter({
   const [isDragging, setIsDragging] = useState(false);
 
   useMountEffect(() => {
-    // small delay here, to allow for arbitrary layout thrashing to settle;
-    // otherwise we have to rely on an observer for the container size, and
-    // resetting whenever the container resizes it likely incorrect behaviour
-    setTimeout(() => {
-      if (containerRef.current) {
-        const newPosition = normalizeUnitsToPercent(
-          containerRef,
-          direction,
-          firstSizingTarget,
-          firstSizing,
-          storageKey,
-        );
+    if (containerRef.current) {
+      const newPosition = normalizeUnitsToPercent(
+        containerRef,
+        direction,
+        firstSizingTarget,
+        firstSizing,
+        storageKey,
+      );
 
-        setSplitPosition(newPosition);
+      setSplitPosition(newPosition);
 
-        if (storageKey) {
-          setStoredSizing(
-            firstSizingTarget,
-            storageKey,
-            newPosition.toString(),
-          );
-        }
+      if (storageKey) {
+        setStoredSizing(firstSizingTarget, storageKey, newPosition.toString());
       }
-    }, 100);
+    }
   });
 
   useOnChange(isDragging, (newValue, oldValue) => {

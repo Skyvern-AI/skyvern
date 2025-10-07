@@ -10,6 +10,7 @@ from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.utils import CustomStreamWrapper, ModelResponse
+from openai import AsyncOpenAI
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from pydantic import BaseModel
 
@@ -47,6 +48,129 @@ class LLMCallStats(BaseModel):
 
 class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
+    _thinking_budget_settings: dict[str, int] | None = None
+    _prompt_caching_settings: dict[str, bool] | None = None
+
+    @staticmethod
+    def _apply_thinking_budget_optimization(
+        parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
+    ) -> None:
+        """Apply thinking budget optimization based on model type and LiteLLM reasoning support."""
+        # Compute a safe model label and a representative model for capability checks
+        model_label = getattr(llm_config, "model_name", None)
+        if model_label is None and isinstance(llm_config, LLMRouterConfig):
+            model_label = getattr(llm_config, "main_model_group", "router")
+        check_model = model_label
+        if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
+            try:
+                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
+            except Exception:
+                check_model = model_label
+        try:
+            # Early return if model doesn't support reasoning
+            if check_model and not litellm.supports_reasoning(model=check_model):
+                LOG.info(
+                    "Thinking budget optimization not supported for model",
+                    prompt_name=prompt_name,
+                    budget=new_budget,
+                    model=model_label,
+                )
+                return
+
+            # Apply optimization based on model type
+            model_label_lower = (model_label or "").lower()
+            if "gemini" in model_label_lower:
+                # Gemini models use the exact integer budget value
+                LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+                    parameters, new_budget, llm_config, prompt_name
+                )
+            elif "anthropic" in model_label_lower or "claude" in model_label_lower:
+                # Anthropic/Claude models use "low" for all budget values (per LiteLLM constants)
+                LLMAPIHandlerFactory._apply_anthropic_thinking_optimization(
+                    parameters, new_budget, llm_config, prompt_name
+                )
+            else:
+                # Other reasoning-capable models (Deepseek, etc.) - use "low" for all budget values
+                parameters["reasoning_effort"] = "low"
+                LOG.info(
+                    "Applied thinking budget optimization (reasoning_effort)",
+                    prompt_name=prompt_name,
+                    budget=new_budget,
+                    reasoning_effort="low",
+                    model=model_label,
+                )
+
+        except (AttributeError, KeyError, TypeError) as e:
+            LOG.warning(
+                "Failed to apply thinking budget optimization",
+                prompt_name=prompt_name,
+                budget=new_budget,
+                model=model_label,
+                error=str(e),
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _apply_anthropic_thinking_optimization(
+        parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
+    ) -> None:
+        """Apply thinking optimization for Anthropic/Claude models."""
+        if llm_config.reasoning_effort is not None:
+            # Use reasoning_effort if configured in LLM config - always use "low" per LiteLLM constants
+            parameters["reasoning_effort"] = "low"
+            # Get safe model label for logging
+            model_label = getattr(llm_config, "model_name", None)
+            if model_label is None and isinstance(llm_config, LLMRouterConfig):
+                model_label = getattr(llm_config, "main_model_group", "router")
+
+            LOG.info(
+                "Applied thinking budget optimization (reasoning_effort)",
+                prompt_name=prompt_name,
+                budget=new_budget,
+                reasoning_effort="low",
+                model=model_label,
+            )
+        else:
+            # Use thinking parameter with budget_tokens for Anthropic models
+            if "thinking" in parameters and isinstance(parameters["thinking"], dict):
+                parameters["thinking"]["budget_tokens"] = new_budget
+            else:
+                parameters["thinking"] = {"budget_tokens": new_budget, "type": "enabled"}
+            # Get safe model label for logging
+            model_label = getattr(llm_config, "model_name", None)
+            if model_label is None and isinstance(llm_config, LLMRouterConfig):
+                model_label = getattr(llm_config, "main_model_group", "router")
+
+            LOG.info(
+                "Applied thinking budget optimization (thinking)",
+                prompt_name=prompt_name,
+                budget=new_budget,
+                model=model_label,
+            )
+
+    @staticmethod
+    def _apply_gemini_thinking_optimization(
+        parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
+    ) -> None:
+        """Apply thinking optimization for Gemini models using exact integer budget value."""
+        if "thinking" in parameters and isinstance(parameters["thinking"], dict):
+            parameters["thinking"]["budget_tokens"] = new_budget
+        else:
+            thinking_payload: dict[str, Any] = {"budget_tokens": new_budget}
+            if settings.GEMINI_INCLUDE_THOUGHT:
+                thinking_payload["type"] = "enabled"
+            parameters["thinking"] = thinking_payload
+        # Get safe model label for logging
+        model_label = getattr(llm_config, "model_name", None)
+        if model_label is None and isinstance(llm_config, LLMRouterConfig):
+            model_label = getattr(llm_config, "main_model_group", "router")
+
+        LOG.info(
+            "Applied thinking budget optimization (budget_tokens)",
+            prompt_name=prompt_name,
+            budget=new_budget,
+            model=model_label,
+        )
 
     @staticmethod
     def get_override_llm_api_handler(override_llm_key: str | None, *, default: LLMAPIHandler) -> LLMAPIHandler:
@@ -101,6 +225,10 @@ class LLMAPIHandlerFactory:
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
             organization_id: str | None = None,
+            tools: list | None = None,
+            use_message_history: bool = False,
+            raw_response: bool = False,
+            window_dimension: Resolution | None = None,
         ) -> dict[str, Any]:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
@@ -118,6 +246,16 @@ class LLMAPIHandlerFactory:
 
             if parameters is None:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+            # Apply thinking budget optimization if settings are available
+            if (
+                LLMAPIHandlerFactory._thinking_budget_settings
+                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
+            ):
+                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    parameters, new_budget, llm_config, prompt_name
+                )
 
             context = skyvern_context.current()
             if context and len(context.hashed_href_map) > 0:
@@ -138,7 +276,61 @@ class LLMAPIHandlerFactory:
                 task_v2=task_v2,
                 thought=thought,
             )
+            # Build messages and apply caching in one step
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+
+            # Inject context caching system message when available
+            try:
+                context_cached_static_prompt = getattr(context, "cached_static_prompt", None)
+                if (
+                    context_cached_static_prompt
+                    and isinstance(llm_config, LLMConfig)
+                    and isinstance(llm_config.model_name, str)
+                ):
+                    # Check if this is a Vertex AI model
+                    if "vertex_ai/" in llm_config.model_name:
+                        caching_system_message = {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": context_cached_static_prompt,
+                                    "cache_control": {"type": "ephemeral", "ttl": "3600s"},
+                                }
+                            ],
+                        }
+                        messages = [caching_system_message] + messages
+                        LOG.info(
+                            "Applied Vertex context caching",
+                            prompt_name=prompt_name,
+                            model=llm_config.model_name,
+                            ttl_seconds=3600,
+                        )
+                    # Check if this is an OpenAI model
+                    elif (
+                        llm_config.model_name.startswith("gpt-")
+                        or llm_config.model_name.startswith("o1-")
+                        or llm_config.model_name.startswith("o3-")
+                    ):
+                        # For OpenAI models, we need to add the cached content as a system message
+                        # and mark it for caching using the cache_control parameter
+                        caching_system_message = {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": context_cached_static_prompt,
+                                }
+                            ],
+                        }
+                        messages = [caching_system_message] + messages
+                        LOG.info(
+                            "Applied OpenAI context caching",
+                            prompt_name=prompt_name,
+                            model=llm_config.model_name,
+                        )
+            except Exception as e:
+                LOG.warning("Failed to apply context caching system message", error=str(e), exc_info=True)
 
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(
@@ -211,16 +403,28 @@ class LLMAPIHandlerFactory:
             except Exception as e:
                 LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
-            prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-            completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+            prompt_tokens = 0
+            completion_tokens = 0
             reasoning_tokens = 0
-            completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
-            if completion_token_detail:
-                reasoning_tokens = completion_token_detail.reasoning_tokens or 0
             cached_tokens = 0
-            cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
-            if cached_token_detail:
-                cached_tokens = cached_token_detail.cached_tokens or 0
+
+            if hasattr(response, "usage") and response.usage:
+                prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
+                completion_tokens = getattr(response.usage, "completion_tokens", 0)
+
+                # Extract reasoning tokens from completion_tokens_details
+                completion_token_detail = getattr(response.usage, "completion_tokens_details", None)
+                if completion_token_detail:
+                    reasoning_tokens = getattr(completion_token_detail, "reasoning_tokens", 0) or 0
+
+                # Extract cached tokens from prompt_tokens_details
+                cached_token_detail = getattr(response.usage, "prompt_tokens_details", None)
+                if cached_token_detail:
+                    cached_tokens = getattr(cached_token_detail, "cached_tokens", 0) or 0
+
+                # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
+                if cached_tokens == 0:
+                    cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
             if step:
                 await app.DATABASE.update_step(
                     task_id=step.task_id,
@@ -300,6 +504,11 @@ class LLMAPIHandlerFactory:
         if LLMConfigRegistry.is_router_config(llm_key):
             return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
+        # For OpenRouter models, use LLMCaller which has native OpenRouter support
+        if llm_key.startswith("openrouter/"):
+            llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
+            return llm_caller.call
+
         assert isinstance(llm_config, LLMConfig)
 
         @TraceManager.traced_async(tags=[llm_key], ignore_inputs=["prompt", "screenshots", "parameters"])
@@ -313,6 +522,10 @@ class LLMAPIHandlerFactory:
             screenshots: list[bytes] | None = None,
             parameters: dict[str, Any] | None = None,
             organization_id: str | None = None,
+            tools: list | None = None,
+            use_message_history: bool = False,
+            raw_response: bool = False,
+            window_dimension: Resolution | None = None,
         ) -> dict[str, Any]:
             start_time = time.time()
             active_parameters = base_parameters or {}
@@ -322,6 +535,16 @@ class LLMAPIHandlerFactory:
             active_parameters.update(parameters)
             if llm_config.litellm_params:  # type: ignore
                 active_parameters.update(llm_config.litellm_params)  # type: ignore
+
+            # Apply thinking budget optimization if settings are available
+            if (
+                LLMAPIHandlerFactory._thinking_budget_settings
+                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
+            ):
+                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+                LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+                    active_parameters, new_budget, llm_config, prompt_name
+                )
 
             context = skyvern_context.current()
             if context and len(context.hashed_href_map) > 0:
@@ -350,6 +573,59 @@ class LLMAPIHandlerFactory:
             model_name = llm_config.model_name
 
             messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
+
+            # Inject context caching system message when available
+            try:
+                context_cached_static_prompt = getattr(context, "cached_static_prompt", None)
+                if (
+                    context_cached_static_prompt
+                    and isinstance(llm_config, LLMConfig)
+                    and isinstance(llm_config.model_name, str)
+                ):
+                    # Check if this is a Vertex AI model
+                    if "vertex_ai/" in llm_config.model_name:
+                        caching_system_message = {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": context_cached_static_prompt,
+                                    "cache_control": {"type": "ephemeral", "ttl": "3600s"},
+                                }
+                            ],
+                        }
+                        messages = [caching_system_message] + messages
+                        LOG.info(
+                            "Applied Vertex context caching",
+                            prompt_name=prompt_name,
+                            model=llm_config.model_name,
+                            ttl_seconds=3600,
+                        )
+                    # Check if this is an OpenAI model
+                    elif (
+                        llm_config.model_name.startswith("gpt-")
+                        or llm_config.model_name.startswith("o1-")
+                        or llm_config.model_name.startswith("o3-")
+                    ):
+                        # For OpenAI models, we need to add the cached content as a system message
+                        # and mark it for caching using the cache_control parameter
+                        caching_system_message = {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": context_cached_static_prompt,
+                                }
+                            ],
+                        }
+                        messages = [caching_system_message] + messages
+                        LOG.info(
+                            "Applied OpenAI context caching",
+                            prompt_name=prompt_name,
+                            model=llm_config.model_name,
+                        )
+            except Exception as e:
+                LOG.warning("Failed to apply context caching system message", error=str(e), exc_info=True)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(
                     {
@@ -374,6 +650,7 @@ class LLMAPIHandlerFactory:
                     model=model_name,
                     messages=messages,
                     timeout=settings.LLM_CONFIG_TIMEOUT,
+                    drop_params=True,  # Drop unsupported parameters gracefully
                     **active_parameters,
                 )
             except litellm.exceptions.APIError as e:
@@ -430,16 +707,28 @@ class LLMAPIHandlerFactory:
             except Exception as e:
                 LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
-            prompt_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-            completion_tokens = response.get("usage", {}).get("completion_tokens", 0)
+            prompt_tokens = 0
+            completion_tokens = 0
             reasoning_tokens = 0
-            completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
-            if completion_token_detail:
-                reasoning_tokens = completion_token_detail.reasoning_tokens or 0
             cached_tokens = 0
-            cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
-            if cached_token_detail:
-                cached_tokens = cached_token_detail.cached_tokens or 0
+
+            if hasattr(response, "usage") and response.usage:
+                prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
+                completion_tokens = getattr(response.usage, "completion_tokens", 0)
+
+                # Extract reasoning tokens from completion_tokens_details
+                completion_token_detail = getattr(response.usage, "completion_tokens_details", None)
+                if completion_token_detail:
+                    reasoning_tokens = getattr(completion_token_detail, "reasoning_tokens", 0) or 0
+
+                # Extract cached tokens from prompt_tokens_details
+                cached_token_detail = getattr(response.usage, "prompt_tokens_details", None)
+                if cached_token_detail:
+                    cached_tokens = getattr(cached_token_detail, "cached_tokens", 0) or 0
+
+                # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
+                if cached_tokens == 0:
+                    cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
             if step:
                 await app.DATABASE.update_step(
@@ -534,10 +823,28 @@ class LLMAPIHandlerFactory:
             raise DuplicateCustomLLMProviderError(llm_key)
         cls._custom_handlers[llm_key] = handler
 
+    @classmethod
+    def set_thinking_budget_settings(cls, settings: dict[str, int] | None) -> None:
+        """Set thinking budget optimization settings for the current task/workflow."""
+        cls._thinking_budget_settings = settings
+        if settings:
+            LOG.info("Thinking budget optimization settings applied", settings=settings)
+
+    @classmethod
+    def set_prompt_caching_settings(cls, settings: dict[str, bool] | None) -> None:
+        """Set prompt caching optimization settings for the current task/workflow."""
+        cls._prompt_caching_settings = settings
+        if settings:
+            LOG.info("Prompt caching optimization settings applied", settings=settings)
+
 
 class LLMCaller:
     """
     An LLMCaller instance defines the LLM configs and keeps the chat history if needed.
+
+    A couple of things to keep in mind:
+    - LLMCaller should be compatible with litellm interface
+    - LLMCaller should also support models that are not supported by litellm
     """
 
     def __init__(
@@ -546,6 +853,7 @@ class LLMCaller:
         screenshot_scaling_enabled: bool = False,
         base_parameters: dict[str, Any] | None = None,
     ):
+        self.original_llm_key = llm_key
         self.llm_key = llm_key
         self.llm_config = LLMConfigRegistry.get_config(llm_key)
         self.base_parameters = base_parameters
@@ -556,6 +864,11 @@ class LLMCaller:
         self.screenshot_resize_target_dimension = self.browser_window_dimension
         if screenshot_scaling_enabled:
             self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
+
+        self.openai_client = None
+        if self.llm_key.startswith("openrouter/"):
+            self.llm_key = self.llm_key.replace("openrouter/", "")
+            self.openai_client = AsyncOpenAI(api_key=settings.OPENROUTER_API_KEY, base_url=settings.OPENROUTER_API_BASE)
 
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
         self.current_tool_results.append(tool_result)
@@ -573,11 +886,11 @@ class LLMCaller:
         ai_suggestion: AISuggestion | None = None,
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
+        organization_id: str | None = None,
         tools: list | None = None,
         use_message_history: bool = False,
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
-        organization_id: str | None = None,
         **extra_parameters: Any,
     ) -> dict[str, Any]:
         start_time = time.perf_counter()
@@ -792,6 +1105,34 @@ class LLMCaller:
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
+        if self.openai_client:
+            # Extract OpenRouter-specific parameters
+            extra_headers = {}
+            if settings.SKYVERN_APP_URL:
+                extra_headers["HTTP-Referer"] = settings.SKYVERN_APP_URL
+                extra_headers["X-Title"] = "Skyvern"
+
+            # Filter out parameters that OpenAI client doesn't support
+            openai_params = {}
+            if "max_completion_tokens" in active_parameters:
+                openai_params["max_completion_tokens"] = active_parameters["max_completion_tokens"]
+            elif "max_tokens" in active_parameters:
+                openai_params["max_tokens"] = active_parameters["max_tokens"]
+            if "temperature" in active_parameters:
+                openai_params["temperature"] = active_parameters["temperature"]
+
+            completion = await self.openai_client.chat.completions.create(
+                model=self.llm_key,
+                messages=messages,
+                extra_headers=extra_headers if extra_headers else None,
+                timeout=timeout,
+                **openai_params,
+            )
+            # Convert OpenAI ChatCompletion to litellm ModelResponse format
+            # litellm.utils.convert_to_model_response_object expects a dict
+            response_dict = completion.model_dump()
+            return litellm.ModelResponse(**response_dict)
+
         if self.llm_key and "ANTHROPIC" in self.llm_key:
             return await self._call_anthropic(messages, tools, timeout, **active_parameters)
 
@@ -800,7 +1141,12 @@ class LLMCaller:
             return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
         return await litellm.acompletion(
-            model=self.llm_config.model_name, messages=messages, tools=tools, timeout=timeout, **active_parameters
+            model=self.llm_config.model_name,
+            messages=messages,
+            tools=tools,
+            timeout=timeout,
+            drop_params=True,  # Drop unsupported parameters gracefully
+            **active_parameters,
         )
 
     async def _call_anthropic(
@@ -899,6 +1245,8 @@ class LLMCaller:
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
+        if self.original_llm_key.startswith("openrouter/"):
+            return empty_call_stats
 
         # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
         if isinstance(response, UITarsResponse):
@@ -930,16 +1278,28 @@ class LLMCaller:
             except Exception as e:
                 LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
-            input_tokens = response.get("usage", {}).get("prompt_tokens", 0)
-            output_tokens = response.get("usage", {}).get("completion_tokens", 0)
+            input_tokens = 0
+            output_tokens = 0
             reasoning_tokens = 0
-            completion_token_detail = response.get("usage", {}).get("completion_tokens_details")
-            if completion_token_detail:
-                reasoning_tokens = completion_token_detail.reasoning_tokens or 0
             cached_tokens = 0
-            cached_token_detail = response.get("usage", {}).get("prompt_tokens_details")
-            if cached_token_detail:
-                cached_tokens = cached_token_detail.cached_tokens or 0
+
+            if hasattr(response, "usage") and response.usage:
+                input_tokens = getattr(response.usage, "prompt_tokens", 0)
+                output_tokens = getattr(response.usage, "completion_tokens", 0)
+
+                # Extract reasoning tokens from completion_tokens_details
+                completion_token_detail = getattr(response.usage, "completion_tokens_details", None)
+                if completion_token_detail:
+                    reasoning_tokens = getattr(completion_token_detail, "reasoning_tokens", 0) or 0
+
+                # Extract cached tokens from prompt_tokens_details
+                cached_token_detail = getattr(response.usage, "prompt_tokens_details", None)
+                if cached_token_detail:
+                    cached_tokens = getattr(cached_token_detail, "cached_tokens", 0) or 0
+
+                # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
+                if cached_tokens == 0:
+                    cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=input_tokens,

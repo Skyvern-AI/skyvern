@@ -4,8 +4,8 @@ Skyvern-AI/skyvern-cloud:
     deleteOrphaned: true
   - source: pyproject.toml
     dest: pyproject.toml
-  - source: poetry.lock
-    dest: poetry.lock
+  - source: uv.lock
+    dest: uv.lock
   - source: setup.sh
     dest: setup.sh
   - source: .env.example

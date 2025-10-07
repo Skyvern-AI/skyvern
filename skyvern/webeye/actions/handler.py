@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import time
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from typing import Any, Awaitable, Callable, List
 
 import pyotp
 import structlog
+from playwright._impl._errors import Error as PlaywrightError
 from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
@@ -17,10 +19,12 @@ from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
+    BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
     REPO_ROOT_DIR,
     SKYVERN_ID_ATTR,
 )
+from skyvern.errors.errors import TOTPExpiredError
 from skyvern.exceptions import (
     DownloadFileMaxWaitingTime,
     EmptySelect,
@@ -393,6 +397,7 @@ class ActionHandler:
     ) -> list[ActionResult]:
         LOG.info("Handling action", action=action)
         actions_result: list[ActionResult] = []
+        llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
         try:
             if action.action_type in ActionHandler._handled_action_types:
                 invalid_web_action_check = check_for_invalid_web_action(action, page, scraped_page, task, step)
@@ -411,28 +416,6 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
-                llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
-                if not results or not isinstance(actions_result[-1], ActionSuccess):
-                    if llm_caller and action.tool_call_id:
-                        # add failure message to the llm caller
-                        tool_call_result = {
-                            "type": "tool_result",
-                            "tool_use_id": action.tool_call_id,
-                            "content": "Tool execution failed",
-                        }
-                        llm_caller.add_tool_result(tool_call_result)
-                        LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
-                    return actions_result
-
-                if llm_caller and action.tool_call_id:
-                    tool_call_result = {
-                        "type": "tool_result",
-                        "tool_use_id": action.tool_call_id,
-                        "content": "Tool executed successfully",
-                    }
-                    LOG.info("Tool call result", tool_call_result=tool_call_result, action=action)
-                    llm_caller.add_tool_result(tool_call_result)
-
                 # do the teardown
                 teardown = ActionHandler._teardown_action_types.get(action.action_type)
                 if teardown:
@@ -470,16 +453,30 @@ class ActionHandler:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
         finally:
+            tool_result_content = ""
+
             if actions_result and isinstance(actions_result[-1], ActionSuccess):
                 action.status = ActionStatus.completed
+                tool_result_content = "Tool executed successfully"
             elif actions_result and isinstance(actions_result[-1], ActionAbort):
                 action.status = ActionStatus.skipped
+                tool_result_content = "Tool executed successfully"
             else:
+                tool_result_content = "Tool execution failed"
                 # either actions_result is empty or the last action is a failure
                 if not actions_result:
                     LOG.warning("Action failed to execute, setting status to failed", action=action)
                 action.status = ActionStatus.failed
+
             await app.DATABASE.create_action(action=action)
+
+            if llm_caller and action.tool_call_id:
+                tool_call_result = {
+                    "type": "tool_result",
+                    "tool_use_id": action.tool_call_id,
+                    "content": tool_result_content,
+                }
+                llm_caller.add_tool_result(tool_call_result)
 
         return actions_result
 
@@ -543,7 +540,7 @@ async def handle_click_action(
                     if (element.hasAttribute('unique_id')) {
                         return element.getAttribute('unique_id');
                     }
-                    
+
                     // If no unique_id attribute is found, return null
                     return null;
                 }
@@ -556,9 +553,9 @@ async def handle_click_action(
         )
         LOG.info("Clicked element at location", x=action.x, y=action.y, element_id=element_id, button=action.button)
         if element_id:
-            skyvern_element = await dom.get_skyvern_element_by_id(element_id)
-            if await skyvern_element.navigate_to_a_href(page=page):
-                return [ActionSuccess()]
+            if skyvern_element := await dom.safe_get_skyvern_element_by_id(element_id):
+                if await skyvern_element.navigate_to_a_href(page=page):
+                    return [ActionSuccess()]
 
         if action.repeat == 1:
             await page.mouse.click(x=action.x, y=action.y, button=action.button)
@@ -753,7 +750,7 @@ async def handle_sequential_click_for_dropdown(
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
-    response = await app.SECONDARY_LLM_API_HANDLER(
+    response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
         step=step,
         prompt_name="check-user-goal",
@@ -871,7 +868,7 @@ async def handle_click_to_download_file_action(
             "Checking if there is any new files after click",
             download_dir=download_dir,
         )
-        async with asyncio.timeout(BROWSER_DOWNLOAD_MAX_WAIT_TIME):
+        async with asyncio.timeout(task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME):
             while True:
                 list_files_after = list_files_in_directory(download_dir)
                 if task.browser_session_id:
@@ -920,7 +917,9 @@ async def handle_click_to_download_file_action(
         workflow_run_id=task.workflow_run_id,
     )
     try:
-        await wait_for_download_finished(downloading_files=downloading_files)
+        await wait_for_download_finished(
+            downloading_files=downloading_files, timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
+        )
     except DownloadFileMaxWaitingTime as e:
         LOG.warning(
             "There're several long-time downloading files, these files might be broken",
@@ -931,6 +930,128 @@ async def handle_click_to_download_file_action(
         )
 
     return [ActionSuccess(download_triggered=True)]
+
+
+# TOTP timing constants
+TOTP_TIME_STEP_SECONDS = 30
+TOTP_EXPIRY_THRESHOLD_SECONDS = 20
+
+
+async def _handle_multi_field_totp_sequence(
+    timing_info: dict[str, Any],
+    task: Task,
+) -> list[ActionResult] | None:
+    """
+    Handle TOTP generation and caching for multi-field TOTP sequences.
+
+    Returns:
+        ActionFailure if TOTP handling failed, None if successful
+    """
+    action_index = timing_info["action_index"]
+    cache_key = f"{task.task_id}_totp_cache"
+    current_context = skyvern_context.ensure_context()
+
+    if action_index == 0:
+        # First digit: generate TOTP and cache it
+        totp_secret = timing_info["totp_secret"]
+        totp = pyotp.TOTP(totp_secret)
+
+        # Check current TOTP expiry time
+        current_time = int(time.time())
+        current_totp_valid_until = ((current_time // TOTP_TIME_STEP_SECONDS) + 1) * TOTP_TIME_STEP_SECONDS
+        seconds_until_expiry = current_totp_valid_until - current_time
+
+        # If less than threshold seconds until expiry, use the next TOTP
+        if seconds_until_expiry < TOTP_EXPIRY_THRESHOLD_SECONDS:
+            # Force generation of next TOTP by advancing time
+            next_time = current_totp_valid_until
+            current_totp = totp.at(next_time)
+
+            LOG.debug(
+                "Using multi-field TOTP flow - using NEXT TOTP due to <20s expiry",
+                task_id=task.task_id,
+                action_idx=action_index,
+                current_totp=totp.now(),
+                next_totp=current_totp,
+                seconds_until_expiry=seconds_until_expiry,
+                is_retry=timing_info.get("is_retry", False),
+            )
+        else:
+            # Use current TOTP
+            current_totp = totp.now()
+
+        current_context.totp_codes[cache_key] = current_totp
+    else:
+        # Subsequent digits: reuse cached TOTP
+        current_totp = current_context.totp_codes.get(cache_key)
+        if not current_totp:
+            # TOTP cache missing for subsequent digit - this should not happen
+            # If it does, something went wrong with the first digit, so fail the action
+            LOG.error(
+                "TOTP cache missing for subsequent digit - first digit may have failed",
+                task_id=task.task_id,
+                action_idx=action_index,
+                cache_key=cache_key,
+            )
+            return [ActionFailure(TOTPExpiredError())]
+
+        # Check if cached TOTP has expired
+        totp_secret = timing_info["totp_secret"]
+        totp = pyotp.TOTP(totp_secret)
+
+        # Get current time and calculate TOTP expiry
+        current_time = int(time.time())
+        totp_valid_until = ((current_time // TOTP_TIME_STEP_SECONDS) + 1) * TOTP_TIME_STEP_SECONDS
+
+        if current_time >= totp_valid_until:
+            LOG.error(
+                "Cached TOTP has expired during multi-field sequence",
+                task_id=task.task_id,
+                action_idx=action_index,
+                current_time=current_time,
+                totp_valid_until=totp_valid_until,
+                cached_totp=current_totp,
+            )
+            return [ActionFailure(TOTPExpiredError())]
+
+        LOG.debug(
+            "Using multi-field TOTP flow - reusing cached TOTP",
+            task_id=task.task_id,
+            action_idx=action_index,
+            totp=current_totp,
+            current_time=current_time,
+            totp_valid_until=totp_valid_until,
+        )
+
+    # Special handling for the 6th digit (action_index=5): wait if TOTP is not yet valid
+    if action_index == 5:
+        # Calculate when this TOTP becomes valid (valid_from time)
+        # If we used the next TOTP window, valid_from is the start of that window
+        totp_valid_from = totp_valid_until - TOTP_TIME_STEP_SECONDS
+
+        if current_time < totp_valid_from:
+            # TOTP is not yet valid, wait until it becomes valid
+            wait_seconds = totp_valid_from - current_time
+
+            LOG.debug(
+                "6th digit: TOTP not yet valid, waiting until valid_from",
+                task_id=task.task_id,
+                action_idx=action_index,
+                current_time=current_time,
+                totp_valid_from=totp_valid_from,
+                wait_seconds=wait_seconds,
+                totp=current_totp,
+            )
+
+            await asyncio.sleep(wait_seconds)
+
+            LOG.debug(
+                "6th digit: Finished waiting, TOTP is now valid",
+                task_id=task.task_id,
+                action_idx=action_index,
+            )
+
+    return None  # Success
 
 
 @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
@@ -958,9 +1079,17 @@ async def handle_input_text_action(
 
     # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
-    text: str | None = await get_actual_value_of_parameter_if_secret(task, action.text)
-    if text is None:
-        return [ActionFailure(FailedToFetchSecret())]
+
+    # Check if this is multi-field TOTP first - if so, skip secret resolution
+    if action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"):
+        # For multi-field TOTP, we'll set text directly in the TOTP logic below
+        text: str = ""
+    else:
+        # For regular inputs, resolve secrets
+        text_result = await get_actual_value_of_parameter_if_secret(task, action.text)
+        if text_result is None:
+            return [ActionFailure(FailedToFetchSecret())]
+        text = text_result
 
     is_totp_value = (
         text == BitwardenConstants.TOTP or text == OnePasswordConstants.TOTP or text == AzureVaultConstants.TOTP
@@ -1185,7 +1314,9 @@ async def handle_input_text_action(
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
-            skyvern_element = blocking_element
+            if await blocking_element.is_editable():
+                skyvern_element = blocking_element
+                tag_name = blocking_element.get_tag_name()
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
@@ -1199,6 +1330,32 @@ async def handle_input_text_action(
         text = generate_totp_value(task=task, parameter=action.text)
         await skyvern_element.input(text)
         return [ActionSuccess()]
+
+    # Handle TOTP generation for multi-field TOTP sequences
+    if action.totp_timing_info:
+        timing_info = action.totp_timing_info
+        if timing_info.get("is_totp_sequence"):
+            result = await _handle_multi_field_totp_sequence(timing_info, task)
+            if result is not None:
+                return result  # Return ActionFailure if TOTP handling failed
+
+            # Extract the digit for this action index
+            current_totp = skyvern_context.ensure_context().totp_codes.get(f"{task.task_id}_totp_cache")
+            action_index = timing_info["action_index"]
+
+            if current_totp and len(current_totp) > action_index:
+                digit = current_totp[action_index]
+                action.text = digit
+                # Also update the text variable that will be used later
+                text = digit
+            else:
+                LOG.error(
+                    "TOTP too short for action index",
+                    task_id=task.task_id,
+                    action_idx=action_index,
+                    totp_length=len(current_totp) if current_totp else 0,
+                )
+                return [ActionFailure(TOTPExpiredError())]
 
     try:
         # TODO: not sure if this case will trigger auto-completion
@@ -1248,18 +1405,57 @@ async def handle_input_text_action(
 
         try:
             await skyvern_element.input_sequentially(text=text)
-        finally:
+
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
-                    task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
+                    task=task,
+                    step=step,
+                    check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)],
                 ),
             )
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
+        except PlaywrightError as inc_error:
+            # Handle Playwright-specific errors during incremental element processing (e.g., TOTP form auto-submit)
+            error_message = str(inc_error).lower()
+            if (
+                "execution context was destroyed" in error_message
+                or "navigation" in error_message
+                or "target closed" in error_message
+            ):
+                # These are expected during page navigation/auto-submit, silently continue
+                LOG.debug(
+                    "Playwright error during incremental element processing (likely page navigation)",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    error_type=type(inc_error).__name__,
+                    error_message=error_message,
+                )
+            else:
+                LOG.warning(
+                    "Unexpected Playwright error during incremental element processing",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    error_type=type(inc_error).__name__,
+                    error_message=str(inc_error),
+                )
+        except Exception as inc_error:
+            # Handle any other unexpected errors during incremental element processing
+            LOG.warning(
+                "Unexpected error during incremental element processing",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                error_type=type(inc_error).__name__,
+                error_message=str(inc_error),
+            )
+        finally:
+            # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
 
         return [ActionSuccess()]
     except Exception as e:
+        # Handle any other unexpected errors during text input
+
         LOG.exception(
             "Failed to input the value or finish the auto completion",
             task_id=task.task_id,
@@ -1798,7 +1994,9 @@ async def handle_terminate_action(
     step: Step,
 ) -> list[ActionResult]:
     if task.error_code_mapping:
-        action.errors = await extract_user_defined_errors(task=task, step=step, scraped_page=scraped_page)
+        action.errors = await extract_user_defined_errors(
+            task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
+        )
     return [ActionSuccess()]
 
 
@@ -1838,9 +2036,6 @@ async def handle_complete_action(
             workflow_run_id=task.workflow_run_id,
         )
         action.verified = True
-
-        if task.error_code_mapping:
-            action.errors = await extract_user_defined_errors(task=task, step=step, scraped_page=scraped_page)
 
         if not task.data_extraction_goal and verification_result.thoughts:
             await app.DATABASE.update_task(
@@ -2323,7 +2518,7 @@ async def choose_auto_completion_dropdown(
             step_id=step.step_id,
             task_id=task.task_id,
         )
-        json_response = await app.SECONDARY_LLM_API_HANDLER(
+        json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
             prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
         )
         element_id = json_response.get("id", "")
@@ -3457,6 +3652,20 @@ async def normal_select(
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 
+    try:
+        await locator.click(
+            timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception as e:
+        LOG.info(
+            "Failed to click before select action",
+            exc_info=True,
+            action=action,
+            locator=locator,
+        )
+        action_result.append(ActionFailure(e))
+        return action_result
+
     if not is_success and value is not None:
         try:
             # click by value (if it matches)
@@ -3723,9 +3932,25 @@ async def _get_input_or_select_context(
         action_reasoning=action.reasoning,
         element_id=action.element_id,
     )
-    json_response = await app.SECONDARY_LLM_API_HANDLER(
+    # Use centralized parse-select handler (set at init or via scripts)
+    json_response = await app.PARSE_SELECT_LLM_API_HANDLER(
         prompt=prompt, step=step, prompt_name="parse-input-or-select-context"
     )
+
+    # Handle edge case where LLM returns list instead of dict
+    if isinstance(json_response, list):
+        LOG.warning(
+            "LLM returned list instead of dict for input/select context parsing",
+            step_id=step.step_id,
+            original_response_type=type(json_response).__name__,
+            original_response_length=len(json_response) if json_response else 0,
+            first_item_type=type(json_response[0]).__name__ if json_response else None,
+            first_item_keys=list(json_response[0].keys())
+            if json_response and isinstance(json_response[0], dict)
+            else None,
+        )
+        json_response = json_response[0] if json_response else {}
+
     json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.info(
@@ -3735,7 +3960,9 @@ async def _get_input_or_select_context(
     return input_or_select_context
 
 
-async def extract_user_defined_errors(task: Task, step: Step, scraped_page: ScrapedPage) -> list[UserDefinedError]:
+async def extract_user_defined_errors(
+    task: Task, step: Step, scraped_page: ScrapedPage, reasoning: str | None = None
+) -> list[UserDefinedError]:
     action_history = await get_action_history(task=task, current_step=step)
     scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False)
     prompt = prompt_engine.load_prompt(
@@ -3747,6 +3974,7 @@ async def extract_user_defined_errors(task: Task, step: Step, scraped_page: Scra
         action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        reasoning=reasoning,
     )
     json_response = await app.EXTRACTION_LLM_API_HANDLER(
         prompt=prompt,

@@ -375,7 +375,7 @@ class ArtifactManager:
                     ]
                 )
             LOG.info(
-                f"S3 upload aio tasks for primary_keys={primary_keys} completed in {time.time() - st:.2f}s",
+                f"Saving artifacts - aio tasks for primary_keys={primary_keys} completed in {time.time() - st:.2f}s",
                 primary_keys=primary_keys,
                 duration=time.time() - st,
             )

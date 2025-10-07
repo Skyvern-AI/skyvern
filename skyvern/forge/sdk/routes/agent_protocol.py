@@ -82,6 +82,7 @@ from skyvern.schemas.runs import (
     CUA_ENGINES,
     BlockRunRequest,
     BlockRunResponse,
+    ProxyLocation,
     RunEngine,
     RunResponse,
     RunType,
@@ -566,6 +567,9 @@ async def create_workflow_from_prompt(
             extra_http_headers=data.extra_http_headers,
             max_iterations=x_max_iterations_override,
             max_steps=x_max_steps_override,
+            status=WorkflowStatus.published if data.publish_workflow else WorkflowStatus.auto_generated,
+            run_with=data.run_with,
+            ai_fallback=data.ai_fallback,
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
@@ -988,7 +992,7 @@ async def run_block(
         organization=organization,
         template=template,
         workflow_permanent_id=block_run_request.workflow_id,
-        workflow_run_request=block_run_request,
+        block_run_request=block_run_request,
     )
 
     browser_session_id = block_run_request.browser_session_id
@@ -1837,6 +1841,36 @@ async def get_workflow(
     )
 
 
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/versions",
+    response_model=list[Workflow],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_versions",
+    },
+)
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/versions/", response_model=list[Workflow], include_in_schema=False
+)
+async def get_workflow_versions(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    template: bool = Query(False),
+) -> list[Workflow]:
+    """
+    Get all versions of a workflow by its permanent ID.
+    """
+    analytics.capture("skyvern-oss-agent-workflow-versions-get")
+    if template:
+        if workflow_permanent_id not in await app.STORAGE.retrieve_global_workflows():
+            raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_permanent_id)
+
+    return await app.WORKFLOW_SERVICE.get_workflow_versions_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=None if template else current_org.organization_id,
+    )
+
+
 @legacy_base_router.post(
     "/suggest/{ai_suggestion_type}",
     include_in_schema=False,
@@ -1952,7 +1986,7 @@ async def get_api_keys(
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")
     api_keys = []
-    org_auth_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)
+    org_auth_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api.value)
     if org_auth_token:
         api_keys.append(org_auth_token)
     return GetOrganizationAPIKeysResponse(api_keys=api_keys)
@@ -2332,6 +2366,7 @@ async def new_debug_session(
     new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+        proxy_location=ProxyLocation.RESIDENTIAL,
     )
 
     debug_session = await app.DATABASE.create_debug_session(
