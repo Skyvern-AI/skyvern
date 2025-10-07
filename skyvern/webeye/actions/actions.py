@@ -88,6 +88,9 @@ class Action(BaseModel):
     is_checked: bool | None = None
     verified: bool = False
 
+    # TOTP timing information for multi-field TOTP sequences
+    totp_timing_info: dict[str, Any] | None = None
+
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None

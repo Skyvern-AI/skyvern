@@ -1,5 +1,6 @@
 import { useLocation } from "react-router-dom";
 import type { WorkflowParameter } from "./types/workflowTypes";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 type Location = ReturnType<typeof useLocation>;
 
@@ -76,4 +77,43 @@ export const formatDuration = (duration: Duration): string => {
   } else {
     return `${duration.second}s`;
   }
+};
+
+export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
+  if (!workflow) {
+    return [];
+  }
+
+  const blockLabels = workflow.workflow_definition.blocks.map(
+    (block) => block.label,
+  );
+
+  return blockLabels;
+};
+
+export const getCode = (
+  orderedBlockLabels: string[],
+  blockScripts?: {
+    [blockName: string]: string;
+  },
+): string[] => {
+  const blockCode: string[] = [];
+  const startBlockCode = blockScripts?.__start_block__;
+
+  if (startBlockCode) {
+    blockCode.push(startBlockCode);
+  }
+
+  for (const blockLabel of orderedBlockLabels) {
+    const code = blockScripts?.[blockLabel];
+
+    if (!code) {
+      continue;
+    }
+
+    blockCode.push(`${code}
+`);
+  }
+
+  return blockCode;
 };

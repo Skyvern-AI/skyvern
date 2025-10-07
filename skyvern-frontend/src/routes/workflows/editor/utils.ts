@@ -1,4 +1,5 @@
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { WorkflowRunStatusApiResponse } from "@/api/types";
 import {
   isDisplayedInWorkflowEditor,
   WorkflowEditorParameterTypes,
@@ -113,25 +114,44 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
 /**
  * Attempt to construct a valid code key value from the workflow parameters.
  */
-const constructCacheKeyValue = (
-  codeKey: string,
-  workflow?: WorkflowApiResponse,
-) => {
+const constructCacheKeyValue = (opts: {
+  codeKey: string;
+  workflow?: WorkflowApiResponse;
+  workflowRun?: WorkflowRunStatusApiResponse;
+}) => {
+  const { workflow, workflowRun } = opts;
+  const codeKey = opts.codeKey;
+
   if (!workflow) {
     return "";
   }
 
-  const workflowParameters = getInitialParameters(workflow)
-    .filter((p) => p.parameterType === "workflow")
-    .reduce(
-      (acc, parameter) => {
-        acc[parameter.key] = parameter.defaultValue;
-        return acc;
-      },
-      {} as Record<string, unknown>,
-    );
+  const workflowParameters = workflowRun
+    ? workflowRun?.parameters ?? {}
+    : getInitialParameters(workflow)
+        .filter((p) => p.parameterType === "workflow")
+        .reduce(
+          (acc, parameter) => {
+            acc[parameter.key] = parameter.defaultValue;
+            return acc;
+          },
+          {} as Record<string, unknown>,
+        );
 
-  for (const [name, value] of Object.entries(workflowParameters)) {
+  return constructCacheKeyValueFromParameters({
+    codeKey,
+    parameters: workflowParameters,
+  });
+};
+
+const constructCacheKeyValueFromParameters = (opts: {
+  codeKey: string;
+  parameters: Record<string, unknown>;
+}) => {
+  const parameters = opts.parameters;
+  let codeKey = opts.codeKey;
+
+  for (const [name, value] of Object.entries(parameters)) {
     if (value === null || value === undefined || value === "") {
       continue;
     }
@@ -146,4 +166,8 @@ const constructCacheKeyValue = (
   return codeKey;
 };
 
-export { constructCacheKeyValue, getInitialParameters };
+export {
+  constructCacheKeyValue,
+  constructCacheKeyValueFromParameters,
+  getInitialParameters,
+};

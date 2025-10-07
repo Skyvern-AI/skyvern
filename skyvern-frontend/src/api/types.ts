@@ -43,6 +43,12 @@ export const ProxyLocation = {
   ResidentialZA: "RESIDENTIAL_ZA",
   ResidentialAR: "RESIDENTIAL_AR",
   ResidentialAU: "RESIDENTIAL_AU",
+  ResidentialBR: "RESIDENTIAL_BR",
+  ResidentialTR: "RESIDENTIAL_TR",
+  ResidentialCA: "RESIDENTIAL_CA",
+  ResidentialMX: "RESIDENTIAL_MX",
+  ResidentialIT: "RESIDENTIAL_IT",
+  ResidentialNL: "RESIDENTIAL_NL",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -193,6 +199,30 @@ export type CreateOnePasswordTokenRequest = {
 export type CreateOnePasswordTokenResponse = {
   token: OnePasswordTokenApiResponse;
 };
+
+export interface AzureClientSecretCredential {
+  tenant_id: string;
+  client_id: string;
+  client_secret: string;
+}
+
+export interface AzureOrganizationAuthToken {
+  id: string;
+  organization_id: string;
+  credential: AzureClientSecretCredential;
+  created_at: string;
+  modified_at: string;
+  token_type: string;
+  valid: boolean;
+}
+
+export interface CreateAzureClientSecretCredentialRequest {
+  credential: AzureClientSecretCredential;
+}
+
+export interface AzureClientSecretCredentialResponse {
+  token: AzureOrganizationAuthToken;
+}
 
 // TODO complete this
 export const ActionTypes = {
@@ -456,3 +486,5 @@ export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
 export type PylonEmailHash = {
   hash: string;
 };
+
+export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 600 as const;

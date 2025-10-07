@@ -154,3 +154,27 @@ class ScriptBlocksResponse(BaseModel):
 class ScriptBlocksRequest(BaseModel):
     cache_key_value: str
     cache_key: str | None = None
+    status: ScriptStatus | None = None
+    workflow_run_id: str | None = None
+
+
+class ScriptStatus(StrEnum):
+    published = "published"
+    pending = "pending"
+
+
+class WorkflowScript(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    workflow_script_id: str
+    organization_id: str
+    script_id: str
+    workflow_permanent_id: str
+    workflow_id: str | None = None
+    workflow_run_id: str | None = None
+    cache_key: str
+    cache_key_value: str
+    status: ScriptStatus
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None

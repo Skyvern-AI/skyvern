@@ -118,6 +118,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
               "bg-slate-950 outline outline-2 outline-slate-300":
                 thisBlockIsTargetted,
             },
+            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -341,7 +342,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                   <div className="flex items-center justify-between">
                     <div className="flex gap-2">
                       <Label className="text-xs font-normal text-slate-300">
-                        File Suffix
+                        File Name
                       </Label>
                       <HelpTooltip
                         content={helpTooltips["action"]["fileSuffix"]}

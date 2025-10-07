@@ -34,17 +34,19 @@ from skyvern.services.script_service import (  # noqa: E402
     download,  # noqa: E402
     extract,  # noqa: E402
     http_request,  # noqa: E402
-    generate_text,  # noqa: E402
     goto,  # noqa: E402
     login,  # noqa: E402
+    loop,  # noqa: E402
     parse_file,  # noqa: E402
     prompt,  # noqa: E402
+    render_list,  # noqa: E402
     render_template,  # noqa: E402
     run_code,  # noqa: E402
     run_script,  # noqa: E402
     run_task,  # noqa: E402
     send_email,  # noqa: E402
     upload_file,  # noqa: E402
+    validate,  # noqa: E402
     wait,  # noqa: E402
 )  # noqa: E402
 
@@ -58,11 +60,12 @@ __all__ = [
     "download",
     "extract",
     "http_request",
-    "generate_text",
     "goto",
     "login",
+    "loop",
     "parse_file",
     "prompt",
+    "render_list",
     "render_template",
     "run_code",
     "run_script",
@@ -70,6 +73,7 @@ __all__ = [
     "send_email",
     "setup",
     "upload_file",
+    "validate",
     "wait",
     "workflow",
 ]

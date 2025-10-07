@@ -1,7 +1,9 @@
 import RFB from "@novnc/novnc/lib/rfb.js";
 import { ExitIcon, HandIcon } from "@radix-ui/react-icons";
 import { useEffect, useState, useRef, useCallback } from "react";
+import { useQuery } from "@tanstack/react-query";
 
+import { getClient } from "@/api/AxiosClient";
 import { Status } from "@/api/types";
 import type {
   TaskApiResponse,
@@ -23,6 +25,11 @@ import { cn } from "@/util/utils";
 
 import { RotateThrough } from "./RotateThrough";
 import "./browser-stream.css";
+
+interface BrowserSession {
+  browser_session_id: string;
+  completed_at?: string;
+}
 
 interface CommandTakeControl {
   kind: "take-control";
@@ -73,12 +80,42 @@ function BrowserStream({
     entity = "task";
   } else if (workflow) {
     runId = workflow.run.workflow_run_id;
+    browserSessionId = workflow.run.browser_session_id ?? undefined;
     showStream = statusIsNotFinalized(workflow.run);
     entity = "workflow";
   } else {
-    throw new Error("No browser session, task or workflow provided");
+    throw new Error("No browser session id, task or workflow provided");
   }
-  const [userIsControlling, setUserIsControlling] = useState(interactive);
+
+  useQuery({
+    queryKey: ["browserSession", browserSessionId],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+
+      try {
+        const response = await client.get<BrowserSession | null>(
+          `/browser_sessions/${browserSessionId}`,
+        );
+        const browserSession = response.data;
+
+        if (!browserSession || browserSession.completed_at) {
+          setHasBrowserSession(false);
+          return false;
+        }
+
+        setHasBrowserSession(true);
+        return true;
+      } catch (error) {
+        setHasBrowserSession(false);
+        return false;
+      }
+    },
+    enabled: !!browserSessionId,
+    refetchInterval: 5000,
+  });
+
+  const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
+  const [userIsControlling, setUserIsControlling] = useState(false);
   const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const prevVncConnectedRef = useRef<boolean>(false);
@@ -87,8 +124,6 @@ function BrowserStream({
     useState(0);
   const prevCommandConnectedRef = useRef<boolean>(false);
   const [isCommandConnected, setIsCommandConnected] = useState<boolean>(false);
-  // goes up a level
-  // const queryClient = useQueryClient();
   const [canvasContainer, setCanvasContainer] = useState<HTMLDivElement | null>(
     null,
   );
@@ -172,6 +207,11 @@ function BrowserStream({
           rfbRef.current.disconnect();
         }
 
+        if (!hasBrowserSession) {
+          setIsVncConnected(false);
+          return;
+        }
+
         const canvas = canvasContainer;
 
         if (!canvas) {
@@ -191,6 +231,8 @@ function BrowserStream({
         rfb.addEventListener("disconnect", async (/* e: RfbEvent */) => {
           setIsVncConnected(false);
         });
+
+        // setIsVncConnected(true); // be optimistic
       }
 
       setupVnc();
@@ -206,11 +248,13 @@ function BrowserStream({
     // cannot include isVncConnected in deps as it will cause infinite loop
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
+      browserSessionId,
+      entity,
       canvasContainer,
+      hasBrowserSession,
+      runId,
       showStream,
       vncDisconnectedTrigger, // will re-run on disconnects
-      runId,
-      entity,
     ],
   );
 
@@ -238,6 +282,11 @@ function BrowserStream({
         throw new Error("No command url");
       }
 
+      if (!hasBrowserSession) {
+        setIsCommandConnected(false);
+        return;
+      }
+
       ws = new WebSocket(commandUrl);
 
       ws.onopen = () => {
@@ -261,10 +310,12 @@ function BrowserStream({
       }
     };
   }, [
+    browserSessionId,
     canvasContainer,
     commandDisconnectedTrigger,
     entity,
     getWebSocketParams,
+    hasBrowserSession,
     runId,
     showStream,
   ]);
@@ -351,7 +402,7 @@ function BrowserStream({
       )}
       ref={setCanvasContainerRef}
     >
-      {isVncConnected && (
+      {isVncConnected && hasBrowserSession && (
         <div className="overlay z-10 flex items-center justify-center overflow-hidden">
           {showControlButtons && (
             <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
@@ -387,18 +438,24 @@ function BrowserStream({
         </div>
       )}
       {!isVncConnected && (
-        <div className="absolute left-0 top-1/2 flex aspect-video w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
-          <RotateThrough interval={7 * 1000}>
-            <span>Hm, working on the connection...</span>
-            <span>Hang tight, we're almost there...</span>
-            <span>Just a moment...</span>
-            <span>Backpropagating...</span>
-            <span>Attention is all I need...</span>
-            <span>Consulting the manual...</span>
-            <span>Looking for the bat phone...</span>
-            <span>Where's Shu?...</span>
-          </RotateThrough>
-          <AnimatedWave text=".‧₊˚ ⋅ ? ✨ ?★ ‧₊˚ ⋅" />
+        <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
+          {browserSessionId && !hasBrowserSession ? (
+            <div>This live browser session is no longer streaming.</div>
+          ) : (
+            <>
+              <RotateThrough interval={7 * 1000}>
+                <span>Hm, working on the connection...</span>
+                <span>Hang tight, we're almost there...</span>
+                <span>Just a moment...</span>
+                <span>Backpropagating...</span>
+                <span>Attention is all I need...</span>
+                <span>Consulting the manual...</span>
+                <span>Looking for the bat phone...</span>
+                <span>Where's Shu?...</span>
+              </RotateThrough>
+              <AnimatedWave text=".‧₊˚ ⋅ ? ✨ ?★ ‧₊˚ ⋅" />
+            </>
+          )}
         </div>
       )}
     </div>

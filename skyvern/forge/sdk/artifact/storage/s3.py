@@ -203,6 +203,44 @@ class S3Storage(BaseStorage):
             f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
         ]
 
+    async def get_shared_downloaded_files_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        object_keys = await self.list_downloaded_files_in_browser_session(organization_id, browser_session_id)
+        if len(object_keys) == 0:
+            return []
+
+        file_infos: list[FileInfo] = []
+        for key in object_keys:
+            metadata = {}
+            modified_at: datetime | None = None
+            # Get metadata (including checksum)
+            try:
+                object_info = await self.async_client.get_object_info(key)
+                metadata = object_info.get("Metadata", {})
+                modified_at = object_info.get("LastModified")
+            except Exception:
+                LOG.exception("Object info retrieval failed", uri=key)
+
+            # Create FileInfo object
+            filename = os.path.basename(key)
+            checksum = metadata.get("sha256_checksum") if metadata else None
+
+            # Get presigned URL
+            presigned_urls = await self.async_client.create_presigned_urls([key])
+            if not presigned_urls:
+                continue
+
+            file_info = FileInfo(
+                url=presigned_urls[0],
+                checksum=checksum,
+                filename=metadata.get("original_filename", filename) if metadata else filename,
+                modified_at=modified_at,
+            )
+            file_infos.append(file_info)
+
+        return file_infos
+
     async def list_downloading_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
@@ -211,6 +249,52 @@ class S3Storage(BaseStorage):
             f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
         ]
         return [file for file in files if file.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+
+    async def list_recordings_in_browser_session(self, organization_id: str, browser_session_id: str) -> list[str]:
+        """List all recording files for a browser session from S3."""
+        uri = f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/v1/{settings.ENV}/{organization_id}/browser_sessions/{browser_session_id}/videos"
+        return [
+            f"s3://{settings.AWS_S3_BUCKET_ARTIFACTS}/{file}" for file in await self.async_client.list_files(uri=uri)
+        ]
+
+    async def get_shared_recordings_in_browser_session(
+        self, organization_id: str, browser_session_id: str
+    ) -> list[FileInfo]:
+        """Get recording files with presigned URLs for a browser session."""
+        object_keys = await self.list_recordings_in_browser_session(organization_id, browser_session_id)
+        if len(object_keys) == 0:
+            return []
+
+        file_infos: list[FileInfo] = []
+        for key in object_keys:
+            metadata = {}
+            modified_at: datetime | None = None
+            # Get metadata (including checksum)
+            try:
+                object_info = await self.async_client.get_object_info(key)
+                metadata = object_info.get("Metadata", {})
+                modified_at = object_info.get("LastModified")
+            except Exception:
+                LOG.exception("Recording object info retrieval failed", uri=key)
+
+            # Create FileInfo object
+            filename = os.path.basename(key)
+            checksum = metadata.get("sha256_checksum") if metadata else None
+
+            # Get presigned URL
+            presigned_urls = await self.async_client.create_presigned_urls([key])
+            if not presigned_urls:
+                continue
+
+            file_info = FileInfo(
+                url=presigned_urls[0],
+                checksum=checksum,
+                filename=metadata.get("original_filename", filename) if metadata else filename,
+                modified_at=modified_at,
+            )
+            file_infos.append(file_info)
+
+        return file_infos
 
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         download_dir = get_download_dir(run_id=run_id)

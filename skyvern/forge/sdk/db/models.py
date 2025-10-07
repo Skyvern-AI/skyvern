@@ -109,6 +109,7 @@ class TaskModel(Base):
     )
     model = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
+    download_timeout = Column(Numeric, nullable=True)
 
 
 class StepModel(Base):
@@ -245,8 +246,11 @@ class WorkflowModel(Base):
     model = Column(JSON, nullable=True)
     status = Column(String, nullable=False, default="published")
     generate_script = Column(Boolean, default=False, nullable=False)
+    run_with = Column(String, nullable=True)  # 'agent' or 'code'
     ai_fallback = Column(Boolean, default=False, nullable=False)
     cache_key = Column(String, nullable=True)
+    run_sequentially = Column(Boolean, nullable=True)
+    sequential_key = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -284,6 +288,12 @@ class WorkflowRunModel(Base):
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
+    job_id = Column(String, nullable=True)
+    sequential_key = Column(String, nullable=True)
+    run_with = Column(String, nullable=True)  # 'agent' or 'code'
+    debug_session_id: Column = Column(String, nullable=True)
+    ai_fallback = Column(Boolean, nullable=True)
+    code_gen = Column(Boolean, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -568,6 +578,7 @@ class AISuggestionModel(Base):
 
 class TOTPCodeModel(Base):
     __tablename__ = "totp_codes"
+    __table_args__ = (Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),)
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
     totp_identifier = Column(String, nullable=False, index=True)
@@ -617,7 +628,10 @@ class ActionModel(Base):
 
 class WorkflowRunBlockModel(Base):
     __tablename__ = "workflow_run_blocks"
-    __table_args__ = (Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),)
+    __table_args__ = (
+        Index("wfrb_org_wfr_index", "organization_id", "workflow_run_id"),
+        Index("ix_workflow_run_blocks_org_created_at", "organization_id", "created_at"),
+    )
 
     workflow_run_block_id = Column(String, primary_key=True, default=generate_workflow_run_block_id)
     workflow_run_id = Column(String, nullable=False)
@@ -667,7 +681,10 @@ class WorkflowRunBlockModel(Base):
 
 class TaskV2Model(Base):
     __tablename__ = "observer_cruises"
-    __table_args__ = (Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),)
+    __table_args__ = (
+        Index("oc_org_wfr_index", "organization_id", "workflow_run_id"),
+        Index("ix_observer_cruises_org_created_at", "organization_id", "created_at"),
+    )
 
     # observer_cruise_id is the task_id for task v2
     observer_cruise_id = Column(String, primary_key=True, default=generate_task_v2_id)
@@ -692,7 +709,8 @@ class TaskV2Model(Base):
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
-    generate_script = Column(Boolean, nullable=False, default=False)
+    generate_script = Column(Boolean, default=False, nullable=False)
+    run_with = Column(String, nullable=True)  # 'agent' or 'code'
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -705,7 +723,10 @@ class TaskV2Model(Base):
 
 class ThoughtModel(Base):
     __tablename__ = "observer_thoughts"
-    __table_args__ = (Index("observer_cruise_index", "organization_id", "observer_cruise_id"),)
+    __table_args__ = (
+        Index("observer_cruise_index", "organization_id", "observer_cruise_id"),
+        Index("ix_observer_thoughts_org_created_at", "organization_id", "created_at"),
+    )
 
     observer_thought_id = Column(String, primary_key=True, default=generate_thought_id)
     organization_id = Column(String, nullable=True)
@@ -745,6 +766,7 @@ class PersistentBrowserSessionModel(Base):
     timeout_minutes = Column(Integer, nullable=True)
     ip_address = Column(String, nullable=True)
     ecs_task_arn = Column(String, nullable=True)
+    proxy_location = Column(String, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
@@ -757,6 +779,7 @@ class TaskRunModel(Base):
     __table_args__ = (
         Index("task_run_org_url_index", "organization_id", "url_hash", "cached"),
         Index("task_run_org_run_id_index", "organization_id", "run_id"),
+        Index("ix_task_runs_org_created_at", "organization_id", "created_at"),
     )
 
     task_run_id = Column(String, primary_key=True, default=generate_task_run_id)
@@ -893,7 +916,9 @@ class WorkflowScriptModel(Base):
     __tablename__ = "workflow_scripts"
     __table_args__ = (
         Index("idx_workflow_scripts_org_created", "organization_id", "created_at"),
-        Index("idx_workflow_scripts_wpid_cache_key_value", "workflow_permanent_id", "cache_key_value"),
+        Index(
+            "idx_workflow_scripts_wpid_cache_key_value", "workflow_permanent_id", "cache_key_value", "workflow_run_id"
+        ),
     )
 
     workflow_script_id = Column(String, primary_key=True, default=generate_workflow_script_id)
@@ -904,6 +929,7 @@ class WorkflowScriptModel(Base):
     workflow_run_id = Column(String, nullable=True)
     cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
     cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
+    status = Column(String, nullable=True, default="published")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import structlog
 
 from skyvern.config import settings
-from skyvern.exceptions import NoTOTPVerificationCodeFound
+from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
@@ -26,7 +26,7 @@ async def poll_verification_code(
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
-    org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api)
+    org_token = await app.DATABASE.get_valid_org_auth_token(organization_id, OrganizationAuthTokenType.api.value)
     if not org_token:
         LOG.error("Failed to get organization token when trying to get verification code")
         return None
@@ -96,7 +96,17 @@ async def _get_verification_code_from_url(
         "x-skyvern-signature": signature,
         "Content-Type": "application/json",
     }
-    json_resp = await aiohttp_post(url=url, data=request_data, headers=headers, raise_exception=False)
+    try:
+        json_resp = await aiohttp_post(url=url, data=request_data, headers=headers, raise_exception=False)
+    except Exception as e:
+        LOG.error("Failed to get verification code from url", exc_info=True)
+        raise FailedToGetTOTPVerificationCode(
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            workflow_id=workflow_permanent_id,
+            totp_verification_url=url,
+            reason=str(e),
+        )
     return json_resp.get("verification_code", None)
 
 

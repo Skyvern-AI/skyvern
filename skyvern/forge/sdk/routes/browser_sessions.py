@@ -1,4 +1,6 @@
-from fastapi import Depends, HTTPException, Path
+import asyncio
+
+from fastapi import Depends, HTTPException, Path, Query
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
@@ -14,6 +16,38 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest
 from skyvern.webeye.schemas import BrowserSessionResponse
+
+
+@base_router.get(
+    "/browser_sessions/history",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/browser_sessions/history/",
+    include_in_schema=False,
+)
+async def get_browser_sessions_all(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    page: int = Query(1, ge=1, description="Page number for pagination"),
+    page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
+) -> list[BrowserSessionResponse]:
+    """Get all browser sessions for the organization"""
+    analytics.capture("skyvern-oss-agent-browser-sessions-get-all")
+
+    browser_sessions = await app.DATABASE.get_persistent_browser_sessions_history(
+        current_org.organization_id,
+        page=page,
+        page_size=page_size,
+    )
+
+    responses = await asyncio.gather(
+        *[
+            BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+            for browser_session in browser_sessions
+        ]
+    )
+
+    return responses
 
 
 @base_router.post(
@@ -43,8 +77,9 @@ async def create_browser_session(
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
         timeout_minutes=browser_session_request.timeout,
+        proxy_location=browser_session_request.proxy_location,
     )
-    return BrowserSessionResponse.from_browser_session(browser_session)
+    return await BrowserSessionResponse.from_browser_session(browser_session)
 
 
 @base_router.post(
@@ -115,7 +150,7 @@ async def get_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    return BrowserSessionResponse.from_browser_session(browser_session)
+    return await BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
 
 
 @base_router.get(
@@ -144,4 +179,9 @@ async def get_browser_sessions(
     """Get all active browser sessions for the organization"""
     analytics.capture("skyvern-oss-agent-browser-sessions-get")
     browser_sessions = await app.PERSISTENT_SESSIONS_MANAGER.get_active_sessions(current_org.organization_id)
-    return [BrowserSessionResponse.from_browser_session(browser_session) for browser_session in browser_sessions]
+    return await asyncio.gather(
+        *[
+            BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+            for browser_session in browser_sessions
+        ]
+    )

@@ -20,7 +20,7 @@ These instructions will get you a copy of the project up and running on your loc
 
 Before you begin, ensure you have the following installed:
 - [Python 3.11](https://www.python.org/downloads/)
-- [Poetry](https://python-poetry.org/docs/#installation)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ### Installation
 
@@ -33,7 +33,7 @@ Before you begin, ensure you have the following installed:
 2. **Install dependencies**
 
    ```sh
-    poetry install
+    uv sync
     ```
 
 3. *Define the following environment variables*

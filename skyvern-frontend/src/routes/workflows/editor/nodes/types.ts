@@ -8,6 +8,7 @@ export type NodeBaseData = {
   editable: boolean;
   model: WorkflowModel | null;
   showCode?: boolean;
+  comparisonColor?: string;
 };
 
 export const errorMappingExampleValue = {

@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any, Callable, Literal
 
 import structlog
+from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 
 from skyvern.config import settings
@@ -29,6 +30,7 @@ from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
 
+jinja_sandbox_env = SandboxedEnvironment()
 LOG = structlog.get_logger()
 SELECT_OPTION_GOAL = """- The intention to select an option: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
@@ -62,6 +64,74 @@ async def _get_element_id_by_xpath(xpath: str, page: Page) -> str | None:
     return element_id
 
 
+def _get_context_data(data: str | dict[str, Any] | None = None) -> dict[str, Any] | str | None:
+    context = skyvern_context.current()
+    global_context_data = context.script_run_parameters if context else None
+    if not data:
+        return global_context_data
+    result: dict[str, Any] | str | None
+    if isinstance(data, dict):
+        result = {k: v for k, v in data.items() if v}
+        if global_context_data:
+            result.update(global_context_data)
+    else:
+        global_context_data_str = json.dumps(global_context_data) if global_context_data else ""
+        result = f"{data}\n{global_context_data_str}"
+    return result
+
+
+def _render_template_with_label(template: str, label: str | None = None) -> str:
+    template_data = {}
+    context = skyvern_context.current()
+    if context and context.workflow_run_id:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+        block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(label)
+        template_data = workflow_run_context.values.copy()
+        if label in template_data:
+            current_value = template_data[label]
+            if isinstance(current_value, dict):
+                block_reference_data.update(current_value)
+            else:
+                LOG.warning(
+                    f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
+                )
+
+        if label:
+            template_data[label] = block_reference_data
+
+        # inject the forloop metadata as global variables
+        if "current_index" in block_reference_data:
+            template_data["current_index"] = block_reference_data["current_index"]
+        if "current_item" in block_reference_data:
+            template_data["current_item"] = block_reference_data["current_item"]
+        if "current_value" in block_reference_data:
+            template_data["current_value"] = block_reference_data["current_value"]
+    try:
+        return render_template(template, data=template_data)
+    except Exception:
+        LOG.exception("Failed to render template", template=template, data=template_data)
+        return template
+
+
+def render_template(template: str, data: dict[str, Any] | None = None) -> str:
+    """
+    Refer to  Block.format_block_parameter_template_from_workflow_run_context
+
+    TODO: complete this function so that block code shares the same template rendering logic
+    """
+    template_data = data.copy() if data else {}
+    jinja_template = jinja_sandbox_env.from_string(template)
+    context = skyvern_context.current()
+    if context and context.workflow_run_id:
+        workflow_run_id = context.workflow_run_id
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        template_data.update(workflow_run_context.values)
+        if template in template_data:
+            return template_data[template]
+
+    return jinja_template.render(template_data)
+
+
 class SkyvernPage:
     """
     A minimal adapter around the chosen driver that:
@@ -81,6 +151,7 @@ class SkyvernPage:
         self.scraped_page = scraped_page
         self.page = page
         self._record = recorder or (lambda ac: None)
+        self.current_label: str | None = None
 
     @classmethod
     async def _get_or_create_browser_state(cls, browser_session_id: str | None = None) -> BrowserState:
@@ -178,7 +249,7 @@ class SkyvernPage:
                 finally:
                     skyvern_page._record(call)
                     # Auto-create action after execution
-                    await skyvern_page._create_action_before_execution(
+                    await skyvern_page._create_action_after_execution(
                         action_type=action,
                         intention=intention,
                         status=action_status,
@@ -195,12 +266,62 @@ class SkyvernPage:
         return decorator
 
     async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
+        url = render_template(url)
         await self.page.goto(
             url,
             timeout=timeout,
         )
 
-    async def _create_action_before_execution(
+    async def _update_action_reasoning(
+        self,
+        action_id: str,
+        organization_id: str,
+        action_type: ActionType,
+        intention: str = "",
+        text: str | None = None,
+        select_option: SelectOption | None = None,
+        file_url: str | None = None,
+        data_extraction_goal: str | None = None,
+        data_extraction_schema: dict[str, Any] | list | str | None = None,
+    ) -> str:
+        """Generate user-facing reasoning for an action using the secondary LLM."""
+        reasoning = f"Auto-generated action for {action_type.value}"
+        try:
+            context = skyvern_context.current()
+            if not context or not context.organization_id:
+                return f"Auto-generated action for {action_type.value}"
+
+            # Build the prompt with available context
+            prompt = prompt_engine.load_prompt(
+                template="generate-action-reasoning",
+                action_type=action_type.value,
+                intention=intention,
+                text=text,
+                select_option=select_option.value if select_option else None,
+                file_url=file_url,
+                data_extraction_goal=data_extraction_goal,
+                data_extraction_schema=data_extraction_schema,
+            )
+
+            # Call secondary LLM to generate reasoning
+            json_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt,
+                prompt_name="generate-action-reasoning",
+                organization_id=context.organization_id,
+            )
+
+            reasoning = json_response.get("reasoning", f"Auto-generated action for {action_type.value}")
+
+        except Exception:
+            LOG.warning("Failed to generate action reasoning, using fallback", action_type=action_type)
+        await app.DATABASE.update_action_reasoning(
+            organization_id=organization_id,
+            action_id=action_id,
+            reasoning=reasoning,
+        )
+        return reasoning
+
+    async def _create_action_after_execution(
         self,
         action_type: ActionType,
         intention: str = "",
@@ -244,14 +365,17 @@ class SkyvernPage:
                 step_order=0,  # Will be updated by the system if needed
                 action_order=context.action_order,  # Will be updated by the system if needed
                 intention=intention,
-                reasoning=f"Auto-generated action for {action_type.value}",
                 text=text,
                 option=select_option,
                 file_url=file_url,
                 response=response,
                 created_by="script",
             )
+            data_extraction_goal = None
+            data_extraction_schema = None
             if action_type == ActionType.EXTRACT:
+                data_extraction_goal = kwargs.get("prompt")
+                data_extraction_schema = kwargs.get("schema")
                 action = ExtractAction(
                     element_id="",
                     action_type=action_type,
@@ -263,16 +387,31 @@ class SkyvernPage:
                     step_order=0,
                     action_order=context.action_order,
                     intention=intention,
-                    reasoning=f"Auto-generated action for {action_type.value}",
-                    data_extraction_goal=kwargs.get("prompt"),
-                    data_extraction_schema=kwargs.get("schema"),
+                    data_extraction_goal=data_extraction_goal,
+                    data_extraction_schema=data_extraction_schema,
                     option=select_option,
                     response=response,
                     created_by="script",
                 )
 
             created_action = await app.DATABASE.create_action(action)
+            # Generate user-facing reasoning using secondary LLM
+            asyncio.create_task(
+                self._update_action_reasoning(
+                    action_id=str(created_action.action_id),
+                    organization_id=str(context.organization_id),
+                    action_type=action_type,
+                    intention=intention,
+                    text=text,
+                    select_option=select_option,
+                    file_url=file_url,
+                    data_extraction_goal=data_extraction_goal,
+                    data_extraction_schema=data_extraction_schema,
+                )
+            )
+
             context.action_order += 1
+
             return created_action
 
         except Exception:
@@ -328,11 +467,11 @@ class SkyvernPage:
         """
         new_xpath = xpath
 
-        if intention and data:
+        if intention:
             try:
                 # Build the element tree of the current page for the prompt
                 context = skyvern_context.ensure_context()
-                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                payload_str = _get_context_data(data)
                 refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                 element_tree = refreshed_page.build_element_tree()
                 single_click_prompt = prompt_engine.load_prompt(
@@ -440,10 +579,12 @@ class SkyvernPage:
         if ai_infer and intention:
             try:
                 prompt = context.prompt if context else None
-                # Build the element tree of the current page for the prompt
-                # clean up empty data values
-                data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
+                data = data or {}
                 if (totp_identifier or totp_url) and context and organization_id and task_id:
+                    if totp_identifier:
+                        totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
+                    if totp_url:
+                        totp_url = _render_template_with_label(totp_url, label=self.current_label)
                     verification_code = await poll_verification_code(
                         organization_id=organization_id,
                         task_id=task_id,
@@ -465,11 +606,9 @@ class SkyvernPage:
                 self.scraped_page = refreshed_page
                 # get the element_id by the xpath
                 element_id = await _get_element_id_by_xpath(xpath, self.page)
-                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
                 script_generation_input_text_prompt = prompt_engine.load_prompt(
                     template="script-generation-input-text-generatiion",
                     intention=intention,
-                    data=payload_str,
                     goal=prompt,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
@@ -516,12 +655,11 @@ class SkyvernPage:
             try:
                 context = skyvern_context.current()
                 prompt = context.prompt if context else None
-                data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
-                payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                data = _get_context_data(data)
                 script_generation_file_url_prompt = prompt_engine.load_prompt(
                     template="script-generation-file-url-generation",
                     intention=intention,
-                    data=payload_str,
+                    data=data,
                     goal=prompt,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
@@ -555,15 +693,15 @@ class SkyvernPage:
             if ai_infer and intention and task and step:
                 try:
                     prompt = context.prompt if context else None
-                    data = {k: v for k, v in data.items() if v} if isinstance(data, dict) else (data or "")
-                    payload_str = json.dumps(data) if isinstance(data, (dict, list)) else (data or "")
+                    # data = _get_context_data(data)
+                    data = data or {}
                     refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                     self.scraped_page = refreshed_page
                     element_tree = refreshed_page.build_element_tree()
                     merged_goal = SELECT_OPTION_GOAL.format(intention=intention, prompt=prompt)
                     single_select_prompt = prompt_engine.load_prompt(
                         template="single-select-action",
-                        navigation_payload_str=payload_str,
+                        navigation_payload_str=data,
                         navigation_goal=merged_goal,
                         current_url=self.page.url,
                         elements=element_tree,
@@ -647,6 +785,7 @@ class SkyvernPage:
         tz_info = datetime.now(tz=timezone.utc).tzinfo
         if context and context.tz_info:
             tz_info = context.tz_info
+        prompt = _render_template_with_label(prompt, label=self.current_label)
         extract_information_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -779,8 +918,10 @@ class ScriptRunContextManager:
     def set_cached_fn(self, cache_key: str, fn: Callable) -> None:
         self.cached_fns[cache_key] = fn
 
-    def get_cached_fn(self, cache_key: str) -> Callable | None:
-        return self.cached_fns.get(cache_key)
+    def get_cached_fn(self, cache_key: str | None = None) -> Callable | None:
+        if cache_key:
+            return self.cached_fns.get(cache_key)
+        return None
 
 
 script_run_context_manager = ScriptRunContextManager()

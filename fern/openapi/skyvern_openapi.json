@@ -2949,6 +2949,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -4136,6 +4147,48 @@
             "description": "Whether the browser session supports VNC streaming",
             "default": false
           },
+          "download_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Path",
+            "description": "The path where the browser session downloads files"
+          },
+          "downloaded_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FileInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Downloaded Files",
+            "description": "The list of files downloaded by the browser session"
+          },
+          "recordings": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/FileInfo"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recordings",
+            "description": "The list of video recordings from the browser session"
+          },
           "started_at": {
             "anyOf": [
               {
@@ -4494,7 +4547,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240,
+                "maximum": 1440,
                 "minimum": 5
               },
               {
@@ -4502,8 +4555,19 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.",
             "default": 60
+          },
+          "proxy_location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProxyLocation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "\nGeographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California\n- US-NY: New York\n- US-TX: Texas\n- US-FL: Florida\n- US-WA: Washington\n- NONE: No proxy\n"
           }
         },
         "type": "object",
@@ -5220,6 +5284,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -5605,6 +5680,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -5748,6 +5834,17 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -5796,6 +5893,19 @@
             ],
             "title": "Filename",
             "description": "Original filename"
+          },
+          "modified_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At",
+            "description": "Modified time of the file"
           }
         },
         "type": "object",
@@ -6254,6 +6364,17 @@
               }
             ],
             "title": "Azure Blob Container Name"
+          },
+          "azure_folder_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Azure Folder Path"
           },
           "path": {
             "anyOf": [
@@ -7207,6 +7328,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -7871,6 +8003,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -8531,6 +8674,12 @@
           "RESIDENTIAL_ZA",
           "RESIDENTIAL_AR",
           "RESIDENTIAL_AU",
+          "RESIDENTIAL_BR",
+          "RESIDENTIAL_TR",
+          "RESIDENTIAL_CA",
+          "RESIDENTIAL_MX",
+          "RESIDENTIAL_IT",
+          "RESIDENTIAL_NL",
           "RESIDENTIAL_ISP",
           "NONE"
         ],
@@ -8672,6 +8821,17 @@
         ],
         "title": "ScriptFileCreate",
         "description": "Model representing a file in a script."
+      },
+      "ScriptRunResponse": {
+        "properties": {
+          "ai_fallback_triggered": {
+            "type": "boolean",
+            "title": "Ai Fallback Triggered",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "ScriptRunResponse"
       },
       "SelectOption": {
         "properties": {
@@ -9396,6 +9556,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -10082,6 +10253,33 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
+          },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors",
+            "description": "The errors for the run"
           },
           "run_type": {
             "type": "string",
@@ -11068,6 +11266,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -11404,6 +11613,17 @@
             "type": "boolean",
             "title": "Include Action History In Verification",
             "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
           }
         },
         "type": "object",
@@ -11805,10 +12025,16 @@
             ],
             "title": "Extra Http Headers"
           },
-          "generate_script": {
-            "type": "boolean",
-            "title": "Generate Script",
-            "default": false
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With"
           },
           "ai_fallback": {
             "type": "boolean",
@@ -11825,6 +12051,28 @@
               }
             ],
             "title": "Cache Key"
+          },
+          "run_sequentially": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Sequentially"
+          },
+          "sequential_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Key"
           },
           "created_at": {
             "type": "string",
@@ -11977,10 +12225,16 @@
             "$ref": "#/components/schemas/WorkflowStatus",
             "default": "published"
           },
-          "generate_script": {
-            "type": "boolean",
-            "title": "Generate Script",
-            "default": false
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With"
           },
           "ai_fallback": {
             "type": "boolean",
@@ -11996,7 +12250,24 @@
                 "type": "null"
               }
             ],
-            "title": "Cache Key"
+            "title": "Cache Key",
+            "default": "default"
+          },
+          "run_sequentially": {
+            "type": "boolean",
+            "title": "Run Sequentially",
+            "default": false
+          },
+          "sequential_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequential Key"
           }
         },
         "type": "object",
@@ -13025,6 +13296,30 @@
               "http://127.0.0.1:9222",
               "ws://127.0.0.1:9222/devtools/browser/1234567890"
             ]
+          },
+          "ai_fallback": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Fallback",
+            "description": "Whether to fallback to AI if the workflow run fails."
+          },
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With",
+            "description": "Whether to run the workflow with agent or code."
           }
         },
         "type": "object",
@@ -13232,6 +13527,33 @@
             ],
             "title": "Max Screenshot Scrolls",
             "description": "The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot"
+          },
+          "script_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScriptRunResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The script run result"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errors",
+            "description": "The errors for the run"
           },
           "run_type": {
             "type": "string",

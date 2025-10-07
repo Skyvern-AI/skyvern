@@ -261,6 +261,22 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                   className="nopan text-xs"
                 />
               </div>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Label className="text-sm text-slate-400">
+                    (Optional) Folder Path
+                  </Label>
+                  <HelpTooltip content="Optional folder path within the blob container. Defaults to {{ workflow_run_id }} if not specified." />
+                </div>
+                <WorkflowBlockInputTextarea
+                  nodeId={id}
+                  onChange={(value) => {
+                    handleChange("path", value);
+                  }}
+                  value={inputs.path as string}
+                  className="nopan text-xs"
+                />
+              </div>
             </>
           )}
         </div>

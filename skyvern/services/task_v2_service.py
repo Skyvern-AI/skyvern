@@ -164,11 +164,8 @@ async def initialize_task_v2(
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
-    generate_script: bool = False,
+    run_with: str | None = None,
 ) -> TaskV2:
-    if generate_script:
-        publish_workflow = True
-
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
         organization_id=organization.organization_id,
@@ -182,7 +179,7 @@ async def initialize_task_v2(
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
         browser_address=browser_address,
-        generate_script=generate_script,
+        run_with=run_with,
     )
     # set task_v2_id in context
     context = skyvern_context.current()
@@ -229,7 +226,7 @@ async def initialize_task_v2(
             status=workflow_status,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
-            generate_script=generate_script,
+            run_with=run_with,
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -466,6 +463,8 @@ async def run_task_v2_helper(
 
     context: skyvern_context.SkyvernContext | None = skyvern_context.current()
     current_run_id = context.run_id if context and context.run_id else task_v2_id
+    # task v2 can be nested inside a workflow run, so we need to use the root workflow run id
+    root_workflow_run_id = context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
     enable_parse_select_in_extract = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_PARSE_SELECT_IN_EXTRACT",
         current_run_id,
@@ -476,6 +475,7 @@ async def run_task_v2_helper(
             organization_id=organization_id,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run_id,
+            root_workflow_run_id=root_workflow_run_id,
             request_id=request_id,
             task_v2_id=task_v2_id,
             run_id=current_run_id,
@@ -489,7 +489,9 @@ async def run_task_v2_helper(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
     )
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id=workflow_run.workflow_run_id)
-    await _set_up_workflow_context(workflow_id, workflow_run_id, organization)
+
+    workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
+    await _set_up_workflow_context(workflow, workflow_run_id, organization)
 
     url = str(task_v2.url)
     user_prompt = task_v2.prompt
@@ -765,25 +767,6 @@ async def run_task_v2_helper(
                     failure_reason=f"Unsupported task block type gets generated: {task_type}",
                 )
                 break
-
-        # generate the extraction task
-        block_result = await block.execute_safe(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
-        task_history_record["status"] = str(block_result.status)
-        if block_result.failure_reason:
-            task_history_record["reason"] = block_result.failure_reason
-
-        extracted_data = _get_extracted_data_from_block_result(
-            block_result,
-            task_type,
-            task_v2_id=task_v2_id,
-            workflow_run_id=workflow_run_id,
-        )
-        if extracted_data is not None:
-            task_history_record["extracted_data"] = extracted_data
-        task_history.append(task_history_record)
         # refresh workflow
         yaml_blocks.extend(block_yaml_list)
         yaml_parameters.extend(parameter_yaml_list)
@@ -806,9 +789,28 @@ async def run_task_v2_helper(
             organization=organization,
             request=workflow_create_request,
             workflow_permanent_id=workflow.workflow_permanent_id,
+            delete_script=False,
         )
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
+        # generate the extraction task
+        block_result = await block.execute_safe(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        task_history_record["status"] = str(block_result.status)
+        if block_result.failure_reason:
+            task_history_record["reason"] = block_result.failure_reason
+
+        extracted_data = _get_extracted_data_from_block_result(
+            block_result,
+            task_type,
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+        )
+        if extracted_data is not None:
+            task_history_record["extracted_data"] = extracted_data
+        task_history.append(task_history_record)
         # execute the extraction task
         workflow_run = await handle_block_result(
             task_v2_id,
@@ -898,7 +900,7 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
-                if task_v2.generate_script:
+                if task_v2.run_with == "code":
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
@@ -1010,16 +1012,21 @@ async def handle_block_result(
     )
 
 
-async def _set_up_workflow_context(workflow_id: str, workflow_run_id: str, organization: Organization) -> None:
+async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, organization: Organization) -> None:
     """
     TODO: see if we could remove this function as we can just set an empty workflow context
     """
     # Get all <workflow parameter, workflow run parameter> tuples
     wp_wps_tuples = await app.WORKFLOW_SERVICE.get_workflow_run_parameter_tuples(workflow_run_id=workflow_run_id)
-    workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(workflow_id=workflow_id)
+    workflow_output_parameters = await app.WORKFLOW_SERVICE.get_workflow_output_parameters(
+        workflow_id=workflow.workflow_id
+    )
     await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
         organization,
         workflow_run_id,
+        workflow.title,
+        workflow.workflow_id,
+        workflow.workflow_permanent_id,
         wp_wps_tuples,
         workflow_output_parameters,
         [],
@@ -1708,6 +1715,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             data_extraction_schema=task_v2.extracted_information_schema,
             error_code_mapping=task_v2.error_code_mapping,
         ),
+        errors=workflow_run_resp.errors if workflow_run_resp else None,
     )
 
 
@@ -1719,7 +1727,7 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         return
     api_key = await app.DATABASE.get_valid_org_auth_token(
         organization_id,
-        OrganizationAuthTokenType.api,
+        OrganizationAuthTokenType.api.value,
     )
     if not api_key:
         LOG.warning(
