@@ -38,13 +38,11 @@ import { KeyValueInput } from "@/components/KeyValueInput";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useSyncFormFieldToStorage } from "@/hooks/useSyncFormFieldToStorage";
-import { useLocalStorageFormDefault } from "@/hooks/useLocalStorageFormDefault";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { apiBaseUrl, lsKeys } from "@/util/env";
+import { apiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -188,10 +186,6 @@ function RunWorkflowForm({
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const browserSessionIdDefault = useLocalStorageFormDefault(
-    lsKeys.browserSessionId,
-    (initialValues.browserSessionId as string | undefined) ?? null,
-  );
   const apiCredential = useApiCredential();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
@@ -200,7 +194,7 @@ function RunWorkflowForm({
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation,
-      browserSessionId: browserSessionIdDefault,
+      browserSessionId: null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -210,8 +204,6 @@ function RunWorkflowForm({
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
-
-  useSyncFormFieldToStorage(form, "browserSessionId", lsKeys.browserSessionId);
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
