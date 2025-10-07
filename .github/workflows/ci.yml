@@ -75,7 +75,7 @@ jobs:
         run: npm ci
       # Finally, run pre-commit.
       - name: Run all pre-commit hooks
-        uses: pre-commit/action@v3.0.0
+        run: uv run pre-commit run --all-files
         env:
           ENABLE_OPENAI: "true"
           OPENAI_API_KEY: "sk-dummy"
