@@ -64,6 +64,15 @@ jobs:
         if: steps.cache-venv.outputs.cache-hit == 'true'
         run: |
           uv sync --group dev
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: skyvern-frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: skyvern-frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: skyvern-frontend
+        run: npm ci
       # Finally, run pre-commit.
       - name: Run all pre-commit hooks
         uses: pre-commit/action@v3.0.0
