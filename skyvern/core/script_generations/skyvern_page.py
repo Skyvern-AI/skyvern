@@ -106,7 +106,11 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
             template_data["current_item"] = block_reference_data["current_item"]
         if "current_value" in block_reference_data:
             template_data["current_value"] = block_reference_data["current_value"]
-    return render_template(template, data=template_data)
+    try:
+        return render_template(template, data=template_data)
+    except Exception:
+        LOG.exception("Failed to render template", template=template, data=template_data)
+        return template
 
 
 def render_template(template: str, data: dict[str, Any] | None = None) -> str:
@@ -577,6 +581,10 @@ class SkyvernPage:
                 prompt = context.prompt if context else None
                 data = data or {}
                 if (totp_identifier or totp_url) and context and organization_id and task_id:
+                    if totp_identifier:
+                        totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
+                    if totp_url:
+                        totp_url = _render_template_with_label(totp_url, label=self.current_label)
                     verification_code = await poll_verification_code(
                         organization_id=organization_id,
                         task_id=task_id,
