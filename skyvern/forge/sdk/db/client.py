@@ -1473,6 +1473,7 @@ class AgentDB:
         workflow_permanent_id: str,
         organization_id: str | None = None,
         version: int | None = None,
+        ignore_version: int | None = None,
         exclude_deleted: bool = True,
     ) -> Workflow | None:
         try:
@@ -1483,6 +1484,8 @@ class AgentDB:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
             if version:
                 get_workflow_query = get_workflow_query.filter_by(version=version)
+            if ignore_version:
+                get_workflow_query = get_workflow_query.filter(WorkflowModel.version != ignore_version)
             get_workflow_query = get_workflow_query.order_by(WorkflowModel.version.desc())
             async with self.Session() as session:
                 if workflow := (await session.scalars(get_workflow_query)).first():
@@ -4513,6 +4516,28 @@ class AgentDB:
                 await session.commit()
 
                 return result.rowcount
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_scripts_by_permanent_id(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+    ) -> list[WorkflowScriptModel]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(deleted_at=None)
+                )
+
+                return (await session.scalars(query)).all()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

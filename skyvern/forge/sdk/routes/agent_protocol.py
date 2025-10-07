@@ -12,7 +12,11 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.exceptions import (
+    BrowserSessionNotRenewable,
+    CannotUpdateWorkflowDueToCodeCache,
+    MissingBrowserAddressError,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -607,6 +611,7 @@ async def update_workflow_legacy(
         ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    delete_code_cache_is_ok: bool = Query(False),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
     # validate the workflow
@@ -622,7 +627,13 @@ async def update_workflow_legacy(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
+            delete_code_cache_is_ok=delete_code_cache_is_ok,
         )
+    except CannotUpdateWorkflowDueToCodeCache as e:
+        raise HTTPException(
+            status_code=422,
+            detail=str(e),
+        ) from e
     except WorkflowParameterMissingRequiredValue as e:
         raise e
     except Exception as e:
