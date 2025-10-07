@@ -118,7 +118,7 @@ DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
 def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
     """
-    This function dumps the workflow definition and removes the unrelevant data to the definition, like created_at and modified_at fields inside:
+    This function dumps the workflow definition and removes the irrelevant data to the definition, like created_at and modified_at fields inside:
     - list of blocks
     - list of parameters
     And return the dumped workflow definition as a python dictionary.
