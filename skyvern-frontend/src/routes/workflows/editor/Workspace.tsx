@@ -157,8 +157,7 @@ function Workspace({
   const saveWorkflow = useWorkflowSave();
 
   const { data: workflowRun } = useWorkflowRunQuery();
-  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : null;
-  const interactor = workflowRun && isFinalized === false ? "agent" : "human";
+  const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -231,11 +230,25 @@ function Workspace({
     }
   }, [cacheKeyValue, searchParams, setSearchParams]);
 
-  const { data: blockScripts } = useBlockScriptsQuery({
+  const { data: blockScriptsPublished } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
     workflowPermanentId,
     status: "published",
+  });
+
+  const publishedLabelCount = Object.keys(blockScriptsPublished ?? {}).length;
+
+  const isGeneratingCode =
+    publishedLabelCount === 0 && !isFinalized && Boolean(workflowRun);
+
+  const { data: blockScriptsPending } = useBlockScriptsQuery({
+    cacheKey,
+    cacheKeyValue,
+    workflowPermanentId,
+    pollIntervalMs: isGeneratingCode ? 3000 : undefined,
+    status: "pending",
+    workflowRunId: workflowRun?.workflow_run_id,
   });
 
   const { data: cacheKeyValues, isLoading: cacheKeyValuesLoading } =
@@ -375,9 +388,9 @@ function Workspace({
   }, []);
 
   useEffect(() => {
-    blockScriptStore.setScripts(blockScripts ?? {});
+    blockScriptStore.setScripts(blockScriptsPublished ?? {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blockScripts]);
+  }, [blockScriptsPublished]);
 
   const afterCycleBrowser = () => {
     setOpenCycleBrowserDialogue(false);
@@ -657,7 +670,8 @@ function Workspace({
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScripts).join("");
+  const code = getCode(orderedBlockLabels, blockScriptsPublished).join("");
+  const codePending = getCode(orderedBlockLabels, blockScriptsPending).join("");
 
   const handleCompareVersions = (
     version1: WorkflowVersion,
@@ -852,6 +866,7 @@ function Workspace({
         <WorkflowHeader
           cacheKeyValue={cacheKeyValue}
           cacheKeyValues={cacheKeyValues}
+          isGeneratingCode={isGeneratingCode}
           saving={workflowChangesStore.saveIsPending}
           cacheKeyValuesPanelOpen={
             workflowPanelState.active &&
@@ -1158,9 +1173,11 @@ function Workspace({
                       <CopyText text={code} />
                     </div>
                     <CodeEditor
-                      className="w-full overflow-y-scroll"
+                      className={cn("w-full overflow-y-scroll", {
+                        "animate-pulse": isGeneratingCode,
+                      })}
                       language="python"
-                      value={code}
+                      value={isGeneratingCode ? codePending : code}
                       lineWrap={false}
                       readOnly
                       fontSize={10}
@@ -1255,11 +1272,11 @@ function Workspace({
                         activeDebugSession.browser_session_id &&
                         !cycleBrowser.isPending ? (
                           <BrowserStream
-                            interactive={interactor === "human"}
+                            interactive={true}
                             browserSessionId={
                               activeDebugSession.browser_session_id
                             }
-                            showControlButtons={interactor === "human"}
+                            showControlButtons={true}
                             resizeTrigger={windowResizeTrigger}
                           />
                         ) : (

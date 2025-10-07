@@ -45,3 +45,8 @@ class GetTOTPVerificationCodeError(SkyvernDefinedError):
 class TimeoutGetTOTPVerificationCodeError(SkyvernDefinedError):
     error_code: str = "OTP_TIMEOUT"
     reasoning: str = "Timeout getting TOTP verification code."
+
+
+class TOTPExpiredError(SkyvernDefinedError):
+    error_code: str = "OTP_EXPIRED"
+    reasoning: str = "TOTP verification code has expired during multi-field input sequence."

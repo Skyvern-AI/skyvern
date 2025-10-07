@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from skyvern.config import settings
+from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
@@ -172,6 +173,7 @@ class AgentDB:
         extra_http_headers: dict[str, str] | None = None,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
+        download_timeout: float | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -203,6 +205,7 @@ class AgentDB:
                     extra_http_headers=extra_http_headers,
                     browser_session_id=browser_session_id,
                     browser_address=browser_address,
+                    download_timeout=download_timeout,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -1420,7 +1423,7 @@ class AgentDB:
                 status=status,
                 run_with=run_with,
                 ai_fallback=ai_fallback,
-                cache_key=cache_key,
+                cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
             )
