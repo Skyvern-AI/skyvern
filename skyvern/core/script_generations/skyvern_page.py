@@ -610,6 +610,7 @@ class SkyvernPage:
                     template="script-generation-input-text-generatiion",
                     intention=intention,
                     goal=prompt,
+                    data=data,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                     prompt=script_generation_input_text_prompt,
