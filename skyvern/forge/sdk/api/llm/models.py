@@ -7,6 +7,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.utils.image_resizer import Resolution
 
 
 class LiteLLMParams(TypedDict, total=False):
@@ -96,6 +97,10 @@ class LLMAPIHandler(Protocol):
         screenshots: list[bytes] | None = None,
         parameters: dict[str, Any] | None = None,
         organization_id: str | None = None,
+        tools: list | None = None,
+        use_message_history: bool = False,
+        raw_response: bool = False,
+        window_dimension: Resolution | None = None,
     ) -> Awaitable[dict[str, Any]]: ...
 
 
@@ -109,5 +114,9 @@ async def dummy_llm_api_handler(
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
     organization_id: str | None = None,
+    tools: list | None = None,
+    use_message_history: bool = False,
+    raw_response: bool = False,
+    window_dimension: Resolution | None = None,
 ) -> dict[str, Any]:
     raise NotImplementedError("Your LLM provider is not configured. Please configure it in the .env file.")
