@@ -1959,6 +1959,7 @@ class AsyncSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
@@ -2041,6 +2042,9 @@ class AsyncSkyvern:
 
             Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
+        browser_address : typing.Optional[str]
+            The CDP address for the task
+
         model : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
 
             Optional model configuration.
@@ -2103,6 +2107,7 @@ class AsyncSkyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
                 "model": model,
                 "extra_http_headers": extra_http_headers,
                 "publish_workflow": publish_workflow,
@@ -2163,6 +2168,7 @@ class AsyncSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -2226,6 +2232,9 @@ class AsyncSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        browser_address : typing.Optional[str]
+            The CDP address for the workflow
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -2275,6 +2284,7 @@ class AsyncSkyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
             },
@@ -3757,6 +3767,7 @@ class AsyncSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
@@ -3794,6 +3805,9 @@ class AsyncSkyvern:
 
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
@@ -3856,6 +3870,7 @@ class AsyncSkyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
                 "credential_id": credential_id,

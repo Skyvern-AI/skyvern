@@ -194,6 +194,7 @@ async def login(
         totp_identifier=login_request.totp_identifier,
         totp_verification_url=login_request.totp_url,
         browser_session_id=login_request.browser_session_id,
+        browser_address=login_request.browser_address,
         max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
         extra_http_headers=login_request.extra_http_headers,
     )

@@ -371,6 +371,16 @@ class AsyncHttpClient:
 
         json_body, data_body = get_request_body(json=json, data=data, request_options=request_options, omit=omit)
 
+        # If omit/pruning removed everything, still send {} for methods that commonly expect a body.
+        if (
+                json_body is None
+                and data_body is None
+                and content is None
+                and files is None
+                and method.upper() in {"POST", "PUT", "PATCH"}
+        ):
+            json_body = {}
+
         # Add the input to each of these and do None-safety checks
         response = await self.httpx_client.request(
             method=method,
