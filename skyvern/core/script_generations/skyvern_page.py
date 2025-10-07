@@ -24,8 +24,15 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, ExtractAction, InputTextAction, SelectOption
-from skyvern.webeye.actions.handler import handle_input_text_action, handle_select_option_action
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionStatus,
+    ExtractAction,
+    InputTextAction,
+    SelectOption,
+    SolveCaptchaAction,
+)
+from skyvern.webeye.actions.handler import ActionHandler, handle_input_text_action, handle_select_option_action
 from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
@@ -610,6 +617,7 @@ class SkyvernPage:
                     template="script-generation-input-text-generatiion",
                     intention=intention,
                     goal=prompt,
+                    data=data,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                     prompt=script_generation_input_text_prompt,
@@ -750,7 +758,23 @@ class SkyvernPage:
     async def solve_captcha(
         self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None
     ) -> None:
-        await asyncio.sleep(30)
+        context = skyvern_context.current()
+        if not context or not context.organization_id or not context.task_id or not context.step_id:
+            await asyncio.sleep(30)
+            return None
+
+        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        if task and step:
+            solve_captcha_handler = ActionHandler._handled_action_types[ActionType.SOLVE_CAPTCHA]
+            action = SolveCaptchaAction(
+                organization_id=context.organization_id,
+                task_id=context.task_id,
+                step_id=context.step_id,
+            )
+            await solve_captcha_handler(action, self.page, self.scraped_page, task, step)
+        else:
+            await asyncio.sleep(30)
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(
