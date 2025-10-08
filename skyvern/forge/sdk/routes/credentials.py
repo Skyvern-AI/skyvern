@@ -167,11 +167,13 @@ async def create_credential(
         item_id=item_id,
         name=data.name,
         credential_type=data.credential_type,
+        totp_type=data.credential.totp_type if hasattr(data.credential, "totp_type") else "none",
     )
 
     if data.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
             username=data.credential.username,
+            totp_type=data.credential.totp_type if hasattr(data.credential, "totp_type") else "none",
         )
         return CredentialResponse(
             credential=credential_response,
@@ -283,6 +285,7 @@ async def get_credential(
     if credential_item.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
             username=credential_item.credential.username,
+            totp_type=credential.totp_type,
         )
         return CredentialResponse(
             credential=credential_response,
@@ -354,7 +357,10 @@ async def get_credentials(
         if not item:
             continue
         if item.credential_type == CredentialType.PASSWORD:
-            credential_response = PasswordCredentialResponse(username=item.credential.username)
+            credential_response = PasswordCredentialResponse(
+                username=item.credential.username,
+                totp_type=credential.totp_type,
+            )
             response_items.append(
                 CredentialResponse(
                     credential=credential_response,
