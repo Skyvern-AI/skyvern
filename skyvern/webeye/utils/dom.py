@@ -296,6 +296,12 @@ class SkyvernElement:
             )
             return False
 
+    async def is_child_of_pdf_object(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool:
+        parent_locator = self.get_locator().locator("..")
+        tag_name: str | None = await parent_locator.evaluate("el => el.tagName", timeout=timeout)
+        type_attr = await parent_locator.get_attribute("type", timeout=timeout)
+        return tag_name is not None and tag_name.lower() == "object" and type_attr == "application/pdf"
+
     async def is_parent_of(self, target: ElementHandle) -> bool:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         return await skyvern_frame.is_parent(await self.get_element_handler(), target)
@@ -361,7 +367,7 @@ class SkyvernElement:
         return handler
 
     async def should_use_navigation_instead_click(self, page: Page) -> str | None:
-        if await self.get_attr("target", mode="static") != "_blank":
+        if await self.get_attr("target", mode="static") != "_blank" and not await self.is_child_of_pdf_object():
             return None
 
         href: str | None = await self.get_attr("href", mode="static")
@@ -837,7 +843,12 @@ class SkyvernElement:
         except Exception as e:
             # some cases use this method to download a file. but it will be redirected away soon
             # and agent will run into ABORTED error.
-            if "net::ERR_ABORTED" in str(e):
+            error = str(e)
+            if "net::ERR_ABORTED" in error:
+                return href
+
+            # some cases playwright will raise error like "Page.goto: Download is starting"
+            if "Page.goto: Download is starting" in error:
                 return href
 
             LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
