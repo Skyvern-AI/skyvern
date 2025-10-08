@@ -2647,6 +2647,18 @@
             "title": "Verified",
             "default": false
           },
+          "totp_timing_info": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Timing Info"
+          },
           "created_at": {
             "anyOf": [
               {
