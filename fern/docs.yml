@@ -1,6 +1,6 @@
 instances:
-  - url: https://skyvern.docs.buildwithfern.com
-    custom-domain: https://docs.skyvern.com
+  - url: skyvern.docs.buildwithfern.com/docs
+    custom-domain: skyvern.com/docs
 title: Skyvern
 favicon: images/skyvern_favicon_small.png
 logo:

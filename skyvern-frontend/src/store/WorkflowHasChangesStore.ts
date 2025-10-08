@@ -28,15 +28,21 @@ type WorkflowHasChangesStore = {
   getSaveData: () => SaveData | null;
   hasChanges: boolean;
   saveIsPending: boolean;
+  saidOkToCodeCacheDeletion: boolean;
+  showConfirmCodeCacheDeletion: boolean;
   setGetSaveData: (getSaveData: () => SaveData) => void;
   setHasChanges: (hasChanges: boolean) => void;
   setSaveIsPending: (isPending: boolean) => void;
+  setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => void;
+  setShowConfirmCodeCacheDeletion: (show: boolean) => void;
 };
 
 const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   return {
     hasChanges: false,
     saveIsPending: false,
+    saidOkToCodeCacheDeletion: false,
+    showConfirmCodeCacheDeletion: false,
     getSaveData: () => null,
     setGetSaveData: (getSaveData: () => SaveData) => {
       set({ getSaveData });
@@ -47,14 +53,25 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
     setSaveIsPending: (isPending: boolean) => {
       set({ saveIsPending: isPending });
     },
+    setSaidOkToCodeCacheDeletion: (saidOkToCodeCacheDeletion: boolean) => {
+      set({ saidOkToCodeCacheDeletion });
+    },
+    setShowConfirmCodeCacheDeletion: (show: boolean) => {
+      set({ showConfirmCodeCacheDeletion: show });
+    },
   };
 });
 
 const useWorkflowSave = () => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const { getSaveData, setHasChanges, setSaveIsPending } =
-    useWorkflowHasChangesStore();
+  const {
+    getSaveData,
+    saidOkToCodeCacheDeletion,
+    setHasChanges,
+    setSaveIsPending,
+    setShowConfirmCodeCacheDeletion,
+  } = useWorkflowHasChangesStore();
 
   const saveWorkflowMutation = useMutation({
     mutationFn: async () => {
@@ -136,6 +153,11 @@ const useWorkflowSave = () => {
           headers: {
             "Content-Type": "text/plain",
           },
+          params: {
+            delete_code_cache_is_ok: saidOkToCodeCacheDeletion
+              ? "true"
+              : "false",
+          },
         },
       );
     },
@@ -168,6 +190,14 @@ const useWorkflowSave = () => {
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
+
+      if (
+        detail &&
+        detail.startsWith("No confirmation for code cache deletion")
+      ) {
+        setShowConfirmCodeCacheDeletion(true);
+        return;
+      }
 
       toast({
         title: "Error",

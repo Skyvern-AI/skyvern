@@ -723,7 +723,7 @@ class BitwardenService:
     @staticmethod
     async def _get_login_item_by_id_using_server(item_id: str) -> PasswordCredential:
         response = await aiohttp_get_json(
-            f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}", retry=3, retry_timeout=15
+            f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}", retry=3, retry_timeout=30
         )
         if not response or response.get("success") is False:
             raise BitwardenGetItemError(f"Failed to get login item by ID: {item_id}")
@@ -882,7 +882,7 @@ class BitwardenService:
     @staticmethod
     async def _create_collection_using_server(bw_organization_id: str, name: str) -> str:
         collection_template_response = await aiohttp_get_json(
-            f"{BITWARDEN_SERVER_BASE_URL}/object/template/collection", retry=3, retry_timeout=15
+            f"{BITWARDEN_SERVER_BASE_URL}/object/template/collection", retry=3, retry_timeout=30
         )
         collection_template = collection_template_response["data"]["template"]
 
@@ -925,7 +925,7 @@ class BitwardenService:
     async def _get_items_by_item_ids_using_server(item_ids: list[str]) -> list[CredentialItem]:
         responses = await asyncio.gather(
             *[
-                aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}", retry=3, retry_timeout=15)
+                aiohttp_get_json(f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}", retry=3, retry_timeout=30)
                 for item_id in item_ids
             ]
         )
@@ -948,7 +948,7 @@ class BitwardenService:
     @staticmethod
     async def _get_collection_items_using_server(collection_id: str) -> list[CredentialItem]:
         response = await aiohttp_get_json(
-            f"{BITWARDEN_SERVER_BASE_URL}/list/object/items?collectionId={collection_id}", retry=3, retry_timeout=15
+            f"{BITWARDEN_SERVER_BASE_URL}/list/object/items?collectionId={collection_id}", retry=3, retry_timeout=30
         )
         if not response or response.get("success") is False:
             raise BitwardenGetItemError("Failed to get collection items")
@@ -971,7 +971,7 @@ class BitwardenService:
     @staticmethod
     async def _get_credential_item_by_id_using_server(item_id: str) -> CredentialItem:
         response = await aiohttp_get_json(
-            f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}", retry=3, retry_timeout=15
+            f"{BITWARDEN_SERVER_BASE_URL}/object/item/{item_id}", retry=3, retry_timeout=30
         )
         if not response or response.get("success") is False:
             raise BitwardenGetItemError(f"Failed to get credential item by ID: {item_id}")
