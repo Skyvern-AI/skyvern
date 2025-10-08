@@ -1044,6 +1044,55 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
+def _build_pdf_parser_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    """Build a skyvern.parse_pdf statement."""
+    args = [
+        cst.Arg(
+            keyword=cst.Name("file_url"),
+            value=_value(block.get("file_url", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        ),
+    ]
+
+    if block.get("json_schema") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("schema"),
+                value=_value(block.get("json_schema")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("label") is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    _mark_last_arg_as_comma(args)
+
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("parse_pdf")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
 def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.parse_file statement."""
     args = [
@@ -1531,6 +1580,8 @@ def _build_block_statement(block: dict[str, Any], data_variable_name: str | None
         stmt = _build_file_url_parser_statement(block)
     elif block_type == "http_request":
         stmt = _build_http_request_statement(block)
+    elif block_type == "pdf_parser":
+        stmt = _build_pdf_parser_statement(block)
     else:
         # Default case for unknown block types
         stmt = cst.SimpleStatementLine([cst.Expr(cst.SimpleString(f"# Unknown block type: {block_type}"))])
