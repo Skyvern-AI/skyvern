@@ -29,6 +29,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     ExtractionBlock,
@@ -325,6 +326,11 @@ async def run_task_v2(
     if not task_v2:
         LOG.error("Task v2 not found", task_v2_id=task_v2_id, organization_id=organization_id)
         raise TaskV2NotFound(task_v2_id=task_v2_id)
+
+    # Collect and add experiment metadata to the trace
+    experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
+    if experiment_metadata:
+        TraceManager.add_experiment_metadata(experiment_metadata)
 
     workflow, workflow_run = None, None
     try:
@@ -1459,6 +1465,10 @@ async def mark_task_v2_as_failed(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
         )
+
+    # Add task failure tag to Laminar trace
+    TraceManager.add_task_completion_tag("failed")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1480,6 +1490,9 @@ async def mark_task_v2_as_completed(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
+    # Add task completion tag to Laminar trace
+    TraceManager.add_task_completion_tag("completed")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1496,6 +1509,10 @@ async def mark_task_v2_as_canceled(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+
+    # Add task canceled tag to Laminar trace
+    TraceManager.add_task_completion_tag("canceled")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1513,6 +1530,10 @@ async def mark_task_v2_as_terminated(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
+
+    # Add task terminated tag to Laminar trace
+    TraceManager.add_task_completion_tag("terminated")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1530,6 +1551,10 @@ async def mark_task_v2_as_timed_out(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+
+    # Add task timed out tag to Laminar trace
+    TraceManager.add_task_completion_tag("timed_out")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 

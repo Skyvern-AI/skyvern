@@ -38,6 +38,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -339,6 +340,12 @@ class WorkflowService:
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
+
+        # Collect and add experiment metadata to the trace
+        experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
+        if experiment_metadata:
+            TraceManager.add_experiment_metadata(experiment_metadata)
+
         LOG.info(
             "Executing workflow",
             workflow_run_id=workflow_run_id,
@@ -1147,6 +1154,10 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             workflow_status="completed",
         )
+
+        # Add workflow completion tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.completed)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.completed,
@@ -1165,6 +1176,10 @@ class WorkflowService:
             workflow_status="failed",
             failure_reason=failure_reason,
         )
+
+        # Add workflow failure tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.failed)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.failed,
@@ -1197,6 +1212,10 @@ class WorkflowService:
             workflow_status="terminated",
             failure_reason=failure_reason,
         )
+
+        # Add workflow terminated tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.terminated)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.terminated,
@@ -1210,6 +1229,10 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             workflow_status="canceled",
         )
+
+        # Add workflow canceled tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.canceled)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.canceled,
@@ -1227,6 +1250,10 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             workflow_status="timed_out",
         )
+
+        # Add workflow timed out tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.timed_out)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.timed_out,
