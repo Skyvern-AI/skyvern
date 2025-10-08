@@ -2,6 +2,7 @@ from typing import Awaitable, Callable
 
 from fastapi import FastAPI
 
+from skyvern.evolution.prompt_manager import PromptManager
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
@@ -43,4 +44,5 @@ scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
 
+PROMPT_MANAGER = PromptManager()
 agent = ForgeAgent()

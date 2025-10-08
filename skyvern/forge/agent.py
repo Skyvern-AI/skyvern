@@ -1316,11 +1316,31 @@ class ForgeAgent:
         )
 
         task_type = task.task_type if task.task_type else TaskType.general
-        template = ""
+
+        # Determine which template to use. Evolved prompts are handled as raw strings,
+        # while standard prompts are handled by name.
+        template_name: str | None = None
+        template_str: str | None = None
+
         if task_type == TaskType.general:
-            template = "extract-action"
+            # For general tasks, try to use the best prompt from our evolution manager.
+            best_prompt = app.PROMPT_MANAGER.get_best_prompt()
+            if best_prompt:
+                LOG.info(f"Using evolved prompt: {best_prompt.name} with score {best_prompt.score}")
+                template_str = best_prompt.template
+            else:
+                # If no evolved prompts, fall back to the baseline prompt.
+                LOG.warning("PromptManager has no prompts. Falling back to baseline 'extract-action'.")
+                baseline_prompt = app.PROMPT_MANAGER.get_prompt("baseline")
+                if baseline_prompt:
+                    template_str = baseline_prompt.template
+                else:
+                    # If even the baseline is missing, this is a critical error.
+                    LOG.error("Baseline prompt could not be loaded from PromptManager.")
+                    # As a last resort, use the template name.
+                    template_name = "extract-action"
         elif task_type == TaskType.validation:
-            template = "decisive-criterion-validate"
+            template_name = "decisive-criterion-validate"
         elif task_type == TaskType.action:
             prompt = prompt_engine.load_prompt("infer-action-type", navigation_goal=navigation_goal)
             json_response = await app.LLM_API_HANDLER(prompt=prompt, step=step)
@@ -1329,26 +1349,22 @@ class ForgeAgent:
                     reason=json_response.get("thought"), error_type=json_response.get("error")
                 )
 
-            action_type: str = json_response.get("action_type") or ""
-            action_type = ActionType[action_type.upper()]
+            action_type_str: str = json_response.get("action_type") or ""
+            action_type = ActionType[action_type_str.upper()]
 
             if action_type == ActionType.CLICK:
-                template = "single-click-action"
+                template_name = "single-click-action"
             elif action_type == ActionType.INPUT_TEXT:
-                template = "single-input-action"
+                template_name = "single-input-action"
             elif action_type == ActionType.UPLOAD_FILE:
-                template = "single-upload-action"
+                template_name = "single-upload-action"
             elif action_type == ActionType.SELECT_OPTION:
-                template = "single-select-action"
+                template_name = "single-select-action"
             else:
                 raise UnsupportedActionType(action_type=action_type)
 
-        if not template:
-            raise UnsupportedTaskType(task_type=task_type)
-
         context = skyvern_context.ensure_context()
-        return prompt_engine.load_prompt(
-            template=template,
+        render_kwargs = dict(
             navigation_goal=navigation_goal,
             navigation_payload_str=json.dumps(final_navigation_payload),
             starting_url=starting_url,
@@ -1362,6 +1378,22 @@ class ForgeAgent:
             complete_criterion=task.complete_criterion,
             terminate_criterion=task.terminate_criterion,
         )
+
+        if template_str is not None:
+            # Render the prompt from a raw string (used for evolved prompts)
+            return prompt_engine.load_prompt_from_string(
+                template=template_str,
+                **render_kwargs,
+            )
+
+        if template_name is not None:
+            # Render the prompt from a template file by name (standard behavior)
+            return prompt_engine.load_prompt(
+                template=template_name,
+                **render_kwargs,
+            )
+
+        raise UnsupportedTaskType(task_type=task_type)
 
     def _build_navigation_payload(
         self,
