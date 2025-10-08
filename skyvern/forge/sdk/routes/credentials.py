@@ -1,5 +1,5 @@
 import structlog
-from fastapi import Body, Depends, HTTPException, Path, Query
+from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -32,6 +32,19 @@ from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 
 LOG = structlog.get_logger()
+
+
+async def fetch_credential_item_background(item_id: str) -> None:
+    """
+    Background task to fetch the recently added credential item from Bitwarden.
+    This makes Bitwarden to get sync the vault earlier so the next request does not have to wait for the sync.
+    """
+    try:
+        LOG.info("Pre-fetching credential item from Bitwarden in background", item_id=item_id)
+        credential_item = await BitwardenService.get_credential_item(item_id)
+        LOG.info("Successfully fetched credential item from Bitwarden", item_id=item_id, name=credential_item.name)
+    except Exception as e:
+        LOG.error("Failed to fetch credential item from Bitwarden in background", item_id=item_id, error=str(e))
 
 
 async def parse_totp_code(content: str, organization_id: str) -> str | None:
@@ -129,6 +142,7 @@ async def send_totp_code(
     include_in_schema=False,
 )
 async def create_credential(
+    background_tasks: BackgroundTasks,
     data: CreateCredentialRequest = Body(
         ...,
         description="The credential data to create",
@@ -169,6 +183,9 @@ async def create_credential(
         credential_type=data.credential_type,
         totp_type=data.credential.totp_type if hasattr(data.credential, "totp_type") else "none",
     )
+
+    # Early resyncing the Bitwarden vault
+    background_tasks.add_task(fetch_credential_item_background, item_id)
 
     if data.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
