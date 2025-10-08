@@ -115,7 +115,7 @@ class TaskBase(BaseModel):
     )
     download_timeout: float | None = Field(
         default=None,
-        description="The maximum time to wait for downloads to complete, in minutes. If not set, defaults to BROWSER_DOWNLOAD_TIMEOUT minutes.",
+        description="The maximum time to wait for downloads to complete, in seconds. If not set, defaults to BROWSER_DOWNLOAD_TIMEOUT seconds.",
         examples=[15.0],
     )
 
