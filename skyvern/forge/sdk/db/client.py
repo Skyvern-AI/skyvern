@@ -1749,6 +1749,7 @@ class AgentDB:
         run_with: str | None = None,
         sequential_key: str | None = None,
         ai_fallback: bool | None = None,
+        depends_on_workflow_run_id: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1777,6 +1778,8 @@ class AgentDB:
                     workflow_run.sequential_key = sequential_key
                 if ai_fallback is not None:
                     workflow_run.ai_fallback = ai_fallback
+                if depends_on_workflow_run_id:
+                    workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -1834,12 +1837,16 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
+    async def get_workflow_run(
+        self, workflow_run_id: str, organization_id: str | None = None, job_id: str | None = None
+    ) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
                 get_workflow_run_query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
                 if organization_id:
                     get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
+                if job_id:
+                    get_workflow_run_query = get_workflow_run_query.filter_by(job_id=job_id)
                 if workflow_run := (await session.scalars(get_workflow_run_query)).first():
                     return convert_to_workflow_run(workflow_run)
                 return None
