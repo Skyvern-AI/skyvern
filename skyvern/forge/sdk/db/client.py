@@ -1788,7 +1788,12 @@ class AgentDB:
                 raise WorkflowRunNotFound(workflow_run_id)
 
     async def get_all_runs(
-        self, organization_id: str, page: int = 1, page_size: int = 10, status: list[WorkflowRunStatus] | None = None
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[WorkflowRunStatus] | None = None,
+        include_debugger_runs: bool = False,
     ) -> list[WorkflowRun | Task]:
         try:
             async with self.Session() as session:
@@ -1804,6 +1809,10 @@ class AgentDB:
                     .filter(WorkflowRunModel.organization_id == organization_id)
                     .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 )
+
+                if not include_debugger_runs:
+                    workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
+
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
                 workflow_run_query = workflow_run_query.order_by(WorkflowRunModel.created_at.desc()).limit(limit)
