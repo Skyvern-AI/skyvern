@@ -344,13 +344,21 @@ class Block(BaseModel, abc.ABC):
             if not browser_state:
                 LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
             else:
-                screenshot = await browser_state.take_fullpage_screenshot(
-                    use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                        "ENABLE_PLAYWRIGHT_FULLPAGE",
-                        workflow_run_id,
-                        properties={"organization_id": str(organization_id)},
+                try:
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            workflow_run_id,
+                            properties={"organization_id": str(organization_id)},
+                        )
                     )
-                )
+                except Exception:
+                    LOG.warning(
+                        "Failed to take screenshot before executing the block, ignoring the exception",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                    )
+                    screenshot = None
                 if screenshot:
                     await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                         workflow_run_block=workflow_run_block,
