@@ -3,7 +3,7 @@ import json
 import uuid
 from collections import deque
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import structlog
@@ -761,6 +761,7 @@ class WorkflowService:
         status: WorkflowStatus = WorkflowStatus.auto_generated,
         run_with: str | None = None,
         ai_fallback: bool = True,
+        task_version: Literal["v1", "v2"] = "v2",
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -776,25 +777,82 @@ class WorkflowService:
         block_label: str = metadata_response.get("block_label", DEFAULT_FIRST_BLOCK_LABEL)
         title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
 
-        task_v2_block = TaskV2Block(
-            prompt=user_prompt,
-            totp_identifier=totp_identifier,
-            totp_verification_url=totp_verification_url,
-            label=block_label,
-            max_iterations=max_iterations or settings.MAX_ITERATIONS_PER_TASK_V2,
-            max_steps=max_steps or settings.MAX_STEPS_PER_TASK_V2,
-            output_parameter=OutputParameter(
-                output_parameter_id=str(uuid.uuid4()),
-                key=f"{block_label}_output",
-                workflow_id="",
-                created_at=datetime.now(UTC),
-                modified_at=datetime.now(UTC),
-            ),
-        )
+        if task_version == "v1":
+            task_prompt = prompt_engine.load_prompt(
+                "generate-task",
+                user_prompt=user_prompt,
+            )
+
+            task_response = await app.LLM_API_HANDLER(
+                prompt=task_prompt,
+                prompt_name="generate-task",
+                organization_id=organization.organization_id,
+            )
+
+            data_extraction_goal: str | None = task_response.get("data_extraction_goal")
+            navigation_goal: str = task_response.get("navigation_goal", user_prompt)
+            url: str = task_response.get("url", "")
+
+            blocks = [
+                NavigationBlock(
+                    url=url,
+                    label=block_label,
+                    title=title,
+                    navigation_goal=navigation_goal,
+                    max_steps_per_run=max_steps or settings.MAX_STEPS_PER_RUN,
+                    totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
+                    output_parameter=OutputParameter(
+                        output_parameter_id=str(uuid.uuid4()),
+                        key=f"{block_label}_output",
+                        workflow_id="",
+                        created_at=datetime.now(UTC),
+                        modified_at=datetime.now(UTC),
+                    ),
+                ),
+            ]
+
+            if data_extraction_goal:
+                blocks.append(
+                    ExtractionBlock(
+                        label="extract_data",
+                        title="Extract Data",
+                        data_extraction_goal=data_extraction_goal,
+                        output_parameter=OutputParameter(
+                            output_parameter_id=str(uuid.uuid4()),
+                            key="extract_data_output",
+                            workflow_id="",
+                            created_at=datetime.now(UTC),
+                            modified_at=datetime.now(UTC),
+                        ),
+                        max_steps_per_run=max_steps or settings.MAX_STEPS_PER_RUN,
+                        totp_verification_url=totp_verification_url,
+                        totp_identifier=totp_identifier,
+                    )
+                )
+
+        elif task_version == "v2":
+            blocks = [
+                TaskV2Block(
+                    prompt=user_prompt,
+                    totp_identifier=totp_identifier,
+                    totp_verification_url=totp_verification_url,
+                    label=block_label,
+                    max_iterations=max_iterations or settings.MAX_ITERATIONS_PER_TASK_V2,
+                    max_steps=max_steps or settings.MAX_STEPS_PER_TASK_V2,
+                    output_parameter=OutputParameter(
+                        output_parameter_id=str(uuid.uuid4()),
+                        key=f"{block_label}_output",
+                        workflow_id="",
+                        created_at=datetime.now(UTC),
+                        modified_at=datetime.now(UTC),
+                    ),
+                )
+            ]
 
         new_workflow = await self.create_workflow(
             title=title,
-            workflow_definition=WorkflowDefinition(parameters=[], blocks=[task_v2_block]),
+            workflow_definition=WorkflowDefinition(parameters=[], blocks=blocks),
             organization_id=organization.organization_id,
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
