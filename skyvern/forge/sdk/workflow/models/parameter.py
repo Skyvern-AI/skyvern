@@ -199,6 +199,9 @@ class WorkflowParameterType(StrEnum):
     FILE_URL = "file_url"
     CREDENTIAL_ID = "credential_id"
 
+    def is_credential_type(self) -> bool:
+        return self == WorkflowParameterType.CREDENTIAL_ID
+
     def convert_value(self, value: Any) -> str | int | float | bool | dict | list | None:
         if value is None:
             return None
