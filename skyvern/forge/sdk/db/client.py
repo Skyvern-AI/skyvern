@@ -2793,6 +2793,8 @@ class AgentDB:
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         generate_script: bool = False,
+        termination_policy: dict[str, Any] | None = None,
+        termination_conditions: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             new_task_v2 = TaskV2Model(
@@ -2813,6 +2815,8 @@ class AgentDB:
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
                 generate_script=generate_script,
+                termination_policy=termination_policy,
+                termination_conditions=termination_conditions,
             )
             session.add(new_task_v2)
             await session.commit()
@@ -2937,6 +2941,7 @@ class AgentDB:
         output: dict[str, Any] | None = None,
         organization_id: str | None = None,
         webhook_failure_reason: str | None = None,
+        termination_conditions: str | None = None,
     ) -> TaskV2:
         async with self.Session() as session:
             task_v2 = (
@@ -2969,6 +2974,8 @@ class AgentDB:
                     task_v2.summary = summary
                 if output:
                     task_v2.output = output
+                if termination_conditions is not None:
+                    task_v2.termination_conditions = termination_conditions
                 if webhook_failure_reason is not None:
                     task_v2.webhook_failure_reason = webhook_failure_reason
                 await session.commit()

@@ -698,6 +698,8 @@ class TaskV2Model(Base):
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     generate_script = Column(Boolean, nullable=False, default=False)
+    termination_policy = Column(JSON, nullable=True)
+    termination_conditions = Column(UnicodeText, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)

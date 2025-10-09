@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.schemas.steps import AgentStepOutput
+from skyvern.schemas.steps import AgentStepOutput, TriedStrategy
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraper import ScrapedPage
@@ -24,6 +24,7 @@ class DetailedAgentStepOutput(BaseModel):
     actions: list[Action] | None
     action_results: list[ActionResult] | None
     actions_and_results: list[tuple[Action, list[ActionResult]]] | None
+    tried_strategies: list[TriedStrategy] | None = None
     step_exception: str | None = None
     cua_response: OpenAIResponse | None = None
 
@@ -56,6 +57,7 @@ class DetailedAgentStepOutput(BaseModel):
             actions_and_results=None
             if self.actions_and_results is None
             else [(action, result) for action, result in self.actions_and_results if result],
+            tried_strategies=self.tried_strategies.copy() if self.tried_strategies else [],
             step_exception=self.step_exception,
             cua_response=self.cua_response,
         )
@@ -67,4 +69,5 @@ class DetailedAgentStepOutput(BaseModel):
             action_results=clean_output.action_results if clean_output.action_results else [],
             actions_and_results=(clean_output.actions_and_results if clean_output.actions_and_results else []),
             errors=clean_output.extract_errors(),
+            tried_strategies=clean_output.tried_strategies,
         )

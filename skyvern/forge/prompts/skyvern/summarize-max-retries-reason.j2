@@ -5,6 +5,17 @@ Make sure to ONLY return the JSON object in this format with no additional text 
 {
   "page_info": str, // Think step by step. Describe useful information from the page HTML related to the user goal.
   "reasoning": str, // Think step by step. Summarize why the actions failed based on 'page_info', screenshots, user goal and the failed actions. Keep it short and to the point.
+  "tried_strategies": [
+    {
+      "label": str, // Short name that captures the strategy intent.
+      "summary": str, // Two short sentences on what was tried and its rationale.
+      "evidence": str, // Key on-screen clues (errors or UI states) backing the summary.
+      "outcome": "failed" | "succeeded" | "blocked", // Final result for this strategy.
+      "signals": [str], // Concise textual or DOM signals that surfaced during the attempt.
+      "attempts": int, // How many times this strategy was executed in this run.
+      "last_seen_state_fingerprint": str // Snapshot like "url|domhash|modal:true".
+    }
+  ] // List may be empty if no strategies were identified.
 }
 ```
 

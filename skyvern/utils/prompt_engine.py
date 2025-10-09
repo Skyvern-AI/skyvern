@@ -1,10 +1,11 @@
 from typing import Any
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
+from skyvern.schemas.steps import TriedStrategy
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.scraper.scraper import ElementTreeBuilder
@@ -35,6 +36,12 @@ class MaxStepsReasonResponse(BaseModel):
     page_info: str
     reasoning: str
     errors: list[UserDefinedError]
+
+
+class MaxRetriesReasonResponse(BaseModel):
+    page_info: str
+    reasoning: str
+    tried_strategies: list[TriedStrategy] = Field(default_factory=list)
 
 
 def load_prompt_with_elements(

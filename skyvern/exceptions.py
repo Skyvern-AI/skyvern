@@ -388,9 +388,11 @@ class StepTerminationError(TerminationError):
         super().__init__(f"Step {step_id} cannot be executed and task is failed. Reason: {reason}")
 
 
-class TaskTerminationError(TerminationError):
-    def __init__(self, reason: str, step_id: str | None = None, task_id: str | None = None) -> None:
-        super().__init__(f"Task {task_id} failed. Reason: {reason}")
+class TaskTerminationError(Exception):
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
 
 
 class BlockTerminationError(SkyvernException):

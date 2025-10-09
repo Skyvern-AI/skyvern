@@ -86,11 +86,15 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
-from skyvern.schemas.steps import AgentStepOutput
+from skyvern.schemas.steps import AgentStepOutput, TriedStrategy
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.utils.image_resizer import Resolution
-from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
+from skyvern.utils.prompt_engine import (
+    MaxRetriesReasonResponse,
+    MaxStepsReasonResponse,
+    load_prompt_with_elements,
+)
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -990,22 +994,55 @@ class ForgeAgent:
                     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                         llm_key_override, default=app.LLM_API_HANDLER
                     )
-                    json_response = await llm_api_handler(
+                    planner_response = await llm_api_handler(
                         prompt=extract_action_prompt,
                         prompt_name="extract-actions",
                         step=step,
                         screenshots=scraped_page.screenshots,
                     )
+                    planner_response_payload = json.dumps(
+                        {
+                            "source": "planner_response_raw",
+                            "prompt_name": "extract-actions",
+                            "response": planner_response,
+                        },
+                        indent=2,
+                        default=str,
+                    ).encode()
+                    await app.ARTIFACT_MANAGER.create_artifact(
+                        step=step,
+                        artifact_type=ArtifactType.LLM_RESPONSE,
+                        data=planner_response_payload,
+                    )
                     try:
-                        json_response = await self.handle_potential_verification_code(
+                        planner_response = await self.handle_potential_verification_code(
                             task,
                             step,
                             scraped_page,
                             browser_state,
-                            json_response,
+                            planner_response,
                         )
-                        detailed_agent_step_output.llm_response = json_response
-                        actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+                        checker_response = await self._run_action_plan_checker(task, step, planner_response)
+                        final_response = checker_response or planner_response
+                        detailed_agent_step_output.llm_response = {
+                            "planner": planner_response,
+                            "checker": checker_response,
+                        }
+                        final_response_payload = json.dumps(
+                            {
+                                "source": "final_action_plan",
+                                "origin": "checker" if checker_response else "planner",
+                                "response": final_response,
+                            },
+                            indent=2,
+                            default=str,
+                        ).encode()
+                        await app.ARTIFACT_MANAGER.create_artifact(
+                            step=step,
+                            artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                            data=final_response_payload,
+                        )
+                        actions = parse_actions(task, step.step_id, step.order, scraped_page, final_response["actions"])
                         if context:
                             context.pop_totp_code(task.task_id)
                     except NoTOTPVerificationCodeFound:
@@ -1038,6 +1075,8 @@ class ForgeAgent:
                         ]
 
             detailed_agent_step_output.actions = actions
+            if context:
+                detailed_agent_step_output.tried_strategies = list(context.tried_strategies)
             if len(actions) == 0:
                 LOG.info(
                     "No actions to execute, marking step as failed",
@@ -1170,7 +1209,20 @@ class ForgeAgent:
 
                 if engine != RunEngine.openai_cua:
                     self.async_operation_pool.run_operation(task.task_id, AgentPhase.action)
-                current_page = await browser_state.must_get_working_page()
+
+                requires_browser_context = action.action_type not in {
+                    ActionType.WAIT,
+                    ActionType.TERMINATE,
+                    ActionType.NULL_ACTION,
+                    ActionType.VERIFICATION_CODE,
+                    ActionType.SOLVE_CAPTCHA,
+                }
+
+                if requires_browser_context:
+                    current_page = await browser_state.must_get_working_page()
+                else:
+                    current_page = await browser_state.get_working_page()
+
                 if isinstance(action, CompleteAction) and not complete_verification:
                     # Do not verify the complete action when complete_verification is False
                     # set verified to True will skip the completion verification
@@ -1183,7 +1235,8 @@ class ForgeAgent:
                 )
                 # wait random time between actions to avoid detection
                 await asyncio.sleep(random.uniform(0.5, 1.0))
-                await self.record_artifacts_after_action(task, step, browser_state, engine)
+                if requires_browser_context and current_page and not current_page.is_closed():
+                    await self.record_artifacts_after_action(task, step, browser_state, engine)
                 for result in results:
                     result.step_retry_number = step.retry_index
                     result.step_order = step.order
@@ -1765,8 +1818,13 @@ class ForgeAgent:
         engine: RunEngine,
     ) -> None:
         working_page = await browser_state.get_working_page()
-        if not working_page:
-            raise BrowserStateMissingPage()
+        if not working_page or working_page.is_closed():
+            LOG.debug(
+                "Skipping post-action artifact capture because the working page is unavailable",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            return
 
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls
@@ -1989,6 +2047,21 @@ class ForgeAgent:
                 expire_verification_code=True,
             )
 
+        if extract_action_prompt:
+            planner_prompt_payload = json.dumps(
+                {
+                    "source": "planner_prompt",
+                    "prompt_name": "extract-actions",
+                    "prompt": extract_action_prompt,
+                },
+                indent=2,
+            ).encode()
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.LLM_PROMPT,
+                data=planner_prompt_payload,
+            )
+
         await app.ARTIFACT_MANAGER.create_artifact(
             step=step,
             artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
@@ -2126,6 +2199,122 @@ class ForgeAgent:
 
     async def _get_action_results(self, task: Task, current_step: Step | None = None) -> str:
         return json.dumps(await get_action_history(task=task, current_step=current_step))
+
+    def _update_tried_strategies_cache(self, strategies: list[TriedStrategy]) -> None:
+        if not strategies:
+            return
+
+        context = skyvern_context.current()
+        if context is None:
+            return
+
+        new_by_label: dict[str, TriedStrategy] = {strategy.label: strategy for strategy in strategies}
+        merged: list[TriedStrategy] = []
+        seen_labels: set[str] = set()
+
+        for strategy in context.tried_strategies:
+            label = strategy.label
+            replacement = new_by_label.get(label)
+            if replacement:
+                merged.append(replacement)
+            else:
+                merged.append(strategy)
+            seen_labels.add(label)
+
+        for strategy in new_by_label.values():
+            if strategy.label not in seen_labels:
+                merged.append(strategy)
+                seen_labels.add(strategy.label)
+
+        context.tried_strategies = merged
+
+    @staticmethod
+    def _format_tried_strategies_summary(strategies: list[TriedStrategy], limit: int = 5) -> str:
+        if not strategies:
+            return "No prior strategies recorded for this run."
+
+        recent_strategies = strategies[-limit:]
+        sentences: list[str] = []
+        for strategy in recent_strategies:
+            signals = ", ".join(strategy.signals[:3])
+            signal_fragment = f" Signals: {signals}." if signals else ""
+            sentences.append(
+                f"{strategy.label}: {strategy.summary} Outcome={strategy.outcome.value} "
+                f"after {strategy.attempts} attempts.{signal_fragment}"
+            )
+        return " ".join(sentences)
+
+    async def _run_action_plan_checker(
+        self,
+        task: Task,
+        step: Step,
+        planner_response: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        proposed_actions = planner_response.get("actions")
+        if not proposed_actions:
+            return None
+
+        context = skyvern_context.current()
+        strategies = context.tried_strategies if context else []
+        strategies_summary = self._format_tried_strategies_summary(strategies)
+        action_history = await self._get_action_results(task=task, current_step=step)
+
+        try:
+            prompt = prompt_engine.load_prompt(
+                "action-plan-checker",
+                navigation_goal=task.navigation_goal,
+                navigation_payload_str=json.dumps(task.navigation_payload),
+                current_action_plan=planner_response.get("action_plan"),
+                proposed_actions=json.dumps(proposed_actions),
+                tried_strategies_summary=strategies_summary,
+                action_history=action_history,
+            )
+            checker_prompt_payload = json.dumps(
+                {
+                    "source": "checker_prompt",
+                    "prompt_name": "action-plan-checker",
+                    "prompt": prompt,
+                    "planner_action_plan": planner_response.get("action_plan"),
+                    "proposed_actions": proposed_actions,
+                    "tried_strategies_summary": strategies_summary,
+                    "action_history": action_history,
+                },
+                indent=2,
+                default=str,
+            ).encode()
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.LLM_PROMPT,
+                data=checker_prompt_payload,
+            )
+            checker_response = await app.SECONDARY_LLM_API_HANDLER(
+                prompt=prompt,
+                step=step,
+                prompt_name="action-plan-checker",
+            )
+            checker_response_payload = json.dumps(
+                {
+                    "source": "checker_response",
+                    "prompt_name": "action-plan-checker",
+                    "response": checker_response,
+                },
+                indent=2,
+                default=str,
+            ).encode()
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.LLM_RESPONSE,
+                data=checker_response_payload,
+            )
+            return checker_response
+        except Exception:
+            LOG.warning(
+                "Action plan checker failed; falling back to planner output",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                exc_info=True,
+            )
+            return None
 
     async def get_extracted_information_for_task(self, task: Task) -> dict[str, Any] | list | str | None:
         """
@@ -2655,23 +2844,21 @@ class ForgeAgent:
                 max_retries=settings.MAX_RETRIES_PER_STEP,
             )
             browser_state = app.BROWSER_MANAGER.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
-            page = None
-            if browser_state is not None:
-                page = await browser_state.get_working_page()
-
-            failure_reason = await self.summary_failure_reason_for_max_retries(
+            page = await browser_state.get_working_page() if browser_state is not None else None
+            summary = await self.summary_failure_reason_for_max_retries(
                 organization=organization,
                 task=task,
                 step=step,
                 page=page,
-                max_retries=max_retries_per_step,
+                max_retries=max(1, min(step.retry_index + 1, max_retries_per_step)),
             )
+            self._update_tried_strategies_cache(summary.tried_strategies)
 
             await self.update_task(
                 task,
                 TaskStatus.failed,
                 failure_reason=(
-                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {failure_reason}"
+                    f"Max retries per step ({max_retries_per_step}) exceeded. Possible failure reasons: {summary.reasoning}"
                 ),
                 errors=[ReachMaxRetriesError().model_dump()],
             )
@@ -2775,7 +2962,7 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
         max_retries: int,
-    ) -> str:
+    ) -> MaxRetriesReasonResponse:
         html = ""
         screenshots: list[bytes] = []
         steps_results = []
@@ -2822,7 +3009,7 @@ class ForgeAgent:
                 step=step,
                 prompt_name="summarize-max-retries-reason",
             )
-            return json_response.get("reasoning", "")
+            return MaxRetriesReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning(
                 "Failed to summarize the failure reason for max retries",
@@ -2831,8 +3018,12 @@ class ForgeAgent:
             )
             if steps_results:
                 last_step_result = steps_results[-1]
-                return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
-            return ""
+                return MaxRetriesReasonResponse(
+                    page_info="",
+                    reasoning=f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}",
+                    tried_strategies=[],
+                )
+            return MaxRetriesReasonResponse(page_info="", reasoning="", tried_strategies=[])
 
     async def handle_completed_step(
         self,

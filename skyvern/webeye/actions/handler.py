@@ -1793,9 +1793,21 @@ async def handle_terminate_action(
     step: Step,
 ) -> list[ActionResult]:
     if task.error_code_mapping:
-        action.errors = await extract_user_defined_errors(
-            task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
-        )
+        try:
+            action.errors = await extract_user_defined_errors(
+                task=task,
+                step=step,
+                scraped_page=scraped_page,
+                reasoning=action.reasoning,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to refresh page while extracting user-defined errors during termination; continuing without errors",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                exc_info=True,
+            )
+            action.errors = action.errors or []
     return [ActionSuccess()]
 
 

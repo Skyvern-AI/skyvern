@@ -2079,6 +2079,7 @@ async def run_task_v2(
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
             browser_address=data.browser_address,
+            termination_policy=data.termination_policy,
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
