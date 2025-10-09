@@ -131,6 +131,8 @@ navigation:
             path: credentials/totp.mdx
           - page: Bitwarden
             path: credentials/bitwarden.mdx
+          - page: 1Password
+            path: credentials/1password.mdx
       - section: Browser Sessions (Beta)
         contents:
           - page: Introduction
