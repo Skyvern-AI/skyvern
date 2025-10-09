@@ -304,6 +304,9 @@ class WorkflowRunContext:
             }
             credential_dict = credential.model_dump()
             for key, value in credential_dict.items():
+                # Exclude totp_type from navigation payload as it's metadata, not input data
+                if key == "totp_type":
+                    continue
                 if value is None:
                     continue
                 random_secret_id = self.generate_random_secret_id()
@@ -353,6 +356,9 @@ class WorkflowRunContext:
         }
         credential_dict = credential.model_dump()
         for key, value in credential_dict.items():
+            # Exclude totp_type from navigation payload as it's metadata, not input data
+            if key == "totp_type":
+                continue
             random_secret_id = self.generate_random_secret_id()
             secret_id = f"{random_secret_id}_{key}"
             self.secrets[secret_id] = value
