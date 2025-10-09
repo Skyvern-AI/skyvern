@@ -28,11 +28,6 @@ log_error() {
 log "Starting entrypoint script..."
 log "Current user: $(whoami)"
 log "Current directory: $(pwd)"
-log "Environment check:"
-log "  BW_HOST: ${BW_HOST:-'NOT SET'}"
-log "  BW_CLIENTID: ${BW_CLIENTID:0:20}... (first 20 chars)"
-log "  BW_CLIENTSECRET: ${BW_CLIENTSECRET:0:10}... (first 10 chars)"
-log "  BW_PASSWORD: $([ -n "${BW_PASSWORD:-}" ] && echo 'SET' || echo 'NOT SET')"
 
 # Check required environment variables
 if [[ -z "${BW_HOST:-}" ]]; then
