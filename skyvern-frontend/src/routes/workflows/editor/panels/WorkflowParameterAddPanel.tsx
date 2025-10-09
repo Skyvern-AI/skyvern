@@ -61,6 +61,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
   const reservedKeys = ["current_item", "current_value", "current_index"];
   const isCloud = useContext(CloudContext);
   const [key, setKey] = useState("");
+  const hasWhitespace = /\s/.test(key);
   const [urlParameterKey, setUrlParameterKey] = useState("");
   const [description, setDescription] = useState("");
   const [bitwardenCollectionId, setBitwardenCollectionId] = useState("");
@@ -108,6 +109,11 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Key</Label>
             <Input value={key} onChange={(e) => setKey(e.target.value)} />
+            {hasWhitespace && (
+              <p className="text-xs text-destructive">
+                Spaces are not allowed, consider using _
+              </p>
+            )}
           </div>
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Description</Label>
@@ -395,6 +401,14 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
                     variant: "destructive",
                     title: "Failed to add parameter",
                     description: "Key is required",
+                  });
+                  return;
+                }
+                if (hasWhitespace) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to add parameter",
+                    description: "Key cannot contain whitespaces",
                   });
                   return;
                 }
