@@ -72,6 +72,7 @@ class Action(BaseModel):
     skyvern_element_hash: str | None = None
     skyvern_element_data: dict[str, Any] | None = None
     tool_call_id: str | None = None
+    xpath: str | None = None
 
     # DecisiveAction (CompleteAction, TerminateAction) fields
     errors: list[UserDefinedError] | None = None
@@ -130,6 +131,8 @@ class Action(BaseModel):
             raise ValueError("Invalid action data")
 
     def get_xpath(self) -> str | None:
+        if self.xpath:
+            return self.xpath
         if not self.skyvern_element_data:
             return None
         if "xpath" in self.skyvern_element_data:
