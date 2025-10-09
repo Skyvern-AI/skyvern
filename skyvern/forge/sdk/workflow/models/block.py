@@ -14,11 +14,13 @@ from collections import defaultdict
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, Literal, Union
 from urllib.parse import quote, urlparse
 
 import filetype
 import pandas as pd
+import pyotp
 import structlog
 from email_validator import EmailNotValidError, validate_email
 from jinja2.sandbox import SandboxedEnvironment
@@ -61,6 +63,8 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -1447,6 +1451,10 @@ class ForLoopBlock(Block):
         )
 
 
+class Credential(SimpleNamespace):
+    pass
+
+
 class CodeBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -1573,11 +1581,38 @@ async def wrapper():
         parameter_values = {}
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
-            secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-            if secret_value is not None:
-                parameter_values[parameter.key] = secret_value
-            else:
+            if not parameter.parameter_type.is_secret_or_credential():
                 parameter_values[parameter.key] = value
+                continue
+            if isinstance(value, dict):
+                real_secret_values = {}
+                for credential_field, credential_place_holder in value.items():
+                    # "context" is a skyvern-defined field to reduce LLM hallucination
+                    if credential_field == "context":
+                        continue
+                    secret_value = workflow_run_context.get_original_secret_value_or_none(credential_place_holder)
+                    if (
+                        secret_value == BitwardenConstants.TOTP
+                        or secret_value == OnePasswordConstants.TOTP
+                        or secret_value == AzureVaultConstants.TOTP
+                    ):
+                        totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
+                        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+                        if totp_secret:
+                            secret_value = pyotp.TOTP(totp_secret).now()
+                        else:
+                            LOG.warning(
+                                "No TOTP secret found, returning the parameter value as is",
+                                parameter=credential_place_holder,
+                            )
+
+                    real_secret_value = secret_value if secret_value is not None else credential_place_holder
+                    parameter_values[credential_field] = real_secret_value
+                    real_secret_values[credential_field] = real_secret_value
+                parameter_values[parameter.key] = Credential(**real_secret_values)
+            else:
+                secret_value = workflow_run_context.get_original_secret_value_or_none(value)
+                parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
         try:
             self.is_safe_code(self.code)
