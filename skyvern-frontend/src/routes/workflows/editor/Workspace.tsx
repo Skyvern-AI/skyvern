@@ -1136,19 +1136,12 @@ function Workspace({
         </>
       )}
 
-      {/* sub panels when in debug mode */}
+      {/* sub panels (but not node library panel) when in debug mode */}
       {showBrowser &&
         !workflowPanelState.data?.showComparison &&
-        workflowPanelState.active && (
-          <div
-            className="absolute right-6 top-[8.5rem] z-30"
-            style={{
-              height:
-                workflowPanelState.content === "nodeLibrary"
-                  ? "calc(100vh - 14rem)"
-                  : "unset",
-            }}
-          >
+        workflowPanelState.active &&
+        workflowPanelState.content !== "nodeLibrary" && (
+          <div className="absolute right-6 top-[8.5rem] z-20">
             {workflowPanelState.content === "cacheKeyValues" && (
               <WorkflowCacheKeyValuesPanel
                 cacheKeyValues={cacheKeyValues}
@@ -1171,10 +1164,16 @@ function Workspace({
             {workflowPanelState.content === "parameters" && (
               <WorkflowParametersPanel />
             )}
+            {workflowPanelState.content === "history" && (
+              <WorkflowHistoryPanel
+                workflowPermanentId={workflowPermanentId!}
+                onCompare={handleCompareVersions}
+              />
+            )}
           </div>
         )}
 
-      {/* code, infinite canvas, browser, and timeline when in debug mode */}
+      {/* code, infinite canvas, browser, timeline, and node library sub panel when in debug mode */}
       {showBrowser && !workflowPanelState.data?.showComparison && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
@@ -1246,58 +1245,25 @@ function Workspace({
               </div>
             </div>
 
-            {/* browser & timeline */}
             <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
-              {/* sub panels */}
-              {workflowPanelState.active && (
-                <div
-                  className={cn("absolute right-6 top-[8.5rem] z-30", {
-                    "left-6": workflowPanelState.content === "nodeLibrary",
-                  })}
-                  style={{
-                    height:
-                      workflowPanelState.content === "nodeLibrary"
-                        ? "calc(100vh - 14rem)"
-                        : "unset",
-                  }}
-                >
-                  {workflowPanelState.content === "cacheKeyValues" && (
-                    <WorkflowCacheKeyValuesPanel
-                      cacheKeyValues={cacheKeyValues}
-                      pending={cacheKeyValuesLoading}
-                      scriptKey={workflow.cache_key ?? "default"}
-                      onDelete={(cacheKeyValue) => {
-                        setToDeleteCacheKeyValue(cacheKeyValue);
-                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
-                      }}
-                      onPaginate={(page) => {
-                        setPage(page);
-                      }}
-                      onSelect={(cacheKeyValue) => {
-                        setCacheKeyValue(cacheKeyValue);
-                        setCacheKeyValueFilter("");
-                        closeWorkflowPanel();
-                      }}
-                    />
-                  )}
-                  {workflowPanelState.content === "parameters" && (
-                    <WorkflowParametersPanel />
-                  )}
-                  {workflowPanelState.content === "history" && (
-                    <WorkflowHistoryPanel
-                      workflowPermanentId={workflowPermanentId!}
-                      onCompare={handleCompareVersions}
-                    />
-                  )}
-                  {workflowPanelState.content === "nodeLibrary" && (
-                    <WorkflowNodeLibraryPanel
-                      onNodeClick={(props) => {
-                        addNode(props);
-                      }}
-                    />
-                  )}
-                </div>
-              )}
+              {/* node library sub panel */}
+              {workflowPanelState.active &&
+                workflowPanelState.content === "nodeLibrary" && (
+                  <div
+                    className="absolute left-6 top-[8.5rem] z-30"
+                    style={{
+                      height: "calc(100vh - 14rem)",
+                    }}
+                  >
+                    <div className="z-30 h-full w-[25rem]">
+                      <WorkflowNodeLibraryPanel
+                        onNodeClick={(props) => {
+                          addNode(props);
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
 
               {/* browser & timeline */}
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
