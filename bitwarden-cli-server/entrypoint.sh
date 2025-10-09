@@ -82,7 +82,6 @@ log_success "Server configuration successful"
 
 # Login using API key with retry logic for rate limiting
 log "Logging in to Bitwarden using API key..."
-log "Using client ID: ${BW_CLIENTID:0:20}..." # Show first 20 chars for debugging
 
 # Retry login with exponential backoff
 max_retries=3
@@ -150,7 +149,6 @@ fi
 # Extract session token from unlock output
 export BW_SESSION="$unlock_output"
 log "Session token length: ${#BW_SESSION}"
-log "Session token (first 20 chars): ${BW_SESSION:0:20}..."
 
 if [[ -z "$BW_SESSION" ]]; then
     log_error "Session token is empty after unlock"
