@@ -855,6 +855,7 @@ function Workspace({
               onClick={async () => {
                 workflowChangesStore.setSaidOkToCodeCacheDeletion(true);
                 await handleOnSave();
+                workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
               }}
             >
               Yes
