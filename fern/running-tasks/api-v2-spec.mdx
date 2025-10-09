@@ -3,12 +3,12 @@ title: Tasks API V2
 description: 'Powered by the latest version of Skyvern agent, with better reasoning and validation. State of the art web navigation with 85.8% on WebVoyager Eval.'
 ---
 
-## Request - Initiate a task 
+## Request - Initiate a task
 Request type: `POST`
 
 Production:`https://api.skyvern.com/api/v2/tasks/`
 
-### Header 
+### Header
 
 | Parameter | Type | Required? | Sample Value | Description |
 | --- | --- | --- | --- | --- |
@@ -25,13 +25,13 @@ Production:`https://api.skyvern.com/api/v2/tasks/`
 | webhook_callback_url | HttpUrl | no | https://mywebsite.com/webhook | The callback URL once our system is finished processing this async task |
 | proxy_location | String | no | RESIDENTIAL | Proxy location for the web-browsing request. Please pass RESIDENTIAL as a value |
 | totp_verification_url | HttpUrl | no | https://mywebsite.com/two_factor_code | The url of your TOTP endpoint. If this field is provided, Skyvern will call the url to fetch the TOTP/2FA/MFA code when needed |
-| totp_identifier | String | no | myemail@example.com / 4155558888 | The email address or the phone number which receives the TOTP/2FA/MFA code. If this field is provided, Skyvern will fetch the code that is pushed to [Skyvern's TOTP API](https://docs.skyvern.com/running-tasks/advanced-features#push-code-to-skyvern) |
+| totp_identifier | String | no | myemail@example.com / 4155558888 | The email address or the phone number which receives the TOTP/2FA/MFA code. If this field is provided, Skyvern will fetch the code that is pushed to [Skyvern's TOTP API](https://www.skyvern.com/docs/running-tasks/advanced-features#push-code-to-skyvern) |
 | extracted_information_schema | JSON object, list, string | no | `{"type": "object", "properties": {"title": {"type": "string", "description": "The title of the post"}, "url": {"type": "string", "description": "The url link to the post"}}}` | Use jsonschema to define the schema of the output. You can also describe the schema but it won't be as reliable as defining it in the jsonschema format |
 
 ## Example Request (Apply for a job)
 
 ```python
-POST https://api.skyvern.com/api/v2/tasks/ 
+POST https://api.skyvern.com/api/v2/tasks/
 
 {
     "user_prompt": "Find a route between Chicago to Los Angeles on google maps, then print the route details.",
@@ -63,9 +63,9 @@ Each task has an associated `task_id` -- a unique identifier you can use to look
 
 
 ## Response Webhook - Task conclusion (POST)
-If a `webhook_callback_url` is specified within your task request, Skyvern will make a callback to your system letting you know that it has either finished, terminated or failed a task execution. 
+If a `webhook_callback_url` is specified within your task request, Skyvern will make a callback to your system letting you know that it has either finished, terminated or failed a task execution.
 
-The following headers can be used to validate it's an authentic Skyvern request. 
+The following headers can be used to validate it's an authentic Skyvern request.
 
 ### Headers
 
@@ -75,7 +75,7 @@ The following headers can be used to validate it's an authentic Skyvern request.
 | x-skyvern-timestamp | String | yes | 1531420618 | Timestamp used to decode and validate the incoming webhook call<br/><br/>We’ll be using the same strategy slack uses, as defined here: https://api.slack.com/authentication/verifying-requests-from-slack#making__validating-a-request |
 
 ### Body
-These parameters are sent in the body of the request to `webhook_callback_url`. 
+These parameters are sent in the body of the request to `webhook_callback_url`.
 
 Here's an example of the webhook body:
 ```

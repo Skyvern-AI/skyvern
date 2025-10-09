@@ -13,7 +13,7 @@ function WorkflowsBetaAlertCard() {
       <div className="flex gap-4 py-4">
         <Button variant="secondary" asChild>
           <a
-            href="https://docs.skyvern.com/workflows/creating-workflows"
+            href="https://www.skyvern.com/docs/workflows/creating-workflows"
             target="_blank"
             rel="noopener noreferrer"
           >
