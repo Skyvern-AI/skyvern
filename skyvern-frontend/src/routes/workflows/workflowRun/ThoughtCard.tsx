@@ -38,16 +38,19 @@ function ThoughtCard({ thought, onClick, active }: Props) {
       <div className="flex justify-between">
         <div className="flex gap-3">
           <BrainIcon className="size-6" />
-          <span>Thought</span>
+          {(thought.answer || thought.thought) && <span>Thought</span>}
+          {!thought.answer && !thought.thought && <span>Thinking</span>}
         </div>
         <div className="flex items-center gap-1 rounded-sm bg-slate-elevation5 px-2 py-1">
           <QuestionMarkIcon className="size-4" />
           <span className="text-xs">Decision</span>
         </div>
       </div>
-      <div className="text-xs text-slate-400">
-        {thought.answer || thought.thought}
-      </div>
+      {(thought.answer || thought.thought) && (
+        <div className="text-xs text-slate-400">
+          {thought.answer || thought.thought}
+        </div>
+      )}
     </div>
   );
 }
