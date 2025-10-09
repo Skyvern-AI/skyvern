@@ -14,6 +14,8 @@ from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
+from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.trace.lmnr import LaminarTrace
@@ -94,6 +96,8 @@ WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()
 PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=DATABASE)
+CREDENTIAL_VAULT_SERVICE: CredentialVaultService = BitwardenCredentialVaultService()
+
 scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 authenticate_user_function: Callable[[str], Awaitable[str | None]] | None = None
