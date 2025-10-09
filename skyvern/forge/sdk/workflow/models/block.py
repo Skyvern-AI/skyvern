@@ -1581,7 +1581,12 @@ async def wrapper():
         parameter_values = {}
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
-            if not parameter.parameter_type.is_secret_or_credential():
+            if not parameter.parameter_type.is_secret_or_credential() and not (
+                # NOTE: skyvern credential is a 'credential_id' workflow parameter type
+                parameter.parameter_type == ParameterType.WORKFLOW
+                and parameter.workflow_parameter_type is not None
+                and parameter.workflow_parameter_type.is_credential_type()
+            ):
                 parameter_values[parameter.key] = value
                 continue
             if isinstance(value, dict):
