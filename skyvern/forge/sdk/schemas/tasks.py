@@ -160,6 +160,29 @@ class TaskRequest(TaskBase):
         return validate_url(url)
 
 
+class PromptedTaskRequest(TaskRequest):
+    ai_fallback: bool | None = Field(
+        default=False,
+        description="Whether to use AI fallback when the task fails.",
+        examples=[True, False],
+    )
+    publish_workflow: bool | None = Field(
+        default=False,
+        description="Whether to publish the workflow created from the prompt.",
+        examples=[True, False],
+    )
+    run_with: str | None = Field(
+        default=None,
+        description="The executor to run the task with.",
+        examples=["code", "agent"],
+    )
+    user_prompt: str = Field(
+        ...,
+        description="The user's prompt for the task.",
+        examples=["Get a quote for car insurance"],
+    )
+
+
 class TaskStatus(StrEnum):
     created = "created"
     queued = "queued"
