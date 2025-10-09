@@ -706,16 +706,8 @@ function Workspace({
     version2: WorkflowVersion,
     mode: "visual" | "json" = "visual",
   ) => {
-    console.log(
-      `${mode === "visual" ? "Visual" : "JSON"} comparison between versions:`,
-      version1.version,
-      "and",
-      version2.version,
-    );
-
     // Implement visual drawer comparison
     if (mode === "visual") {
-      console.log("Opening visual comparison panel...");
       // Keep history panel active but add comparison data
       setWorkflowPanelState({
         active: true,
@@ -731,15 +723,13 @@ function Workspace({
     // TODO: Implement JSON diff comparison
     if (mode === "json") {
       // This will open a JSON diff view
-      console.log("Opening JSON diff view...");
+      console.warn("[Not Implemented] opening JSON diff view...");
       // Future: setJsonDiffOpen(true);
       // Future: setJsonDiffVersions({ version1, version2 });
     }
   };
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
-    console.log("Loading version into main editor:", selectedVersion.version);
-
     // Close panels
     setWorkflowPanelState({
       active: false,
@@ -1269,51 +1259,42 @@ function Workspace({
               {/* browser & timeline */}
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
                 {/* VNC browser */}
-                {!activeDebugSession ||
-                  (activeDebugSession.vnc_streaming_supported && (
-                    <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div key={reloadKey} className="w-full flex-1">
-                        {activeDebugSession &&
-                        activeDebugSession.browser_session_id &&
-                        !cycleBrowser.isPending ? (
-                          <BrowserStream
-                            interactive={true}
-                            browserSessionId={
-                              activeDebugSession.browser_session_id
-                            }
-                            showControlButtons={true}
-                            resizeTrigger={windowResizeTrigger}
-                          />
-                        ) : (
-                          <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
-                            Connecting to your browser...
-                            <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
-                          </div>
-                        )}
-                      </div>
-                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
-                        <div className="flex items-center gap-2">
-                          <GlobeIcon /> Live Browser
-                        </div>
-                        {showBreakoutButton && (
-                          <BreakoutButton onClick={() => breakout()} />
-                        )}
-                        <div
-                          className={cn("ml-auto flex items-center gap-2", {
-                            "mr-16": !blockLabel,
-                          })}
-                        >
-                          {showPowerButton && (
-                            <PowerButton onClick={() => cycle()} />
-                          )}
-                          <ReloadButton
-                            isReloading={isReloading}
-                            onClick={() => reload()}
-                          />
-                        </div>
-                      </footer>
+                {(!activeDebugSession ||
+                  activeDebugSession.vnc_streaming_supported) && (
+                  <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                    <div key={reloadKey} className="w-full flex-1">
+                      <BrowserStream
+                        interactive={true}
+                        browserSessionId={
+                          activeDebugSession?.browser_session_id
+                        }
+                        showControlButtons={true}
+                        resizeTrigger={windowResizeTrigger}
+                      />
                     </div>
-                  ))}
+                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                      <div className="flex items-center gap-2">
+                        <GlobeIcon /> Live Browser
+                      </div>
+                      {showBreakoutButton && (
+                        <BreakoutButton onClick={() => breakout()} />
+                      )}
+                      <div
+                        className={cn("ml-auto flex items-center gap-2", {
+                          "mr-16": !blockLabel,
+                        })}
+                      >
+                        {showPowerButton && (
+                          <PowerButton onClick={() => cycle()} />
+                        )}
+                        <ReloadButton
+                          isReloading={isReloading}
+                          onClick={() => reload()}
+                        />
+                      </div>
+                    </footer>
+                  </div>
+                )}
 
                 {/* Screenshot browser} */}
                 {activeDebugSession &&
