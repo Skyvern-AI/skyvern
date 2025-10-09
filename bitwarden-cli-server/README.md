@@ -15,17 +15,17 @@ The CLI server acts as a bridge between Skyvern and vaultwarden, providing the R
 This container is part of the main Skyvern Docker Compose setup. Configure your environment variables in the main `.env` file:
 
 ```bash
-# Vaultwarden Configuration
-BW_HOST=https://your-vaultwarden-server.com
-BW_CLIENTID=user.your-client-id-here
-BW_CLIENTSECRET=your-client-secret-here
-BW_PASSWORD=your-master-password-here
-
 # Skyvern Bitwarden Configuration
 SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID=your-org-id-here
 SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD=your-master-password-here
 SKYVERN_AUTH_BITWARDEN_CLIENT_ID=user.your-client-id-here
 SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET=your-client-secret-here
+
+# Vaultwarden Configuration
+BW_HOST=https://your-vaultwarden-server.com
+BW_CLIENTID=${SKYVERN_AUTH_BITWARDEN_CLIENT_ID}
+BW_CLIENTSECRET=${SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET}
+BW_PASSWORD=${SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD}
 ```
 
 Then start the service:
@@ -36,7 +36,7 @@ docker-compose up -d bitwarden-cli
 
 ## Available Endpoints
 
-Once running, the CLI server provides these endpoints on port 11001:
+Once running, the CLI server provides these endpoints on port 8002:
 
 - `GET /status` - Check server status
 - `POST /unlock` - Unlock vault
@@ -74,10 +74,10 @@ The container includes a health check that calls `/status`. If it fails:
 1. **Test the CLI server directly**:
    ```bash
    # Check status
-   curl http://localhost:11001/status
+   curl http://localhost:8002/status
 
    # List items (after unlock)
-   curl http://localhost:11001/list/object/items
+   curl http://localhost:8002/list/object/items
    ```
 
 2. **Check Skyvern configuration**:
