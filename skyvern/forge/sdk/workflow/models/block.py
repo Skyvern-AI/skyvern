@@ -1542,6 +1542,47 @@ async def wrapper():
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
+        # If no browser state exists, create one (e.g., when code block is the first block)
+        if not browser_state:
+            LOG.info(
+                "No browser state found, creating one for code block execution",
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=None,  # Code block doesn't need to navigate to a URL initially
+                    browser_session_id=browser_session_id,
+                )
+                # Ensure the browser state has a working page
+                await browser_state.check_and_fix_state(
+                    url=None,  # Don't navigate to any URL, just ensure a page exists
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    browser_address=workflow_run.browser_address,
+                )
+            except Exception as e:
+                LOG.exception(
+                    "Failed to create browser state for code block",
+                    workflow_run_id=workflow_run_id,
+                    error=str(e),
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to create browser for code block: {str(e)}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
         if not browser_state:
             return await self.build_block_result(
                 success=False,
