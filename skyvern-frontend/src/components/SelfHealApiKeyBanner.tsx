@@ -58,11 +58,6 @@ function SelfHealApiKeyBanner() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const isDevMode = import.meta.env.MODE === "development";
-  if (!isDevMode) {
-    return null;
-  }
-
   const { data, error, isLoading, refetch } = diagnosticsQuery;
 
   const rawStatus = data?.status;

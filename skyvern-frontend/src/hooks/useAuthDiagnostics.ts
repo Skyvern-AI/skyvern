@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
-import { getClient } from "@/api/AxiosClient";
+import axios from "axios";
 
-const isDevMode = import.meta.env.MODE === "development";
+import { getClient } from "@/api/AxiosClient";
 
 export type AuthStatusValue =
   | "missing_env"
@@ -21,17 +21,23 @@ export type AuthDiagnosticsResponse = {
 
 async function fetchDiagnostics(): Promise<AuthDiagnosticsResponse> {
   const client = await getClient(null);
-  const response = await client.get<AuthDiagnosticsResponse>(
-    "/internal/auth/status",
-  );
-  return response.data;
+  try {
+    const response = await client.get<AuthDiagnosticsResponse>(
+      "/internal/auth/status",
+    );
+    return response.data;
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      return { status: "ok" };
+    }
+    throw error;
+  }
 }
 
 function useAuthDiagnostics() {
   return useQuery<AuthDiagnosticsResponse, Error>({
     queryKey: ["internal", "auth", "status"],
     queryFn: fetchDiagnostics,
-    enabled: isDevMode,
     retry: false,
     refetchOnWindowFocus: false,
   });
