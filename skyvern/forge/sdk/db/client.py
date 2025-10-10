@@ -4520,6 +4520,8 @@ class AgentDB:
         self,
         organization_id: str,
         workflow_permanent_id: str,
+        statuses: list[ScriptStatus] | None = None,
+        script_ids: list[str] | None = None,
     ) -> int:
         """
         Soft delete all published workflow scripts for a workflow permanent id by setting deleted_at timestamp.
@@ -4540,6 +4542,12 @@ class AgentDB:
                     .values(deleted_at=datetime.now(timezone.utc))
                 )
 
+                if statuses:
+                    stmt = stmt.where(WorkflowScriptModel.status.in_([s.value for s in statuses]))
+
+                if script_ids:
+                    stmt = stmt.where(WorkflowScriptModel.script_id.in_(script_ids))
+
                 result = await session.execute(stmt)
                 await session.commit()
 
@@ -4555,6 +4563,7 @@ class AgentDB:
         self,
         organization_id: str,
         workflow_permanent_id: str,
+        statuses: list[ScriptStatus] | None = None,
     ) -> list[WorkflowScriptModel]:
         try:
             async with self.Session() as session:
@@ -4564,6 +4573,9 @@ class AgentDB:
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
                     .filter_by(deleted_at=None)
                 )
+
+                if statuses:
+                    query = query.filter(WorkflowScriptModel.status.in_([s.value for s in statuses]))
 
                 return (await session.scalars(query)).all()
         except SQLAlchemyError:
