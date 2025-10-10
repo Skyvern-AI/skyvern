@@ -114,10 +114,11 @@ services:
     # Bitwarden Settings
     # If you are looking to integrate Skyvern with a password manager (eg Bitwarden), you can use the following environment variables.
     # - BITWARDEN_SERVER=http://localhost  # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
-    # - BITWARDEN_SERVER_PORT=8002 # OPTIONAL IF YOU ARE SELF HOSTING BITWARDEN
-    # - BITWARDEN_CLIENT_ID=FILL_ME_IN_PLEASE
-    # - BITWARDEN_CLIENT_SECRET=FILL_ME_IN_PLEASE
-    # - BITWARDEN_MASTER_PASSWORD=FILL_ME_IN_PLEASE
+    # - BITWARDEN_SERVER_PORT=8002 # IF YOU ARE SELF HOSTING BITWARDEN AND USE THIS COMPOSE FILE, PORT IS 8002 UNLESS CHANGED
+    # - SKYVERN_AUTH_BITWARDEN_ORGANIZATION_ID=your-org-id-here
+    # - SKYVERN_AUTH_BITWARDEN_CLIENT_ID=user.your-client-id-here
+    # - SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET=your-client-secret-here
+    # - SKYVERN_AUTH_BITWARDEN_MASTER_PASSWORD=your-master-password-here
 
     # 1Password Integration
     # If you are looking to integrate Skyvern with 1Password, you can use the following environment variables.
@@ -158,3 +159,51 @@ services:
     depends_on:
       skyvern:
         condition: service_healthy
+
+# uncomment for local usage of `vaultwarden` & bitwarden-cli - see more at: https://github.com/dani-garcia/vaultwarden
+# First this container needs to be started and configured to sign up, create master password and organization
+# Once created, under SETTINGS/SECURITY/KEYS/API you should be able to get client id and secret for CLI & Skyvern integrations
+#  vaultwarden:
+#    image: vaultwarden/server:latest-alpine
+#    container_name: vaultwarden
+#    restart: unless-stopped
+#    environment:
+#      # DOMAIN: "https://vaultwarden.example.com"  # required when using a reverse proxy; your domain; vaultwarden needs to know it's https to work properly with attachments
+#      SIGNUPS_ALLOWED: "true" # Deactivate this with "false" after you have created your account so that no strangers can register
+#    volumes:
+#      - ~/vw-data/:/data/ # the path before the : can be changed
+#    ports:
+#      - 127.0.0.1:11002:80 # you can replace the 11002 with your preferred port
+
+# Bitwarden CLI Server (provides REST API endpoints for Skyvern)
+# Once you have master password and api credentials, you can set them below and this CLI should start providing secure access for Skyvern to Vaultwarden
+#  bitwarden-cli:
+#    build:
+#      context: ./bitwarden-cli-server
+#      dockerfile: Dockerfile
+#    environment:
+#      # Vaultwarden server URL
+#      BW_HOST: "http://vaultwarden"
+#      # API credentials for vaultwarden
+#      BW_CLIENTID: "user.your-client-id-here"
+#      BW_CLIENTSECRET: "your-client-secret-here"
+#      # Master password for unlocking vault
+#      BW_PASSWORD: "your-master-password-here"
+#    ports:
+#      # Bind to localhost only for security
+#      - "127.0.0.1:8002:8087"
+#    restart: unless-stopped
+#    healthcheck:
+#      test: [ "CMD", "curl", "-f", "http://localhost:8087/status" ]
+#      interval: 30s
+#      timeout: 10s
+#      retries: 5
+#      start_period: 30s
+#    depends_on:
+#      vaultwarden:
+#        condition: service_healthy
+#    volumes:
+#      # Optional: persist Bitwarden CLI config
+#      - ~/bitwarden-cli-config:/app/.config
+#    labels:
+#      - "traefik.enable=false"  # Don't expose via reverse proxy

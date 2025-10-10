@@ -56,6 +56,43 @@ function CredentialsPage() {
       </div>
       <CredentialsList />
       <CredentialsModal />
+
+      {/* Footer note */}
+      <div className="mt-8 border-t border-slate-700 pt-4">
+        <div className="text-sm italic text-slate-400">
+          <strong>Note:</strong> This feature requires a Bitwarden-compatible
+          server ({" "}
+          <a
+            href="https://bitwarden.com/help/self-host-an-organization/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-400 underline hover:text-blue-300"
+          >
+            self-hosted Bitwarden
+          </a>{" "}
+          ) or{" "}
+          <a
+            href="https://github.com/dani-garcia/vaultwarden"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-400 underline hover:text-blue-300"
+          >
+            this community version
+          </a>{" "}
+          or a paid Bitwarden account. Make sure the relevant
+          `SKYVERN_AUTH_BITWARDEN_*` environment variables are configured. See
+          details{" "}
+          <a
+            href="https://docs.skyvern.com/credentials/bitwarden"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-400 underline hover:text-blue-300"
+          >
+            here
+          </a>
+          .
+        </div>
+      </div>
     </div>
   );
 }
