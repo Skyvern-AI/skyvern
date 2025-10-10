@@ -2310,8 +2310,15 @@ class SendEmailBlock(Block):
             self.subject, workflow_run_context
         )
         self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
-        # file_attachments are formatted in _get_file_paths()
-        # recipients are formatted in get_real_email_recipients()
+
+        # Format recipients
+        formatted_recipients = []
+        for recipient in self.recipients:
+            formatted_recipient = self.format_block_parameter_template_from_workflow_run_context(
+                recipient, workflow_run_context
+            )
+            formatted_recipients.append(formatted_recipient)
+        self.recipients = formatted_recipients
 
     def _decrypt_smtp_parameters(self, workflow_run_context: WorkflowRunContext) -> tuple[str, int, str, str]:
         obfuscated_smtp_host_value = workflow_run_context.get_value(self.smtp_host.key)
@@ -2410,6 +2417,7 @@ class SendEmailBlock(Block):
     def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
         recipients = []
         for recipient in self.recipients:
+            # Check if the recipient is a parameter and get its value
             if workflow_run_context.has_parameter(recipient):
                 maybe_recipient = workflow_run_context.get_value(recipient)
             else:

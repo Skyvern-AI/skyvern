@@ -944,9 +944,6 @@ def _build_goto_statement(block: dict[str, Any], data_variable_name: str | None 
 
 def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.run_code statement."""
-    parameters = block.get("parameters", [])
-    parameter_list = [parameter["key"] for parameter in parameters]
-
     args = [
         cst.Arg(
             keyword=cst.Name("code"),
@@ -966,7 +963,7 @@ def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
         ),
         cst.Arg(
             keyword=cst.Name("parameters"),
-            value=_value(parameter_list),
+            value=_value(block.get("parameters", None)),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -988,9 +985,6 @@ def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
 
 def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.upload_file statement."""
-    parameters = block.get("parameters", [])
-    parameter_list = [parameter["key"] for parameter in parameters]
-
     args = [
         cst.Arg(
             keyword=cst.Name("label"),
@@ -1002,7 +996,7 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         ),
         cst.Arg(
             keyword=cst.Name("parameters"),
-            value=_value(parameter_list),
+            value=_value(block.get("parameters", None)),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1295,12 +1289,10 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
         )
 
     if block.get("parameters") is not None:
-        parameters = block.get("parameters", [])
-        parameter_list = [parameter["key"] for parameter in parameters]
         args.append(
             cst.Arg(
                 keyword=cst.Name("parameters"),
-                value=_value(parameter_list),
+                value=_value(block.get("parameters")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                 ),
