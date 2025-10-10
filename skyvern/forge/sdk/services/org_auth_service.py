@@ -4,6 +4,7 @@ from typing import Annotated
 import structlog
 from asyncache import cached
 from cachetools import TTLCache
+from ddtrace import tracer
 from fastapi import Header, HTTPException, status
 from jose import jwt
 from jose.exceptions import JWTError
@@ -37,11 +38,30 @@ async def get_current_org(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
+    organization = None
     if x_api_key:
-        return await _get_current_org_cached(x_api_key, app.DATABASE)
+        organization = await _get_current_org_cached(x_api_key, app.DATABASE)
     elif authorization:
-        return await _authenticate_helper(authorization)
+        organization = await _authenticate_helper(authorization)
 
+    if organization:
+        try:
+            # Set in context
+            curr_ctx = skyvern_context.current()
+            if curr_ctx:
+                curr_ctx.organization_id = organization.organization_id
+                curr_ctx.organization_name = organization.organization_name
+
+            # Tag datadog span immediately
+            span = tracer.current_span()
+            if span:
+                span.set_tag("organization_id", organization.organization_id)
+                if organization.organization_name:
+                    span.set_tag("organization_name", organization.organization_name)
+        except Exception:
+            pass
+
+        return organization
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Invalid credentials",
@@ -83,6 +103,13 @@ async def _authenticate_helper(authorization: str) -> Organization:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
+
+    # set organization_id in skyvern context and log context
+    context = skyvern_context.current()
+    if context:
+        context.organization_id = organization.organization_id
+        context.organization_name = organization.organization_name
+
     return organization
 
 

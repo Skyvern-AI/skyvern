@@ -14,11 +14,13 @@ from collections import defaultdict
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, Literal, Union
 from urllib.parse import quote, urlparse
 
 import filetype
 import pandas as pd
+import pyotp
 import structlog
 from email_validator import EmailNotValidError, validate_email
 from jinja2.sandbox import SandboxedEnvironment
@@ -61,6 +63,8 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -344,13 +348,21 @@ class Block(BaseModel, abc.ABC):
             if not browser_state:
                 LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
             else:
-                screenshot = await browser_state.take_fullpage_screenshot(
-                    use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                        "ENABLE_PLAYWRIGHT_FULLPAGE",
-                        workflow_run_id,
-                        properties={"organization_id": str(organization_id)},
+                try:
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            workflow_run_id,
+                            properties={"organization_id": str(organization_id)},
+                        )
                     )
-                )
+                except Exception:
+                    LOG.warning(
+                        "Failed to take screenshot before executing the block, ignoring the exception",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                    )
+                    screenshot = None
                 if screenshot:
                     await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                         workflow_run_block=workflow_run_block,
@@ -1439,6 +1451,10 @@ class ForLoopBlock(Block):
         )
 
 
+class Credential(SimpleNamespace):
+    pass
+
+
 class CodeBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -1526,6 +1542,47 @@ async def wrapper():
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
+        # If no browser state exists, create one (e.g., when code block is the first block)
+        if not browser_state:
+            LOG.info(
+                "No browser state found, creating one for code block execution",
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=None,  # Code block doesn't need to navigate to a URL initially
+                    browser_session_id=browser_session_id,
+                )
+                # Ensure the browser state has a working page
+                await browser_state.check_and_fix_state(
+                    url=None,  # Don't navigate to any URL, just ensure a page exists
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    browser_address=workflow_run.browser_address,
+                )
+            except Exception as e:
+                LOG.exception(
+                    "Failed to create browser state for code block",
+                    workflow_run_id=workflow_run_id,
+                    error=str(e),
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to create browser for code block: {str(e)}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
         if not browser_state:
             return await self.build_block_result(
                 success=False,
@@ -1565,11 +1622,43 @@ async def wrapper():
         parameter_values = {}
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
-            secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-            if secret_value is not None:
-                parameter_values[parameter.key] = secret_value
-            else:
+            if not parameter.parameter_type.is_secret_or_credential() and not (
+                # NOTE: skyvern credential is a 'credential_id' workflow parameter type
+                parameter.parameter_type == ParameterType.WORKFLOW
+                and parameter.workflow_parameter_type is not None
+                and parameter.workflow_parameter_type.is_credential_type()
+            ):
                 parameter_values[parameter.key] = value
+                continue
+            if isinstance(value, dict):
+                real_secret_values = {}
+                for credential_field, credential_place_holder in value.items():
+                    # "context" is a skyvern-defined field to reduce LLM hallucination
+                    if credential_field == "context":
+                        continue
+                    secret_value = workflow_run_context.get_original_secret_value_or_none(credential_place_holder)
+                    if (
+                        secret_value == BitwardenConstants.TOTP
+                        or secret_value == OnePasswordConstants.TOTP
+                        or secret_value == AzureVaultConstants.TOTP
+                    ):
+                        totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
+                        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+                        if totp_secret:
+                            secret_value = pyotp.TOTP(totp_secret).now()
+                        else:
+                            LOG.warning(
+                                "No TOTP secret found, returning the parameter value as is",
+                                parameter=credential_place_holder,
+                            )
+
+                    real_secret_value = secret_value if secret_value is not None else credential_place_holder
+                    parameter_values[credential_field] = real_secret_value
+                    real_secret_values[credential_field] = real_secret_value
+                parameter_values[parameter.key] = Credential(**real_secret_values)
+            else:
+                secret_value = workflow_run_context.get_original_secret_value_or_none(value)
+                parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
         try:
             self.is_safe_code(self.code)

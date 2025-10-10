@@ -288,7 +288,7 @@ class WorkflowRunModel(Base):
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
-    job_id = Column(String, nullable=True)
+    job_id = Column(String, nullable=True, index=True)
     depends_on_workflow_run_id = Column(String, nullable=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
@@ -818,6 +818,7 @@ class CredentialModel(Base):
 
     name = Column(String, nullable=False)
     credential_type = Column(String, nullable=False)
+    totp_type = Column(String, nullable=False, default="none")
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

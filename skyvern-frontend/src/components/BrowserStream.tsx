@@ -67,8 +67,8 @@ function BrowserStream({
   onClose,
 }: Props) {
   let showStream: boolean = false;
-  let runId: string;
-  let entity: "browserSession" | "task" | "workflow";
+  let runId: string | null;
+  let entity: "browserSession" | "task" | "workflow" | null;
 
   if (browserSessionId) {
     runId = browserSessionId;
@@ -84,7 +84,8 @@ function BrowserStream({
     showStream = statusIsNotFinalized(workflow.run);
     entity = "workflow";
   } else {
-    throw new Error("No browser session id, task or workflow provided");
+    entity = null;
+    runId = null;
   }
 
   useQuery({
@@ -120,6 +121,8 @@ function BrowserStream({
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
+  const [isCanvasReady, setIsCanvasReady] = useState<boolean>(false);
+  const [isReady, setIsReady] = useState(false);
   const [commandDisconnectedTrigger, setCommandDisconnectedTrigger] =
     useState(0);
   const prevCommandConnectedRef = useRef<boolean>(false);
@@ -131,6 +134,7 @@ function BrowserStream({
     setCanvasContainer(node);
   }, []);
   const rfbRef = useRef<RFB | null>(null);
+  const observerRef = useRef<MutationObserver | null>(null);
   const clientId = useClientIdStore((state) => state.clientId);
   const credentialGetter = useCredentialGetter();
 
@@ -153,6 +157,11 @@ function BrowserStream({
 
     return `${params}`;
   }, [clientId, credentialGetter]);
+
+  // browser is ready
+  useEffect(() => {
+    setIsReady(isVncConnected && isCanvasReady && hasBrowserSession);
+  }, [hasBrowserSession, isCanvasReady, isVncConnected]);
 
   // effect for vnc disconnects only
   useEffect(() => {
@@ -218,11 +227,31 @@ function BrowserStream({
           throw new Error("Canvas element not found");
         }
 
+        observerRef.current = new MutationObserver(() => {
+          const canvasElement = canvasContainer.querySelector("canvas");
+          if (canvasElement) {
+            setIsCanvasReady(true);
+            observerRef.current?.disconnect();
+          }
+        });
+
+        observerRef.current.observe(canvasContainer, {
+          childList: true,
+          subtree: true,
+        });
+
         const rfb = new RFB(canvas, vncUrl);
 
         rfb.scaleViewport = true;
 
         rfbRef.current = rfb;
+
+        const canvasElement = canvasContainer.querySelector("canvas");
+
+        if (canvasElement) {
+          setIsCanvasReady(true);
+          observerRef.current?.disconnect();
+        }
 
         rfb.addEventListener("connect", () => {
           setIsVncConnected(true);
@@ -230,19 +259,25 @@ function BrowserStream({
 
         rfb.addEventListener("disconnect", async (/* e: RfbEvent */) => {
           setIsVncConnected(false);
+          setIsCanvasReady(false);
         });
 
-        // setIsVncConnected(true); // be optimistic
+        setIsVncConnected(true); // be optimistic
       }
 
       setupVnc();
 
       return () => {
+        if (observerRef.current) {
+          observerRef.current.disconnect();
+          observerRef.current = null;
+        }
         if (rfbRef.current) {
           rfbRef.current.disconnect();
           rfbRef.current = null;
         }
         setIsVncConnected(false);
+        setIsCanvasReady(false);
       };
     },
     // cannot include isVncConnected in deps as it will cause infinite loop
@@ -402,7 +437,7 @@ function BrowserStream({
       )}
       ref={setCanvasContainerRef}
     >
-      {isVncConnected && hasBrowserSession && (
+      {isReady && (
         <div className="overlay z-10 flex items-center justify-center overflow-hidden">
           {showControlButtons && (
             <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
@@ -437,7 +472,7 @@ function BrowserStream({
           )}
         </div>
       )}
-      {!isVncConnected && (
+      {!isReady && (
         <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
           {browserSessionId && !hasBrowserSession ? (
             <div>This live browser session is no longer streaming.</div>

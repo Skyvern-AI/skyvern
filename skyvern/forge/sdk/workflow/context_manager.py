@@ -295,16 +295,18 @@ class WorkflowRunContext:
             if db_credential is None:
                 raise CredentialParameterNotFoundError(credential_id)
 
-            bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
-
-            credential_item = bitwarden_credential.credential
+            credential_item = await app.CREDENTIAL_VAULT_SERVICE.get_credential_item(db_credential)
+            credential = credential_item.credential
 
             self.parameters[parameter.key] = parameter
             self.values[parameter.key] = {
                 "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
             }
-            credential_dict = credential_item.model_dump()
+            credential_dict = credential.model_dump()
             for key, value in credential_dict.items():
+                # Exclude totp_type from navigation payload as it's metadata, not input data
+                if key == "totp_type":
+                    continue
                 if value is None:
                     continue
                 random_secret_id = self.generate_random_secret_id()
@@ -312,12 +314,12 @@ class WorkflowRunContext:
                 self.secrets[secret_id] = value
                 self.values[parameter.key][key] = secret_id
 
-            if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+            if isinstance(credential, PasswordCredential) and credential.totp is not None:
                 random_secret_id = self.generate_random_secret_id()
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = BitwardenConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = parse_totp_secret(credential_item.totp)
+                self.secrets[totp_secret_value] = parse_totp_secret(credential.totp)
                 self.values[parameter.key]["totp"] = totp_secret_id
         except Exception as e:
             LOG.error(f"Failed to get credential from database: {credential_id}. Error: {e}")
@@ -345,27 +347,29 @@ class WorkflowRunContext:
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
 
-        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
-
-        credential_item = bitwarden_credential.credential
+        credential_item = await app.CREDENTIAL_VAULT_SERVICE.get_credential_item(db_credential)
+        credential = credential_item.credential
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
         }
-        credential_dict = credential_item.model_dump()
+        credential_dict = credential.model_dump()
         for key, value in credential_dict.items():
+            # Exclude totp_type from navigation payload as it's metadata, not input data
+            if key == "totp_type":
+                continue
             random_secret_id = self.generate_random_secret_id()
             secret_id = f"{random_secret_id}_{key}"
             self.secrets[secret_id] = value
             self.values[parameter.key][key] = secret_id
 
-        if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+        if isinstance(credential, PasswordCredential) and credential.totp is not None:
             random_secret_id = self.generate_random_secret_id()
             totp_secret_id = f"{random_secret_id}_totp"
             self.secrets[totp_secret_id] = BitwardenConstants.TOTP
             totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-            self.secrets[totp_secret_value] = parse_totp_secret(credential_item.totp)
+            self.secrets[totp_secret_value] = parse_totp_secret(credential.totp)
             self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_aws_secret_parameter_value(

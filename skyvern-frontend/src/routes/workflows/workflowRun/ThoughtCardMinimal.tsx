@@ -8,7 +8,7 @@ type Props = {
 
 function ThoughtCardMinimal({ thought }: Props) {
   return (
-    <Tip content={thought.answer || thought.thought || null}>
+    <Tip asChild={false} content={thought.answer || thought.thought || null}>
       <BrainIcon className="size-6" />
     </Tip>
   );

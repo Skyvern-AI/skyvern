@@ -37,6 +37,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     HttpRequestBlock,
     LoginBlock,
+    PDFParserBlock,
     SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
@@ -1815,6 +1816,29 @@ async def send_email(
         parameters=parameters or [],
     )
     await send_email_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+
+
+async def parse_pdf(
+    file_url: str,
+    schema: dict[str, Any] | None = None,
+    label: str | None = None,
+    parameters: list[PARAMETER_TYPE] | None = None,
+) -> None:
+    block_validation_output = await _validate_and_get_output_parameter(label)
+    file_url = _render_template_with_label(file_url, label)
+    pdf_parser_block = PDFParserBlock(
+        file_url=file_url,
+        json_schema=schema,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=parameters or [],
+    )
+    await pdf_parser_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
         organization_id=block_validation_output.organization_id,

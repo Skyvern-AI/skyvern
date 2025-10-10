@@ -3,7 +3,7 @@ import json
 import uuid
 from collections import deque
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import structlog
@@ -38,6 +38,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -339,6 +340,12 @@ class WorkflowService:
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
+
+        # Collect and add experiment metadata to the trace
+        experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
+        if experiment_metadata:
+            TraceManager.add_experiment_metadata(experiment_metadata)
+
         LOG.info(
             "Executing workflow",
             workflow_run_id=workflow_run_id,
@@ -754,6 +761,7 @@ class WorkflowService:
         status: WorkflowStatus = WorkflowStatus.auto_generated,
         run_with: str | None = None,
         ai_fallback: bool = True,
+        task_version: Literal["v1", "v2"] = "v2",
     ) -> Workflow:
         metadata_prompt = prompt_engine.load_prompt(
             "conversational_ui_goal",
@@ -769,25 +777,82 @@ class WorkflowService:
         block_label: str = metadata_response.get("block_label", DEFAULT_FIRST_BLOCK_LABEL)
         title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
 
-        task_v2_block = TaskV2Block(
-            prompt=user_prompt,
-            totp_identifier=totp_identifier,
-            totp_verification_url=totp_verification_url,
-            label=block_label,
-            max_iterations=max_iterations or settings.MAX_ITERATIONS_PER_TASK_V2,
-            max_steps=max_steps or settings.MAX_STEPS_PER_TASK_V2,
-            output_parameter=OutputParameter(
-                output_parameter_id=str(uuid.uuid4()),
-                key=f"{block_label}_output",
-                workflow_id="",
-                created_at=datetime.now(UTC),
-                modified_at=datetime.now(UTC),
-            ),
-        )
+        if task_version == "v1":
+            task_prompt = prompt_engine.load_prompt(
+                "generate-task",
+                user_prompt=user_prompt,
+            )
+
+            task_response = await app.LLM_API_HANDLER(
+                prompt=task_prompt,
+                prompt_name="generate-task",
+                organization_id=organization.organization_id,
+            )
+
+            data_extraction_goal: str | None = task_response.get("data_extraction_goal")
+            navigation_goal: str = task_response.get("navigation_goal", user_prompt)
+            url: str = task_response.get("url", "")
+
+            blocks = [
+                NavigationBlock(
+                    url=url,
+                    label=block_label,
+                    title=title,
+                    navigation_goal=navigation_goal,
+                    max_steps_per_run=max_steps or settings.MAX_STEPS_PER_RUN,
+                    totp_verification_url=totp_verification_url,
+                    totp_identifier=totp_identifier,
+                    output_parameter=OutputParameter(
+                        output_parameter_id=str(uuid.uuid4()),
+                        key=f"{block_label}_output",
+                        workflow_id="",
+                        created_at=datetime.now(UTC),
+                        modified_at=datetime.now(UTC),
+                    ),
+                ),
+            ]
+
+            if data_extraction_goal:
+                blocks.append(
+                    ExtractionBlock(
+                        label="extract_data",
+                        title="Extract Data",
+                        data_extraction_goal=data_extraction_goal,
+                        output_parameter=OutputParameter(
+                            output_parameter_id=str(uuid.uuid4()),
+                            key="extract_data_output",
+                            workflow_id="",
+                            created_at=datetime.now(UTC),
+                            modified_at=datetime.now(UTC),
+                        ),
+                        max_steps_per_run=max_steps or settings.MAX_STEPS_PER_RUN,
+                        totp_verification_url=totp_verification_url,
+                        totp_identifier=totp_identifier,
+                    )
+                )
+
+        elif task_version == "v2":
+            blocks = [
+                TaskV2Block(
+                    prompt=user_prompt,
+                    totp_identifier=totp_identifier,
+                    totp_verification_url=totp_verification_url,
+                    label=block_label,
+                    max_iterations=max_iterations or settings.MAX_ITERATIONS_PER_TASK_V2,
+                    max_steps=max_steps or settings.MAX_STEPS_PER_TASK_V2,
+                    output_parameter=OutputParameter(
+                        output_parameter_id=str(uuid.uuid4()),
+                        key=f"{block_label}_output",
+                        workflow_id="",
+                        created_at=datetime.now(UTC),
+                        modified_at=datetime.now(UTC),
+                    ),
+                )
+            ]
 
         new_workflow = await self.create_workflow(
             title=title,
-            workflow_definition=WorkflowDefinition(parameters=[], blocks=[task_v2_block]),
+            workflow_definition=WorkflowDefinition(parameters=[], blocks=blocks),
             organization_id=organization.organization_id,
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
@@ -1147,6 +1212,10 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             workflow_status="completed",
         )
+
+        # Add workflow completion tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.completed)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.completed,
@@ -1165,6 +1234,10 @@ class WorkflowService:
             workflow_status="failed",
             failure_reason=failure_reason,
         )
+
+        # Add workflow failure tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.failed)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.failed,
@@ -1197,6 +1270,10 @@ class WorkflowService:
             workflow_status="terminated",
             failure_reason=failure_reason,
         )
+
+        # Add workflow terminated tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.terminated)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.terminated,
@@ -1210,6 +1287,10 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             workflow_status="canceled",
         )
+
+        # Add workflow canceled tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.canceled)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.canceled,
@@ -1227,6 +1308,10 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             workflow_status="timed_out",
         )
+
+        # Add workflow timed out tag to Laminar trace
+        TraceManager.add_task_completion_tag(WorkflowRunStatus.timed_out)
+
         return await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.timed_out,

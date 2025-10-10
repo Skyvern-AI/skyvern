@@ -26,6 +26,12 @@ class BaseTrace(ABC):
     ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
         pass
 
+    def add_task_completion_tag(self, status: str) -> None:
+        """Add a completion tag to the current trace based on task/workflow status."""
+
+    def add_experiment_metadata(self, experiment_data: dict[str, Any]) -> None:
+        """Add experiment metadata to the current trace."""
+
 
 class NoOpTrace(BaseTrace):
     def traced(

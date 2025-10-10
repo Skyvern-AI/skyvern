@@ -83,6 +83,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -311,6 +312,11 @@ class ForgeAgent:
         close_browser_on_completion = (
             close_browser_on_completion and browser_session_id is None and not task.browser_address
         )
+
+        # Collect and add experiment metadata to the trace
+        experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
+        if experiment_metadata:
+            TraceManager.add_experiment_metadata(experiment_metadata)
 
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -2471,6 +2477,9 @@ class ForgeAgent:
 
         # log the task status as an event
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
+
+        # Add task completion tag to Laminar trace
+        TraceManager.add_task_completion_tag(task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state
             # We don't need the artifacts and send the webhook response directly only when there is an issue with the browser
