@@ -204,6 +204,6 @@ services:
 #        condition: service_healthy
 #    volumes:
 #      # Optional: persist Bitwarden CLI config
-#      - ~/bitwarden-cli-config:/home/bw/.config
+#      - ~/bitwarden-cli-config:/app/.config
 #    labels:
 #      - "traefik.enable=false"  # Don't expose via reverse proxy

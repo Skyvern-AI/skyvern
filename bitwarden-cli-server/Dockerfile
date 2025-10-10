@@ -8,8 +8,8 @@ RUN apk add --no-cache curl bash &&  \
 # Create non-root user for security
 # Create directory for Bitwarden config
 RUN addgroup -g 1001 -S bw && adduser -S bw -u 1001 -G bw && \
-    mkdir -p /home/bw/.config && \
-    chown -R bw:bw /home/bw/.config
+    mkdir -p /app/.config && \
+    chown -R bw:bw /app/.config
 
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
@@ -17,7 +17,7 @@ RUN chmod +x /entrypoint.sh
 
 # Switch to non-root user
 USER bw
-WORKDIR /home/bw
+WORKDIR /app
 
 # Expose port for bw serve
 EXPOSE 8087
