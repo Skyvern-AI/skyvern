@@ -489,4 +489,4 @@ export type PylonEmailHash = {
   hash: string;
 };
 
-export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 600 as const;
+export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
