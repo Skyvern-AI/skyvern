@@ -436,13 +436,8 @@ class WorkflowRunContext:
             integration_name="Skyvern",
             integration_version="v1.0.0",
         )
-        item_id = parameter.item_id
-        vault_id = parameter.vault_id
-        if self.has_parameter(parameter.item_id) and self.has_value(parameter.item_id):
-            item_id = self.values[parameter.item_id]
-        if self.has_parameter(parameter.vault_id) and self.has_value(parameter.vault_id):
-            vault_id = self.values[parameter.vault_id]
-
+        item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
+        vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
         item = await client.items.get(vault_id, item_id)
 
         # Check if item is None
@@ -560,15 +555,9 @@ class WorkflowRunContext:
         parameter: AzureVaultCredentialParameter,
         organization: Organization,
     ) -> None:
-        vault_name = self._resolve_parameter_value(parameter.vault_name)
-        if not vault_name:
-            raise ValueError("Azure Vault Name is missing")
-        username_key = self._resolve_parameter_value(parameter.username_key)
-        if not username_key:
-            raise ValueError("Azure Username Key is missing")
-        password_key = self._resolve_parameter_value(parameter.password_key)
-        if not password_key:
-            raise ValueError("Azure Password Key is missing")
+        vault_name = self._resolve_required_parameter_value(parameter.vault_name, "Azure Vault Name")
+        username_key = self._resolve_required_parameter_value(parameter.username_key, "Azure Username Key")
+        password_key = self._resolve_required_parameter_value(parameter.password_key, "Azure Password Key")
 
         totp_secret_key = self._resolve_parameter_value(parameter.totp_secret_key)
 
@@ -961,6 +950,12 @@ class WorkflowRunContext:
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"
+
+    def _resolve_required_parameter_value(self, parameter_value: str | None, name: str) -> str:
+        result = self._resolve_parameter_value(parameter_value)
+        if not result:
+            raise ValueError(f"{name} is missing")
+        return result
 
     def _resolve_parameter_value(self, parameter_value: str | None) -> str | None:
         if not parameter_value:
