@@ -7,7 +7,7 @@ slug: running-tasks/run-tasks
 - [Run Task API](/api-reference/api-reference/agent/run-task)
 
 Every feature in this page is enabled through API & SDK. Some features are enabled through [Skyvern's Discover page](https://app.skyvern.com/discover) as well.
- 
+
 <Frame caption="Run Task UI">
 <img src="../images/run_tasks/ui_run_task.png" alt="Configure advanced settings in the UI" width="400" />
 </Frame>
@@ -20,7 +20,7 @@ Parameter: `engine`
 
 This parameter defines the engine that powers the agent task.
 
-- `skyvern-2.0`: this is the default engine. It's the latest Skyvern agent that performs really well with complex and multi-step tasks. It scores **state of the art** 85.85% on the [WebVoyager benchmark](https://blog.skyvern.com/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
+- `skyvern-2.0`: this is the default engine. It's the latest Skyvern agent that performs really well with complex and multi-step tasks. It scores **state of the art** 85.85% on the [WebVoyager benchmark](https://www.skyvern.com/blog/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
 - `skyvern-1.0`: performs really well for tasks with a simple goal, like filling a form, or searching for information on Google.
 - `openai-cua`: uses OpenAI's CUA model.
 - `anthropic-cua`: uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
@@ -80,7 +80,7 @@ You can set a browser session for a task. Having a browser session persist the r
 See the [Browser Sessions](/browser-sessions/introduction) section to see how to create a browser session.
 
 ## Use Cases
-### Control Your Own Browser (Chrome) 
+### Control Your Own Browser (Chrome)
 <Warning>Since [Chrome 136](https://developer.chrome.com/blog/remote-debugging-port), Chrome refuses any CDP connect to the browser using the default user_data_dir. In order to use your browser data, Skyvern copies your default user_data_dir to `./tmp/user_data_dir` the first time connecting to your local browser.</Warning>
 
 **Just With Python Code**

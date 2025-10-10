@@ -184,15 +184,15 @@ class Skyvern:
 
         webhook_url : typing.Optional[str]
 
-            After a run is finished, send an update to this URL. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
+            After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.
 
         totp_identifier : typing.Optional[str]
 
-            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         totp_url : typing.Optional[str]
 
-            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         browser_session_id : typing.Optional[str]
 
@@ -362,15 +362,15 @@ class Skyvern:
             - NONE: No proxy
 
         webhook_url : typing.Optional[str]
-            URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
+            URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
 
         totp_url : typing.Optional[str]
 
-            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         totp_identifier : typing.Optional[str]
 
-            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
@@ -2027,15 +2027,15 @@ class AsyncSkyvern:
 
         webhook_url : typing.Optional[str]
 
-            After a run is finished, send an update to this URL. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for more details.
+            After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.
 
         totp_identifier : typing.Optional[str]
 
-            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         totp_url : typing.Optional[str]
 
-            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         browser_session_id : typing.Optional[str]
 
@@ -2213,15 +2213,15 @@ class AsyncSkyvern:
             - NONE: No proxy
 
         webhook_url : typing.Optional[str]
-            URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
+            URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
 
         totp_url : typing.Optional[str]
 
-            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
+            URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
 
         totp_identifier : typing.Optional[str]
 
-            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
+            Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
 
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
