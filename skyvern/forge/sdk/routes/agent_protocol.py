@@ -98,6 +98,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.services.pdf_import_service import pdf_import_service
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -586,6 +587,47 @@ async def create_workflow_from_prompt(
         raise FailedToCreateWorkflow(str(e))
 
     return workflow.model_dump(by_alias=True)
+
+
+@legacy_base_router.post(
+    "/workflows/import-pdf",
+    response_model=dict[str, Any],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "import_workflow_from_pdf",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "curl",
+                        "code": 'curl -X POST "https://api.skyvern.com/workflows/import-pdf" \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -F "file=@sop_document.pdf"',
+                    }
+                ]
+            }
+        ],
+    },
+    description="Import a workflow from a PDF containing Standard Operating Procedures",
+    summary="Import workflow from PDF",
+    responses={
+        200: {"description": "Successfully imported workflow from PDF"},
+        400: {"description": "Invalid PDF file or no content found"},
+        422: {"description": "Failed to convert SOP to workflow"},
+        500: {"description": "Internal server error during processing"},
+    },
+)
+@legacy_base_router.post(
+    "/workflows/import-pdf/",
+    response_model=dict[str, Any],
+    include_in_schema=False,
+)
+async def import_workflow_from_pdf(
+    file: UploadFile,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, Any]:
+    """Import a workflow from a PDF file containing Standard Operating Procedures."""
+    analytics.capture("skyvern-oss-workflow-import-pdf")
+
+    return await pdf_import_service.import_workflow_from_pdf(file, current_org)
 
 
 @legacy_base_router.put(

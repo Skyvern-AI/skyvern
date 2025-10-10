@@ -67,16 +67,55 @@ function ImportWorkflowButton() {
             <input
               id={inputId}
               type="file"
-              accept=".yaml,.yml,.json"
+              accept=".yaml,.yml,.json,.pdf"
               className="hidden"
               onChange={async (event) => {
                 if (event.target.files && event.target.files[0]) {
-                  const fileTextContent = await event.target.files[0].text();
-                  const isJson = isJsonString(fileTextContent);
-                  const content = isJson
-                    ? convertToYAML(JSON.parse(fileTextContent))
-                    : fileTextContent;
-                  createWorkflowFromYamlMutation.mutate(content);
+                  const file = event.target.files[0];
+                  const fileName = file.name.toLowerCase();
+
+                  if (fileName.endsWith(".pdf")) {
+                    // Handle PDF file - send as FormData to new endpoint
+                    const formData = new FormData();
+                    formData.append("file", file);
+
+                    const client = await getClient(credentialGetter);
+                    try {
+                      const response = await client.post<WorkflowApiResponse>(
+                        "/workflows/import-pdf",
+                        formData,
+                        {
+                          headers: {
+                            "Content-Type": "multipart/form-data",
+                          },
+                        },
+                      );
+
+                      queryClient.invalidateQueries({
+                        queryKey: ["workflows"],
+                      });
+                      navigate(
+                        `/workflows/${response.data.workflow_permanent_id}/debug`,
+                      );
+                    } catch (error) {
+                      toast({
+                        title: "Import Failed",
+                        description:
+                          error instanceof Error
+                            ? error.message
+                            : "Failed to import PDF",
+                        variant: "destructive",
+                      });
+                    }
+                  } else {
+                    // Non-pdf files like yaml, json
+                    const fileTextContent = await file.text();
+                    const isJson = isJsonString(fileTextContent);
+                    const content = isJson
+                      ? convertToYAML(JSON.parse(fileTextContent))
+                      : fileTextContent;
+                    createWorkflowFromYamlMutation.mutate(content);
+                  }
                 }
               }}
             />
@@ -91,7 +130,7 @@ function ImportWorkflowButton() {
           </Label>
         </TooltipTrigger>
         <TooltipContent>
-          Import a workflow from a YAML or JSON file
+          Import a workflow from a YAML, JSON, or PDF file
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
