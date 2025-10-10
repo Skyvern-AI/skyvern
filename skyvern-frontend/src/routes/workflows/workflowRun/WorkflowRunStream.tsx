@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
-import { envCredential } from "@/util/env";
+import { getRuntimeApiKey } from "@/util/env";
 import { toast } from "@/components/ui/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -45,7 +45,8 @@ function WorkflowRunStream(props?: Props) {
         const token = await credentialGetter();
         credential = `?token=Bearer ${token}`;
       } else {
-        credential = `?apikey=${envCredential}`;
+        const apiKey = getRuntimeApiKey();
+        credential = apiKey ? `?apikey=${apiKey}` : "";
       }
       if (socket) {
         socket.close();

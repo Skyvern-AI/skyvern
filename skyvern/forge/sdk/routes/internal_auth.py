@@ -115,6 +115,7 @@ async def repair_api_key(request: Request) -> dict[str, object]:
         "status": AuthStatus.ok.value,
         "organization_id": organization_id,
         "fingerprint": fingerprint_token(token),
+        "api_key": token,
     }
 
 

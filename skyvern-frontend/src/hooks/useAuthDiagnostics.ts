@@ -16,6 +16,7 @@ export type AuthDiagnosticsResponse = {
   fingerprint?: string;
   organization_id?: string;
   expires_at?: number;
+  api_key?: string;
 };
 
 async function fetchDiagnostics(): Promise<AuthDiagnosticsResponse> {

@@ -2,7 +2,7 @@ import { useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { getClient } from "@/api/AxiosClient";
+import { getClient, setApiKeyHeader } from "@/api/AxiosClient";
 import {
   AuthStatusValue,
   useAuthDiagnostics,
@@ -88,15 +88,27 @@ function SelfHealApiKeyBanner() {
     setErrorMessage(null);
     try {
       const client = await getClient(null);
-      const response = await client.post<{ fingerprint?: string }>(
-        "/internal/auth/repair",
-      );
-      const fingerprint = response.data.fingerprint
-        ? ` (fingerprint ${response.data.fingerprint})`
+      const response = await client.post<{
+        fingerprint?: string;
+        api_key?: string;
+      }>("/internal/auth/repair");
+
+      const { fingerprint, api_key: apiKey } = response.data;
+
+      if (!apiKey) {
+        throw new Error("Repair succeeded but no API key was returned.");
+      }
+
+      setApiKeyHeader(apiKey);
+
+      const fingerprintSuffix = fingerprint
+        ? ` (fingerprint ${fingerprint})`
         : "";
+
       setStatusMessage(
-        `API key regenerated${fingerprint}. The UI should reload automatically due to an .env update...`,
+        `API key regenerated${fingerprintSuffix}. Requests will now use the updated key automatically.`,
       );
+
       await refetch({ throwOnError: false });
     } catch (fetchError) {
       const message =
