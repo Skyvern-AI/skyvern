@@ -4,6 +4,11 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class CredentialVaultType(StrEnum):
+    BITWARDEN = "bitwarden"
+    AZURE_VAULT = "azure_vault"
+
+
 class CredentialType(StrEnum):
     """Type of credential stored in the system."""
 
@@ -141,13 +146,17 @@ class Credential(BaseModel):
         ..., description="ID of the organization that owns the credential", examples=["o_1234567890"]
     )
     name: str = Field(..., description="Name of the credential", examples=["Skyvern Login"])
-    credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
+    vault_type: CredentialVaultType | None = Field(..., description="Where the secret is stored: Bitwarden vs Azure")
     item_id: str = Field(..., description="ID of the associated credential item", examples=["item_1234567890"])
+    credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
+    username: str | None = Field(..., description="For password credentials: the username")
     totp_type: TotpType = Field(
         TotpType.NONE,
         description="Type of 2FA method used for this credential",
         examples=[TotpType.AUTHENTICATOR],
     )
+    card_last4: str | None = Field(..., description="For credit_card credentials: the last four digits of the card")
+    card_brand: str | None = Field(..., description="For credit_card credentials: the card brand")
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")
     modified_at: datetime = Field(..., description="Timestamp when the credential was last modified")
