@@ -2531,6 +2531,17 @@
             ],
             "title": "Tool Call Id"
           },
+          "xpath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Xpath"
+          },
           "errors": {
             "anyOf": [
               {
@@ -8319,6 +8330,14 @@
             "examples": [
               "JBSWY3DPEHPK3PXP"
             ]
+          },
+          "totp_type": {
+            "$ref": "#/components/schemas/TotpType",
+            "description": "Type of 2FA method used for this credential",
+            "default": "none",
+            "examples": [
+              "authenticator"
+            ]
           }
         },
         "type": "object",
@@ -8656,6 +8675,14 @@
             "description": "The username associated with the credential",
             "examples": [
               "user@example.com"
+            ]
+          },
+          "totp_type": {
+            "$ref": "#/components/schemas/TotpType",
+            "description": "Type of 2FA method used for this credential",
+            "default": "none",
+            "examples": [
+              "authenticator"
             ]
           }
         },
@@ -10926,6 +10953,17 @@
           "failure_describe"
         ],
         "title": "ThoughtType"
+      },
+      "TotpType": {
+        "type": "string",
+        "enum": [
+          "authenticator",
+          "email",
+          "text",
+          "none"
+        ],
+        "title": "TotpType",
+        "description": "Type of 2FA/TOTP method used."
       },
       "UploadToS3Block": {
         "properties": {
