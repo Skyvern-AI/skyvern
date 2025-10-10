@@ -1533,9 +1533,13 @@ async function buildTreeFromBody(
   ) {
     window.GlobalSkyvernFrameIndex = frame_index;
   }
+  const maxElementNumber = 15000;
   const elementsAndResultArray = await buildElementTree(
     document.documentElement,
     frame,
+    false,
+    undefined,
+    maxElementNumber,
   );
   DomUtils.elementListCache = elementsAndResultArray[0];
   return elementsAndResultArray;
@@ -1546,6 +1550,7 @@ async function buildElementTree(
   frame,
   full_tree = false,
   hoverStylesMap = undefined,
+  maxElementNumber = 0,
 ) {
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
@@ -1583,6 +1588,13 @@ async function buildElementTree(
     // skip processing option element as they are already added to the select.options
     if (tagName === "option") {
       return;
+    }
+
+    if (maxElementNumber > 0 && elements.length >= maxElementNumber) {
+      _jsConsoleWarn(
+        "Max element number reached, aborting the element tree building",
+      );
+      return [elements, resultArray];
     }
 
     let current_xpath = null;
