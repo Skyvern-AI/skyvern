@@ -93,6 +93,8 @@ class AzureCredentialVaultService(CredentialVaultService):
 
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_name=db_credential.item_id, vault_name=self._vault_name)
+        if secret_json_str is None:
+            raise ValueError(f"Azure Credential Vault secret not found for {db_credential.item_id}")
 
         data = TypeAdapter(AzureCredentialVaultService._CredentialDataImage).validate_json(secret_json_str)
         if isinstance(data, AzureCredentialVaultService._PasswordCredentialDataImage):
@@ -102,6 +104,7 @@ class AzureCredentialVaultService(CredentialVaultService):
                     username=data.username,
                     password=data.password,
                     totp=data.totp,
+                    totp_type=db_credential.totp_type,
                 ),
                 name=db_credential.name,
                 credential_type=CredentialType.PASSWORD,
