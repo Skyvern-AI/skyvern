@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "./useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
-import { envCredential } from "@/util/env";
+import { getRuntimeApiKey } from "@/util/env";
 import { ApiKeyApiResponse, OrganizationApiResponse } from "@/api/types";
 
 function useApiCredential() {
   const credentialGetter = useCredentialGetter();
-  const credentialsFromEnv = envCredential;
+  const credentialsFromEnv = getRuntimeApiKey();
 
   const { data: organizations } = useQuery<Array<OrganizationApiResponse>>({
     queryKey: ["organizations"],
@@ -16,7 +16,7 @@ function useApiCredential() {
         .get("/organizations/")
         .then((response) => response.data.organizations);
     },
-    enabled: envCredential === null,
+    enabled: credentialsFromEnv === null,
   });
 
   const organization = organizations?.[0];
