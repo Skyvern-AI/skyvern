@@ -5,6 +5,10 @@ This Docker setup provides a Bitwarden CLI server with `bw serve` functionality 
 ## Architecture
 
 ```text
+Usual setup (in cloud):
+Skyvern → official Bitwarden
+
+Local from docker compose:
 Skyvern → bw serve (CLI Server) → vaultwarden Server
 ```
 
