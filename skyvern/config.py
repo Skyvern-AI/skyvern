@@ -295,6 +295,16 @@ class Settings(BaseSettings):
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
+    # Where credentials are stored: bitwarden or azure_vault
+    CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+
+    # Azure Setting
+    AZURE_TENANT_ID: str | None = None
+    AZURE_CLIENT_ID: str | None = None
+    AZURE_CLIENT_SECRET: str | None = None
+    # The Azure Key Vault name to store credentials
+    AZURE_CREDENTIAL_VAULT: str | None = None
+
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
     SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET: str | None = None

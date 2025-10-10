@@ -7,7 +7,7 @@ from rich.panel import Panel
 
 from .console import console
 
-DOCS_URL = "https://docs.skyvern.com"
+DOCS_URL = "https://www.skyvern.com/docs"
 
 docs_app = typer.Typer(
     invoke_without_command=True,

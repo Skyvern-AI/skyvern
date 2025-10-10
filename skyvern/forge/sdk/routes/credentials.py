@@ -1,6 +1,7 @@
 import structlog
 from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
@@ -17,6 +18,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     CredentialResponse,
     CredentialType,
+    CredentialVaultType,
     CreditCardCredentialResponse,
     PasswordCredentialResponse,
 )
@@ -30,6 +32,7 @@ from skyvern.forge.sdk.schemas.organizations import (
 from skyvern.forge.sdk.schemas.totp_codes import TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
+from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 
 LOG = structlog.get_logger()
 
@@ -155,12 +158,13 @@ async def create_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential = await app.CREDENTIAL_VAULT_SERVICE.create_credential(
-        organization_id=current_org.organization_id, data=data
-    )
+    credential_service = await _get_credential_vault_service(current_org.organization_id)
 
-    # Early resyncing the Bitwarden vault
-    background_tasks.add_task(fetch_credential_item_background, credential.item_id)
+    credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
+
+    if credential.vault_type == CredentialVaultType.BITWARDEN:
+        # Early resyncing the Bitwarden vault
+        background_tasks.add_task(fetch_credential_item_background, credential.item_id)
 
     if data.credential_type == CredentialType.PASSWORD:
         credential_response = PasswordCredentialResponse(
@@ -221,7 +225,12 @@ async def delete_credential(
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    await app.CREDENTIAL_VAULT_SERVICE.delete_credential(credential)
+    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+    if not credential_service:
+        raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+
+    await credential_service.delete_credential(credential)
 
     return None
 
@@ -253,7 +262,9 @@ async def get_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    return await app.CREDENTIAL_VAULT_SERVICE.get_credential(current_org.organization_id, credential_id)
+    credential_service = await _get_credential_vault_service(current_org.organization_id)
+
+    return await credential_service.get_credential(current_org.organization_id, credential_id)
 
 
 @legacy_base_router.get("/credentials")
@@ -291,7 +302,9 @@ async def get_credentials(
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
 ) -> list[CredentialResponse]:
-    return await app.CREDENTIAL_VAULT_SERVICE.get_credentials(current_org.organization_id, page, page_size)
+    credential_service = await _get_credential_vault_service(current_org.organization_id)
+
+    return await credential_service.get_credentials(current_org.organization_id, page, page_size)
 
 
 @base_router.get(
@@ -498,3 +511,16 @@ async def update_azure_client_secret_credential(
             status_code=500,
             detail=f"Failed to create or update Azure Client Secret Credential: {str(e)}",
         )
+
+
+async def _get_credential_vault_service(organization_id: str) -> CredentialVaultService:
+    org_collection = await app.DATABASE.get_organization_bitwarden_collection(organization_id)
+
+    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN or org_collection:
+        return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
+    elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.AZURE_VAULT:
+        if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
+        return app.AZURE_CREDENTIAL_VAULT_SERVICE
+    else:
+        raise HTTPException(status_code=400, detail="Credential storage not supported")

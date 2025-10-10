@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { ProxyLocation } from "@/api/types";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Drawer,
@@ -62,6 +63,18 @@ function sessionIsOpen(browserSession: BrowserSession): boolean {
     browserSession.completed_at === null && browserSession.started_at !== null
   );
 }
+
+const No = () => (
+  <Badge className="flex h-7 w-12 justify-center bg-gray-800 text-orange-50 hover:bg-gray-900">
+    No
+  </Badge>
+);
+
+const Yes = () => (
+  <Badge className="flex h-7 w-12 justify-center bg-green-900 text-green-50 hover:bg-green-900/80">
+    Yes
+  </Badge>
+);
 
 function BrowserSessions() {
   const navigate = useNavigate();
@@ -233,19 +246,9 @@ function BrowserSessions() {
                           />
                         </div>
                       </TableCell>
+                      <TableCell>{isOpen ? <Yes /> : <No />}</TableCell>
                       <TableCell>
-                        {isOpen ? (
-                          "Yes"
-                        ) : (
-                          <span className="opacity-50">No</span>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {browserSession.runnable_id ? (
-                          "Yes"
-                        ) : (
-                          <span className="opacity-50">No</span>
-                        )}
+                        {browserSession.runnable_id ? <Yes /> : <No />}
                       </TableCell>
                       <TableCell
                         title={

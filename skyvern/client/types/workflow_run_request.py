@@ -25,9 +25,9 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
     """
-    
+
     Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
-    
+
     Available geotargeting options:
     - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
     - RESIDENTIAL_ES: Spain
@@ -52,19 +52,19 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     webhook_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-    URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.
+    URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.
     """
 
     totp_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-    
-    URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://docs.skyvern.com/credentials/totp#option-2-get-code-from-your-endpoint for more details.
+
+    URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
     """
 
     totp_identifier: typing.Optional[str] = pydantic.Field(default=None)
     """
-    
-    Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://docs.skyvern.com/credentials/totp#option-3-push-code-to-skyvern for more details.
+
+    Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
     """
 
     browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
