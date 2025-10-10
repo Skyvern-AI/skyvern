@@ -39,7 +39,7 @@ class CredentialVaultService(ABC):
         """Retrieve the full credential data from the vault."""
 
     @staticmethod
-    async def _created_db_credential(
+    async def _create_db_credential(
         organization_id: str,
         data: CreateCredentialRequest,
         item_id: str,

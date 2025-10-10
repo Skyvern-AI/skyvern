@@ -58,7 +58,7 @@ class AzureCredentialVaultService(CredentialVaultService):
             credential=data.credential,
         )
 
-        credential = await self._created_db_credential(
+        credential = await self._create_db_credential(
             organization_id=organization_id,
             data=data,
             item_id=item_id,
