@@ -1229,7 +1229,7 @@ class ForgeAgent:
                     }
 
                 results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
-                await app.AGENT_FUNCTION.post_action_execution()
+                await app.AGENT_FUNCTION.post_action_execution(action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
                     results,
