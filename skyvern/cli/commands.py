@@ -1,6 +1,8 @@
 import typer
 from dotenv import load_dotenv
 
+from skyvern.utils.env_paths import resolve_backend_env_path
+
 from .docs import docs_app
 from .init_command import init, init_browser
 from .quickstart import quickstart_app
@@ -54,5 +56,5 @@ def init_browser_command() -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover - manual CLI invocation
-    load_dotenv()
+    load_dotenv(str(resolve_backend_env_path()))
     cli_app()

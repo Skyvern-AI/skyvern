@@ -2,7 +2,6 @@ import asyncio
 import os
 import shutil
 import subprocess
-from pathlib import Path
 from typing import Any, List
 
 import psutil
@@ -17,6 +16,7 @@ from skyvern.cli.utils import start_services
 from skyvern.config import settings
 from skyvern.library.skyvern import Skyvern
 from skyvern.utils import detect_os
+from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 from .console import console
 
@@ -83,8 +83,9 @@ def kill_pids(pids: List[int]) -> None:
 @run_app.command(name="server")
 def run_server() -> None:
     """Run the Skyvern API server."""
+    backend_env_path = resolve_backend_env_path()
     load_dotenv()
-    load_dotenv(".env")
+    load_dotenv(str(backend_env_path))
     from skyvern.config import settings  # noqa: PLC0415
 
     port = settings.PORT
@@ -117,70 +118,29 @@ def run_ui() -> None:
     except Exception as e:  # pragma: no cover - CLI safeguards
         console.print(f"[red]Error checking for process: {e}[/red]")
 
-    # Try multiple methods to find the frontend directory
-    frontend_dir = None
-
-    # Method 1: Relative to current working directory
-    cwd_frontend = Path.cwd() / "skyvern-frontend"
-    if cwd_frontend.exists():
-        frontend_dir = cwd_frontend
-
-    # Method 2: Relative to the module file (original method)
-    if frontend_dir is None:
-        module_based_frontend = Path(__file__).parent.parent.parent / "skyvern-frontend"
-        if module_based_frontend.exists():
-            frontend_dir = module_based_frontend
-
-    # Method 3: Search up the directory tree from current working directory
-    if frontend_dir is None:
-        current = Path.cwd()
-        while current != current.parent:  # Stop at filesystem root
-            candidate = current / "skyvern-frontend"
-            if candidate.exists() and candidate.is_dir():
-                frontend_dir = candidate
-                break
-            current = current.parent
-
-    if frontend_dir is None:
-        console.print(
-            f"[bold red]ERROR: Skyvern Frontend directory not found. Searched in:[/bold red]\n"
-            f"  • {cwd_frontend}\n"
-            f"  • {Path(__file__).parent.parent.parent / 'skyvern-frontend'}\n"
-            f"  • Parent directories of {Path.cwd()}\n"
-            f"[bold red]Are you in the right repo?[/bold red]"
-        )
+    frontend_env_path = resolve_frontend_env_path()
+    if frontend_env_path is None:
+        console.print("[bold red]ERROR: Skyvern Frontend directory not found.[/bold red]")
         return
 
-    frontend_env_path = frontend_dir / ".env"
+    frontend_dir = frontend_env_path.parent
     if not frontend_env_path.exists():
         console.print("[bold blue]Setting up frontend .env file...[/bold blue]")
         shutil.copy(frontend_dir / ".env.example", frontend_env_path)
         console.print("✅ [green]Successfully set up frontend .env file[/green]")
 
-    # Look for .env file in multiple locations
-    main_env_path = None
-    env_search_paths = [
-        Path.cwd() / ".env",
-        frontend_dir.parent / ".env",
-        Path(__file__).parent.parent.parent / ".env",
-    ]
-
-    for env_path in env_search_paths:
-        if env_path.exists():
-            main_env_path = env_path
-            break
-
-    if main_env_path and main_env_path.exists():
-        load_dotenv(main_env_path)
+    backend_env_path = resolve_backend_env_path()
+    if backend_env_path.exists():
+        load_dotenv(str(backend_env_path))
         skyvern_api_key = os.getenv("SKYVERN_API_KEY")
         if skyvern_api_key:
             set_key(str(frontend_env_path), "VITE_SKYVERN_API_KEY", skyvern_api_key)
         else:
             console.print("[red]ERROR: SKYVERN_API_KEY not found in .env file[/red]")
     else:
-        console.print("[red]ERROR: .env file not found[/red]")
+        console.print(f"[red]ERROR: Backend .env file not found at {backend_env_path}[/red]")
 
-    os.chdir(frontend_dir)
+    os.chdir(str(frontend_dir))
 
     try:
         console.print("📦 [bold blue]Running npm install...[/bold blue]")

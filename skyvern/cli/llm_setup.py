@@ -1,15 +1,15 @@
-from pathlib import Path
-
 from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
+
+from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .console import console
 
 
 def update_or_add_env_var(key: str, value: str) -> None:
     """Update or add environment variable in .env file."""
-    env_path = Path(".env")
+    env_path = resolve_backend_env_path()
     if not env_path.exists():
         env_path.touch()
         defaults = {
@@ -47,10 +47,10 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "ENABLE_LOG_ARTIFACTS": "false",
         }
         for k, v in defaults.items():
-            set_key(env_path, k, v)
+            set_key(str(env_path), k, v)
 
-    load_dotenv(env_path)
-    set_key(env_path, key, value)
+    load_dotenv(str(env_path))
+    set_key(str(env_path), key, value)
 
 
 def setup_llm_providers() -> None:
