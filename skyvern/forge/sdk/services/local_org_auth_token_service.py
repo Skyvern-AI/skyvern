@@ -9,11 +9,9 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core import security
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthTokenType
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
+from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 LOG = structlog.get_logger()
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-ROOT_ENV_PATH = PROJECT_ROOT / ".env"
-FRONTEND_ENV_PATH = PROJECT_ROOT / "skyvern-frontend" / ".env"
 SKYVERN_LOCAL_ORG = "Skyvern-local"
 SKYVERN_LOCAL_DOMAIN = "skyvern.local"
 
@@ -23,7 +21,7 @@ def _write_env(path: Path, key: str, value: str) -> None:
     if not path.exists():
         path.touch()
     set_key(str(path), key, value)
-    LOG.info(".env written", path=(str(path)), key=key)
+    LOG.info(".env written", path=str(path), key=key)
 
 
 def fingerprint_token(value: str) -> str:
@@ -61,8 +59,15 @@ async def regenerate_local_api_key() -> tuple[str, str]:
         token_type=OrganizationAuthTokenType.api,
     )
 
-    _write_env(ROOT_ENV_PATH, "SKYVERN_API_KEY", api_key)
-    _write_env(FRONTEND_ENV_PATH, "VITE_SKYVERN_API_KEY", api_key)
+    backend_env_path = resolve_backend_env_path()
+    _write_env(backend_env_path, "SKYVERN_API_KEY", api_key)
+
+    frontend_env_path = resolve_frontend_env_path()
+    if frontend_env_path:
+        _write_env(frontend_env_path, "VITE_SKYVERN_API_KEY", api_key)
+    else:
+        LOG.warning("Frontend directory not found; skipping VITE_SKYVERN_API_KEY update")
+
     settings.SKYVERN_API_KEY = api_key
     os.environ["SKYVERN_API_KEY"] = api_key
 
