@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
@@ -577,7 +577,7 @@ class AgentDB:
                         step.status = status
 
                         if status.is_terminal() and step.finished_at is None:
-                            step.finished_at = datetime.now(timezone.utc)
+                            step.finished_at = datetime.utcnow()
                     if output is not None:
                         step.output = output.model_dump(exclude_none=True)
                     if is_last is not None:
@@ -4502,7 +4502,7 @@ class AgentDB:
                             WorkflowScriptModel.deleted_at.is_(None),
                         )
                     )
-                    .values(deleted_at=datetime.now(timezone.utc))
+                    .values(deleted_at=datetime.utcnow())
                 )
 
                 result = await session.execute(stmt)
@@ -4539,7 +4539,7 @@ class AgentDB:
                             WorkflowScriptModel.deleted_at.is_(None),
                         )
                     )
-                    .values(deleted_at=datetime.now(timezone.utc))
+                    .values(deleted_at=datetime.utcnow())
                 )
 
                 if statuses:
