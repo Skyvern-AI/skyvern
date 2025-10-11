@@ -2,10 +2,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import SKYVERN_DIR
+from skyvern.utils.env_paths import resolve_backend_env_path
+
+_DEFAULT_ENV_FILES = (
+    str(resolve_backend_env_path(".env")),
+    str(resolve_backend_env_path(".env.staging")),
+    str(resolve_backend_env_path(".env.prod")),
+)
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=(".env", ".env.staging", ".env.prod"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore")
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
