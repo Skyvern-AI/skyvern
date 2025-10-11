@@ -105,7 +105,7 @@ def _emit_diagnostics(result: DiagnosticsResult) -> dict[str, object]:
     return {"status": status_value}
 
 
-@router.post("/repair")
+@router.post("/repair", include_in_schema=False)
 async def repair_api_key(request: Request) -> dict[str, object]:
     _require_local_access(request)
 
@@ -119,7 +119,7 @@ async def repair_api_key(request: Request) -> dict[str, object]:
     }
 
 
-@router.get("/status")
+@router.get("/status", include_in_schema=False)
 async def auth_status(request: Request) -> dict[str, object]:
     _require_local_access(request)
     token_candidate = request.headers.get("x-api-key") or ""
