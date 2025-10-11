@@ -77,7 +77,7 @@ from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import (
@@ -3628,19 +3628,27 @@ class AgentDB:
 
     async def create_credential(
         self,
-        name: str,
-        credential_type: CredentialType,
         organization_id: str,
+        name: str,
+        vault_type: CredentialVaultType,
         item_id: str,
-        totp_type: str = "none",
+        credential_type: CredentialType,
+        username: str | None,
+        totp_type: str,
+        card_last4: str | None,
+        card_brand: str | None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
                 organization_id=organization_id,
                 name=name,
-                credential_type=credential_type,
+                vault_type=vault_type,
                 item_id=item_id,
+                credential_type=credential_type,
+                username=username,
                 totp_type=totp_type,
+                card_last4=card_last4,
+                card_brand=card_brand,
             )
             session.add(credential)
             await session.commit()
@@ -3733,7 +3741,9 @@ class AgentDB:
         async with self.Session() as session:
             organization_bitwarden_collection = (
                 await session.scalars(
-                    select(OrganizationBitwardenCollectionModel).filter_by(organization_id=organization_id)
+                    select(OrganizationBitwardenCollectionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(deleted_at=None)
                 )
             ).first()
             if organization_bitwarden_collection:
@@ -4510,6 +4520,8 @@ class AgentDB:
         self,
         organization_id: str,
         workflow_permanent_id: str,
+        statuses: list[ScriptStatus] | None = None,
+        script_ids: list[str] | None = None,
     ) -> int:
         """
         Soft delete all published workflow scripts for a workflow permanent id by setting deleted_at timestamp.
@@ -4530,6 +4542,12 @@ class AgentDB:
                     .values(deleted_at=datetime.now(timezone.utc))
                 )
 
+                if statuses:
+                    stmt = stmt.where(WorkflowScriptModel.status.in_([s.value for s in statuses]))
+
+                if script_ids:
+                    stmt = stmt.where(WorkflowScriptModel.script_id.in_(script_ids))
+
                 result = await session.execute(stmt)
                 await session.commit()
 
@@ -4545,6 +4563,7 @@ class AgentDB:
         self,
         organization_id: str,
         workflow_permanent_id: str,
+        statuses: list[ScriptStatus] | None = None,
     ) -> list[WorkflowScriptModel]:
         try:
             async with self.Session() as session:
@@ -4554,6 +4573,9 @@ class AgentDB:
                     .filter_by(workflow_permanent_id=workflow_permanent_id)
                     .filter_by(deleted_at=None)
                 )
+
+                if statuses:
+                    query = query.filter(WorkflowScriptModel.status.in_([s.value for s in statuses]))
 
                 return (await session.scalars(query)).all()
         except SQLAlchemyError:

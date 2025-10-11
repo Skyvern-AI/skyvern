@@ -441,6 +441,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
 
 def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> FunctionDef:
     name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
+    cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
     is_extraction_block = block.get("block_type") == "extraction"
 
@@ -473,7 +474,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
                 Param(name=Name("context"), annotation=cst.Annotation(cst.Name("RunContext"))),
             ]
         ),
-        decorators=[_make_decorator(name, block)],
+        decorators=[_make_decorator(cache_key, block)],
         body=cst.IndentedBlock(body_stmts),
         returns=None,
         asynchronous=cst.Asynchronous(),
@@ -482,6 +483,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
 
 def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, Any]]) -> FunctionDef:
     """Build a cached function for task_v2 blocks that calls child workflow sub-tasks."""
+    cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     name = _safe_name(block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}")
     body_stmts: list[cst.BaseStatement] = []
 
@@ -501,7 +503,7 @@ def _build_task_v2_block_fn(block: dict[str, Any], child_blocks: list[dict[str, 
                 Param(name=Name("context"), annotation=cst.Annotation(cst.Name("RunContext"))),
             ]
         ),
-        decorators=[_make_decorator(name, block)],
+        decorators=[_make_decorator(cache_key, block)],
         body=cst.IndentedBlock(body_stmts),
         returns=None,
         asynchronous=cst.Asynchronous(),
@@ -942,6 +944,9 @@ def _build_goto_statement(block: dict[str, Any], data_variable_name: str | None 
 
 def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.run_code statement."""
+    parameters = block.get("parameters", [])
+    parameter_list = [parameter["key"] for parameter in parameters]
+
     args = [
         cst.Arg(
             keyword=cst.Name("code"),
@@ -961,7 +966,7 @@ def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
         ),
         cst.Arg(
             keyword=cst.Name("parameters"),
-            value=_value(block.get("parameters", None)),
+            value=_value(parameter_list),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
             ),
@@ -983,6 +988,9 @@ def _build_code_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
 
 def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.upload_file statement."""
+    parameters = block.get("parameters", [])
+    parameter_list = [parameter["key"] for parameter in parameters]
+
     args = [
         cst.Arg(
             keyword=cst.Name("label"),
@@ -994,7 +1002,7 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         ),
         cst.Arg(
             keyword=cst.Name("parameters"),
-            value=_value(block.get("parameters", None)),
+            value=_value(parameter_list),
             whitespace_after_arg=cst.ParenthesizedWhitespace(
                 indent=True,
                 last_line=cst.SimpleWhitespace(INDENT),
@@ -1287,10 +1295,12 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
         )
 
     if block.get("parameters") is not None:
+        parameters = block.get("parameters", [])
+        parameter_list = [parameter["key"] for parameter in parameters]
         args.append(
             cst.Arg(
                 keyword=cst.Name("parameters"),
-                value=_value(block.get("parameters")),
+                value=_value(parameter_list),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                 ),
