@@ -36,3 +36,15 @@ class ActionType(StrEnum):
             ActionType.SELECT_OPTION,
             ActionType.CHECKBOX,
         ]
+
+
+POST_ACTION_EXECUTION_ACTION_TYPES = [
+    ActionType.CLICK,
+    ActionType.INPUT_TEXT,
+    ActionType.UPLOAD_FILE,
+    ActionType.DOWNLOAD_FILE,
+    ActionType.SELECT_OPTION,
+    ActionType.WAIT,
+    ActionType.SOLVE_CAPTCHA,
+    ActionType.EXTRACT,
+]
