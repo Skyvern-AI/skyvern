@@ -3,7 +3,6 @@ import { ThemeProvider } from "@/components/ThemeProvider";
 import { router } from "./router";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { queryClient } from "./api/QueryClient";
-import { SelfHealApiKeyBanner } from "@/components/SelfHealApiKeyBanner";
 
 import { PostHogProvider } from "posthog-js/react";
 import { LoggingContext, loggingStub } from "@/store/LoggingContext";
@@ -31,7 +30,6 @@ function App() {
         >
           <QueryClientProvider client={queryClient}>
             <ThemeProvider defaultTheme="dark">
-              <SelfHealApiKeyBanner />
               <RouterProvider router={router} />
             </ThemeProvider>
           </QueryClientProvider>
