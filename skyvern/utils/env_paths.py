@@ -4,33 +4,26 @@ from typing import Optional
 
 from skyvern.constants import SKYVERN_DIR
 
-BACKEND_ENV_FILENAME = ".env"
+BACKEND_ENV_DEFAULT = ".env"
 FRONTEND_DIRNAME = "skyvern-frontend"
 FRONTEND_ENV_FILENAME = ".env"
 FRONTEND_ENV_OVERRIDE = "SKYVERN_FRONTEND_PATH"
 
 
-def resolve_backend_env_path(create_if_missing: bool = False) -> Path:
-    """Return the preferred backend .env path.
+def resolve_backend_env_path(
+    basename: str = BACKEND_ENV_DEFAULT,
+    *,
+    create_if_missing: bool = False,
+) -> Path:
+    """Return the backend env file path inside the current working directory."""
 
-    Preference order:
-        1. Package root .env if it exists.
-        2. Current working directory .env if it exists.
-        3. Package root (used for creation when none exist).
-    """
+    env_path = Path.cwd() / basename
 
-    package_env = SKYVERN_DIR / BACKEND_ENV_FILENAME
-    if package_env.exists():
-        target = package_env
-    else:
-        cwd_env = Path.cwd() / BACKEND_ENV_FILENAME
-        target = cwd_env if cwd_env.exists() else package_env
+    if create_if_missing and not env_path.exists():
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.touch()
 
-    if create_if_missing and not target.exists():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.touch()
-
-    return target
+    return env_path
 
 
 def resolve_frontend_env_path(create_if_missing: bool = False) -> Optional[Path]:
