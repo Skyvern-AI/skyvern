@@ -59,7 +59,11 @@ function getRuntimeApiKey(): string | null {
   }
 
   const persisted = readPersistedApiKey();
-  runtimeApiKey = persisted ?? buildTimeApiKey;
+  const candidate = persisted ?? buildTimeApiKey;
+
+  // Treat YOUR_API_KEY as missing. We may inherit this from .env.example
+  // in some cases of misconfiguration.
+  runtimeApiKey = candidate === "YOUR_API_KEY" ? null : candidate;
   return runtimeApiKey;
 }
 
