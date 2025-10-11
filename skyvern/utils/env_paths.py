@@ -2,8 +2,6 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from skyvern.constants import SKYVERN_DIR
-
 BACKEND_ENV_DEFAULT = ".env"
 FRONTEND_DIRNAME = "skyvern-frontend"
 FRONTEND_ENV_FILENAME = ".env"
@@ -38,19 +36,19 @@ def resolve_frontend_env_path(create_if_missing: bool = False) -> Optional[Path]
             frontend_root = override_path
 
     if frontend_root is None:
-        package_frontend = SKYVERN_DIR / FRONTEND_DIRNAME
-        if package_frontend.exists():
-            frontend_root = package_frontend
+        cwd_frontend = Path.cwd() / FRONTEND_DIRNAME
+        if cwd_frontend.exists() and cwd_frontend.is_dir():
+            frontend_root = cwd_frontend
 
     if frontend_root is None:
-        cwd_frontend = Path.cwd() / FRONTEND_DIRNAME
-        if cwd_frontend.exists():
-            frontend_root = cwd_frontend
+        module_based_frontend = Path(__file__).resolve().parent.parent.parent / FRONTEND_DIRNAME
+        if module_based_frontend.exists() and module_based_frontend.is_dir():
+            frontend_root = module_based_frontend
 
     if frontend_root is None:
         for parent in Path.cwd().parents:
             candidate = parent / FRONTEND_DIRNAME
-            if candidate.exists():
+            if candidate.exists() and candidate.is_dir():
                 frontend_root = candidate
                 break
 
