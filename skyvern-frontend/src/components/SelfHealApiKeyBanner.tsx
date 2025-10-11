@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { useToast } from "@/components/ui/use-toast";
 import { getClient, setApiKeyHeader } from "@/api/AxiosClient";
 import {
   AuthStatusValue,
@@ -54,8 +55,8 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
 
 function SelfHealApiKeyBanner() {
   const diagnosticsQuery = useAuthDiagnostics();
+  const { toast } = useToast();
   const [isRepairing, setIsRepairing] = useState(false);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const { data, error, isLoading, refetch } = diagnosticsQuery;
@@ -67,7 +68,7 @@ function SelfHealApiKeyBanner() {
       ? rawStatus
       : null;
 
-  if (!bannerStatus && !statusMessage && !errorMessage) {
+  if (!bannerStatus && !errorMessage) {
     if (isLoading) {
       return null;
     }
@@ -79,7 +80,6 @@ function SelfHealApiKeyBanner() {
 
   const handleRepair = async () => {
     setIsRepairing(true);
-    setStatusMessage(null);
     setErrorMessage(null);
     try {
       const client = await getClient(null);
@@ -100,9 +100,10 @@ function SelfHealApiKeyBanner() {
         ? ` (fingerprint ${fingerprint})`
         : "";
 
-      setStatusMessage(
-        `API key regenerated${fingerprintSuffix}. Requests will now use the updated key automatically.`,
-      );
+      toast({
+        title: "API key regenerated",
+        description: `Requests now use the updated key automatically${fingerprintSuffix}.`,
+      });
 
       await refetch({ throwOnError: false });
     } catch (fetchError) {
@@ -144,9 +145,6 @@ function SelfHealApiKeyBanner() {
           ) : (
             <p>{copy.description}</p>
           )}
-          {statusMessage ? (
-            <p className="text-xs text-slate-200">{statusMessage}</p>
-          ) : null}
           {errorMessage ? (
             <p className="text-xs text-rose-200">{errorMessage}</p>
           ) : null}
