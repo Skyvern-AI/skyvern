@@ -84,7 +84,6 @@ def kill_pids(pids: List[int]) -> None:
 def run_server() -> None:
     """Run the Skyvern API server."""
     backend_env_path = resolve_backend_env_path()
-    load_dotenv()
     load_dotenv(str(backend_env_path))
     from skyvern.config import settings  # noqa: PLC0415
 
