@@ -34,7 +34,7 @@ def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
 
 
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
-    if f"{request.method} {request.url.path}" in _SENSITIVE_ENDPOINTS:
+    if f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS:
         return "****"
     if not body:
         return ""
