@@ -1,5 +1,4 @@
 import asyncio
-import os
 import subprocess
 import uuid
 
@@ -10,6 +9,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 
 from skyvern.utils import migrate_db
+from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .browser import setup_browser_config
 from .console import console
@@ -50,8 +50,9 @@ def init(
         else:
             console.print("[red]Failed to generate local organization API key. Please check server logs.[/red]")
 
-        if os.path.exists(".env"):
-            console.print("💡 [.env] file already exists.", style="yellow")
+        backend_env_path = resolve_backend_env_path()
+        if backend_env_path.exists():
+            console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow")
             redo_llm_setup = Confirm.ask(
                 "Do you want to go through [bold yellow]LLM provider setup again[/bold yellow]?",
                 default=False,
@@ -108,7 +109,7 @@ def init(
     analytics_id = analytics_id_input if analytics_id_input else str(uuid.uuid4())
     update_or_add_env_var("ANALYTICS_ID", analytics_id)
     update_or_add_env_var("SKYVERN_API_KEY", api_key)
-    console.print("✅ [green].env file has been initialized.[/green]")
+    console.print(f"✅ [green]{resolve_backend_env_path()} file has been initialized.[/green]")
 
     if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):
         setup_mcp()
