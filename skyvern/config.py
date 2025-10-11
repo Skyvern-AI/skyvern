@@ -4,6 +4,11 @@ from skyvern import constants
 from skyvern.constants import SKYVERN_DIR
 from skyvern.utils.env_paths import resolve_backend_env_path
 
+# NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
+# the process has changed dir to the desired project root by this time.
+# Even if we were to resolve paths at instantiation time, the global `settings`
+# singleton instantiation at the bottom of this file also runs at import time
+# and relies on the same assumption.
 _DEFAULT_ENV_FILES = (
     str(resolve_backend_env_path(".env")),
     str(resolve_backend_env_path(".env.staging")),
