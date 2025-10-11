@@ -10,8 +10,10 @@ if (!environment) {
   console.warn("environment environment variable was not set");
 }
 
-const envCredential: string | null =
-  import.meta.env.VITE_SKYVERN_API_KEY ?? null;
+const buildTimeApiKey: string | null =
+  typeof import.meta.env.VITE_SKYVERN_API_KEY === "string"
+    ? import.meta.env.VITE_SKYVERN_API_KEY
+    : null;
 
 const artifactApiBaseUrl = import.meta.env.VITE_ARTIFACT_API_BASE_URL;
 
@@ -21,8 +23,11 @@ if (!artifactApiBaseUrl) {
 
 const apiPathPrefix = import.meta.env.VITE_API_PATH_PREFIX ?? "";
 
+const API_KEY_STORAGE_KEY = "skyvern.apiKey";
+
 const lsKeys = {
   browserSessionId: "skyvern.browserSessionId",
+  apiKey: API_KEY_STORAGE_KEY,
 };
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
@@ -38,13 +43,49 @@ try {
   newWssBaseUrl = wssBaseUrl.replace("/api", "");
 }
 
+let runtimeApiKey: string | null | undefined;
+
+function readPersistedApiKey(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return window.localStorage.getItem(API_KEY_STORAGE_KEY);
+}
+
+function getRuntimeApiKey(): string | null {
+  if (runtimeApiKey !== undefined) {
+    return runtimeApiKey;
+  }
+
+  const persisted = readPersistedApiKey();
+  runtimeApiKey = persisted ?? buildTimeApiKey;
+  return runtimeApiKey;
+}
+
+function persistRuntimeApiKey(value: string): void {
+  runtimeApiKey = value;
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(API_KEY_STORAGE_KEY, value);
+  }
+}
+
+function clearRuntimeApiKey(): void {
+  runtimeApiKey = null;
+  if (typeof window !== "undefined") {
+    window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+  }
+}
+
 export {
   apiBaseUrl,
   environment,
-  envCredential,
   artifactApiBaseUrl,
   apiPathPrefix,
   lsKeys,
   wssBaseUrl,
   newWssBaseUrl,
+  getRuntimeApiKey,
+  persistRuntimeApiKey,
+  clearRuntimeApiKey,
 };

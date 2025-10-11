@@ -1,4 +1,10 @@
-import { apiBaseUrl, artifactApiBaseUrl, envCredential } from "@/util/env";
+import {
+  apiBaseUrl,
+  artifactApiBaseUrl,
+  getRuntimeApiKey,
+  persistRuntimeApiKey,
+  clearRuntimeApiKey,
+} from "@/util/env";
 import axios from "axios";
 
 type ApiVersion = "sans-api-v1" | "v1" | "v2";
@@ -9,12 +15,15 @@ const url = new URL(apiBaseUrl);
 const pathname = url.pathname.replace("/api", "");
 const apiSansApiV1BaseUrl = `${url.origin}${pathname}`;
 
+const initialApiKey = getRuntimeApiKey();
+const apiKeyHeader = initialApiKey ? { "X-API-Key": initialApiKey } : {};
+
 const client = axios.create({
   baseURL: apiV1BaseUrl,
   headers: {
     "Content-Type": "application/json",
     "x-user-agent": "skyvern-ui",
-    "x-api-key": envCredential,
+    ...apiKeyHeader,
   },
 });
 
@@ -23,7 +32,7 @@ const v2Client = axios.create({
   headers: {
     "Content-Type": "application/json",
     "x-user-agent": "skyvern-ui",
-    "x-api-key": envCredential,
+    ...apiKeyHeader,
   },
 });
 
@@ -32,7 +41,7 @@ const clientSansApiV1 = axios.create({
   headers: {
     "Content-Type": "application/json",
     "x-user-agent": "skyvern-ui",
-    "x-api-key": envCredential,
+    ...apiKeyHeader,
   },
 });
 
@@ -55,12 +64,14 @@ export function removeAuthorizationHeader() {
 }
 
 export function setApiKeyHeader(apiKey: string) {
+  persistRuntimeApiKey(apiKey);
   client.defaults.headers.common["X-API-Key"] = apiKey;
   v2Client.defaults.headers.common["X-API-Key"] = apiKey;
   clientSansApiV1.defaults.headers.common["X-API-Key"] = apiKey;
 }
 
 export function removeApiKeyHeader() {
+  clearRuntimeApiKey();
   if (client.defaults.headers.common["X-API-Key"]) {
     delete client.defaults.headers.common["X-API-Key"];
   }

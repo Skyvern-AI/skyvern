@@ -11,6 +11,7 @@ from rich.panel import Panel
 
 from skyvern.client import Skyvern
 from skyvern.config import settings
+from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .console import console
 
@@ -34,7 +35,7 @@ def tasks_callback(
 def _get_client(api_key: str | None = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
     load_dotenv()
-    load_dotenv(".env")
+    load_dotenv(str(resolve_backend_env_path()))
     key = api_key or os.getenv("SKYVERN_API_KEY") or settings.SKYVERN_API_KEY
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
 

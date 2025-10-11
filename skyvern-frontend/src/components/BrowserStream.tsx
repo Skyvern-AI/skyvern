@@ -16,10 +16,10 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import {
-  envCredential,
   environment,
   wssBaseUrl,
   newWssBaseUrl,
+  getRuntimeApiKey,
 } from "@/util/env";
 import { cn } from "@/util/utils";
 
@@ -140,22 +140,18 @@ function BrowserStream({
 
   const getWebSocketParams = useCallback(async () => {
     const clientIdQueryParam = `client_id=${clientId}`;
-    let credentialQueryParam = "";
+    const runtimeApiKey = getRuntimeApiKey();
 
-    if (environment === "local") {
-      credentialQueryParam = `apikey=${envCredential}`;
-    } else {
-      if (credentialGetter) {
-        const token = await credentialGetter();
-        credentialQueryParam = `token=Bearer ${token}`;
-      } else {
-        credentialQueryParam = `apikey=${envCredential}`;
-      }
+    let credentialQueryParam = runtimeApiKey ? `apikey=${runtimeApiKey}` : "";
+
+    if (environment !== "local" && credentialGetter) {
+      const token = await credentialGetter();
+      credentialQueryParam = token ? `token=Bearer ${token}` : "";
     }
 
-    const params = [credentialQueryParam, clientIdQueryParam].join("&");
-
-    return `${params}`;
+    return credentialQueryParam
+      ? `${credentialQueryParam}&${clientIdQueryParam}`
+      : clientIdQueryParam;
   }, [clientId, credentialGetter]);
 
   // browser is ready
