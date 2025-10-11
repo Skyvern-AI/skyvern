@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from skyvern.constants import REPO_ROOT_DIR
+from skyvern.constants import SKYVERN_DIR
 
 BACKEND_ENV_FILENAME = ".env"
 FRONTEND_DIRNAME = "skyvern-frontend"
@@ -19,7 +19,7 @@ def resolve_backend_env_path(create_if_missing: bool = False) -> Path:
         3. Package root (used for creation when none exist).
     """
 
-    package_env = REPO_ROOT_DIR / BACKEND_ENV_FILENAME
+    package_env = SKYVERN_DIR / BACKEND_ENV_FILENAME
     if package_env.exists():
         target = package_env
     else:
@@ -45,7 +45,7 @@ def resolve_frontend_env_path(create_if_missing: bool = False) -> Optional[Path]
             frontend_root = override_path
 
     if frontend_root is None:
-        package_frontend = REPO_ROOT_DIR / FRONTEND_DIRNAME
+        package_frontend = SKYVERN_DIR / FRONTEND_DIRNAME
         if package_frontend.exists():
             frontend_root = package_frontend
 
