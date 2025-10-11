@@ -50,7 +50,7 @@ function readPersistedApiKey(): string | null {
     return null;
   }
 
-  return window.localStorage.getItem(API_KEY_STORAGE_KEY);
+  return window.sessionStorage.getItem(API_KEY_STORAGE_KEY);
 }
 
 function getRuntimeApiKey(): string | null {
@@ -70,14 +70,14 @@ function getRuntimeApiKey(): string | null {
 function persistRuntimeApiKey(value: string): void {
   runtimeApiKey = value;
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(API_KEY_STORAGE_KEY, value);
+    window.sessionStorage.setItem(API_KEY_STORAGE_KEY, value);
   }
 }
 
 function clearRuntimeApiKey(): void {
   runtimeApiKey = null;
   if (typeof window !== "undefined") {
-    window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+    window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
   }
 }
 
