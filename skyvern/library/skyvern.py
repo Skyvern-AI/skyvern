@@ -58,7 +58,7 @@ class Skyvern(AsyncSkyvern):
             if not env_path.exists():
                 raise Exception("No .env file found. Please run 'skyvern init' first to set up your environment.")
 
-            load_dotenv(str(env_path))
+            load_dotenv(env_path)
             migrate_db()
 
         self._api_key = api_key

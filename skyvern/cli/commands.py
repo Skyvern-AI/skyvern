@@ -56,5 +56,5 @@ def init_browser_command() -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover - manual CLI invocation
-    load_dotenv(str(resolve_backend_env_path()))
+    load_dotenv(resolve_backend_env_path())
     cli_app()

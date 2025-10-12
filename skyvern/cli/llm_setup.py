@@ -47,10 +47,10 @@ def update_or_add_env_var(key: str, value: str) -> None:
             "ENABLE_LOG_ARTIFACTS": "false",
         }
         for k, v in defaults.items():
-            set_key(str(env_path), k, v)
+            set_key(env_path, k, v)
 
-    load_dotenv(str(env_path))
-    set_key(str(env_path), key, value)
+    load_dotenv(env_path)
+    set_key(env_path, key, value)
 
 
 def setup_llm_providers() -> None:

@@ -83,8 +83,7 @@ def kill_pids(pids: List[int]) -> None:
 @run_app.command(name="server")
 def run_server() -> None:
     """Run the Skyvern API server."""
-    backend_env_path = resolve_backend_env_path()
-    load_dotenv(str(backend_env_path))
+    load_dotenv(resolve_backend_env_path())
     from skyvern.config import settings  # noqa: PLC0415
 
     port = settings.PORT
@@ -130,10 +129,10 @@ def run_ui() -> None:
 
     backend_env_path = resolve_backend_env_path()
     if backend_env_path.exists():
-        load_dotenv(str(backend_env_path))
+        load_dotenv(backend_env_path)
         skyvern_api_key = os.getenv("SKYVERN_API_KEY")
         if skyvern_api_key:
-            set_key(str(frontend_env_path), "VITE_SKYVERN_API_KEY", skyvern_api_key)
+            set_key(frontend_env_path, "VITE_SKYVERN_API_KEY", skyvern_api_key)
         else:
             console.print("[red]ERROR: SKYVERN_API_KEY not found in .env file[/red]")
     else:

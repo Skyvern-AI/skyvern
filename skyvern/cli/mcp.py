@@ -134,7 +134,7 @@ def setup_claude_desktop_config(host_system: str, path_to_env: str) -> bool:
                 json.dump({"mcpServers": {}}, f, indent=2)
 
         backend_env_path = resolve_backend_env_path()
-        load_dotenv(str(backend_env_path))
+        load_dotenv(backend_env_path)
         skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
         skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
         if not skyvern_base_url or not skyvern_api_key:
@@ -187,7 +187,7 @@ def setup_cursor_config(host_system: str, path_to_env: str) -> bool:
                 json.dump({"mcpServers": {}}, f, indent=2)
 
         backend_env_path = resolve_backend_env_path()
-        load_dotenv(str(backend_env_path))
+        load_dotenv(backend_env_path)
         skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
         skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
         if not skyvern_base_url or not skyvern_api_key:
@@ -232,7 +232,7 @@ def setup_windsurf_config(host_system: str, path_to_env: str) -> bool:
 
     path_windsurf_config = get_windsurf_config_path(host_system)
     backend_env_path = resolve_backend_env_path()
-    load_dotenv(str(backend_env_path))
+    load_dotenv(backend_env_path)
     skyvern_base_url = os.environ.get("SKYVERN_BASE_URL", "")
     skyvern_api_key = os.environ.get("SKYVERN_API_KEY", "")
     if not skyvern_base_url or not skyvern_api_key:

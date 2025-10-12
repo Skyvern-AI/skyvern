@@ -10,9 +10,9 @@ from skyvern.utils.env_paths import resolve_backend_env_path
 # singleton instantiation at the bottom of this file also runs at import time
 # and relies on the same assumption.
 _DEFAULT_ENV_FILES = (
-    str(resolve_backend_env_path(".env")),
-    str(resolve_backend_env_path(".env.staging")),
-    str(resolve_backend_env_path(".env.prod")),
+    resolve_backend_env_path(".env"),
+    resolve_backend_env_path(".env.staging"),
+    resolve_backend_env_path(".env.prod"),
 )
 
 
