@@ -20,7 +20,7 @@ def _write_env(path: Path, key: str, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.touch()
-    set_key(str(path), key, value)
+    set_key(path, key, value)
     LOG.info(".env written", path=str(path), key=key)
 
 
