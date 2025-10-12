@@ -288,7 +288,8 @@ class WorkflowRunModel(Base):
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
-    job_id = Column(String, nullable=True)
+    job_id = Column(String, nullable=True, index=True)
+    depends_on_workflow_run_id = Column(String, nullable=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
@@ -806,6 +807,7 @@ class OrganizationBitwardenCollectionModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
 
 
 class CredentialModel(Base):
@@ -813,10 +815,16 @@ class CredentialModel(Base):
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
+    vault_type = Column(String, nullable=True)
     item_id = Column(String, nullable=True)
 
     name = Column(String, nullable=False)
     credential_type = Column(String, nullable=False)
+    username = Column(String, nullable=True)
+    totp_type = Column(String, nullable=False, default="none")
+    totp_identifier = Column(String, nullable=True, default=None)
+    card_last4 = Column(String, nullable=True)
+    card_brand = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

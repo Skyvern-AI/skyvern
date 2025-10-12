@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
@@ -73,6 +73,13 @@ class ParameterYAML(BaseModel, abc.ABC):
     parameter_type: ParameterType
     key: str
     description: str | None = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_no_whitespace(cls, v: str) -> str:
+        if any(char in v for char in [" ", "\t", "\n", "\r"]):
+            raise ValueError("Key cannot contain whitespaces")
+        return v
 
 
 class AWSSecretParameterYAML(ParameterYAML):

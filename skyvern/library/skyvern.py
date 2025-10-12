@@ -1,5 +1,4 @@
 import asyncio
-import os
 import typing
 from typing import Any
 
@@ -28,6 +27,7 @@ from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine, RunStatus, RunType
 from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.utils import migrate_db
+from skyvern.utils.env_paths import resolve_backend_env_path
 
 
 class Skyvern(AsyncSkyvern):
@@ -54,10 +54,11 @@ class Skyvern(AsyncSkyvern):
             httpx_client=httpx_client,
         )
         if base_url is None and api_key is None:
-            if not os.path.exists(".env"):
+            env_path = resolve_backend_env_path()
+            if not env_path.exists():
                 raise Exception("No .env file found. Please run 'skyvern init' first to set up your environment.")
 
-            load_dotenv(".env")
+            load_dotenv(env_path)
             migrate_db()
 
         self._api_key = api_key

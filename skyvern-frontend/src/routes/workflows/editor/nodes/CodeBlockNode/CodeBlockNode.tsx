@@ -9,6 +9,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { deepEqualStringArrays } from "@/util/equality";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { updateNodeData } = useReactFlow();
@@ -64,10 +65,20 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
           <WorkflowBlockInputSet
             nodeId={id}
             onChange={(parameterKeys) => {
+              const differs = !deepEqualStringArrays(
+                inputs.parameterKeys,
+                Array.from(parameterKeys),
+              );
+
+              if (!differs) {
+                return;
+              }
+
               setInputs({
                 ...inputs,
                 parameterKeys: Array.from(parameterKeys),
               });
+
               updateNodeData(id, { parameterKeys: Array.from(parameterKeys) });
             }}
             values={new Set(inputs.parameterKeys ?? [])}

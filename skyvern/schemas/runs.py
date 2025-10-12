@@ -371,7 +371,7 @@ class WorkflowRunRequest(BaseModel):
     )
     webhook_url: str | None = Field(
         default=None,
-        description="URL to send workflow status updates to after a run is finished. Refer to https://docs.skyvern.com/running-tasks/webhooks-faq for webhook questions.",
+        description="URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions.",
     )
     totp_url: str | None = Field(
         default=None,

@@ -24,8 +24,15 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, ExtractAction, InputTextAction, SelectOption
-from skyvern.webeye.actions.handler import handle_input_text_action, handle_select_option_action
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionStatus,
+    ExtractAction,
+    InputTextAction,
+    SelectOption,
+    SolveCaptchaAction,
+)
+from skyvern.webeye.actions.handler import ActionHandler, handle_input_text_action, handle_select_option_action
 from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
@@ -339,6 +346,9 @@ class SkyvernPage:
             # Create action record. TODO: store more action fields
             kwargs = kwargs or {}
             # we're using "value" instead of "text" for input text actions interface
+            xpath = kwargs.get("xpath")
+            if action_type == ActionType.CLICK:
+                xpath = call_result or xpath
             text = None
             select_option = None
             response: str | None = kwargs.get("response")
@@ -369,6 +379,7 @@ class SkyvernPage:
                 option=select_option,
                 file_url=file_url,
                 response=response,
+                xpath=xpath,
                 created_by="script",
             )
             data_extraction_goal = None
@@ -454,7 +465,7 @@ class SkyvernPage:
 
     ######### Public Interfaces #########
     @action_wrap(ActionType.CLICK)
-    async def click(self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+    async def click(self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None) -> str:
         """Click an element identified by ``xpath``.
 
         When ``intention`` and ``data`` are provided a new click action is
@@ -497,6 +508,7 @@ class SkyvernPage:
 
         locator = self.page.locator(f"xpath={new_xpath}")
         await locator.click(timeout=5000)
+        return new_xpath
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def fill(
@@ -610,6 +622,7 @@ class SkyvernPage:
                     template="script-generation-input-text-generatiion",
                     intention=intention,
                     goal=prompt,
+                    data=data,
                 )
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                     prompt=script_generation_input_text_prompt,
@@ -747,10 +760,24 @@ class SkyvernPage:
         return
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)
-    async def solve_captcha(
-        self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None
-    ) -> None:
-        await asyncio.sleep(30)
+    async def solve_captcha(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+        context = skyvern_context.current()
+        if not context or not context.organization_id or not context.task_id or not context.step_id:
+            await asyncio.sleep(30)
+            return None
+
+        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        if task and step:
+            solve_captcha_handler = ActionHandler._handled_action_types[ActionType.SOLVE_CAPTCHA]
+            action = SolveCaptchaAction(
+                organization_id=context.organization_id,
+                task_id=context.task_id,
+                step_id=context.step_id,
+            )
+            await solve_captcha_handler(action, self.page, self.scraped_page, task, step)
+        else:
+            await asyncio.sleep(30)
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(

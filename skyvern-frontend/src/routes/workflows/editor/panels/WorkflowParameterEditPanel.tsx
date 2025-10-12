@@ -73,6 +73,7 @@ function WorkflowParameterEditPanel({
 }: Props) {
   const isCloud = useContext(CloudContext);
   const [key, setKey] = useState(initialValues.key);
+  const hasWhitespace = /\s/.test(key);
   const isBitwardenCredential =
     initialValues.parameterType === "credential" &&
     parameterIsBitwardenCredential(initialValues);
@@ -192,6 +193,11 @@ function WorkflowParameterEditPanel({
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Key</Label>
             <Input value={key} onChange={(e) => setKey(e.target.value)} />
+            {hasWhitespace && (
+              <p className="text-xs text-destructive">
+                Spaces are not allowed, consider using _
+              </p>
+            )}
           </div>
           <div className="space-y-1">
             <Label className="text-xs text-slate-300">Description</Label>
@@ -477,6 +483,15 @@ function WorkflowParameterEditPanel({
                     variant: "destructive",
                     title: "Failed to save parameter",
                     description: "Key is required",
+                  });
+                  return;
+                }
+                if (hasWhitespace) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to save parameter",
+                    description:
+                      "Key cannot contain whitespace characters. Consider using underscores (_) instead.",
                   });
                   return;
                 }

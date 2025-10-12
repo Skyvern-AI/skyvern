@@ -12,7 +12,11 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.exceptions import (
+    BrowserSessionNotRenewable,
+    CannotUpdateWorkflowDueToCodeCache,
+    MissingBrowserAddressError,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -49,6 +53,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     OrganizationUpdate,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.prompts import CreateFromPromptRequest
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
@@ -93,6 +98,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.services.pdf_import_service import pdf_import_service
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -531,18 +537,21 @@ async def create_workflow(
     include_in_schema=False,
 )
 async def create_workflow_from_prompt(
-    data: TaskV2Request,
+    data: CreateFromPromptRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
+    task_version = data.task_version or "v2"
+    request = data.request
+
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(
             "Overriding max steps for workflow-from-prompt",
             max_iterations_override=x_max_iterations_override,
             max_steps_override=x_max_steps_override,
         )
-    await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
+    await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=request.browser_session_id)
 
     if isinstance(x_max_iterations_override, str):
         try:
@@ -555,27 +564,70 @@ async def create_workflow_from_prompt(
             x_max_steps_override = int(x_max_steps_override)
         except ValueError:
             x_max_steps_override = None
+
     try:
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_prompt(
             organization=organization,
-            user_prompt=data.user_prompt,
-            totp_identifier=data.totp_identifier,
-            totp_verification_url=data.totp_verification_url,
-            webhook_callback_url=data.webhook_callback_url,
-            proxy_location=data.proxy_location,
-            max_screenshot_scrolling_times=data.max_screenshot_scrolls,
-            extra_http_headers=data.extra_http_headers,
+            user_prompt=request.user_prompt,
+            totp_identifier=request.totp_identifier,
+            totp_verification_url=request.totp_verification_url,
+            webhook_callback_url=request.webhook_callback_url,
+            proxy_location=request.proxy_location,
+            max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+            extra_http_headers=request.extra_http_headers,
             max_iterations=x_max_iterations_override,
             max_steps=x_max_steps_override,
-            status=WorkflowStatus.published if data.publish_workflow else WorkflowStatus.auto_generated,
-            run_with=data.run_with,
-            ai_fallback=data.ai_fallback,
+            status=WorkflowStatus.published if request.publish_workflow else WorkflowStatus.auto_generated,
+            run_with=request.run_with,
+            ai_fallback=request.ai_fallback if request.ai_fallback is not None else True,
+            task_version=task_version,
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
         raise FailedToCreateWorkflow(str(e))
 
     return workflow.model_dump(by_alias=True)
+
+
+@legacy_base_router.post(
+    "/workflows/import-pdf",
+    response_model=dict[str, Any],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "import_workflow_from_pdf",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "curl",
+                        "code": 'curl -X POST "https://api.skyvern.com/workflows/import-pdf" \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -F "file=@sop_document.pdf"',
+                    }
+                ]
+            }
+        ],
+    },
+    description="Import a workflow from a PDF containing Standard Operating Procedures",
+    summary="Import workflow from PDF",
+    responses={
+        200: {"description": "Successfully imported workflow from PDF"},
+        400: {"description": "Invalid PDF file or no content found"},
+        422: {"description": "Failed to convert SOP to workflow"},
+        500: {"description": "Internal server error during processing"},
+    },
+)
+@legacy_base_router.post(
+    "/workflows/import-pdf/",
+    response_model=dict[str, Any],
+    include_in_schema=False,
+)
+async def import_workflow_from_pdf(
+    file: UploadFile,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, Any]:
+    """Import a workflow from a PDF file containing Standard Operating Procedures."""
+    analytics.capture("skyvern-oss-workflow-import-pdf")
+
+    return await pdf_import_service.import_workflow_from_pdf(file, current_org)
 
 
 @legacy_base_router.put(
@@ -607,6 +659,7 @@ async def update_workflow_legacy(
         ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    delete_code_cache_is_ok: bool = Query(False),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
     # validate the workflow
@@ -622,7 +675,13 @@ async def update_workflow_legacy(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
+            delete_code_cache_is_ok=delete_code_cache_is_ok,
         )
+    except CannotUpdateWorkflowDueToCodeCache as e:
+        raise HTTPException(
+            status_code=422,
+            detail=str(e),
+        ) from e
     except WorkflowParameterMissingRequiredValue as e:
         raise e
     except Exception as e:
