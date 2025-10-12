@@ -2,10 +2,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import SKYVERN_DIR
+from skyvern.utils.env_paths import resolve_backend_env_path
+
+# NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
+# the process has changed dir to the desired project root by this time.
+# Even if we were to resolve paths at instantiation time, the global `settings`
+# singleton instantiation at the bottom of this file also runs at import time
+# and relies on the same assumption.
+_DEFAULT_ENV_FILES = (
+    resolve_backend_env_path(".env"),
+    resolve_backend_env_path(".env.staging"),
+    resolve_backend_env_path(".env.prod"),
+)
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=(".env", ".env.staging", ".env.prod"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore")
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
@@ -294,6 +306,16 @@ class Settings(BaseSettings):
     BITWARDEN_MASTER_PASSWORD: str | None = None
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
+
+    # Where credentials are stored: bitwarden or azure_vault
+    CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+
+    # Azure Setting
+    AZURE_TENANT_ID: str | None = None
+    AZURE_CLIENT_ID: str | None = None
+    AZURE_CLIENT_SECRET: str | None = None
+    # The Azure Key Vault name to store credentials
+    AZURE_CREDENTIAL_VAULT: str | None = None
 
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None

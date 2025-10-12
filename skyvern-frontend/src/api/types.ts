@@ -423,6 +423,7 @@ export type Createv2TaskRequest = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
+  totp_type: "authenticator" | "email" | "text" | "none";
 };
 
 export type CreditCardCredentialApiResponse = {
@@ -459,6 +460,7 @@ export type PasswordCredential = {
   username: string;
   password: string;
   totp: string | null;
+  totp_type: "authenticator" | "email" | "text" | "none";
 };
 
 export type CreditCardCredential = {
@@ -487,4 +489,4 @@ export type PylonEmailHash = {
   hash: string;
 };
 
-export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 600 as const;
+export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;

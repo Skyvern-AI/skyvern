@@ -17,6 +17,7 @@ import {
   WorkflowRunOverviewActiveElement,
 } from "@/routes/workflows/workflowRun/WorkflowRunOverview";
 import { WorkflowRunTimelineBlockItem } from "@/routes/workflows/workflowRun/WorkflowRunTimelineBlockItem";
+import { cn } from "@/util/utils";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -54,8 +55,15 @@ function DebuggerRunTimeline({
     return total + 0;
   }, 0);
 
+  const firstActionOrThoughtIsPending =
+    !workflowRunIsFinalized && workflowRunTimeline.length === 0;
+
   return (
-    <div className="w-full min-w-0 space-y-4 rounded p-4">
+    <div
+      className={cn("w-full min-w-0 space-y-4 rounded p-4", {
+        "animate-pulse": firstActionOrThoughtIsPending,
+      })}
+    >
       <div className="grid w-full grid-cols-2 gap-2">
         <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
           Actions: {numberOfActions}
@@ -64,40 +72,55 @@ function DebuggerRunTimeline({
           Steps: {workflowRun.total_steps ?? 0}
         </div>
       </div>
-      {!workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
-        <Skeleton className="h-full w-full" />
-      )}
       <ScrollArea>
         <ScrollAreaViewport className="h-full w-full">
           <div className="w-full space-y-4">
             {workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
               <div>Workflow timeline is empty</div>
             )}
-            {workflowRunTimeline?.map((timelineItem) => {
+            {!workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
+              <div className="flex h-full w-full items-center justify-center">
+                Formulating actions...
+              </div>
+            )}
+            {workflowRunTimeline?.map((timelineItem, i) => {
               if (isBlockItem(timelineItem)) {
                 return (
-                  <WorkflowRunTimelineBlockItem
+                  <div
+                    className={cn({
+                      "animate-pulse": !workflowRunIsFinalized && i === 0,
+                    })}
                     key={timelineItem.block.workflow_run_block_id}
-                    subItems={timelineItem.children}
-                    activeItem={activeItem}
-                    block={timelineItem.block}
-                    onActionClick={onActionItemSelected}
-                    onBlockItemClick={onBlockItemSelected}
-                    onThoughtCardClick={onObserverThoughtCardSelected}
-                  />
+                  >
+                    <WorkflowRunTimelineBlockItem
+                      subItems={timelineItem.children}
+                      activeItem={activeItem}
+                      block={timelineItem.block}
+                      onActionClick={onActionItemSelected}
+                      onBlockItemClick={onBlockItemSelected}
+                      onThoughtCardClick={onObserverThoughtCardSelected}
+                    />
+                  </div>
                 );
               }
               if (isThoughtItem(timelineItem)) {
                 return (
-                  <ThoughtCard
+                  <div
+                    className={cn({
+                      "animate-pulse": !workflowRunIsFinalized && i === 0,
+                    })}
                     key={timelineItem.thought.thought_id}
-                    active={
-                      isObserverThought(activeItem) &&
-                      activeItem.thought_id === timelineItem.thought.thought_id
-                    }
-                    onClick={onObserverThoughtCardSelected}
-                    thought={timelineItem.thought}
-                  />
+                  >
+                    <ThoughtCard
+                      active={
+                        isObserverThought(activeItem) &&
+                        activeItem.thought_id ===
+                          timelineItem.thought.thought_id
+                      }
+                      onClick={onObserverThoughtCardSelected}
+                      thought={timelineItem.thought}
+                    />
+                  </div>
                 );
               }
             })}

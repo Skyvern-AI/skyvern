@@ -11,6 +11,7 @@ import { ActionCardMinimal } from "./ActionCardMinimal";
 import { Status } from "@/api/types";
 import { ThoughtCardMinimal } from "./ThoughtCardMinimal";
 import { ItemStatusIndicator } from "./ItemStatusIndicator";
+import { cn } from "@/util/utils";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -30,7 +31,11 @@ function WorkflowRunTimelineBlockItemMinimal({ block, subItems }: Props) {
       block.status === Status.Canceled);
 
   return (
-    <div className="flex flex-col items-center justify-center gap-2">
+    <div
+      className={cn("flex flex-col items-center justify-center gap-2", {
+        "rounded-lg bg-slate-elevation4 pl-2 pr-3 pt-4": actions.length > 0,
+      })}
+    >
       <Tip
         content={workflowBlockTitle[block.block_type] ?? null}
         asChild={false}

@@ -136,8 +136,48 @@ function PromptBox() {
   const { setAutoplay } = useAutoplayStore();
 
   const generateWorkflowMutation = useMutation({
-    mutationFn: async (prompt: string) => {
+    mutationFn: async ({
+      prompt,
+      version,
+    }: {
+      prompt: string;
+      version: string;
+    }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
+      const v = version === "v1" ? "v1" : "v2";
+
+      const request: Record<string, unknown> = {
+        user_prompt: prompt,
+        webhook_callback_url: webhookCallbackUrl,
+        proxy_location: proxyLocation,
+        totp_identifier: totpIdentifier,
+        max_screenshot_scrolls: maxScreenshotScrolls,
+        publish_workflow: publishWorkflow,
+        run_with: "code",
+        ai_fallback: true,
+        extracted_information_schema: dataSchema
+          ? (() => {
+              try {
+                return JSON.parse(dataSchema);
+              } catch (e) {
+                return dataSchema;
+              }
+            })()
+          : null,
+        extra_http_headers: extraHttpHeaders
+          ? (() => {
+              try {
+                return JSON.parse(extraHttpHeaders);
+              } catch (e) {
+                return extraHttpHeaders;
+              }
+            })()
+          : null,
+      };
+
+      if (v === "v1") {
+        request.url = "https://google.com"; // a stand-in value; real url is generated via prompt
+      }
 
       const result = await client.post<
         Createv2TaskRequest,
@@ -145,32 +185,8 @@ function PromptBox() {
       >(
         "/workflows/create-from-prompt",
         {
-          user_prompt: prompt,
-          webhook_callback_url: webhookCallbackUrl,
-          proxy_location: proxyLocation,
-          totp_identifier: totpIdentifier,
-          max_screenshot_scrolls: maxScreenshotScrolls,
-          publish_workflow: publishWorkflow,
-          run_with: "code",
-          ai_fallback: true,
-          extracted_information_schema: dataSchema
-            ? (() => {
-                try {
-                  return JSON.parse(dataSchema);
-                } catch (e) {
-                  return dataSchema;
-                }
-              })()
-            : null,
-          extra_http_headers: extraHttpHeaders
-            ? (() => {
-                try {
-                  return JSON.parse(extraHttpHeaders);
-                } catch (e) {
-                  return extraHttpHeaders;
-                }
-              })()
-            : null,
+          task_version: v,
+          request,
         },
         {
           headers: {
@@ -313,7 +329,10 @@ function PromptBox() {
                       <PaperPlaneIcon
                         className="size-6 cursor-pointer"
                         onClick={async () => {
-                          generateWorkflowMutation.mutate(prompt);
+                          generateWorkflowMutation.mutate({
+                            prompt,
+                            version: selectValue,
+                          });
                         }}
                       />
                     )}
@@ -514,7 +533,10 @@ function PromptBox() {
               icon={example.icon}
               label={example.label}
               onClick={() => {
-                generateWorkflowMutation.mutate(example.prompt);
+                generateWorkflowMutation.mutate({
+                  prompt: example.prompt,
+                  version: "v2",
+                });
               }}
             />
           );

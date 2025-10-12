@@ -32,6 +32,18 @@ class ParameterType(StrEnum):
     CREDENTIAL = "credential"
     AZURE_SECRET = "azure_secret"
 
+    def is_secret_or_credential(self) -> bool:
+        return self in [
+            ParameterType.AWS_SECRET,
+            ParameterType.BITWARDEN_LOGIN_CREDENTIAL,
+            ParameterType.BITWARDEN_SENSITIVE_INFORMATION,
+            ParameterType.BITWARDEN_CREDIT_CARD_DATA,
+            ParameterType.ONEPASSWORD,
+            ParameterType.AZURE_VAULT_CREDENTIAL,
+            ParameterType.CREDENTIAL,
+            ParameterType.AZURE_SECRET,
+        ]
+
 
 class Parameter(BaseModel, abc.ABC):
     # TODO (kerem): Should we also have organization_id here?
@@ -186,6 +198,9 @@ class WorkflowParameterType(StrEnum):
     JSON = "json"
     FILE_URL = "file_url"
     CREDENTIAL_ID = "credential_id"
+
+    def is_credential_type(self) -> bool:
+        return self == WorkflowParameterType.CREDENTIAL_ID
 
     def convert_value(self, value: Any) -> str | int | float | bool | dict | list | None:
         if value is None:

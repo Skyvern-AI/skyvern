@@ -90,3 +90,13 @@ class TraceManager:
     @staticmethod
     def set_trace_provider(trace_provider: BaseTrace) -> None:
         TraceManager.__instance = trace_provider
+
+    @staticmethod
+    def add_task_completion_tag(status: str) -> None:
+        """Add a completion tag to the current trace based on task/workflow status."""
+        TraceManager.__instance.add_task_completion_tag(status)
+
+    @staticmethod
+    def add_experiment_metadata(experiment_data: dict[str, Any]) -> None:
+        """Add experiment metadata to the current trace."""
+        TraceManager.__instance.add_experiment_metadata(experiment_data)

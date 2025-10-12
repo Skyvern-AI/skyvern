@@ -13,7 +13,11 @@ from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
+from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
+from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.trace.lmnr import LaminarTrace
@@ -94,6 +98,21 @@ WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
 WORKFLOW_SERVICE = WorkflowService()
 AGENT_FUNCTION = AgentFunction()
 PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=DATABASE)
+
+BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService = BitwardenCredentialVaultService()
+AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None = None
+if SettingsManager.get_settings().AZURE_CREDENTIAL_VAULT:
+    AZURE_CREDENTIAL_VAULT_SERVICE = AzureCredentialVaultService(
+        tenant_id=SettingsManager.get_settings().AZURE_TENANT_ID,  # type: ignore
+        client_id=SettingsManager.get_settings().AZURE_CLIENT_ID,  # type: ignore
+        client_secret=SettingsManager.get_settings().AZURE_CLIENT_SECRET,  # type: ignore
+        vault_name=SettingsManager.get_settings().AZURE_CREDENTIAL_VAULT,  # type: ignore
+    )
+CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None] = {
+    CredentialVaultType.BITWARDEN: BITWARDEN_CREDENTIAL_VAULT_SERVICE,
+    CredentialVaultType.AZURE_VAULT: AZURE_CREDENTIAL_VAULT_SERVICE,
+}
+
 scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 authenticate_user_function: Callable[[str], Awaitable[str | None]] | None = None

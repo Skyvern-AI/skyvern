@@ -288,7 +288,7 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=8192,
+            max_completion_tokens=64000,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -308,7 +308,7 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=8192,
+            max_completion_tokens=32000,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -318,7 +318,17 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=8192,
+            max_completion_tokens=64000,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.5_SONNET",
+        LLMConfig(
+            "anthropic/claude-sonnet-4-5-20250929",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=64000,
         ),
     )
 

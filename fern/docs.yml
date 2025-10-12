@@ -43,7 +43,7 @@ tabs:
   blog:
     display-name: Blog
     icon: newspaper
-    href: https://blog.skyvern.com
+    href: https://www.skyvern.com/blog
   community:
     display-name: Community
     icon: fa-brands fa-discord
