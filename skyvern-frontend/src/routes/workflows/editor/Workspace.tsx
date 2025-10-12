@@ -416,6 +416,18 @@ function Workspace({
   }, []);
 
   useEffect(() => {
+    if (isFinalized) {
+      queryClient.invalidateQueries({
+        queryKey: ["block-scripts"],
+      });
+
+      queryClient.invalidateQueries({
+        queryKey: ["cache-key-values"],
+      });
+    }
+  }, [isFinalized, queryClient, workflowRun]);
+
+  useEffect(() => {
     blockScriptStore.setScripts(blockScriptsPublished ?? {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blockScriptsPublished]);

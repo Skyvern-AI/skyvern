@@ -17,6 +17,7 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   debuggableWorkflowBlockTypes,
@@ -67,6 +68,7 @@ type Payload = Record<string, unknown> & {
   totp_url: string | null;
   webhook_url: string | null;
   workflow_id: string;
+  code_gen: boolean | null;
 };
 
 const getPayload = (opts: {
@@ -169,6 +171,9 @@ function NodeHeader({
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const { data: debugSession } = useDebugSessionQuery({
+    workflowPermanentId,
+  });
+  const { data: workflow } = useWorkflowQuery({
     workflowPermanentId,
   });
   const saveWorkflow = useWorkflowSave();
@@ -458,7 +463,10 @@ function NodeHeader({
   });
 
   const handleOnPlay = () => {
-    runBlock.mutate({ codeGen: false });
+    const numBlocksInWorkflow = (workflow?.workflow_definition.blocks ?? [])
+      .length;
+
+    runBlock.mutate({ codeGen: numBlocksInWorkflow === 1 });
   };
 
   const handleOnCancel = () => {
