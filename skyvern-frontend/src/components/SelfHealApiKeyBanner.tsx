@@ -86,9 +86,16 @@ function SelfHealApiKeyBanner() {
       const response = await client.post<{
         fingerprint?: string;
         api_key?: string;
+        backend_env_path?: string;
+        frontend_env_path?: string;
       }>("/internal/auth/repair");
 
-      const { fingerprint, api_key: apiKey } = response.data;
+      const {
+        fingerprint,
+        api_key: apiKey,
+        backend_env_path: backendEnvPath,
+        frontend_env_path: frontendEnvPath,
+      } = response.data;
 
       if (!apiKey) {
         throw new Error("Repair succeeded but no API key was returned.");
@@ -100,9 +107,29 @@ function SelfHealApiKeyBanner() {
         ? ` (fingerprint ${fingerprint})`
         : "";
 
+      const pathsElements = [];
+      if (backendEnvPath) {
+        pathsElements.push(<div key="backend">Backend: {backendEnvPath}</div>);
+      }
+      if (frontendEnvPath) {
+        pathsElements.push(
+          <div key="frontend">Frontend: {frontendEnvPath}</div>,
+        );
+      }
+
       toast({
         title: "API key regenerated",
-        description: `Requests now use the updated key automatically${fingerprintSuffix}.`,
+        description: (
+          <div>
+            <div>
+              Requests now use the updated key automatically{fingerprintSuffix}{" "}
+              written to the following .env paths:
+            </div>
+            {pathsElements.length > 0 && (
+              <div className="mt-2 space-y-2">{pathsElements}</div>
+            )}
+          </div>
+        ),
       });
 
       await refetch({ throwOnError: false });

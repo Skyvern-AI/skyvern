@@ -42,8 +42,12 @@ async def ensure_local_org() -> Organization:
     )
 
 
-async def regenerate_local_api_key() -> tuple[str, str]:
-    """Create a fresh API key for the local organization and persist it to env files."""
+async def regenerate_local_api_key() -> tuple[str, str, str, str | None]:
+    """Create a fresh API key for the local organization and persist it to env files.
+
+    Returns:
+        tuple: (api_key, org_id, backend_env_path, frontend_env_path_or_none)
+    """
     organization = await ensure_local_org()
     org_id = organization.organization_id
 
@@ -76,4 +80,4 @@ async def regenerate_local_api_key() -> tuple[str, str]:
         organization_id=org_id,
         fingerprint=fingerprint_token(api_key),
     )
-    return api_key, org_id
+    return api_key, org_id, str(backend_env_path), str(frontend_env_path) if frontend_env_path else None

@@ -109,14 +109,20 @@ def _emit_diagnostics(result: DiagnosticsResult) -> dict[str, object]:
 async def repair_api_key(request: Request) -> dict[str, object]:
     _require_local_access(request)
 
-    token, organization_id = await regenerate_local_api_key()
+    token, organization_id, backend_env_path, frontend_env_path = await regenerate_local_api_key()
 
-    return {
+    response: dict[str, object] = {
         "status": AuthStatus.ok.value,
         "organization_id": organization_id,
         "fingerprint": fingerprint_token(token),
         "api_key": token,
+        "backend_env_path": backend_env_path,
     }
+
+    if frontend_env_path:
+        response["frontend_env_path"] = frontend_env_path
+
+    return response
 
 
 @router.get("/status", include_in_schema=False)
