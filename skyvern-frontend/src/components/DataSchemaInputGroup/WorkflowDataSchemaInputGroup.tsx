@@ -42,8 +42,6 @@ function WorkflowDataSchemaInputGroup({
     return TSON.parse(value);
   }, [value]);
 
-  console.log({ tsonResult });
-
   const getDataSchemaSuggestionMutation = useMutation({
     mutationFn: async () => {
       const client = await getClient(credentialGetter);

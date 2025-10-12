@@ -8,6 +8,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialResponse,
     CredentialType,
+    CredentialVaultType,
     CreditCardCredentialResponse,
     PasswordCredentialResponse,
 )
@@ -40,12 +41,11 @@ class BitwardenCredentialVaultService(CredentialVaultService):
             credential=data.credential,
         )
 
-        credential = await app.DATABASE.create_credential(
+        credential = await self._create_db_credential(
             organization_id=organization_id,
+            data=data,
             item_id=item_id,
-            name=data.name,
-            credential_type=data.credential_type,
-            totp_type=data.credential.totp_type if hasattr(data.credential, "totp_type") else "none",
+            vault_type=CredentialVaultType.BITWARDEN,
         )
 
         return credential

@@ -194,7 +194,7 @@ function PasswordCredentialContent({
                   </Link>{" "}
                   or{" "}
                   <Link
-                    to="https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp"
+                    to="https://www.skyvern.com/docs/running-tasks/advanced-features#time-based-one-time-password-totp"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="underline underline-offset-2"
