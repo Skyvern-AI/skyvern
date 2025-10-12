@@ -130,6 +130,35 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class GetRunResponse_GeminiCua(UniversalBaseModel):
+    run_type: typing.Literal["gemini_cua"] = "gemini_cua"
+    run_id: str
+    status: RunStatus
+    output: typing.Optional[TaskRunResponseOutput] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
+    screenshot_urls: typing.Optional[typing.List[str]] = None
+    failure_reason: typing.Optional[str] = None
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    queued_at: typing.Optional[dt.datetime] = None
+    started_at: typing.Optional[dt.datetime] = None
+    finished_at: typing.Optional[dt.datetime] = None
+    app_url: typing.Optional[str] = None
+    browser_session_id: typing.Optional[str] = None
+    max_screenshot_scrolls: typing.Optional[int] = None
+    run_request: typing.Optional[TaskRunRequest] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class GetRunResponse_UiTars(UniversalBaseModel):
     run_type: typing.Literal["ui_tars"] = "ui_tars"
     run_id: str
@@ -193,6 +222,7 @@ GetRunResponse = typing.Union[
     GetRunResponse_TaskV2,
     GetRunResponse_OpenaiCua,
     GetRunResponse_AnthropicCua,
+    GetRunResponse_GeminiCua,
     GetRunResponse_UiTars,
     GetRunResponse_WorkflowRun,
 ]

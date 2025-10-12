@@ -197,6 +197,8 @@ async def run_task(
             run_type = RunType.openai_cua
         elif run_request.engine == RunEngine.anthropic_cua:
             run_type = RunType.anthropic_cua
+        elif run_request.engine == RunEngine.gemini_cua:
+            run_type = RunType.gemini_cua
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,

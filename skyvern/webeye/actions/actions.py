@@ -153,6 +153,19 @@ class ReloadPageAction(Action):
     action_type: ActionType = ActionType.RELOAD_PAGE
 
 
+class NavigateAction(Action):
+    action_type: ActionType = ActionType.NAVIGATE
+    url: str
+
+
+class GoBackAction(Action):
+    action_type: ActionType = ActionType.GO_BACK
+
+
+class GoForwardAction(Action):
+    action_type: ActionType = ActionType.GO_FORWARD
+
+
 class ClickAction(WebAction):
     action_type: ActionType = ActionType.CLICK
     file_url: str | None = None

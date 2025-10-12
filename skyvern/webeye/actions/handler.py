@@ -2142,6 +2142,67 @@ async def handle_verification_code_action(
 
 
 @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+async def handle_navigate_action(
+    action: actions.NavigateAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    try:
+        await page.goto(action.url, wait_until="domcontentloaded")
+        return [ActionSuccess()]
+    except Exception:
+        LOG.exception(
+            "Failed to navigate to URL",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            url=action.url,
+        )
+        return [ActionFailure(Exception(f"Failed to navigate to {action.url}"))]
+
+
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+async def handle_go_back_action(
+    action: actions.GoBackAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    try:
+        await page.go_back()
+        return [ActionSuccess()]
+    except Exception:
+        LOG.exception(
+            "Failed to go back in browser history",
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+        return [ActionFailure(Exception("Failed to go back in browser history"))]
+
+
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+async def handle_go_forward_action(
+    action: actions.GoForwardAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    try:
+        await page.go_forward()
+        return [ActionSuccess()]
+    except Exception:
+        LOG.exception(
+            "Failed to go forward in browser history",
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+        return [ActionFailure(Exception("Failed to go forward in browser history"))]
+
+
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_left_mouse_action(
     action: actions.LeftMouseAction,
     page: Page,
@@ -2170,6 +2231,9 @@ ActionHandler.register_action_type(ActionType.MOVE, handle_move_action)
 ActionHandler.register_action_type(ActionType.DRAG, handle_drag_action)
 ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verification_code_action)
 ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
+ActionHandler.register_action_type(ActionType.NAVIGATE, handle_navigate_action)
+ActionHandler.register_action_type(ActionType.GO_BACK, handle_go_back_action)
+ActionHandler.register_action_type(ActionType.GO_FORWARD, handle_go_forward_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:

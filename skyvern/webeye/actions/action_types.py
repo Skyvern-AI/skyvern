@@ -26,6 +26,9 @@ class ActionType(StrEnum):
     MOVE = "move"
     DRAG = "drag"
     LEFT_MOUSE = "left_mouse"
+    NAVIGATE = "navigate"
+    GO_BACK = "go_back"
+    GO_FORWARD = "go_forward"
 
     def is_web_action(self) -> bool:
         return self in [
