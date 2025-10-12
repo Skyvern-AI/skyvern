@@ -138,7 +138,7 @@ def run_ui() -> None:
     else:
         console.print(f"[red]ERROR: Backend .env file not found at {backend_env_path}[/red]")
 
-    os.chdir(str(frontend_dir))
+    os.chdir(frontend_dir)
 
     try:
         console.print("📦 [bold blue]Running npm install...[/bold blue]")
