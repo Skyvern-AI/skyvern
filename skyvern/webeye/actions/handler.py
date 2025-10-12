@@ -1293,8 +1293,10 @@ async def handle_input_text_action(
     # run `Locator.clear()` when:
     # 1. the element is not a spin button
     #   1.1. the element has a value attribute
-    #   1.2. the element is not common input tag
-    if not await skyvern_element.is_spinbtn_input() and (current_text or (tag_name not in COMMON_INPUT_TAGS)):
+    #   1.2. the element is not editable and not common input tag
+    if not await skyvern_element.is_spinbtn_input() and (
+        current_text or (not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS)
+    ):
         try:
             await skyvern_element.input_clear()
         except TimeoutError:
@@ -1359,7 +1361,7 @@ async def handle_input_text_action(
 
     try:
         # TODO: not sure if this case will trigger auto-completion
-        if tag_name not in COMMON_INPUT_TAGS:
+        if not await skyvern_element.is_editable() and tag_name not in COMMON_INPUT_TAGS:
             await skyvern_element.input_fill(text)
             return [ActionSuccess()]
 
@@ -3873,7 +3875,8 @@ async def get_input_value(tag_name: str, locator: Locator) -> str | None:
     if tag_name in COMMON_INPUT_TAGS:
         return await locator.input_value()
     # for span, div, p or other tags:
-    return await locator.inner_text()
+    # we need to trim the unicode space for these tags
+    return (await locator.inner_text()).replace("\xa0", " ").strip()
 
 
 class AbstractActionForContextParse(BaseModel):

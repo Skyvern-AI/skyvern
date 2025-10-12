@@ -198,6 +198,34 @@ function Workspace({
     splitLeft: useRef<HTMLInputElement>(null),
   };
 
+  const handleOnSave = async () => {
+    const errors = getWorkflowErrors(nodes);
+    if (errors.length > 0) {
+      toast({
+        title: "Encountered error while trying to save workflow:",
+        description: (
+          <div className="space-y-2">
+            {errors.map((error) => (
+              <p key={error}>{error}</p>
+            ))}
+          </div>
+        ),
+        variant: "destructive",
+      });
+      return;
+    }
+
+    await saveWorkflow.mutateAsync();
+
+    workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
+
+    queryClient.invalidateQueries({
+      queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
+    });
+
+    setCacheKeyValueFilter("");
+  };
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -386,6 +414,18 @@ function Workspace({
     return () => window.removeEventListener("resize", handleResize);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (isFinalized) {
+      queryClient.invalidateQueries({
+        queryKey: ["block-scripts"],
+      });
+
+      queryClient.invalidateQueries({
+        queryKey: ["cache-key-values"],
+      });
+    }
+  }, [isFinalized, queryClient, workflowRun]);
 
   useEffect(() => {
     blockScriptStore.setScripts(blockScriptsPublished ?? {});
@@ -678,16 +718,8 @@ function Workspace({
     version2: WorkflowVersion,
     mode: "visual" | "json" = "visual",
   ) => {
-    console.log(
-      `${mode === "visual" ? "Visual" : "JSON"} comparison between versions:`,
-      version1.version,
-      "and",
-      version2.version,
-    );
-
     // Implement visual drawer comparison
     if (mode === "visual") {
-      console.log("Opening visual comparison panel...");
       // Keep history panel active but add comparison data
       setWorkflowPanelState({
         active: true,
@@ -703,15 +735,13 @@ function Workspace({
     // TODO: Implement JSON diff comparison
     if (mode === "json") {
       // This will open a JSON diff view
-      console.log("Opening JSON diff view...");
+      console.warn("[Not Implemented] opening JSON diff view...");
       // Future: setJsonDiffOpen(true);
       // Future: setJsonDiffVersions({ version1, version2 });
     }
   };
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
-    console.log("Loading version into main editor:", selectedVersion.version);
-
     // Close panels
     setWorkflowPanelState({
       active: false,
@@ -797,6 +827,40 @@ function Workspace({
               {cycleBrowser.isPending && (
                 <ReloadIcon className="ml-2 size-4 animate-spin" />
               )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* confirm code cache deletion dialog */}
+      <Dialog
+        open={workflowChangesStore.showConfirmCodeCacheDeletion}
+        onOpenChange={(open) => {
+          !open && workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
+          !open && workflowChangesStore.setSaidOkToCodeCacheDeletion(false);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Are you sure?</DialogTitle>
+            <DialogDescription>
+              Saving will delete cached code, and Skyvern will re-generate it in
+              the next run. Proceed?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="secondary">Cancel</Button>
+            </DialogClose>
+            <Button
+              variant="default"
+              onClick={async () => {
+                workflowChangesStore.setSaidOkToCodeCacheDeletion(true);
+                await handleOnSave();
+                workflowChangesStore.setShowConfirmCodeCacheDeletion(false);
+              }}
+            >
+              Yes
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -914,30 +978,7 @@ function Workspace({
               });
             }
           }}
-          onSave={async () => {
-            const errors = getWorkflowErrors(nodes);
-            if (errors.length > 0) {
-              toast({
-                title: "Can not save workflow because of errors:",
-                description: (
-                  <div className="space-y-2">
-                    {errors.map((error) => (
-                      <p key={error}>{error}</p>
-                    ))}
-                  </div>
-                ),
-                variant: "destructive",
-              });
-              return;
-            }
-            await saveWorkflow.mutateAsync();
-
-            queryClient.invalidateQueries({
-              queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
-            });
-
-            setCacheKeyValueFilter("");
-          }}
+          onSave={async () => await handleOnSave()}
           onRun={() => {
             closeWorkflowPanel();
           }}
@@ -1098,19 +1139,12 @@ function Workspace({
         </>
       )}
 
-      {/* sub panels when in debug mode */}
+      {/* sub panels (but not node library panel) when in debug mode */}
       {showBrowser &&
         !workflowPanelState.data?.showComparison &&
-        workflowPanelState.active && (
-          <div
-            className="absolute right-6 top-[8.5rem] z-30"
-            style={{
-              height:
-                workflowPanelState.content === "nodeLibrary"
-                  ? "calc(100vh - 14rem)"
-                  : "unset",
-            }}
-          >
+        workflowPanelState.active &&
+        workflowPanelState.content !== "nodeLibrary" && (
+          <div className="absolute right-6 top-[8.5rem] z-20">
             {workflowPanelState.content === "cacheKeyValues" && (
               <WorkflowCacheKeyValuesPanel
                 cacheKeyValues={cacheKeyValues}
@@ -1133,10 +1167,16 @@ function Workspace({
             {workflowPanelState.content === "parameters" && (
               <WorkflowParametersPanel />
             )}
+            {workflowPanelState.content === "history" && (
+              <WorkflowHistoryPanel
+                workflowPermanentId={workflowPermanentId!}
+                onCompare={handleCompareVersions}
+              />
+            )}
           </div>
         )}
 
-      {/* code, infinite canvas, browser, and timeline when in debug mode */}
+      {/* code, infinite canvas, browser, timeline, and node library sub panel when in debug mode */}
       {showBrowser && !workflowPanelState.data?.showComparison && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
@@ -1208,107 +1248,65 @@ function Workspace({
               </div>
             </div>
 
-            {/* browser & timeline */}
             <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
-              {/* sub panels */}
-              {workflowPanelState.active && (
-                <div
-                  className={cn("absolute right-6 top-[8.5rem] z-30", {
-                    "left-6": workflowPanelState.content === "nodeLibrary",
-                  })}
-                  style={{
-                    height:
-                      workflowPanelState.content === "nodeLibrary"
-                        ? "calc(100vh - 14rem)"
-                        : "unset",
-                  }}
-                >
-                  {workflowPanelState.content === "cacheKeyValues" && (
-                    <WorkflowCacheKeyValuesPanel
-                      cacheKeyValues={cacheKeyValues}
-                      pending={cacheKeyValuesLoading}
-                      scriptKey={workflow.cache_key ?? "default"}
-                      onDelete={(cacheKeyValue) => {
-                        setToDeleteCacheKeyValue(cacheKeyValue);
-                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
-                      }}
-                      onPaginate={(page) => {
-                        setPage(page);
-                      }}
-                      onSelect={(cacheKeyValue) => {
-                        setCacheKeyValue(cacheKeyValue);
-                        setCacheKeyValueFilter("");
-                        closeWorkflowPanel();
-                      }}
-                    />
-                  )}
-                  {workflowPanelState.content === "parameters" && (
-                    <WorkflowParametersPanel />
-                  )}
-                  {workflowPanelState.content === "history" && (
-                    <WorkflowHistoryPanel
-                      workflowPermanentId={workflowPermanentId!}
-                      onCompare={handleCompareVersions}
-                    />
-                  )}
-                  {workflowPanelState.content === "nodeLibrary" && (
-                    <WorkflowNodeLibraryPanel
-                      onNodeClick={(props) => {
-                        addNode(props);
-                      }}
-                    />
-                  )}
-                </div>
-              )}
+              {/* node library sub panel */}
+              {workflowPanelState.active &&
+                workflowPanelState.content === "nodeLibrary" && (
+                  <div
+                    className="absolute left-6 top-[8.5rem] z-30"
+                    style={{
+                      height: "calc(100vh - 14rem)",
+                    }}
+                  >
+                    <div className="z-30 h-full w-[25rem]">
+                      <WorkflowNodeLibraryPanel
+                        onNodeClick={(props) => {
+                          addNode(props);
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
 
               {/* browser & timeline */}
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
                 {/* VNC browser */}
-                {!activeDebugSession ||
-                  (activeDebugSession.vnc_streaming_supported && (
-                    <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div key={reloadKey} className="w-full flex-1">
-                        {activeDebugSession &&
-                        activeDebugSession.browser_session_id &&
-                        !cycleBrowser.isPending ? (
-                          <BrowserStream
-                            interactive={true}
-                            browserSessionId={
-                              activeDebugSession.browser_session_id
-                            }
-                            showControlButtons={true}
-                            resizeTrigger={windowResizeTrigger}
-                          />
-                        ) : (
-                          <div className="flex aspect-video w-full flex-col items-center justify-center gap-2 rounded-md border border-slate-800 pb-2 pt-4 text-sm text-slate-400">
-                            Connecting to your browser...
-                            <AnimatedWave text=".‧₊˚ ⋅ ✨★ ‧₊˚ ⋅" />
-                          </div>
-                        )}
-                      </div>
-                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
-                        <div className="flex items-center gap-2">
-                          <GlobeIcon /> Live Browser
-                        </div>
-                        {showBreakoutButton && (
-                          <BreakoutButton onClick={() => breakout()} />
-                        )}
-                        <div
-                          className={cn("ml-auto flex items-center gap-2", {
-                            "mr-16": !blockLabel,
-                          })}
-                        >
-                          {showPowerButton && (
-                            <PowerButton onClick={() => cycle()} />
-                          )}
-                          <ReloadButton
-                            isReloading={isReloading}
-                            onClick={() => reload()}
-                          />
-                        </div>
-                      </footer>
+                {(!activeDebugSession ||
+                  activeDebugSession.vnc_streaming_supported) && (
+                  <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                    <div key={reloadKey} className="w-full flex-1">
+                      <BrowserStream
+                        interactive={true}
+                        browserSessionId={
+                          activeDebugSession?.browser_session_id
+                        }
+                        showControlButtons={true}
+                        resizeTrigger={windowResizeTrigger}
+                      />
                     </div>
-                  ))}
+                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                      <div className="flex items-center gap-2">
+                        <GlobeIcon /> Live Browser
+                      </div>
+                      {showBreakoutButton && (
+                        <BreakoutButton onClick={() => breakout()} />
+                      )}
+                      <div
+                        className={cn("ml-auto flex items-center gap-2", {
+                          "mr-16": !blockLabel,
+                        })}
+                      >
+                        {showPowerButton && (
+                          <PowerButton onClick={() => cycle()} />
+                        )}
+                        <ReloadButton
+                          isReloading={isReloading}
+                          onClick={() => reload()}
+                        />
+                      </div>
+                    </footer>
+                  </div>
+                )}
 
                 {/* Screenshot browser} */}
                 {activeDebugSession &&

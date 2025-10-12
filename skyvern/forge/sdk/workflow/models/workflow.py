@@ -143,6 +143,7 @@ class WorkflowRun(BaseModel):
     run_with: str | None = None
     script_run: ScriptRunResponse | None = None
     job_id: str | None = None
+    depends_on_workflow_run_id: str | None = None
     sequential_key: str | None = None
     ai_fallback: bool | None = None
     code_gen: bool | None = None

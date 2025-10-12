@@ -346,6 +346,9 @@ class SkyvernPage:
             # Create action record. TODO: store more action fields
             kwargs = kwargs or {}
             # we're using "value" instead of "text" for input text actions interface
+            xpath = kwargs.get("xpath")
+            if action_type == ActionType.CLICK:
+                xpath = call_result or xpath
             text = None
             select_option = None
             response: str | None = kwargs.get("response")
@@ -376,6 +379,7 @@ class SkyvernPage:
                 option=select_option,
                 file_url=file_url,
                 response=response,
+                xpath=xpath,
                 created_by="script",
             )
             data_extraction_goal = None
@@ -461,7 +465,7 @@ class SkyvernPage:
 
     ######### Public Interfaces #########
     @action_wrap(ActionType.CLICK)
-    async def click(self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+    async def click(self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None) -> str:
         """Click an element identified by ``xpath``.
 
         When ``intention`` and ``data`` are provided a new click action is
@@ -504,6 +508,7 @@ class SkyvernPage:
 
         locator = self.page.locator(f"xpath={new_xpath}")
         await locator.click(timeout=5000)
+        return new_xpath
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def fill(
@@ -755,9 +760,7 @@ class SkyvernPage:
         return
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)
-    async def solve_captcha(
-        self, xpath: str, intention: str | None = None, data: str | dict[str, Any] | None = None
-    ) -> None:
+    async def solve_captcha(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             await asyncio.sleep(30)

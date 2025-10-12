@@ -17,7 +17,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.schemas.credentials import PasswordCredential
+from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
@@ -295,16 +295,23 @@ class WorkflowRunContext:
             if db_credential is None:
                 raise CredentialParameterNotFoundError(credential_id)
 
-            bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
+            vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
+            credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+            if credential_service is None:
+                raise CredentialParameterNotFoundError(credential_id)
 
-            credential_item = bitwarden_credential.credential
+            credential_item = await credential_service.get_credential_item(db_credential)
+            credential = credential_item.credential
 
             self.parameters[parameter.key] = parameter
             self.values[parameter.key] = {
                 "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
             }
-            credential_dict = credential_item.model_dump()
+            credential_dict = credential.model_dump()
             for key, value in credential_dict.items():
+                # Exclude totp_type from navigation payload as it's metadata, not input data
+                if key == "totp_type":
+                    continue
                 if value is None:
                     continue
                 random_secret_id = self.generate_random_secret_id()
@@ -312,12 +319,12 @@ class WorkflowRunContext:
                 self.secrets[secret_id] = value
                 self.values[parameter.key][key] = secret_id
 
-            if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+            if isinstance(credential, PasswordCredential) and credential.totp is not None:
                 random_secret_id = self.generate_random_secret_id()
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = BitwardenConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-                self.secrets[totp_secret_value] = parse_totp_secret(credential_item.totp)
+                self.secrets[totp_secret_value] = parse_totp_secret(credential.totp)
                 self.values[parameter.key]["totp"] = totp_secret_id
         except Exception as e:
             LOG.error(f"Failed to get credential from database: {credential_id}. Error: {e}")
@@ -345,27 +352,34 @@ class WorkflowRunContext:
         if db_credential is None:
             raise CredentialParameterNotFoundError(credential_id)
 
-        bitwarden_credential = await BitwardenService.get_credential_item(db_credential.item_id)
+        vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
+        credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+        if credential_service is None:
+            raise CredentialParameterNotFoundError(credential_id)
 
-        credential_item = bitwarden_credential.credential
+        credential_item = await credential_service.get_credential_item(db_credential)
+        credential = credential_item.credential
 
         self.parameters[parameter.key] = parameter
         self.values[parameter.key] = {
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
         }
-        credential_dict = credential_item.model_dump()
+        credential_dict = credential.model_dump()
         for key, value in credential_dict.items():
+            # Exclude totp_type from navigation payload as it's metadata, not input data
+            if key == "totp_type":
+                continue
             random_secret_id = self.generate_random_secret_id()
             secret_id = f"{random_secret_id}_{key}"
             self.secrets[secret_id] = value
             self.values[parameter.key][key] = secret_id
 
-        if isinstance(credential_item, PasswordCredential) and credential_item.totp is not None:
+        if isinstance(credential, PasswordCredential) and credential.totp is not None:
             random_secret_id = self.generate_random_secret_id()
             totp_secret_id = f"{random_secret_id}_totp"
             self.secrets[totp_secret_id] = BitwardenConstants.TOTP
             totp_secret_value = self.totp_secret_value_key(totp_secret_id)
-            self.secrets[totp_secret_value] = parse_totp_secret(credential_item.totp)
+            self.secrets[totp_secret_value] = parse_totp_secret(credential.totp)
             self.values[parameter.key]["totp"] = totp_secret_id
 
     async def register_aws_secret_parameter_value(
@@ -394,13 +408,13 @@ class WorkflowRunContext:
         # If the parameter is an Azure secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
-        azure_vault_client = AsyncAzureVaultClient.create_default()
-        secret_value = await azure_vault_client.get_secret(parameter.azure_key, vault_name)
-        if secret_value is not None:
-            random_secret_id = self.generate_random_secret_id()
-            self.secrets[random_secret_id] = secret_value
-            self.values[parameter.key] = random_secret_id
-            self.parameters[parameter.key] = parameter
+        async with AsyncAzureVaultClient.create_default() as azure_vault_client:
+            secret_value = await azure_vault_client.get_secret(parameter.azure_key, vault_name)
+            if secret_value is not None:
+                random_secret_id = self.generate_random_secret_id()
+                self.secrets[random_secret_id] = secret_value
+                self.values[parameter.key] = random_secret_id
+                self.parameters[parameter.key] = parameter
 
     async def register_onepassword_credential_parameter_value(
         self, parameter: OnePasswordCredentialParameter, organization: Organization
@@ -422,13 +436,8 @@ class WorkflowRunContext:
             integration_name="Skyvern",
             integration_version="v1.0.0",
         )
-        item_id = parameter.item_id
-        vault_id = parameter.vault_id
-        if self.has_parameter(parameter.item_id) and self.has_value(parameter.item_id):
-            item_id = self.values[parameter.item_id]
-        if self.has_parameter(parameter.vault_id) and self.has_value(parameter.vault_id):
-            vault_id = self.values[parameter.vault_id]
-
+        item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
+        vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
         item = await client.items.get(vault_id, item_id)
 
         # Check if item is None
@@ -546,34 +555,27 @@ class WorkflowRunContext:
         parameter: AzureVaultCredentialParameter,
         organization: Organization,
     ) -> None:
-        vault_name = self._resolve_parameter_value(parameter.vault_name)
-        if not vault_name:
-            raise ValueError("Azure Vault Name is missing")
-        username_key = self._resolve_parameter_value(parameter.username_key)
-        if not username_key:
-            raise ValueError("Azure Username Key is missing")
-        password_key = self._resolve_parameter_value(parameter.password_key)
-        if not password_key:
-            raise ValueError("Azure Password Key is missing")
+        vault_name = self._resolve_required_parameter_value(parameter.vault_name, "Azure Vault Name")
+        username_key = self._resolve_required_parameter_value(parameter.username_key, "Azure Username Key")
+        password_key = self._resolve_required_parameter_value(parameter.password_key, "Azure Password Key")
 
         totp_secret_key = self._resolve_parameter_value(parameter.totp_secret_key)
 
-        azure_vault_client = await self._get_azure_vault_client_for_organization(organization)
+        async with await self._get_azure_vault_client_for_organization(organization) as azure_vault_client:
+            secret_username = await azure_vault_client.get_secret(username_key, vault_name)
+            if not secret_username:
+                raise ValueError(f"Azure Vault username not found by key: {username_key}")
 
-        secret_username = await azure_vault_client.get_secret(username_key, vault_name)
-        if not secret_username:
-            raise ValueError(f"Azure Vault username not found by key: {username_key}")
+            secret_password = await azure_vault_client.get_secret(password_key, vault_name)
+            if not secret_password:
+                raise ValueError(f"Azure Vault password not found by key: {password_key}")
 
-        secret_password = await azure_vault_client.get_secret(password_key, vault_name)
-        if not secret_password:
-            raise ValueError(f"Azure Vault password not found by key: {password_key}")
-
-        if totp_secret_key:
-            totp_secret = await azure_vault_client.get_secret(totp_secret_key, vault_name)
-            if not totp_secret:
-                raise ValueError(f"Azure Vault TOTP not found by key: {totp_secret_key}")
-        else:
-            totp_secret = None
+            if totp_secret_key:
+                totp_secret = await azure_vault_client.get_secret(totp_secret_key, vault_name)
+                if not totp_secret:
+                    raise ValueError(f"Azure Vault TOTP not found by key: {totp_secret_key}")
+            else:
+                totp_secret = None
 
         if secret_username is not None and secret_password is not None:
             random_secret_id = self.generate_random_secret_id()
@@ -948,6 +950,12 @@ class WorkflowRunContext:
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"
+
+    def _resolve_required_parameter_value(self, parameter_value: str | None, name: str) -> str:
+        result = self._resolve_parameter_value(parameter_value)
+        if not result:
+            raise ValueError(f"{name} is missing")
+        return result
 
     def _resolve_parameter_value(self, parameter_value: str | None) -> str | None:
         if not parameter_value:

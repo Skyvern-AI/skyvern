@@ -37,6 +37,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     HttpRequestBlock,
     LoginBlock,
+    PDFParserBlock,
     SendEmailBlock,
     TaskBlock,
     TextPromptBlock,
@@ -1656,6 +1657,7 @@ class BlockValidationOutput:
     context: skyvern_context.SkyvernContext
     label: str
     output_parameter: OutputParameter
+    input_parameters: list[PARAMETER_TYPE]
     workflow: Workflow
     workflow_id: str
     workflow_run_id: str
@@ -1663,7 +1665,9 @@ class BlockValidationOutput:
     browser_session_id: str | None = None
 
 
-async def _validate_and_get_output_parameter(label: str | None = None) -> BlockValidationOutput:
+async def _validate_and_get_output_parameter(
+    label: str | None = None, parameter_keys: list[str] | None = None
+) -> BlockValidationOutput:
     context = skyvern_context.ensure_context()
     workflow_id = context.workflow_id
     workflow_run_id = context.workflow_run_id
@@ -1693,10 +1697,18 @@ async def _validate_and_get_output_parameter(label: str | None = None) -> BlockV
             modified_at=datetime.now(),
             parameter_type=ParameterType.OUTPUT,
         )
+    input_parameters = []
+    if parameter_keys:
+        for parameter_key in parameter_keys:
+            parameter = workflow.get_parameter(parameter_key)
+            if parameter:
+                input_parameters.append(parameter)
+
     return BlockValidationOutput(
         context=context,
         label=label,
         output_parameter=output_parameter,
+        input_parameters=input_parameters,
         workflow=workflow,
         workflow_id=workflow_id,
         workflow_run_id=workflow_run_id,
@@ -1708,13 +1720,13 @@ async def _validate_and_get_output_parameter(label: str | None = None) -> BlockV
 async def run_code(
     code: str,
     label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
+    parameters: list[str] | None = None,
 ) -> dict[str, Any]:
-    block_validation_output = await _validate_and_get_output_parameter(label)
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     code_block = CodeBlock(
         code=code,
         label=block_validation_output.label,
-        parameters=parameters or [],
+        parameters=block_validation_output.input_parameters,
         output_parameter=block_validation_output.output_parameter,
     )
     block_result = await code_block.execute_safe(
@@ -1728,7 +1740,7 @@ async def run_code(
 
 async def upload_file(
     label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
+    parameters: list[str] | None = None,
     storage_type: FileStorageType = FileStorageType.S3,
     s3_bucket: str | None = None,
     aws_access_key_id: str | None = None,
@@ -1739,7 +1751,7 @@ async def upload_file(
     azure_blob_container_name: str | None = None,
     path: str | None = None,
 ) -> None:
-    block_validation_output = await _validate_and_get_output_parameter(label)
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     if s3_bucket:
         s3_bucket = _render_template_with_label(s3_bucket, label)
     if aws_access_key_id:
@@ -1759,7 +1771,7 @@ async def upload_file(
     file_upload_block = FileUploadBlock(
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
-        parameters=parameters or [],
+        parameters=block_validation_output.input_parameters,
         storage_type=FileStorageType(storage_type),
         s3_bucket=s3_bucket,
         aws_access_key_id=aws_access_key_id,
@@ -1785,9 +1797,9 @@ async def send_email(
     body: str,
     file_attachments: list[str] = [],
     label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
+    parameters: list[str] | None = None,
 ) -> None:
-    block_validation_output = await _validate_and_get_output_parameter(label)
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     sender = _render_template_with_label(sender, label)
     if isinstance(recipients, str):
         recipients = render_list(_render_template_with_label(recipients, label))
@@ -1812,9 +1824,32 @@ async def send_email(
         file_attachments=file_attachments,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
-        parameters=parameters or [],
+        parameters=block_validation_output.input_parameters,
     )
     await send_email_block.execute_safe(
+        workflow_run_id=block_validation_output.workflow_run_id,
+        parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
+        organization_id=block_validation_output.organization_id,
+        browser_session_id=block_validation_output.browser_session_id,
+    )
+
+
+async def parse_pdf(
+    file_url: str,
+    schema: dict[str, Any] | None = None,
+    label: str | None = None,
+    parameters: list[str] | None = None,
+) -> None:
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
+    file_url = _render_template_with_label(file_url, label)
+    pdf_parser_block = PDFParserBlock(
+        file_url=file_url,
+        json_schema=schema,
+        label=block_validation_output.label,
+        output_parameter=block_validation_output.output_parameter,
+        parameters=block_validation_output.input_parameters,
+    )
+    await pdf_parser_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
         organization_id=block_validation_output.organization_id,
@@ -1827,9 +1862,9 @@ async def parse_file(
     file_type: FileType,
     schema: dict[str, Any] | None = None,
     label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
+    parameters: list[str] | None = None,
 ) -> None:
-    block_validation_output = await _validate_and_get_output_parameter(label)
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     file_url = _render_template_with_label(file_url, label)
     file_parser_block = FileParserBlock(
         file_url=file_url,
@@ -1837,7 +1872,7 @@ async def parse_file(
         json_schema=schema,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
-        parameters=parameters or [],
+        parameters=block_validation_output.input_parameters,
     )
     await file_parser_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
@@ -1855,9 +1890,9 @@ async def http_request(
     timeout: int = 30,
     follow_redirects: bool = True,
     label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
+    parameters: list[str] | None = None,
 ) -> None:
-    block_validation_output = await _validate_and_get_output_parameter(label)
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     method = _render_template_with_label(method, label)
     url = _render_template_with_label(url, label)
     http_request_block = HttpRequestBlock(
@@ -1869,7 +1904,7 @@ async def http_request(
         follow_redirects=follow_redirects,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
-        parameters=parameters or [],
+        parameters=block_validation_output.input_parameters,
     )
     await http_request_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
@@ -1882,15 +1917,15 @@ async def http_request(
 async def goto(
     url: str,
     label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
+    parameters: list[str] | None = None,
 ) -> None:
-    block_validation_output = await _validate_and_get_output_parameter(label)
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     url = _render_template_with_label(url, label)
     goto_url_block = UrlBlock(
         url=url,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
-        parameters=parameters or [],
+        parameters=block_validation_output.input_parameters,
     )
     await goto_url_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
@@ -1904,16 +1939,16 @@ async def prompt(
     prompt: str,
     schema: dict[str, Any] | None = None,
     label: str | None = None,
-    parameters: list[PARAMETER_TYPE] | None = None,
+    parameters: list[str] | None = None,
 ) -> dict[str, Any] | list | str | None:
-    block_validation_output = await _validate_and_get_output_parameter(label)
+    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     prompt = _render_template_with_label(prompt, label)
     prompt_block = TextPromptBlock(
         prompt=prompt,
         json_schema=schema,
         label=block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
-        parameters=parameters or [],
+        parameters=block_validation_output.input_parameters,
     )
     result = await prompt_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,

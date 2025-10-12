@@ -24,23 +24,39 @@ type Props = {
     username: string;
     password: string;
     totp: string;
+    totp_type: "authenticator" | "email" | "text" | "none";
   };
   onChange: (values: {
     name: string;
     username: string;
     password: string;
     totp: string;
+    totp_type: "authenticator" | "email" | "text" | "none";
   }) => void;
 };
 
 function PasswordCredentialContent({
-  values: { name, username, password, totp },
+  values: { name, username, password, totp, totp_type },
   onChange,
 }: Props) {
   const [totpMethod, setTotpMethod] = useState<
-    "text" | "email" | "authenticator"
+    "authenticator" | "email" | "text"
   >("authenticator");
   const [showPassword, setShowPassword] = useState(false);
+
+  // Update totp_type when totpMethod changes
+  const handleTotpMethodChange = (
+    method: "authenticator" | "email" | "text",
+  ) => {
+    setTotpMethod(method);
+    onChange({
+      name,
+      username,
+      password,
+      totp: method === "authenticator" ? totp : "",
+      totp_type: method,
+    });
+  };
 
   return (
     <div className="space-y-5">
@@ -59,6 +75,7 @@ function PasswordCredentialContent({
               username,
               password,
               totp,
+              totp_type,
             })
           }
         />
@@ -76,6 +93,7 @@ function PasswordCredentialContent({
               username: e.target.value,
               password,
               totp,
+              totp_type,
             })
           }
         />
@@ -95,6 +113,7 @@ function PasswordCredentialContent({
                 username,
                 totp,
                 password: e.target.value,
+                totp_type,
               })
             }
           />
@@ -133,7 +152,7 @@ function PasswordCredentialContent({
                       "bg-slate-elevation3": totpMethod === "authenticator",
                     },
                   )}
-                  onClick={() => setTotpMethod("authenticator")}
+                  onClick={() => handleTotpMethodChange("authenticator")}
                 >
                   <QRCodeIcon className="h-6 w-6" />
                   <Label>Authenticator App</Label>
@@ -145,7 +164,7 @@ function PasswordCredentialContent({
                       "bg-slate-elevation3": totpMethod === "email",
                     },
                   )}
-                  onClick={() => setTotpMethod("email")}
+                  onClick={() => handleTotpMethodChange("email")}
                 >
                   <EnvelopeClosedIcon className="h-6 w-6" />
                   <Label>Email</Label>
@@ -157,7 +176,7 @@ function PasswordCredentialContent({
                       "bg-slate-elevation3": totpMethod === "text",
                     },
                   )}
-                  onClick={() => setTotpMethod("text")}
+                  onClick={() => handleTotpMethodChange("text")}
                 >
                   <MobileIcon className="h-6 w-6" />
                   <Label>Text Message</Label>
@@ -175,7 +194,7 @@ function PasswordCredentialContent({
                   </Link>{" "}
                   or{" "}
                   <Link
-                    to="https://docs.skyvern.com/running-tasks/advanced-features#time-based-one-time-password-totp"
+                    to="https://www.skyvern.com/docs/running-tasks/advanced-features#time-based-one-time-password-totp"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="underline underline-offset-2"
@@ -202,6 +221,7 @@ function PasswordCredentialContent({
                           username,
                           password,
                           totp: e.target.value,
+                          totp_type,
                         })
                       }
                     />

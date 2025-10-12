@@ -14,7 +14,7 @@
 </p>
 <p align="center">
   <a href="https://www.skyvern.com/"><img src="https://img.shields.io/badge/Website-blue?logo=googlechrome&logoColor=black"/></a>
-  <a href="https://docs.skyvern.com/"><img src="https://img.shields.io/badge/Docs-yellow?logo=gitbook&logoColor=black"/></a>
+  <a href="https://www.skyvern.com/docs/"><img src="https://img.shields.io/badge/Docs-yellow?logo=gitbook&logoColor=black"/></a>
   <a href="https://discord.gg/fG2XXEuQX3"><img src="https://img.shields.io/discord/1212486326352617534?logo=discord&label=discord"/></a>
   <!-- <a href="https://pepy.tech/project/skyvern" target="_blank"><img src="https://static.pepy.tech/badge/skyvern" alt="Total Downloads"/></a> -->
   <a href="https://github.com/skyvern-ai/skyvern"><img src="https://img.shields.io/github/stars/skyvern-ai/skyvern" /></a>
@@ -52,7 +52,7 @@ This approach has a few advantages:
     1. If you wanted to get an auto insurance quote from Geico, the answer to a common question "Were you eligible to drive at 18?" could be inferred from the driver receiving their license at age 16
     1. If you were doing competitor analysis, it's understanding that an Arnold Palmer 22 oz can at 7/11 is almost definitely the same product as a 23 oz can at Gopuff (even though the sizes are slightly different, which could be a rounding error!)
 
-A detailed technical report can be found [here](https://blog.skyvern.com/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
+A detailed technical report can be found [here](https://www.skyvern.com/blog/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
 
 # Demo
 <!-- Redo demo -->
@@ -60,7 +60,7 @@ https://github.com/user-attachments/assets/5cab4668-e8e2-4982-8551-aab05ff73a7f
 
 # Performance & Evaluation
 
-Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://blog.skyvern.com/web-bench-a-new-way-to-compare-ai-browser-agents/)
+Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://www.skyvern.com/blog/web-bench-a-new-way-to-compare-ai-browser-agents/)
 
 <p align="center">
   <img src="fern/images/performance/webbench_overall.png"/>
@@ -325,7 +325,7 @@ Examples include:
 1. Email based 2FA
 1. SMS based 2FA
 
-🔐 Learn more about 2FA support [here](https://docs.skyvern.com/credentials/totp).
+🔐 Learn more about 2FA support [here](https://www.skyvern.com/docs/credentials/totp).
 
 ### Password Manager Integrations
 Skyvern currently supports the following password manager integrations:
@@ -342,11 +342,11 @@ See the MCP documentation [here](https://github.com/Skyvern-AI/skyvern/blob/main
 ## Zapier / Make.com / N8N Integration
 Skyvern supports Zapier, Make.com, and N8N to allow you to connect your Skyvern workflows to other apps.
 
-* [Zapier](https://docs.skyvern.com/integrations/zapier)
-* [Make.com](https://docs.skyvern.com/integrations/make.com)
-* [N8N](https://docs.skyvern.com/integrations/n8n)
+* [Zapier](https://www.skyvern.com/docs/integrations/zapier)
+* [Make.com](https://www.skyvern.com/docs/integrations/make.com)
+* [N8N](https://www.skyvern.com/docs/integrations/n8n)
 
-🔐 Learn more about 2FA support [here](https://docs.skyvern.com/credentials/totp).
+🔐 Learn more about 2FA support [here](https://www.skyvern.com/docs/credentials/totp).
 
 
 # Real-world examples of Skyvern
@@ -412,7 +412,7 @@ Make sure to have [uv](https://docs.astral.sh/uv/getting-started/installation/) 
 
 # Documentation
 
-More extensive documentation can be found on our [📕 docs page](https://docs.skyvern.com). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
+More extensive documentation can be found on our [📕 docs page](https://www.skyvern.com/docs). Please let us know if something is unclear or missing by opening an issue or reaching out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
 # Supported LLMs
 | Provider | Supported Models |
