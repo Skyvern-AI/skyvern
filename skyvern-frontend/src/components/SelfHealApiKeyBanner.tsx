@@ -123,7 +123,8 @@ function SelfHealApiKeyBanner() {
           <div>
             <div>
               Requests now use the updated key automatically{fingerprintSuffix}{" "}
-              written to the following .env paths:
+              persisted to sessionStorage and written to the following .env
+              paths:
             </div>
             {pathsElements.length > 0 && (
               <div className="mt-2 space-y-2">{pathsElements}</div>
