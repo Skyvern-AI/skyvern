@@ -35,7 +35,6 @@ def workflow_callback(
 
 def _get_client(api_key: str | None = None) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
-    load_dotenv()
     load_dotenv(resolve_backend_env_path())
     key = api_key or os.getenv("SKYVERN_API_KEY") or settings.SKYVERN_API_KEY
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
