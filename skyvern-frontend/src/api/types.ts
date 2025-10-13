@@ -481,6 +481,7 @@ export const RunEngine = {
   SkyvernV2: "skyvern-2.0",
   OpenaiCua: "openai-cua",
   AnthropicCua: "anthropic-cua",
+  GeminiCua: "gemini-cua",
 } as const;
 
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
