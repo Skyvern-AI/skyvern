@@ -14,7 +14,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { envCredential } from "@/util/env";
+import { getRuntimeApiKey } from "@/util/env";
 import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
@@ -22,7 +22,7 @@ import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSe
 function Settings() {
   const { environment, organization, setEnvironment, setOrganization } =
     useSettingsStore();
-  const apiKey = envCredential;
+  const apiKey = getRuntimeApiKey();
 
   return (
     <div className="flex flex-col gap-8">

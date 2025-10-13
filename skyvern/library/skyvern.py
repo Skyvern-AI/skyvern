@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.services.local_org_auth_token_service import SKYVERN_LOCAL_DOMAIN, SKYVERN_LOCAL_ORG
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
@@ -96,11 +97,11 @@ class Skyvern(AsyncSkyvern):
             raise ValueError("Initializing Skyvern failed: api_key must be provided")
 
     async def get_organization(self) -> Organization:
-        organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
+        organization = await app.DATABASE.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
         if not organization:
             organization = await app.DATABASE.create_organization(
-                organization_name="Skyvern-local",
-                domain="skyvern.local",
+                organization_name=SKYVERN_LOCAL_ORG,
+                domain=SKYVERN_LOCAL_DOMAIN,
                 max_steps_per_run=10,
                 max_retries_per_step=3,
             )
