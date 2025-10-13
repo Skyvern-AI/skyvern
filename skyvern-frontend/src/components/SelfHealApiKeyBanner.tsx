@@ -58,6 +58,7 @@ function SelfHealApiKeyBanner() {
   const { toast } = useToast();
   const [isRepairing, setIsRepairing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const isProductionBuild = !import.meta.env.DEV;
 
   const { data, error, isLoading, refetch } = diagnosticsQuery;
 
@@ -129,6 +130,11 @@ function SelfHealApiKeyBanner() {
             {pathsElements.length > 0 && (
               <div className="mt-2 space-y-2">{pathsElements}</div>
             )}
+            {isProductionBuild && (
+              <div className="mt-3">
+                Restart the UI server for more robust API key persistence.
+              </div>
+            )}
           </div>
         ),
       });
@@ -160,6 +166,14 @@ function SelfHealApiKeyBanner() {
                 by running <code>skyvern init</code> or click the button below
                 to regenerate it automatically.
               </p>
+              {isProductionBuild && (
+                <p className="text-yellow-300">
+                  When running a production build, the regenerated API key is
+                  stored in sessionStorage. Closing this tab or browser window
+                  will lose the key. Restart the UI server for more robust
+                  persistence.
+                </p>
+              )}
               <div className="flex justify-center">
                 <Button
                   onClick={handleRepair}
