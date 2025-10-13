@@ -1660,12 +1660,44 @@ class ForgeAgent:
             return [], previous_state
 
         conversation = self._initialize_gemini_conversation(previous_state, task, scraped_page)
-        response, candidate, function_calls, updated_conversation = await self._gemini_infer_with_followups(
-            conversation=conversation,
-            task=task,
-            step=step,
-            scraped_page=scraped_page,
-        )
+
+        response = await self._call_gemini_generate_content(conversation)
+        if response is None or not getattr(response, "candidates", None):
+            LOG.warning(
+                "Gemini Computer Use returned no candidates.",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            return [], previous_state
+
+        candidate = response.candidates[0]
+        if getattr(candidate, "content", None):
+            conversation.append(candidate.content)
+
+        function_calls = self._extract_gemini_function_calls(getattr(candidate, "content", None))
+
+        if not function_calls:
+            reply_text = await self._build_gemini_user_reply(task, step, scraped_page, candidate)
+            if reply_text:
+                conversation.append(genai_types.Content(role="user", parts=[genai_types.Part(text=reply_text)]))
+
+                followup_response = await self._call_gemini_generate_content(conversation)
+                if followup_response is None or not getattr(followup_response, "candidates", None):
+                    LOG.warning(
+                        "Gemini Computer Use follow-up returned no candidates.",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                    )
+                    return [], previous_state
+
+                followup_candidate = followup_response.candidates[0]
+                if getattr(followup_candidate, "content", None):
+                    conversation.append(followup_candidate.content)
+
+                function_calls = self._extract_gemini_function_calls(getattr(followup_candidate, "content", None))
+                response = followup_response
+                candidate = followup_candidate
+
         if response is None or candidate is None:
             LOG.warning(
                 "Gemini Computer Use response is empty; returning no actions.",
@@ -1682,7 +1714,7 @@ class ForgeAgent:
         )
         await self._record_gemini_usage(task, step, response)
         new_state = GeminiComputerUseState(
-            contents=updated_conversation,
+            contents=conversation,
             last_response=response,
             last_function_calls=function_calls,
         )
@@ -1710,51 +1742,6 @@ class ForgeAgent:
             if function_response_parts:
                 conversation.append(genai_types.Content(role="user", parts=function_response_parts))
         return conversation
-
-    async def _gemini_infer_with_followups(
-        self,
-        conversation: list[genai_types.Content],
-        task: Task,
-        step: Step,
-        scraped_page: ScrapedPage,
-    ) -> tuple[
-        genai_types.GenerateContentResponse | None,
-        genai_types.Candidate | None,
-        list[genai_types.FunctionCall],
-        list[genai_types.Content],
-    ]:
-        attempts = 0
-        response: genai_types.GenerateContentResponse | None = None
-        candidate: genai_types.Candidate | None = None
-        function_calls: list[genai_types.FunctionCall] = []
-
-        while attempts < 3:
-            response = await self._call_gemini_generate_content(conversation)
-            if response is None or not getattr(response, "candidates", None):
-                LOG.warning(
-                    "Gemini Computer Use returned no candidates.",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    attempt=attempts,
-                )
-                return response, None, [], conversation
-
-            candidate = response.candidates[0]
-            if getattr(candidate, "content", None):
-                conversation.append(candidate.content)
-
-            function_calls = self._extract_gemini_function_calls(getattr(candidate, "content", None))
-            if function_calls:
-                break
-
-            reply_text = await self._build_gemini_user_reply(task, step, scraped_page, candidate)
-            if not reply_text:
-                break
-
-            conversation.append(genai_types.Content(role="user", parts=[genai_types.Part(text=reply_text)]))
-            attempts += 1
-
-        return response, candidate, function_calls, conversation
 
     def _extract_gemini_function_calls(
         self,
