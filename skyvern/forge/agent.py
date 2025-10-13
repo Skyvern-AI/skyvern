@@ -1859,11 +1859,11 @@ class ForgeAgent:
                 genai_types.Tool(
                     computer_use=genai_types.ComputerUse(
                         environment=genai_types.Environment.ENVIRONMENT_BROWSER,
-                        display_width_px=settings.BROWSER_WIDTH,
-                        display_height_px=settings.BROWSER_HEIGHT,
                     )
                 )
             ],
+            # Explicit screen dimensions were removed from the 1.43.0 ComputerUse schema;
+            # letting the service pick the default media resolution avoids INVALID_ARGUMENT errors.
             temperature=0,
         )
         return await client.aio.models.generate_content(

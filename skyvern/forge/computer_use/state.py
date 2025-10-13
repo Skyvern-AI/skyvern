@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from google.genai.types import Content, FunctionCall, GenerateContentResponse
+from google.genai.types import Content, FunctionCall, GenerateContentResponse
 
 
 @dataclass
