@@ -1866,16 +1866,11 @@ class ForgeAgent:
             ],
             temperature=0,
         )
-        loop = asyncio.get_running_loop()
-
-        def _invoke() -> genai_types.GenerateContentResponse:
-            return client.models.generate_content(
-                model=settings.GEMINI_CUA_MODEL,
-                contents=contents,
-                config=config,
-            )
-
-        return await loop.run_in_executor(None, _invoke)
+        return await client.aio.models.generate_content(
+            model=settings.GEMINI_CUA_MODEL,
+            contents=contents,
+            config=config,
+        )
 
     async def _record_gemini_usage(
         self,
