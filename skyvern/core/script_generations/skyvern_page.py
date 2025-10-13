@@ -279,6 +279,31 @@ class SkyvernPage:
             timeout=timeout,
         )
 
+    @action_wrap(ActionType.NAVIGATE)
+    async def navigate(
+        self,
+        url: str,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> None:
+        await self.goto(url)
+
+    @action_wrap(ActionType.GO_BACK)
+    async def go_back(
+        self,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> None:
+        await self.page.go_back()
+
+    @action_wrap(ActionType.GO_FORWARD)
+    async def go_forward(
+        self,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> None:
+        await self.page.go_forward()
+
     async def _update_action_reasoning(
         self,
         action_id: str,
