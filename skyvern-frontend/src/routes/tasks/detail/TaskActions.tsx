@@ -5,7 +5,7 @@ import { toast } from "@/components/ui/use-toast";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCostCalculator } from "@/hooks/useCostCalculator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { envCredential } from "@/util/env";
+import { getRuntimeApiKey } from "@/util/env";
 import {
   keepPreviousData,
   useQuery,
@@ -79,7 +79,8 @@ function TaskActions() {
         const token = await credentialGetter();
         credential = `?token=Bearer ${token}`;
       } else {
-        credential = `?apikey=${envCredential}`;
+        const apiKey = getRuntimeApiKey();
+        credential = apiKey ? `?apikey=${apiKey}` : "";
       }
       if (socket) {
         socket.close();
