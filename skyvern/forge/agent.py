@@ -973,7 +973,7 @@ class ForgeAgent:
 
             if engine == RunEngine.openai_cua:
                 openai_previous = cua_response if isinstance(cua_response, OpenAIResponse) else None
-                actions, new_cua_response = await self._generate_cua_actions(
+                actions, new_cua_response = await self._generate_openai_cua_actions(
                     task=task,
                     step=step,
                     scraped_page=scraped_page,
@@ -1483,7 +1483,7 @@ class ForgeAgent:
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
-    async def _generate_cua_actions(
+    async def _generate_openai_cua_actions(
         self,
         task: Task,
         step: Step,
