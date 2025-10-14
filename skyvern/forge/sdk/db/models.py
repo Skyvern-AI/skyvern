@@ -969,6 +969,7 @@ class ScriptBlockModel(Base):
     script_revision_id = Column(String, nullable=False, index=True)
     script_block_label = Column(String, nullable=False)
     script_file_id = Column(String, nullable=True)
+    run_signature = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
