@@ -189,3 +189,5 @@ tmp/user_data_dir
 
 # Claude
 .claude
+
+skyvern.db
