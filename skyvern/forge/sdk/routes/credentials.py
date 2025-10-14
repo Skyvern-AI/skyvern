@@ -3,7 +3,6 @@ from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE,
@@ -51,36 +50,36 @@ async def fetch_credential_item_background(item_id: str) -> None:
         LOG.exception("Failed to fetch credential item from Bitwarden in background", item_id=item_id, error=str(e))
 
 
-async def parse_totp_code(content: str, organization_id: str) -> str | None:
-    prompt = prompt_engine.load_prompt("parse-verification-code", content=content)
-    code_resp = await app.SECONDARY_LLM_API_HANDLER(
-        prompt=prompt, prompt_name="parse-verification-code", organization_id=organization_id
-    )
-    LOG.info("TOTP Code Parser Response", code_resp=code_resp)
-    return code_resp.get("code", None)
-
-
-@legacy_base_router.post("/otp")
-@legacy_base_router.post("/otp/", include_in_schema=False)
+@legacy_base_router.post("/totp")
+@legacy_base_router.post("/totp/", include_in_schema=False)
 @base_router.post(
-    "/credentials/otp",
+    "/credentials/totp",
     response_model=TOTPCode,
-    summary="Send OTP content",
-    description="Forward a OTP (TOTP, Magic Link) email or sms message containing otp login data to Skyvern. This endpoint stores the otp login data in database so that Skyvern can use it while running tasks/workflows.",
+    summary="Send TOTP code",
+    description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
     tags=["Credentials"],
     openapi_extra={
-        "x-fern-sdk-method-name": "send_otp_content",
+        "x-fern-sdk-method-name": "send_totp_code",
+        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
     },
 )
 @base_router.post(
-    "/credentials/otp/",
+    "/credentials/totp/",
     response_model=TOTPCode,
     include_in_schema=False,
 )
-async def send_otp_content(
+async def send_totp_code(
     data: TOTPCodeCreate,
     curr_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TOTPCode:
+    LOG.info(
+        "Saving OTP code",
+        organization_id=curr_org.organization_id,
+        totp_identifier=data.totp_identifier,
+        task_id=data.task_id,
+        workflow_id=data.workflow_id,
+        workflow_run_id=data.workflow_run_id,
+    )
     content = data.content.strip()
     otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
@@ -109,65 +108,6 @@ async def send_otp_content(
         source=data.source,
         expired_at=data.expired_at,
         otp_type=otp_value.get_otp_type(),
-    )
-
-
-@legacy_base_router.post("/totp")
-@legacy_base_router.post("/totp/", include_in_schema=False)
-@base_router.post(
-    "/credentials/totp",
-    response_model=TOTPCode,
-    summary="Send TOTP code",
-    description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
-    tags=["Credentials"],
-    openapi_extra={
-        "x-fern-sdk-method-name": "send_totp_code",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
-    },
-)
-@base_router.post(
-    "/credentials/totp/",
-    response_model=TOTPCode,
-    include_in_schema=False,
-)
-async def send_totp_code(
-    data: TOTPCodeCreate,
-    curr_org: Organization = Depends(org_auth_service.get_current_org),
-) -> TOTPCode:
-    LOG.info(
-        "Saving TOTP code",
-        organization_id=curr_org.organization_id,
-        totp_identifier=data.totp_identifier,
-        task_id=data.task_id,
-        workflow_id=data.workflow_id,
-        workflow_run_id=data.workflow_run_id,
-    )
-    content = data.content.strip()
-    code: str | None = content
-    # We assume the user is sending the code directly when the length of code is less than or equal to 10
-    if len(content) > 10:
-        code = await parse_totp_code(content, curr_org.organization_id)
-    if not code:
-        LOG.error(
-            "Failed to parse totp code",
-            totp_identifier=data.totp_identifier,
-            task_id=data.task_id,
-            workflow_id=data.workflow_id,
-            workflow_run_id=data.workflow_run_id,
-            content=data.content,
-        )
-        raise HTTPException(status_code=400, detail="Failed to parse totp code")
-    return await app.DATABASE.create_otp_code(
-        organization_id=curr_org.organization_id,
-        totp_identifier=data.totp_identifier,
-        content=data.content,
-        code=code,
-        task_id=data.task_id,
-        workflow_id=data.workflow_id,
-        workflow_run_id=data.workflow_run_id,
-        source=data.source,
-        expired_at=data.expired_at,
-        otp_type=OTPType.TOTP,
     )
 
 
