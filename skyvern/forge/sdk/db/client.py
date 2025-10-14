@@ -893,7 +893,6 @@ class AgentDB:
         token_type: Literal["api", "onepassword_service_account", "azure_client_secret_credential"],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
         try:
-            print("lol")
             async with self.Session() as session:
                 if token := (
                     await session.scalars(
