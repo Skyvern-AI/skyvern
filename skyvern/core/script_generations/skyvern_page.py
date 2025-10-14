@@ -14,13 +14,14 @@ from playwright.async_api import Page
 
 from skyvern.config import settings
 from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
-from skyvern.core.totp import poll_verification_code
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
@@ -597,14 +598,15 @@ class SkyvernPage:
                         totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
                     if totp_url:
                         totp_url = _render_template_with_label(totp_url, label=self.current_label)
-                    verification_code = await poll_verification_code(
+                    otp_value = await poll_otp_value(
                         organization_id=organization_id,
                         task_id=task_id,
                         workflow_run_id=workflow_run_id,
                         totp_identifier=totp_identifier,
                         totp_verification_url=totp_url,
                     )
-                    if verification_code:
+                    if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
+                        verification_code = otp_value.value
                         if isinstance(data, dict) and SPECIAL_FIELD_VERIFICATION_CODE not in data:
                             data[SPECIAL_FIELD_VERIFICATION_CODE] = verification_code
                         elif isinstance(data, str) and SPECIAL_FIELD_VERIFICATION_CODE not in data:

@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -65,9 +66,15 @@ class TOTPCodeCreate(TOTPCodeBase):
         return sanitize_postgres_text(value)
 
 
+class OTPType(StrEnum):
+    TOTP = "totp"
+    MAGIC_LINK = "magic_link"
+
+
 class TOTPCode(TOTPCodeCreate):
     totp_code_id: str = Field(..., description="The skyvern ID of the TOTP code.")
     code: str = Field(..., description="The TOTP code extracted from the content.")
     organization_id: str = Field(..., description="The ID of the organization that the TOTP code is for.")
     created_at: datetime = Field(..., description="The timestamp when the TOTP code was created.")
     modified_at: datetime = Field(..., description="The timestamp when the TOTP code was modified.")
+    otp_type: OTPType | None = Field(None, description="The type of the OTP code.")
