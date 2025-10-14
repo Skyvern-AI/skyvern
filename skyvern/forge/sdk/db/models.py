@@ -35,6 +35,7 @@ from skyvern.forge.sdk.db.id import (
     generate_org_id,
     generate_organization_auth_token_id,
     generate_organization_bitwarden_collection_id,
+    generate_otp_code_id,
     generate_output_parameter_id,
     generate_persistent_browser_session_id,
     generate_script_block_id,
@@ -47,7 +48,6 @@ from skyvern.forge.sdk.db.id import (
     generate_task_run_id,
     generate_task_v2_id,
     generate_thought_id,
-    generate_totp_code_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -579,9 +579,12 @@ class AISuggestionModel(Base):
 
 class TOTPCodeModel(Base):
     __tablename__ = "totp_codes"
-    __table_args__ = (Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
+        Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+    )
 
-    totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
+    totp_code_id = Column(String, primary_key=True, default=generate_otp_code_id)
     totp_identifier = Column(String, nullable=False, index=True)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     task_id = Column(String, ForeignKey("tasks.task_id"))
@@ -593,6 +596,7 @@ class TOTPCodeModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
+    otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
 
 
 class ActionModel(Base):

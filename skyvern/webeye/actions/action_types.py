@@ -21,6 +21,7 @@ class ActionType(StrEnum):
     EXTRACT = "extract"
     VERIFICATION_CODE = "verification_code"
 
+    GOTO_URL = "goto_url"
     SCROLL = "scroll"
     KEYPRESS = "keypress"
     MOVE = "move"

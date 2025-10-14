@@ -67,6 +67,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     DragAction,
     ExtractAction,
+    GotoUrlAction,
     InputTextAction,
     KeypressAction,
     LeftMouseAction,
@@ -105,6 +106,7 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.DRAG: DragAction,
     ActionType.VERIFICATION_CODE: VerificationCodeAction,
     ActionType.LEFT_MOUSE: LeftMouseAction,
+    ActionType.GOTO_URL: GotoUrlAction,
 }
 
 

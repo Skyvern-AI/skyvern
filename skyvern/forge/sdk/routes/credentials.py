@@ -29,10 +29,11 @@ from skyvern.forge.sdk.schemas.organizations import (
     CreateOnePasswordTokenResponse,
     Organization,
 )
-from skyvern.forge.sdk.schemas.totp_codes import TOTPCode, TOTPCodeCreate
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.services.otp_service import OTPValue, parse_otp_login
 
 LOG = structlog.get_logger()
 
@@ -57,6 +58,58 @@ async def parse_totp_code(content: str, organization_id: str) -> str | None:
     )
     LOG.info("TOTP Code Parser Response", code_resp=code_resp)
     return code_resp.get("code", None)
+
+
+@legacy_base_router.post("/otp")
+@legacy_base_router.post("/otp/", include_in_schema=False)
+@base_router.post(
+    "/credentials/otp",
+    response_model=TOTPCode,
+    summary="Send OTP content",
+    description="Forward a OTP (TOTP, Magic Link) email or sms message containing otp login data to Skyvern. This endpoint stores the otp login data in database so that Skyvern can use it while running tasks/workflows.",
+    tags=["Credentials"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "send_otp_content",
+    },
+)
+@base_router.post(
+    "/credentials/otp/",
+    response_model=TOTPCode,
+    include_in_schema=False,
+)
+async def send_otp_content(
+    data: TOTPCodeCreate,
+    curr_org: Organization = Depends(org_auth_service.get_current_org),
+) -> TOTPCode:
+    content = data.content.strip()
+    otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
+    # We assume the user is sending the code directly when the length of code is less than or equal to 10
+    if len(content) > 10:
+        otp_value = await parse_otp_login(content, curr_org.organization_id)
+
+    if not otp_value:
+        LOG.error(
+            "Failed to parse otp login",
+            totp_identifier=data.totp_identifier,
+            task_id=data.task_id,
+            workflow_id=data.workflow_id,
+            workflow_run_id=data.workflow_run_id,
+            content=data.content,
+        )
+        raise HTTPException(status_code=400, detail="Failed to parse otp login")
+
+    return await app.DATABASE.create_otp_code(
+        organization_id=curr_org.organization_id,
+        totp_identifier=data.totp_identifier,
+        content=data.content,
+        code=otp_value.value,
+        task_id=data.task_id,
+        workflow_id=data.workflow_id,
+        workflow_run_id=data.workflow_run_id,
+        source=data.source,
+        expired_at=data.expired_at,
+        otp_type=otp_value.get_otp_type(),
+    )
 
 
 @legacy_base_router.post("/totp")
@@ -104,7 +157,7 @@ async def send_totp_code(
             content=data.content,
         )
         raise HTTPException(status_code=400, detail="Failed to parse totp code")
-    return await app.DATABASE.create_totp_code(
+    return await app.DATABASE.create_otp_code(
         organization_id=curr_org.organization_id,
         totp_identifier=data.totp_identifier,
         content=data.content,
@@ -114,6 +167,7 @@ async def send_totp_code(
         workflow_run_id=data.workflow_run_id,
         source=data.source,
         expired_at=data.expired_at,
+        otp_type=OTPType.TOTP,
     )
 
 

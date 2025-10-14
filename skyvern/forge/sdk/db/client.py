@@ -91,7 +91,7 @@ from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
-from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -2610,11 +2610,12 @@ class AgentDB:
                 return None
             return TaskGeneration.model_validate(task_generation)
 
-    async def get_totp_codes(
+    async def get_otp_codes(
         self,
         organization_id: str,
         totp_identifier: str,
         valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        otp_type: OTPType | None = None,
     ) -> list[TOTPCode]:
         """
         1. filter by:
@@ -2634,17 +2635,20 @@ class AgentDB:
                 .filter_by(organization_id=organization_id)
                 .filter_by(totp_identifier=totp_identifier)
                 .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-                .order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             )
+            if otp_type:
+                query = query.filter(TOTPCodeModel.otp_type == otp_type)
+            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
 
-    async def create_totp_code(
+    async def create_otp_code(
         self,
         organization_id: str,
         totp_identifier: str,
         content: str,
         code: str,
+        otp_type: OTPType,
         task_id: str | None = None,
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -2662,6 +2666,7 @@ class AgentDB:
                 workflow_run_id=workflow_run_id,
                 source=source,
                 expired_at=expired_at,
+                otp_type=otp_type,
             )
             session.add(new_totp_code)
             await session.commit()
