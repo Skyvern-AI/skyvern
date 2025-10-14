@@ -60,14 +60,18 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
     except Exception:
         pass
 
+    url_path = request.url.path
+    http_method = request.method
     sanitized_headers = _sanitize_headers(dict(request.headers))
     body_text = _sanitize_body(request, body_bytes, request.headers.get("content-type"))
 
-    LOG.info(
-        "api.raw_request",
-        method=request.method,
-        path=request.url.path,
-        headers=sanitized_headers,
-        body=body_text,
-    )
-    return await call_next(request)
+    try:
+        return await call_next(request)
+    finally:
+        LOG.info(
+            "api.raw_request",
+            method=http_method,
+            path=url_path,
+            headers=sanitized_headers,
+            body=body_text,
+        )
