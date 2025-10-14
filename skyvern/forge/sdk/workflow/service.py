@@ -774,8 +774,8 @@ class WorkflowService:
             organization_id=organization.organization_id,
         )
 
-        block_label: str = metadata_response.get("block_label", DEFAULT_FIRST_BLOCK_LABEL)
-        title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
+        block_label: str = metadata_response.get("block_label", None) or DEFAULT_FIRST_BLOCK_LABEL
+        title: str = metadata_response.get("title", None) or DEFAULT_WORKFLOW_TITLE
 
         if task_version == "v1":
             task_prompt = prompt_engine.load_prompt(
@@ -790,8 +790,8 @@ class WorkflowService:
             )
 
             data_extraction_goal: str | None = task_response.get("data_extraction_goal")
-            navigation_goal: str = task_response.get("navigation_goal", user_prompt)
-            url: str = task_response.get("url", "")
+            navigation_goal: str = task_response.get("navigation_goal", None) or user_prompt
+            url: str = task_response.get("url", None) or ""
 
             blocks = [
                 NavigationBlock(
