@@ -586,38 +586,7 @@ def _build_download_statement(
     block_title: str, block: dict[str, Any], data_variable_name: str | None = None
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.download statement."""
-    args = [
-        cst.Arg(
-            keyword=cst.Name("prompt"),
-            value=_value(block.get("navigation_goal") or ""),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-                last_line=cst.SimpleWhitespace(INDENT),
-            ),
-        ),
-    ]
-    if block.get("download_suffix"):
-        args.append(
-            cst.Arg(
-                keyword=cst.Name("download_suffix"),
-                value=_value(block.get("download_suffix")),
-                whitespace_after_arg=cst.ParenthesizedWhitespace(
-                    indent=True,
-                    last_line=cst.SimpleWhitespace(INDENT),
-                ),
-            )
-        )
-    args.append(
-        cst.Arg(
-            keyword=cst.Name("cache_key"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        )
-    )
-
+    args = __build_base_task_statement(block_title, block, data_variable_name)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
         args=args,
@@ -1498,6 +1467,17 @@ def __build_base_task_statement(
                 ),
             )
         )
+    if block.get("download_suffix"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("download_suffix"),
+                value=_value(block.get("download_suffix")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
     if block.get("totp_identifier"):
         args.append(
             cst.Arg(
@@ -1746,6 +1726,12 @@ async def generate_workflow_script_python_code(
                 block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
                 temp_module = cst.Module(body=[block_fn_def])
                 block_code = temp_module.code
+
+                # Extract the run signature (the statement that calls skyvern.action/extract/etc)
+                block_stmt = _build_block_statement(task)
+                run_signature_module = cst.Module(body=[block_stmt])
+                run_signature = run_signature_module.code.strip()
+
                 await create_or_update_script_block(
                     block_code=block_code,
                     script_revision_id=script_revision_id,
@@ -1753,6 +1739,7 @@ async def generate_workflow_script_python_code(
                     organization_id=organization_id,
                     block_label=block_name,
                     update=pending,
+                    run_signature=run_signature,
                 )
             except Exception as e:
                 LOG.error("Failed to create script block", error=str(e), exc_info=True)
@@ -1796,6 +1783,11 @@ async def generate_workflow_script_python_code(
 
                 block_name = task_v2.get("label") or task_v2.get("title") or f"task_v2_{idx}"
 
+                # Extract the run signature for task_v2 block
+                task_v2_stmt = _build_block_statement(task_v2)
+                run_signature_module = cst.Module(body=[task_v2_stmt])
+                run_signature = run_signature_module.code.strip()
+
                 await create_or_update_script_block(
                     block_code=task_v2_block_code,
                     script_revision_id=script_revision_id,
@@ -1803,6 +1795,7 @@ async def generate_workflow_script_python_code(
                     organization_id=organization_id,
                     block_label=block_name,
                     update=pending,
+                    run_signature=run_signature,
                 )
             except Exception as e:
                 LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
@@ -1891,6 +1884,7 @@ async def create_or_update_script_block(
     organization_id: str,
     block_label: str,
     update: bool = False,
+    run_signature: str | None = None,
 ) -> None:
     """
     Create a script block in the database and save the block code to a script file.
@@ -1903,6 +1897,7 @@ async def create_or_update_script_block(
         organization_id: The organization ID
         block_label: Optional custom name for the block (defaults to function name)
         update: Whether to update the script block instead of creating a new one
+        run_signature: The function call code to execute this block (e.g., "await skyvern.action(...)")
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
@@ -1918,6 +1913,14 @@ async def create_or_update_script_block(
                 script_id=script_id,
                 organization_id=organization_id,
                 script_block_label=block_label,
+                run_signature=run_signature,
+            )
+        elif run_signature:
+            # Update the run_signature if provided
+            script_block = await app.DATABASE.update_script_block(
+                script_block_id=script_block.script_block_id,
+                organization_id=organization_id,
+                run_signature=run_signature,
             )
 
         # Step 4: Create script file for the block

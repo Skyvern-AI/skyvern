@@ -651,7 +651,9 @@ class SkyvernPage:
                 intention=intention,
                 response=value,
             )
-            await handle_input_text_action(action, self.page, self.scraped_page, task, step)
+            result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
+            if result and result[-1].success is False:
+                raise Exception(result[-1].exception_message)
         else:
             locator = self.page.locator(f"xpath={xpath}")
             await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
