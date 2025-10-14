@@ -70,6 +70,8 @@ class WorkflowRunContext:
             | BitwardenLoginCredentialParameter
             | BitwardenCreditCardDataParameter
             | BitwardenSensitiveInformationParameter
+            | OnePasswordCredentialParameter
+            | AzureVaultCredentialParameter
             | CredentialParameter
         ],
         block_outputs: dict[str, Any] | None = None,
@@ -1012,6 +1014,9 @@ class WorkflowContextManager:
             | BitwardenLoginCredentialParameter
             | BitwardenCreditCardDataParameter
             | BitwardenSensitiveInformationParameter
+            | OnePasswordCredentialParameter
+            | AzureVaultCredentialParameter
+            | CredentialParameter
         ],
         block_outputs: dict[str, Any] | None = None,
     ) -> WorkflowRunContext:

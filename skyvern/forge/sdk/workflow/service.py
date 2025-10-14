@@ -3,7 +3,7 @@ import json
 import uuid
 from collections import deque
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import httpx
 import structlog
@@ -31,7 +31,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.db.models import AzureVaultCredentialParameterModel
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1395,7 +1394,7 @@ class WorkflowService:
         description: str | None = None,
         bitwarden_collection_id: str | None = None,
         bitwarden_item_id: str | None = None,
-    ) -> Parameter:
+    ) -> BitwardenLoginCredentialParameter:
         return await app.DATABASE.create_bitwarden_login_credential_parameter(
             workflow_id=workflow_id,
             bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
@@ -1447,7 +1446,7 @@ class WorkflowService:
         password_key: str,
         totp_secret_key: str | None = None,
         description: str | None = None,
-    ) -> AzureVaultCredentialParameterModel:
+    ) -> AzureVaultCredentialParameter:
         return await app.DATABASE.create_azure_vault_credential_parameter(
             workflow_id=workflow_id,
             key=key,
@@ -1469,7 +1468,7 @@ class WorkflowService:
         bitwarden_identity_fields: list[str],
         key: str,
         description: str | None = None,
-    ) -> Parameter:
+    ) -> BitwardenSensitiveInformationParameter:
         return await app.DATABASE.create_bitwarden_sensitive_information_parameter(
             workflow_id=workflow_id,
             bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
@@ -1492,7 +1491,7 @@ class WorkflowService:
         bitwarden_item_id: str,
         key: str,
         description: str | None = None,
-    ) -> Parameter:
+    ) -> BitwardenCreditCardDataParameter:
         return await app.DATABASE.create_bitwarden_credit_card_data_parameter(
             workflow_id=workflow_id,
             bitwarden_client_id_aws_secret_key=bitwarden_client_id_aws_secret_key,
@@ -2326,9 +2325,9 @@ class WorkflowService:
     @staticmethod
     async def block_yaml_to_block(
         block_yaml: BLOCK_YAML_TYPES,
-        parameters: dict[str, Parameter],
+        parameters: dict[str, PARAMETER_TYPE],
     ) -> BlockTypeVar:
-        output_parameter = parameters[f"{block_yaml.label}_output"]
+        output_parameter = cast(OutputParameter, parameters[f"{block_yaml.label}_output"])
         if block_yaml.block_type == BlockType.TASK:
             task_block_parameters = (
                 [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
