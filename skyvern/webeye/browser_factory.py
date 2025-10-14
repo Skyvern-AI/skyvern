@@ -680,7 +680,7 @@ class BrowserState:
                 await self.navigate_to_url(page=page, url=url)
 
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
-        if page.url == url:
+        if page.url.rstrip("/") == url.rstrip("/"):
             return
         try:
             for retry_time in range(retry_times):
