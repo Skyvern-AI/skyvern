@@ -394,6 +394,7 @@ export type ActionsApiResponse = {
   intention: string | null;
   response: string | null;
   created_by: string | null;
+  text: string | null;
 };
 
 export type TaskV2 = {
