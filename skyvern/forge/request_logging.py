@@ -72,6 +72,6 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
             "api.raw_request",
             method=http_method,
             path=url_path,
-            headers=sanitized_headers,
             body=body_text,
+            headers=sanitized_headers,
         )
