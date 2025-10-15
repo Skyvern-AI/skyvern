@@ -1594,12 +1594,17 @@ class AgentDB:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
-        title: str = "",
+        search_key: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
-        parameter: str | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
+
+        Search semantics:
+        - If `search_key` is provided, its value is used as a unified search term for both
+          `workflows.title` and workflow parameter metadata (key, description, and default_value).
+        - If `search_key` is not provided, no search filtering is applied.
+        - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -1632,9 +1637,9 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
                 if statuses:
                     main_query = main_query.where(WorkflowModel.status.in_(statuses))
-                if parameter:
-                    parameter_like = f"%{parameter}%"
-                    title_like = WorkflowModel.title.ilike(parameter_like)
+                if search_key:
+                    search_like = f"%{search_key}%"
+                    title_like = WorkflowModel.title.ilike(search_like)
 
                     parameter_filters = [
                         self._exists_parameter_search(
@@ -1644,17 +1649,17 @@ class AgentDB:
                                 WorkflowParameterModel.description,
                                 WorkflowParameterModel.default_value,
                             ],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             OutputParameterModel,
                             [OutputParameterModel.key, OutputParameterModel.description],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             AWSSecretParameterModel,
                             [AWSSecretParameterModel.key, AWSSecretParameterModel.description],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             BitwardenLoginCredentialParameterModel,
@@ -1662,7 +1667,7 @@ class AgentDB:
                                 BitwardenLoginCredentialParameterModel.key,
                                 BitwardenLoginCredentialParameterModel.description,
                             ],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             BitwardenSensitiveInformationParameterModel,
@@ -1670,7 +1675,7 @@ class AgentDB:
                                 BitwardenSensitiveInformationParameterModel.key,
                                 BitwardenSensitiveInformationParameterModel.description,
                             ],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             BitwardenCreditCardDataParameterModel,
@@ -1678,7 +1683,7 @@ class AgentDB:
                                 BitwardenCreditCardDataParameterModel.key,
                                 BitwardenCreditCardDataParameterModel.description,
                             ],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             OnePasswordCredentialParameterModel,
@@ -1686,7 +1691,7 @@ class AgentDB:
                                 OnePasswordCredentialParameterModel.key,
                                 OnePasswordCredentialParameterModel.description,
                             ],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             AzureVaultCredentialParameterModel,
@@ -1694,17 +1699,15 @@ class AgentDB:
                                 AzureVaultCredentialParameterModel.key,
                                 AzureVaultCredentialParameterModel.description,
                             ],
-                            parameter_like,
+                            search_like,
                         ),
                         self._exists_parameter_search(
                             CredentialParameterModel,
                             [CredentialParameterModel.key, CredentialParameterModel.description],
-                            parameter_like,
+                            search_like,
                         ),
                     ]
                     main_query = main_query.where(or_(title_like, or_(*parameter_filters)))
-                elif title:
-                    main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )

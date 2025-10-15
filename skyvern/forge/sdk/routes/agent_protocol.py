@@ -1815,18 +1815,28 @@ async def get_workflows(
     page_size: int = Query(10, ge=1),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
-    title: str = Query(""),
-    parameter: str | None = Query(
+    search_key: str | None = Query(
         None,
-        description="Filter workflows by parameter key, description, or default value(only for WorkflowParameterModel)",
+        description="Unified search across workflow title and parameter metadata (key, description, default_value).",
     ),
+    title: str = Query("", deprecated=True, description="Deprecated: use search_key instead."),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
     """
     Get all workflows with the latest version for the organization.
+
+    Search semantics:
+    - If `search_key` is provided, its value is used as a unified search term for both
+      `workflows.title` and workflow parameter metadata (key, description, and default_value for
+      `WorkflowParameterModel`).
+    - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
+    - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
     """
     analytics.capture("skyvern-oss-agent-workflows-get")
+
+    # Determine the effective search term: prioritize search_key, fallback to title
+    effective_search = search_key or (title if title else None)
 
     if template:
         global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
@@ -1836,7 +1846,7 @@ async def get_workflows(
             workflow_permanent_ids=global_workflows_permanent_ids,
             page=page,
             page_size=page_size,
-            title=title,
+            search_key=effective_search or "",
             statuses=[WorkflowStatus.published, WorkflowStatus.draft],
         )
         return workflows
@@ -1853,9 +1863,8 @@ async def get_workflows(
         page_size=page_size,
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
-        title=title,
+        search_key=effective_search,
         statuses=[WorkflowStatus.published, WorkflowStatus.draft],
-        parameter=parameter,
     )
 
 

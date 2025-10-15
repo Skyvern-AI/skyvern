@@ -1127,7 +1127,7 @@ class WorkflowService:
         organization_id: str | None = None,
         page: int = 1,
         page_size: int = 10,
-        title: str = "",
+        search_key: str = "",
         statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         return await app.DATABASE.get_workflows_by_permanent_ids(
@@ -1135,7 +1135,7 @@ class WorkflowService:
             organization_id=organization_id,
             page=page,
             page_size=page_size,
-            title=title,
+            title=search_key,
             statuses=statuses,
         )
 
@@ -1146,12 +1146,14 @@ class WorkflowService:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
-        title: str = "",
+        search_key: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
-        parameter: str | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
+
+        Args:
+            search_key: Unified search term for title and parameter metadata (replaces title/parameter).
         """
         return await app.DATABASE.get_workflows_by_organization_id(
             organization_id=organization_id,
@@ -1159,9 +1161,8 @@ class WorkflowService:
             page_size=page_size,
             only_saved_tasks=only_saved_tasks,
             only_workflows=only_workflows,
-            title=title,
+            search_key=search_key,
             statuses=statuses,
-            parameter=parameter,
         )
 
     async def update_workflow_definition(

@@ -82,8 +82,9 @@ function Workflows() {
       params.append("page", String(page));
       params.append("page_size", String(itemsPerPage));
       params.append("only_workflows", "true");
-      params.append("title", debouncedSearch);
-      params.append("parameter", debouncedSearch);
+      if (debouncedSearch) {
+        params.append("search_key", debouncedSearch);
+      }
       return client
         .get(`/workflows`, {
           params,
@@ -100,8 +101,9 @@ function Workflows() {
       params.append("page", String(page + 1));
       params.append("page_size", String(itemsPerPage));
       params.append("only_workflows", "true");
-      params.append("title", debouncedSearch);
-      params.append("parameter", debouncedSearch);
+      if (debouncedSearch) {
+        params.append("search_key", debouncedSearch);
+      }
       return client
         .get(`/workflows`, {
           params,
