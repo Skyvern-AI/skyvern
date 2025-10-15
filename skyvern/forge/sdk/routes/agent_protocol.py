@@ -1686,6 +1686,10 @@ async def get_workflow_runs_by_id(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        description="Search runs by parameter key, parameter description, or run parameter value.",
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
@@ -1695,6 +1699,7 @@ async def get_workflow_runs_by_id(
         page=page,
         page_size=page_size,
         status=status,
+        search_key=search_key,
     )
 
 
@@ -1808,6 +1813,7 @@ async def get_workflows(
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
     title: str = Query(""),
+    parameter: str | None = Query(None, description="Filter workflows by parameter key, description, or default value(only for WorkflowParameterModel)"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
@@ -1843,6 +1849,7 @@ async def get_workflows(
         only_workflows=only_workflows,
         title=title,
         statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+        parameter=parameter,
     )
 
 

@@ -1148,6 +1148,7 @@ class WorkflowService:
         only_workflows: bool = False,
         title: str = "",
         statuses: list[WorkflowStatus] | None = None,
+        parameter: str | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -1160,6 +1161,7 @@ class WorkflowService:
             only_workflows=only_workflows,
             title=title,
             statuses=statuses,
+            parameter=parameter,
         )
 
     async def update_workflow_definition(
@@ -1317,6 +1319,7 @@ class WorkflowService:
         page: int = 1,
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
+        search_key: str | None = None,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -1324,6 +1327,7 @@ class WorkflowService:
             page=page,
             page_size=page_size,
             status=status,
+            search_key=search_key,
         )
 
     async def create_workflow_run(
