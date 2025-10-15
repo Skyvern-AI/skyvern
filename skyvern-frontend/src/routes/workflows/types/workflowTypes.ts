@@ -318,6 +318,7 @@ export type Taskv2Block = WorkflowBlockBase & {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_steps: number | null;
+  disable_cache: boolean;
 };
 
 export type ForLoopBlock = WorkflowBlockBase & {
@@ -391,6 +392,7 @@ export type ValidationBlock = WorkflowBlockBase & {
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameters: Array<WorkflowParameter>;
+  disable_cache?: boolean;
 };
 
 export type ActionBlock = WorkflowBlockBase & {
