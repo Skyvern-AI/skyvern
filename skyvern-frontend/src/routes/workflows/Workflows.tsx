@@ -1,6 +1,8 @@
+import styles from "./Workflows.module.css";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import React from "react";
 import {
   Pagination,
   PaginationContent,
@@ -156,9 +158,20 @@ function Workflows() {
   }
 
   return (
-    <div className="space-y-10">
-      <div className="flex h-32 justify-between gap-6">
-        <div className="space-y-5">
+    <div
+      className={cn(
+        "space-y-10",
+        styles.mobileContainer,
+        styles.mobileMainContainer,
+      )}
+    >
+      <div
+        className={cn(
+          "flex h-32 justify-between gap-6",
+          styles.mobileHeaderContainer,
+        )}
+      >
+        <div className={cn("space-y-5", styles.mobileHeaderContent)}>
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
             <h1 className="text-2xl">Workflows</h1>
@@ -168,7 +181,7 @@ function Workflows() {
             Define a series of actions, set it, and forget it.
           </p>
         </div>
-        <div className="flex gap-5">
+        <div className={cn("flex gap-5", styles.mobileNarrativeCards)}>
           <NarrativeCard
             index={1}
             description="Save browser sessions and reuse them in subsequent runs"
@@ -183,12 +196,17 @@ function Workflows() {
           />
         </div>
       </div>
-      <div className="space-y-4">
-        <header>
+      <div className={cn("space-y-4", styles.mobileFlowsSection)}>
+        <header className={styles.mobileFlowsHeader}>
           <h1 className="text-xl">My Flows</h1>
         </header>
-        <div className="flex justify-between">
-          <div className="relative">
+        <div
+          className={cn(
+            "flex justify-between",
+            styles.mobileSearchButtonContainer,
+          )}
+        >
+          <div className={cn("relative", styles.mobileSearchContainer)}>
             <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
               <MagnifyingGlassIcon className="size-6" />
             </div>
@@ -199,16 +217,17 @@ function Workflows() {
                 setParamPatch({ page: "1" });
               }}
               placeholder="Search by title..."
-              className="w-48 pl-9 lg:w-72"
+              className={cn("w-48 pl-9 lg:w-72", styles.mobileSearchInput)}
             />
           </div>
-          <div className="flex gap-4">
+          <div className={cn("flex gap-4", styles.mobileButtonContainer)}>
             <ImportWorkflowButton />
             <Button
               disabled={createWorkflowMutation.isPending}
               onClick={() => {
                 createWorkflowMutation.mutate(emptyWorkflowRequest);
               }}
+              className={styles.mobileButton}
             >
               {createWorkflowMutation.isPending ? (
                 <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
@@ -219,107 +238,118 @@ function Workflows() {
             </Button>
           </div>
         </div>
-        <div className="rounded-lg border">
-          <Table>
-            <TableHeader className="rounded-t-lg bg-slate-elevation2">
-              <TableRow>
-                <TableHead className="w-1/3 rounded-tl-lg text-slate-400">
-                  ID
-                </TableHead>
-                <TableHead className="w-1/3 text-slate-400">Title</TableHead>
-                <TableHead className="w-1/3 text-slate-400">
-                  Created At
-                </TableHead>
-                <TableHead className="rounded-tr-lg"></TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading ? (
+        <div className={cn("rounded-lg border", styles.mobileTableContainer)}>
+          <div className={styles.mobileTableWrapper}>
+            <Table className={styles.mobileTable}>
+              <TableHeader className="rounded-t-lg bg-slate-elevation2">
                 <TableRow>
-                  <TableCell colSpan={4}>Loading...</TableCell>
+                  <TableHead className="w-1/3 rounded-tl-lg text-slate-400">
+                    ID
+                  </TableHead>
+                  <TableHead className="w-1/3 text-slate-400">Title</TableHead>
+                  <TableHead className="w-1/3 text-slate-400">
+                    Created At
+                  </TableHead>
+                  <TableHead className="rounded-tr-lg"></TableHead>
                 </TableRow>
-              ) : workflows?.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={4}>No workflows found</TableCell>
-                </TableRow>
-              ) : (
-                workflows?.map((workflow) => {
-                  return (
-                    <TableRow
-                      key={workflow.workflow_permanent_id}
-                      className="cursor-pointer"
-                    >
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
+              </TableHeader>
+              <TableBody>
+                {isLoading ? (
+                  <TableRow>
+                    <TableCell colSpan={4}>Loading...</TableCell>
+                  </TableRow>
+                ) : workflows?.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={4}>No workflows found</TableCell>
+                  </TableRow>
+                ) : (
+                  workflows?.map((workflow) => {
+                    return (
+                      <TableRow
+                        key={workflow.workflow_permanent_id}
+                        className="cursor-pointer"
                       >
-                        {workflow.workflow_permanent_id}
-                      </TableCell>
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
-                      >
-                        {workflow.title}
-                      </TableCell>
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
-                        title={basicTimeFormat(workflow.created_at)}
-                      >
-                        {basicLocalTimeFormat(workflow.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex justify-end gap-2">
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    handleIconClick(
-                                      event,
-                                      `/workflows/${workflow.workflow_permanent_id}/debug`,
-                                    );
-                                  }}
-                                >
-                                  <Pencil2Icon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>Open in Editor</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    handleIconClick(
-                                      event,
-                                      `/workflows/${workflow.workflow_permanent_id}/run`,
-                                    );
-                                  }}
-                                >
-                                  <PlayIcon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>Create New Run</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                          <WorkflowActions workflow={workflow} />
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  );
-                })
-              )}
-            </TableBody>
-          </Table>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id,
+                            );
+                          }}
+                        >
+                          {workflow.workflow_permanent_id}
+                        </TableCell>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id,
+                            );
+                          }}
+                        >
+                          {workflow.title}
+                        </TableCell>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id,
+                            );
+                          }}
+                          title={basicTimeFormat(workflow.created_at)}
+                        >
+                          {basicLocalTimeFormat(workflow.created_at)}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex justify-end gap-2">
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="outline"
+                                    onClick={(event) => {
+                                      handleIconClick(
+                                        event,
+                                        `/workflows/${workflow.workflow_permanent_id}/debug`,
+                                      );
+                                    }}
+                                  >
+                                    <Pencil2Icon className="h-4 w-4" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Open in Editor</TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="outline"
+                                    onClick={(event) => {
+                                      handleIconClick(
+                                        event,
+                                        `/workflows/${workflow.workflow_permanent_id}/run`,
+                                      );
+                                    }}
+                                  >
+                                    <PlayIcon className="h-4 w-4" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Create New Run</TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                            <WorkflowActions workflow={workflow} />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })
+                )}
+              </TableBody>
+            </Table>
+          </div>
           <div className="relative px-3 py-3">
             <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
               <span className="text-slate-400">Items per page</span>
@@ -340,7 +370,7 @@ function Workflows() {
                 <option value={50}>50</option>
               </select>
             </div>
-            <Pagination className="pt-0">
+            <Pagination className={cn("pt-0", styles.mobilePagination)}>
               <PaginationContent>
                 <PaginationItem>
                   <PaginationPrevious
@@ -365,7 +395,9 @@ function Workflows() {
             </Pagination>
           </div>
         </div>
-        <WorkflowTemplates />
+        <div className={styles.mobileWorkflowTemplates}>
+          <WorkflowTemplates />
+        </div>
       </div>
     </div>
   );
