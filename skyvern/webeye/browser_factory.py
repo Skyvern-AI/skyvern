@@ -690,7 +690,7 @@ class BrowserState:
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url:
+            if url and page.url.rstrip("/") != url.rstrip("/"):
                 await self.navigate_to_url(page=page, url=url)
 
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
