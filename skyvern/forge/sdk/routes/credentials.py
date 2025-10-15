@@ -205,6 +205,7 @@ async def create_credential(
     include_in_schema=False,
 )
 async def delete_credential(
+    background_tasks: BackgroundTasks,
     credential_id: str = Path(
         ...,
         description="The unique identifier of the credential to delete",
@@ -225,6 +226,9 @@ async def delete_credential(
         raise HTTPException(status_code=400, detail="Unsupported credential storage type")
 
     await credential_service.delete_credential(credential)
+
+    # Schedule background cleanup if the service implements it
+    background_tasks.add_task(credential_service.post_delete_credential_item, credential.item_id)
 
     return None
 
