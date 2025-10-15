@@ -144,6 +144,7 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "credential_parameter_id",
         "onepassword_credential_parameter_id",
         "azure_vault_credential_parameter_id",
+        "disable_cache",
     ]
 
     # Use BFS to recursively remove fields from all nested objects
