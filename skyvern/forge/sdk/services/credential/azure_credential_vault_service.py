@@ -1,6 +1,7 @@
 import uuid
 from typing import Annotated, Literal, Union
 
+import structlog
 from azure.identity.aio import ClientSecretCredential
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, TypeAdapter
@@ -20,6 +21,8 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredentialResponse,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+
+LOG = structlog.get_logger()
 
 
 class AzureCredentialVaultService(CredentialVaultService):
@@ -72,7 +75,37 @@ class AzureCredentialVaultService(CredentialVaultService):
         credential: Credential,
     ) -> None:
         await app.DATABASE.delete_credential(credential.credential_id, credential.organization_id)
-        await self.delete_credential_item(credential.item_id)
+        # Deleting takes several seconds, so we empty the value and delete async so customers do not have to wait
+        await self._client.create_or_update_secret(
+            vault_name=self._vault_name,
+            secret_name=credential.item_id,
+            secret_value="",
+        )
+
+    async def post_delete_credential_item(self, item_id: str) -> None:
+        """
+        Background task to delete the credential item from Azure Key Vault.
+        This allows the API to respond quickly while the deletion happens asynchronously.
+        """
+        try:
+            LOG.info(
+                "Deleting credential item from Azure Key Vault in background",
+                item_id=item_id,
+                vault_name=self._vault_name,
+            )
+            await self._client.delete_secret(secret_name=item_id, vault_name=self._vault_name)
+            LOG.info(
+                "Successfully deleted credential item from Azure Key Vault",
+                item_id=item_id,
+                vault_name=self._vault_name,
+            )
+        except Exception as e:
+            LOG.exception(
+                "Failed to delete credential item from Azure Key Vault in background",
+                item_id=item_id,
+                vault_name=self._vault_name,
+                error=str(e),
+            )
 
     async def get_credential(self, organization_id: str, credential_id: str) -> CredentialResponse:
         credential = await app.DATABASE.get_credential(credential_id=credential_id, organization_id=organization_id)
@@ -84,12 +117,6 @@ class AzureCredentialVaultService(CredentialVaultService):
     async def get_credentials(self, organization_id: str, page: int, page_size: int) -> list[CredentialResponse]:
         credentials = await app.DATABASE.get_credentials(organization_id, page=page, page_size=page_size)
         return [_convert_to_response(credential) for credential in credentials]
-
-    async def delete_credential_item(self, item_id: str) -> None:
-        await self._client.delete_secret(
-            vault_name=self._vault_name,
-            secret_name=item_id,
-        )
 
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_name=db_credential.item_id, vault_name=self._vault_name)
@@ -154,7 +181,7 @@ class AzureCredentialVaultService(CredentialVaultService):
         secret_name = f"{organization_id}-{uuid.uuid4()}".replace("_", "")
         secret_value = data.model_dump_json(exclude_none=True)
 
-        return await self._client.create_secret(
+        return await self._client.create_or_update_secret(
             vault_name=self._vault_name,
             secret_name=secret_name,
             secret_value=secret_value,
