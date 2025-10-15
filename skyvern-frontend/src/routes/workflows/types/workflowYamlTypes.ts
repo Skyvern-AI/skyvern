@@ -160,6 +160,7 @@ export type TaskBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
@@ -196,6 +197,7 @@ export type ActionBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   engine: RunEngine | null;
 };
 
@@ -213,6 +215,7 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -230,6 +233,7 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   engine: RunEngine | null;
 };
 
@@ -245,6 +249,7 @@ export type LoginBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -268,6 +273,7 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   engine: RunEngine | null;
   download_timeout?: number | null;
 };

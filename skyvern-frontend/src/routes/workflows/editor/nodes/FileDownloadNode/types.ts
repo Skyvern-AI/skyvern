@@ -15,6 +15,7 @@ export type FileDownloadNodeData = NodeBaseData & {
   totpIdentifier: string | null;
   engine: RunEngine | null;
   cacheActions: boolean;
+  disableCache: boolean;
   downloadTimeout: number | null;
 };
 
@@ -35,6 +36,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  disableCache: false,
   engine: RunEngine.SkyvernV1,
   model: null,
   downloadTimeout: null,
