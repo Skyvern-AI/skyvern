@@ -306,6 +306,7 @@ export type TaskBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
 };
@@ -406,6 +407,7 @@ export type ActionBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   engine: RunEngine | null;
 };
 
@@ -423,6 +425,7 @@ export type NavigationBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -439,6 +442,7 @@ export type ExtractionBlock = WorkflowBlockBase & {
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
   cache_actions: boolean;
+  disable_cache?: boolean;
   engine: RunEngine | null;
 };
 
@@ -454,6 +458,7 @@ export type LoginBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -477,6 +482,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   engine: RunEngine | null;
   download_timeout: number | null; // seconds
 };

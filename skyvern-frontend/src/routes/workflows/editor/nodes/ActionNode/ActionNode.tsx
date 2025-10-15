@@ -41,6 +41,8 @@ import { NodeHeader } from "../components/NodeHeader";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
+import { DisableCache } from "../DisableCache";
+
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
 const navigationGoalTooltip =
@@ -61,6 +63,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
     allowDownloads: data.allowDownloads,
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
+    disableCache: data.disableCache,
     downloadSuffix: data.downloadSuffix,
     totpVerificationUrl: data.totpVerificationUrl,
     model: data.model,
@@ -296,27 +299,17 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                       />
                     </div>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Cache Actions
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["action"]["cacheActions"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={inputs.cacheActions}
-                        onCheckedChange={(checked) => {
-                          if (!editable) {
-                            return;
-                          }
-                          handleChange("cacheActions", checked);
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <DisableCache
+                    cacheActions={inputs.cacheActions}
+                    disableCache={inputs.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      handleChange("cacheActions", cacheActions);
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      handleChange("disableCache", disableCache);
+                    }}
+                  />
                   <Separator />
                   <div className="flex items-center justify-between">
                     <div className="flex gap-2">

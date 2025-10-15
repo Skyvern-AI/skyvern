@@ -42,6 +42,8 @@ import { NodeHeader } from "../components/NodeHeader";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 
+import { DisableCache } from "../DisableCache";
+
 function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const { blockLabel: urlBlockLabel } = useParams();
   const { updateNodeData } = useReactFlow();
@@ -60,6 +62,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const [inputs, setInputs] = useState({
     allowDownloads: data.allowDownloads,
     cacheActions: data.cacheActions,
+    disableCache: data.disableCache,
     completeCriterion: data.completeCriterion,
     continueOnFailure: data.continueOnFailure,
     downloadSuffix: data.downloadSuffix,
@@ -360,24 +363,17 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       />
                     </div>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Cache Actions
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["navigation"]["cacheActions"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={inputs.cacheActions}
-                        onCheckedChange={(checked) => {
-                          handleChange("cacheActions", checked);
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <DisableCache
+                    cacheActions={inputs.cacheActions}
+                    disableCache={inputs.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      handleChange("cacheActions", cacheActions);
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      handleChange("disableCache", disableCache);
+                    }}
+                  />
                   <Separator />
                   <div className="flex items-center justify-between">
                     <div className="flex gap-2">
