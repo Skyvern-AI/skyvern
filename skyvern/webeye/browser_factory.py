@@ -267,6 +267,7 @@ class BrowserContextFactory:
                 browser_context, browser_artifacts, cleanup_func = await _connect_to_cdp_browser(
                     playwright,
                     remote_browser_url=str(browser_address),
+                    extra_http_headers=kwargs.get("extra_http_headers"),
                 )
             else:
                 creator = cls._creators.get(browser_type)
