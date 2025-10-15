@@ -2666,6 +2666,7 @@ class WorkflowService:
                 continue_on_failure=block_yaml.continue_on_failure,
                 # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
                 max_steps_per_run=2,
+                disable_cache=block_yaml.disable_cache,
                 model=block_yaml.model,
             )
 
@@ -2834,6 +2835,7 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
                 max_steps=block_yaml.max_steps,
+                disable_cache=block_yaml.disable_cache,
                 model=block_yaml.model,
                 output_parameter=output_parameter,
             )

@@ -341,6 +341,7 @@ class ValidationBlockYAML(BlockYAML):
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
+    disable_cache: bool = False
 
 
 class ActionBlockYAML(BlockYAML):
@@ -462,6 +463,7 @@ class TaskV2BlockYAML(BlockYAML):
     totp_identifier: str | None = None
     max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+    disable_cache: bool = False
 
 
 class HttpRequestBlockYAML(BlockYAML):
