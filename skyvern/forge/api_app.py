@@ -1,6 +1,7 @@
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Awaitable, Callable
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 import structlog
 from fastapi import FastAPI, Response, status
@@ -50,12 +51,20 @@ def custom_openapi() -> dict:
     return app.openapi_schema
 
 
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, Any]:
+    """Lifespan context manager for FastAPI app startup and shutdown."""
+    LOG.info("Server started")
+    yield
+    LOG.info("Server shutting down")
+
+
 def get_agent_app() -> FastAPI:
     """
     Start the agent server.
     """
 
-    app = FastAPI()
+    app = FastAPI(lifespan=lifespan)
 
     # Add CORS middleware
     app.add_middleware(
