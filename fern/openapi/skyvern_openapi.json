@@ -3162,6 +3162,7 @@
           "reload_page",
           "extract",
           "verification_code",
+          "goto_url",
           "scroll",
           "keypress",
           "move",
@@ -8348,6 +8349,14 @@
         "title": "NonEmptyPasswordCredential",
         "description": "Password credential model that requires non-empty values."
       },
+      "OTPType": {
+        "type": "string",
+        "enum": [
+          "totp",
+          "magic_link"
+        ],
+        "title": "OTPType"
+      },
       "OnePasswordCredentialParameter": {
         "properties": {
           "parameter_type": {
@@ -9215,6 +9224,17 @@
             "format": "date-time",
             "title": "Modified At",
             "description": "The timestamp when the TOTP code was modified."
+          },
+          "otp_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OTPType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of the OTP code."
           }
         },
         "type": "object",
