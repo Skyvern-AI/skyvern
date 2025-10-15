@@ -1813,7 +1813,10 @@ async def get_workflows(
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
     title: str = Query(""),
-    parameter: str | None = Query(None, description="Filter workflows by parameter key, description, or default value(only for WorkflowParameterModel)"),
+    parameter: str | None = Query(
+        None,
+        description="Filter workflows by parameter key, description, or default value(only for WorkflowParameterModel)",
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:

@@ -24,7 +24,12 @@ import {
 } from "@/components/ui/table";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import { MagnifyingGlassIcon, MixerHorizontalIcon, Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import {
+  MagnifyingGlassIcon,
+  MixerHorizontalIcon,
+  Pencil2Icon,
+  PlayIcon,
+} from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import {
   Link,
@@ -37,7 +42,12 @@ import { useWorkflowRunsQuery } from "./hooks/useWorkflowRunsQuery";
 import { WorkflowActions } from "./WorkflowActions";
 import { Input } from "@/components/ui/input";
 import { useDebounce } from "use-debounce";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
 
 function WorkflowPage() {
@@ -134,7 +144,10 @@ function WorkflowPage() {
               className="w-48 pl-9 lg:w-72"
             />
           </div>
-          <StatusFilterDropdown values={statusFilters} onChange={setStatusFilters} />
+          <StatusFilterDropdown
+            values={statusFilters}
+            onChange={setStatusFilters}
+          />
         </div>
         <div className="rounded-md border">
           <Table>
@@ -207,7 +220,9 @@ function WorkflowPage() {
                                   variant="outline"
                                   onClick={(event) => {
                                     event.stopPropagation();
-                                    setOpenRunParams(workflowRun.workflow_run_id ?? null);
+                                    setOpenRunParams(
+                                      workflowRun.workflow_run_id ?? null,
+                                    );
                                   }}
                                 >
                                   <MixerHorizontalIcon className="h-4 w-4" />

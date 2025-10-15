@@ -323,7 +323,11 @@ function Workflows() {
                                 <Button
                                   size="icon"
                                   variant="outline"
-                                  onClick={() => setOpenWorkflowId(workflow.workflow_permanent_id)}
+                                  onClick={() =>
+                                    setOpenWorkflowId(
+                                      workflow.workflow_permanent_id,
+                                    )
+                                  }
                                   disabled={
                                     !workflow.workflow_definition.parameters.some(
                                       (p) => p.parameter_type !== "output",

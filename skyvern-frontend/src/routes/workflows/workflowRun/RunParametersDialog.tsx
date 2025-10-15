@@ -4,6 +4,8 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { useQuery } from "@tanstack/react-query";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
+import { WorkflowRunStatusApiResponse } from "@/api/types";
+import { Parameter } from "../types/workflowTypes";
 
 type Props = {
   open: boolean;
@@ -12,11 +14,16 @@ type Props = {
   workflowRunId: string | null;
 };
 
-export function RunParametersDialog({ open, onOpenChange, workflowPermanentId, workflowRunId }: Props) {
+export function RunParametersDialog({
+  open,
+  onOpenChange,
+  workflowPermanentId,
+  workflowRunId,
+}: Props) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
-  const { data: run } = useQuery<any>({
+  const { data: run } = useQuery<WorkflowRunStatusApiResponse>({
     queryKey: ["workflowRun", workflowPermanentId, workflowRunId, "dialog"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
@@ -28,20 +35,26 @@ export function RunParametersDialog({ open, onOpenChange, workflowPermanentId, w
         params.set("template", "true");
       }
       return client
-        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, { params })
+        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
+          params,
+        })
         .then((r) => r.data);
     },
     enabled: !!workflowPermanentId && !!workflowRunId && !!globalWorkflows,
   });
 
   const defByKey = new Map(
-    (workflow?.workflow_definition.parameters ?? []).map((p: any) => [p.key, p])
+    (workflow?.workflow_definition.parameters ?? []).map((p: Parameter) => [
+      p.key,
+      p,
+    ]),
   );
 
   const items = Object.entries(run?.parameters ?? {}).map(([key, value]) => {
     const def = defByKey.get(key);
-    const description = def && "description" in def ? (def as any).description ?? undefined : undefined;
-    const type = def ? (def as any).parameter_type ?? undefined : undefined;
+    const description =
+      def && "description" in def ? def.description ?? undefined : undefined;
+    const type = def ? def.parameter_type ?? undefined : undefined;
     const displayValue =
       value === null || value === undefined
         ? ""
@@ -67,5 +80,3 @@ export function RunParametersDialog({ open, onOpenChange, workflowPermanentId, w
     />
   );
 }
-
-

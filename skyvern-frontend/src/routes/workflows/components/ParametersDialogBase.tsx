@@ -1,4 +1,9 @@
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
@@ -22,7 +27,13 @@ type Props = {
   items: Array<ParameterItem>;
 };
 
-export function ParametersDialogBase({ open, onOpenChange, title = "Parameters", sectionLabel = "Parameters", items }: Props) {
+export function ParametersDialogBase({
+  open,
+  onOpenChange,
+  title = "Parameters",
+  sectionLabel = "Parameters",
+  items,
+}: Props) {
   const [revealedIds, setRevealedIds] = useState<Set<string>>(new Set());
 
   function toggleReveal(id: string) {
@@ -35,16 +46,23 @@ export function ParametersDialogBase({ open, onOpenChange, title = "Parameters",
   }
 
   function renderRow(item: ParameterItem) {
-    const revealed = item.value !== undefined && item.value !== null && item.value !== "" && revealedIds.has(item.id);
-    const isRevealable = item.value !== undefined && item.value !== null && item.value !== "";
+    const revealed =
+      item.value !== undefined &&
+      item.value !== null &&
+      item.value !== "" &&
+      revealedIds.has(item.id);
+    const isRevealable =
+      item.value !== undefined && item.value !== null && item.value !== "";
     return (
       <div key={item.id} className="rounded-md border p-3">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <div className="font-mono text-sm break-all">{item.key}</div>
+              <div className="break-all font-mono text-sm">{item.key}</div>
               {item.description ? (
-                <div className="text-xs text-slate-400">— {item.description}</div>
+                <div className="text-xs text-slate-400">
+                  — {item.description}
+                </div>
               ) : null}
             </div>
           </div>
@@ -57,14 +75,18 @@ export function ParametersDialogBase({ open, onOpenChange, title = "Parameters",
                 onClick={() => toggleReveal(item.id)}
                 title={revealed ? "Hide value" : "Show value"}
               >
-                {revealed ? <EyeClosedIcon className="h-4 w-4" /> : <EyeOpenIcon className="h-4 w-4" />}
+                {revealed ? (
+                  <EyeClosedIcon className="h-4 w-4" />
+                ) : (
+                  <EyeOpenIcon className="h-4 w-4" />
+                )}
               </Button>
             ) : null}
           </div>
         </div>
         {isRevealable ? (
           <div className="mt-2">
-            <div className="rounded bg-slate-elevation2 p-2 text-xs font-mono">
+            <div className="rounded bg-slate-elevation2 p-2 font-mono text-xs">
               {revealed ? item.value : "••••••"}
             </div>
           </div>
@@ -86,7 +108,9 @@ export function ParametersDialogBase({ open, onOpenChange, title = "Parameters",
             <Label className="text-xs">{sectionLabel}</Label>
             <ScrollArea>
               <ScrollAreaViewport className="max-h-[420px]">
-                <div className="space-y-3">{items.map((it) => renderRow(it))}</div>
+                <div className="space-y-3">
+                  {items.map((it) => renderRow(it))}
+                </div>
               </ScrollAreaViewport>
             </ScrollArea>
           </div>
@@ -95,5 +119,3 @@ export function ParametersDialogBase({ open, onOpenChange, title = "Parameters",
     </Dialog>
   );
 }
-
-

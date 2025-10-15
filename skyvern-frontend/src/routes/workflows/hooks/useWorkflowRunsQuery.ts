@@ -28,7 +28,13 @@ function useWorkflowRunsQuery({
   const credentialGetter = useCredentialGetter();
 
   return useQuery<Array<WorkflowRunApiResponse>>({
-    queryKey: ["workflowRuns", { statusFilters }, workflowPermanentId, page, search],
+    queryKey: [
+      "workflowRuns",
+      { statusFilters },
+      workflowPermanentId,
+      page,
+      search,
+    ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
