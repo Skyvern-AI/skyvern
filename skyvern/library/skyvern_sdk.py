@@ -86,13 +86,20 @@ class SkyvernSdk:
         Raises:
             Exception: If no API key is provided and no .env file exists.
         """
+
         if api_key is None:
-            if not os.path.exists(".env"):
-                raise Exception("No .env file found. Please run 'skyvern quickstart' first to set up your environment.")
+            if os.path.exists(".env"):
+                load_dotenv(".env")
 
-            load_dotenv(".env")
+            env_key = os.getenv("SKYVERN_API_KEY")
+            if not env_key:
+                raise ValueError(
+                    "SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in environment/.env."
+                )
+            self._api_key = env_key
+        else:
+            self._api_key = api_key
 
-        self._api_key = api_key or os.environ["SKYVERN_API_KEY"]
         self._api = AsyncSkyvern(
             environment=environment,
             base_url=base_url,
@@ -192,7 +199,7 @@ class SkyvernSdk:
 
     async def _connect_to_cloud_browser_session(self, browser_session: BrowserSessionResponse) -> SkyvernBrowser:
         if browser_session.browser_address is None:
-            raise Exception(f"Browser session id is missing for {browser_session.browser_session_id}")
+            raise Exception(f"Browser address is missing for session {browser_session.browser_session_id}")
 
         playwright = await self._get_playwright()
         browser = await playwright.chromium.connect_over_cdp(
@@ -205,3 +212,11 @@ class SkyvernSdk:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
         return self._playwright
+
+    async def aclose(self) -> None:
+        """Close Playwright and release resources."""
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            finally:
+                self._playwright = None

@@ -3,7 +3,7 @@ from typing import Any
 
 from playwright.async_api import Page
 
-from skyvern.client import AsyncSkyvern
+from skyvern.client import AsyncSkyvern, GetRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
 from skyvern.schemas.run_blocks import CredentialType
@@ -80,7 +80,7 @@ class SkyvernPageRun:
             user_agent=user_agent,
         )
 
-        await self._wait_for_run_completion(task_run.run_id, timeout)
+        task_run = await self._wait_for_run_completion(task_run.run_id, timeout)
         return TaskRunResponse.model_validate(task_run.model_dump())
 
     async def login(
@@ -138,7 +138,7 @@ class SkyvernPageRun:
             extra_http_headers=extra_http_headers,
         )
 
-        await self._wait_for_run_completion(workflow_run.run_id, timeout)
+        workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
     async def run_workflow(
@@ -179,16 +179,17 @@ class SkyvernPageRun:
             browser_address=self._browser_address,
         )
 
-        await self._wait_for_run_completion(workflow_run.run_id, timeout)
+        workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
-    async def _wait_for_run_completion(self, run_id: str, timeout: float) -> None:
+    async def _wait_for_run_completion(self, run_id: str, timeout: float) -> GetRunResponse:
         async with asyncio.timeout(timeout):
             while True:
                 task_run = await self._client.get_run(run_id)
                 if RunStatus(task_run.status).is_final():
                     break
                 await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
+        return task_run
 
     def _get_page_url(self) -> str | None:
         url = self._page.url

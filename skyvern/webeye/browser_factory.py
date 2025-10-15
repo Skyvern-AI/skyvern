@@ -564,7 +564,7 @@ async def _connect_to_cdp_browser(
     playwright: Playwright,
     remote_browser_url: str,
     extra_http_headers: dict[str, str] | None = None,
-) -> tuple[BrowserContext, BrowserArtifacts, None]:
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(

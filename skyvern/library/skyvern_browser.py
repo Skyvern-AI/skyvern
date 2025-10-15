@@ -14,8 +14,8 @@ class SkyvernBrowser:
 
     Example:
         ```python
-        async with AsyncSkyvern() as client:
-            browser = await client.launch_browser()
+            sdk = SkyvernSdk()
+            browser = await sdk.launch_local_browser()
 
             # Get or create the working page
             page = await browser.get_working_page()
