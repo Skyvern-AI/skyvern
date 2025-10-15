@@ -1692,6 +1692,9 @@ async def get_workflow_runs_by_id(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
+    """
+    Get workflow runs for a specific workflow permanent id.
+    """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
         workflow_permanent_id=workflow_id,

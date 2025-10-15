@@ -2081,6 +2081,9 @@ class AgentDB:
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
     ) -> list[WorkflowRun]:
+        """
+        Get runs for a workflow, with optional `search_key` on parameter key/description/value.
+        """
         try:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
