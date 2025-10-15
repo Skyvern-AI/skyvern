@@ -644,7 +644,7 @@ class WorkflowService:
 
                 # Try executing with script code if available
                 block_executed_with_code = False
-                valid_to_run_code = block.label and block.label in script_blocks_by_label
+                valid_to_run_code = block.label and block.label in script_blocks_by_label and not block.disable_cache
                 if valid_to_run_code:
                     script_block = script_blocks_by_label[block.label]
                     LOG.info(
@@ -2517,6 +2517,7 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                disable_cache=block_yaml.disable_cache,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
@@ -2695,6 +2696,7 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                disable_cache=block_yaml.disable_cache,
                 # DO NOT run complete verification for action block
                 complete_verification=False,
                 max_steps_per_run=1,
@@ -2724,6 +2726,7 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                disable_cache=block_yaml.disable_cache,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
@@ -2750,6 +2753,7 @@ class WorkflowService:
                 model=block_yaml.model,
                 continue_on_failure=block_yaml.continue_on_failure,
                 cache_actions=block_yaml.cache_actions,
+                disable_cache=block_yaml.disable_cache,
                 complete_verification=False,
             )
 
@@ -2775,6 +2779,7 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                disable_cache=block_yaml.disable_cache,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
@@ -2814,6 +2819,7 @@ class WorkflowService:
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 cache_actions=block_yaml.cache_actions,
+                disable_cache=block_yaml.disable_cache,
                 complete_on_download=True,
                 complete_verification=True,
                 download_timeout=block_yaml.download_timeout,
