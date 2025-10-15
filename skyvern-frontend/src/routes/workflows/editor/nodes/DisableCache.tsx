@@ -12,7 +12,7 @@ function DisableCache({
   onCacheActionsChange,
   onDisableCacheChange,
 }: {
-  cacheActions: boolean;
+  cacheActions?: boolean;
   disableCache: boolean;
   editable: boolean;
   // --

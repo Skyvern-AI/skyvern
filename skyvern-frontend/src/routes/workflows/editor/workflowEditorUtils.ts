@@ -264,6 +264,7 @@ function convertToNode(
           prompt: block.prompt,
           url: block.url ?? "",
           maxSteps: block.max_steps,
+          disableCache: block.disable_cache ?? false,
           totpIdentifier: block.totp_identifier,
           totpVerificationUrl: block.totp_verification_url,
           maxScreenshotScrolls: null,
@@ -281,6 +282,7 @@ function convertToNode(
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: block.parameters.map((p) => p.key),
+          disableCache: block.disable_cache ?? false,
         },
       };
     }
