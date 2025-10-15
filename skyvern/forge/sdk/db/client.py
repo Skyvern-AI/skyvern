@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -1576,6 +1576,7 @@ class AgentDB:
         only_workflows: bool = False,
         title: str = "",
         statuses: list[WorkflowStatus] | None = None,
+        parameter: str | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -1609,10 +1610,116 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
                 elif only_workflows:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
-                if title:
-                    main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
                 if statuses:
                     main_query = main_query.where(WorkflowModel.status.in_(statuses))
+                if parameter:
+                    parameter_like = f"%{parameter}%"
+                    title_like = WorkflowModel.title.ilike(parameter_like)
+                    parameter_filters = [
+                        exists(
+                            select(1)
+                            .select_from(WorkflowParameterModel)
+                            .where(WorkflowParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    WorkflowParameterModel.key.ilike(parameter_like),
+                                    WorkflowParameterModel.description.ilike(parameter_like),
+                                    WorkflowParameterModel.default_value.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(OutputParameterModel)
+                            .where(OutputParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    OutputParameterModel.key.ilike(parameter_like),
+                                    OutputParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(AWSSecretParameterModel)
+                            .where(AWSSecretParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    AWSSecretParameterModel.key.ilike(parameter_like),
+                                    AWSSecretParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(BitwardenLoginCredentialParameterModel)
+                            .where(BitwardenLoginCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    BitwardenLoginCredentialParameterModel.key.ilike(parameter_like),
+                                    BitwardenLoginCredentialParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(BitwardenSensitiveInformationParameterModel)
+                            .where(BitwardenSensitiveInformationParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    BitwardenSensitiveInformationParameterModel.key.ilike(parameter_like),
+                                    BitwardenSensitiveInformationParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(BitwardenCreditCardDataParameterModel)
+                            .where(BitwardenCreditCardDataParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    BitwardenCreditCardDataParameterModel.key.ilike(parameter_like),
+                                    BitwardenCreditCardDataParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(OnePasswordCredentialParameterModel)
+                            .where(OnePasswordCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    OnePasswordCredentialParameterModel.key.ilike(parameter_like),
+                                    OnePasswordCredentialParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(AzureVaultCredentialParameterModel)
+                            .where(AzureVaultCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    AzureVaultCredentialParameterModel.key.ilike(parameter_like),
+                                    AzureVaultCredentialParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                        exists(
+                            select(1)
+                            .select_from(CredentialParameterModel)
+                            .where(CredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(
+                                or_(
+                                    CredentialParameterModel.key.ilike(parameter_like),
+                                    CredentialParameterModel.description.ilike(parameter_like),
+                                )
+                            )
+                        ),
+                    ]
+                    main_query = main_query.where(or_(title_like, or_(*parameter_filters)))
+                elif title:
+                    main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
@@ -1987,6 +2094,7 @@ class AgentDB:
         page: int = 1,
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
+        search_key: str | None = None,
     ) -> list[WorkflowRun]:
         try:
             async with self.Session() as session:
@@ -1997,6 +2105,28 @@ class AgentDB:
                     .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                 )
+                if search_key:
+                    key_like = f"%{search_key}%"
+                    # Filter runs where any run parameter matches by key/description/value
+                    # Use EXISTS to avoid duplicate rows and to keep pagination correct
+                    param_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .join(
+                            WorkflowParameterModel,
+                            WorkflowParameterModel.workflow_parameter_id
+                            == WorkflowRunParameterModel.workflow_parameter_id,
+                        )
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(
+                            or_(
+                                WorkflowParameterModel.key.ilike(key_like),
+                                WorkflowParameterModel.description.ilike(key_like),
+                                WorkflowRunParameterModel.value.ilike(key_like),
+                            )
+                        )
+                    )
+                    query = query.where(param_exists)
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
