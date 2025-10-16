@@ -23,6 +23,7 @@ from skyvern.exceptions import (
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
+    ScriptTerminationException,
     SkyvernException,
     WorkflowNotFound,
     WorkflowRunNotFound,
@@ -144,6 +145,7 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "credential_parameter_id",
         "onepassword_credential_parameter_id",
         "azure_vault_credential_parameter_id",
+        "disable_cache",
     ]
 
     # Use BFS to recursively remove fields from all nested objects
@@ -677,9 +679,17 @@ class WorkflowService:
 
                         LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
 
-                        exec_code = compile(wrapper_code, "<run_signature>", "exec")
-                        exec(exec_code, exec_globals)
-                        output_value = await exec_globals["__run_signature_wrapper"]()
+                        try:
+                            exec_code = compile(wrapper_code, "<run_signature>", "exec")
+                            exec(exec_code, exec_globals)
+                            output_value = await exec_globals["__run_signature_wrapper"]()
+                        except ScriptTerminationException as e:
+                            LOG.warning(
+                                "Script termination",
+                                block_label=block.label,
+                                error=str(e),
+                                exc_info=True,
+                            )
 
                         # Execution succeeded - get the block result from the workflow run blocks
                         # The script execution should have created the workflow run block
@@ -2670,6 +2680,7 @@ class WorkflowService:
                 continue_on_failure=block_yaml.continue_on_failure,
                 # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
                 max_steps_per_run=2,
+                disable_cache=block_yaml.disable_cache,
                 model=block_yaml.model,
             )
 
@@ -2838,6 +2849,7 @@ class WorkflowService:
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
                 max_steps=block_yaml.max_steps,
+                disable_cache=block_yaml.disable_cache,
                 model=block_yaml.model,
                 output_parameter=output_parameter,
             )

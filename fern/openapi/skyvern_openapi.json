@@ -2963,6 +2963,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -3127,6 +3132,11 @@
             "type": "boolean",
             "title": "Cache Actions",
             "default": false
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           }
         },
         "type": "object",
@@ -3162,6 +3172,7 @@
           "reload_page",
           "extract",
           "verification_code",
+          "goto_url",
           "scroll",
           "keypress",
           "move",
@@ -5298,6 +5309,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -5433,6 +5449,11 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
+            "default": false
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
             "default": false
           }
         },
@@ -5694,6 +5715,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -5856,6 +5882,11 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
+            "default": false
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
             "default": false
           },
           "download_timeout": {
@@ -7342,6 +7373,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -7500,6 +7536,11 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
+            "default": false
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
             "default": false
           },
           "complete_criterion": {
@@ -8017,6 +8058,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -8187,6 +8233,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -8347,6 +8398,14 @@
         ],
         "title": "NonEmptyPasswordCredential",
         "description": "Password credential model that requires non-empty values."
+      },
+      "OTPType": {
+        "type": "string",
+        "enum": [
+          "totp",
+          "magic_link"
+        ],
+        "title": "OTPType"
       },
       "OnePasswordCredentialParameter": {
         "properties": {
@@ -9215,6 +9274,17 @@
             "format": "date-time",
             "title": "Modified At",
             "description": "The timestamp when the TOTP code was modified."
+          },
+          "otp_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OTPType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The type of the OTP code."
           }
         },
         "type": "object",
@@ -9586,6 +9656,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -9790,6 +9865,11 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
+            "default": false
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
             "default": false
           },
           "complete_criterion": {
@@ -11307,6 +11387,11 @@
             "title": "Cache Actions",
             "default": false
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -11652,6 +11737,11 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
+            "default": false
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {

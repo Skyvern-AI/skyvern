@@ -37,6 +37,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     HttpRequestBlock,
     LoginBlock,
+    NavigationBlock,
     PDFParserBlock,
     SendEmailBlock,
     TaskBlock,
@@ -807,12 +808,16 @@ async def _fallback_to_ai_run(
         # Update block status to completed if workflow block was created
         if workflow_run_block_id:
             # refresh the task
+            failure_reason = None
             refreshed_task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
             if refreshed_task:
                 task = refreshed_task
+            if task.status in [TaskStatus.terminated, TaskStatus.failed]:
+                failure_reason = task.failure_reason
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus(task.status.value),
+                failure_reason=failure_reason,
                 label=cache_key,
             )
 
@@ -1172,7 +1177,7 @@ async def run_task(
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
-            block_type=BlockType.TASK,
+            block_type=BlockType.NAVIGATION,
             prompt=prompt,
             url=url,
             label=cache_key,
@@ -1197,7 +1202,7 @@ async def run_task(
         except Exception as e:
             LOG.exception("Failed to run task block. Falling back to AI run.")
             await _fallback_to_ai_run(
-                block_type=BlockType.TASK,
+                block_type=BlockType.NAVIGATION,
                 cache_key=cache_key,
                 prompt=prompt,
                 url=url,
@@ -1212,7 +1217,7 @@ async def run_task(
             context.prompt = None
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
-        task_block = TaskBlock(
+        task_block = NavigationBlock(
             label=block_validation_output.label,
             output_parameter=block_validation_output.output_parameter,
             url=url,

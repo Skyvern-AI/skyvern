@@ -26,6 +26,7 @@ import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunO
 import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
 import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode";
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
+import { CredentialsPage } from "@/routes/credentials/CredentialsPage.tsx";
 
 const router = createBrowserRouter([
   {
@@ -198,6 +199,16 @@ const router = createBrowserRouter([
           {
             index: true,
             element: <Settings />,
+          },
+        ],
+      },
+      {
+        path: "credentials",
+        element: <PageLayout />,
+        children: [
+          {
+            index: true,
+            element: <CredentialsPage />,
           },
         ],
       },

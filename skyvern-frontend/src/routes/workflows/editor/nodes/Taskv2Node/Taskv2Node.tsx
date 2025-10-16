@@ -26,6 +26,8 @@ import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 
+import { DisableCache } from "../DisableCache";
+
 function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
@@ -49,6 +51,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
     maxSteps: data.maxSteps,
+    disableCache: data.disableCache,
     model: data.model,
   });
 
@@ -167,6 +170,18 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                       }}
                     />
                   </div>
+                  <Separator />
+                  <DisableCache
+                    disableCache={inputs.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      handleChange("cacheActions", cacheActions);
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      handleChange("disableCache", disableCache);
+                    }}
+                  />
+                  <Separator />
                   <div className="space-y-2">
                     <div className="flex gap-2">
                       <Label className="text-xs text-slate-300">

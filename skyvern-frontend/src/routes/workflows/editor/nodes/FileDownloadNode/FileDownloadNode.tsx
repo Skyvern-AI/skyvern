@@ -42,6 +42,8 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useRerender } from "@/hooks/useRerender";
 import { BROWSER_DOWNLOAD_TIMEOUT_SECONDS } from "@/api/types";
 
+import { DisableCache } from "../DisableCache";
+
 const urlTooltip =
   "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
 const urlPlaceholder = "https://";
@@ -70,6 +72,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
     maxStepsOverride: data.maxStepsOverride,
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
+    disableCache: data.disableCache,
     downloadSuffix: data.downloadSuffix,
     totpVerificationUrl: data.totpVerificationUrl,
     totpIdentifier: data.totpIdentifier,
@@ -323,24 +326,17 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       />
                     </div>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Cache Actions
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["download"]["cacheActions"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={inputs.cacheActions}
-                        onCheckedChange={(checked) => {
-                          handleChange("cacheActions", checked);
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <DisableCache
+                    cacheActions={inputs.cacheActions}
+                    disableCache={inputs.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      handleChange("cacheActions", cacheActions);
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      handleChange("disableCache", disableCache);
+                    }}
+                  />
                   <Separator />
                   <div className="space-y-2">
                     <div className="flex gap-2">

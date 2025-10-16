@@ -785,11 +785,13 @@ async def handle_sequential_click_for_dropdown(
 
     if dropdown_select_context.is_date_related:
         LOG.info(
-            "The dropdown is date related, exiting the sequential click logic",
+            "The dropdown is date related, exiting the sequential click logic and skipping the remaining actions",
             step_id=step.step_id,
             task_id=task.task_id,
         )
-        return None
+        result = ActionSuccess()
+        result.skip_remaining_actions = True
+        return result
 
     LOG.info(
         "Found the dropdown menu element after clicking, triggering the sequential click logic",
@@ -3179,7 +3181,7 @@ async def select_from_dropdown(
         step_id=step.step_id,
         task_id=task.task_id,
     )
-    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
+    json_response = await app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
     select_reason: str | None = json_response.get("reasoning", None)
@@ -3477,6 +3479,16 @@ async def locate_dropdown_menu(
                     task_id=task.task_id,
                     exc_info=True,
                 )
+        # check if opening react-datetime datepicker: https://github.com/arqex/react-datetime
+        class_name = await head_element.get_attr("class", mode="static")
+        if class_name and "rdtOpen" in class_name:
+            LOG.info(
+                "Confirm it's an opened React-Datetime datepicker",
+                element_id=element_id,
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            return head_element
 
         # sometimes taking screenshot might scroll away, need to scroll back after the screenshot
         x, y = await skyvern_frame.get_scroll_x_y()
@@ -3664,7 +3676,7 @@ async def normal_select(
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
 
-    json_response = await app.SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
+    json_response = await app.NORMAL_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="normal-select")
     index: int | None = json_response.get("index")
     value: str | None = json_response.get("value")
 

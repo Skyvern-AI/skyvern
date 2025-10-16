@@ -1,0 +1,10 @@
+# yamlfmt configuration
+# Force Unix LF line endings for all YAML files
+line_ending: lf
+
+# Additional formatting options
+formatter:
+  type: basic
+  indent: 2
+  include_document_start: false
+  pad_line_comments: 1

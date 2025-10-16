@@ -78,7 +78,7 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
-from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession
+from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession, DebugSessionRun
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
@@ -4063,6 +4063,65 @@ class AgentDB:
             model = (await session.scalars(query)).first()
 
             return DebugSession.model_validate(model) if model else None
+
+    async def get_debug_session_by_id(
+        self,
+        debug_session_id: str,
+        organization_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(debug_session_id=debug_session_id)
+            )
+
+            model = (await session.scalars(query)).first()
+
+            return DebugSession.model_validate(model) if model else None
+
+    async def get_workflow_runs_by_debug_session_id(
+        self,
+        debug_session_id: str,
+        organization_id: str,
+    ) -> list[DebugSessionRun]:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel, BlockRunModel)
+                .join(BlockRunModel, BlockRunModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.debug_session_id == debug_session_id)
+                .order_by(WorkflowRunModel.created_at.desc())
+            )
+
+            results = (await session.execute(query)).all()
+
+            debug_session_runs = []
+            for workflow_run, block_run in results:
+                debug_session_runs.append(
+                    DebugSessionRun(
+                        ai_fallback=workflow_run.ai_fallback,
+                        block_label=block_run.block_label,
+                        browser_session_id=workflow_run.browser_session_id,
+                        code_gen=workflow_run.code_gen,
+                        debug_session_id=workflow_run.debug_session_id,
+                        failure_reason=workflow_run.failure_reason,
+                        output_parameter_id=block_run.output_parameter_id,
+                        run_with=workflow_run.run_with,
+                        script_run_id=workflow_run.script_run.get("script_run_id") if workflow_run.script_run else None,
+                        status=workflow_run.status,
+                        workflow_id=workflow_run.workflow_id,
+                        workflow_permanent_id=workflow_run.workflow_permanent_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        created_at=workflow_run.created_at,
+                        queued_at=workflow_run.queued_at,
+                        started_at=workflow_run.started_at,
+                        finished_at=workflow_run.finished_at,
+                    )
+                )
+
+            return debug_session_runs
 
     async def complete_debug_sessions(
         self,

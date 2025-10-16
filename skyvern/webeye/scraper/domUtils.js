@@ -790,9 +790,12 @@ function isInteractableInput(element, hoverStylesMap) {
   // "city", "state", "zip", "country"
   // That's the reason I (Kerem) removed the valid input types check
   var type = element.getAttribute("type")?.toLowerCase().trim() ?? "text";
+  var readOnly = isReadonlyElement(element);
+
   return (
     isHoverPointerElement(element, hoverStylesMap) ||
-    (!isReadonlyElement(element) && type !== "hidden")
+    isReadonlyInputDropdown(element) ||
+    (!readOnly && type !== "hidden")
   );
 }
 
@@ -916,7 +919,9 @@ function isInteractable(element, hoverStylesMap) {
 
   if (
     tagName === "li" &&
-    (className.includes("ui-menu-item") || className.includes("dropdown-item"))
+    (className.includes("ui-menu-item") ||
+      className.includes("dropdown-item") ||
+      className === "option")
   ) {
     return true;
   }
@@ -1105,6 +1110,15 @@ const isReactSelectDropdown = (element) => {
     element.getAttribute("role") === "combobox"
   );
 };
+
+function isReadonlyInputDropdown(element) {
+  const className = element.className?.toString() ?? "";
+  return (
+    element.tagName.toLowerCase() === "input" &&
+    className.includes("custom-select") &&
+    isReadonlyElement(element)
+  );
+}
 
 function hasNgAttribute(element) {
   if (!element.attributes[Symbol.iterator]) {
@@ -1490,7 +1504,8 @@ async function buildElementObject(
       isAngularDropdown(element) ||
       isAngularMaterialDatePicker(element) ||
       isSelect2Dropdown(element) ||
-      isSelect2MultiChoice(element),
+      isSelect2MultiChoice(element) ||
+      isReadonlyInputDropdown(element),
   };
 
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;

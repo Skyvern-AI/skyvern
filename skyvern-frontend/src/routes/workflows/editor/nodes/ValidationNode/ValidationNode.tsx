@@ -39,6 +39,8 @@ import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRerender } from "@/hooks/useRerender";
 
+import { DisableCache } from "../DisableCache";
+
 function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -58,6 +60,7 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
     terminateCriterion: data.terminateCriterion,
     errorCodeMapping: data.errorCodeMapping,
     model: data.model,
+    disableCache: data.disableCache,
   });
 
   const rerender = useRerender({ prefix: "accordian" });
@@ -243,6 +246,16 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                       />
                     </div>
                   </div>
+                  <DisableCache
+                    disableCache={inputs.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      handleChange("cacheActions", cacheActions);
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      handleChange("disableCache", disableCache);
+                    }}
+                  />
                 </div>
               </AccordionContent>
             </AccordionItem>
