@@ -14,7 +14,7 @@ from playwright.async_api import Page
 
 from skyvern.config import settings
 from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
-from skyvern.exceptions import WorkflowRunNotFound
+from skyvern.exceptions import ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file
@@ -28,12 +28,18 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
+    CompleteAction,
     ExtractAction,
     InputTextAction,
     SelectOption,
     SolveCaptchaAction,
 )
-from skyvern.webeye.actions.handler import ActionHandler, handle_input_text_action, handle_select_option_action
+from skyvern.webeye.actions.handler import (
+    ActionHandler,
+    handle_complete_action,
+    handle_input_text_action,
+    handle_select_option_action,
+)
 from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ScrapedPage, scrape_website
@@ -791,11 +797,33 @@ class SkyvernPage:
         return
 
     @action_wrap(ActionType.COMPLETE)
-    async def complete(
-        self, data_extraction_goal: str, intention: str | None = None, data: str | dict[str, Any] | None = None
-    ) -> None:
-        # TODO: update the workflow run status to completed
-        return
+    async def complete(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+        # TODO: add validation here. if it doesn't pass the validation criteria:
+        #  1. terminate the workflow run if fallback to ai is false
+        #  2. fallback to ai if fallback to ai is true
+        context = skyvern_context.current()
+        if (
+            not context
+            or not context.organization_id
+            or not context.workflow_run_id
+            or not context.task_id
+            or not context.step_id
+        ):
+            return
+        task = await app.DATABASE.get_task(context.task_id, context.organization_id)
+        step = await app.DATABASE.get_step(context.step_id, context.organization_id)
+        if task and step:
+            action = CompleteAction(
+                organization_id=context.organization_id,
+                task_id=context.task_id,
+                step_id=context.step_id,
+                step_order=step.order,
+                action_order=context.action_order,
+            )
+            # result = await ActionHandler.handle_action(self.scraped_page, task, step, self.page, action)
+            result = await handle_complete_action(action, self.page, self.scraped_page, task, step)
+            if result and result[-1].success is False:
+                raise ScriptTerminationException(result[-1].exception_message)
 
     @action_wrap(ActionType.RELOAD_PAGE)
     async def reload_page(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
