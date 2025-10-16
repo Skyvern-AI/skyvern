@@ -27,6 +27,7 @@ from skyvern.schemas.workflows import FileStorageType
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
+GENERATE_CODE_AI_MODE = "proactive"
 
 
 # --------------------------------------------------------------------- #
@@ -227,7 +228,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     """
     Turn one Action dict into:
 
-        await page.<method>(xpath=..., intention=..., data=context.parameters)
+        await page.<method>(selector=..., intention=..., data=context.parameters)
 
     Or if assign_to_output is True for extract actions:
 
@@ -239,8 +240,8 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     if method in ACTIONS_WITH_XPATH:
         args.append(
             cst.Arg(
-                keyword=cst.Name("xpath"),
-                value=_value(act["xpath"]),
+                keyword=cst.Name("selector"),
+                value=_value(f"xpath={act['xpath']}"),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -248,7 +249,18 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
             )
         )
 
-    if method in ["type", "fill"]:
+    if method == "click":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("ai"),
+                value=_value(GENERATE_CODE_AI_MODE),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    elif method in ["type", "fill"]:
         # Use context.parameters if field_name is available, otherwise fallback to direct value
         if act.get("field_name"):
             text_value = cst.Subscript(
@@ -273,8 +285,8 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         )
         args.append(
             cst.Arg(
-                keyword=cst.Name("ai_infer"),
-                value=cst.Name("True"),
+                keyword=cst.Name("ai"),
+                value=_value(GENERATE_CODE_AI_MODE),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -330,8 +342,8 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
             )
             args.append(
                 cst.Arg(
-                    keyword=cst.Name("ai_infer"),
-                    value=cst.Name("True"),
+                    keyword=cst.Name("ai"),
+                    value=_value(GENERATE_CODE_AI_MODE),
                     whitespace_after_arg=cst.ParenthesizedWhitespace(
                         indent=True,
                         last_line=cst.SimpleWhitespace(INDENT),
@@ -361,8 +373,8 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         )
         args.append(
             cst.Arg(
-                keyword=cst.Name("ai_infer"),
-                value=cst.Name("True"),
+                keyword=cst.Name("ai"),
+                value=_value(GENERATE_CODE_AI_MODE),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
