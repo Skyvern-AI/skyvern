@@ -91,7 +91,7 @@ from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
-from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -893,7 +893,6 @@ class AgentDB:
         token_type: Literal["api", "onepassword_service_account", "azure_client_secret_credential"],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
         try:
-            print("lol")
             async with self.Session() as session:
                 if token := (
                     await session.scalars(
@@ -2610,11 +2609,12 @@ class AgentDB:
                 return None
             return TaskGeneration.model_validate(task_generation)
 
-    async def get_totp_codes(
+    async def get_otp_codes(
         self,
         organization_id: str,
         totp_identifier: str,
         valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        otp_type: OTPType | None = None,
     ) -> list[TOTPCode]:
         """
         1. filter by:
@@ -2634,17 +2634,20 @@ class AgentDB:
                 .filter_by(organization_id=organization_id)
                 .filter_by(totp_identifier=totp_identifier)
                 .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-                .order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             )
+            if otp_type:
+                query = query.filter(TOTPCodeModel.otp_type == otp_type)
+            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
 
-    async def create_totp_code(
+    async def create_otp_code(
         self,
         organization_id: str,
         totp_identifier: str,
         content: str,
         code: str,
+        otp_type: OTPType,
         task_id: str | None = None,
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -2662,6 +2665,7 @@ class AgentDB:
                 workflow_run_id=workflow_run_id,
                 source=source,
                 expired_at=expired_at,
+                otp_type=otp_type,
             )
             session.add(new_totp_code)
             await session.commit()
@@ -4148,6 +4152,7 @@ class AgentDB:
         organization_id: str,
         script_block_label: str,
         script_file_id: str | None = None,
+        run_signature: str | None = None,
     ) -> ScriptBlock:
         """Create a script block."""
         async with self.Session() as session:
@@ -4157,6 +4162,7 @@ class AgentDB:
                 organization_id=organization_id,
                 script_block_label=script_block_label,
                 script_file_id=script_file_id,
+                run_signature=run_signature,
             )
             session.add(script_block)
             await session.commit()
@@ -4168,6 +4174,7 @@ class AgentDB:
         script_block_id: str,
         organization_id: str,
         script_file_id: str | None = None,
+        run_signature: str | None = None,
     ) -> ScriptBlock:
         async with self.Session() as session:
             script_block = (
@@ -4178,8 +4185,10 @@ class AgentDB:
                 )
             ).first()
             if script_block:
-                if script_file_id:
+                if script_file_id is not None:
                     script_block.script_file_id = script_file_id
+                if run_signature is not None:
+                    script_block.run_signature = run_signature
                 await session.commit()
                 await session.refresh(script_block)
                 return convert_to_script_block(script_block)

@@ -11,6 +11,7 @@ export type ExtractionNodeData = NodeBaseData & {
   maxStepsOverride: number | null;
   parameterKeys: Array<string>;
   cacheActions: boolean;
+  disableCache: boolean;
   engine: RunEngine | null;
 };
 
@@ -28,6 +29,7 @@ export const extractionNodeDefaultData: ExtractionNodeData = {
   parameterKeys: [],
   continueOnFailure: false,
   cacheActions: false,
+  disableCache: false,
   engine: RunEngine.SkyvernV1,
   model: null,
 } as const;

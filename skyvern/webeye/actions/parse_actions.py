@@ -7,13 +7,14 @@ from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
 from skyvern.constants import SCROLL_AMOUNT_MULTIPLIER
-from skyvern.core.totp import poll_verification_code
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -809,13 +810,16 @@ async def generate_cua_fallback_actions(
                 totp_identifier=task.totp_identifier,
             )
             try:
-                verification_code = await poll_verification_code(
+                otp_value = await poll_otp_value(
                     organization_id=task.organization_id,
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,
                 )
+                if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
+                    raise NoTOTPVerificationCodeFound()
+                verification_code = otp_value.value
                 reasoning = reasoning or f"Received verification code: {verification_code}"
                 action = VerificationCodeAction(
                     verification_code=verification_code,

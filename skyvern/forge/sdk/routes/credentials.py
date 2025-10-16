@@ -3,7 +3,6 @@ from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE,
@@ -29,10 +28,11 @@ from skyvern.forge.sdk.schemas.organizations import (
     CreateOnePasswordTokenResponse,
     Organization,
 )
-from skyvern.forge.sdk.schemas.totp_codes import TOTPCode, TOTPCodeCreate
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.services.otp_service import OTPValue, parse_otp_login
 
 LOG = structlog.get_logger()
 
@@ -48,15 +48,6 @@ async def fetch_credential_item_background(item_id: str) -> None:
         LOG.info("Successfully fetched credential item from Bitwarden", item_id=item_id, name=credential_item.name)
     except Exception as e:
         LOG.exception("Failed to fetch credential item from Bitwarden in background", item_id=item_id, error=str(e))
-
-
-async def parse_totp_code(content: str, organization_id: str) -> str | None:
-    prompt = prompt_engine.load_prompt("parse-verification-code", content=content)
-    code_resp = await app.SECONDARY_LLM_API_HANDLER(
-        prompt=prompt, prompt_name="parse-verification-code", organization_id=organization_id
-    )
-    LOG.info("TOTP Code Parser Response", code_resp=code_resp)
-    return code_resp.get("code", None)
 
 
 @legacy_base_router.post("/totp")
@@ -82,7 +73,7 @@ async def send_totp_code(
     curr_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TOTPCode:
     LOG.info(
-        "Saving TOTP code",
+        "Saving OTP code",
         organization_id=curr_org.organization_id,
         totp_identifier=data.totp_identifier,
         task_id=data.task_id,
@@ -90,30 +81,33 @@ async def send_totp_code(
         workflow_run_id=data.workflow_run_id,
     )
     content = data.content.strip()
-    code: str | None = content
+    otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
     if len(content) > 10:
-        code = await parse_totp_code(content, curr_org.organization_id)
-    if not code:
+        otp_value = await parse_otp_login(content, curr_org.organization_id)
+
+    if not otp_value:
         LOG.error(
-            "Failed to parse totp code",
+            "Failed to parse otp login",
             totp_identifier=data.totp_identifier,
             task_id=data.task_id,
             workflow_id=data.workflow_id,
             workflow_run_id=data.workflow_run_id,
             content=data.content,
         )
-        raise HTTPException(status_code=400, detail="Failed to parse totp code")
-    return await app.DATABASE.create_totp_code(
+        raise HTTPException(status_code=400, detail="Failed to parse otp login")
+
+    return await app.DATABASE.create_otp_code(
         organization_id=curr_org.organization_id,
         totp_identifier=data.totp_identifier,
         content=data.content,
-        code=code,
+        code=otp_value.value,
         task_id=data.task_id,
         workflow_id=data.workflow_id,
         workflow_run_id=data.workflow_run_id,
         source=data.source,
         expired_at=data.expired_at,
+        otp_type=otp_value.get_otp_type(),
     )
 
 
@@ -211,6 +205,7 @@ async def create_credential(
     include_in_schema=False,
 )
 async def delete_credential(
+    background_tasks: BackgroundTasks,
     credential_id: str = Path(
         ...,
         description="The unique identifier of the credential to delete",
@@ -231,6 +226,9 @@ async def delete_credential(
         raise HTTPException(status_code=400, detail="Unsupported credential storage type")
 
     await credential_service.delete_credential(credential)
+
+    # Schedule background cleanup if the service implements it
+    background_tasks.add_task(credential_service.post_delete_credential_item, credential.item_id)
 
     return None
 

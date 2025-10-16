@@ -67,6 +67,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     DragAction,
     ExtractAction,
+    GotoUrlAction,
     InputTextAction,
     KeypressAction,
     LeftMouseAction,
@@ -105,6 +106,7 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.DRAG: DragAction,
     ActionType.VERIFICATION_CODE: VerificationCodeAction,
     ActionType.LEFT_MOUSE: LeftMouseAction,
+    ActionType.GOTO_URL: GotoUrlAction,
 }
 
 
@@ -578,6 +580,7 @@ def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock
         script_revision_id=script_block_model.script_revision_id,
         script_block_label=script_block_model.script_block_label,
         script_file_id=script_block_model.script_file_id,
+        run_signature=script_block_model.run_signature,
         created_at=script_block_model.created_at,
         modified_at=script_block_model.modified_at,
         deleted_at=script_block_model.deleted_at,

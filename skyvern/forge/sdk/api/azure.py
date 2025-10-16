@@ -33,7 +33,7 @@ class AsyncAzureVaultClient:
         finally:
             await secret_client.close()
 
-    async def create_secret(self, secret_name: str, secret_value: str, vault_name: str) -> str:
+    async def create_or_update_secret(self, secret_name: str, secret_value: str, vault_name: str) -> str:
         secret_client = await self._get_secret_client(vault_name)
         try:
             secret = await secret_client.set_secret(secret_name, secret_value)

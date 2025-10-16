@@ -26,6 +26,12 @@ class CredentialVaultService(ABC):
     async def delete_credential(self, credential: Credential) -> None:
         """Delete a credential from the vault and database."""
 
+    async def post_delete_credential_item(self, item_id: str) -> None:
+        """
+        Optional hook for scheduling background cleanup tasks after credential deletion.
+        Default implementation does nothing. Override in subclasses as needed.
+        """
+
     @abstractmethod
     async def get_credential(self, organization_id: str, credential_id: str) -> CredentialResponse:
         """Retrieve a credential with masked sensitive data."""

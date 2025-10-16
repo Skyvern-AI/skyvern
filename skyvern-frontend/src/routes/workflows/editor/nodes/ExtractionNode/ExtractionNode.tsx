@@ -42,6 +42,8 @@ import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRerender } from "@/hooks/useRerender";
 
+import { DisableCache } from "../DisableCache";
+
 function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
   const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
@@ -63,6 +65,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
     maxStepsOverride: data.maxStepsOverride,
     continueOnFailure: data.continueOnFailure,
     cacheActions: data.cacheActions,
+    disableCache: data.disableCache,
     engine: data.engine,
     model: data.model,
   });
@@ -254,27 +257,17 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                       />
                     </div>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Cache Actions
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["extraction"]["cacheActions"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={inputs.cacheActions}
-                        onCheckedChange={(checked) => {
-                          if (!editable) {
-                            return;
-                          }
-                          handleChange("cacheActions", checked);
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <DisableCache
+                    cacheActions={inputs.cacheActions}
+                    disableCache={inputs.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      handleChange("cacheActions", cacheActions);
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      handleChange("disableCache", disableCache);
+                    }}
+                  />
                 </div>
               </AccordionContent>
             </AccordionItem>

@@ -260,6 +260,11 @@ class KeypressAction(Action):
     duration: int = 0
 
 
+class GotoUrlAction(Action):
+    action_type: ActionType = ActionType.GOTO_URL
+    url: str
+
+
 class MoveAction(Action):
     action_type: ActionType = ActionType.MOVE
     x: int

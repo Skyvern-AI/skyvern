@@ -6,3 +6,8 @@ SCRIPT_TASK_BLOCKS = {
     "extraction",
     "login",
 }
+SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION = {
+    "task",
+    "navigation",
+    "login",
+}

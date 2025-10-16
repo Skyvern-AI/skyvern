@@ -432,6 +432,7 @@ class BaseTaskBlock(Block):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
@@ -630,6 +631,16 @@ class BaseTaskBlock(Block):
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
                     )
+                    working_page = await browser_state.get_working_page()
+                    if not working_page:
+                        LOG.error(
+                            "BrowserState has no page",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                        )
+                        raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
+                    if working_page.url == "about:blank" and self.url:
+                        await browser_state.navigate_to_url(page=working_page, url=self.url)
+
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",

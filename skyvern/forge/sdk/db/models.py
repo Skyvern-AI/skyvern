@@ -579,7 +579,10 @@ class AISuggestionModel(Base):
 
 class TOTPCodeModel(Base):
     __tablename__ = "totp_codes"
-    __table_args__ = (Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
+        Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+    )
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
     totp_identifier = Column(String, nullable=False, index=True)
@@ -593,6 +596,7 @@ class TOTPCodeModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
+    otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
 
 
 class ActionModel(Base):
@@ -965,6 +969,7 @@ class ScriptBlockModel(Base):
     script_revision_id = Column(String, nullable=False, index=True)
     script_block_label = Column(String, nullable=False)
     script_file_id = Column(String, nullable=True)
+    run_signature = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
