@@ -233,6 +233,21 @@ class SkyvernPage:
         and screenshot artifacts after action execution.
         """
 
+        # Emoji mapping for different action types
+        ACTION_EMOJIS = {
+            ActionType.CLICK: "👆",
+            ActionType.INPUT_TEXT: "⌨️",
+            ActionType.UPLOAD_FILE: "📤",
+            ActionType.DOWNLOAD_FILE: "📥",
+            ActionType.SELECT_OPTION: "🎯",
+            ActionType.WAIT: "⏳",
+            ActionType.SOLVE_CAPTCHA: "🔓",
+            ActionType.VERIFICATION_CODE: "🔐",
+            ActionType.SCROLL: "📜",
+            ActionType.COMPLETE: "✅",
+            ActionType.TERMINATE: "🛑",
+        }
+
         def decorator(fn: Callable) -> Callable:
             async def wrapper(
                 skyvern_page: SkyvernPage,
@@ -246,6 +261,17 @@ class SkyvernPage:
 
                 action_status = ActionStatus.completed
 
+                # Print action in script mode
+                context = skyvern_context.current()
+                if context and context.script_mode:
+                    emoji = ACTION_EMOJIS.get(action, "🔧")
+                    action_name = action.value if hasattr(action, "value") else str(action)
+                    print(f"{emoji} {action_name.replace('_', ' ').title()}", end="")
+                    if intention:
+                        print(f": {intention}")
+                    else:
+                        print()
+
                 try:
                     call.result = await fn(
                         skyvern_page, *args, intention=intention, data=data, **kwargs
@@ -253,11 +279,19 @@ class SkyvernPage:
 
                     # Note: Action status would be updated to completed here if update method existed
 
+                    # Print success in script mode
+                    if context and context.script_mode:
+                        print("  ✓ Completed")
+
                     return call.result
                 except Exception as e:
                     call.error = e
                     action_status = ActionStatus.failed
                     # Note: Action status would be updated to failed here if update method existed
+
+                    # Print failure in script mode
+                    if context and context.script_mode:
+                        print(f"  ✗ Failed: {str(e)}")
 
                     # LLM fallback hook could go here ...
                     raise
@@ -282,10 +316,19 @@ class SkyvernPage:
 
     async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
         url = render_template(url)
+
+        # Print navigation in script mode
+        context = skyvern_context.current()
+        if context and context.script_mode:
+            print(f"🌐 Navigating to: {url}")
+
         await self.page.goto(
             url,
             timeout=timeout,
         )
+
+        if context and context.script_mode:
+            print("  ✓ Page loaded")
 
     async def _update_action_reasoning(
         self,
@@ -548,6 +591,9 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         clicking the originally supplied ``selector``.
         """
+        context = skyvern_context.current()
+        if context and context.ai_mode_override:
+            ai = context.ai_mode_override
         if ai == "fallback":
             # try to click the element with the original selector first
             error_to_raise = None
@@ -739,12 +785,16 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         inputting the originally supplied ``text``.
         """
+        context = skyvern_context.current()
+        if context and context.ai_mode_override:
+            ai = context.ai_mode_override
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
             try:
                 locator = self.page.locator(selector)
                 await handler_utils.input_sequentially(locator, value, timeout=timeout)
+                return value
             except Exception as e:
                 error_to_raise = e
 
@@ -820,6 +870,9 @@ class SkyvernPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
+        context = skyvern_context.current()
+        if context and context.ai_mode_override:
+            ai = context.ai_mode_override
         if ai == "fallback":
             error_to_raise = None
             try:
@@ -927,12 +980,16 @@ class SkyvernPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
+        context = skyvern_context.current()
+        if context and context.ai_mode_override:
+            ai = context.ai_mode_override
         value = value or ""
         if ai == "fallback":
             error_to_raise = None
             try:
                 locator = self.page.locator(selector)
                 await locator.select_option(value, timeout=timeout)
+                return value
             except Exception as e:
                 error_to_raise = e
             if intention:
@@ -1070,6 +1127,18 @@ class SkyvernPage:
             screenshots=scraped_page_refreshed.screenshots,
             prompt_name="extract-information",
         )
+        if context and context.script_mode:
+            print(f"\n✨ 📊 Extracted Information:\n{'-' * 50}")
+
+            try:
+                # Pretty print JSON if result is a dict/list
+                if isinstance(result, (dict, list)):
+                    print(json.dumps(result, indent=2, ensure_ascii=False))
+                else:
+                    print(result)
+            except Exception:
+                print(result)
+            print(f"{'-' * 50}\n")
         return result
 
     @action_wrap(ActionType.VERIFICATION_CODE)
