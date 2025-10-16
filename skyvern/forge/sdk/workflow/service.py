@@ -41,7 +41,6 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import TraceManager
-from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -346,11 +345,6 @@ class WorkflowService:
     ) -> WorkflowRun:
         """Execute a workflow."""
         organization_id = organization.organization_id
-
-        # Collect and add experiment metadata to the trace
-        experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
-        if experiment_metadata:
-            TraceManager.add_experiment_metadata(experiment_metadata)
 
         LOG.info(
             "Executing workflow",
