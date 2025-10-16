@@ -13,6 +13,7 @@ import {
   ChevronLeftIcon,
   CopyIcon,
   GlobeIcon,
+  PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useParams, useSearchParams } from "react-router-dom";
@@ -40,12 +41,13 @@ import {
 import { Splitter } from "@/components/Splitter";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogClose,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { BrowserStream } from "@/components/BrowserStream";
@@ -60,7 +62,7 @@ import {
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
-
+import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
@@ -108,6 +110,65 @@ interface Dom {
   splitLeft: MutableRefObject<HTMLInputElement | null>;
 }
 
+function bash(text: string, alternateText?: string) {
+  return (
+    <div className="flex items-center justify-start gap-1">
+      <CopyText className="min-w-[2.25rem]" text={alternateText ?? text} />
+      <code className="text-xs text-[lightblue]">{text}</code>
+    </div>
+  );
+}
+
+function CopyAndExplainCode({ code }: { code: string }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const numCodeLines = code.split("\n").length;
+
+  return (
+    <div className="flex items-center justify-end">
+      <Dialog open={isOpen} onOpenChange={setIsOpen}>
+        <DialogTrigger asChild>
+          <Button variant="tertiary" size="sm">
+            <div className="flex items-center justify-center gap-2">
+              <div>Run Locally</div>
+              <PlayIcon />
+            </div>
+          </Button>
+        </DialogTrigger>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Run This Code</DialogTitle>
+            <DialogDescription>
+              Set up skyvern in your environment and run the code on your own.
+            </DialogDescription>
+          </DialogHeader>
+          <div>
+            <div>1. Install skyvern: {bash("pip install skyvern")}</div>
+            <div>2. Set up skyvern: {bash("skyvern quickstart")}</div>
+            <div>
+              3. Copy-paste the code and save it in a file, for example{" "}
+              <code>main.py</code>{" "}
+              {bash(`copy code [${numCodeLines} line(s)]`, code)}
+            </div>
+            <div>
+              4. Run the code:{" "}
+              {bash(
+                'skyvern run code --params \'{"param1": "val1", "param2": "val2"}\' main.py',
+              )}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setIsOpen(false)}>
+              Ok
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <CopyText text={code} />
+    </div>
+  );
+}
+
 function CopyText({ className, text }: { className?: string; text: string }) {
   const [wasCopied, setWasCopied] = useState(false);
 
@@ -131,8 +192,6 @@ function CopyText({ className, text }: { className?: string; text: string }) {
     </Button>
   );
 }
-
-export { CopyText };
 
 function Workspace({
   initialNodes,
@@ -1186,7 +1245,7 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* code and infinite canvas */}
+            {/* code, infinite canvas, and block runs */}
             <div className="relative h-full w-full">
               <div
                 className={cn(
@@ -1209,8 +1268,8 @@ function Workspace({
                   })}
                 >
                   <div className="relative mt-[8.5rem] w-full p-6 pr-5 pt-0">
-                    <div className="absolute right-[1.25rem] top-0 z-20">
-                      <CopyText text={code} />
+                    <div className="absolute right-[2rem] top-[0.75rem] z-20">
+                      <CopyAndExplainCode code={code} />
                     </div>
                     <CodeEditor
                       className={cn("w-full overflow-y-scroll", {
@@ -1245,6 +1304,10 @@ function Workspace({
                     onContainerResize={containerResizeTrigger}
                   />
                 </div>
+              </div>
+              {/* block runs history for current debug session id*/}
+              <div className="absolute bottom-[0.5rem] left-[0.75rem] flex w-full items-start justify-center">
+                <DebuggerBlockRuns />
               </div>
             </div>
 
@@ -1428,4 +1491,4 @@ function Workspace({
   );
 }
 
-export { Workspace };
+export { CopyText, CopyAndExplainCode, Workspace };

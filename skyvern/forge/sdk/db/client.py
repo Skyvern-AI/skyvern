@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -78,7 +78,7 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
-from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession
+from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession, DebugSessionRun
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
@@ -1574,11 +1574,17 @@ class AgentDB:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
-        title: str = "",
+        search_key: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
+
+        Search semantics:
+        - If `search_key` is provided, its value is used as a unified search term for both
+          `workflows.title` and workflow parameter metadata (key, description, and default_value).
+        - If `search_key` is not provided, no search filtering is applied.
+        - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -1609,10 +1615,133 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
                 elif only_workflows:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
-                if title:
-                    main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
                 if statuses:
                     main_query = main_query.where(WorkflowModel.status.in_(statuses))
+                if search_key:
+                    search_like = f"%{search_key}%"
+                    title_like = WorkflowModel.title.ilike(search_like)
+
+                    parameter_filters = [
+                        # WorkflowParameterModel
+                        exists(
+                            select(1)
+                            .select_from(WorkflowParameterModel)
+                            .where(WorkflowParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(WorkflowParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    WorkflowParameterModel.key.ilike(search_like),
+                                    WorkflowParameterModel.description.ilike(search_like),
+                                    WorkflowParameterModel.default_value.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # OutputParameterModel
+                        exists(
+                            select(1)
+                            .select_from(OutputParameterModel)
+                            .where(OutputParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(OutputParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    OutputParameterModel.key.ilike(search_like),
+                                    OutputParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # AWSSecretParameterModel
+                        exists(
+                            select(1)
+                            .select_from(AWSSecretParameterModel)
+                            .where(AWSSecretParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(AWSSecretParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    AWSSecretParameterModel.key.ilike(search_like),
+                                    AWSSecretParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # BitwardenLoginCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenLoginCredentialParameterModel)
+                            .where(BitwardenLoginCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenLoginCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenLoginCredentialParameterModel.key.ilike(search_like),
+                                    BitwardenLoginCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # BitwardenSensitiveInformationParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenSensitiveInformationParameterModel)
+                            .where(BitwardenSensitiveInformationParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenSensitiveInformationParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenSensitiveInformationParameterModel.key.ilike(search_like),
+                                    BitwardenSensitiveInformationParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # BitwardenCreditCardDataParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenCreditCardDataParameterModel)
+                            .where(BitwardenCreditCardDataParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenCreditCardDataParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenCreditCardDataParameterModel.key.ilike(search_like),
+                                    BitwardenCreditCardDataParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # OnePasswordCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(OnePasswordCredentialParameterModel)
+                            .where(OnePasswordCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(OnePasswordCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    OnePasswordCredentialParameterModel.key.ilike(search_like),
+                                    OnePasswordCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # AzureVaultCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(AzureVaultCredentialParameterModel)
+                            .where(AzureVaultCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(AzureVaultCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    AzureVaultCredentialParameterModel.key.ilike(search_like),
+                                    AzureVaultCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # CredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(CredentialParameterModel)
+                            .where(CredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(CredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    CredentialParameterModel.key.ilike(search_like),
+                                    CredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                    ]
+                    main_query = main_query.where(or_(title_like, or_(*parameter_filters)))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
@@ -1987,7 +2116,11 @@ class AgentDB:
         page: int = 1,
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
+        search_key: str | None = None,
     ) -> list[WorkflowRun]:
+        """
+        Get runs for a workflow, with optional `search_key` on parameter key/description/value.
+        """
         try:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
@@ -1997,6 +2130,29 @@ class AgentDB:
                     .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                 )
+                if search_key:
+                    key_like = f"%{search_key}%"
+                    # Filter runs where any run parameter matches by key/description/value
+                    # Use EXISTS to avoid duplicate rows and to keep pagination correct
+                    param_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .join(
+                            WorkflowParameterModel,
+                            WorkflowParameterModel.workflow_parameter_id
+                            == WorkflowRunParameterModel.workflow_parameter_id,
+                        )
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowParameterModel.deleted_at.is_(None))
+                        .where(
+                            or_(
+                                WorkflowParameterModel.key.ilike(key_like),
+                                WorkflowParameterModel.description.ilike(key_like),
+                                WorkflowRunParameterModel.value.ilike(key_like),
+                            )
+                        )
+                    )
+                    query = query.where(param_exists)
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
@@ -3907,6 +4063,65 @@ class AgentDB:
             model = (await session.scalars(query)).first()
 
             return DebugSession.model_validate(model) if model else None
+
+    async def get_debug_session_by_id(
+        self,
+        debug_session_id: str,
+        organization_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(debug_session_id=debug_session_id)
+            )
+
+            model = (await session.scalars(query)).first()
+
+            return DebugSession.model_validate(model) if model else None
+
+    async def get_workflow_runs_by_debug_session_id(
+        self,
+        debug_session_id: str,
+        organization_id: str,
+    ) -> list[DebugSessionRun]:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel, BlockRunModel)
+                .join(BlockRunModel, BlockRunModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.debug_session_id == debug_session_id)
+                .order_by(WorkflowRunModel.created_at.desc())
+            )
+
+            results = (await session.execute(query)).all()
+
+            debug_session_runs = []
+            for workflow_run, block_run in results:
+                debug_session_runs.append(
+                    DebugSessionRun(
+                        ai_fallback=workflow_run.ai_fallback,
+                        block_label=block_run.block_label,
+                        browser_session_id=workflow_run.browser_session_id,
+                        code_gen=workflow_run.code_gen,
+                        debug_session_id=workflow_run.debug_session_id,
+                        failure_reason=workflow_run.failure_reason,
+                        output_parameter_id=block_run.output_parameter_id,
+                        run_with=workflow_run.run_with,
+                        script_run_id=workflow_run.script_run.get("script_run_id") if workflow_run.script_run else None,
+                        status=workflow_run.status,
+                        workflow_id=workflow_run.workflow_id,
+                        workflow_permanent_id=workflow_run.workflow_permanent_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        created_at=workflow_run.created_at,
+                        queued_at=workflow_run.queued_at,
+                        started_at=workflow_run.started_at,
+                        finished_at=workflow_run.finished_at,
+                    )
+                )
+
+            return debug_session_runs
 
     async def complete_debug_sessions(
         self,
