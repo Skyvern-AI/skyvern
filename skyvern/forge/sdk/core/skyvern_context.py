@@ -44,6 +44,8 @@ class SkyvernContext:
     loop_metadata: dict[str, Any] | None = None
     loop_output_values: list[dict[str, Any]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
+    script_mode: bool = False
+    ai_mode_override: str | None = None
     """
     Example output value:
     {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}
