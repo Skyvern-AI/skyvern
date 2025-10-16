@@ -37,7 +37,7 @@ type Props = {
   type: WorkflowEditorParameterType;
   onClose: () => void;
   onSave: (value: ParametersState[number]) => void;
-  initialValues: ParametersState[number];
+  initialValues?: ParametersState[number];
 };
 
 const workflowParameterTypeOptions = [
@@ -50,20 +50,21 @@ const workflowParameterTypeOptions = [
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
 
-function header(type: WorkflowEditorParameterType) {
+function header(type: WorkflowEditorParameterType, isEdit: boolean) {
+  const prefix = isEdit ? "Edit" : "Add";
   if (type === "workflow") {
-    return "Edit Input Parameter";
+    return `${prefix} Input Parameter`;
   }
   if (type === "credential") {
-    return "Edit Credential Parameter";
+    return `${prefix} Credential Parameter`;
   }
   if (type === "secret") {
-    return "Edit Secret Parameter";
+    return `${prefix} Secret Parameter`;
   }
   if (type === "creditCardData") {
-    return "Edit Credit Card Parameter";
+    return `${prefix} Credit Card Parameter`;
   }
-  return "Edit Context Parameter";
+  return `${prefix} Context Parameter`;
 }
 
 function WorkflowParameterEditPanel({
@@ -72,20 +73,22 @@ function WorkflowParameterEditPanel({
   onSave,
   initialValues,
 }: Props) {
+  const reservedKeys = ["current_item", "current_value", "current_index"];
   const isCloud = useContext(CloudContext);
-  const [key, setKey] = useState(initialValues.key);
+  const isEditMode = !!initialValues;
+  const [key, setKey] = useState(initialValues?.key ?? "");
   const hasWhitespace = /\s/.test(key);
   const isBitwardenCredential =
-    initialValues.parameterType === "credential" &&
+    initialValues?.parameterType === "credential" &&
     parameterIsBitwardenCredential(initialValues);
   const isSkyvernCredential =
-    initialValues.parameterType === "credential" &&
+    initialValues?.parameterType === "credential" &&
     parameterIsSkyvernCredential(initialValues);
   const isOnePasswordCredential =
-    initialValues.parameterType === "onepassword" &&
+    initialValues?.parameterType === "onepassword" &&
     parameterIsOnePasswordCredential(initialValues);
   const isAzureVaultCredential =
-    initialValues.parameterType === "credential" &&
+    initialValues?.parameterType === "credential" &&
     parameterIsAzureVaultCredential(initialValues);
   const [credentialType, setCredentialType] = useState<
     "bitwarden" | "skyvern" | "onepassword" | "azurevault"
@@ -99,21 +102,21 @@ function WorkflowParameterEditPanel({
           : "skyvern",
   );
   const [urlParameterKey, setUrlParameterKey] = useState(
-    isBitwardenCredential ? initialValues.urlParameterKey ?? "" : "",
+    isBitwardenCredential ? initialValues?.urlParameterKey ?? "" : "",
   );
   const [description, setDescription] = useState(
-    initialValues.description ?? "",
+    initialValues?.description ?? "",
   );
-  const [collectionId, setCollectionId] = useState(
+  const [bitwardenCollectionId, setBitwardenCollectionId] = useState(
     isBitwardenCredential ||
-      initialValues.parameterType === "secret" ||
-      initialValues.parameterType === "creditCardData"
-      ? initialValues.collectionId ?? ""
+      initialValues?.parameterType === "secret" ||
+      initialValues?.parameterType === "creditCardData"
+      ? initialValues?.collectionId ?? ""
       : "",
   );
   const [parameterType, setParameterType] =
     useState<WorkflowParameterValueType>(
-      initialValues.parameterType === "workflow"
+      initialValues?.parameterType === "workflow"
         ? initialValues.dataType
         : "string",
     );
@@ -122,7 +125,7 @@ function WorkflowParameterEditPanel({
     hasDefaultValue: boolean;
     defaultValue: unknown;
   }>(
-    initialValues.parameterType === "workflow"
+    initialValues?.parameterType === "workflow"
       ? {
           hasDefaultValue: initialValues.defaultValue !== null,
           defaultValue: initialValues.defaultValue ?? null,
@@ -136,23 +139,23 @@ function WorkflowParameterEditPanel({
   const [sourceParameterKey, setSourceParameterKey] = useState<
     string | undefined
   >(
-    initialValues.parameterType === "context"
+    initialValues?.parameterType === "context"
       ? initialValues.sourceParameterKey
       : undefined,
   );
 
   const [identityKey, setIdentityKey] = useState(
-    initialValues.parameterType === "secret" ? initialValues.identityKey : "",
+    initialValues?.parameterType === "secret" ? initialValues.identityKey : "",
   );
 
   const [identityFields, setIdentityFields] = useState(
-    initialValues.parameterType === "secret"
+    initialValues?.parameterType === "secret"
       ? initialValues.identityFields.join(", ")
       : "",
   );
 
-  const [itemId, setItemId] = useState(
-    initialValues.parameterType === "creditCardData"
+  const [sensitiveInformationItemId, setSensitiveInformationItemId] = useState(
+    initialValues?.parameterType === "creditCardData"
       ? initialValues.itemId
       : "",
   );
@@ -160,7 +163,7 @@ function WorkflowParameterEditPanel({
   const [credentialId, setCredentialId] = useState(
     isSkyvernCredential ? initialValues.credentialId : "",
   );
-  const [vaultId, setVaultId] = useState(
+  const [opVaultId, setOpVaultId] = useState(
     isOnePasswordCredential ? initialValues.vaultId : "",
   );
   const [opItemId, setOpItemId] = useState(
@@ -168,7 +171,7 @@ function WorkflowParameterEditPanel({
   );
 
   const [bitwardenLoginCredentialItemId, setBitwardenLoginCredentialItemId] =
-    useState(isBitwardenCredential ? initialValues.itemId ?? "" : "");
+    useState(isBitwardenCredential ? initialValues?.itemId ?? "" : "");
 
   const [azureVaultName, setAzureVaultName] = useState(
     isAzureVaultCredential ? initialValues.vaultName : "",
@@ -188,7 +191,7 @@ function WorkflowParameterEditPanel({
       <ScrollAreaViewport className="max-h-[500px]">
         <div className="space-y-4 p-1 px-4">
           <header className="flex items-center justify-between">
-            <span>{header(type)}</span>
+            <span>{header(type, isEditMode)}</span>
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
           </header>
           <div className="space-y-1">
@@ -340,8 +343,8 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">Collection ID</Label>
                 <Input
-                  value={collectionId}
-                  onChange={(e) => setCollectionId(e.target.value)}
+                  value={bitwardenCollectionId}
+                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
@@ -363,8 +366,8 @@ function WorkflowParameterEditPanel({
                   <HelpTooltip content="You can find the Vault ID and Item ID in the URL when viewing the item in 1Password on the web." />
                 </div>
                 <Input
-                  value={vaultId}
-                  onChange={(e) => setVaultId(e.target.value)}
+                  value={opVaultId}
+                  onChange={(e) => setOpVaultId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
@@ -451,8 +454,8 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">Collection ID</Label>
                 <Input
-                  value={collectionId}
-                  onChange={(e) => setCollectionId(e.target.value)}
+                  value={bitwardenCollectionId}
+                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
             </>
@@ -462,15 +465,17 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">Collection ID</Label>
                 <Input
-                  value={collectionId}
-                  onChange={(e) => setCollectionId(e.target.value)}
+                  value={bitwardenCollectionId}
+                  onChange={(e) => setBitwardenCollectionId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
                 <Label className="text-xs text-slate-300">Item ID</Label>
                 <Input
-                  value={itemId}
-                  onChange={(e) => setItemId(e.target.value)}
+                  value={sensitiveInformationItemId}
+                  onChange={(e) =>
+                    setSensitiveInformationItemId(e.target.value)
+                  }
                 />
               </div>
             </>
@@ -509,6 +514,14 @@ function WorkflowParameterEditPanel({
                   });
                   return;
                 }
+                if (!isEditMode && reservedKeys.includes(key)) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to add parameter",
+                    description: `${key} is reserved, please use another key`,
+                  });
+                  return;
+                }
                 if (type === "workflow") {
                   if (
                     parameterType === "json" &&
@@ -542,7 +555,7 @@ function WorkflowParameterEditPanel({
                 }
                 if (type === "credential" && credentialType === "bitwarden") {
                   const errorMessage = validateBitwardenLoginCredential(
-                    collectionId,
+                    bitwardenCollectionId,
                     bitwardenLoginCredentialItemId,
                     urlParameterKey,
                   );
@@ -563,12 +576,15 @@ function WorkflowParameterEditPanel({
                         : bitwardenLoginCredentialItemId,
                     urlParameterKey:
                       urlParameterKey === "" ? null : urlParameterKey,
-                    collectionId: collectionId === "" ? null : collectionId,
+                    collectionId:
+                      bitwardenCollectionId === ""
+                        ? null
+                        : bitwardenCollectionId,
                     description,
                   });
                 }
                 if (type === "credential" && credentialType === "onepassword") {
-                  if (vaultId.trim() === "" || opItemId.trim() === "") {
+                  if (opVaultId.trim() === "" || opItemId.trim() === "") {
                     toast({
                       variant: "destructive",
                       title: "Failed to save parameter",
@@ -579,7 +595,7 @@ function WorkflowParameterEditPanel({
                   onSave({
                     key,
                     parameterType: "onepassword",
-                    vaultId,
+                    vaultId: opVaultId,
                     itemId: opItemId,
                     description,
                   });
@@ -610,7 +626,7 @@ function WorkflowParameterEditPanel({
                   });
                 }
                 if (type === "secret" || type === "creditCardData") {
-                  if (!collectionId) {
+                  if (!bitwardenCollectionId) {
                     toast({
                       variant: "destructive",
                       title: "Failed to save parameter",
@@ -623,7 +639,7 @@ function WorkflowParameterEditPanel({
                   onSave({
                     key,
                     parameterType: "secret",
-                    collectionId,
+                    collectionId: bitwardenCollectionId,
                     identityFields: identityFields
                       .split(",")
                       .filter((s) => s.length > 0)
@@ -636,8 +652,8 @@ function WorkflowParameterEditPanel({
                   onSave({
                     key,
                     parameterType: "creditCardData",
-                    collectionId,
-                    itemId,
+                    collectionId: bitwardenCollectionId,
+                    itemId: sensitiveInformationItemId,
                     description,
                   });
                 }
