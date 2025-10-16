@@ -364,11 +364,17 @@ function WorkflowParameterEditPanel({
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID</Label>
+                <Label className="text-xs text-slate-300">Item ID (Login/Password or Credit Card)</Label>
                 <Input
                   value={opItemId}
                   onChange={(e) => setOpItemId(e.target.value)}
                 />
+              </div>
+              <div className="rounded-md bg-slate-800 p-2">
+                <div className="space-y-1 text-xs text-slate-400">
+                  * Credit Cards: 
+                  Due to a 1Password limitation, add the expiration date as a separate text item named “Expire Date” in the format MM/YYYY (e.g. 09/2027).
+                </div>
               </div>
             </>
           )}
