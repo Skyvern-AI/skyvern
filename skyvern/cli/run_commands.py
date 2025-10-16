@@ -199,7 +199,7 @@ def run_code(
     """
     # Disable LiteLLM loggers
     os.environ["LITELLM_LOG"] = "CRITICAL"
-    import litellm
+    import litellm  # noqa: PLC0415
 
     litellm.suppress_debug_info = True
     litellm.set_verbose = False
@@ -237,7 +237,7 @@ def run_code(
     # Priority: params_file > params_json > individual -p flags
     if params_file:
         try:
-            with open(params_file, "r") as f:
+            with open(params_file) as f:
                 parameters = json.load(f)
             console.print(f"[blue]✓ Loaded parameters from file: {params_file}[/blue]")
         except FileNotFoundError:
