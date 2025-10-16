@@ -55,7 +55,19 @@ def custom_openapi() -> dict:
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, Any]:
     """Lifespan context manager for FastAPI app startup and shutdown."""
     LOG.info("Server started")
+    if forge_app.api_app_startup_event:
+        LOG.info("Calling api app startup event")
+        try:
+            await forge_app.api_app_startup_event()
+        except Exception:
+            LOG.exception("Failed to execute api app startup event")
     yield
+    if forge_app.api_app_shutdown_event:
+        LOG.info("Calling api app shutdown event")
+        try:
+            await forge_app.api_app_shutdown_event()
+        except Exception:
+            LOG.exception("Failed to execute api app shutdown event")
     LOG.info("Server shutting down")
 
 

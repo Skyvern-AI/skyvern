@@ -127,6 +127,8 @@ scrape_exclude: ScrapeExcludeFunc | None = None
 authentication_function: Callable[[str], Awaitable[Organization]] | None = None
 authenticate_user_function: Callable[[str], Awaitable[str | None]] | None = None
 setup_api_app: Callable[[FastAPI], None] | None = None
+api_app_startup_event: Callable[[], Awaitable[None]] | None = None
+api_app_shutdown_event: Callable[[], Awaitable[None]] | None = None
 
 agent = ForgeAgent()
 
