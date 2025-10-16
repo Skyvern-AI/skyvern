@@ -3480,7 +3480,8 @@ async def locate_dropdown_menu(
                     exc_info=True,
                 )
         # check if opening react-datetime datepicker: https://github.com/arqex/react-datetime
-        if "rdtOpen" in await head_element.get_attr("class", mode="static"):
+        class_name = await head_element.get_attr("class", mode="static")
+        if class_name and "rdtOpen" in class_name:
             LOG.info(
                 "Confirm it's an opened React-Datetime datepicker",
                 element_id=element_id,
