@@ -785,11 +785,13 @@ async def handle_sequential_click_for_dropdown(
 
     if dropdown_select_context.is_date_related:
         LOG.info(
-            "The dropdown is date related, exiting the sequential click logic",
+            "The dropdown is date related, exiting the sequential click logic and skipping the remaining actions",
             step_id=step.step_id,
             task_id=task.task_id,
         )
-        return None
+        result = ActionSuccess()
+        result.skip_remaining_actions = True
+        return result
 
     LOG.info(
         "Found the dropdown menu element after clicking, triggering the sequential click logic",
@@ -3477,6 +3479,16 @@ async def locate_dropdown_menu(
                     task_id=task.task_id,
                     exc_info=True,
                 )
+        # check if opening react-datetime datepicker: https://github.com/arqex/react-datetime
+        class_name = await head_element.get_attr("class", mode="static")
+        if class_name and "rdtOpen" in class_name:
+            LOG.info(
+                "Confirm it's an opened React-Datetime datepicker",
+                element_id=element_id,
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            return head_element
 
         # sometimes taking screenshot might scroll away, need to scroll back after the screenshot
         x, y = await skyvern_frame.get_scroll_x_y()
