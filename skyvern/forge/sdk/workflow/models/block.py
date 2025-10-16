@@ -113,6 +113,7 @@ class Block(BaseModel, abc.ABC):
     output_parameter: OutputParameter
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
+    disable_cache: bool = False
 
     @property
     def override_llm_key(self) -> str | None:
@@ -432,7 +433,6 @@ class BaseTaskBlock(Block):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
-    disable_cache: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
