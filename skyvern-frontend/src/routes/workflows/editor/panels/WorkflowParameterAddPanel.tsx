@@ -25,6 +25,7 @@ import { WorkflowParameterInput } from "../../WorkflowParameterInput";
 import { ParametersState } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
+import { HelpTooltip } from "@/components/HelpTooltip";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -273,14 +274,20 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
           {type === "credential" && credentialType === "onepassword" && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Vault ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Vault ID</Label>
+                  <HelpTooltip content="You can find the Vault ID and Item ID in the URL when viewing the item in 1Password on the web."/>
+                </div>
                 <Input
                   value={vaultId}
                   onChange={(e) => setVaultId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID (Login/Password or Credit Card)</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Item ID</Label>
+                  <HelpTooltip content="Supports all 1Password item types: Logins, Passwords, Credit Cards, Secure Notes, and more."/>
+                </div>
                 <Input
                   value={itemId}
                   onChange={(e) => setItemId(e.target.value)}
