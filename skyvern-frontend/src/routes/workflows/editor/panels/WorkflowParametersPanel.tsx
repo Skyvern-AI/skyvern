@@ -241,7 +241,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           }}
         >
           {operationPanelState.operation === "add" && (
-            <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
+            <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 px-2 shadow-xl">
               <WorkflowParameterAddPanel
                 type={operationPanelState.type}
                 onSave={(parameter) => {
@@ -265,7 +265,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           )}
           {operationPanelState.operation === "edit" &&
             operationPanelState.parameter && (
-              <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
+              <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 px-2 shadow-xl">
                 <WorkflowParameterEditPanel
                   key={operationPanelState.parameter?.key}
                   type={operationPanelState.type}

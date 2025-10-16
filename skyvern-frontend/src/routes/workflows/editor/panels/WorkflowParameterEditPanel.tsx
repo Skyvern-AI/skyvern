@@ -185,7 +185,7 @@ function WorkflowParameterEditPanel({
   return (
     <ScrollArea>
       <ScrollAreaViewport className="max-h-[500px]">
-        <div className="space-y-4 p-1">
+        <div className="space-y-4 p-1 px-4">
           <header className="flex items-center justify-between">
             <span>{header(type)}</span>
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
