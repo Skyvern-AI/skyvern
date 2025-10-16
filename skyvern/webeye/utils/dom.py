@@ -323,6 +323,15 @@ class SkyvernElement:
             return True
         return False
 
+    async def has_attr(self, attr_name: str, mode: typing.Literal["auto", "dynamic", "static"] = "auto") -> bool:
+        value = await self.get_attr(attr_name, mode=mode)
+        # FIXME(maybe?): already parsed the value of "disabled", "readonly" into boolean.
+        # so the empty string values should be considered as FALSE value?
+        # maybe need to come back to change it?
+        if value:
+            return True
+        return False
+
     def get_element_dict(self) -> dict:
         return self.__static_element
 
