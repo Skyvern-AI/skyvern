@@ -62,7 +62,7 @@ import {
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
-
+import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
@@ -1245,7 +1245,7 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* code and infinite canvas */}
+            {/* code, infinite canvas, and block runs */}
             <div className="relative h-full w-full">
               <div
                 className={cn(
@@ -1304,6 +1304,10 @@ function Workspace({
                     onContainerResize={containerResizeTrigger}
                   />
                 </div>
+              </div>
+              {/* block runs history for current debug session id*/}
+              <div className="absolute bottom-[0.5rem] left-[0.75rem] flex w-full items-start justify-center">
+                <DebuggerBlockRuns />
               </div>
             </div>
 

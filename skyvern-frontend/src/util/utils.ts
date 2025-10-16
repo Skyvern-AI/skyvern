@@ -36,3 +36,22 @@ export const formatMs = (elapsed: number) => {
     day: days,
   };
 };
+
+export function toDate(
+  time: string,
+  defaultDate: Date | null = new Date(0),
+): Date | null {
+  time = time.replace(/\.(\d{3})\d*/, ".$1");
+
+  if (!time.endsWith("Z")) {
+    time += "Z";
+  }
+
+  const date = new Date(time);
+
+  if (isNaN(date.getTime())) {
+    return defaultDate;
+  }
+
+  return date;
+}
