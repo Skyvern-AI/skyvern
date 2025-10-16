@@ -1679,8 +1679,15 @@ async def get_workflow_runs_by_id(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        description="Search runs by parameter key, parameter description, or run parameter value.",
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
+    """
+    Get workflow runs for a specific workflow permanent id.
+    """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
         workflow_permanent_id=workflow_id,
@@ -1688,6 +1695,7 @@ async def get_workflow_runs_by_id(
         page=page,
         page_size=page_size,
         status=status,
+        search_key=search_key,
     )
 
 
@@ -1800,14 +1808,28 @@ async def get_workflows(
     page_size: int = Query(10, ge=1),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
-    title: str = Query(""),
+    search_key: str | None = Query(
+        None,
+        description="Unified search across workflow title and parameter metadata (key, description, default_value).",
+    ),
+    title: str = Query("", deprecated=True, description="Deprecated: use search_key instead."),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
     """
     Get all workflows with the latest version for the organization.
+
+    Search semantics:
+    - If `search_key` is provided, its value is used as a unified search term for both
+      `workflows.title` and workflow parameter metadata (key, description, and default_value for
+      `WorkflowParameterModel`).
+    - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
+    - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
     """
     analytics.capture("skyvern-oss-agent-workflows-get")
+
+    # Determine the effective search term: prioritize search_key, fallback to title
+    effective_search = search_key or (title if title else None)
 
     if template:
         global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
@@ -1817,7 +1839,7 @@ async def get_workflows(
             workflow_permanent_ids=global_workflows_permanent_ids,
             page=page,
             page_size=page_size,
-            title=title,
+            search_key=effective_search or "",
             statuses=[WorkflowStatus.published, WorkflowStatus.draft],
         )
         return workflows
@@ -1834,7 +1856,7 @@ async def get_workflows(
         page_size=page_size,
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
-        title=title,
+        search_key=effective_search,
         statuses=[WorkflowStatus.published, WorkflowStatus.draft],
     )
 
