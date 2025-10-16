@@ -502,6 +502,15 @@ class TaskRunResponse(BaseRunResponse):
 
 class WorkflowRunResponse(BaseRunResponse):
     run_type: Literal[RunType.workflow_run] = Field(description="Type of run - always workflow_run for workflow runs")
+    run_with: str | None = Field(
+        default=None,
+        description="Whether the workflow run was executed with agent or code",
+        examples=["agent", "code"],
+    )
+    ai_fallback: bool | None = Field(
+        default=None,
+        description="Whether to fallback to AI if code run fails.",
+    )
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
