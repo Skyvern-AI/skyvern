@@ -7,6 +7,7 @@ from .run_status import RunStatus
 from .task_run_response_output import TaskRunResponseOutput
 from .file_info import FileInfo
 import datetime as dt
+from .script_run_response import ScriptRunResponse
 from .task_run_request import TaskRunRequest
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import pydantic
@@ -31,6 +32,8 @@ class GetRunResponse_TaskV1(UniversalBaseModel):
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -60,6 +63,8 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -89,6 +94,8 @@ class GetRunResponse_OpenaiCua(UniversalBaseModel):
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -118,6 +125,8 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -147,6 +156,8 @@ class GetRunResponse_UiTars(UniversalBaseModel):
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     run_request: typing.Optional[TaskRunRequest] = None
 
     if IS_PYDANTIC_V2:
@@ -176,6 +187,8 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     run_request: typing.Optional[WorkflowRunRequest] = None
 
     if IS_PYDANTIC_V2:

@@ -61,8 +61,10 @@ class WorkflowDefinitionBlocksItem_Action(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -135,8 +137,10 @@ class WorkflowDefinitionBlocksItem_Extraction(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -172,8 +176,10 @@ class WorkflowDefinitionBlocksItem_FileDownload(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -196,6 +202,9 @@ class WorkflowDefinitionBlocksItem_FileUpload(UniversalBaseModel):
     aws_access_key_id: typing.Optional[str] = None
     aws_secret_access_key: typing.Optional[str] = None
     region_name: typing.Optional[str] = None
+    azure_storage_account_name: typing.Optional[str] = None
+    azure_storage_account_key: typing.Optional[str] = None
+    azure_blob_container_name: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -215,7 +224,8 @@ class WorkflowDefinitionBlocksItem_FileUrlParser(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
-    file_type: FileType = "csv"
+    file_type: FileType
+    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -276,8 +286,10 @@ class WorkflowDefinitionBlocksItem_GotoUrl(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -337,8 +349,10 @@ class WorkflowDefinitionBlocksItem_Login(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -374,8 +388,10 @@ class WorkflowDefinitionBlocksItem_Navigation(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -456,8 +472,10 @@ class WorkflowDefinitionBlocksItem_Task(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -555,8 +573,10 @@ class WorkflowDefinitionBlocksItem_Validation(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

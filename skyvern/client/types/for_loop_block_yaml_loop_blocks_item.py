@@ -35,6 +35,7 @@ class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     complete_verification: typing.Optional[bool] = None
@@ -155,6 +156,10 @@ class ForLoopBlockYamlLoopBlocksItem_FileUpload(UniversalBaseModel):
     aws_access_key_id: typing.Optional[str] = None
     aws_secret_access_key: typing.Optional[str] = None
     region_name: typing.Optional[str] = None
+    azure_storage_account_name: typing.Optional[str] = None
+    azure_storage_account_key: typing.Optional[str] = None
+    azure_blob_container_name: typing.Optional[str] = None
+    azure_folder_path: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -198,7 +203,8 @@ class ForLoopBlockYamlLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     file_url: str
-    file_type: FileType = "csv"
+    file_type: FileType
+    json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -247,6 +253,7 @@ class ForLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -276,6 +283,7 @@ class ForLoopBlockYamlLoopBlocksItem_Navigation(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     complete_verification: typing.Optional[bool] = None
@@ -305,6 +313,7 @@ class ForLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
     max_steps_per_run: typing.Optional[int] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -332,6 +341,7 @@ class ForLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     complete_verification: typing.Optional[bool] = None
@@ -380,6 +390,8 @@ class ForLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
+    download_timeout: typing.Optional[float] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

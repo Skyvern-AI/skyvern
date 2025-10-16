@@ -20,6 +20,9 @@ class FileUploadBlock(UniversalBaseModel):
     aws_access_key_id: typing.Optional[str] = None
     aws_secret_access_key: typing.Optional[str] = None
     region_name: typing.Optional[str] = None
+    azure_storage_account_name: typing.Optional[str] = None
+    azure_storage_account_key: typing.Optional[str] = None
+    azure_blob_container_name: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
