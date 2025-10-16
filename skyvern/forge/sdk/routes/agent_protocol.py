@@ -341,6 +341,8 @@ async def run_workflow(
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
         browser_address=workflow_run_request.browser_address,
+        run_with=workflow_run_request.run_with,
+        ai_fallback=workflow_run_request.ai_fallback,
     )
 
     try:
@@ -371,6 +373,8 @@ async def run_workflow(
         downloaded_files=None,
         recording_url=None,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        run_with=workflow_run.run_with,
+        ai_fallback=workflow_run.ai_fallback,
     )
 
 
