@@ -83,7 +83,6 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.trace import TraceManager
-from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -314,11 +313,6 @@ class ForgeAgent:
         close_browser_on_completion = (
             close_browser_on_completion and browser_session_id is None and not task.browser_address
         )
-
-        # Collect and add experiment metadata to the trace
-        experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
-        if experiment_metadata:
-            TraceManager.add_experiment_metadata(experiment_metadata)
 
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
