@@ -481,7 +481,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
     block_type = block.get("block_type")
     if block_type in SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION:
         complete_action = {"action_type": "complete"}
-        body_stmts.append(_action_to_stmt(complete_action, block, assign_to_output=assign_to_output))
+        body_stmts.append(_action_to_stmt(complete_action, block))
 
     # For extraction blocks, add return output statement if we have actions
     if is_extraction_block and any(
