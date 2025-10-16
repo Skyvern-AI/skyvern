@@ -23,6 +23,7 @@ from skyvern.exceptions import (
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
+    ScriptTerminationException,
     SkyvernException,
     WorkflowNotFound,
     WorkflowRunNotFound,
@@ -678,9 +679,17 @@ class WorkflowService:
 
                         LOG.debug("Executing run_signature wrapper", wrapper_code=wrapper_code)
 
-                        exec_code = compile(wrapper_code, "<run_signature>", "exec")
-                        exec(exec_code, exec_globals)
-                        output_value = await exec_globals["__run_signature_wrapper"]()
+                        try:
+                            exec_code = compile(wrapper_code, "<run_signature>", "exec")
+                            exec(exec_code, exec_globals)
+                            output_value = await exec_globals["__run_signature_wrapper"]()
+                        except ScriptTerminationException as e:
+                            LOG.warning(
+                                "Script termination",
+                                block_label=block.label,
+                                error=str(e),
+                                exc_info=True,
+                            )
 
                         # Execution succeeded - get the block result from the workflow run blocks
                         # The script execution should have created the workflow run block

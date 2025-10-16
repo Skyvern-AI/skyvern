@@ -807,12 +807,16 @@ async def _fallback_to_ai_run(
         # Update block status to completed if workflow block was created
         if workflow_run_block_id:
             # refresh the task
+            failure_reason = None
             refreshed_task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
             if refreshed_task:
                 task = refreshed_task
+            if task.status in [TaskStatus.terminated, TaskStatus.failed]:
+                failure_reason = task.failure_reason
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus(task.status.value),
+                failure_reason=failure_reason,
                 label=cache_key,
             )
 

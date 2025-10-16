@@ -17,7 +17,7 @@ import structlog
 from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
 from skyvern.config import settings
-from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
+from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS, SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION
 from skyvern.core.script_generations.generate_workflow_parameters import (
     generate_workflow_parameters_schema,
     hydrate_input_text_actions_with_field_names,
@@ -92,6 +92,7 @@ ACTION_MAP = {
     "verification_code": "verification_code",
     "wait": "wait",
     "extract": "extract",
+    "complete": "complete",
 }
 ACTIONS_WITH_XPATH = [
     "click",
@@ -402,26 +403,34 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                     comma=cst.Comma(),
                 )
             )
+    intention = act.get("intention") or act.get("reasoning") or ""
+    if intention:
+        args.extend(
+            [
+                cst.Arg(
+                    keyword=cst.Name("intention"),
+                    value=_value(intention),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
+                    comma=cst.Comma(),
+                ),
+            ]
+        )
 
-    args.extend(
-        [
-            cst.Arg(
-                keyword=cst.Name("intention"),
-                value=_value(act.get("intention") or act.get("reasoning") or ""),
-                whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
-                comma=cst.Comma(),
+    # Only use indented parentheses if we have arguments
+    if args:
+        call = cst.Call(
+            func=cst.Attribute(value=cst.Name("page"), attr=cst.Name(method)),
+            args=args,
+            whitespace_before_args=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
             ),
-        ]
-    )
-
-    call = cst.Call(
-        func=cst.Attribute(value=cst.Name("page"), attr=cst.Name(method)),
-        args=args,
-        whitespace_before_args=cst.ParenthesizedWhitespace(
-            indent=True,
-            last_line=cst.SimpleWhitespace(INDENT),
-        ),
-    )
+        )
+    else:
+        call = cst.Call(
+            func=cst.Attribute(value=cst.Name("page"), attr=cst.Name(method)),
+            args=args,
+        )
 
     # await page.method(...)
     await_expr = cst.Await(call)
@@ -455,6 +464,12 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
         # For extraction blocks, assign extract action results to output variable
         assign_to_output = is_extraction_block and act["action_type"] == "extract"
         body_stmts.append(_action_to_stmt(act, block, assign_to_output=assign_to_output))
+
+    # add complete action
+    block_type = block.get("block_type")
+    if block_type in SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION:
+        complete_action = {"action_type": "complete"}
+        body_stmts.append(_action_to_stmt(complete_action, block, assign_to_output=assign_to_output))
 
     # For extraction blocks, add return output statement if we have actions
     if is_extraction_block and any(
