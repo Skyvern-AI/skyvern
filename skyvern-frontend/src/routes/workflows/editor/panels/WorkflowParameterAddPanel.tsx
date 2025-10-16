@@ -296,7 +296,7 @@ function WorkflowParameterAddPanel({ type, onClose, onSave }: Props) {
               <div className="rounded-md bg-slate-800 p-2">
                 <div className="space-y-1 text-xs text-slate-400">
                   * Credit Cards:
-                  Due to a 1Password limitation, add the expiration date as a separate text item named "Expire Date" in the format MM/YYYY (e.g. 09/2027).
+                  Due to a 1Password limitation, add the expiration date as a separate text field named "Expire Date" in the format MM/YYYY (e.g. 09/2027).
                 </div>
               </div>
             </>
