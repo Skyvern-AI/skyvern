@@ -360,7 +360,7 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <div className="flex gap-2">
                   <Label className="text-xs text-slate-300">Vault ID</Label>
-                  <HelpTooltip content="You can find the Vault ID and Item ID in the URL when viewing the item in 1Password on the web."/>
+                  <HelpTooltip content="You can find the Vault ID and Item ID in the URL when viewing the item in 1Password on the web." />
                 </div>
                 <Input
                   value={vaultId}
@@ -370,7 +370,7 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <div className="flex gap-2">
                   <Label className="text-xs text-slate-300">Item ID</Label>
-                  <HelpTooltip content="Supports all 1Password item types: Logins, Passwords, Credit Cards, Secure Notes, and more."/>
+                  <HelpTooltip content="Supports all 1Password item types: Logins, Passwords, Credit Cards, Secure Notes, and more." />
                 </div>
                 <Input
                   value={opItemId}
@@ -379,8 +379,9 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="rounded-md bg-slate-800 p-2">
                 <div className="space-y-1 text-xs text-slate-400">
-                  * Credit Cards: 
-                  Due to a 1Password limitation, add the expiration date as a separate text field named “Expire Date” in the format MM/YYYY (e.g. 09/2027).
+                  Credit Cards: Due to a 1Password limitation, add the
+                  expiration date as a separate text field named “Expire Date”
+                  in the format MM/YYYY (e.g. 09/2027).
                 </div>
               </div>
             </>
