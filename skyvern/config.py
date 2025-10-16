@@ -139,6 +139,7 @@ class Settings(BaseSettings):
     EXTRACTION_LLM_KEY: str | None = None
     CHECK_USER_GOAL_LLM_KEY: str | None = None
     AUTO_COMPLETION_LLM_KEY: str | None = None
+    SCRIPT_GENERATION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
