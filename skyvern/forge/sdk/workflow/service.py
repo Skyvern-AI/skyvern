@@ -469,7 +469,8 @@ class WorkflowService:
                 LOG.info(
                     "Workflow run is already timed_out, canceled, failed, or terminated, not marking as completed",
                     workflow_run_id=workflow_run_id,
-                    workflow_run_status=workflow_run.status if workflow_run else None,
+                    workflow_run_status=workflow_run.status,
+                    run_with=workflow_run.run_with,
                 )
         await self.clean_up_workflow(
             workflow=workflow,
@@ -2991,6 +2992,7 @@ class WorkflowService:
                 cache_key_value=rendered_cache_key_value,
                 script_id=existing_script.script_id,
                 script_revision_id=existing_script.script_revision_id,
+                run_with=workflow_run.run_with,
             )
             return
 
