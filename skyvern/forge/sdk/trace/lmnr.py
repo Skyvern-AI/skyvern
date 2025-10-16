@@ -42,7 +42,7 @@ class LaminarTrace(BaseTrace):
 
             # Map status to appropriate tag
             status_tag_map = {
-                "completed": "COMPLETION",
+                "completed": "COMPLETED",
                 "failed": "FAILURE",
                 "timed_out": "TIMEOUT",
                 "canceled": "CANCELED",
