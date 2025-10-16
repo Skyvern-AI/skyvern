@@ -144,26 +144,6 @@ class AgentDB:
         )
         self.Session = async_sessionmaker(bind=self.engine)
 
-    @staticmethod
-    def _exists_parameter_search(
-        model,
-        searchable_columns: list,
-        parameter_like: str,
-    ):
-        """
-        Build an EXISTS(...) predicate that:
-        - scopes to the same workflow (model.workflow_id == WorkflowModel.workflow_id)
-        - ignores soft-deleted rows (model.deleted_at IS NULL)
-        - matches any of the provided columns with ILIKE parameter_like
-        """
-        return exists(
-            select(1)
-            .select_from(model)
-            .where(getattr(model, "workflow_id") == WorkflowModel.workflow_id)
-            .where(getattr(model, "deleted_at").is_(None))
-            .where(or_(*[col.ilike(parameter_like) for col in searchable_columns]))
-        )
-
     async def create_task(
         self,
         url: str,
@@ -1642,69 +1622,123 @@ class AgentDB:
                     title_like = WorkflowModel.title.ilike(search_like)
 
                     parameter_filters = [
-                        self._exists_parameter_search(
-                            WorkflowParameterModel,
-                            [
-                                WorkflowParameterModel.key,
-                                WorkflowParameterModel.description,
-                                WorkflowParameterModel.default_value,
-                            ],
-                            search_like,
+                        # WorkflowParameterModel
+                        exists(
+                            select(1)
+                            .select_from(WorkflowParameterModel)
+                            .where(WorkflowParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(WorkflowParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    WorkflowParameterModel.key.ilike(search_like),
+                                    WorkflowParameterModel.description.ilike(search_like),
+                                    WorkflowParameterModel.default_value.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            OutputParameterModel,
-                            [OutputParameterModel.key, OutputParameterModel.description],
-                            search_like,
+                        # OutputParameterModel
+                        exists(
+                            select(1)
+                            .select_from(OutputParameterModel)
+                            .where(OutputParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(OutputParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    OutputParameterModel.key.ilike(search_like),
+                                    OutputParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            AWSSecretParameterModel,
-                            [AWSSecretParameterModel.key, AWSSecretParameterModel.description],
-                            search_like,
+                        # AWSSecretParameterModel
+                        exists(
+                            select(1)
+                            .select_from(AWSSecretParameterModel)
+                            .where(AWSSecretParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(AWSSecretParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    AWSSecretParameterModel.key.ilike(search_like),
+                                    AWSSecretParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            BitwardenLoginCredentialParameterModel,
-                            [
-                                BitwardenLoginCredentialParameterModel.key,
-                                BitwardenLoginCredentialParameterModel.description,
-                            ],
-                            search_like,
+                        # BitwardenLoginCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenLoginCredentialParameterModel)
+                            .where(BitwardenLoginCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenLoginCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenLoginCredentialParameterModel.key.ilike(search_like),
+                                    BitwardenLoginCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            BitwardenSensitiveInformationParameterModel,
-                            [
-                                BitwardenSensitiveInformationParameterModel.key,
-                                BitwardenSensitiveInformationParameterModel.description,
-                            ],
-                            search_like,
+                        # BitwardenSensitiveInformationParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenSensitiveInformationParameterModel)
+                            .where(BitwardenSensitiveInformationParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenSensitiveInformationParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenSensitiveInformationParameterModel.key.ilike(search_like),
+                                    BitwardenSensitiveInformationParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            BitwardenCreditCardDataParameterModel,
-                            [
-                                BitwardenCreditCardDataParameterModel.key,
-                                BitwardenCreditCardDataParameterModel.description,
-                            ],
-                            search_like,
+                        # BitwardenCreditCardDataParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenCreditCardDataParameterModel)
+                            .where(BitwardenCreditCardDataParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenCreditCardDataParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenCreditCardDataParameterModel.key.ilike(search_like),
+                                    BitwardenCreditCardDataParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            OnePasswordCredentialParameterModel,
-                            [
-                                OnePasswordCredentialParameterModel.key,
-                                OnePasswordCredentialParameterModel.description,
-                            ],
-                            search_like,
+                        # OnePasswordCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(OnePasswordCredentialParameterModel)
+                            .where(OnePasswordCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(OnePasswordCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    OnePasswordCredentialParameterModel.key.ilike(search_like),
+                                    OnePasswordCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            AzureVaultCredentialParameterModel,
-                            [
-                                AzureVaultCredentialParameterModel.key,
-                                AzureVaultCredentialParameterModel.description,
-                            ],
-                            search_like,
+                        # AzureVaultCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(AzureVaultCredentialParameterModel)
+                            .where(AzureVaultCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(AzureVaultCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    AzureVaultCredentialParameterModel.key.ilike(search_like),
+                                    AzureVaultCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
-                        self._exists_parameter_search(
-                            CredentialParameterModel,
-                            [CredentialParameterModel.key, CredentialParameterModel.description],
-                            search_like,
+                        # CredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(CredentialParameterModel)
+                            .where(CredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(CredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    CredentialParameterModel.key.ilike(search_like),
+                                    CredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
                         ),
                     ]
                     main_query = main_query.where(or_(title_like, or_(*parameter_filters)))
