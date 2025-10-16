@@ -780,7 +780,6 @@ class SkyvernPage:
         self,
         selector: str,
         files: str,
-        file_path: str,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -806,6 +805,7 @@ class SkyvernPage:
                 LOG.exception(f"Failed to adapt value for input text action on selector={selector}, file={files}")
         if not files:
             raise ValueError("file url must be provided")
+        file_path = await download_file(files)
         locator = self.page.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout)
         return files
@@ -820,10 +820,10 @@ class SkyvernPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
-        file_path = await download_file(files)
         if ai == "fallback":
             error_to_raise = None
             try:
+                file_path = await download_file(files)
                 locator = self.page.locator(selector)
                 await locator.set_input_files(file_path)
             except Exception as e:
@@ -832,7 +832,6 @@ class SkyvernPage:
                 return await self._ai_upload_file(
                     selector=selector,
                     files=files,
-                    file_path=file_path,
                     intention=intention,
                     data=data,
                     timeout=timeout,
@@ -845,11 +844,11 @@ class SkyvernPage:
             return await self._ai_upload_file(
                 selector=selector,
                 files=files,
-                file_path=file_path,
                 intention=intention,
                 data=data,
                 timeout=timeout,
             )
+        file_path = await download_file(files)
         locator = self.page.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout)
         return files
