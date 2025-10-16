@@ -505,6 +505,10 @@ class WorkflowRunContext:
                     # this will be the username, password or other fields
                     self._add_secret_parameter_value(parameter, field.id.replace(" ", "_"), field.value)
 
+        # Secure Note support
+        if item.notes:
+            self._add_secret_parameter_value(parameter, "notes", item.notes)
+
     async def register_bitwarden_login_credential_parameter_value(
         self,
         parameter: BitwardenLoginCredentialParameter,
