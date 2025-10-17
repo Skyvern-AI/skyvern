@@ -899,6 +899,8 @@ async def _regenerate_script_block_after_ai_fallback(
     2. create a completely new script, with only the current block's script being different as it's newly generated.
       -
     """
+    LOG.info("skipping script regeneration after AI fallback")
+    return None
     try:
         # Get the current script for this workflow and cache key value
         # Render the cache_key_value from workflow run parameters (same logic as generate_script_for_workflow)
