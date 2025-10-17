@@ -471,7 +471,7 @@ class WorkflowRunContext:
                 self.secrets[totp_secret_value] = parse_totp_secret(field.value)
                 self.values[parameter.key]["totp"] = totp_secret_id
             elif field.title and field.title.lower() in ["expire date", "expiry date", "expiration date"]:
-                parts = field.value.strip().split("/")
+                parts = [part.strip() for part in field.value.strip().split("/")]
 
                 if len(parts) == 2:
                     month, year_part = parts
