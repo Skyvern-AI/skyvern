@@ -1,7 +1,6 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import { useState } from "react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import type { WaitNode } from "./types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
@@ -11,9 +10,9 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 function WaitNode({ id, data, type }: NodeProps<WaitNode>) {
-  const { updateNodeData } = useReactFlow();
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -23,19 +22,9 @@ function WaitNode({ id, data, type }: NodeProps<WaitNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    waitInSeconds: data.waitInSeconds,
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+
+  const update = useUpdate<WaitNode["data"]>({ id, editable });
 
   return (
     <div>
@@ -84,9 +73,9 @@ function WaitNode({ id, data, type }: NodeProps<WaitNode>) {
             ) : null}
           </div>
           <Input
-            value={inputs.waitInSeconds}
+            value={data.waitInSeconds}
             onChange={(event) => {
-              handleChange("waitInSeconds", event.target.value);
+              update({ waitInSeconds: event.target.value });
             }}
             className="nopan text-xs"
           />

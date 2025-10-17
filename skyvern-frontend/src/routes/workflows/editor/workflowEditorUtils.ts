@@ -264,6 +264,7 @@ function convertToNode(
           prompt: block.prompt,
           url: block.url ?? "",
           maxSteps: block.max_steps,
+          cacheActions: block.cache_actions ?? false,
           disableCache: block.disable_cache ?? false,
           totpIdentifier: block.totp_identifier,
           totpVerificationUrl: block.totp_verification_url,
@@ -1457,7 +1458,10 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
-      extraHttpHeaders: data.extraHttpHeaders,
+      extraHttpHeaders:
+        data.extraHttpHeaders && typeof data.extraHttpHeaders === "object"
+          ? JSON.stringify(data.extraHttpHeaders)
+          : data.extraHttpHeaders,
       runWith: data.runWith,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
