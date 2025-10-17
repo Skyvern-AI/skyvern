@@ -262,18 +262,10 @@ class BrowserContextFactory:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         try:
-            browser_address = kwargs.get("browser_address")
-            if browser_address:
-                browser_context, browser_artifacts, cleanup_func = await _connect_to_cdp_browser(
-                    playwright,
-                    remote_browser_url=str(browser_address),
-                    extra_http_headers=kwargs.get("extra_http_headers"),
-                )
-            else:
-                creator = cls._creators.get(browser_type)
-                if not creator:
-                    raise UnknownBrowserType(browser_type)
-                browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            creator = cls._creators.get(browser_type)
+            if not creator:
+                raise UnknownBrowserType(browser_type)
+            browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
 
@@ -427,6 +419,13 @@ async def _create_headless_chromium(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -455,6 +454,13 @@ async def _create_headful_chromium(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -511,6 +517,13 @@ async def _create_cdp_connection_browser(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
 
