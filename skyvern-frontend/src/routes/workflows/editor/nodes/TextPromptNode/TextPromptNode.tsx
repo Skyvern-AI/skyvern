@@ -1,8 +1,7 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import { useState } from "react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { type TextPromptNode } from "./types";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
@@ -15,9 +14,9 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
-  const { updateNodeData } = useReactFlow();
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -27,21 +26,8 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    prompt: data.prompt,
-    jsonSchema: data.jsonSchema,
-    model: data.model,
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const update = useUpdate<TextPromptNode["data"]>({ id, editable });
 
   return (
     <div>
@@ -91,9 +77,9 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
           <WorkflowBlockInputTextarea
             nodeId={id}
             onChange={(value) => {
-              handleChange("prompt", value);
+              update({ prompt: value });
             }}
-            value={inputs.prompt}
+            value={data.prompt}
             placeholder="What do you want to generate?"
             className="nopan text-xs"
           />
@@ -101,16 +87,16 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
         <Separator />
         <ModelSelector
           className="nopan w-52 text-xs"
-          value={inputs.model}
+          value={data.model}
           onChange={(value) => {
-            handleChange("model", value);
+            update({ model: value });
           }}
         />
         <WorkflowDataSchemaInputGroup
           exampleValue={dataSchemaExampleValue}
-          value={inputs.jsonSchema}
+          value={data.jsonSchema}
           onChange={(value) => {
-            handleChange("jsonSchema", value);
+            update({ jsonSchema: value });
           }}
           suggestionContext={{}}
         />

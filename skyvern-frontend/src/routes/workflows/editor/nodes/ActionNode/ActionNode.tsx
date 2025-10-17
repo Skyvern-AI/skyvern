@@ -8,14 +8,7 @@ import {
 } from "@/components/ui/accordion";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import type { ActionNode } from "./types";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -40,6 +33,7 @@ import { useParams } from "react-router-dom";
 import { NodeHeader } from "../components/NodeHeader";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 import { DisableCache } from "../DisableCache";
 
@@ -51,25 +45,10 @@ const navigationGoalTooltip =
 const navigationGoalPlaceholder = 'Input {{ name }} into "Name" field.';
 
 function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
-  const [inputs, setInputs] = useState({
-    url: data.url,
-    navigationGoal: data.navigationGoal,
-    errorCodeMapping: data.errorCodeMapping,
-    allowDownloads: data.allowDownloads,
-    continueOnFailure: data.continueOnFailure,
-    cacheActions: data.cacheActions,
-    disableCache: data.disableCache,
-    downloadSuffix: data.downloadSuffix,
-    totpVerificationUrl: data.totpVerificationUrl,
-    model: data.model,
-    totpIdentifier: data.totpIdentifier,
-    engine: data.engine,
-  });
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
@@ -79,19 +58,10 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const rerender = useRerender({ prefix: "accordian" });
-
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
-
+  const update = useUpdate<ActionNode["data"]>({ id, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   useEffect(() => {
@@ -128,8 +98,8 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
             blockLabel={label}
             editable={editable}
             nodeId={id}
-            totpIdentifier={inputs.totpIdentifier}
-            totpUrl={inputs.totpVerificationUrl}
+            totpIdentifier={data.totpIdentifier}
+            totpUrl={data.totpVerificationUrl}
             type={type}
           />
           <div
@@ -154,9 +124,9 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                 canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("url", value);
+                  update({ url: value });
                 }}
-                value={inputs.url}
+                value={data.url}
                 placeholder={placeholders["action"]["url"]}
                 className="nopan text-xs"
               />
@@ -171,9 +141,9 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
               <WorkflowBlockInputTextarea
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("navigationGoal", value);
+                  update({ navigationGoal: value });
                 }}
-                value={inputs.navigationGoal}
+                value={data.navigationGoal}
                 placeholder={navigationGoalPlaceholder}
                 className="nopan text-xs"
               />
@@ -203,16 +173,16 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"
-                      value={inputs.model}
+                      value={data.model}
                       onChange={(value) => {
-                        handleChange("model", value);
+                        update({ model: value });
                       }}
                     />
                     <ParametersMultiSelect
                       availableOutputParameters={outputParameterKeys}
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
-                        updateNodeData(id, { parameterKeys });
+                        update({ parameterKeys });
                       }}
                     />
                   </div>
@@ -223,9 +193,9 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                       </Label>
                     </div>
                     <RunEngineSelector
-                      value={inputs.engine}
+                      value={data.engine}
                       onChange={(value) => {
-                        handleChange("engine", value);
+                        update({ engine: value });
                       }}
                       className="nopan w-52 text-xs"
                     />
@@ -241,35 +211,34 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                         />
                       </div>
                       <Checkbox
-                        checked={inputs.errorCodeMapping !== "null"}
+                        checked={data.errorCodeMapping !== "null"}
                         disabled={!editable}
                         onCheckedChange={(checked) => {
                           if (!editable) {
                             return;
                           }
-                          handleChange(
-                            "errorCodeMapping",
-                            checked
+                          update({
+                            errorCodeMapping: checked
                               ? JSON.stringify(
                                   errorMappingExampleValue,
                                   null,
                                   2,
                                 )
                               : "null",
-                          );
+                          });
                         }}
                       />
                     </div>
-                    {inputs.errorCodeMapping !== "null" && (
+                    {data.errorCodeMapping !== "null" && (
                       <div>
                         <CodeEditor
                           language="json"
-                          value={inputs.errorCodeMapping}
+                          value={data.errorCodeMapping}
                           onChange={(value) => {
                             if (!editable) {
                               return;
                             }
-                            handleChange("errorCodeMapping", value);
+                            update({ errorCodeMapping: value });
                           }}
                           className="nopan"
                           fontSize={8}
@@ -289,25 +258,25 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.continueOnFailure}
+                        checked={data.continueOnFailure}
                         onCheckedChange={(checked) => {
                           if (!editable) {
                             return;
                           }
-                          handleChange("continueOnFailure", checked);
+                          update({ continueOnFailure: checked });
                         }}
                       />
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={inputs.cacheActions}
-                    disableCache={inputs.disableCache}
+                    cacheActions={data.cacheActions}
+                    disableCache={data.disableCache}
                     editable={editable}
                     onCacheActionsChange={(cacheActions) => {
-                      handleChange("cacheActions", cacheActions);
+                      update({ cacheActions });
                     }}
                     onDisableCacheChange={(disableCache) => {
-                      handleChange("disableCache", disableCache);
+                      update({ disableCache });
                     }}
                   />
                   <Separator />
@@ -322,12 +291,12 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.allowDownloads}
+                        checked={data.allowDownloads}
                         onCheckedChange={(checked) => {
                           if (!editable) {
                             return;
                           }
-                          handleChange("allowDownloads", checked);
+                          update({ allowDownloads: checked });
                         }}
                       />
                     </div>
@@ -346,9 +315,9 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                       type="text"
                       placeholder={placeholders["action"]["downloadSuffix"]}
                       className="nopan w-52 text-xs"
-                      value={inputs.downloadSuffix ?? ""}
+                      value={data.downloadSuffix ?? ""}
                       onChange={(value) => {
-                        handleChange("downloadSuffix", value);
+                        update({ downloadSuffix: value });
                       }}
                     />
                   </div>
@@ -365,9 +334,9 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpIdentifier", value);
+                        update({ totpIdentifier: value });
                       }}
-                      value={inputs.totpIdentifier ?? ""}
+                      value={data.totpIdentifier ?? ""}
                       placeholder={placeholders["action"]["totpIdentifier"]}
                       className="nopan text-xs"
                     />
@@ -384,9 +353,9 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpVerificationUrl", value);
+                        update({ totpVerificationUrl: value });
                       }}
-                      value={inputs.totpVerificationUrl ?? ""}
+                      value={data.totpVerificationUrl ?? ""}
                       placeholder={placeholders["task"]["totpVerificationUrl"]}
                       className="nopan text-xs"
                     />

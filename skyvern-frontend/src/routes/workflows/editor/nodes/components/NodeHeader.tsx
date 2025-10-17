@@ -91,7 +91,9 @@ const getPayload = (opts: {
     extraHttpHeaders =
       opts.workflowSettings.extraHttpHeaders === null
         ? null
-        : JSON.parse(opts.workflowSettings.extraHttpHeaders);
+        : typeof opts.workflowSettings.extraHttpHeaders === "object"
+          ? opts.workflowSettings.extraHttpHeaders
+          : JSON.parse(opts.workflowSettings.extraHttpHeaders);
   } catch (e: unknown) {
     toast({
       variant: "warning",

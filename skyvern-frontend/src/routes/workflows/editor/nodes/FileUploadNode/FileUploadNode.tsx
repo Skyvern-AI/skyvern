@@ -1,11 +1,10 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { type FileUploadNode } from "./types";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
-import { useState } from "react";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
@@ -18,9 +17,9 @@ import {
 } from "@/components/ui/select";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
-  const { updateNodeData } = useReactFlow();
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -30,26 +29,7 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-
-  const [inputs, setInputs] = useState({
-    storageType: data.storageType,
-    awsAccessKeyId: data.awsAccessKeyId ?? "",
-    awsSecretAccessKey: data.awsSecretAccessKey ?? "",
-    s3Bucket: data.s3Bucket ?? "",
-    regionName: data.regionName ?? "",
-    path: data.path ?? "",
-    azureStorageAccountName: data.azureStorageAccountName ?? "",
-    azureStorageAccountKey: data.azureStorageAccountKey ?? "",
-    azureBlobContainerName: data.azureBlobContainerName ?? "",
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!data.editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const update = useUpdate<FileUploadNode["data"]>({ id, editable });
 
   return (
     <div>
@@ -92,8 +72,10 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
               />
             </div>
             <Select
-              value={inputs.storageType}
-              onValueChange={(value) => handleChange("storageType", value)}
+              value={data.storageType}
+              onValueChange={(value) =>
+                value && update({ storageType: value as "s3" | "azure" })
+              }
               disabled={!editable}
             >
               <SelectTrigger className="nopan text-xs">
@@ -106,7 +88,7 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
             </Select>
           </div>
 
-          {inputs.storageType === "s3" && (
+          {data.storageType === "s3" && (
             <>
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
@@ -120,9 +102,9 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInputTextarea
                   nodeId={id}
                   onChange={(value) => {
-                    handleChange("awsAccessKeyId", value);
+                    update({ awsAccessKeyId: value });
                   }}
-                  value={inputs.awsAccessKeyId as string}
+                  value={data.awsAccessKeyId as string}
                   className="nopan text-xs"
                 />
               </div>
@@ -140,10 +122,10 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInput
                   nodeId={id}
                   type="password"
-                  value={inputs.awsSecretAccessKey as string}
+                  value={data.awsSecretAccessKey as string}
                   className="nopan text-xs"
                   onChange={(value) => {
-                    handleChange("awsSecretAccessKey", value);
+                    update({ awsSecretAccessKey: value });
                   }}
                 />
               </div>
@@ -157,9 +139,9 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInputTextarea
                   nodeId={id}
                   onChange={(value) => {
-                    handleChange("s3Bucket", value);
+                    update({ s3Bucket: value });
                   }}
-                  value={inputs.s3Bucket as string}
+                  value={data.s3Bucket as string}
                   className="nopan text-xs"
                 />
               </div>
@@ -173,9 +155,9 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInputTextarea
                   nodeId={id}
                   onChange={(value) => {
-                    handleChange("regionName", value);
+                    update({ regionName: value });
                   }}
-                  value={inputs.regionName as string}
+                  value={data.regionName as string}
                   className="nopan text-xs"
                 />
               </div>
@@ -189,16 +171,16 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInputTextarea
                   nodeId={id}
                   onChange={(value) => {
-                    handleChange("path", value);
+                    update({ path: value });
                   }}
-                  value={inputs.path as string}
+                  value={data.path as string}
                   className="nopan text-xs"
                 />
               </div>
             </>
           )}
 
-          {inputs.storageType === "azure" && (
+          {data.storageType === "azure" && (
             <>
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
@@ -214,9 +196,9 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInputTextarea
                   nodeId={id}
                   onChange={(value) => {
-                    handleChange("azureStorageAccountName", value);
+                    update({ azureStorageAccountName: value });
                   }}
-                  value={inputs.azureStorageAccountName as string}
+                  value={data.azureStorageAccountName as string}
                   className="nopan text-xs"
                 />
               </div>
@@ -234,10 +216,10 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInput
                   nodeId={id}
                   type="password"
-                  value={inputs.azureStorageAccountKey as string}
+                  value={data.azureStorageAccountKey as string}
                   className="nopan text-xs"
                   onChange={(value) => {
-                    handleChange("azureStorageAccountKey", value);
+                    update({ azureStorageAccountKey: value });
                   }}
                 />
               </div>
@@ -255,9 +237,9 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInputTextarea
                   nodeId={id}
                   onChange={(value) => {
-                    handleChange("azureBlobContainerName", value);
+                    update({ azureBlobContainerName: value });
                   }}
-                  value={inputs.azureBlobContainerName as string}
+                  value={data.azureBlobContainerName as string}
                   className="nopan text-xs"
                 />
               </div>
@@ -271,9 +253,9 @@ function FileUploadNode({ id, data }: NodeProps<FileUploadNode>) {
                 <WorkflowBlockInputTextarea
                   nodeId={id}
                   onChange={(value) => {
-                    handleChange("path", value);
+                    update({ path: value });
                   }}
-                  value={inputs.path as string}
+                  value={data.path as string}
                   className="nopan text-xs"
                 />
               </div>
