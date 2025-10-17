@@ -44,7 +44,6 @@ dependencies = [
     "onnxruntime>=1.20.0,<1.23.0 ; python_version >= '3.12' and python_version < '3.14'",
     "onnxruntime<1.17 ; python_version >= '3.11' and python_version < '3.12'",
     "aioredlock>=0.7.3,<0.8",
-    "stripe>=9.7.0,<10",
     "tldextract>=5.1.2,<6",
     "websockets~=12.0",
     "email-validator>=2.2.0,<3",
