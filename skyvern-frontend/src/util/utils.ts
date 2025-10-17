@@ -55,3 +55,15 @@ export function toDate(
 
   return date;
 }
+
+/** Returns a date in the format 'July 14th at 4:52pm' */
+export function formatDate(date: Date): string {
+  const options: Intl.DateTimeFormatOptions = {
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "numeric",
+    hour12: true,
+  };
+  return date.toLocaleString("en-US", options);
+}
