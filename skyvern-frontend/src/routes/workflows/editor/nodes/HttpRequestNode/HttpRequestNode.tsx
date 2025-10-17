@@ -8,15 +8,8 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
-import { useState } from "react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
+import { useCallback } from "react";
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import type { HttpRequestNode as HttpRequestNodeType } from "./types";
@@ -31,6 +24,7 @@ import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import {
   Select,
   SelectContent,
@@ -67,83 +61,59 @@ const followRedirectsTooltip =
   "Whether to automatically follow HTTP redirects.";
 
 function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
-  const { updateNodeData } = useReactFlow();
   const { editable } = data;
   const [label, setLabel] = useNodeLabelChangeHandler({
     id,
     initialValue: data.label,
   });
-  const [inputs, setInputs] = useState({
-    method: data.method,
-    url: data.url,
-    headers: data.headers,
-    body: data.body,
-    timeout: data.timeout,
-    followRedirects: data.followRedirects,
-    continueOnFailure: data.continueOnFailure,
-  });
   const deleteNodeCallback = useDeleteNodeCallback();
-
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
+  const update = useUpdate<HttpRequestNodeType["data"]>({ id, editable });
 
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const handleCurlImport = useCallback(
+    (importedData: {
+      method: string;
+      url: string;
+      headers: string;
+      body: string;
+      timeout: number;
+      followRedirects: boolean;
+    }) => {
+      update({
+        method: importedData.method,
+        url: importedData.url,
+        headers: importedData.headers,
+        body: importedData.body,
+        timeout: importedData.timeout,
+        followRedirects: importedData.followRedirects,
+      });
+    },
+    [update],
+  );
 
-  const handleCurlImport = (importedData: {
-    method: string;
-    url: string;
-    headers: string;
-    body: string;
-    timeout: number;
-    followRedirects: boolean;
-  }) => {
-    const newInputs = {
-      ...inputs,
-      method: importedData.method,
-      url: importedData.url,
-      headers: importedData.headers,
-      body: importedData.body,
-      timeout: importedData.timeout,
-      followRedirects: importedData.followRedirects,
-    };
-    setInputs(newInputs);
-    updateNodeData(id, {
-      method: importedData.method,
-      url: importedData.url,
-      headers: importedData.headers,
-      body: importedData.body,
-      timeout: importedData.timeout,
-      followRedirects: importedData.followRedirects,
-    });
-  };
-
-  const handleQuickHeaders = (headers: Record<string, string>) => {
-    try {
-      const existingHeaders = JSON.parse(inputs.headers || "{}");
-      const mergedHeaders = { ...existingHeaders, ...headers };
-      const newHeadersString = JSON.stringify(mergedHeaders, null, 2);
-      handleChange("headers", newHeadersString);
-    } catch (error) {
-      // If existing headers are invalid, just use the new ones
-      const newHeadersString = JSON.stringify(headers, null, 2);
-      handleChange("headers", newHeadersString);
-    }
-  };
+  const handleQuickHeaders = useCallback(
+    (headers: Record<string, string>) => {
+      try {
+        const existingHeaders = JSON.parse(data.headers || "{}");
+        const mergedHeaders = { ...existingHeaders, ...headers };
+        const newHeadersString = JSON.stringify(mergedHeaders, null, 2);
+        update({ headers: newHeadersString });
+      } catch (error) {
+        // If existing headers are invalid, just use the new ones
+        const newHeadersString = JSON.stringify(headers, null, 2);
+        update({ headers: newHeadersString });
+      }
+    },
+    [data.headers, update],
+  );
 
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
 
   const showBodyEditor =
-    inputs.method !== "GET" &&
-    inputs.method !== "HEAD" &&
-    inputs.method !== "DELETE";
+    data.method !== "GET" && data.method !== "HEAD" && data.method !== "DELETE";
 
   return (
     <div>
@@ -210,13 +180,13 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 <HelpTooltip content={methodTooltip} />
               </div>
               <Select
-                value={inputs.method}
-                onValueChange={(value) => handleChange("method", value)}
+                value={data.method}
+                onValueChange={(value) => update({ method: value })}
                 disabled={!editable}
               >
                 <SelectTrigger className="nopan text-xs">
                   <div className="flex items-center gap-2">
-                    <MethodBadge method={inputs.method} />
+                    <MethodBadge method={data.method} />
                   </div>
                 </SelectTrigger>
                 <SelectContent>
@@ -247,13 +217,13 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                 canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("url", value);
+                  update({ url: value });
                 }}
-                value={inputs.url}
+                value={data.url}
                 placeholder={placeholders["httpRequest"]["url"]}
                 className="nopan text-xs"
               />
-              <UrlValidator url={inputs.url} />
+              <UrlValidator url={data.url} />
             </div>
           </div>
 
@@ -279,9 +249,9 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
             <CodeEditor
               className="w-full"
               language="json"
-              value={inputs.headers}
+              value={data.headers}
               onChange={(value) => {
-                handleChange("headers", value || "{}");
+                update({ headers: value || "{}" });
               }}
               readOnly={!editable}
               minHeight="80px"
@@ -299,9 +269,9 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
               <CodeEditor
                 className="w-full"
                 language="json"
-                value={inputs.body}
+                value={data.body}
                 onChange={(value) => {
-                  handleChange("body", value || "{}");
+                  update({ body: value || "{}" });
                 }}
                 readOnly={!editable}
                 minHeight="100px"
@@ -312,10 +282,10 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
 
           {/* Request Preview */}
           <RequestPreview
-            method={inputs.method}
-            url={inputs.url}
-            headers={inputs.headers}
-            body={inputs.body}
+            method={data.method}
+            url={data.url}
+            headers={data.headers}
+            body={data.body}
           />
         </div>
 
@@ -336,7 +306,7 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                   availableOutputParameters={outputParameterKeys}
                   parameters={data.parameterKeys}
                   onParametersChange={(parameterKeys) => {
-                    updateNodeData(id, { parameterKeys });
+                    update({ parameterKeys });
                   }}
                 />
                 <div className="flex gap-4">
@@ -349,9 +319,11 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                       type="number"
                       min="1"
                       max="300"
-                      value={inputs.timeout}
+                      value={data.timeout}
                       onChange={(e) =>
-                        handleChange("timeout", parseInt(e.target.value) || 30)
+                        update({
+                          timeout: parseInt(e.target.value) || 30,
+                        })
                       }
                       className="nopan text-xs"
                       disabled={!editable}
@@ -369,9 +341,9 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                         Automatically follow HTTP redirects
                       </span>
                       <Switch
-                        checked={inputs.followRedirects}
+                        checked={data.followRedirects}
                         onCheckedChange={(checked) =>
-                          handleChange("followRedirects", checked)
+                          update({ followRedirects: checked })
                         }
                         disabled={!editable}
                       />
@@ -390,9 +362,9 @@ function HttpRequestNode({ id, data }: NodeProps<HttpRequestNodeType>) {
                     </div>
                     <div className="flex items-center justify-end">
                       <Switch
-                        checked={inputs.continueOnFailure}
+                        checked={data.continueOnFailure}
                         onCheckedChange={(checked) =>
-                          handleChange("continueOnFailure", checked)
+                          update({ continueOnFailure: checked })
                         }
                         disabled={!editable}
                       />
