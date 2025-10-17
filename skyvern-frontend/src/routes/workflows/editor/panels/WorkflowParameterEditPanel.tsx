@@ -277,7 +277,7 @@ function WorkflowParameterEditPanel({
                         setDefaultValueState((state) => {
                           return {
                             ...state,
-                            defaultValue: value,
+                            defaultValue: value.s3uri,
                           };
                         });
                         return;
