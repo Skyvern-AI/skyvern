@@ -4,6 +4,7 @@ import typing
 from .environment import SkyvernEnvironment
 import httpx
 from .core.client_wrapper import SyncClientWrapper
+from .scripts.client import ScriptsClient
 from .types.run_engine import RunEngine
 from .types.proxy_location import ProxyLocation
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
@@ -23,6 +24,7 @@ from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
+from .types.workflow_run_timeline import WorkflowRunTimeline
 from .types.browser_session_response import BrowserSessionResponse
 from .errors.forbidden_error import ForbiddenError
 import datetime as dt
@@ -31,7 +33,11 @@ from .types.credential_response import CredentialResponse
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.create_credential_request_credential import CreateCredentialRequestCredential
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
+from .types.script import Script
+from .types.script_file_create import ScriptFileCreate
+from .types.create_script_response import CreateScriptResponse
 from .core.client_wrapper import AsyncClientWrapper
+from .scripts.client import AsyncScriptsClient
 
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
@@ -99,6 +105,7 @@ class Skyvern:
             else httpx.Client(timeout=_defaulted_timeout),
             timeout=_defaulted_timeout,
         )
+        self.scripts = ScriptsClient(client_wrapper=self._client_wrapper)
 
     def run_task(
         self,
@@ -121,6 +128,7 @@ class Skyvern:
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -214,6 +222,9 @@ class Skyvern:
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -257,6 +268,7 @@ class Skyvern:
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
+                "browser_address": browser_address,
             },
             headers={
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -314,6 +326,9 @@ class Skyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        ai_fallback: typing.Optional[bool] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -381,6 +396,15 @@ class Skyvern:
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
 
+        browser_address : typing.Optional[str]
+            The CDP address for the workflow run.
+
+        ai_fallback : typing.Optional[bool]
+            Whether to fallback to AI if the workflow run fails.
+
+        run_with : typing.Optional[str]
+            Whether to run the workflow with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -418,6 +442,9 @@ class Skyvern:
                 "browser_session_id": browser_session_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
+                "browser_address": browser_address,
+                "ai_fallback": ai_fallback,
+                "run_with": run_with,
             },
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
@@ -1077,6 +1104,86 @@ class Skyvern:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    def get_run_timeline(
+        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> typing.List[WorkflowRunTimeline]:
+        """
+        Get timeline for a run (workflow run or task_v2 run)
+
+        Parameters
+        ----------
+        run_id : str
+            The id of the workflow run or task_v2 run.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRunTimeline]
+            Successfully retrieved run timeline
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+        client.get_run_timeline(
+            run_id="wr_123",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/runs/{jsonable_encoder(run_id)}/timeline",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[WorkflowRunTimeline],
+                    parse_obj_as(
+                        type_=typing.List[WorkflowRunTimeline],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.List[BrowserSessionResponse]:
@@ -1143,7 +1250,11 @@ class Skyvern:
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
     def create_browser_session(
-        self, *, timeout: typing.Optional[int] = OMIT, request_options: typing.Optional[RequestOptions] = None
+        self,
+        *,
+        timeout: typing.Optional[int] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
         Create a browser session that persists across multiple runs
@@ -1151,7 +1262,32 @@ class Skyvern:
         Parameters
         ----------
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 120. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+
+        proxy_location : typing.Optional[ProxyLocation]
+
+            Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+            Available geotargeting options:
+            - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+            - RESIDENTIAL_ES: Spain
+            - RESIDENTIAL_IE: Ireland
+            - RESIDENTIAL_GB: United Kingdom
+            - RESIDENTIAL_IN: India
+            - RESIDENTIAL_JP: Japan
+            - RESIDENTIAL_FR: France
+            - RESIDENTIAL_DE: Germany
+            - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_ZA: South Africa
+            - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_ISP: ISP proxy
+            - US-CA: California
+            - US-NY: New York
+            - US-TX: Texas
+            - US-FL: Florida
+            - US-WA: Washington
+            - NONE: No proxy
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1176,6 +1312,7 @@ class Skyvern:
             method="POST",
             json={
                 "timeout": timeout,
+                "proxy_location": proxy_location,
             },
             headers={
                 "content-type": "application/json",
@@ -1757,10 +1894,14 @@ class Skyvern:
         bitwarden_item_id: typing.Optional[str] = OMIT,
         onepassword_vault_id: typing.Optional[str] = OMIT,
         onepassword_item_id: typing.Optional[str] = OMIT,
+        azure_vault_name: typing.Optional[str] = OMIT,
+        azure_vault_username_key: typing.Optional[str] = OMIT,
+        azure_vault_password_key: typing.Optional[str] = OMIT,
+        azure_vault_totp_secret_key: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
-        Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password
+        Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault
 
         Parameters
         ----------
@@ -1809,6 +1950,18 @@ class Skyvern:
         onepassword_item_id : typing.Optional[str]
             1Password item ID
 
+        azure_vault_name : typing.Optional[str]
+            Azure Vault Name
+
+        azure_vault_username_key : typing.Optional[str]
+            Azure Vault username key
+
+        azure_vault_password_key : typing.Optional[str]
+            Azure Vault password key
+
+        azure_vault_totp_secret_key : typing.Optional[str]
+            Azure Vault TOTP secret key
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -1848,6 +2001,10 @@ class Skyvern:
                 "bitwarden_item_id": bitwarden_item_id,
                 "onepassword_vault_id": onepassword_vault_id,
                 "onepassword_item_id": onepassword_item_id,
+                "azure_vault_name": azure_vault_name,
+                "azure_vault_username_key": azure_vault_username_key,
+                "azure_vault_password_key": azure_vault_password_key,
+                "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
             },
             headers={
                 "content-type": "application/json",
@@ -1861,6 +2018,298 @@ class Skyvern:
                     WorkflowRunResponse,
                     parse_obj_as(
                         type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    def get_scripts(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Script]:
+        """
+        Retrieves a paginated list of scripts for the current organization
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination
+
+        page_size : typing.Optional[int]
+            Number of items per page
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Script]
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+        client.get_scripts(
+            page=1,
+            page_size=10,
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/scripts",
+            method="GET",
+            params={
+                "page": page,
+                "page_size": page_size,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[Script],
+                    parse_obj_as(
+                        type_=typing.List[Script],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    def create_script(
+        self,
+        *,
+        workflow_id: typing.Optional[str] = OMIT,
+        run_id: typing.Optional[str] = OMIT,
+        files: typing.Optional[typing.Sequence[ScriptFileCreate]] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> CreateScriptResponse:
+        """
+        Create a new script with optional files and metadata
+
+        Parameters
+        ----------
+        workflow_id : typing.Optional[str]
+            Associated workflow ID
+
+        run_id : typing.Optional[str]
+            Associated run ID
+
+        files : typing.Optional[typing.Sequence[ScriptFileCreate]]
+            Array of files to include in the script
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CreateScriptResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+        client.create_script()
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/scripts",
+            method="POST",
+            json={
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "files": convert_and_respect_annotation_metadata(
+                    object_=files, annotation=typing.Sequence[ScriptFileCreate], direction="write"
+                ),
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    CreateScriptResponse,
+                    parse_obj_as(
+                        type_=CreateScriptResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    def get_script(self, script_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Script:
+        """
+        Retrieves a specific script by its ID
+
+        Parameters
+        ----------
+        script_id : str
+            The unique identifier of the script
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Script
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+        client.get_script(
+            script_id="s_abc123",
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/scripts/{jsonable_encoder(script_id)}",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    Script,
+                    parse_obj_as(
+                        type_=Script,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    def deploy_script(
+        self,
+        script_id: str,
+        *,
+        files: typing.Sequence[ScriptFileCreate],
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> CreateScriptResponse:
+        """
+        Deploy a script with updated files, creating a new version
+
+        Parameters
+        ----------
+        script_id : str
+            The unique identifier of the script
+
+        files : typing.Sequence[ScriptFileCreate]
+            Array of files to include in the script
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CreateScriptResponse
+            Successful Response
+
+        Examples
+        --------
+        from skyvern import ScriptFileCreate, Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+        client.deploy_script(
+            script_id="s_abc123",
+            files=[
+                ScriptFileCreate(
+                    path="src/main.py",
+                    content="content",
+                )
+            ],
+        )
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/scripts/{jsonable_encoder(script_id)}/deploy",
+            method="POST",
+            json={
+                "files": convert_and_respect_annotation_metadata(
+                    object_=files, annotation=typing.Sequence[ScriptFileCreate], direction="write"
+                ),
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    CreateScriptResponse,
+                    parse_obj_as(
+                        type_=CreateScriptResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -1942,6 +2391,7 @@ class AsyncSkyvern:
             else httpx.AsyncClient(timeout=_defaulted_timeout),
             timeout=_defaulted_timeout,
         )
+        self.scripts = AsyncScriptsClient(client_wrapper=self._client_wrapper)
 
     async def run_task(
         self,
@@ -1964,6 +2414,7 @@ class AsyncSkyvern:
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TaskRunResponse:
         """
@@ -2057,6 +2508,9 @@ class AsyncSkyvern:
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2108,6 +2562,7 @@ class AsyncSkyvern:
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
+                "browser_address": browser_address,
             },
             headers={
                 "x-user-agent": str(user_agent) if user_agent is not None else None,
@@ -2165,6 +2620,9 @@ class AsyncSkyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        ai_fallback: typing.Optional[bool] = OMIT,
+        run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -2232,6 +2690,15 @@ class AsyncSkyvern:
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
 
+        browser_address : typing.Optional[str]
+            The CDP address for the workflow run.
+
+        ai_fallback : typing.Optional[bool]
+            Whether to fallback to AI if the workflow run fails.
+
+        run_with : typing.Optional[str]
+            Whether to run the workflow with agent or code.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2277,6 +2744,9 @@ class AsyncSkyvern:
                 "browser_session_id": browser_session_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
+                "browser_address": browser_address,
+                "ai_fallback": ai_fallback,
+                "run_with": run_with,
             },
             headers={
                 "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
@@ -3010,6 +3480,94 @@ class AsyncSkyvern:
             raise ApiError(status_code=_response.status_code, body=_response.text)
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
+    async def get_run_timeline(
+        self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
+    ) -> typing.List[WorkflowRunTimeline]:
+        """
+        Get timeline for a run (workflow run or task_v2 run)
+
+        Parameters
+        ----------
+        run_id : str
+            The id of the workflow run or task_v2 run.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRunTimeline]
+            Successfully retrieved run timeline
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_run_timeline(
+                run_id="wr_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/runs/{jsonable_encoder(run_id)}/timeline",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[WorkflowRunTimeline],
+                    parse_obj_as(
+                        type_=typing.List[WorkflowRunTimeline],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
     async def get_browser_sessions(
         self, *, request_options: typing.Optional[RequestOptions] = None
     ) -> typing.List[BrowserSessionResponse]:
@@ -3084,7 +3642,11 @@ class AsyncSkyvern:
         raise ApiError(status_code=_response.status_code, body=_response_json)
 
     async def create_browser_session(
-        self, *, timeout: typing.Optional[int] = OMIT, request_options: typing.Optional[RequestOptions] = None
+        self,
+        *,
+        timeout: typing.Optional[int] = OMIT,
+        proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
     ) -> BrowserSessionResponse:
         """
         Create a browser session that persists across multiple runs
@@ -3092,7 +3654,32 @@ class AsyncSkyvern:
         Parameters
         ----------
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 120. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+
+        proxy_location : typing.Optional[ProxyLocation]
+
+            Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+            Available geotargeting options:
+            - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+            - RESIDENTIAL_ES: Spain
+            - RESIDENTIAL_IE: Ireland
+            - RESIDENTIAL_GB: United Kingdom
+            - RESIDENTIAL_IN: India
+            - RESIDENTIAL_JP: Japan
+            - RESIDENTIAL_FR: France
+            - RESIDENTIAL_DE: Germany
+            - RESIDENTIAL_NZ: New Zealand
+            - RESIDENTIAL_ZA: South Africa
+            - RESIDENTIAL_AR: Argentina
+            - RESIDENTIAL_AU: Australia
+            - RESIDENTIAL_ISP: ISP proxy
+            - US-CA: California
+            - US-NY: New York
+            - US-TX: Texas
+            - US-FL: Florida
+            - US-WA: Washington
+            - NONE: No proxy
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -3125,6 +3712,7 @@ class AsyncSkyvern:
             method="POST",
             json={
                 "timeout": timeout,
+                "proxy_location": proxy_location,
             },
             headers={
                 "content-type": "application/json",
@@ -3764,10 +4352,14 @@ class AsyncSkyvern:
         bitwarden_item_id: typing.Optional[str] = OMIT,
         onepassword_vault_id: typing.Optional[str] = OMIT,
         onepassword_item_id: typing.Optional[str] = OMIT,
+        azure_vault_name: typing.Optional[str] = OMIT,
+        azure_vault_username_key: typing.Optional[str] = OMIT,
+        azure_vault_password_key: typing.Optional[str] = OMIT,
+        azure_vault_totp_secret_key: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
-        Log in to a website using either credential stored in Skyvern, Bitwarden or 1Password
+        Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault
 
         Parameters
         ----------
@@ -3816,6 +4408,18 @@ class AsyncSkyvern:
         onepassword_item_id : typing.Optional[str]
             1Password item ID
 
+        azure_vault_name : typing.Optional[str]
+            Azure Vault Name
+
+        azure_vault_username_key : typing.Optional[str]
+            Azure Vault username key
+
+        azure_vault_password_key : typing.Optional[str]
+            Azure Vault password key
+
+        azure_vault_totp_secret_key : typing.Optional[str]
+            Azure Vault TOTP secret key
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -3863,6 +4467,10 @@ class AsyncSkyvern:
                 "bitwarden_item_id": bitwarden_item_id,
                 "onepassword_vault_id": onepassword_vault_id,
                 "onepassword_item_id": onepassword_item_id,
+                "azure_vault_name": azure_vault_name,
+                "azure_vault_username_key": azure_vault_username_key,
+                "azure_vault_password_key": azure_vault_password_key,
+                "azure_vault_totp_secret_key": azure_vault_totp_secret_key,
             },
             headers={
                 "content-type": "application/json",
@@ -3876,6 +4484,330 @@ class AsyncSkyvern:
                     WorkflowRunResponse,
                     parse_obj_as(
                         type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def get_scripts(
+        self,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[Script]:
+        """
+        Retrieves a paginated list of scripts for the current organization
+
+        Parameters
+        ----------
+        page : typing.Optional[int]
+            Page number for pagination
+
+        page_size : typing.Optional[int]
+            Number of items per page
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[Script]
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_scripts(
+                page=1,
+                page_size=10,
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/scripts",
+            method="GET",
+            params={
+                "page": page,
+                "page_size": page_size,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    typing.List[Script],
+                    parse_obj_as(
+                        type_=typing.List[Script],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def create_script(
+        self,
+        *,
+        workflow_id: typing.Optional[str] = OMIT,
+        run_id: typing.Optional[str] = OMIT,
+        files: typing.Optional[typing.Sequence[ScriptFileCreate]] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> CreateScriptResponse:
+        """
+        Create a new script with optional files and metadata
+
+        Parameters
+        ----------
+        workflow_id : typing.Optional[str]
+            Associated workflow ID
+
+        run_id : typing.Optional[str]
+            Associated run ID
+
+        files : typing.Optional[typing.Sequence[ScriptFileCreate]]
+            Array of files to include in the script
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CreateScriptResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.create_script()
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/scripts",
+            method="POST",
+            json={
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "files": convert_and_respect_annotation_metadata(
+                    object_=files, annotation=typing.Sequence[ScriptFileCreate], direction="write"
+                ),
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    CreateScriptResponse,
+                    parse_obj_as(
+                        type_=CreateScriptResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def get_script(self, script_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> Script:
+        """
+        Retrieves a specific script by its ID
+
+        Parameters
+        ----------
+        script_id : str
+            The unique identifier of the script
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        Script
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.get_script(
+                script_id="s_abc123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/scripts/{jsonable_encoder(script_id)}",
+            method="GET",
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    Script,
+                    parse_obj_as(
+                        type_=Script,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def deploy_script(
+        self,
+        script_id: str,
+        *,
+        files: typing.Sequence[ScriptFileCreate],
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> CreateScriptResponse:
+        """
+        Deploy a script with updated files, creating a new version
+
+        Parameters
+        ----------
+        script_id : str
+            The unique identifier of the script
+
+        files : typing.Sequence[ScriptFileCreate]
+            Array of files to include in the script
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        CreateScriptResponse
+            Successful Response
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern, ScriptFileCreate
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+            x_api_key="YOUR_X_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.deploy_script(
+                script_id="s_abc123",
+                files=[
+                    ScriptFileCreate(
+                        path="src/main.py",
+                        content="content",
+                    )
+                ],
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/scripts/{jsonable_encoder(script_id)}/deploy",
+            method="POST",
+            json={
+                "files": convert_and_respect_annotation_metadata(
+                    object_=files, annotation=typing.Sequence[ScriptFileCreate], direction="write"
+                ),
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    CreateScriptResponse,
+                    parse_obj_as(
+                        type_=CreateScriptResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )

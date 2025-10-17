@@ -7,6 +7,7 @@ import typing
 from .workflow_run_response_output import WorkflowRunResponseOutput
 from .file_info import FileInfo
 import datetime as dt
+from .script_run_response import ScriptRunResponse
 from .workflow_run_request import WorkflowRunRequest
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 
@@ -85,6 +86,16 @@ class WorkflowRunResponse(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = pydantic.Field(default=None)
     """
     The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot
+    """
+
+    script_run: typing.Optional[ScriptRunResponse] = pydantic.Field(default=None)
+    """
+    The script run result
+    """
+
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = pydantic.Field(default=None)
+    """
+    The errors for the run
     """
 
     run_request: typing.Optional[WorkflowRunRequest] = pydantic.Field(default=None)
