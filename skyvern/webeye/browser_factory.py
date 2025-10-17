@@ -419,6 +419,13 @@ async def _create_headless_chromium(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -447,6 +454,13 @@ async def _create_headful_chromium(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -503,6 +517,13 @@ async def _create_cdp_connection_browser(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
 
@@ -550,13 +571,20 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
+    return await _connect_to_cdp_browser(playwright, settings.BROWSER_REMOTE_DEBUGGING_URL, extra_http_headers)
+
+
+async def _connect_to_cdp_browser(
+    playwright: Playwright,
+    remote_browser_url: str,
+    extra_http_headers: dict[str, str] | None = None,
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
     )
 
-    remote_browser_url = settings.BROWSER_REMOTE_DEBUGGING_URL
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
 
@@ -676,7 +704,7 @@ class BrowserState:
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url:
+            if url and page.url.rstrip("/") != url.rstrip("/"):
                 await self.navigate_to_url(page=page, url=url)
 
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
