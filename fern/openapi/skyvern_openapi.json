@@ -465,7 +465,7 @@
           "Workflows"
         ],
         "summary": "Get Workflows",
-        "description": "Get all workflows with the latest version for the organization.",
+        "description": "Get all workflows with the latest version for the organization.\n\nSearch semantics:\n- If `search_key` is provided, its value is used as a unified search term for both\n  `workflows.title` and workflow parameter metadata (key, description, and default_value for\n  `WorkflowParameterModel`).\n- Falls back to deprecated `title` (title-only search) if `search_key` is not provided.\n- Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.",
         "operationId": "get_workflows_v1_workflows_get",
         "parameters": [
           {
@@ -511,14 +511,36 @@
             }
           },
           {
+            "name": "search_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Unified search across workflow title and parameter metadata (key, description, default_value).",
+              "title": "Search Key"
+            },
+            "description": "Unified search across workflow title and parameter metadata (key, description, default_value)."
+          },
+          {
             "name": "title",
             "in": "query",
             "required": false,
             "schema": {
               "type": "string",
+              "description": "Deprecated: use search_key instead.",
+              "deprecated": true,
               "default": "",
               "title": "Title"
-            }
+            },
+            "description": "Deprecated: use search_key instead.",
+            "deprecated": true
           },
           {
             "name": "template",
@@ -2744,6 +2766,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -2961,11 +2988,6 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
-            "default": false
-          },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {
@@ -4317,6 +4339,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "code": {
             "type": "string",
             "title": "Code"
@@ -5011,6 +5038,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "url": {
             "type": "string",
             "title": "Url"
@@ -5096,6 +5128,11 @@
               }
             ],
             "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           },
           "task_type": {
             "type": "string",
@@ -5307,11 +5344,6 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
-            "default": false
-          },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {
@@ -5496,6 +5528,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -5713,11 +5750,6 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
-            "default": false
-          },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {
@@ -6074,6 +6106,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "file_url": {
             "type": "string",
             "title": "File Url"
@@ -6208,6 +6245,11 @@
               }
             ],
             "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           },
           "storage_type": {
             "$ref": "#/components/schemas/FileStorageType",
@@ -6479,6 +6521,11 @@
               }
             ],
             "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           },
           "loop_blocks": {
             "items": {
@@ -6830,6 +6877,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "method": {
             "type": "string",
             "title": "Method",
@@ -7154,6 +7206,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -7371,11 +7428,6 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
-            "default": false
-          },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {
@@ -7846,6 +7898,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -8056,11 +8113,6 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
-            "default": false
-          },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {
@@ -8647,6 +8699,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "file_url": {
             "type": "string",
             "title": "File Url"
@@ -9001,6 +9058,11 @@
               }
             ],
             "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           },
           "smtp_host": {
             "$ref": "#/components/schemas/AWSSecretParameter"
@@ -9437,6 +9499,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -9654,11 +9721,6 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
-            "default": false
-          },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {
@@ -10466,6 +10528,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "prompt": {
             "type": "string",
             "title": "Prompt"
@@ -10597,6 +10664,11 @@
             "type": "integer",
             "title": "Max Steps",
             "default": 25
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           }
         },
         "type": "object",
@@ -10637,6 +10709,11 @@
               }
             ],
             "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           },
           "llm_key": {
             "type": "string",
@@ -11077,6 +11154,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "path": {
             "anyOf": [
               {
@@ -11174,6 +11256,11 @@
               }
             ],
             "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           },
           "task_type": {
             "type": "string",
@@ -11385,11 +11472,6 @@
           "cache_actions": {
             "type": "boolean",
             "title": "Cache Actions",
-            "default": false
-          },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
             "default": false
           },
           "complete_verification": {
@@ -11520,6 +11602,11 @@
             ],
             "title": "Model"
           },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
           "task_type": {
             "type": "string",
             "title": "Task Type",
@@ -11739,11 +11826,6 @@
             "title": "Cache Actions",
             "default": false
           },
-          "disable_cache": {
-            "type": "boolean",
-            "title": "Disable Cache",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -11851,6 +11933,11 @@
               }
             ],
             "title": "Parameter Keys"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           }
         },
         "type": "object",
@@ -11923,6 +12010,11 @@
               }
             ],
             "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
           },
           "wait_sec": {
             "type": "integer",
@@ -13700,6 +13792,34 @@
             "const": "workflow_run",
             "title": "Run Type",
             "description": "Type of run - always workflow_run for workflow runs"
+          },
+          "run_with": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run With",
+            "description": "Whether the workflow run was executed with agent or code",
+            "examples": [
+              "agent",
+              "code"
+            ]
+          },
+          "ai_fallback": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Fallback",
+            "description": "Whether to fallback to AI if code run fails."
           },
           "run_request": {
             "anyOf": [
