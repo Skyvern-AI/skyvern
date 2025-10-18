@@ -1656,6 +1656,12 @@ class ForgeAgent:
             LOG.error("Gemini client is not configured. Skipping Gemini CUA action generation.", task_id=task.task_id)
             return [], previous_state
 
+        LOG.info(
+            "Gemini CUA call starts",
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+
         conversation = self._initialize_gemini_conversation(previous_state, task, scraped_page)
 
         response = await self._call_gemini_generate_content(conversation)
