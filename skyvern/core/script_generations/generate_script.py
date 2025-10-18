@@ -84,6 +84,9 @@ ACTION_MAP = {
     "upload_file": "upload_file",
     "select_option": "select_option",
     "goto": "goto",
+    "navigate": "goto_url",
+    "go_back": "go_back",
+    "go_forward": "go_forward",
     "scroll": "scroll",
     "keypress": "keypress",
     "type": "type",
@@ -93,6 +96,7 @@ ACTION_MAP = {
     "verification_code": "verification_code",
     "wait": "wait",
     "extract": "extract",
+    "left_mouse": "left_mouse",
     "complete": "complete",
 }
 ACTIONS_WITH_XPATH = [
@@ -375,6 +379,156 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
             cst.Arg(
                 keyword=cst.Name("ai"),
                 value=_value(GENERATE_CODE_AI_MODE),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    elif method == "goto_url":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("url"),
+                value=_value(act["url"]),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    elif method == "scroll":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("scroll_x"),
+                value=_value(act.get("scroll_x", 0)),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("scroll_y"),
+                value=_value(act.get("scroll_y", 0)),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    elif method == "keypress":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("keys"),
+                value=_value(act.get("keys", [])),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        if act.get("hold") is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("hold"),
+                    value=_value(act["hold"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+        if act.get("duration") is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("duration"),
+                    value=_value(act["duration"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+    elif method == "move":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("x"),
+                value=_value(act["x"]),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("y"),
+                value=_value(act["y"]),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    elif method == "drag":
+        if act.get("start_x") is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("start_x"),
+                    value=_value(act["start_x"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+        if act.get("start_y") is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("start_y"),
+                    value=_value(act["start_y"]),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("path"),
+                value=_value(act.get("path", [])),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    elif method == "left_mouse":
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("x"),
+                value=_value(act.get("x")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("y"),
+                value=_value(act.get("y")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("direction"),
+                value=_value(act.get("direction")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),

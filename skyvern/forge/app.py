@@ -2,6 +2,7 @@ from typing import Awaitable, Callable
 
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
+from google import genai
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from skyvern.forge.agent import ForgeAgent
@@ -51,6 +52,10 @@ if SettingsManager.get_settings().ENABLE_AZURE_CUA:
 ANTHROPIC_CLIENT = AsyncAnthropic(api_key=SettingsManager.get_settings().ANTHROPIC_API_KEY)
 if SettingsManager.get_settings().ENABLE_BEDROCK_ANTHROPIC:
     ANTHROPIC_CLIENT = AsyncAnthropicBedrock()
+
+GEMINI_CLIENT: genai.Client | None = None
+if SettingsManager.get_settings().ENABLE_GEMINI and SettingsManager.get_settings().GEMINI_API_KEY:
+    GEMINI_CLIENT = genai.Client(api_key=SettingsManager.get_settings().GEMINI_API_KEY)
 
 # Add UI-TARS client setup
 UI_TARS_CLIENT = None

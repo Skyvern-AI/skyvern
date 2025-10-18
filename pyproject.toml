@@ -46,7 +46,7 @@ dependencies = [
     "aioredlock>=0.7.3,<0.8",
     "stripe>=9.7.0,<10",
     "tldextract>=5.1.2,<6",
-    "websockets~=12.0",
+    "websockets>=13,<15.1.0",
     "email-validator>=2.2.0,<3",
     "temporalio>=1.6.0,<2",
     "requests-toolbelt>=1.0.0,<2",
@@ -75,6 +75,7 @@ dependencies = [
     "azure-identity>=1.24.0,<2",
     "azure-keyvault>=4.2.0,<5",
     "dramatiq[asyncio]>=1.18.0,<2",
+    "google-genai==1.43.0",
 ]
 
 [dependency-groups]

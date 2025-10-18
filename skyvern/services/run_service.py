@@ -20,12 +20,13 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
     if not run:
         return None
 
-    if (
-        run.task_run_type == RunType.task_v1
-        or run.task_run_type == RunType.openai_cua
-        or run.task_run_type == RunType.anthropic_cua
-        or run.task_run_type == RunType.ui_tars
-    ):
+    if run.task_run_type in [
+        RunType.task_v1,
+        RunType.openai_cua,
+        RunType.anthropic_cua,
+        RunType.gemini_cua,
+        RunType.ui_tars,
+    ]:
         # fetch task v1 from db and transform to task run response
         try:
             task_v1_response = await task_v1_service.get_task_v1_response(
@@ -38,6 +39,8 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             run_engine = RunEngine.openai_cua
         elif run.task_run_type == RunType.anthropic_cua:
             run_engine = RunEngine.anthropic_cua
+        elif run.task_run_type == RunType.gemini_cua:
+            run_engine = RunEngine.gemini_cua
         elif run.task_run_type == RunType.ui_tars:
             run_engine = RunEngine.ui_tars
 
@@ -134,7 +137,13 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
             detail=f"Run not found {run_id}",
         )
 
-    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
+    if run.task_run_type in [
+        RunType.task_v1,
+        RunType.openai_cua,
+        RunType.anthropic_cua,
+        RunType.gemini_cua,
+        RunType.ui_tars,
+    ]:
         await cancel_task_v1(run_id, organization_id=organization_id, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:
         await cancel_task_v2(run_id, organization_id=organization_id)
@@ -157,7 +166,13 @@ async def retry_run_webhook(run_id: str, organization_id: str | None = None, api
             detail=f"Run not found {run_id}",
         )
 
-    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
+    if run.task_run_type in [
+        RunType.task_v1,
+        RunType.openai_cua,
+        RunType.anthropic_cua,
+        RunType.gemini_cua,
+        RunType.ui_tars,
+    ]:
         task = await app.DATABASE.get_task(run_id, organization_id=organization_id)
         if not task:
             raise TaskNotFound(task_id=run_id)

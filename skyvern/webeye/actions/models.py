@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypeAlias
 
 from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import BaseModel, ConfigDict
 
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
+from skyvern.forge.computer_use.state import GeminiComputerUseState
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.actions.responses import ActionResult
 from skyvern.webeye.scraper.scraper import ScrapedPage
+
+ComputerUseState: TypeAlias = OpenAIResponse | GeminiComputerUseState
 
 
 class DetailedAgentStepOutput(BaseModel):
@@ -25,7 +28,7 @@ class DetailedAgentStepOutput(BaseModel):
     action_results: list[ActionResult] | None
     actions_and_results: list[tuple[Action, list[ActionResult]]] | None
     step_exception: str | None = None
-    cua_response: OpenAIResponse | None = None
+    cua_response: ComputerUseState | None = None
 
     model_config = ConfigDict(exclude=["scraped_page", "extract_action_prompt"])
 

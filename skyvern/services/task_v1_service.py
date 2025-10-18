@@ -92,6 +92,8 @@ async def run_task(
         run_type = RunType.openai_cua
     elif engine == RunEngine.anthropic_cua:
         run_type = RunType.anthropic_cua
+    elif engine == RunEngine.gemini_cua:
+        run_type = RunType.gemini_cua
     elif engine == RunEngine.ui_tars:
         run_type = RunType.ui_tars
     await app.DATABASE.create_task_run(
