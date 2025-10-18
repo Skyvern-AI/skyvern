@@ -87,7 +87,10 @@ function ActionCard({ action, onClick, active, index }: Props) {
           <>
             <Separator />
             <div className="text-xs text-slate-400">
-              Input: {action.response}
+              Input:{" "}
+              {action.action_type === "input_text"
+                ? action.text ?? action.response
+                : action.response}
             </div>
           </>
         )}

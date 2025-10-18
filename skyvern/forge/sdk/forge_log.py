@@ -100,6 +100,9 @@ class CustomConsoleRenderer(structlog.dev.ConsoleRenderer):
     colorize it.
     """
 
+    def __init__(self) -> None:
+        super().__init__(sort_keys=False)
+
     def __call__(self, logger: logging.Logger, name: str, event_dict: EventDict) -> str:
         file_section = event_dict.pop("file", "")
         file_section_colored = f"\x1b[90m{file_section}\x1b[0m" if file_section else ""

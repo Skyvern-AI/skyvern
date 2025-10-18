@@ -26,7 +26,7 @@ class ActionType(StrEnum):
     MOVE = "move"
     DRAG = "drag"
     LEFT_MOUSE = "left_mouse"
-    GOTO_URL = "navigate"
+    GOTO_URL = "goto_url"
     GO_BACK = "go_back"
     GO_FORWARD = "go_forward"
 
@@ -39,3 +39,15 @@ class ActionType(StrEnum):
             ActionType.SELECT_OPTION,
             ActionType.CHECKBOX,
         ]
+
+
+POST_ACTION_EXECUTION_ACTION_TYPES = [
+    ActionType.CLICK,
+    ActionType.INPUT_TEXT,
+    ActionType.UPLOAD_FILE,
+    ActionType.DOWNLOAD_FILE,
+    ActionType.SELECT_OPTION,
+    ActionType.WAIT,
+    ActionType.SOLVE_CAPTCHA,
+    ActionType.EXTRACT,
+]

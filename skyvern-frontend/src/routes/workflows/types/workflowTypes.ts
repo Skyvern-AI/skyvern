@@ -306,6 +306,7 @@ export type TaskBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
 };
@@ -317,6 +318,8 @@ export type Taskv2Block = WorkflowBlockBase & {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_steps: number | null;
+  cache_actions?: boolean;
+  disable_cache: boolean;
 };
 
 export type ForLoopBlock = WorkflowBlockBase & {
@@ -390,6 +393,7 @@ export type ValidationBlock = WorkflowBlockBase & {
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameters: Array<WorkflowParameter>;
+  disable_cache?: boolean;
 };
 
 export type ActionBlock = WorkflowBlockBase & {
@@ -406,6 +410,7 @@ export type ActionBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   engine: RunEngine | null;
 };
 
@@ -423,6 +428,7 @@ export type NavigationBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -439,6 +445,7 @@ export type ExtractionBlock = WorkflowBlockBase & {
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
   cache_actions: boolean;
+  disable_cache?: boolean;
   engine: RunEngine | null;
 };
 
@@ -454,6 +461,7 @@ export type LoginBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -477,6 +485,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache?: boolean;
   engine: RunEngine | null;
   download_timeout: number | null; // seconds
 };

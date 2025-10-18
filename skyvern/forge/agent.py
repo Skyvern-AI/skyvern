@@ -29,7 +29,6 @@ from skyvern.constants import (
     SPECIAL_FIELD_VERIFICATION_CODE,
     ScrapeType,
 )
-from skyvern.core.totp import poll_verification_code
 from skyvern.errors.errors import (
     GetTOTPVerificationCodeError,
     ReachMaxRetriesError,
@@ -85,8 +84,8 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.trace import TraceManager
-from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -94,6 +93,7 @@ from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse, load_prompt_with_elements
 from skyvern.webeye.actions.action_types import ActionType
@@ -104,6 +104,7 @@ from skyvern.webeye.actions.actions import (
     CompleteVerifyResult,
     DecisiveAction,
     ExtractAction,
+    GotoUrlAction,
     ReloadPageAction,
     TerminateAction,
     WebAction,
@@ -316,11 +317,6 @@ class ForgeAgent:
         close_browser_on_completion = (
             close_browser_on_completion and browser_session_id is None and not task.browser_address
         )
-
-        # Collect and add experiment metadata to the trace
-        experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
-        if experiment_metadata:
-            TraceManager.add_experiment_metadata(experiment_metadata)
 
         workflow_run: WorkflowRun | None = None
         if task.workflow_run_id:
@@ -1044,15 +1040,17 @@ class ForgeAgent:
                         screenshots=scraped_page.screenshots,
                     )
                     try:
-                        json_response = await self.handle_potential_verification_code(
-                            task,
-                            step,
-                            scraped_page,
-                            browser_state,
-                            json_response,
+                        otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
+                            task, step, scraped_page, browser_state, json_response
                         )
-                        detailed_agent_step_output.llm_response = json_response
-                        actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+                        if otp_actions:
+                            detailed_agent_step_output.llm_response = otp_json_response
+                            actions = otp_actions
+                        else:
+                            actions = parse_actions(
+                                task, step.step_id, step.order, scraped_page, json_response["actions"]
+                            )
+
                         if context:
                             context.pop_totp_code(task.task_id)
                     except NoTOTPVerificationCodeFound:
@@ -1239,7 +1237,7 @@ class ForgeAgent:
                     }
 
                 results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
-                await app.AGENT_FUNCTION.post_action_execution()
+                await app.AGENT_FUNCTION.post_action_execution(action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
                     results,
@@ -1414,7 +1412,6 @@ class ForgeAgent:
                         complete_results = await ActionHandler.handle_action(
                             scraped_page, task, step, working_page, complete_action
                         )
-                        await app.AGENT_FUNCTION.post_action_execution()
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
 
@@ -1434,7 +1431,7 @@ class ForgeAgent:
                 extract_results = await ActionHandler.handle_action(
                     scraped_page, task, step, working_page, extract_action
                 )
-                await app.AGENT_FUNCTION.post_action_execution()
+                await app.AGENT_FUNCTION.post_action_execution(extract_action)
                 detailed_agent_step_output.actions_and_results.append((extract_action, extract_results))
 
             # If no action errors return the agent state and output
@@ -3479,6 +3476,83 @@ class ForgeAgent:
                 )
             return None, None, next_step
 
+    async def handle_potential_OTP_actions(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        browser_state: BrowserState,
+        json_response: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[Action]]:
+        if not task.organization_id:
+            return json_response, []
+
+        if not task.totp_verification_url and not task.totp_identifier:
+            return json_response, []
+
+        should_verify_by_magic_link = json_response.get("should_verify_by_magic_link")
+        place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
+        should_enter_verification_code = json_response.get("should_enter_verification_code")
+
+        if (
+            not should_verify_by_magic_link
+            and not place_to_enter_verification_code
+            and not should_enter_verification_code
+        ):
+            return json_response, []
+
+        if place_to_enter_verification_code and should_enter_verification_code:
+            json_response = await self.handle_potential_verification_code(
+                task, step, scraped_page, browser_state, json_response
+            )
+            actions = parse_actions(task, step.step_id, step.order, scraped_page, json_response["actions"])
+            return json_response, actions
+
+        if should_verify_by_magic_link:
+            actions = await self.handle_potential_magic_link(task, step, scraped_page, browser_state, json_response)
+            return json_response, actions
+
+        return json_response, []
+
+    async def handle_potential_magic_link(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        browser_state: BrowserState,
+        json_response: dict[str, Any],
+    ) -> list[Action]:
+        should_verify_by_magic_link = json_response.get("should_verify_by_magic_link")
+        if not should_verify_by_magic_link:
+            return []
+
+        LOG.info("Handling magic link verification", task_id=task.task_id)
+        otp_value = await poll_otp_value(
+            organization_id=task.organization_id,
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            totp_verification_url=task.totp_verification_url,
+            totp_identifier=task.totp_identifier,
+        )
+        if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
+            return []
+
+        # TODO: not sure whether all magic links can directly login + navigate to the homepage
+        return [
+            GotoUrlAction(
+                action_type=ActionType.GOTO_URL,
+                reasoning="Navigating to the magic link URL to verify the login",
+                intention="Navigating to the magic link URL to verify the login",
+                url=otp_value.value,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                action_order=0,
+            ),
+        ]
+
     async def handle_potential_verification_code(
         self,
         task: Task,
@@ -3502,7 +3576,7 @@ class ForgeAgent:
                 if workflow_run:
                     workflow_id = workflow_run.workflow_id
                     workflow_permanent_id = workflow_run.workflow_permanent_id
-            verification_code = await poll_verification_code(
+            otp_value = await poll_otp_value(
                 organization_id=task.organization_id,
                 task_id=task.task_id,
                 workflow_id=workflow_id,
@@ -3511,8 +3585,11 @@ class ForgeAgent:
                 totp_verification_url=task.totp_verification_url,
                 totp_identifier=task.totp_identifier,
             )
+            if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
+                return json_response
+
             current_context = skyvern_context.ensure_context()
-            current_context.totp_codes[task.task_id] = verification_code
+            current_context.totp_codes[task.task_id] = otp_value.value
 
             extract_action_prompt, use_caching = await self._build_extract_action_prompt(
                 task,

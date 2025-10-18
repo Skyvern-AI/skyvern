@@ -21,6 +21,8 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
 from skyvern.services import workflow_script_service
+from skyvern.webeye.actions.action_types import POST_ACTION_EXECUTION_ACTION_TYPES
+from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.scraper.scraper import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.dom import SkyvernElement
@@ -617,10 +619,12 @@ class AgentFunction:
         if not settings.ENABLE_CODE_BLOCK:
             raise DisabledBlockExecutionError("CodeBlock is disabled")
 
-    async def _post_action_execution(self) -> None:
+    async def _post_action_execution(self, action: Action) -> None:
         """
         If this is a workflow running environment, generate the
         """
+        if action.action_type not in POST_ACTION_EXECUTION_ACTION_TYPES:
+            return
         context = skyvern_context.current()
         if (
             not context
@@ -652,5 +656,5 @@ class AgentFunction:
             workflow=workflow,
         )
 
-    async def post_action_execution(self) -> None:
-        asyncio.create_task(self._post_action_execution())
+    async def post_action_execution(self, action: Action) -> None:
+        asyncio.create_task(self._post_action_execution(action))

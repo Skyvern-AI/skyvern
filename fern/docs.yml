@@ -151,6 +151,8 @@ navigation:
             path: integrations/n8n.mdx
           - page: Workato
             path: integrations/workato.mdx
+          - page: Ollama + LiteLLM
+            path: integrations/ollama-litellm.mdx
   - tab: api
     layout:
       - api: API Reference

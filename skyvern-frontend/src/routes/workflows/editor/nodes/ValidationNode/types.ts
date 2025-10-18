@@ -6,6 +6,8 @@ export type ValidationNodeData = NodeBaseData & {
   terminateCriterion: string;
   errorCodeMapping: string;
   parameterKeys: Array<string>;
+  cacheActions?: boolean;
+  disableCache: boolean;
 };
 
 export type ValidationNode = Node<ValidationNodeData, "validation">;
@@ -19,6 +21,8 @@ export const validationNodeDefaultData: ValidationNodeData = {
   continueOnFailure: false,
   editable: true,
   parameterKeys: [],
+  cacheActions: false,
+  disableCache: false,
   model: null,
 };
 

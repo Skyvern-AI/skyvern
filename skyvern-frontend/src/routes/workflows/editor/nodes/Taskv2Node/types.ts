@@ -11,6 +11,8 @@ export type Taskv2NodeData = NodeBaseData & {
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
   maxSteps: number | null;
+  cacheActions: boolean;
+  disableCache: boolean;
   maxScreenshotScrolls: number | null;
 };
 
@@ -26,6 +28,8 @@ export const taskv2NodeDefaultData: Taskv2NodeData = {
   totpIdentifier: null,
   totpVerificationUrl: null,
   maxSteps: MAX_STEPS_DEFAULT,
+  cacheActions: false,
+  disableCache: false,
   model: null,
   maxScreenshotScrolls: null,
 };

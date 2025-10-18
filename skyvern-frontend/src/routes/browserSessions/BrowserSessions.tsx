@@ -37,26 +37,7 @@ import { useCreateBrowserSessionMutation } from "@/routes/browserSessions/hooks/
 import { type BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { basicTimeFormat } from "@/util/timeFormat";
-import { cn, formatMs } from "@/util/utils";
-
-function toDate(
-  time: string,
-  defaultDate: Date | null = new Date(0),
-): Date | null {
-  time = time.replace(/\.(\d{3})\d*/, ".$1");
-
-  if (!time.endsWith("Z")) {
-    time += "Z";
-  }
-
-  const date = new Date(time);
-
-  if (isNaN(date.getTime())) {
-    return defaultDate;
-  }
-
-  return date;
-}
+import { cn, formatMs, toDate } from "@/util/utils";
 
 function sessionIsOpen(browserSession: BrowserSession): boolean {
   return (

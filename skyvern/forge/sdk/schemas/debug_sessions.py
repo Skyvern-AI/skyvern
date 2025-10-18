@@ -26,3 +26,33 @@ class DebugSession(BaseModel):
     modified_at: datetime
     deleted_at: datetime | None = None
     status: DebugSessionStatus
+
+
+class DebugSessionRun(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    ai_fallback: bool | None = None
+    block_label: str
+    browser_session_id: str
+    code_gen: bool | None = None
+    debug_session_id: str
+    failure_reason: str | None = None
+    output_parameter_id: str
+    run_with: str | None = None
+    script_run_id: str | None = None
+    status: str
+    workflow_id: str
+    workflow_permanent_id: str
+    workflow_run_id: str
+    # --
+    created_at: datetime
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class DebugSessionRuns(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    debug_session: DebugSession
+    runs: list[DebugSessionRun]

@@ -17,14 +17,7 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import { AppNode } from "..";
 import { helpTooltips, placeholders } from "../../helpContent";
@@ -41,10 +34,12 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
+import { DisableCache } from "../DisableCache";
+
 function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
@@ -57,40 +52,12 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
-  const [inputs, setInputs] = useState({
-    url: data.url,
-    navigationGoal: data.navigationGoal,
-    dataExtractionGoal: data.dataExtractionGoal,
-    completeCriterion: data.completeCriterion,
-    terminateCriterion: data.terminateCriterion,
-    dataSchema: data.dataSchema,
-    maxStepsOverride: data.maxStepsOverride,
-    allowDownloads: data.allowDownloads,
-    continueOnFailure: data.continueOnFailure,
-    cacheActions: data.cacheActions,
-    downloadSuffix: data.downloadSuffix,
-    errorCodeMapping: data.errorCodeMapping,
-    totpVerificationUrl: data.totpVerificationUrl,
-    totpIdentifier: data.totpIdentifier,
-    includeActionHistoryInVerification: data.includeActionHistoryInVerification,
-    engine: data.engine,
-    model: data.model,
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const update = useUpdate<TaskNode["data"]>({ id, editable });
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -126,8 +93,8 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
             blockLabel={label}
             editable={editable}
             nodeId={id}
-            totpIdentifier={inputs.totpIdentifier}
-            totpUrl={inputs.totpVerificationUrl}
+            totpIdentifier={data.totpIdentifier}
+            totpUrl={data.totpVerificationUrl}
             type={type}
           />
           <Accordion
@@ -155,9 +122,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       canWriteTitle={true}
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("url", value);
+                        update({ url: value });
                       }}
-                      value={inputs.url}
+                      value={data.url}
                       placeholder={placeholders["task"]["url"]}
                       className="nopan text-xs"
                     />
@@ -172,9 +139,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("navigationGoal", value);
+                        update({ navigationGoal: value });
                       }}
-                      value={inputs.navigationGoal}
+                      value={data.navigationGoal}
                       placeholder={placeholders["task"]["navigationGoal"]}
                       className="nopan text-xs"
                     />
@@ -184,7 +151,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       availableOutputParameters={outputParameterKeys}
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
-                        updateNodeData(id, { parameterKeys });
+                        update({ parameterKeys });
                       }}
                     />
                   </div>
@@ -207,9 +174,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("dataExtractionGoal", value);
+                        update({ dataExtractionGoal: value });
                       }}
-                      value={inputs.dataExtractionGoal}
+                      value={data.dataExtractionGoal}
                       placeholder={placeholders["task"]["dataExtractionGoal"]}
                       className="nopan text-xs"
                     />
@@ -217,13 +184,13 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                   <WorkflowDataSchemaInputGroup
                     exampleValue={dataSchemaExampleValue}
                     onChange={(value) => {
-                      handleChange("dataSchema", value);
+                      update({ dataSchema: value });
                     }}
-                    value={inputs.dataSchema}
+                    value={data.dataSchema}
                     suggestionContext={{
-                      data_extraction_goal: inputs.dataExtractionGoal,
-                      current_schema: inputs.dataSchema,
-                      navigation_goal: inputs.navigationGoal,
+                      data_extraction_goal: data.dataExtractionGoal,
+                      current_schema: data.dataSchema,
+                      navigation_goal: data.navigationGoal,
                     }}
                   />
                 </div>
@@ -240,18 +207,18 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("completeCriterion", value);
+                        update({ completeCriterion: value });
                       }}
-                      value={inputs.completeCriterion}
+                      value={data.completeCriterion}
                       className="nopan text-xs"
                     />
                   </div>
                   <Separator />
                   <ModelSelector
                     className="nopan w-52 text-xs"
-                    value={inputs.model}
+                    value={data.model}
                     onChange={(value) => {
-                      handleChange("model", value);
+                      update({ model: value });
                     }}
                   />
                   <div className="flex items-center justify-between">
@@ -261,9 +228,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       </Label>
                     </div>
                     <RunEngineSelector
-                      value={inputs.engine}
+                      value={data.engine}
                       onChange={(value) => {
-                        handleChange("engine", value);
+                        update({ engine: value });
                       }}
                       className="nopan w-52 text-xs"
                     />
@@ -282,13 +249,13 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       placeholder={placeholders["task"]["maxStepsOverride"]}
                       className="nopan w-52 text-xs"
                       min="0"
-                      value={inputs.maxStepsOverride ?? ""}
+                      value={data.maxStepsOverride ?? ""}
                       onChange={(event) => {
                         const value =
                           event.target.value === ""
                             ? null
                             : Number(event.target.value);
-                        handleChange("maxStepsOverride", value);
+                        update({ maxStepsOverride: value });
                       }}
                     />
                   </div>
@@ -303,29 +270,28 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                         />
                       </div>
                       <Checkbox
-                        checked={inputs.errorCodeMapping !== "null"}
+                        checked={data.errorCodeMapping !== "null"}
                         disabled={!editable}
                         onCheckedChange={(checked) => {
-                          handleChange(
-                            "errorCodeMapping",
-                            checked
+                          update({
+                            errorCodeMapping: checked
                               ? JSON.stringify(
                                   errorMappingExampleValue,
                                   null,
                                   2,
                                 )
                               : "null",
-                          );
+                          });
                         }}
                       />
                     </div>
-                    {inputs.errorCodeMapping !== "null" && (
+                    {data.errorCodeMapping !== "null" && (
                       <div>
                         <CodeEditor
                           language="json"
-                          value={inputs.errorCodeMapping}
+                          value={data.errorCodeMapping}
                           onChange={(value) => {
-                            handleChange("errorCodeMapping", value);
+                            update({ errorCodeMapping: value });
                           }}
                           className="nopan"
                           fontSize={8}
@@ -349,12 +315,11 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.includeActionHistoryInVerification}
+                        checked={data.includeActionHistoryInVerification}
                         onCheckedChange={(checked) => {
-                          handleChange(
-                            "includeActionHistoryInVerification",
-                            checked,
-                          );
+                          update({
+                            includeActionHistoryInVerification: checked,
+                          });
                         }}
                       />
                     </div>
@@ -370,31 +335,24 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.continueOnFailure}
+                        checked={data.continueOnFailure}
                         onCheckedChange={(checked) => {
-                          handleChange("continueOnFailure", checked);
+                          update({ continueOnFailure: checked });
                         }}
                       />
                     </div>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Cache Actions
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["task"]["cacheActions"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={inputs.cacheActions}
-                        onCheckedChange={(checked) => {
-                          handleChange("cacheActions", checked);
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <DisableCache
+                    cacheActions={data.cacheActions}
+                    disableCache={data.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      update({ cacheActions });
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      update({ disableCache });
+                    }}
+                  />
                   <Separator />
                   <div className="flex items-center justify-between">
                     <div className="flex gap-2">
@@ -407,9 +365,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.allowDownloads}
+                        checked={data.allowDownloads}
                         onCheckedChange={(checked) => {
-                          handleChange("allowDownloads", checked);
+                          update({ allowDownloads: checked });
                         }}
                       />
                     </div>
@@ -428,9 +386,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       type="text"
                       placeholder={placeholders["task"]["downloadSuffix"]}
                       className="nopan w-52 text-xs"
-                      value={inputs.downloadSuffix ?? ""}
+                      value={data.downloadSuffix ?? ""}
                       onChange={(value) => {
-                        handleChange("downloadSuffix", value);
+                        update({ downloadSuffix: value });
                       }}
                     />
                   </div>
@@ -447,9 +405,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpIdentifier", value);
+                        update({ totpIdentifier: value });
                       }}
-                      value={inputs.totpIdentifier ?? ""}
+                      value={data.totpIdentifier ?? ""}
                       placeholder={placeholders["task"]["totpIdentifier"]}
                       className="nopan text-xs"
                     />
@@ -466,9 +424,9 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpVerificationUrl", value);
+                        update({ totpVerificationUrl: value });
                       }}
-                      value={inputs.totpVerificationUrl ?? ""}
+                      value={data.totpVerificationUrl ?? ""}
                       placeholder={placeholders["task"]["totpVerificationUrl"]}
                       className="nopan text-xs"
                     />

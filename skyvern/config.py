@@ -2,10 +2,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import SKYVERN_DIR
+from skyvern.utils.env_paths import resolve_backend_env_path
+
+# NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
+# the process has changed dir to the desired project root by this time.
+# Even if we were to resolve paths at instantiation time, the global `settings`
+# singleton instantiation at the bottom of this file also runs at import time
+# and relies on the same assumption.
+_DEFAULT_ENV_FILES = (
+    resolve_backend_env_path(".env"),
+    resolve_backend_env_path(".env.staging"),
+    resolve_backend_env_path(".env.prod"),
+)
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=(".env", ".env.staging", ".env.prod"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore")
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
@@ -118,6 +130,8 @@ class Settings(BaseSettings):
     LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
+    NORMAL_SELECT_AGENT_LLM_KEY: str | None = None
+    CUSTOM_SELECT_AGENT_LLM_KEY: str | None = None
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
     SINGLE_INPUT_AGENT_LLM_KEY: str | None = None
     PROMPT_BLOCK_LLM_KEY: str | None = None
@@ -125,6 +139,7 @@ class Settings(BaseSettings):
     EXTRACTION_LLM_KEY: str | None = None
     CHECK_USER_GOAL_LLM_KEY: str | None = None
     AUTO_COMPLETION_LLM_KEY: str | None = None
+    SCRIPT_GENERATION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096

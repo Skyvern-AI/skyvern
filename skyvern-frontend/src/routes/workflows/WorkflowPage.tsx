@@ -24,7 +24,12 @@ import {
 } from "@/components/ui/table";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import { Pencil2Icon, PlayIcon } from "@radix-ui/react-icons";
+import {
+  MagnifyingGlassIcon,
+  MixerHorizontalIcon,
+  Pencil2Icon,
+  PlayIcon,
+} from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import {
   Link,
@@ -35,6 +40,15 @@ import {
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunsQuery } from "./hooks/useWorkflowRunsQuery";
 import { WorkflowActions } from "./WorkflowActions";
+import { Input } from "@/components/ui/input";
+import { useDebounce } from "use-debounce";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -44,11 +58,15 @@ function WorkflowPage() {
   const navigate = useNavigate();
 
   const PAGE_SIZE = 10;
+  const [search, setSearch] = useState("");
+  const [debouncedSearch] = useDebounce(search, 500);
+  const [openRunParams, setOpenRunParams] = useState<string | null>(null);
 
   const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
     workflowPermanentId,
     statusFilters,
     page,
+    search: debouncedSearch,
     refetchOnMount: "always",
   });
 
@@ -106,13 +124,31 @@ function WorkflowPage() {
         </div>
       </header>
       <div className="space-y-4">
-        <header className="flex justify-between">
+        <header>
           <h1 className="text-2xl">Past Runs</h1>
+        </header>
+        <div className="flex items-center justify-between gap-4">
+          <div className="relative">
+            <div className="absolute left-0 top-0 flex h-9 w-9 items-center justify-center">
+              <MagnifyingGlassIcon className="size-5" />
+            </div>
+            <Input
+              value={search}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                const params = new URLSearchParams(searchParams);
+                params.set("page", "1");
+                setSearchParams(params, { replace: true });
+              }}
+              placeholder="Search runs by parameter..."
+              className="w-48 pl-9 lg:w-72"
+            />
+          </div>
           <StatusFilterDropdown
             values={statusFilters}
             onChange={setStatusFilters}
           />
-        </header>
+        </div>
         <div className="rounded-md border">
           <Table>
             <TableHeader>
@@ -120,6 +156,7 @@ function WorkflowPage() {
                 <TableHead className="w-1/3">ID</TableHead>
                 <TableHead className="w-1/3">Status</TableHead>
                 <TableHead className="w-1/3">Created At</TableHead>
+                <TableHead className="w-0"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -173,12 +210,43 @@ function WorkflowPage() {
                       >
                         {basicLocalTimeFormat(workflowRun.created_at)}
                       </TableCell>
+                      <TableCell>
+                        <div className="flex justify-end">
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  size="icon"
+                                  variant="outline"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setOpenRunParams(
+                                      workflowRun.workflow_run_id ?? null,
+                                    );
+                                  }}
+                                >
+                                  <MixerHorizontalIcon className="h-4 w-4" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>View Parameters</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </div>
+                      </TableCell>
                     </TableRow>
                   );
                 })
               )}
             </TableBody>
           </Table>
+          <RunParametersDialog
+            open={openRunParams !== null}
+            onOpenChange={(open) => {
+              if (!open) setOpenRunParams(null);
+            }}
+            workflowPermanentId={workflowPermanentId}
+            workflowRunId={openRunParams}
+          />
           <Pagination className="pt-2">
             <PaginationContent>
               <PaginationItem>

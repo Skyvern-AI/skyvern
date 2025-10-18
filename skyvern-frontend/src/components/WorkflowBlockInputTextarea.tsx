@@ -5,6 +5,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useEffect, useRef, useState } from "react";
+import { useDebouncedCallback } from "use-debounce";
 
 type Props = Omit<
   React.ComponentProps<typeof AutoResizingTextarea>,
@@ -29,14 +30,14 @@ function WorkflowBlockInputTextarea(props: Props) {
     setInternalValue(props.value ?? "");
   }, [props.value]);
 
-  const doOnChange = (value: string) => {
+  const doOnChange = useDebouncedCallback((value: string) => {
     onChange(value);
 
     if (canWriteTitle) {
       maybeWriteTitle(value);
       maybeAcceptTitle();
     }
-  };
+  }, 300);
 
   const handleTextareaSelect = () => {
     if (textareaRef.current) {
@@ -76,12 +77,13 @@ function WorkflowBlockInputTextarea(props: Props) {
         {...textAreaProps}
         value={internalValue}
         ref={textareaRef}
-        onBlur={(event) => {
-          doOnChange(event.target.value);
+        onBlur={() => {
+          doOnChange.flush();
         }}
         onChange={(event) => {
           setInternalValue(event.target.value);
           handleTextareaSelect();
+          doOnChange(event.target.value);
         }}
         onClick={handleTextareaSelect}
         onKeyUp={handleTextareaSelect}

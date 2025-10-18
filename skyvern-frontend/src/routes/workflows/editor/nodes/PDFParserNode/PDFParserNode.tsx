@@ -1,8 +1,7 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import { useState } from "react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { dataSchemaExampleForFileExtraction } from "../types";
 import { type PDFParserNode } from "./types";
@@ -13,10 +12,10 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { ModelSelector } from "@/components/ModelSelector";
 
 function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
-  const { updateNodeData } = useReactFlow();
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -26,21 +25,8 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    fileUrl: data.fileUrl,
-    jsonSchema: data.jsonSchema,
-    model: data.model,
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!data.editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const update = useUpdate<PDFParserNode["data"]>({ id, editable });
 
   return (
     <div>
@@ -89,26 +75,26 @@ function PDFParserNode({ id, data }: NodeProps<PDFParserNode>) {
             </div>
             <WorkflowBlockInput
               nodeId={id}
-              value={inputs.fileUrl}
+              value={data.fileUrl}
               onChange={(value) => {
-                handleChange("fileUrl", value);
+                update({ fileUrl: value });
               }}
               className="nopan text-xs"
             />
           </div>
           <WorkflowDataSchemaInputGroup
             exampleValue={dataSchemaExampleForFileExtraction}
-            value={inputs.jsonSchema}
+            value={data.jsonSchema}
             onChange={(value) => {
-              handleChange("jsonSchema", value);
+              update({ jsonSchema: value });
             }}
             suggestionContext={{}}
           />
           <ModelSelector
             className="nopan w-52 text-xs"
-            value={inputs.model}
+            value={data.model}
             onChange={(value) => {
-              handleChange("model", value);
+              update({ model: value });
             }}
           />
         </div>

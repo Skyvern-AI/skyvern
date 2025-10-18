@@ -37,6 +37,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     HttpRequestBlock,
     LoginBlock,
+    NavigationBlock,
     PDFParserBlock,
     SendEmailBlock,
     TaskBlock,
@@ -47,7 +48,15 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.scripts import CreateScriptResponse, FileEncoding, FileNode, ScriptFileCreate, ScriptStatus
+from skyvern.schemas.scripts import (
+    CreateScriptResponse,
+    FileEncoding,
+    FileNode,
+    Script,
+    ScriptFile,
+    ScriptFileCreate,
+    ScriptStatus,
+)
 from skyvern.schemas.workflows import BlockStatus, BlockType, FileStorageType, FileType
 
 LOG = structlog.get_logger()
@@ -258,35 +267,18 @@ async def create_script(
         raise HTTPException(status_code=500, detail="Failed to create script")
 
 
-async def execute_script(
-    script_id: str,
-    organization_id: str,
-    parameters: dict[str, Any] | None = None,
-    workflow_run_id: str | None = None,
-    browser_session_id: str | None = None,
-    background_tasks: BackgroundTasks | None = None,
+async def load_scripts(
+    script: Script,
+    script_files: list[ScriptFile],
 ) -> None:
-    # step 1: get the script revision
-    script = await app.DATABASE.get_script(
-        script_id=script_id,
-        organization_id=organization_id,
-    )
-    if not script:
-        raise ScriptNotFound(script_id=script_id)
-
-    # step 2: get the script files
-    script_files = await app.DATABASE.get_script_files(
-        script_revision_id=script.script_revision_id, organization_id=organization_id
-    )
-
-    # step 3: copy the script files to the local directory
+    organization_id = script.organization_id
     for file in script_files:
         # retrieve the artifact
         if not file.artifact_id:
             continue
         artifact = await app.DATABASE.get_artifact_by_id(file.artifact_id, organization_id)
         if not artifact:
-            LOG.error("Artifact not found", artifact_id=file.artifact_id, script_id=script_id)
+            LOG.error("Artifact not found", artifact_id=file.artifact_id, script_id=script.script_id)
             continue
         file_content = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
         if not file_content:
@@ -313,6 +305,31 @@ async def execute_script(
             with open(file_path, "wb") as f:
                 f.write(file_content)
 
+
+async def execute_script(
+    script_id: str,
+    organization_id: str,
+    parameters: dict[str, Any] | None = None,
+    workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
+    background_tasks: BackgroundTasks | None = None,
+) -> None:
+    # step 1: get the script revision
+    script = await app.DATABASE.get_script(
+        script_id=script_id,
+        organization_id=organization_id,
+    )
+    if not script:
+        raise ScriptNotFound(script_id=script_id)
+
+    # step 2: get the script files
+    script_files = await app.DATABASE.get_script_files(
+        script_revision_id=script.script_revision_id, organization_id=organization_id
+    )
+
+    # step 3: copy the script files to the local directory
+    await load_scripts(script, script_files)
+
     # step 4: execute the script
     if workflow_run_id and not parameters:
         parameter_tuples = await app.DATABASE.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
@@ -320,6 +337,7 @@ async def execute_script(
         LOG.info("Script run Parameters is using workflow run parameters", parameters=parameters)
 
     script_path = os.path.join(settings.TEMP_PATH, script.script_id, "main.py")
+
     if background_tasks:
         # Execute asynchronously in background
         background_tasks.add_task(
@@ -329,6 +347,7 @@ async def execute_script(
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
             browser_session_id=browser_session_id,
+            script_id=script_id,
         )
     else:
         # Execute synchronously
@@ -681,17 +700,7 @@ async def _fallback_to_ai_run(
             organization_id=organization_id,
             status=StepStatus.failed,
         )
-        # 2. create a new step for ai run
-        ai_step = await app.DATABASE.create_step(
-            task_id=task_id,
-            organization_id=organization_id,
-            order=previous_step.order + 1,
-            retry_index=0,
-        )
-        context.step_id = ai_step.step_id
-        ai_step_id = ai_step.step_id
-        # 3. build the task block
-        # 4. run execute_step
+        # 2. run execute_step
         organization = await app.DATABASE.get_organization(organization_id=organization_id)
         if not organization:
             raise Exception(f"Organization is missing organization_id={organization_id}")
@@ -717,7 +726,28 @@ async def _fallback_to_ai_run(
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_run_id=workflow_run_id,
             )
+            if workflow_run_block_id:
+                await _update_workflow_block(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=str(error),
+                    step_id=script_step_id,
+                    step_status=StepStatus.failed,
+                    label=cache_key,
+                )
             return
+
+        # 2. create a new step for ai run
+        ai_step = await app.DATABASE.create_step(
+            task_id=task_id,
+            organization_id=organization_id,
+            order=previous_step.order + 1,
+            retry_index=0,
+        )
+        context.step_id = ai_step.step_id
+        ai_step_id = ai_step.step_id
 
         # get the output_paramter
         output_parameter = workflow.get_output_parameter(cache_key)
@@ -777,11 +807,17 @@ async def _fallback_to_ai_run(
 
         # Update block status to completed if workflow block was created
         if workflow_run_block_id:
+            # refresh the task
+            failure_reason = None
+            refreshed_task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
+            if refreshed_task:
+                task = refreshed_task
+            if task.status in [TaskStatus.terminated, TaskStatus.failed]:
+                failure_reason = task.failure_reason
             await _update_workflow_block(
                 workflow_run_block_id,
-                BlockStatus.completed,
-                task_id=context.task_id,
-                step_id=context.step_id,
+                BlockStatus(task.status.value),
+                failure_reason=failure_reason,
                 label=cache_key,
             )
 
@@ -863,6 +899,8 @@ async def _regenerate_script_block_after_ai_fallback(
     2. create a completely new script, with only the current block's script being different as it's newly generated.
       -
     """
+    LOG.info("skipping script regeneration after AI fallback")
+    return None
     try:
         # Get the current script for this workflow and cache key value
         # Render the cache_key_value from workflow run parameters (same logic as generate_script_for_workflow)
@@ -1141,7 +1179,7 @@ async def run_task(
     if cache_key and cached_fn:
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
-            block_type=BlockType.TASK,
+            block_type=BlockType.NAVIGATION,
             prompt=prompt,
             url=url,
             label=cache_key,
@@ -1166,7 +1204,7 @@ async def run_task(
         except Exception as e:
             LOG.exception("Failed to run task block. Falling back to AI run.")
             await _fallback_to_ai_run(
-                block_type=BlockType.TASK,
+                block_type=BlockType.NAVIGATION,
                 cache_key=cache_key,
                 prompt=prompt,
                 url=url,
@@ -1181,7 +1219,7 @@ async def run_task(
             context.prompt = None
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
-        task_block = TaskBlock(
+        task_block = NavigationBlock(
             label=block_validation_output.label,
             output_parameter=block_validation_output.output_parameter,
             url=url,
@@ -1581,7 +1619,6 @@ async def run_script(
     user_script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(user_script)
 
-    # Call run_workflow from the imported module
     if hasattr(user_script, "run_workflow"):
         # If parameters is None, pass an empty dict
         if parameters:
@@ -1919,20 +1956,24 @@ async def goto(
     label: str | None = None,
     parameters: list[str] | None = None,
 ) -> None:
-    block_validation_output = await _validate_and_get_output_parameter(label, parameters)
-    url = _render_template_with_label(url, label)
-    goto_url_block = UrlBlock(
-        url=url,
-        label=block_validation_output.label,
-        output_parameter=block_validation_output.output_parameter,
-        parameters=block_validation_output.input_parameters,
-    )
-    await goto_url_block.execute_safe(
-        workflow_run_id=block_validation_output.workflow_run_id,
-        parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
-        organization_id=block_validation_output.organization_id,
-        browser_session_id=block_validation_output.browser_session_id,
-    )
+    try:
+        block_validation_output = await _validate_and_get_output_parameter(label, parameters)
+        url = _render_template_with_label(url, label)
+        goto_url_block = UrlBlock(
+            url=url,
+            label=block_validation_output.label,
+            output_parameter=block_validation_output.output_parameter,
+            parameters=block_validation_output.input_parameters,
+        )
+        await goto_url_block.execute_safe(
+            workflow_run_id=block_validation_output.workflow_run_id,
+            parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
+            organization_id=block_validation_output.organization_id,
+            browser_session_id=block_validation_output.browser_session_id,
+        )
+    except Exception:
+        run_context = script_run_context_manager.ensure_run_context()
+        await run_context.page.goto(url)
 
 
 async def prompt(

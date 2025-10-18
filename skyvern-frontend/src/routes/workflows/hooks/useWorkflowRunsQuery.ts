@@ -14,19 +14,27 @@ type Props = {
   workflowPermanentId?: string;
   statusFilters?: Array<Status>;
   page: number;
+  search?: string;
 } & UseQueryOptions;
 
 function useWorkflowRunsQuery({
   workflowPermanentId,
   statusFilters,
   page,
+  search,
   ...queryOptions
 }: Props) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
 
   return useQuery<Array<WorkflowRunApiResponse>>({
-    queryKey: ["workflowRuns", { statusFilters }, workflowPermanentId, page],
+    queryKey: [
+      "workflowRuns",
+      { statusFilters },
+      workflowPermanentId,
+      page,
+      search,
+    ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
@@ -41,6 +49,9 @@ function useWorkflowRunsQuery({
         statusFilters.forEach((status) => {
           params.append("status", status);
         });
+      }
+      if (search) {
+        params.append("search_key", search);
       }
 
       return client

@@ -223,6 +223,7 @@ class TaskBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
@@ -340,6 +341,7 @@ class ValidationBlockYAML(BlockYAML):
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
+    disable_cache: bool = False
 
 
 class ActionBlockYAML(BlockYAML):
@@ -359,6 +361,7 @@ class ActionBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
 
 
 class NavigationBlockYAML(BlockYAML):
@@ -379,6 +382,7 @@ class NavigationBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
@@ -397,6 +401,7 @@ class ExtractionBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
 
 
 class LoginBlockYAML(BlockYAML):
@@ -413,6 +418,7 @@ class LoginBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
@@ -440,6 +446,7 @@ class FileDownloadBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     download_timeout: float | None = None
 
 
@@ -456,6 +463,7 @@ class TaskV2BlockYAML(BlockYAML):
     totp_identifier: str | None = None
     max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+    disable_cache: bool = False
 
 
 class HttpRequestBlockYAML(BlockYAML):

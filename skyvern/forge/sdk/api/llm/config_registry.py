@@ -213,9 +213,6 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
-            litellm_params=LiteLLMParams(
-                drop_params=True,  # type: ignore
-            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -228,9 +225,6 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
-            litellm_params=LiteLLMParams(
-                drop_params=True,  # type: ignore
-            ),
         ),
     )
 

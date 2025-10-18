@@ -31,6 +31,7 @@ import {
 } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
+import { HelpTooltip } from "@/components/HelpTooltip";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -185,7 +186,7 @@ function WorkflowParameterEditPanel({
   return (
     <ScrollArea>
       <ScrollAreaViewport className="max-h-[500px]">
-        <div className="space-y-4 p-1">
+        <div className="space-y-4 p-1 px-4">
           <header className="flex items-center justify-between">
             <span>{header(type)}</span>
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
@@ -357,18 +358,31 @@ function WorkflowParameterEditPanel({
           {type === "credential" && credentialType === "onepassword" && (
             <>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Vault ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Vault ID</Label>
+                  <HelpTooltip content="You can find the Vault ID and Item ID in the URL when viewing the item in 1Password on the web." />
+                </div>
                 <Input
                   value={vaultId}
                   onChange={(e) => setVaultId(e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-slate-300">Item ID</Label>
+                <div className="flex gap-2">
+                  <Label className="text-xs text-slate-300">Item ID</Label>
+                  <HelpTooltip content="Supports all 1Password item types: Logins, Passwords, Credit Cards, Secure Notes, and more." />
+                </div>
                 <Input
                   value={opItemId}
                   onChange={(e) => setOpItemId(e.target.value)}
                 />
+              </div>
+              <div className="rounded-md bg-slate-800 p-2">
+                <div className="space-y-1 text-xs text-slate-400">
+                  Credit Cards: Due to a 1Password limitation, add the
+                  expiration date as a separate text field named “Expire Date”
+                  in the format MM/YYYY (e.g. 09/2027).
+                </div>
               </div>
             </>
           )}

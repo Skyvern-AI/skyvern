@@ -6,7 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
-import { Timer } from "@/components/Timer";
+import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -34,7 +34,7 @@ import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
 } from "@/store/WorkflowSettingsStore";
-import { cn } from "@/util/utils";
+import { cn, formatDate, toDate } from "@/util/utils";
 import {
   statusIsAFailureType,
   statusIsFinalized,
@@ -91,7 +91,9 @@ const getPayload = (opts: {
     extraHttpHeaders =
       opts.workflowSettings.extraHttpHeaders === null
         ? null
-        : JSON.parse(opts.workflowSettings.extraHttpHeaders);
+        : typeof opts.workflowSettings.extraHttpHeaders === "object"
+          ? opts.workflowSettings.extraHttpHeaders
+          : JSON.parse(opts.workflowSettings.extraHttpHeaders);
   } catch (e: unknown) {
     toast({
       variant: "warning",
@@ -185,13 +187,6 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
-
-  const timerDurationOverride =
-    workflowRun && workflowRun.finished_at
-      ? new Date(workflowRun.finished_at).getTime() -
-        new Date(workflowRun.created_at).getTime() +
-        3500
-      : null;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -473,16 +468,30 @@ function NodeHeader({
     cancelBlock.mutate();
   };
 
+  const isRunning = workflowRun ? statusIsRunningOrQueued(workflowRun) : false;
+  const createdAt = toDate(workflowRun?.created_at ?? "", null);
+  const finishedAt = toDate(workflowRun?.finished_at ?? "", null);
+  const dt = finishedAt
+    ? formatDate(finishedAt)
+    : createdAt
+      ? formatDate(createdAt)
+      : null;
+
   return (
     <>
-      {thisBlockIsTargetted && (
-        <div className="flex w-full animate-[auto-height_1s_ease-in-out_forwards] items-center justify-between overflow-hidden">
-          <div className="pb-4">
-            <Timer override={timerDurationOverride ?? undefined} />
+      {thisBlockIsTargetted ? (
+        <div className="flex w-full animate-[auto-height_1s_ease-in-out_forwards] items-center justify-between overflow-hidden pb-4 pt-1">
+          {isRunning ? (
+            <div>
+              <ReloadIcon className="animate-spin" />
+            </div>
+          ) : null}
+          {dt ? <div className="text-sm opacity-70">{dt}</div> : <span />}
+          <div>
+            <StatusBadge status={workflowRun?.status ?? "pending"} />
           </div>
-          <div className="pb-4">{workflowRun?.status ?? "pending"}</div>
         </div>
-      )}
+      ) : null}
 
       <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
         <div

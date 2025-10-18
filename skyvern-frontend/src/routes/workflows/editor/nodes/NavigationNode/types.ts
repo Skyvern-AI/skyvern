@@ -18,6 +18,7 @@ export type NavigationNodeData = NodeBaseData & {
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
   cacheActions: boolean;
+  disableCache: boolean;
   includeActionHistoryInVerification: boolean;
 };
 
@@ -43,6 +44,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   totpIdentifier: null,
   continueOnFailure: false,
   cacheActions: false,
+  disableCache: false,
   includeActionHistoryInVerification: false,
 } as const;
 

@@ -10,6 +10,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 LOG = structlog.get_logger()
 
@@ -117,7 +118,9 @@ async def _get_verification_code_from_db(
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
 ) -> str | None:
-    totp_codes = await app.DATABASE.get_totp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
+    totp_codes = await app.DATABASE.get_otp_codes(
+        organization_id=organization_id, totp_identifier=totp_identifier, otp_type=OTPType.TOTP
+    )
     for totp_code in totp_codes:
         if totp_code.workflow_run_id and workflow_run_id and totp_code.workflow_run_id != workflow_run_id:
             continue

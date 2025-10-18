@@ -21,6 +21,8 @@ import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 
+import { CopyAndExplainCode } from "../editor/Workspace";
+
 interface Props {
   showCacheKeyValueSelector?: boolean;
 }
@@ -152,7 +154,7 @@ function WorkflowRunCode(props?: Props) {
   }
 
   return (
-    <div className="flex h-full w-full flex-col items-end justify-center gap-2">
+    <div className="relative flex h-full w-full flex-col items-end justify-center gap-2">
       {cacheKeyValueSet.size > 0 ? (
         <div className="flex w-full justify-end gap-4">
           <div className="flex items-center justify-around gap-2">
@@ -209,6 +211,9 @@ function WorkflowRunCode(props?: Props) {
         readOnly
         fontSize={10}
       />
+      <div className="absolute right-[0.75rem] top-[3.5rem] flex items-center justify-end">
+        <CopyAndExplainCode code={code} />
+      </div>
     </div>
   );
 }
