@@ -25,10 +25,11 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
@@ -208,8 +209,8 @@ function TaskDetails() {
                 }
                 return {
                   method: "POST",
-                  url: `${apiBaseUrl}/tasks`,
-                  body: createTaskRequestObject(task),
+                  url: `${runsApiBaseUrl}/run/tasks`,
+                  body: buildTaskRunPayload(createTaskRequestObject(task)),
                   headers: {
                     "Content-Type": "application/json",
                     "x-api-key": apiCredential ?? "<your-api-key>",

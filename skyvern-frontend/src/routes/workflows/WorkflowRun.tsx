@@ -21,7 +21,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import {
   CodeIcon,
   FileIcon,
@@ -311,31 +311,35 @@ function WorkflowRun() {
           </div>
 
           <div className="flex gap-2">
-            <ApiWebhookActionsMenu
-              getOptions={() =>
-                ({
-                  method: "POST",
-                  url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                  body: {
-                    data: workflowRun?.parameters,
-                    proxy_location: "RESIDENTIAL",
-                  },
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiCredential ?? "<your-api-key>",
-                  },
-                }) satisfies ApiCommandOptions
-              }
-              webhookDisabled={workflowRunIsLoading || !workflowRunIsFinalized}
-              onTestWebhook={() => setReplayOpen(true)}
-            />
-            <WebhookReplayDialog
-              runId={workflowRunId ?? ""}
-              disabled={workflowRunIsLoading || !workflowRunIsFinalized}
-              open={replayOpen}
-              onOpenChange={setReplayOpen}
-              hideTrigger
-            />
+              <ApiWebhookActionsMenu
+               getOptions={() => {
+                 // Build headers - x-max-steps-override is optional and can be added manually if needed
+                 const headers: Record<string, string> = {
+                   "Content-Type": "application/json",
+                   "x-api-key": apiCredential ?? "<your-api-key>",
+                 };
+          
+                 return {
+                   method: "POST",
+                   url: `${runsApiBaseUrl}/run/workflows`,
+                   body: {
+                     workflow_id: workflowPermanentId,
+                     parameters: workflowRun?.parameters,
+                     proxy_location: "RESIDENTIAL",
+                   },
+                   headers,
+                 } satisfies ApiCommandOptions;
+               }}
+               webhookDisabled={workflowRunIsLoading || !workflowRunIsFinalized}
+               onTestWebhook={() => setReplayOpen(true)}
+             />
+             <WebhookReplayDialog
+               runId={workflowRunId ?? ""}
+               disabled={workflowRunIsLoading || !workflowRunIsFinalized}
+               open={replayOpen}
+               onOpenChange={setReplayOpen}
+               hideTrigger
+             />
             <Button asChild variant="secondary">
               <Link to={`/workflows/${workflowPermanentId}/debug`}>
                 <Pencil2Icon className="mr-2 h-4 w-4" />
