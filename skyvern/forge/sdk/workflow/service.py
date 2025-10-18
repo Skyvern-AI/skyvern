@@ -1916,6 +1916,7 @@ class WorkflowService:
         close_browser_on_completion: bool = True,
         need_call_webhook: bool = True,
         browser_session_id: str | None = None,
+        override_webhook_url: str | None = None,
     ) -> None:
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
@@ -1966,12 +1967,13 @@ class WorkflowService:
         if not need_call_webhook:
             return
 
-        await self.execute_workflow_webhook(workflow_run, api_key)
+        await self.execute_workflow_webhook(workflow_run, api_key, override_webhook_url)
 
     async def execute_workflow_webhook(
         self,
         workflow_run: WorkflowRun,
         api_key: str | None = None,
+        override_webhook_url: str | None = None,
     ) -> None:
         workflow_id = workflow_run.workflow_id
         workflow_run_status_response = await self.build_workflow_run_status_response(
@@ -1984,11 +1986,23 @@ class WorkflowService:
             workflow_run_status_response=workflow_run_status_response,
         )
 
-        if not workflow_run.webhook_callback_url:
+        # Use override URL if provided, otherwise use the workflow's default
+        webhook_url = override_webhook_url or workflow_run.webhook_callback_url
+        LOG.debug(
+            "Determining webhook URL",
+            default_url=workflow_run.webhook_callback_url,
+            override_url=override_webhook_url,
+            final_url=webhook_url,
+            workflow_run_id=workflow_run.workflow_run_id
+        )
+
+        if not webhook_url:
             LOG.warning(
-                "Workflow has no webhook callback url. Not sending workflow response",
+                "No webhook URL available. Not sending workflow response",
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
+                default_url=workflow_run.webhook_callback_url,
+                override_url=override_webhook_url
             )
             return
 
@@ -2023,7 +2037,7 @@ class WorkflowService:
                 title=workflow_run_status_response.workflow_title,
                 parameters=workflow_run_status_response.parameters,
                 proxy_location=workflow_run.proxy_location,
-                webhook_url=workflow_run.webhook_callback_url or None,
+                webhook_url=webhook_url,  # Use the potentially overridden URL here
                 totp_url=workflow_run.totp_verification_url or None,
                 totp_identifier=workflow_run.totp_identifier,
             ),
@@ -2038,23 +2052,29 @@ class WorkflowService:
             api_key=api_key,
         )
         LOG.info(
-            "Sending webhook run status to webhook callback url",
+            "Sending webhook run status",
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
-            webhook_callback_url=workflow_run.webhook_callback_url,
+            webhook_url=webhook_url,
+            is_override=bool(override_webhook_url),
             payload=payload,
             headers=headers,
         )
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    url=workflow_run.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+                    url=webhook_url,
+                    data=payload,
+                    headers=headers,
+                    timeout=httpx.Timeout(30.0)
                 )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_url=webhook_url,
+                    is_override=bool(override_webhook_url),
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
@@ -2063,10 +2083,12 @@ class WorkflowService:
                     webhook_failure_reason="",
                 )
             else:
-                LOG.info(
+                LOG.warning(
                     "Webhook failed",
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_url=webhook_url,
+                    is_override=bool(override_webhook_url),
                     webhook_data=payload,
                     resp=resp,
                     resp_code=resp.status_code,
@@ -2544,7 +2566,7 @@ class WorkflowService:
                 loop_over_parameter = parameters[block_yaml.loop_over_parameter_key]
 
             if block_yaml.loop_variable_reference:
-                # it's backaward compatible with jinja style parameter and context paramter
+                # it's backward compatible with jinja style parameter and context paramter
                 # we trim the format like {{ loop_key }} into loop_key to initialize the context parater,
                 # otherwise it might break the context parameter initialization chain, blow up the worklofw parameters
                 # TODO: consider remove this if we totally give up context parameter
