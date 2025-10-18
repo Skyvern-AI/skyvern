@@ -85,6 +85,19 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
           />
           <div className="space-y-4">
             <div className="space-y-2">
+              <Label className="text-xs text-slate-300">URL</Label>
+              <WorkflowBlockInputTextarea
+                canWriteTitle={true}
+                nodeId={id}
+                onChange={(value) => {
+                  update({ url: value });
+                }}
+                value={data.url}
+                placeholder={placeholders[type]["url"]}
+                className="nopan text-xs"
+              />
+            </div>
+            <div className="space-y-2">
               <div className="flex justify-between">
                 <Label className="text-xs text-slate-300">Prompt</Label>
                 {isFirstWorkflowBlock ? (
@@ -100,19 +113,6 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                 }}
                 value={data.prompt}
                 placeholder={placeholders[type]["prompt"]}
-                className="nopan text-xs"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs text-slate-300">URL</Label>
-              <WorkflowBlockInputTextarea
-                canWriteTitle={true}
-                nodeId={id}
-                onChange={(value) => {
-                  update({ url: value });
-                }}
-                value={data.url}
-                placeholder={placeholders[type]["url"]}
                 className="nopan text-xs"
               />
             </div>
