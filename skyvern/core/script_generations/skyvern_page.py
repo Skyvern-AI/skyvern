@@ -798,8 +798,8 @@ class SkyvernPage:
         await self.page.reload()
         return
 
-    @action_wrap(ActionType.NAVIGATE)
-    async def navigate(
+    @action_wrap(ActionType.GOTO_URL)
+    async def goto_url(
         self,
         url: str,
         intention: str | None = None,

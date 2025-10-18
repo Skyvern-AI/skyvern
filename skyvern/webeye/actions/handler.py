@@ -2142,8 +2142,8 @@ async def handle_verification_code_action(
 
 
 @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
-async def handle_navigate_action(
-    action: actions.NavigateAction,
+async def handle_goto_url_action(
+    action: actions.GotoUrlAction,
     page: Page,
     scraped_page: ScrapedPage,
     task: Task,
@@ -2231,7 +2231,7 @@ ActionHandler.register_action_type(ActionType.MOVE, handle_move_action)
 ActionHandler.register_action_type(ActionType.DRAG, handle_drag_action)
 ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verification_code_action)
 ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
-ActionHandler.register_action_type(ActionType.NAVIGATE, handle_navigate_action)
+ActionHandler.register_action_type(ActionType.GOTO_URL, handle_goto_url_action)
 ActionHandler.register_action_type(ActionType.GO_BACK, handle_go_back_action)
 ActionHandler.register_action_type(ActionType.GO_FORWARD, handle_go_forward_action)
 

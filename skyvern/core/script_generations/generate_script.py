@@ -83,7 +83,7 @@ ACTION_MAP = {
     "upload_file": "upload_file",
     "select_option": "select_option",
     "goto": "goto",
-    "navigate": "navigate",
+    "navigate": "goto_url",
     "go_back": "go_back",
     "go_forward": "go_forward",
     "scroll": "scroll",
@@ -372,7 +372,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                 ),
             )
         )
-    elif method == "navigate":
+    elif method == "goto_url":
         args.append(
             cst.Arg(
                 keyword=cst.Name("url"),

@@ -125,8 +125,8 @@ class Action(BaseModel):
                 return SolveCaptchaAction.model_validate(value)
             elif action_type is ActionType.RELOAD_PAGE:
                 return ReloadPageAction.model_validate(value)
-            elif action_type is ActionType.NAVIGATE:
-                return NavigateAction.model_validate(value)
+            elif action_type is ActionType.GOTO_URL:
+                return GotoUrlAction.model_validate(value)
             elif action_type is ActionType.GO_BACK:
                 return GoBackAction.model_validate(value)
             elif action_type is ActionType.GO_FORWARD:
@@ -171,8 +171,8 @@ class ReloadPageAction(Action):
     action_type: ActionType = ActionType.RELOAD_PAGE
 
 
-class NavigateAction(Action):
-    action_type: ActionType = ActionType.NAVIGATE
+class GotoUrlAction(Action):
+    action_type: ActionType = ActionType.GOTO_URL
     url: str
 
 

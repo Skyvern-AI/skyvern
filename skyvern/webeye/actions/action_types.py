@@ -26,7 +26,7 @@ class ActionType(StrEnum):
     MOVE = "move"
     DRAG = "drag"
     LEFT_MOUSE = "left_mouse"
-    NAVIGATE = "navigate"
+    GOTO_URL = "navigate"
     GO_BACK = "go_back"
     GO_FORWARD = "go_forward"
 

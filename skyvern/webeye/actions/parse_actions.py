@@ -27,12 +27,12 @@ from skyvern.webeye.actions.actions import (
     DragAction,
     GoBackAction,
     GoForwardAction,
+    GotoUrlAction,
     InputOrSelectContext,
     InputTextAction,
     KeypressAction,
     LeftMouseAction,
     MoveAction,
-    NavigateAction,
     NullAction,
     ScrollAction,
     SelectOption,
@@ -532,7 +532,7 @@ def _build_gemini_actions_from_call(
             )
         case "search":
             actions.append(
-                NavigateAction(
+                GotoUrlAction(
                     reasoning=reasoning,
                     intention=reasoning,
                     response="Open search engine homepage.",
@@ -543,7 +543,7 @@ def _build_gemini_actions_from_call(
             url = args.get("url")
             if isinstance(url, str) and url:
                 actions.append(
-                    NavigateAction(
+                    GotoUrlAction(
                         reasoning=reasoning,
                         intention=reasoning,
                         response=f"Navigate to {url}",
