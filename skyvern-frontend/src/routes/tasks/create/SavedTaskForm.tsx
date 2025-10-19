@@ -33,6 +33,7 @@ import { TaskFormSection } from "./TaskFormSection";
 import { savedTaskFormSchema, SavedTaskFormValues } from "./taskFormTypes";
 import { OrganizationApiResponse, ProxyLocation } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 
 type Props = {
   initialValues: SavedTaskFormValues;
@@ -627,11 +628,31 @@ function SavedTaskForm({ initialValues }: Props) {
                         </FormLabel>
                         <div className="w-full">
                           <FormControl>
-                            <Input
-                              {...field}
-                              placeholder="https://"
-                              value={field.value === null ? "" : field.value}
-                            />
+                            <div className="flex flex-col gap-2">
+                              <Input
+                                className="w-full"
+                                {...field}
+                                placeholder="https://"
+                                value={field.value === null ? "" : field.value}
+                              />
+                              <TestWebhookDialog
+                                runType="task"
+                                runId={null}
+                                initialWebhookUrl={
+                                  field.value === null ? undefined : field.value
+                                }
+                                trigger={
+                                  <Button
+                                    type="button"
+                                    variant="secondary"
+                                    className="self-start"
+                                    disabled={!field.value}
+                                  >
+                                    Test Webhook
+                                  </Button>
+                                }
+                              />
+                            </div>
                           </FormControl>
                           <FormMessage />
                         </div>
