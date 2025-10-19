@@ -163,3 +163,309 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> str:
 
     payload_dict.update(json.loads(workflow_run_response.model_dump_json(exclude_unset=True)))
     return json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from time import perf_counter
+from typing import TYPE_CHECKING
+
+import httpx
+import structlog
+from fastapi import status
+
+from skyvern.config import settings
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException, TaskNotFound, WorkflowRunNotFound
+from skyvern.forge import app
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.schemas.runs import (
+    RunStatus,
+    RunType,
+    TaskRunResponse,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+)
+from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
+from skyvern.services import run_service, task_v2_service
+from skyvern.utils.url_validators import validate_url
+
+LOG = structlog.get_logger()
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.models import WorkflowRun
+    from skyvern.forge.sdk.schemas.task_v2 import TaskV2
+    from skyvern.forge.sdk.schemas.tasks import Task
+
+
+class WebhookReplayError(Exception):
+    """Raised when a webhook replay cannot be completed."""
+
+
+class MissingWebhookTarget(WebhookReplayError):
+    """Raised when there is no webhook URL to send the replay to."""
+
+
+class MissingApiKey(WebhookReplayError):
+    """Raised when the organization has no valid API key for signing webhooks."""
+
+
+@dataclass
+class _WebhookPayload:
+    run_id: str
+    run_type: str
+    payload: str
+    default_webhook_url: str | None
+
+
+async def build_run_preview(organization_id: str, run_id: str) -> RunWebhookPreviewResponse:
+    """Return the payload and headers that would be used for a replay."""
+    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
+    api_key = await _get_api_key(organization_id=organization_id)
+    headers = generate_skyvern_webhook_headers(payload=payload.payload, api_key=api_key)
+    return RunWebhookPreviewResponse(
+        run_id=payload.run_id,
+        run_type=payload.run_type,
+        default_webhook_url=payload.default_webhook_url,
+        payload=payload.payload,
+        headers=headers,
+    )
+
+
+async def replay_run_webhook(organization_id: str, run_id: str, target_url: str | None) -> RunWebhookReplayResponse:
+    """
+    Send the webhook payload for a run to either the stored URL or a caller-provided override.
+    """
+    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
+    api_key = await _get_api_key(organization_id=organization_id)
+    headers = generate_skyvern_webhook_headers(payload=payload.payload, api_key=api_key)
+
+    url_to_use: str | None = target_url if target_url else payload.default_webhook_url
+
+    if not url_to_use:
+        raise MissingWebhookTarget("No webhook URL configured for the run.")
+
+    validated_url = _validate_target_url(url_to_use)
+
+    status_code, latency_ms, response_body, error = await _deliver_webhook(
+        url=validated_url,
+        payload=payload.payload,
+        headers=headers,
+    )
+
+    return RunWebhookReplayResponse(
+        run_id=payload.run_id,
+        run_type=payload.run_type,
+        default_webhook_url=payload.default_webhook_url,
+        target_webhook_url=validated_url,
+        payload=payload.payload,
+        headers=headers,
+        status_code=status_code,
+        latency_ms=latency_ms,
+        response_body=response_body,
+        error=error,
+    )
+
+
+async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookPayload:
+    run = await app.DATABASE.get_run(run_id, organization_id=organization_id)
+    if not run:
+        # Attempt to resolve task v2 runs that may not yet be in the runs table.
+        task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
+        if task_v2:
+            return await _build_task_v2_payload(task_v2)
+        raise WebhookReplayError(f"Run {run_id} was not found.")
+
+    run_type = _as_run_type_str(run.task_run_type)
+    if run.task_run_type in {
+        RunType.task_v1,
+        RunType.openai_cua,
+        RunType.anthropic_cua,
+        RunType.ui_tars,
+    }:
+        return await _build_task_payload(
+            organization_id=organization_id,
+            run_id=run.run_id,
+            run_type_str=run_type,
+        )
+    if run.task_run_type == RunType.task_v2:
+        task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
+        if not task_v2:
+            raise WebhookReplayError(f"Task v2 run {run_id} missing task record.")
+        return await _build_task_v2_payload(task_v2)
+    if run.task_run_type == RunType.workflow_run:
+        return await _build_workflow_payload(organization_id=organization_id, workflow_run_id=run.run_id)
+
+    raise WebhookReplayError(f"Run type {run_type} is not supported for webhook replay.")
+
+
+async def _build_task_payload(organization_id: str, run_id: str, run_type_str: str) -> _WebhookPayload:
+    task: Task | None = await app.DATABASE.get_task(run_id, organization_id=organization_id)
+    if not task:
+        raise TaskNotFound(task_id=run_id)
+    latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
+    task_response = await app.agent.build_task_response(task=task, last_step=latest_step)
+
+    payload_dict = json.loads(task_response.model_dump_json(exclude={"request"}))
+
+    run_response = await run_service.get_run_response(run_id=run_id, organization_id=organization_id)
+    if isinstance(run_response, TaskRunResponse):
+        run_response_json = run_response.model_dump_json(exclude={"run_request"})
+        payload_dict.update(json.loads(run_response_json))
+
+    payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+    return _WebhookPayload(
+        run_id=run_id,
+        run_type=run_type_str,
+        payload=payload,
+        default_webhook_url=task.webhook_callback_url,
+    )
+
+
+async def _build_task_v2_payload(task_v2: TaskV2) -> _WebhookPayload:
+    task_run_response = await task_v2_service.build_task_v2_run_response(task_v2)
+    task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
+
+    payload_dict = json.loads(task_v2.model_dump_json(by_alias=True))
+    payload_dict.update(json.loads(task_run_response_json))
+
+    payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+    return _WebhookPayload(
+        run_id=task_v2.observer_cruise_id,
+        run_type=RunType.task_v2.value,
+        payload=payload,
+        default_webhook_url=task_v2.webhook_callback_url,
+    )
+
+
+async def _build_workflow_payload(
+    organization_id: str,
+    workflow_run_id: str,
+) -> _WebhookPayload:
+    workflow_run: WorkflowRun | None = await app.DATABASE.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+    if not workflow_run:
+        raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+
+    status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+        workflow_permanent_id=workflow_run.workflow_permanent_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id=workflow_run.organization_id,
+    )
+
+    app_url = (
+        f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
+        f"{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
+    )
+
+    run_response = WorkflowRunResponse(
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        status=RunStatus(status_response.status),
+        output=status_response.outputs,
+        downloaded_files=status_response.downloaded_files,
+        recording_url=status_response.recording_url,
+        screenshot_urls=status_response.screenshot_urls,
+        failure_reason=status_response.failure_reason,
+        app_url=app_url,
+        script_run=status_response.script_run,
+        created_at=status_response.created_at,
+        modified_at=status_response.modified_at,
+        run_request=WorkflowRunRequest(
+            workflow_id=workflow_run.workflow_permanent_id,
+            title=status_response.workflow_title,
+            parameters=status_response.parameters,
+            proxy_location=workflow_run.proxy_location,
+            webhook_url=workflow_run.webhook_callback_url or None,
+            totp_url=workflow_run.totp_verification_url or None,
+            totp_identifier=workflow_run.totp_identifier,
+        ),
+        errors=status_response.errors,
+    )
+
+    payload_dict = json.loads(status_response.model_dump_json())
+    payload_dict.update(json.loads(run_response.model_dump_json()))
+    payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+
+    return _WebhookPayload(
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run.value,
+        payload=payload,
+        default_webhook_url=workflow_run.webhook_callback_url,
+    )
+
+
+async def _get_api_key(organization_id: str) -> str:
+    api_key_obj = await app.DATABASE.get_valid_org_auth_token(
+        organization_id,
+        OrganizationAuthTokenType.api.value,
+    )
+    if not api_key_obj or not api_key_obj.token:
+        raise MissingApiKey("Organization does not have a valid API key configured.")
+    return api_key_obj.token
+
+
+async def _deliver_webhook(
+    url: str, payload: str, headers: dict[str, str]
+) -> tuple[int | None, int, str | None, str | None]:
+    start = perf_counter()
+    status_code: int | None = None
+    response_body: str | None = None
+    error: str | None = None
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, content=payload, headers=headers, timeout=httpx.Timeout(10.0))
+        status_code = response.status_code
+        body_text = response.text or ""
+        if len(body_text) > 2048:
+            response_body = f"{body_text[:2048]}\n... (truncated)"
+        else:
+            response_body = body_text or None
+    except httpx.TimeoutException:
+        error = "Request timed out after 10 seconds."
+        LOG.warning("Webhook replay timed out", url=url)
+    except httpx.NetworkError as exc:
+        error = f"Could not reach URL: {exc}"
+        LOG.warning("Webhook replay network error", url=url, error=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive guard
+        error = f"Unexpected error: {exc}"
+        LOG.error("Webhook replay unexpected error", url=url, error=str(exc), exc_info=True)
+
+    latency_ms = int((perf_counter() - start) * 1000)
+    return status_code, latency_ms, response_body, error
+
+
+def _as_run_type_str(run_type: RunType | str | None) -> str:
+    if isinstance(run_type, RunType):
+        return run_type.value
+    if isinstance(run_type, str):
+        return run_type
+    return "unknown"
+
+
+def _validate_target_url(url: str) -> str:
+    try:
+        validated_url = validate_url(url)
+        if not validated_url:
+            raise SkyvernHTTPException("Invalid webhook URL.", status_code=status.HTTP_400_BAD_REQUEST)
+        return validated_url
+    except BlockedHost as exc:
+        raise SkyvernHTTPException(
+            message=(
+                f"This URL is blocked by SSRF protection. {str(exc)} "
+                "Add the host to ALLOWED_HOSTS to test internal endpoints or use an external receiver "
+                "such as webhook.site or requestbin.com."
+            ),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        ) from exc
+    except SkyvernHTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive guard
+        LOG.error("Unexpected error validating webhook URL", url=url, error=str(exc))
+        raise SkyvernHTTPException(
+            "Unexpected error while validating the webhook URL.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        ) from exc
