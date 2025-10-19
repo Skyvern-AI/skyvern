@@ -26,6 +26,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { apiBaseUrl } from "@/util/env";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -211,6 +212,10 @@ function TaskDetails() {
                   },
                 } satisfies ApiCommandOptions;
               }}
+            />
+            <WebhookReplayDialog
+              runId={taskId ?? ""}
+              disabled={taskIsLoading || !taskHasTerminalState}
             />
             {taskIsRunningOrQueued && (
               <Dialog>

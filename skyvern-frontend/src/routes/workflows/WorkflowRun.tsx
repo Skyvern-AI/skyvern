@@ -42,6 +42,7 @@ import { CodeEditor } from "./components/CodeEditor";
 import { cn } from "@/util/utils";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
@@ -319,6 +320,10 @@ function WorkflowRun() {
                   },
                 }) satisfies ApiCommandOptions
               }
+            />
+            <WebhookReplayDialog
+              runId={workflowRunId ?? ""}
+              disabled={workflowRunIsLoading || !workflowRunIsFinalized}
             />
             <Button asChild variant="secondary">
               <Link to={`/workflows/${workflowPermanentId}/debug`}>
