@@ -124,6 +124,64 @@ async def send_totp_code(
     )
 
 
+@base_router.get(
+    "/credentials/totp",
+    response_model=list[TOTPCode],
+    summary="List TOTP codes",
+    description="Retrieves recent TOTP codes for the current organization.",
+    tags=["Credentials"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_totp_codes",
+    },
+)
+@base_router.get(
+    "/credentials/totp/",
+    response_model=list[TOTPCode],
+    include_in_schema=False,
+)
+async def get_totp_codes(
+    curr_org: Organization = Depends(org_auth_service.get_current_org),
+    totp_identifier: str | None = Query(
+        None,
+        description="Filter by TOTP identifier such as an email or phone number.",
+        examples=["john.doe@example.com"],
+    ),
+    workflow_run_id: str | None = Query(
+        None,
+        description="Filter by workflow run ID.",
+        examples=["wr_123456"],
+    ),
+    otp_type: OTPType | None = Query(
+        None,
+        description="Filter by OTP type (e.g. totp, magic_link).",
+        examples=[OTPType.TOTP.value],
+    ),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=200,
+        description="Maximum number of codes to return.",
+    ),
+) -> list[TOTPCode]:
+    if totp_identifier:
+        codes = await app.DATABASE.get_otp_codes(
+            organization_id=curr_org.organization_id,
+            totp_identifier=totp_identifier,
+            otp_type=otp_type,
+        )
+    else:
+        codes = await app.DATABASE.get_recent_otp_codes(
+            organization_id=curr_org.organization_id,
+            limit=limit,
+            otp_type=otp_type,
+        )
+
+    if workflow_run_id:
+        codes = [code for code in codes if code.workflow_run_id == workflow_run_id]
+
+    return codes[:limit]
+
+
 @legacy_base_router.post("/credentials")
 @legacy_base_router.post("/credentials/", include_in_schema=False)
 @base_router.post(

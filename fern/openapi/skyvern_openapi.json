@@ -1462,6 +1462,104 @@
             ]
           }
         ]
+      },
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "List TOTP codes",
+        "description": "Retrieves recent TOTP codes for the current organization.",
+        "operationId": "get_totp_codes_v1_credentials_totp_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "totp_identifier",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by TOTP identifier such as an email or phone number.",
+            "examples": {
+              "example": {
+                "value": "john.doe@example.com"
+              }
+            }
+          },
+          {
+            "name": "workflow_run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by workflow run ID.",
+            "examples": {
+              "example": {
+                "value": "wr_123456"
+              }
+            }
+          },
+          {
+            "name": "otp_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OTPType"
+            },
+            "description": "Filter by OTP type (e.g. totp, magic_link)."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "Maximum number of codes to return."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved TOTP codes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TOTPCode"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        }
       }
     },
     "/v1/credentials": {

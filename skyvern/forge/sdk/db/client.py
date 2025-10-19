@@ -2825,6 +2825,33 @@ class AgentDB:
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
 
+    async def get_recent_otp_codes(
+        self,
+        organization_id: str,
+        limit: int = 50,
+        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        otp_type: OTPType | None = None,
+    ) -> list[TOTPCode]:
+        """
+        Return recent otp codes for an organization ordered by newest first.
+        """
+        all_null = and_(
+            TOTPCodeModel.task_id.is_(None),
+            TOTPCodeModel.workflow_id.is_(None),
+            TOTPCodeModel.workflow_run_id.is_(None),
+        )
+        async with self.Session() as session:
+            query = (
+                select(TOTPCodeModel)
+                .filter_by(organization_id=organization_id)
+                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
+            )
+            if otp_type:
+                query = query.filter(TOTPCodeModel.otp_type == otp_type)
+            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc()).limit(limit)
+            totp_codes = (await session.scalars(query)).all()
+            return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
+
     async def create_otp_code(
         self,
         organization_id: str,
