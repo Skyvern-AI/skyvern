@@ -52,16 +52,6 @@ async def fetch_credential_item_background(item_id: str) -> None:
 
 @legacy_base_router.post("/totp")
 @legacy_base_router.post("/totp/", include_in_schema=False)
-@legacy_base_router.post(
-    "/credentials/totp",
-    response_model=TOTPCode,
-    include_in_schema=False,
-)
-@legacy_base_router.post(
-    "/credentials/totp/",
-    response_model=TOTPCode,
-    include_in_schema=False,
-)
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
@@ -121,16 +111,6 @@ async def send_totp_code(
     )
 
 
-@legacy_base_router.get(
-    "/credentials/totp",
-    response_model=list[TOTPCode],
-    include_in_schema=False,
-)
-@legacy_base_router.get(
-    "/credentials/totp/",
-    response_model=list[TOTPCode],
-    include_in_schema=False,
-)
 @base_router.get(
     "/credentials/totp",
     response_model=list[TOTPCode],
