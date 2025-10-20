@@ -177,7 +177,14 @@ async def test_webhook(
 import structlog
 from fastapi import Depends, HTTPException, status
 
-from skyvern.exceptions import SkyvernHTTPException, TaskNotFound, WorkflowRunNotFound
+from skyvern.exceptions import (
+    MissingApiKey,
+    MissingWebhookTarget,
+    SkyvernHTTPException,
+    TaskNotFound,
+    WebhookReplayError,
+    WorkflowRunNotFound,
+)
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
@@ -186,13 +193,7 @@ from skyvern.schemas.webhooks import (
     RunWebhookReplayRequest,
     RunWebhookReplayResponse,
 )
-from skyvern.services.webhook_service import (
-    MissingApiKey,
-    MissingWebhookTarget,
-    WebhookReplayError,
-    build_run_preview,
-    replay_run_webhook,
-)
+from skyvern.services.webhook_service import build_run_preview, replay_run_webhook
 
 LOG = structlog.get_logger()
 
@@ -202,12 +203,14 @@ LOG = structlog.get_logger()
     tags=["Internal"],
     response_model=RunWebhookPreviewResponse,
     summary="Preview webhook replay payload",
+    include_in_schema=False,
 )
 @base_router.get(
     "/internal/runs/{run_id}/test-webhook",
     tags=["Internal"],
     response_model=RunWebhookPreviewResponse,
     summary="Preview webhook replay payload",
+    include_in_schema=False,
 )
 async def preview_webhook_replay(
     run_id: str,
@@ -253,12 +256,14 @@ async def preview_webhook_replay(
     tags=["Internal"],
     response_model=RunWebhookReplayResponse,
     summary="Replay webhook for a completed run",
+    include_in_schema=False,
 )
 @base_router.post(
     "/internal/runs/{run_id}/test-webhook",
     tags=["Internal"],
     response_model=RunWebhookReplayResponse,
     summary="Replay webhook for a completed run",
+    include_in_schema=False,
 )
 async def trigger_webhook_replay(
     run_id: str,

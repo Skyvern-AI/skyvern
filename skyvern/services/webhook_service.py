@@ -168,17 +168,27 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING
 
 import httpx
 import structlog
 from fastapi import status
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException, TaskNotFound, WorkflowRunNotFound
+from skyvern.exceptions import (
+    BlockedHost,
+    MissingApiKey,
+    MissingWebhookTarget,
+    SkyvernHTTPException,
+    TaskNotFound,
+    WebhookReplayError,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2
+from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import RunStatus, RunType, TaskRunResponse, WorkflowRunResponse
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
@@ -187,23 +197,6 @@ from skyvern.utils.url_validators import validate_url
 LOG = structlog.get_logger()
 
 RESPONSE_BODY_TRUNCATION_LIMIT = 2048
-
-if TYPE_CHECKING:
-    from skyvern.forge.sdk.db.models import WorkflowRun
-    from skyvern.forge.sdk.schemas.task_v2 import TaskV2
-    from skyvern.forge.sdk.schemas.tasks import Task
-
-
-class WebhookReplayError(Exception):
-    """Raised when a webhook replay cannot be completed."""
-
-
-class MissingWebhookTarget(WebhookReplayError):
-    """Raised when there is no webhook URL to send the replay to."""
-
-
-class MissingApiKey(WebhookReplayError):
-    """Raised when the organization has no valid API key for signing webhooks."""
 
 
 @dataclass
@@ -239,7 +232,7 @@ async def replay_run_webhook(organization_id: str, run_id: str, target_url: str 
     url_to_use: str | None = target_url if target_url else payload.default_webhook_url
 
     if not url_to_use:
-        raise MissingWebhookTarget("No webhook URL configured for the run.")
+        raise MissingWebhookTarget()
 
     validated_url = _validate_target_url(url_to_use)
 
@@ -387,7 +380,7 @@ async def _get_api_key(organization_id: str) -> str:
         OrganizationAuthTokenType.api.value,
     )
     if not api_key_obj or not api_key_obj.token:
-        raise MissingApiKey("Organization does not have a valid API key configured.")
+        raise MissingApiKey()
     return api_key_obj.token
 
 
