@@ -80,7 +80,7 @@ async def test_webhook(
             error=error_message,
         )
     except Exception as exc:  # pragma: no cover - defensive guard
-        LOG.error("Error validating webhook URL", error=str(exc), webhook_url=request.webhook_url)
+        LOG.exception("Error validating webhook URL", error=str(exc), webhook_url=request.webhook_url)
         return TestWebhookResponse(
             status_code=None,
             latency_ms=0,
@@ -96,7 +96,7 @@ async def test_webhook(
         else:  # workflow_run
             payload = build_sample_workflow_run_payload(run_id=request.run_id)
     except Exception as e:
-        LOG.error("Error building sample payload", error=str(e), run_type=request.run_type)
+        LOG.exception("Error building sample payload", error=str(e), run_type=request.run_type)
         return TestWebhookResponse(
             status_code=None,
             latency_ms=0,
