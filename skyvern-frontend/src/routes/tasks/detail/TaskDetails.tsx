@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { useState } from "react";
 import {
   Status,
   TaskApiResponse,
@@ -25,7 +26,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { apiBaseUrl } from "@/util/env";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
@@ -125,6 +126,8 @@ function TaskDetails() {
     },
   });
 
+  const [replayOpen, setReplayOpen] = useState(false);
+
   if (taskIsError) {
     return <div>Error: {taskError?.message}</div>;
   }
@@ -190,7 +193,8 @@ function TaskDetails() {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <CopyApiCommandDropdown
+            {/** API & Webhooks consolidated dropdown + controlled dialog */}
+            <ApiWebhookActionsMenu
               getOptions={() => {
                 if (!task) {
                   return {
@@ -212,10 +216,15 @@ function TaskDetails() {
                   },
                 } satisfies ApiCommandOptions;
               }}
+              webhookDisabled={taskIsLoading || !taskHasTerminalState}
+              onTestWebhook={() => setReplayOpen(true)}
             />
             <WebhookReplayDialog
               runId={taskId ?? ""}
               disabled={taskIsLoading || !taskHasTerminalState}
+              open={replayOpen}
+              onOpenChange={setReplayOpen}
+              hideTrigger
             />
             {taskIsRunningOrQueued && (
               <Dialog>

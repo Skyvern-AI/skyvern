@@ -43,6 +43,9 @@ export type WebhookReplayDialogProps = {
   runId: string;
   disabled?: boolean;
   triggerLabel?: string;
+  open?: boolean;
+  onOpenChange?: (nextOpen: boolean) => void;
+  hideTrigger?: boolean;
 };
 
 const formatJson = (raw: string | undefined) => {
@@ -60,8 +63,13 @@ export function WebhookReplayDialog({
   runId,
   disabled = false,
   triggerLabel = "Replay Webhook",
+  open: controlledOpen,
+  onOpenChange,
+  hideTrigger = false,
 }: WebhookReplayDialogProps) {
-  const [open, setOpen] = useState(false);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const isControlled = controlledOpen !== undefined;
+  const open = isControlled ? (controlledOpen as boolean) : uncontrolledOpen;
   const [targetUrl, setTargetUrl] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
   const [replayResult, setReplayResult] = useState<WebhookReplayResult | null>(
@@ -170,7 +178,11 @@ export function WebhookReplayDialog({
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
-    setOpen(nextOpen);
+    if (isControlled) {
+      onOpenChange?.(nextOpen);
+    } else {
+      setUncontrolledOpen(nextOpen);
+    }
     if (!nextOpen) {
       setReplayResult(null);
       setFormError(null);
@@ -181,14 +193,16 @@ export function WebhookReplayDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogTrigger asChild>
-        <Button variant="secondary" disabled={disabled || runId.length === 0}>
-          {triggerLabel}
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="h-[85vh] max-w-3xl gap-3 overflow-y-auto">
+      {!hideTrigger && (
+        <DialogTrigger asChild>
+          <Button variant="secondary" disabled={disabled || runId.length === 0}>
+            {triggerLabel}
+          </Button>
+        </DialogTrigger>
+      )}
+      <DialogContent className="max-h-[85vh] max-w-3xl gap-3 overflow-y-auto">
         <DialogHeader className="space-y-1">
-          <DialogTitle>Replay Webhook</DialogTitle>
+          <DialogTitle>Test Webhook</DialogTitle>
           <DialogDescription>
             Resend the payload generated for this run or override the
             destination URL before sending.
@@ -222,7 +236,7 @@ export function WebhookReplayDialog({
                 {replayMutation.isPending && (
                   <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                 )}
-                Send Replay
+                Send Payload
               </Button>
               {replayResult?.target_webhook_url && (
                 <span className="text-xs text-muted-foreground">
@@ -241,11 +255,7 @@ export function WebhookReplayDialog({
                 </span>
               )}
             </div>
-            {previewQuery.isLoading && !replayResult ? (
-              <div className="flex h-32 items-center justify-center rounded-md border border-dashed text-sm text-muted-foreground">
-                Loading payload preview…
-              </div>
-            ) : (
+            {previewQuery.isLoading && !replayResult ? null : (
               <CodeEditor
                 language="json"
                 value={payloadText || "{}"}
