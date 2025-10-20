@@ -19,6 +19,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
+import { copyText } from "@/util/copyText";
 
 type TestWebhookRequest = {
   webhook_url: string;
@@ -137,9 +138,20 @@ function TestWebhookDialog({
     if (!result?.response_body) {
       return;
     }
-    await navigator.clipboard.writeText(result.response_body);
-    setCopiedResponse(true);
-    setTimeout(() => setCopiedResponse(false), 2000);
+    try {
+      await copyText(result.response_body);
+      setCopiedResponse(true);
+      setTimeout(() => setCopiedResponse(false), 2000);
+    } catch (error) {
+      toast({
+        variant: "destructive",
+        title: "Failed to copy response",
+        description:
+          error instanceof Error
+            ? error.message
+            : "Clipboard permissions are required.",
+      });
+    }
   };
 
   const getStatusBadgeClass = (statusCode: number | null) => {

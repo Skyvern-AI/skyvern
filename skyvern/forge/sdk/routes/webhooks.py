@@ -23,12 +23,14 @@ LOG = structlog.get_logger()
     tags=["Internal"],
     description="Test a webhook endpoint by sending a sample payload",
     summary="Test webhook endpoint",
+    include_in_schema=False,
 )
 @base_router.post(
     "/internal/test-webhook",
     tags=["Internal"],
     description="Test a webhook endpoint by sending a sample payload",
     summary="Test webhook endpoint",
+    include_in_schema=False,
 )
 async def test_webhook(
     request: TestWebhookRequest,
@@ -59,13 +61,14 @@ async def test_webhook(
                 error="Invalid webhook URL",
             )
     except BlockedHost as exc:
+        blocked_host: str | None = getattr(exc, "host", None)
         return TestWebhookResponse(
             status_code=None,
             latency_ms=0,
             response_body="",
             headers_sent={},
             error=(
-                f"This URL is blocked by SSRF protection (host: {exc.host}). "
+                f"This URL is blocked by SSRF protection (host: {blocked_host or 'unknown'}). "
                 "Add the host to ALLOWED_HOSTS to test internal endpoints or use an external receiver "
                 "such as webhook.site or requestbin.com."
             ),
