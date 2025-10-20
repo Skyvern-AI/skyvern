@@ -213,19 +213,33 @@ async def preview_webhook_replay(
     run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> RunWebhookPreviewResponse:
+    """Return the replay payload preview for a completed run.
+
+    Args:
+        run_id (str): Identifier of the run to preview.
+        current_org (Organization): Organization context for permission and signing.
+
+    Returns:
+        RunWebhookPreviewResponse: Payload and headers that would be used to replay the webhook.
+
+    Raises:
+        HTTPException: 400 if the organization lacks a valid API key or other replay preconditions fail.
+        HTTPException: 404 if the specified run cannot be found.
+        HTTPException: 500 if an unexpected error occurs while building the preview.
+    """
     try:
         return await build_run_preview(
             organization_id=current_org.organization_id,
             run_id=run_id,
         )
     except MissingApiKey as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except (TaskNotFound, WorkflowRunNotFound) as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=exc.message or str(exc))
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except WebhookReplayError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except SkyvernHTTPException as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive guard
         LOG.error("Failed to build webhook replay preview", run_id=run_id, error=str(exc), exc_info=True)
         raise HTTPException(
@@ -251,6 +265,21 @@ async def trigger_webhook_replay(
     request: RunWebhookReplayRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> RunWebhookReplayResponse:
+    """Replay a completed run's webhook to the stored or override URL.
+
+    Args:
+        run_id (str): Identifier of the run whose webhook should be replayed.
+        request (RunWebhookReplayRequest): Optional override URL details for the replay.
+        current_org (Organization): Organization context for permission and signing.
+
+    Returns:
+        RunWebhookReplayResponse: Delivery status information for the replay attempt.
+
+    Raises:
+        HTTPException: 400 if no target URL is available, the organization lacks an API key, or replay validation fails.
+        HTTPException: 404 if the specified run cannot be found.
+        HTTPException: 500 if an unexpected error occurs while replaying the webhook.
+    """
     try:
         return await replay_run_webhook(
             organization_id=current_org.organization_id,
@@ -258,15 +287,15 @@ async def trigger_webhook_replay(
             target_url=request.override_webhook_url,
         )
     except MissingWebhookTarget as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except MissingApiKey as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except (TaskNotFound, WorkflowRunNotFound) as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=exc.message or str(exc))
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except WebhookReplayError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except SkyvernHTTPException as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - defensive guard
         LOG.error("Failed to replay webhook", run_id=run_id, error=str(exc), exc_info=True)
         raise HTTPException(
