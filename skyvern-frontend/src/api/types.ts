@@ -478,6 +478,37 @@ export type CreditCardCredential = {
   card_holder_name: string;
 };
 
+export const OtpType = {
+  Totp: "totp",
+  MagicLink: "magic_link",
+} as const;
+
+export type OtpType = (typeof OtpType)[keyof typeof OtpType];
+
+export type TotpCode = {
+  totp_code_id: string;
+  totp_identifier: string | null;
+  code: string;
+  content: string;
+  workflow_run_id: string | null;
+  workflow_id: string | null;
+  task_id: string | null;
+  source: string | null;
+  otp_type: OtpType | null;
+  expired_at: string | null;
+  created_at: string;
+  modified_at: string;
+};
+
+export type TotpCodeListParams = {
+  totp_identifier?: string;
+  workflow_run_id?: string;
+  workflow_id?: string;
+  task_id?: string;
+  otp_type?: OtpType;
+  limit?: number;
+};
+
 export type ModelsResponse = {
   models: Record<string, string>;
 };
