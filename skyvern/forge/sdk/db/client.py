@@ -2799,13 +2799,17 @@ class AgentDB:
         totp_identifier: str,
         valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
         otp_type: OTPType | None = None,
+        workflow_run_id: str | None = None,
+        limit: int | None = None,
     ) -> list[TOTPCode]:
         """
         1. filter by:
         - organization_id
         - totp_identifier
+        - workflow_run_id (optional)
         2. make sure created_at is within the valid lifespan
         3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
+        4. apply an optional limit at the DB layer
         """
         all_null = and_(
             TOTPCodeModel.task_id.is_(None),
@@ -2821,7 +2825,11 @@ class AgentDB:
             )
             if otp_type:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
+            if workflow_run_id is not None:
+                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
             query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc())
+            if limit is not None:
+                query = query.limit(limit)
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
 
@@ -2831,9 +2839,11 @@ class AgentDB:
         limit: int = 50,
         valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
         otp_type: OTPType | None = None,
+        workflow_run_id: str | None = None,
     ) -> list[TOTPCode]:
         """
-        Return recent otp codes for an organization ordered by newest first.
+        Return recent otp codes for an organization ordered by newest first with optional
+        workflow_run_id filtering.
         """
         all_null = and_(
             TOTPCodeModel.task_id.is_(None),
@@ -2848,6 +2858,8 @@ class AgentDB:
             )
             if otp_type:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
+            if workflow_run_id is not None:
+                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
             query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc()).limit(limit)
             totp_codes = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]

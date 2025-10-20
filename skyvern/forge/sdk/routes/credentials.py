@@ -188,18 +188,18 @@ async def get_totp_codes(
             organization_id=curr_org.organization_id,
             totp_identifier=totp_identifier,
             otp_type=otp_type,
+            workflow_run_id=workflow_run_id,
+            limit=limit,
         )
     else:
         codes = await app.DATABASE.get_recent_otp_codes(
             organization_id=curr_org.organization_id,
             limit=limit,
             otp_type=otp_type,
+            workflow_run_id=workflow_run_id,
         )
 
-    if workflow_run_id:
-        codes = [code for code in codes if code.workflow_run_id == workflow_run_id]
-
-    return codes[:limit]
+    return codes
 
 
 @legacy_base_router.post("/credentials")
