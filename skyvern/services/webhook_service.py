@@ -14,18 +14,14 @@ from skyvern.exceptions import BlockedHost, SkyvernHTTPException, TaskNotFound, 
 from skyvern.forge import app
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.schemas.runs import (
-    RunStatus,
-    RunType,
-    TaskRunResponse,
-    WorkflowRunRequest,
-    WorkflowRunResponse,
-)
+from skyvern.schemas.runs import RunStatus, RunType, TaskRunResponse, WorkflowRunResponse
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
 from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
+
+RESPONSE_BODY_TRUNCATION_LIMIT = 2048
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.models import WorkflowRun
@@ -161,10 +157,7 @@ async def _build_task_v2_payload(task_v2: TaskV2) -> _WebhookPayload:
     task_run_response = await task_v2_service.build_task_v2_run_response(task_v2)
     task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
 
-    payload_dict = json.loads(task_v2.model_dump_json(by_alias=True))
-    payload_dict.update(json.loads(task_run_response_json))
-
-    payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+    payload = json.dumps(json.loads(task_run_response_json), separators=(",", ":"), ensure_ascii=False)
     return _WebhookPayload(
         run_id=task_v2.observer_cruise_id,
         run_type=RunType.task_v2.value,
@@ -208,20 +201,11 @@ async def _build_workflow_payload(
         script_run=status_response.script_run,
         created_at=status_response.created_at,
         modified_at=status_response.modified_at,
-        run_request=WorkflowRunRequest(
-            workflow_id=workflow_run.workflow_permanent_id,
-            title=status_response.workflow_title,
-            parameters=status_response.parameters,
-            proxy_location=workflow_run.proxy_location,
-            webhook_url=workflow_run.webhook_callback_url or None,
-            totp_url=workflow_run.totp_verification_url or None,
-            totp_identifier=workflow_run.totp_identifier,
-        ),
         errors=status_response.errors,
     )
 
     payload_dict = json.loads(status_response.model_dump_json())
-    payload_dict.update(json.loads(run_response.model_dump_json()))
+    payload_dict.update(json.loads(run_response.model_dump_json(exclude={"run_request"})))
     payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
 
     return _WebhookPayload(
@@ -255,8 +239,8 @@ async def _deliver_webhook(
             response = await client.post(url, content=payload, headers=headers, timeout=httpx.Timeout(10.0))
         status_code = response.status_code
         body_text = response.text or ""
-        if len(body_text) > 2048:
-            response_body = f"{body_text[:2048]}\n... (truncated)"
+        if len(body_text) > RESPONSE_BODY_TRUNCATION_LIMIT:
+            response_body = f"{body_text[:RESPONSE_BODY_TRUNCATION_LIMIT]}\n... (truncated)"
         else:
             response_body = body_text or None
     except httpx.TimeoutException:
