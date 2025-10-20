@@ -5,6 +5,7 @@ import { cn } from "@/util/utils";
 import {
   CounterClockwiseClockIcon,
   GearIcon,
+  GlobeIcon,
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { KeyIcon } from "@/components/icons/KeyIcon.tsx";
@@ -35,6 +36,11 @@ function SideNav() {
             label: "History",
             to: "/history",
             icon: <CounterClockwiseClockIcon className="size-6" />,
+          },
+          {
+            label: "Browsers",
+            to: "/browser-sessions",
+            icon: <GlobeIcon className="size-6" />,
           },
         ]}
       />
