@@ -13,9 +13,11 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { KeyIcon } from "@/components/icons/KeyIcon";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { CredentialsTotpTab } from "./CredentialsTotpTab";
 
 const subHeaderText =
-  "Securely store your passwords or credit cards here to link them throughout your workflows.";
+  "Securely store your passwords, credit cards, and manage incoming 2FA codes for your workflows.";
 
 function CredentialsPage() {
   const { setIsOpen, setType } = useCredentialModalState();
@@ -54,7 +56,25 @@ function CredentialsPage() {
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
-      <CredentialsList />
+      <Tabs defaultValue="passwords" className="space-y-4">
+        <TabsList className="bg-slate-elevation1">
+          <TabsTrigger value="passwords">Passwords</TabsTrigger>
+          <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
+          <TabsTrigger value="twoFactor">2FA</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="passwords" className="space-y-4">
+          <CredentialsList filter="password" />
+        </TabsContent>
+
+        <TabsContent value="creditCards" className="space-y-4">
+          <CredentialsList filter="credit_card" />
+        </TabsContent>
+
+        <TabsContent value="twoFactor" className="space-y-4">
+          <CredentialsTotpTab />
+        </TabsContent>
+      </Tabs>
       <CredentialsModal />
 
       {/* Footer note */}
