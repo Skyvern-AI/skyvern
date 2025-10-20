@@ -132,7 +132,9 @@ function CredentialsTotpTab() {
               <Label htmlFor="totp-limit-filter">Limit</Label>
               <Select
                 value={String(limit)}
-                onValueChange={(value) => setLimit(Number(value))}
+                onValueChange={(value) =>
+                  setLimit(Number(value) as (typeof LIMIT_OPTIONS)[number])
+                }
               >
                 <SelectTrigger id="totp-limit-filter" className="w-32">
                   <SelectValue />
@@ -254,7 +256,7 @@ function CredentialsTotpTab() {
                   ))}
               </TableBody>
             </Table>
-            {error && !isFeatureUnavailable && (
+            {Boolean(error) && !isFeatureUnavailable && (
               <div className="border-t border-slate-700 px-4 py-3 text-sm text-red-400">
                 Failed to load codes. Try adjusting filters or refreshing the
                 page.
