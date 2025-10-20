@@ -204,9 +204,7 @@ function BrowserSessions() {
                   ) : (
                     <span className="opacity-50">never</span>
                   );
-                  const cdpUrl =
-                    browserSession.browser_address ??
-                    "wss://session-staging.skyvern.com/pbs_442960015326262218/devtools/browser/f01f27e1-182b-4a33-9017-4c1146d3eb3e";
+                  const cdpUrl = browserSession.browser_address ?? "-";
 
                   return (
                     <TableRow
