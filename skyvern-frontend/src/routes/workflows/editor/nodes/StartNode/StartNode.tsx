@@ -209,7 +209,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                                 <SelectValue placeholder="Run Method" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="ai">
+                                <SelectItem value="agent">
                                   Skyvern Agent
                                 </SelectItem>
                                 <SelectItem value="code">Code</SelectItem>
