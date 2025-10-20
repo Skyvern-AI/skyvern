@@ -408,6 +408,10 @@ class Settings(BaseSettings):
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
                     "label": "Anthropic Claude 4 Sonnet",
                 },
+                "claude-haiku-4-5-20251001": {
+                    "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
+                    "label": "Anthropic Claude 4.5 Haiku",
+                },
                 # "claude-sonnet-4-20250514": {
                 #     "llm_key": "ANTHROPIC_CLAUDE4_SONNET",
                 #     "label": "Anthropic Claude 4 Sonnet",
@@ -439,6 +443,10 @@ class Settings(BaseSettings):
                 "us.anthropic.claude-sonnet-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
                     "label": "Anthropic Claude 4 Sonnet",
+                },
+                "claude-haiku-4-5-20251001": {
+                    "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
+                    "label": "Anthropic Claude 4.5 Haiku",
                 },
             }
 

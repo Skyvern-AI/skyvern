@@ -949,6 +949,7 @@ function isInteractable(element, hoverStylesMap) {
     return true;
   }
 
+  // FIXME: maybe we need to enable the pointer check for all elements?
   if (
     tagName === "div" ||
     tagName === "img" ||
@@ -963,7 +964,12 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "h1" ||
     tagName === "h2" ||
     tagName === "h3" ||
-    tagName === "h4"
+    tagName === "h4" ||
+    // sometime it's a customized element like <my-login-button>, we should check pointer style
+    tagName.includes("button") ||
+    tagName.includes("select") ||
+    tagName.includes("option") ||
+    tagName.includes("textarea")
   ) {
     if (isHoverPointerElement(element, hoverStylesMap)) {
       return true;
