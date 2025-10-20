@@ -171,7 +171,7 @@ function PushTotpCodeForm({
           placeholder="Paste the full email/SMS body or the 6-digit code"
           value={content}
           onChange={(event) => setContent(event.target.value)}
-          disabled={mutation.isPending}
+          readOnly={mutation.isPending}
           className="min-h-[4.5rem]"
         />
         <p className="text-xs text-slate-400">

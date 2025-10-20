@@ -17,7 +17,9 @@ type Options = {
   >;
 };
 
-type UseTotpCodesQueryReturn = ReturnType<typeof useQuery<QueryFnData>> & {
+type UseTotpCodesQueryReturn = ReturnType<
+  typeof useQuery<QueryFnData, unknown, QueryFnData, QueryKey>
+> & {
   isFeatureUnavailable: boolean;
   isCredentialAccountMissing: boolean;
 };
