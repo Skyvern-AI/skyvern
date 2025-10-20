@@ -44,7 +44,7 @@ browser_session = await skyvern.get_browser_session(
 ```python
 from playwright.sync_api import sync_playwright
 
-browser_adress = browser_session.browser_address # Use the browser_session created in the previous step
+browser_address = browser_session.browser_address # Use the browser_session created in the previous step
 download_path = browser_session.download_path # Use the browser_session created in the previous step
 
 with sync_playwright() as playwright: # 
@@ -62,8 +62,7 @@ with sync_playwright() as playwright: #
     )
     context = browser.contexts[0]
     page = context.pages[0]
-
-	page.goto("https://www.skyvern.com")
+    page.goto("https://www.skyvern.com")
 ```
 
 ## Close A Browser Session
