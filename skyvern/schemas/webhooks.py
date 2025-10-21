@@ -15,7 +15,6 @@ class TestWebhookResponse(BaseModel):
     response_body: str = Field(..., description="First 2KB of the response body")
     headers_sent: dict[str, str] = Field(..., description="Headers sent with the webhook request")
     error: str | None = Field(None, description="Error message if the request failed")
-from pydantic import BaseModel, Field
 
 
 class RunWebhookPreviewResponse(BaseModel):

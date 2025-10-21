@@ -1,8 +1,34 @@
-import json
-from datetime import datetime, timezone
+from __future__ import annotations
 
-from skyvern.forge.sdk.schemas.tasks import TaskRequest, TaskResponse, TaskStatus
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunResponseBase, WorkflowRunStatus
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from time import perf_counter
+
+import httpx
+import structlog
+from fastapi import status
+
+from skyvern.config import settings
+from skyvern.exceptions import (
+    BlockedHost,
+    MissingApiKey,
+    MissingWebhookTarget,
+    SkyvernHTTPException,
+    TaskNotFound,
+    WebhookReplayError,
+    WorkflowRunNotFound,
+)
+from skyvern.forge import app
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2
+from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    WorkflowRun,
+    WorkflowRunResponseBase,
+    WorkflowRunStatus,
+)
 from skyvern.schemas.runs import (
     ProxyLocation,
     RunStatus,
@@ -12,6 +38,13 @@ from skyvern.schemas.runs import (
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
+from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
+from skyvern.services import run_service, task_v2_service
+from skyvern.utils.url_validators import validate_url
+
+LOG = structlog.get_logger()
+
+RESPONSE_BODY_TRUNCATION_LIMIT = 2048
 
 
 def _now() -> datetime:
@@ -163,40 +196,6 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> str:
 
     payload_dict.update(json.loads(workflow_run_response.model_dump_json(exclude_unset=True)))
     return json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-from __future__ import annotations
-
-import json
-from dataclasses import dataclass
-from time import perf_counter
-
-import httpx
-import structlog
-from fastapi import status
-
-from skyvern.config import settings
-from skyvern.exceptions import (
-    BlockedHost,
-    MissingApiKey,
-    MissingWebhookTarget,
-    SkyvernHTTPException,
-    TaskNotFound,
-    WebhookReplayError,
-    WorkflowRunNotFound,
-)
-from skyvern.forge import app
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.schemas.task_v2 import TaskV2
-from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.schemas.runs import RunStatus, RunType, TaskRunResponse, WorkflowRunResponse
-from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
-from skyvern.services import run_service, task_v2_service
-from skyvern.utils.url_validators import validate_url
-
-LOG = structlog.get_logger()
-
-RESPONSE_BODY_TRUNCATION_LIMIT = 2048
 
 
 @dataclass
@@ -263,6 +262,15 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
         task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
         if task_v2:
             return await _build_task_v2_payload(task_v2)
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=run_id,
+            organization_id=organization_id,
+        )
+        if workflow_run:
+            return await _build_workflow_payload(
+                organization_id=organization_id,
+                workflow_run_id=run_id,
+            )
         raise WebhookReplayError(f"Run {run_id} was not found.")
 
     run_type = _as_run_type_str(run.task_run_type)
