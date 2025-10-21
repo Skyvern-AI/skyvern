@@ -300,6 +300,13 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
     task: Task | None = await app.DATABASE.get_task(run_id, organization_id=organization_id)
     if not task:
         raise TaskNotFound(task_id=run_id)
+    if not task.status.is_final():
+        LOG.warning(
+            "Webhook replay requested for non-terminal task run",
+            run_id=run_id,
+            status=task.status,
+        )
+        raise WebhookReplayError(f"Run {run_id} has not reached a terminal state (status={task.status}).")
     latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
     task_response = await app.agent.build_task_response(task=task, last_step=latest_step)
 
@@ -307,6 +314,13 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
 
     run_response = await run_service.get_run_response(run_id=run_id, organization_id=organization_id)
     if isinstance(run_response, TaskRunResponse):
+        if not run_response.status.is_final():
+            LOG.warning(
+                "Webhook replay requested for non-terminal task run response",
+                run_id=run_id,
+                status=run_response.status,
+            )
+            raise WebhookReplayError(f"Run {run_id} has not reached a terminal state (status={run_response.status}).")
         run_response_json = run_response.model_dump_json(exclude={"run_request"})
         payload_dict.update(json.loads(run_response_json))
 
@@ -320,7 +334,25 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
 
 
 async def _build_task_v2_payload(task_v2: TaskV2) -> _WebhookPayload:
+    if not task_v2.status.is_final():
+        LOG.warning(
+            "Webhook replay requested for non-terminal task v2 run",
+            run_id=task_v2.observer_cruise_id,
+            status=task_v2.status,
+        )
+        raise WebhookReplayError(
+            f"Run {task_v2.observer_cruise_id} has not reached a terminal state (status={task_v2.status})."
+        )
     task_run_response = await task_v2_service.build_task_v2_run_response(task_v2)
+    if not task_run_response.status.is_final():
+        LOG.warning(
+            "Webhook replay requested for non-terminal task v2 run response",
+            run_id=task_v2.observer_cruise_id,
+            status=task_run_response.status,
+        )
+        raise WebhookReplayError(
+            f"Run {task_v2.observer_cruise_id} has not reached a terminal state (status={task_run_response.status})."
+        )
     task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
 
     payload = json.dumps(json.loads(task_run_response_json), separators=(",", ":"), ensure_ascii=False)
@@ -342,12 +374,30 @@ async def _build_workflow_payload(
     )
     if not workflow_run:
         raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+    if not workflow_run.status.is_final():
+        LOG.warning(
+            "Webhook replay requested for non-terminal workflow run",
+            workflow_run_id=workflow_run_id,
+            status=workflow_run.status,
+        )
+        raise WebhookReplayError(
+            f"Run {workflow_run_id} has not reached a terminal state (status={workflow_run.status})."
+        )
 
     status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
         workflow_permanent_id=workflow_run.workflow_permanent_id,
         workflow_run_id=workflow_run.workflow_run_id,
         organization_id=workflow_run.organization_id,
     )
+    if not status_response.status.is_final():
+        LOG.warning(
+            "Webhook replay requested for non-terminal workflow run response",
+            workflow_run_id=workflow_run_id,
+            status=status_response.status,
+        )
+        raise WebhookReplayError(
+            f"Run {workflow_run_id} has not reached a terminal state (status={status_response.status})."
+        )
 
     app_url = (
         f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
