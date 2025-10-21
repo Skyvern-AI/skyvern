@@ -98,6 +98,16 @@ class WorkflowRunResponse(UniversalBaseModel):
     The errors for the run
     """
 
+    run_with: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Whether the workflow run was executed with agent or code
+    """
+
+    ai_fallback: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    Whether to fallback to AI if code run fails.
+    """
+
     run_request: typing.Optional[WorkflowRunRequest] = pydantic.Field(default=None)
     """
     The original request parameters used to start this workflow run

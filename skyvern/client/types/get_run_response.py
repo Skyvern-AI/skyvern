@@ -189,6 +189,8 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    run_with: typing.Optional[str] = None
+    ai_fallback: typing.Optional[bool] = None
     run_request: typing.Optional[WorkflowRunRequest] = None
 
     if IS_PYDANTIC_V2:

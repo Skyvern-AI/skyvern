@@ -225,6 +225,7 @@ class ForLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
     terminate_criterion: typing.Optional[str] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
+    disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -449,6 +450,7 @@ class ForLoopBlockYamlLoopBlocksItem_TaskV2(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     max_iterations: typing.Optional[int] = None
     max_steps: typing.Optional[int] = None
+    disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

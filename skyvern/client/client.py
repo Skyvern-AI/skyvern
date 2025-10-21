@@ -622,12 +622,20 @@ class Skyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[Workflow]:
         """
         Get all workflows with the latest version for the organization.
+
+        Search semantics:
+        - If `search_key` is provided, its value is used as a unified search term for both
+          `workflows.title` and workflow parameter metadata (key, description, and default_value for
+          `WorkflowParameterModel`).
+        - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
+        - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
 
         Parameters
         ----------
@@ -639,7 +647,11 @@ class Skyvern:
 
         only_workflows : typing.Optional[bool]
 
+        search_key : typing.Optional[str]
+            Unified search across workflow title and parameter metadata (key, description, default_value).
+
         title : typing.Optional[str]
+            Deprecated: use search_key instead.
 
         template : typing.Optional[bool]
 
@@ -669,6 +681,7 @@ class Skyvern:
                 "page_size": page_size,
                 "only_saved_tasks": only_saved_tasks,
                 "only_workflows": only_workflows,
+                "search_key": search_key,
                 "title": title,
                 "template": template,
             },
@@ -1887,6 +1900,7 @@ class Skyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
         credential_id: typing.Optional[str] = OMIT,
@@ -1928,6 +1942,9 @@ class Skyvern:
 
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+        browser_address : typing.Optional[str]
+            The CDP address for the task.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests
@@ -1994,6 +2011,7 @@ class Skyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
                 "extra_http_headers": extra_http_headers,
                 "max_screenshot_scrolling_times": max_screenshot_scrolling_times,
                 "credential_id": credential_id,
@@ -2409,7 +2427,6 @@ class AsyncSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
         model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         publish_workflow: typing.Optional[bool] = OMIT,
@@ -2493,9 +2510,6 @@ class AsyncSkyvern:
 
             Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
 
-        browser_address : typing.Optional[str]
-            The CDP address for the task
-
         model : typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]]
 
             Optional model configuration.
@@ -2561,7 +2575,6 @@ class AsyncSkyvern:
                 "totp_identifier": totp_identifier,
                 "totp_url": totp_url,
                 "browser_session_id": browser_session_id,
-                "browser_address": browser_address,
                 "model": model,
                 "extra_http_headers": extra_http_headers,
                 "publish_workflow": publish_workflow,
@@ -2623,7 +2636,6 @@ class AsyncSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
-        browser_address: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
@@ -2690,9 +2702,6 @@ class AsyncSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
-        browser_address : typing.Optional[str]
-            The CDP address for the workflow
-
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -2751,7 +2760,6 @@ class AsyncSkyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
-                "browser_address": browser_address,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
                 "browser_address": browser_address,
@@ -2950,12 +2958,20 @@ class AsyncSkyvern:
         page_size: typing.Optional[int] = None,
         only_saved_tasks: typing.Optional[bool] = None,
         only_workflows: typing.Optional[bool] = None,
+        search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[Workflow]:
         """
         Get all workflows with the latest version for the organization.
+
+        Search semantics:
+        - If `search_key` is provided, its value is used as a unified search term for both
+          `workflows.title` and workflow parameter metadata (key, description, and default_value for
+          `WorkflowParameterModel`).
+        - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
+        - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
 
         Parameters
         ----------
@@ -2967,7 +2983,11 @@ class AsyncSkyvern:
 
         only_workflows : typing.Optional[bool]
 
+        search_key : typing.Optional[str]
+            Unified search across workflow title and parameter metadata (key, description, default_value).
+
         title : typing.Optional[str]
+            Deprecated: use search_key instead.
 
         template : typing.Optional[bool]
 
@@ -3005,6 +3025,7 @@ class AsyncSkyvern:
                 "page_size": page_size,
                 "only_saved_tasks": only_saved_tasks,
                 "only_workflows": only_workflows,
+                "search_key": search_key,
                 "title": title,
                 "template": template,
             },
@@ -4399,7 +4420,7 @@ class AsyncSkyvern:
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
 
         browser_address : typing.Optional[str]
-            The CDP address for the task
+            The CDP address for the task.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             Additional HTTP headers to include in requests

@@ -16,6 +16,7 @@ class TaskV2BlockYaml(UniversalBaseModel):
     totp_identifier: typing.Optional[str] = None
     max_iterations: typing.Optional[int] = None
     max_steps: typing.Optional[int] = None
+    disable_cache: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

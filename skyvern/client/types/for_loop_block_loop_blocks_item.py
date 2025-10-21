@@ -43,6 +43,7 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -61,7 +62,6 @@ class ForLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -82,6 +82,7 @@ class ForLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     code: str
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
 
@@ -101,6 +102,7 @@ class ForLoopBlockLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     url: str
 
     if IS_PYDANTIC_V2:
@@ -119,6 +121,7 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -137,7 +140,6 @@ class ForLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -158,6 +160,7 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -176,7 +179,6 @@ class ForLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -197,6 +199,7 @@ class ForLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None
@@ -223,6 +226,7 @@ class ForLoopBlockLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     file_url: str
     file_type: FileType
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -243,6 +247,7 @@ class ForLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
     loop_variable_reference: typing.Optional[str] = None
@@ -267,6 +272,7 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: str
     title: typing.Optional[str] = None
@@ -285,7 +291,6 @@ class ForLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -306,6 +311,7 @@ class ForLoopBlockLoopBlocksItem_HttpRequest(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
     headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
@@ -330,6 +336,7 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -348,7 +355,6 @@ class ForLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -369,6 +375,7 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -387,7 +394,6 @@ class ForLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -408,6 +414,7 @@ class ForLoopBlockLoopBlocksItem_PdfParser(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
 
@@ -427,6 +434,7 @@ class ForLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     smtp_host: AwsSecretParameter
     smtp_port: AwsSecretParameter
     smtp_username: AwsSecretParameter
@@ -453,6 +461,7 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -471,7 +480,6 @@ class ForLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -492,6 +500,7 @@ class ForLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     prompt: str
     url: typing.Optional[str] = None
     totp_verification_url: typing.Optional[str] = None
@@ -515,6 +524,7 @@ class ForLoopBlockLoopBlocksItem_TextPrompt(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     llm_key: typing.Optional[str] = None
     prompt: str
     parameters: typing.Optional[typing.List[TextPromptBlockParametersItem]] = None
@@ -536,6 +546,7 @@ class ForLoopBlockLoopBlocksItem_UploadToS3(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -554,6 +565,7 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -572,7 +584,6 @@ class ForLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
-    disable_cache: typing.Optional[bool] = None
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
@@ -593,6 +604,7 @@ class ForLoopBlockLoopBlocksItem_Wait(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     wait_sec: int
     parameters: typing.Optional[typing.List[WaitBlockParametersItem]] = None
 
