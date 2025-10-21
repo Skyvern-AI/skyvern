@@ -220,7 +220,7 @@ function TaskDetails() {
               onTestWebhook={() => setReplayOpen(true)}
             />
             <WebhookReplayDialog
-              runId={taskId ?? ""}
+              runId={task?.workflow_run_id ?? ""}
               disabled={taskIsLoading || !taskHasTerminalState}
               open={replayOpen}
               onOpenChange={setReplayOpen}

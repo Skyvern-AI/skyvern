@@ -214,7 +214,7 @@ LOG = structlog.get_logger()
 )
 async def preview_webhook_replay(
     run_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org),  # noqa: B008
 ) -> RunWebhookPreviewResponse:
     """Return the replay payload preview for a completed run.
 
@@ -268,7 +268,7 @@ async def preview_webhook_replay(
 async def trigger_webhook_replay(
     run_id: str,
     request: RunWebhookReplayRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org),  # noqa: B008
 ) -> RunWebhookReplayResponse:
     """Replay a completed run's webhook to the stored or override URL.
 
