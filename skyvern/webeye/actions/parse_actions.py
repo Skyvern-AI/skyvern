@@ -821,7 +821,7 @@ async def generate_cua_fallback_actions(
                 if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
                     raise NoTOTPVerificationCodeFound()
                 magic_link = otp_value.value
-                reasoning = reasoning or f"Received magic link: {magic_link}"
+                reasoning = reasoning or "Received magic link. Navigating to the magic link URL to verify the login"
                 action = GotoUrlAction(
                     url=magic_link,
                     reasoning=reasoning,
