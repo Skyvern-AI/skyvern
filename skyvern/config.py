@@ -265,6 +265,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
     GEMINI_THINKING_BUDGET: int | None = None
+    GEMINI_CUA_MODEL: str = "gemini-2.5-computer-use-preview-10-2025"
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None

@@ -3,9 +3,11 @@ import re
 from typing import Any, Dict, Match
 
 import structlog
+from google.genai import types as genai_types
 from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
+from skyvern.config import settings
 from skyvern.constants import SCROLL_AMOUNT_MULTIPLIER
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
@@ -24,6 +26,9 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    GoBackAction,
+    GoForwardAction,
+    GotoUrlAction,
     InputOrSelectContext,
     InputTextAction,
     KeypressAction,
@@ -392,6 +397,314 @@ async def parse_cua_actions(
         assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
         actions = await generate_cua_fallback_actions(task, step, assistant_message, reasoning)
     return actions
+
+
+async def parse_gemini_cua_actions(
+    task: Task,
+    step: Step,
+    candidate: genai_types.Candidate,
+    window_dimension: dict[str, int] | None,
+) -> list[Action]:
+    width, height = _resolve_window_dimensions(window_dimension)
+    actions: list[Action] = []
+    text_buffer: list[str] = []
+
+    content = getattr(candidate, "content", None)
+    if not content:
+        assistant_message = None
+        return await generate_cua_fallback_actions(task, step, assistant_message, assistant_message)
+
+    for part in getattr(content, "parts", []) or []:
+        text_content = getattr(part, "text", None)
+        if text_content:
+            text_buffer.append(text_content)
+            continue
+
+        function_call = getattr(part, "function_call", None)
+        if not function_call:
+            continue
+
+        reasoning = " ".join(text_buffer).strip()
+        if reasoning:
+            text_buffer = []
+        else:
+            reasoning = f"Gemini requested {function_call.name}"
+
+        call_actions = _build_gemini_actions_from_call(function_call, reasoning, width, height)
+        for action in call_actions:
+            action.organization_id = task.organization_id
+            action.workflow_run_id = task.workflow_run_id
+            action.task_id = task.task_id
+            action.step_id = step.step_id
+            action.step_order = step.order
+            action.action_order = len(actions)
+            action.tool_call_id = getattr(function_call, "id", None)
+            actions.append(action)
+
+    if actions:
+        return actions
+
+    assistant_message = " ".join(text_buffer) if text_buffer else None
+    return await generate_cua_fallback_actions(task, step, assistant_message, assistant_message)
+
+
+def _resolve_window_dimensions(window_dimension: dict[str, int] | None) -> tuple[int, int]:
+    width: int = settings.BROWSER_WIDTH
+    height: int = settings.BROWSER_HEIGHT
+    if window_dimension is None:
+        LOG.warning("Window dimension missing; falling back to default viewport", width=width, height=height)
+        return width, height
+
+    width_value = window_dimension.get("width")
+    height_value = window_dimension.get("height")
+
+    if not isinstance(width_value, int) or not isinstance(height_value, int):
+        LOG.warning(
+            "Window dimension not int; falling back to default viewport",
+            width=width_value,
+            height=height_value,
+        )
+        return width, height
+
+    return width_value, height_value
+
+
+def _normalized_to_pixel(value: Any, dimension: int) -> int:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = 0.0
+    numeric = max(0.0, min(999.0, numeric))
+    return int(round((numeric / 999.0) * dimension))
+
+
+def _build_gemini_actions_from_call(
+    function_call: genai_types.FunctionCall,
+    reasoning: str,
+    width: int,
+    height: int,
+) -> list[Action]:
+    raw_args = getattr(function_call, "args", {}) or {}
+    if hasattr(raw_args, "to_dict"):
+        args = raw_args.to_dict()  # type: ignore[assignment]
+    elif isinstance(raw_args, dict):
+        args = raw_args
+    else:
+        try:
+            args = dict(raw_args)  # type: ignore[arg-type]
+        except Exception:
+            args = {}
+
+    actions: list[Action] = []
+    name = getattr(function_call, "name", "") or ""
+
+    match name:
+        case "open_web_browser":
+            actions.append(
+                NullAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response="Browser session already active.",
+                )
+            )
+        case "wait_5_seconds":
+            actions.append(
+                WaitAction(
+                    seconds=5,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+            )
+        case "go_back":
+            actions.append(
+                GoBackAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response="Navigate back in browser history.",
+                )
+            )
+        case "go_forward":
+            actions.append(
+                GoForwardAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response="Navigate forward in browser history.",
+                )
+            )
+        case "search":
+            actions.append(
+                GotoUrlAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response="Open search engine homepage.",
+                    url="https://www.google.com",
+                )
+            )
+        case "navigate":
+            url = args.get("url")
+            if isinstance(url, str) and url:
+                actions.append(
+                    GotoUrlAction(
+                        reasoning=reasoning,
+                        intention=reasoning,
+                        response=f"Navigate to {url}",
+                        url=url,
+                    )
+                )
+        case "click_at":
+            x = _normalized_to_pixel(args.get("x"), width)
+            y = _normalized_to_pixel(args.get("y"), height)
+            button = args.get("button", "left")
+            repeat = int(args.get("clicks", 1) or 1)
+            actions.append(
+                ClickAction(
+                    element_id="",
+                    x=x,
+                    y=y,
+                    button=button if button in ["left", "right"] else "left",
+                    repeat=repeat,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=f"Click at ({x}, {y})",
+                )
+            )
+        case "hover_at":
+            x = _normalized_to_pixel(args.get("x"), width)
+            y = _normalized_to_pixel(args.get("y"), height)
+            actions.append(
+                MoveAction(
+                    x=x,
+                    y=y,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=f"Hover at ({x}, {y})",
+                )
+            )
+        case "type_text_at":
+            x = _normalized_to_pixel(args.get("x"), width)
+            y = _normalized_to_pixel(args.get("y"), height)
+            text = args.get("text") or ""
+            press_enter = bool(args.get("press_enter", False))
+
+            actions.append(
+                ClickAction(
+                    element_id="",
+                    x=x,
+                    y=y,
+                    button="left",
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=f"Focus input at ({x}, {y})",
+                )
+            )
+            actions.append(
+                InputTextAction(
+                    element_id="",
+                    text=str(text),
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=str(text),
+                )
+            )
+            if press_enter:
+                actions.append(
+                    KeypressAction(
+                        element_id="",
+                        keys=["Enter"],
+                        reasoning=reasoning,
+                        intention=reasoning,
+                        response="Press Enter",
+                    )
+                )
+        case "key_combination":
+            keys_arg = args.get("keys") or ""
+            if isinstance(keys_arg, str) and keys_arg:
+                keys = [key.strip() for key in keys_arg.replace("-", "+").split("+") if key.strip()]
+                if keys:
+                    actions.append(
+                        KeypressAction(
+                            element_id="",
+                            keys=keys,
+                            reasoning=reasoning,
+                            intention=reasoning,
+                            response=f"Press keys: {' + '.join(keys)}",
+                        )
+                    )
+        case "scroll_document":
+            direction = str(args.get("direction", "down")).lower()
+            magnitude = int(args.get("magnitude", 800) or 800)
+            scroll_x, scroll_y = _direction_to_scroll_delta(direction, magnitude)
+            actions.append(
+                ScrollAction(
+                    scroll_x=scroll_x,
+                    scroll_y=scroll_y,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=f"Scroll {direction}",
+                )
+            )
+        case "scroll_at":
+            direction = str(args.get("direction", "down")).lower()
+            magnitude = int(args.get("magnitude", 800) or 800)
+            x = _normalized_to_pixel(args.get("x"), width)
+            y = _normalized_to_pixel(args.get("y"), height)
+            scroll_x, scroll_y = _direction_to_scroll_delta(direction, magnitude)
+            actions.append(
+                MoveAction(
+                    x=x,
+                    y=y,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=f"Move to ({x}, {y})",
+                )
+            )
+            actions.append(
+                ScrollAction(
+                    x=x,
+                    y=y,
+                    scroll_x=scroll_x,
+                    scroll_y=scroll_y,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=f"Scroll {direction} with magnitude {magnitude}",
+                )
+            )
+        case "drag_and_drop":
+            start_x = _normalized_to_pixel(args.get("x"), width)
+            start_y = _normalized_to_pixel(args.get("y"), height)
+            dest_x = _normalized_to_pixel(args.get("destination_x"), width)
+            dest_y = _normalized_to_pixel(args.get("destination_y"), height)
+            actions.append(
+                DragAction(
+                    start_x=start_x,
+                    start_y=start_y,
+                    path=[(dest_x, dest_y)],
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    response=f"Drag from ({start_x}, {start_y}) to ({dest_x}, {dest_y})",
+                )
+            )
+        case _:
+            LOG.warning(
+                "Unsupported Gemini Computer Use command",
+                command=name,
+                args=args,
+            )
+
+    return actions
+
+
+def _direction_to_scroll_delta(direction: str, magnitude: int) -> tuple[int, int]:
+    magnitude = max(0, magnitude)
+    if direction == "up":
+        return 0, -magnitude
+    if direction == "down":
+        return 0, magnitude
+    if direction == "left":
+        return -magnitude, 0
+    if direction == "right":
+        return magnitude, 0
+    return 0, magnitude
 
 
 async def parse_anthropic_actions(

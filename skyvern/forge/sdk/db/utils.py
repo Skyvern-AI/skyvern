@@ -67,6 +67,8 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     DragAction,
     ExtractAction,
+    GoBackAction,
+    GoForwardAction,
     GotoUrlAction,
     InputTextAction,
     KeypressAction,
@@ -99,6 +101,9 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.WAIT: WaitAction,
     ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
     ActionType.RELOAD_PAGE: ReloadPageAction,
+    ActionType.GOTO_URL: GotoUrlAction,
+    ActionType.GO_BACK: GoBackAction,
+    ActionType.GO_FORWARD: GoForwardAction,
     ActionType.EXTRACT: ExtractAction,
     ActionType.SCROLL: ScrollAction,
     ActionType.KEYPRESS: KeypressAction,
@@ -106,7 +111,6 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.DRAG: DragAction,
     ActionType.VERIFICATION_CODE: VerificationCodeAction,
     ActionType.LEFT_MOUSE: LeftMouseAction,
-    ActionType.GOTO_URL: GotoUrlAction,
 }
 
 

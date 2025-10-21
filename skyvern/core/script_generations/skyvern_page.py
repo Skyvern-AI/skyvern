@@ -1087,6 +1087,31 @@ class SkyvernPage:
         await self.page.reload()
         return
 
+    @action_wrap(ActionType.GOTO_URL)
+    async def goto_url(
+        self,
+        url: str,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> None:
+        await self.goto(url)
+
+    @action_wrap(ActionType.GO_BACK)
+    async def go_back(
+        self,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> None:
+        await self.page.go_back()
+
+    @action_wrap(ActionType.GO_FORWARD)
+    async def go_forward(
+        self,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> None:
+        await self.page.go_forward()
+
     @action_wrap(ActionType.EXTRACT)
     async def extract(
         self,

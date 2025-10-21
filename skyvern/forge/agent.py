@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import os
 import random
@@ -11,6 +12,7 @@ from typing import Any, Tuple, cast
 
 import httpx
 import structlog
+from google.genai import types as genai_types
 from openai.types.responses.response import Response as OpenAIResponse
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
@@ -61,6 +63,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
+from skyvern.forge.computer_use.state import GeminiComputerUseState
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import aws_client
 from skyvern.forge.sdk.api.files import (
@@ -108,11 +111,12 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler
-from skyvern.webeye.actions.models import DetailedAgentStepOutput
+from skyvern.webeye.actions.models import ComputerUseState, DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
     parse_actions,
     parse_anthropic_actions,
     parse_cua_actions,
+    parse_gemini_cua_actions,
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
@@ -301,7 +305,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         complete_verification: bool = True,
         engine: RunEngine = RunEngine.skyvern_v1,
-        cua_response: OpenAIResponse | None = None,
+        cua_response: ComputerUseState | None = None,
         llm_caller: LLMCaller | None = None,
     ) -> Tuple[Step, DetailedAgentStepOutput | None, Step | None]:
         # do not need to do complete verification when it's a CUA task
@@ -917,7 +921,7 @@ class ForgeAgent:
         organization: Organization | None = None,
         task_block: BaseTaskBlock | None = None,
         complete_verification: bool = True,
-        cua_response: OpenAIResponse | None = None,
+        cua_response: ComputerUseState | None = None,
         llm_caller: LLMCaller | None = None,
     ) -> tuple[Step, DetailedAgentStepOutput]:
         detailed_agent_step_output = DetailedAgentStepOutput(
@@ -964,11 +968,12 @@ class ForgeAgent:
             actions: list[Action]
 
             if engine == RunEngine.openai_cua:
-                actions, new_cua_response = await self._generate_cua_actions(
+                openai_previous = cua_response if isinstance(cua_response, OpenAIResponse) else None
+                actions, new_cua_response = await self._generate_openai_cua_actions(
                     task=task,
                     step=step,
                     scraped_page=scraped_page,
-                    previous_response=cua_response,
+                    previous_response=openai_previous,
                     engine=engine,
                 )
                 detailed_agent_step_output.cua_response = new_cua_response
@@ -980,6 +985,15 @@ class ForgeAgent:
                     scraped_page=scraped_page,
                     llm_caller=llm_caller,
                 )
+            elif engine == RunEngine.gemini_cua:
+                gemini_state = cua_response if isinstance(cua_response, GeminiComputerUseState) else None
+                actions, new_gemini_state = await self._generate_gemini_cua_actions(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                    previous_state=gemini_state,
+                )
+                detailed_agent_step_output.cua_response = new_gemini_state
             elif engine == RunEngine.ui_tars and not app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                 "DISABLE_UI_TARS_CUA",
                 task.workflow_run_id or task.task_id,
@@ -1466,7 +1480,7 @@ class ForgeAgent:
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
 
-    async def _generate_cua_actions(
+    async def _generate_openai_cua_actions(
         self,
         task: Task,
         step: Step,
@@ -1630,6 +1644,262 @@ class ForgeAgent:
         )
 
         return await parse_cua_actions(task, step, current_response), current_response
+
+    async def _generate_gemini_cua_actions(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        previous_state: GeminiComputerUseState | None = None,
+    ) -> tuple[list[Action], ComputerUseState | None]:
+        if app.GEMINI_CLIENT is None:
+            LOG.error("Gemini client is not configured. Skipping Gemini CUA action generation.", task_id=task.task_id)
+            return [], previous_state
+
+        LOG.info(
+            "Gemini CUA call starts",
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+
+        conversation = self._initialize_gemini_conversation(previous_state, task, scraped_page)
+
+        response = await self._call_gemini_generate_content(conversation)
+        if response is None or not getattr(response, "candidates", None):
+            LOG.warning(
+                "Gemini Computer Use returned no candidates.",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            return [], previous_state
+
+        candidate = response.candidates[0]
+        if getattr(candidate, "content", None):
+            conversation.append(candidate.content)
+
+        function_calls = self._extract_gemini_function_calls(getattr(candidate, "content", None))
+
+        if not function_calls:
+            reply_text = await self._build_gemini_user_reply(task, step, scraped_page, candidate)
+            if reply_text:
+                conversation.append(genai_types.Content(role="user", parts=[genai_types.Part(text=reply_text)]))
+
+                followup_response = await self._call_gemini_generate_content(conversation)
+                if followup_response is None or not getattr(followup_response, "candidates", None):
+                    LOG.warning(
+                        "Gemini Computer Use follow-up returned no candidates.",
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                    )
+                    return [], previous_state
+
+                followup_candidate = followup_response.candidates[0]
+                if getattr(followup_candidate, "content", None):
+                    conversation.append(followup_candidate.content)
+
+                function_calls = self._extract_gemini_function_calls(getattr(followup_candidate, "content", None))
+                response = followup_response
+                candidate = followup_candidate
+
+        if response is None or candidate is None:
+            LOG.warning(
+                "Gemini Computer Use response is empty; returning no actions.",
+                task_id=task.task_id,
+                step_id=step.step_id,
+            )
+            return [], previous_state
+
+        actions = await parse_gemini_cua_actions(
+            task=task,
+            step=step,
+            candidate=candidate,
+            window_dimension=scraped_page.window_dimension,
+        )
+        await self._record_gemini_usage(task, step, response)
+        new_state = GeminiComputerUseState(
+            contents=conversation,
+            last_response=response,
+            last_function_calls=function_calls,
+        )
+        return actions, new_state
+
+    def _initialize_gemini_conversation(
+        self,
+        previous_state: GeminiComputerUseState | None,
+        task: Task,
+        scraped_page: ScrapedPage,
+    ) -> list[genai_types.Content]:
+        if previous_state:
+            conversation = copy.deepcopy(previous_state.contents)
+        else:
+            user_parts = [genai_types.Part(text=task.navigation_goal)]
+            if scraped_page.screenshots:
+                user_parts.append(genai_types.Part.from_bytes(data=scraped_page.screenshots[0], mime_type="image/png"))
+            conversation = [genai_types.Content(role="user", parts=user_parts)]
+
+        if previous_state and previous_state.last_function_calls:
+            function_response_parts = self._build_gemini_function_responses(
+                previous_state.last_function_calls,
+                scraped_page,
+            )
+            if function_response_parts:
+                conversation.append(genai_types.Content(role="user", parts=function_response_parts))
+        return conversation
+
+    def _extract_gemini_function_calls(
+        self,
+        content: genai_types.Content | None,
+    ) -> list[genai_types.FunctionCall]:
+        function_calls: list[genai_types.FunctionCall] = []
+        if not content:
+            return function_calls
+
+        for part in getattr(content, "parts", []) or []:
+            function_call = getattr(part, "function_call", None)
+            if function_call:
+                function_calls.append(function_call)
+        return function_calls
+
+    def _build_gemini_function_responses(
+        self,
+        function_calls: list[genai_types.FunctionCall],
+        scraped_page: ScrapedPage,
+    ) -> list[genai_types.Part]:
+        if not scraped_page.screenshots:
+            LOG.warning(
+                "Gemini CUA function response requested but no screenshot is available.",
+                url=scraped_page.url,
+            )
+            return []
+
+        screenshot = scraped_page.screenshots[0]
+        response_parts: list[genai_types.Part] = []
+        for function_call in function_calls:
+            response_payload = {"url": scraped_page.url}
+            args = getattr(function_call, "args", {}) or {}
+            if isinstance(args, dict) and args.get("safety_decision"):
+                response_payload["safety_acknowledgement"] = "true"
+
+            response_parts.append(
+                genai_types.Part(
+                    function_response=genai_types.FunctionResponse(
+                        name=function_call.name,
+                        response=response_payload,
+                        parts=[
+                            genai_types.FunctionResponsePart(
+                                inline_data=genai_types.FunctionResponseBlob(
+                                    mime_type="image/png",
+                                    data=screenshot,
+                                )
+                            )
+                        ],
+                    )
+                )
+            )
+        return response_parts
+
+    async def _build_gemini_user_reply(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        candidate: genai_types.Candidate,
+    ) -> str | None:
+        context = skyvern_context.ensure_context()
+        if task.task_id in context.totp_codes:
+            verification_code = context.totp_codes.pop(task.task_id)
+            LOG.info(
+                "Using verification code from context for Gemini CU call",
+                task_id=task.task_id,
+                verification_code=verification_code,
+            )
+            return f"Here is the verification code: {verification_code}"
+
+        assistant_message = self._extract_gemini_text(candidate)
+        if not assistant_message:
+            return None
+
+        skyvern_repsonse_prompt = load_prompt_with_elements(
+            element_tree_builder=scraped_page,
+            prompt_engine=prompt_engine,
+            template_name="cua-answer-question",
+            navigation_goal=task.navigation_goal,
+            assistant_reasoning=None,
+            assistant_message=assistant_message,
+        )
+        skyvern_response = await app.LLM_API_HANDLER(
+            prompt=skyvern_repsonse_prompt,
+            prompt_name="cua-answer-question",
+            step=step,
+            screenshots=scraped_page.screenshots,
+        )
+        LOG.info("Skyvern response to Gemini CUA question", skyvern_response=skyvern_response)
+        resp_content = skyvern_response.get("answer")
+        if not resp_content:
+            resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
+        return resp_content
+
+    def _extract_gemini_text(self, candidate: genai_types.Candidate) -> str | None:
+        if not getattr(candidate, "content", None):
+            return None
+        texts: list[str] = []
+        for part in getattr(candidate.content, "parts", []) or []:
+            text = getattr(part, "text", None)
+            if text:
+                texts.append(text)
+        return " ".join(texts) if texts else None
+
+    async def _call_gemini_generate_content(
+        self,
+        contents: list[genai_types.Content],
+    ) -> genai_types.GenerateContentResponse | None:
+        client = app.GEMINI_CLIENT
+        if client is None:
+            return None
+
+        config = genai_types.GenerateContentConfig(
+            tools=[
+                genai_types.Tool(
+                    computer_use=genai_types.ComputerUse(
+                        environment=genai_types.Environment.ENVIRONMENT_BROWSER,
+                    )
+                )
+            ],
+            # Explicit screen dimensions were removed from the 1.43.0 ComputerUse schema;
+            # letting the service pick the default media resolution avoids INVALID_ARGUMENT errors.
+            temperature=0,
+        )
+        return await client.aio.models.generate_content(
+            model=settings.GEMINI_CUA_MODEL,
+            contents=contents,
+            config=config,
+        )
+
+    async def _record_gemini_usage(
+        self,
+        task: Task,
+        step: Step,
+        response: genai_types.GenerateContentResponse,
+    ) -> None:
+        usage = getattr(response, "usage_metadata", None) or getattr(response, "usage", None)
+        if not usage:
+            return
+
+        input_tokens = getattr(usage, "prompt_token_count", None) or getattr(usage, "input_tokens", None)
+        output_tokens = getattr(usage, "candidates_token_count", None) or getattr(usage, "output_tokens", None)
+        reasoning_tokens = getattr(usage, "reasoning_token_count", None)
+        cached_tokens = getattr(usage, "cached_token_count", None)
+
+        await app.DATABASE.update_step(
+            task_id=task.task_id,
+            step_id=step.step_id,
+            organization_id=task.organization_id,
+            incremental_cost=0,
+            incremental_input_tokens=input_tokens if input_tokens else None,
+            incremental_output_tokens=output_tokens if output_tokens else None,
+            incremental_reasoning_tokens=reasoning_tokens if reasoning_tokens else None,
+            incremental_cached_tokens=cached_tokens if cached_tokens else None,
+        )
 
     async def _generate_anthropic_actions(
         self,

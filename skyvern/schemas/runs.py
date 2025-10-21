@@ -231,6 +231,7 @@ class RunType(StrEnum):
     workflow_run = "workflow_run"
     openai_cua = "openai_cua"
     anthropic_cua = "anthropic_cua"
+    gemini_cua = "gemini_cua"
     ui_tars = "ui_tars"
 
 
@@ -239,11 +240,12 @@ class RunEngine(StrEnum):
     skyvern_v2 = "skyvern-2.0"
     openai_cua = "openai-cua"
     anthropic_cua = "anthropic-cua"
+    gemini_cua = "gemini-cua"
     ui_tars = "ui-tars"
 
 
-CUA_ENGINES = [RunEngine.openai_cua, RunEngine.anthropic_cua, RunEngine.ui_tars]
-CUA_RUN_TYPES = [RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]
+CUA_ENGINES = [RunEngine.openai_cua, RunEngine.anthropic_cua, RunEngine.gemini_cua, RunEngine.ui_tars]
+CUA_RUN_TYPES = [RunType.openai_cua, RunType.anthropic_cua, RunType.gemini_cua, RunType.ui_tars]
 
 
 class RunStatus(StrEnum):
@@ -492,9 +494,14 @@ class BaseRunResponse(BaseModel):
 
 
 class TaskRunResponse(BaseRunResponse):
-    run_type: Literal[RunType.task_v1, RunType.task_v2, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars] = (
-        Field(description="Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars")
-    )
+    run_type: Literal[
+        RunType.task_v1,
+        RunType.task_v2,
+        RunType.openai_cua,
+        RunType.anthropic_cua,
+        RunType.gemini_cua,
+        RunType.ui_tars,
+    ] = Field(description="Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, gemini_cua, ui_tars")
     run_request: TaskRunRequest | None = Field(
         default=None, description="The original request parameters used to start this task run"
     )

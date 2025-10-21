@@ -282,6 +282,7 @@
                       "task_v2": "#/components/schemas/TaskRunResponse",
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
+                      "gemini_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
@@ -8863,6 +8864,7 @@
           "skyvern-2.0",
           "openai-cua",
           "anthropic-cua",
+          "gemini-cua",
           "ui-tars"
         ],
         "title": "RunEngine"
@@ -10018,7 +10020,7 @@
           },
           "engine": {
             "$ref": "#/components/schemas/RunEngine",
-            "description": "\nThe engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
+            "description": "\nThe engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool. The `gemini-cua` engine uses Google's Gemini 2.5 Computer Use model.\n",
             "default": "skyvern-2.0"
           },
           "title": {
@@ -10485,10 +10487,11 @@
               "task_v2",
               "openai_cua",
               "anthropic_cua",
+              "gemini_cua",
               "ui_tars"
             ],
             "title": "Run Type",
-            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
+            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, gemini_cua, ui_tars"
           },
           "run_request": {
             "anyOf": [

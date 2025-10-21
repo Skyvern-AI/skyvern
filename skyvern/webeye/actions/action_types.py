@@ -21,12 +21,14 @@ class ActionType(StrEnum):
     EXTRACT = "extract"
     VERIFICATION_CODE = "verification_code"
 
-    GOTO_URL = "goto_url"
     SCROLL = "scroll"
     KEYPRESS = "keypress"
     MOVE = "move"
     DRAG = "drag"
     LEFT_MOUSE = "left_mouse"
+    GOTO_URL = "goto_url"
+    GO_BACK = "go_back"
+    GO_FORWARD = "go_forward"
 
     def is_web_action(self) -> bool:
         return self in [
