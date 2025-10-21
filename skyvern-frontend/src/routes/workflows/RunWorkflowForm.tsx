@@ -48,6 +48,7 @@ import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types"
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 
 // Utility function to omit specified keys from an object
 function omit<T extends Record<string, unknown>, K extends keyof T>(
@@ -461,13 +462,37 @@ function RunWorkflowForm({
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
-                        <Input
-                          {...field}
-                          placeholder="https://"
-                          value={
-                            field.value === null ? "" : (field.value as string)
-                          }
-                        />
+                        <div className="flex flex-col gap-2">
+                          <Input
+                            className="w-full"
+                            {...field}
+                            placeholder="https://"
+                            value={
+                              field.value === null
+                                ? ""
+                                : (field.value as string)
+                            }
+                          />
+                          <TestWebhookDialog
+                            runType="workflow_run"
+                            runId={null}
+                            initialWebhookUrl={
+                              field.value === null
+                                ? undefined
+                                : (field.value as string)
+                            }
+                            trigger={
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                className="self-start"
+                                disabled={!field.value}
+                              >
+                                Test Webhook
+                              </Button>
+                            }
+                          />
+                        </div>
                       </FormControl>
                       <FormMessage />
                     </div>
