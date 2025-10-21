@@ -25,3 +25,10 @@ groups:
           repository: Skyvern-AI/skyvern-python
         config:
           client_class_name: Skyvern
+  ts-sdk:
+    generators:
+      - name: fernapi/fern-typescript-node-sdk
+        version: 3.10.0
+        output:
+          location: npm
+          package-name: "@skyvern/skyvern-typescript"
