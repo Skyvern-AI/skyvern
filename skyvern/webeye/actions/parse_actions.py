@@ -24,6 +24,7 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    GotoUrlAction,
     InputOrSelectContext,
     InputTextAction,
     KeypressAction,
@@ -799,6 +800,53 @@ async def generate_cua_fallback_actions(
             reasoning=reasoning,
             intention=reasoning,
         )
+    elif skyvern_action_type == "get_magic_link":
+        if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+            LOG.info(
+                "Getting magic link for CUA",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
+            )
+            try:
+                otp_value = await poll_otp_value(
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    totp_verification_url=task.totp_verification_url,
+                    totp_identifier=task.totp_identifier,
+                )
+                if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
+                    raise NoTOTPVerificationCodeFound()
+                magic_link = otp_value.value
+                reasoning = reasoning or f"Received magic link: {magic_link}"
+                action = GotoUrlAction(
+                    url=magic_link,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+            except NoTOTPVerificationCodeFound:
+                reasoning_suffix = "No magic link found"
+                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+            except FailedToGetTOTPVerificationCode as e:
+                reasoning_suffix = f"Failed to get magic link. Reason: {e.reason}"
+                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+        else:
+            action = TerminateAction(
+                reasoning=reasoning,
+                intention=reasoning,
+            )
+
     elif skyvern_action_type == "get_verification_code":
         if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             LOG.info(
