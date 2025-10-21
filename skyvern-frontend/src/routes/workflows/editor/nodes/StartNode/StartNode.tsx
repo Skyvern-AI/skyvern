@@ -39,6 +39,8 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { cn } from "@/util/utils";
+import { Button } from "@/components/ui/button";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 
 interface StartSettings {
   webhookCallbackUrl: string;
@@ -170,15 +172,35 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           <Label>Webhook Callback URL</Label>
                           <HelpTooltip content="The URL of a webhook endpoint to send the workflow results" />
                         </div>
-                        <Input
-                          value={data.webhookCallbackUrl}
-                          placeholder="https://"
-                          onChange={(event) => {
-                            update({
-                              webhookCallbackUrl: event.target.value,
-                            });
-                          }}
-                        />
+                        <div className="flex flex-col gap-2">
+                          <Input
+                            className="w-full"
+                            value={data.webhookCallbackUrl}
+                            placeholder="https://"
+                            onChange={(event) => {
+                              update({
+                                webhookCallbackUrl: event.target.value,
+                              });
+                            }}
+                          />
+                          <TestWebhookDialog
+                            runType="workflow_run"
+                            runId={null}
+                            initialWebhookUrl={
+                              data.webhookCallbackUrl || undefined
+                            }
+                            trigger={
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                className="self-start"
+                                disabled={!data.webhookCallbackUrl}
+                              >
+                                Test Webhook
+                              </Button>
+                            }
+                          />
+                        </div>
                       </div>
                       <div className="space-y-2">
                         <div className="flex gap-2">

@@ -41,6 +41,7 @@ import {
 import { ProxySelector } from "@/components/ProxySelector";
 import { Switch } from "@/components/ui/switch";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
@@ -527,11 +528,31 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         </FormLabel>
                         <div className="w-full">
                           <FormControl>
-                            <Input
-                              {...field}
-                              placeholder="https://"
-                              value={field.value === null ? "" : field.value}
-                            />
+                            <div className="flex flex-col gap-2">
+                              <Input
+                                className="w-full"
+                                {...field}
+                                placeholder="https://"
+                                value={field.value === null ? "" : field.value}
+                              />
+                              <TestWebhookDialog
+                                runType="task"
+                                runId={null}
+                                initialWebhookUrl={
+                                  field.value === null ? undefined : field.value
+                                }
+                                trigger={
+                                  <Button
+                                    type="button"
+                                    variant="secondary"
+                                    className="self-start"
+                                    disabled={!field.value}
+                                  >
+                                    Test Webhook
+                                  </Button>
+                                }
+                              />
+                            </div>
                           </FormControl>
                           <FormMessage />
                         </div>
