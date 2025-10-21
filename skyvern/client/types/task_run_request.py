@@ -12,19 +12,19 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2
 class TaskRunRequest(UniversalBaseModel):
     prompt: str = pydantic.Field()
     """
-
+    
     The goal or task description for Skyvern to accomplish
     """
 
     url: typing.Optional[str] = pydantic.Field(default=None)
     """
-
+    
     The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
     """
 
     engine: typing.Optional[RunEngine] = pydantic.Field(default=None)
     """
-
+    
     The engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
     """
 
@@ -35,9 +35,9 @@ class TaskRunRequest(UniversalBaseModel):
 
     proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
     """
-
+    
     Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
-
+    
     Available geotargeting options:
     - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
     - RESIDENTIAL_ES: Spain
@@ -62,49 +62,49 @@ class TaskRunRequest(UniversalBaseModel):
 
     data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = pydantic.Field(default=None)
     """
-
+    
     The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
     """
 
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
     """
-
+    
     Custom mapping of error codes to error messages if Skyvern encounters an error.
     """
 
     max_steps: typing.Optional[int] = pydantic.Field(default=None)
     """
-
+    
     Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
     """
 
     webhook_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-
+    
     After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.
     """
 
     totp_identifier: typing.Optional[str] = pydantic.Field(default=None)
     """
-
+    
     Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
     """
 
     totp_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-
+    
     URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
     """
 
     browser_session_id: typing.Optional[str] = pydantic.Field(default=None)
     """
-
+    
     Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
     """
 
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = pydantic.Field(default=None)
     """
-
+    
     Optional model configuration.
     """
 
@@ -126,6 +126,11 @@ class TaskRunRequest(UniversalBaseModel):
     max_screenshot_scrolls: typing.Optional[int] = pydantic.Field(default=None)
     """
     The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
+    """
+
+    browser_address: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    The CDP address for the task.
     """
 
     if IS_PYDANTIC_V2:
