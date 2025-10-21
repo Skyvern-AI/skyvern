@@ -2,8 +2,9 @@
 
 from ..core.pydantic_utilities import UniversalBaseModel
 import pydantic
-from ..core.pydantic_utilities import IS_PYDANTIC_V2
 import typing
+from .totp_type import TotpType
+from ..core.pydantic_utilities import IS_PYDANTIC_V2
 
 
 class PasswordCredentialResponse(UniversalBaseModel):
@@ -14,6 +15,11 @@ class PasswordCredentialResponse(UniversalBaseModel):
     username: str = pydantic.Field()
     """
     The username associated with the credential
+    """
+
+    totp_type: typing.Optional[TotpType] = pydantic.Field(default=None)
+    """
+    Type of 2FA method used for this credential
     """
 
     if IS_PYDANTIC_V2:

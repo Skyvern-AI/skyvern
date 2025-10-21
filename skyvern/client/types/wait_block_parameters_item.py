@@ -33,6 +33,51 @@ class WaitBlockParametersItem_AwsSecret(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class WaitBlockParametersItem_AzureSecret(UniversalBaseModel):
+    parameter_type: typing.Literal["azure_secret"] = "azure_secret"
+    key: str
+    description: typing.Optional[str] = None
+    azure_secret_parameter_id: str
+    workflow_id: str
+    azure_key: str
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WaitBlockParametersItem_AzureVaultCredential(UniversalBaseModel):
+    parameter_type: typing.Literal["azure_vault_credential"] = "azure_vault_credential"
+    key: str
+    description: typing.Optional[str] = None
+    azure_vault_credential_parameter_id: str
+    workflow_id: str
+    vault_name: str
+    username_key: str
+    password_key: str
+    totp_secret_key: typing.Optional[str] = None
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class WaitBlockParametersItem_BitwardenCreditCardData(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_credit_card_data"] = "bitwarden_credit_card_data"
     key: str
@@ -218,6 +263,8 @@ class WaitBlockParametersItem_Workflow(UniversalBaseModel):
 
 WaitBlockParametersItem = typing.Union[
     WaitBlockParametersItem_AwsSecret,
+    WaitBlockParametersItem_AzureSecret,
+    WaitBlockParametersItem_AzureVaultCredential,
     WaitBlockParametersItem_BitwardenCreditCardData,
     WaitBlockParametersItem_BitwardenLoginCredential,
     WaitBlockParametersItem_BitwardenSensitiveInformation,

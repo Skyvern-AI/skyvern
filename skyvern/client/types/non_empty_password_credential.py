@@ -3,6 +3,7 @@
 from ..core.pydantic_utilities import UniversalBaseModel
 import pydantic
 import typing
+from .totp_type import TotpType
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 
 
@@ -24,6 +25,11 @@ class NonEmptyPasswordCredential(UniversalBaseModel):
     totp: typing.Optional[str] = pydantic.Field(default=None)
     """
     Optional TOTP (Time-based One-Time Password) string used to generate 2FA codes
+    """
+
+    totp_type: typing.Optional[TotpType] = pydantic.Field(default=None)
+    """
+    Type of 2FA method used for this credential
     """
 
     if IS_PYDANTIC_V2:

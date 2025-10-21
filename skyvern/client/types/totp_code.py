@@ -4,6 +4,7 @@ from ..core.pydantic_utilities import UniversalBaseModel
 import pydantic
 import typing
 import datetime as dt
+from .otp_type import OtpType
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 
 
@@ -66,6 +67,11 @@ class TotpCode(UniversalBaseModel):
     modified_at: dt.datetime = pydantic.Field()
     """
     The timestamp when the TOTP code was modified.
+    """
+
+    otp_type: typing.Optional[OtpType] = pydantic.Field(default=None)
+    """
+    The type of the OTP code.
     """
 
     if IS_PYDANTIC_V2:
