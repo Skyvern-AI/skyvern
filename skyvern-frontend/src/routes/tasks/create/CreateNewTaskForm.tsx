@@ -21,9 +21,10 @@ import { KeyValueInput } from "@/components/KeyValueInput";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
@@ -757,8 +758,10 @@ function CreateNewTaskForm({ initialValues }: Props) {
             getOptions={() =>
               ({
                 method: "POST",
-                url: `${apiBaseUrl}/tasks`,
-                body: createTaskRequestObject(form.getValues()),
+                url: `${runsApiBaseUrl}/run/tasks`,
+                body: buildTaskRunPayload(
+                  createTaskRequestObject(form.getValues()),
+                ),
                 headers: {
                   "Content-Type": "application/json",
                   "x-api-key": apiCredential ?? "<your-api-key>",

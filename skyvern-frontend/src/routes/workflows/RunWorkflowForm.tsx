@@ -42,7 +42,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -165,6 +165,25 @@ function getRunWorkflowRequestBody(
   }
 
   return body;
+}
+
+// Transform RunWorkflowRequestBody to match WorkflowRunRequest schema for Runs API v2
+function transformToWorkflowRunRequest(
+  body: RunWorkflowRequestBody,
+  workflowId: string,
+) {
+  const { data, webhook_callback_url, ...rest } = body;
+  const transformed: Record<string, unknown> = {
+    workflow_id: workflowId,
+    parameters: data,
+    ...rest,
+  };
+
+  if (webhook_callback_url) {
+    transformed.webhook_url = webhook_callback_url;
+  }
+
+  return transformed;
 }
 
 type RunWorkflowFormType = Record<string, unknown> & {
@@ -807,14 +826,22 @@ function RunWorkflowForm({
                 values,
                 workflowParameters,
               );
+              const transformedBody = transformToWorkflowRunRequest(
+                body,
+                workflowPermanentId,
+              );
+
+              // Build headers - x-max-steps-override is optional and can be added manually if needed
+              const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                "x-api-key": apiCredential ?? "<your-api-key>",
+              };
+
               return {
                 method: "POST",
-                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                body,
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
+                url: `${runsApiBaseUrl}/run/workflows`,
+                body: transformedBody,
+                headers,
               } satisfies ApiCommandOptions;
             }}
           />
