@@ -38,6 +38,7 @@ from .types.script_file_create import ScriptFileCreate
 from .types.create_script_response import CreateScriptResponse
 from .core.client_wrapper import AsyncClientWrapper
 from .scripts.client import AsyncScriptsClient
+from skyvern.forge.sdk.schemas.actions import RunActionResponse, RunSdkActionResponse, SdkAction
 
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
@@ -2328,6 +2329,84 @@ class Skyvern:
                     CreateScriptResponse,
                     parse_obj_as(
                         type_=CreateScriptResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    def run_sdk_action(
+        self,
+        *,
+        url: str,
+        action: SdkAction,
+        browser_session_id: str | None = None,
+        browser_address: str | None = None,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> RunSdkActionResponse:
+        """
+        Execute a single SDK action with the specified parameters
+
+        Parameters
+        ----------
+        url : str
+            The URL where the action should be executed
+
+        action : SdkAction
+            The action to execute (ClickAction, InputTextAction, UploadFileAction, SelectOptionAction, or ExtractAction)
+
+        browser_session_id : str | None
+            The browser session ID where the action should be executed
+
+        browser_address : str | None
+            The browser address where the action should be executed
+
+        workflow_run_id : typing.Optional[str]
+            Optional workflow run ID to continue an existing workflow run
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        RunSdkActionResponse
+            The result from executing the SDK action, including the workflow_run_id and result
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/actions/run_sdk_action",
+            method="POST",
+            json={
+                "url": url,
+                "action": action,
+                "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
+                "workflow_run_id": workflow_run_id,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    RunSdkActionResponse,
+                    parse_obj_as(
+                        type_=RunSdkActionResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )
@@ -4844,6 +4923,84 @@ class AsyncSkyvern:
                     CreateScriptResponse,
                     parse_obj_as(
                         type_=CreateScriptResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    )
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, body=_response.text)
+        raise ApiError(status_code=_response.status_code, body=_response_json)
+
+    async def run_sdk_action(
+        self,
+        *,
+        url: str,
+        action: SdkAction,
+        browser_session_id: str | None = None,
+        browser_address: str | None = None,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> RunSdkActionResponse:
+        """
+        Execute a single SDK action with the specified parameters
+
+        Parameters
+        ----------
+        url : str
+            The URL where the action should be executed
+
+        action : SdkAction
+            The action to execute (ClickAction, InputTextAction, UploadFileAction, SelectOptionAction, or ExtractAction)
+
+        browser_session_id : str | None
+            The browser session ID where the action should be executed
+
+        browser_address : str | None
+            The browser address where the action should be executed
+
+        workflow_run_id : typing.Optional[str]
+            Optional workflow run ID to continue an existing workflow run
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        RunSdkActionResponse
+            The result from executing the SDK action, including the workflow_run_id and result
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/actions/run_sdk_action",
+            method="POST",
+            json={
+                "url": url,
+                "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
+                "workflow_run_id": workflow_run_id,
+                "action": action,
+            },
+            headers={
+                "content-type": "application/json",
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                return typing.cast(
+                    RunSdkActionResponse,
+                    parse_obj_as(
+                        type_=RunSdkActionResponse,  # type: ignore
                         object_=_response.json(),
                     ),
                 )

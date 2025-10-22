@@ -1,7 +1,7 @@
 from playwright.async_api import BrowserContext, Page
 
 from skyvern.client import AsyncSkyvern
-from skyvern.library.skyvern_browser_page import SkyvernBrowserPage, SkyvernPageRun
+from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 
 
 class SkyvernBrowser:
@@ -44,6 +44,20 @@ class SkyvernBrowser:
         self._browser_address = browser_address
         self._client = client
 
+        self.workflow_run_id: None | str = None
+
+    @property
+    def browser_session_id(self) -> str | None:
+        return self._browser_session_id
+
+    @property
+    def browser_address(self) -> str | None:
+        return self._browser_address
+
+    @property
+    def client(self) -> AsyncSkyvern:
+        return self._client
+
     async def get_working_page(self) -> SkyvernBrowserPage:
         """Get the most recent page or create a new one if none exists.
 
@@ -73,5 +87,4 @@ class SkyvernBrowser:
         return await self._create_skyvern_page(page)
 
     async def _create_skyvern_page(self, page: Page) -> SkyvernBrowserPage:
-        page_ai = SkyvernPageRun(page, self._browser_session_id, self._browser_address, self._client)
-        return SkyvernBrowserPage(page, page_ai)
+        return SkyvernBrowserPage(self, page)
