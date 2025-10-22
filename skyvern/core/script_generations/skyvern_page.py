@@ -10,7 +10,8 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.config import settings
-from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi, render_template
+from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi, render_template
+from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.exceptions import ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -123,7 +124,7 @@ class SkyvernPage:
     ) -> SkyvernPage:
         scraped_page = await cls.create_scraped_page(browser_session_id=browser_session_id)
         page = await scraped_page._browser_state.must_get_working_page()
-        ai = SkyvernPageAi(scraped_page, page)
+        ai = RealSkyvernPageAi(scraped_page, page)
         return cls(scraped_page=scraped_page, page=page, ai=ai)
 
     @classmethod
