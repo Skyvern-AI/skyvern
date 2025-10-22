@@ -3,6 +3,7 @@
 from ..core.pydantic_utilities import UniversalBaseModel
 import pydantic
 import typing
+from .file_info import FileInfo
 import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 
@@ -45,6 +46,26 @@ class BrowserSessionResponse(UniversalBaseModel):
     app_url: typing.Optional[str] = pydantic.Field(default=None)
     """
     Url for the browser session page
+    """
+
+    vnc_streaming_supported: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    Whether the browser session supports VNC streaming
+    """
+
+    download_path: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    The path where the browser session downloads files
+    """
+
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = pydantic.Field(default=None)
+    """
+    The list of files downloaded by the browser session
+    """
+
+    recordings: typing.Optional[typing.List[FileInfo]] = pydantic.Field(default=None)
+    """
+    The list of video recordings from the browser session
     """
 
     started_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)

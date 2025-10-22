@@ -6,4 +6,4 @@ import enum
 class SkyvernEnvironment(enum.Enum):
     PRODUCTION = "https://api.skyvern.com"
     STAGING = "https://api-staging.skyvern.com"
-    LOCAL = "http://localhost:8000"
+    DEVELOPMENT = "http://localhost:8000"

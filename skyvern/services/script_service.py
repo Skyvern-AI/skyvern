@@ -379,7 +379,7 @@ async def _take_workflow_run_block_screenshot(
         LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
         screenshot = await browser_state.take_fullpage_screenshot(
-            use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                 "ENABLE_PLAYWRIGHT_FULLPAGE",
                 workflow_run_id,
                 properties={"organization_id": str(organization_id)},

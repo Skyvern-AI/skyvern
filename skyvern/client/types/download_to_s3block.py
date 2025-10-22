@@ -12,6 +12,7 @@ class DownloadToS3Block(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     url: str
 
     if IS_PYDANTIC_V2:
