@@ -66,7 +66,7 @@ class SkyvernSdk:
     def __init__(
         self,
         *,
-        environment: SkyvernEnvironment = SkyvernEnvironment.LOCAL,
+        environment: SkyvernEnvironment = SkyvernEnvironment.DEVELOPMENT,
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
