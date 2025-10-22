@@ -28,4 +28,4 @@ groups:
   ts-sdk:
     generators:
       - name: fernapi/fern-typescript-sdk
-        version: 2.13.0
+        version: 3.11.1
