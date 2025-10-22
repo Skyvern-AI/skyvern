@@ -73,12 +73,12 @@ async def collect_experiment_metadata(
         for flag in experiment_flags:
             try:
                 # Get the experiment value (already cached by experimentation provider)
-                value = experimentation_provider.get_value_cached(
+                value = await experimentation_provider.get_value_cached(
                     flag, distinct_id, properties={"organization_id": organization_id}
                 )
 
                 # Get the payload if available (already cached by experimentation provider)
-                payload = experimentation_provider.get_payload_cached(
+                payload = await experimentation_provider.get_payload_cached(
                     flag, distinct_id, properties={"organization_id": organization_id}
                 )
 
