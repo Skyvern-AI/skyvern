@@ -3,6 +3,7 @@
 from ..core.pydantic_utilities import UniversalBaseModel
 import pydantic
 import typing
+import datetime as dt
 from ..core.pydantic_utilities import IS_PYDANTIC_V2
 
 
@@ -24,6 +25,11 @@ class FileInfo(UniversalBaseModel):
     filename: typing.Optional[str] = pydantic.Field(default=None)
     """
     Original filename
+    """
+
+    modified_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
+    """
+    Modified time of the file
     """
 
     if IS_PYDANTIC_V2:

@@ -15,11 +15,15 @@ class FileUploadBlock(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
     aws_access_key_id: typing.Optional[str] = None
     aws_secret_access_key: typing.Optional[str] = None
     region_name: typing.Optional[str] = None
+    azure_storage_account_name: typing.Optional[str] = None
+    azure_storage_account_key: typing.Optional[str] = None
+    azure_blob_container_name: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
