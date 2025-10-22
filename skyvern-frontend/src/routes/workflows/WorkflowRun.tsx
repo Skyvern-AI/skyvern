@@ -41,7 +41,8 @@ import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
 import { cn } from "@/util/utils";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
+import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
@@ -108,6 +109,7 @@ function WorkflowRun() {
   }, [blockScriptsPublished, setHasPublishedCode]);
 
   const { data: workflowRunTimeline } = useWorkflowRunTimelineQuery();
+  const [replayOpen, setReplayOpen] = useState(false);
 
   const cancelWorkflowMutation = useMutation({
     mutationFn: async () => {
@@ -304,7 +306,7 @@ function WorkflowRun() {
           </div>
 
           <div className="flex gap-2">
-            <CopyApiCommandDropdown
+            <ApiWebhookActionsMenu
               getOptions={() =>
                 ({
                   method: "POST",
@@ -319,6 +321,15 @@ function WorkflowRun() {
                   },
                 }) satisfies ApiCommandOptions
               }
+              webhookDisabled={workflowRunIsLoading || !workflowRunIsFinalized}
+              onTestWebhook={() => setReplayOpen(true)}
+            />
+            <WebhookReplayDialog
+              runId={workflowRunId ?? ""}
+              disabled={workflowRunIsLoading || !workflowRunIsFinalized}
+              open={replayOpen}
+              onOpenChange={setReplayOpen}
+              hideTrigger
             />
             <Button asChild variant="secondary">
               <Link to={`/workflows/${workflowPermanentId}/debug`}>
