@@ -44,3 +44,18 @@ async def auth(apikey: str | None, token: str | None, websocket: WebSocket) -> s
         return None
 
     return organization_id
+
+
+# NOTE(jdo:streaming-local-dev): use this instead of the above `auth`
+async def _auth(apikey: str | None, token: str | None, websocket: WebSocket) -> str | None:
+    """
+    Dummy auth for local testing.
+    """
+
+    try:
+        await websocket.accept()
+    except ConnectionClosedOK:
+        LOG.info("WebSocket connection closed cleanly.")
+        return None
+
+    return "o_temp123"
