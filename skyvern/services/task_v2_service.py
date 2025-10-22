@@ -166,7 +166,7 @@ async def initialize_task_v2(
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
-        url=user_url,
+        url=user_url if user_url else None,
         organization_id=organization.organization_id,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
