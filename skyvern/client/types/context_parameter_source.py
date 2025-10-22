@@ -75,6 +75,27 @@ class ContextParameterSource_AwsSecret(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class ContextParameterSource_AzureSecret(UniversalBaseModel):
+    parameter_type: typing.Literal["azure_secret"] = "azure_secret"
+    key: str
+    description: typing.Optional[str] = None
+    azure_secret_parameter_id: str
+    workflow_id: str
+    azure_key: str
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class ContextParameterSource_BitwardenLoginCredential(UniversalBaseModel):
     parameter_type: typing.Literal["bitwarden_login_credential"] = "bitwarden_login_credential"
     key: str
@@ -174,6 +195,30 @@ class ContextParameterSource_Onepassword(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class ContextParameterSource_AzureVaultCredential(UniversalBaseModel):
+    parameter_type: typing.Literal["azure_vault_credential"] = "azure_vault_credential"
+    key: str
+    description: typing.Optional[str] = None
+    azure_vault_credential_parameter_id: str
+    workflow_id: str
+    vault_name: str
+    username_key: str
+    password_key: str
+    totp_secret_key: typing.Optional[str] = None
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    deleted_at: typing.Optional[dt.datetime] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class ContextParameterSource_Output(UniversalBaseModel):
     parameter_type: typing.Literal["output"] = "output"
     key: str
@@ -219,10 +264,12 @@ ContextParameterSource = typing.Union[
     ContextParameterSource_Workflow,
     ContextParameterSource_Context,
     ContextParameterSource_AwsSecret,
+    ContextParameterSource_AzureSecret,
     ContextParameterSource_BitwardenLoginCredential,
     ContextParameterSource_BitwardenSensitiveInformation,
     ContextParameterSource_BitwardenCreditCardData,
     ContextParameterSource_Onepassword,
+    ContextParameterSource_AzureVaultCredential,
     ContextParameterSource_Output,
     ContextParameterSource_Credential,
 ]

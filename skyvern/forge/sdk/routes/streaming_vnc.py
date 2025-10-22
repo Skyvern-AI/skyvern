@@ -1,8 +1,16 @@
 """
 Streaming VNC WebSocket connections.
+
+NOTE(jdo:streaming-local-dev)
+-----------------------------
+  - grep the above for local development seams
+  - augment those seams as indicated, then
+  - stand up https://github.com/jomido/whyvern
+
 """
 
 import asyncio
+import typing as t
 from urllib.parse import urlparse
 
 import structlog
@@ -14,6 +22,7 @@ from websockets.exceptions import ConnectionClosedError
 import skyvern.forge.sdk.routes.streaming_clients as sc
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.routes.streaming_agent import connected_agent
 from skyvern.forge.sdk.routes.streaming_auth import auth
 from skyvern.forge.sdk.routes.streaming_verify import (
     loop_verify_browser_session,
@@ -157,6 +166,68 @@ async def get_streaming_for_workflow_run(
     return streaming, loops
 
 
+def verify_message_channel(
+    message_channel: sc.MessageChannel | None, streaming: sc.Streaming
+) -> sc.MessageChannel | t.Literal[False]:
+    if message_channel and message_channel.is_open:
+        return message_channel
+
+    LOG.warning(
+        "No message channel found for client, or it is not open",
+        message_channel=message_channel,
+        client_id=streaming.client_id,
+        organization_id=streaming.organization_id,
+    )
+
+    return False
+
+
+async def copy_text(streaming: sc.Streaming) -> None:
+    try:
+        async with connected_agent(streaming) as agent:
+            copied_text = await agent.get_selected_text()
+
+            LOG.info(
+                "Retrieved selected text via CDP",
+                organization_id=streaming.organization_id,
+            )
+
+            message_channel = sc.get_message_client(streaming.client_id)
+
+            if cc := verify_message_channel(message_channel, streaming):
+                await cc.send_copied_text(copied_text, streaming)
+            else:
+                LOG.warning(
+                    "No message channel found for client, or it is not open",
+                    message_channel=message_channel,
+                    client_id=streaming.client_id,
+                    organization_id=streaming.organization_id,
+                )
+    except Exception:
+        LOG.exception(
+            "Failed to retrieve selected text via CDP",
+            organization_id=streaming.organization_id,
+        )
+
+
+async def ask_for_clipboard(streaming: sc.Streaming) -> None:
+    try:
+        LOG.info(
+            "Asking for clipboard data via CDP",
+            organization_id=streaming.organization_id,
+        )
+
+        message_channel = sc.get_message_client(streaming.client_id)
+
+        if cc := verify_message_channel(message_channel, streaming):
+            await cc.ask_for_clipboard(streaming)
+    except Exception:
+        LOG.exception(
+            "Failed to ask for clipboard via CDP",
+            organization_id=streaming.organization_id,
+        )
+
+
 async def loop_stream_vnc(streaming: sc.Streaming) -> None:
     """
     Actually stream the VNC session data between a frontend and a browser
@@ -183,6 +254,9 @@ async def loop_stream_vnc(streaming: sc.Streaming) -> None:
         host = parsed_browser_address.hostname
         vnc_url = f"ws://{host}:{streaming.vnc_port}"
 
+    # NOTE(jdo:streaming-local-dev)
+    # vnc_url = "ws://localhost:9001/ws/novnc"
+
     LOG.info(
         "Connecting to VNC URL.",
         vnc_url=vnc_url,
@@ -206,6 +280,12 @@ async def loop_stream_vnc(streaming: sc.Streaming) -> None:
 
                         if message_type == sc.MessageType.Keyboard.value:
                             streaming.update_key_state(data)
+
+                            if streaming.key_state.is_copy(data):
+                                await copy_text(streaming)
+
+                            if streaming.key_state.is_paste(data):
+                                await ask_for_clipboard(streaming)
 
                             if streaming.key_state.is_forbidden(data):
                                 continue

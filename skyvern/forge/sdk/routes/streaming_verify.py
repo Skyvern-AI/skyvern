@@ -233,7 +233,7 @@ async def verify_workflow_run(
     return workflow_run, addressable_browser_session
 
 
-async def loop_verify_browser_session(verifiable: sc.CommandChannel | sc.Streaming) -> None:
+async def loop_verify_browser_session(verifiable: sc.MessageChannel | sc.Streaming) -> None:
     """
     Loop until the browser session is cleared or the websocket is closed.
     """
@@ -266,7 +266,7 @@ async def loop_verify_task(streaming: sc.Streaming) -> None:
         await asyncio.sleep(2)
 
 
-async def loop_verify_workflow_run(verifiable: sc.CommandChannel | sc.Streaming) -> None:
+async def loop_verify_workflow_run(verifiable: sc.MessageChannel | sc.Streaming) -> None:
     """
     Loop until the workflow run is cleared or the websocket is closed.
     """

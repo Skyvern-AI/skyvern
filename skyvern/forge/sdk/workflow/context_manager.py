@@ -148,7 +148,9 @@ class WorkflowRunContext:
             workflow_run_context.parameters[context_parameter.key] = context_parameter
 
         # Compute once and cache whether secrets should be included in templates
-        workflow_run_context.include_secrets_in_templates = workflow_run_context._should_include_secrets_in_templates()
+        workflow_run_context.include_secrets_in_templates = (
+            await workflow_run_context._should_include_secrets_in_templates()
+        )
 
         return workflow_run_context
 
@@ -203,12 +205,12 @@ class WorkflowRunContext:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
 
-    def _should_include_secrets_in_templates(self) -> bool:
+    async def _should_include_secrets_in_templates(self) -> bool:
         """
         Check if secrets should be included in template formatting based on experimentation provider.
         This check is done once per workflow run context to avoid repeated calls.
         """
-        return app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+        return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
             "CODE_BLOCK_ENABLED",
             self.workflow_run_id,
             properties={"organization_id": self.organization_id},
