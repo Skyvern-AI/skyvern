@@ -24,6 +24,7 @@ class NavigationBlockYaml(UniversalBaseModel):
     totp_verification_url: typing.Optional[str] = None
     totp_identifier: typing.Optional[str] = None
     cache_actions: typing.Optional[bool] = None
+    disable_cache: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     complete_verification: typing.Optional[bool] = None

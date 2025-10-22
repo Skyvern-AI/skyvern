@@ -536,7 +536,7 @@ async def run_task_v2_helper(
     current_run_id = context.run_id if context and context.run_id else task_v2_id
     # task v2 can be nested inside a workflow run, so we need to use the root workflow run id
     root_workflow_run_id = context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
-    enable_parse_select_in_extract = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+    enable_parse_select_in_extract = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_PARSE_SELECT_IN_EXTRACT",
         current_run_id,
         properties={"organization_id": organization_id, "task_url": task_v2.url},

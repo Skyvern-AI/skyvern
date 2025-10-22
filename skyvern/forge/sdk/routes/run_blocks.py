@@ -30,6 +30,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import workflow_service
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 
 LOG = structlog.get_logger()
 DEFAULT_LOGIN_PROMPT = """If you're not on the login page, navigate to login page and login using the credentials given.
@@ -74,6 +75,15 @@ async def login(
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    try:
+        url = prepend_scheme_and_validate_url(login_request.url) if login_request.url else None
+        totp_verification_url = (
+            prepend_scheme_and_validate_url(login_request.totp_url) if login_request.totp_url else None
+        )
+        webhook_url = prepend_scheme_and_validate_url(login_request.webhook_url) if login_request.webhook_url else None
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
     # 1. create empty workflow with a credential parameter
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
         organization,
@@ -157,11 +167,11 @@ async def login(
     login_block_yaml = LoginBlockYAML(
         label=label,
         title=label,
-        url=login_request.url,
+        url=url,
         navigation_goal=login_request.prompt or DEFAULT_LOGIN_PROMPT,
         max_steps_per_run=10,
         parameter_keys=[parameter_key],
-        totp_verification_url=login_request.totp_url,
+        totp_verification_url=totp_verification_url,
         totp_identifier=login_request.totp_identifier,
     )
     yaml_blocks = [login_block_yaml]
@@ -190,9 +200,9 @@ async def login(
     request_id = context.request_id
     legacy_workflow_request = WorkflowRequestBody(
         proxy_location=login_request.proxy_location,
-        webhook_callback_url=login_request.webhook_url,
+        webhook_callback_url=webhook_url,
         totp_identifier=login_request.totp_identifier,
-        totp_verification_url=login_request.totp_url,
+        totp_verification_url=totp_verification_url,
         browser_session_id=login_request.browser_session_id,
         browser_address=login_request.browser_address,
         max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
@@ -225,8 +235,8 @@ async def login(
             workflow_id=new_workflow.workflow_id,
             title=new_workflow.title,
             proxy_location=login_request.proxy_location,
-            webhook_url=login_request.webhook_url,
-            totp_url=login_request.totp_url,
+            webhook_url=webhook_url,
+            totp_url=totp_verification_url,
             totp_identifier=login_request.totp_identifier,
             browser_session_id=login_request.browser_session_id,
             max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,

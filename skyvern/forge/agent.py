@@ -980,7 +980,7 @@ class ForgeAgent:
                     scraped_page=scraped_page,
                     llm_caller=llm_caller,
                 )
-            elif engine == RunEngine.ui_tars and not app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                 "DISABLE_UI_TARS_CUA",
                 task.workflow_run_id or task.task_id,
                 properties={"organization_id": task.organization_id},
@@ -1374,7 +1374,7 @@ class ForgeAgent:
                 and complete_verification
                 and (task.navigation_goal or task.complete_criterion)
             ):
-                disable_user_goal_check = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                     "DISABLE_USER_GOAL_CHECK",
                     task.task_id,
                     properties={"task_url": task.url, "organization_id": task.organization_id},
@@ -1857,7 +1857,7 @@ class ForgeAgent:
         try:
             screenshot = await browser_state.take_post_action_screenshot(
                 scrolling_number=scrolling_number,
-                use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                     "ENABLE_PLAYWRIGHT_FULLPAGE",
                     task.workflow_run_id or task.task_id,
                     properties={"organization_id": task.organization_id},
@@ -2487,7 +2487,7 @@ class ForgeAgent:
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
                     screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                             "ENABLE_PLAYWRIGHT_FULLPAGE",
                             task.workflow_run_id or task.task_id,
                             properties={"organization_id": task.organization_id},
