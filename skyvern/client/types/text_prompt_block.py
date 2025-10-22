@@ -14,6 +14,7 @@ class TextPromptBlock(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     llm_key: typing.Optional[str] = None
     prompt: str
     parameters: typing.Optional[typing.List[TextPromptBlockParametersItem]] = None

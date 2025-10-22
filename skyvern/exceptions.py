@@ -49,6 +49,26 @@ class ProxyLocationNotSupportedError(SkyvernException):
         super().__init__(f"Unknown proxy location: {proxy_location}")
 
 
+class WebhookReplayError(SkyvernHTTPException):
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        status_code: int = status.HTTP_400_BAD_REQUEST,
+    ):
+        super().__init__(message=message or "Webhook replay failed.", status_code=status_code)
+
+
+class MissingWebhookTarget(WebhookReplayError):
+    def __init__(self, message: str | None = None):
+        super().__init__(message or "No webhook URL configured for the run.")
+
+
+class MissingApiKey(WebhookReplayError):
+    def __init__(self, message: str | None = None):
+        super().__init__(message or "Organization does not have a valid API key configured.")
+
+
 class TaskNotFound(SkyvernHTTPException):
     def __init__(self, task_id: str | None = None):
         super().__init__(f"Task {task_id} not found", status_code=status.HTTP_404_NOT_FOUND)
