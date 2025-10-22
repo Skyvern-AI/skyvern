@@ -271,7 +271,10 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
                 organization_id=organization_id,
                 workflow_run_id=run_id,
             )
-        raise WebhookReplayError(f"Run {run_id} was not found.")
+        raise SkyvernHTTPException(
+            f"Run {run_id} not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
 
     run_type = _as_run_type_str(run.task_run_type)
     if run.task_run_type in {
@@ -288,7 +291,10 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
     if run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
-            raise WebhookReplayError(f"Task v2 run {run_id} missing task record.")
+            raise SkyvernHTTPException(
+                f"Task v2 run {run_id} missing task record",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
         return await _build_task_v2_payload(task_v2)
     if run.task_run_type == RunType.workflow_run:
         return await _build_workflow_payload(organization_id=organization_id, workflow_run_id=run.run_id)
@@ -420,7 +426,16 @@ async def _build_workflow_payload(
         errors=status_response.errors,
     )
 
-    payload_dict = json.loads(status_response.model_dump_json())
+    payload_dict = json.loads(
+        status_response.model_dump_json(
+            exclude={
+                "webhook_callback_url",
+                "totp_verification_url",
+                "totp_identifier",
+                "extra_http_headers",
+            }
+        )
+    )
     payload_dict.update(json.loads(run_response.model_dump_json(exclude={"run_request"})))
     payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
 

@@ -157,13 +157,13 @@ export function WebhookReplayDialog({
       replayResult?.payload ?? previewQuery.data?.payload ?? undefined;
     return formatJson(payload);
   }, [replayResult?.payload, previewQuery.data?.payload]);
+  const defaultUrl = previewQuery.data?.default_webhook_url?.trim() ?? "";
 
   const handleSend = () => {
     if (!previewQuery.data || replayMutation.isPending) {
       return;
     }
     const trimmed = targetUrl.trim();
-    const defaultUrl = previewQuery.data.default_webhook_url?.trim() ?? "";
 
     if (!trimmed && !defaultUrl) {
       setFormError("Provide a webhook URL before sending.");
@@ -231,7 +231,9 @@ export function WebhookReplayDialog({
             <div className="flex items-center gap-3 pt-1">
               <Button
                 onClick={handleSend}
-                disabled={replayMutation.isPending || !targetUrl.trim()}
+                disabled={
+                  replayMutation.isPending || (!targetUrl.trim() && !defaultUrl)
+                }
               >
                 {replayMutation.isPending && (
                   <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
