@@ -351,7 +351,7 @@ class Block(BaseModel, abc.ABC):
             else:
                 try:
                     screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                             "ENABLE_PLAYWRIGHT_FULLPAGE",
                             workflow_run_id,
                             properties={"organization_id": str(organization_id)},
@@ -659,7 +659,7 @@ class BaseTaskBlock(Block):
                 try:
                     # add screenshot artifact for the first task
                     screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                             "ENABLE_PLAYWRIGHT_FULLPAGE",
                             workflow_run_id,
                             properties={"organization_id": str(organization_id)},
