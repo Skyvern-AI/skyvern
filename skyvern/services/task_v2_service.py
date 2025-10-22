@@ -262,7 +262,7 @@ async def initialize_task_v2_metadata(
     user_prompt: str | None,
     current_browser_url: str | None,
     user_url: str | None,
-    current_run_id: str | None,
+    current_run_id: str,
 ) -> TaskV2:
     thought = await app.DATABASE.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -271,7 +271,7 @@ async def initialize_task_v2_metadata(
         thought_scenario=ThoughtScenario.generate_metadata,
     )
 
-    enable_current_url_validation = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+    enable_current_url_validation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_TASKV2_METADATA_CURRENT_URL_VALIDATION",
         current_run_id,
         properties={"organization_id": task_v2.organization_id},
@@ -586,7 +586,7 @@ async def run_task_v2_helper(
         user_prompt=task_v2.prompt,
         current_browser_url=current_url,
         user_url=task_v2.url,
-        current_run_id=current_run_id
+        current_run_id=current_run_id,
     )
     url = str(task_v2.url)
 
