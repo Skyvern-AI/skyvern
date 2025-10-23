@@ -2180,6 +2180,18 @@ async def handle_goto_url_action(
     return [ActionSuccess()]
 
 
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+async def handle_close_page_action(
+    action: actions.ClosePageAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.close(reason=action.reasoning)
+    return [ActionSuccess()]
+
+
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
 ActionHandler.register_action_type(ActionType.CLICK, handle_click_action)
 ActionHandler.register_action_type(ActionType.INPUT_TEXT, handle_input_text_action)
@@ -2198,6 +2210,7 @@ ActionHandler.register_action_type(ActionType.DRAG, handle_drag_action)
 ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verification_code_action)
 ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
 ActionHandler.register_action_type(ActionType.GOTO_URL, handle_goto_url_action)
+ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_action)
 
 
 async def get_actual_value_of_parameter_if_secret(task: Task, parameter: str) -> Any:
