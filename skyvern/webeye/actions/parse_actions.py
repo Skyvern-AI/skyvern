@@ -21,6 +21,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     CheckboxAction,
     ClickAction,
+    ClosePageAction,
     CompleteAction,
     DownloadFileAction,
     DragAction,
@@ -167,6 +168,9 @@ def parse_action(
 
     if action_type == ActionType.SOLVE_CAPTCHA:
         return SolveCaptchaAction(**base_action_dict)
+
+    if action_type == ActionType.CLOSE_PAGE:
+        return ClosePageAction(**base_action_dict)
 
     raise UnsupportedActionType(action_type=action_type)
 
@@ -826,6 +830,7 @@ async def generate_cua_fallback_actions(
                     url=magic_link,
                     reasoning=reasoning,
                     intention=reasoning,
+                    is_magic_link=True,
                 )
             except NoTOTPVerificationCodeFound:
                 reasoning_suffix = "No magic link found"

@@ -1262,6 +1262,7 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             WorkflowRunStatus.running,
             WorkflowRunStatus.created,
             WorkflowRunStatus.queued,
+            WorkflowRunStatus.paused,
         ]:
             continue
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)

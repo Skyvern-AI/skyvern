@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from playwright.async_api import Frame
+from playwright.async_api import Frame, Page
 
 
 @dataclass
@@ -46,6 +46,15 @@ class SkyvernContext:
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
     ai_mode_override: str | None = None
+
+    # magic link handling
+    # task_id is the key, page is the value
+    # we only consider the page is a magic link page in the same task scope
+    # for example, login block has a magic link page,
+    # but it will only be considered as a magic link page in the login block scope
+    # next blocks won't consider the page as a magic link page
+    magic_link_pages: dict[str, Page] = field(default_factory=dict)
+
     """
     Example output value:
     {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}
@@ -61,6 +70,19 @@ class SkyvernContext:
     def pop_totp_code(self, task_id: str) -> None:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
+
+    def add_magic_link_page(self, task_id: str, page: Page) -> None:
+        self.magic_link_pages[task_id] = page
+
+    def has_magic_link_page(self, task_id: str) -> bool:
+        if task_id not in self.magic_link_pages:
+            return False
+
+        page = self.magic_link_pages[task_id]
+        if page.is_closed():
+            self.magic_link_pages.pop(task_id)
+            return False
+        return True
 
 
 _context: ContextVar[SkyvernContext | None] = ContextVar(
