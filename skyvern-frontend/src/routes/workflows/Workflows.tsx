@@ -40,7 +40,6 @@ import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import { NarrativeCard } from "./components/header/NarrativeCard";
-import { WorkflowParametersDialog } from "./components/WorkflowParametersDialog";
 import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
@@ -71,7 +70,6 @@ function Workflows() {
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
-  const [openWorkflowId, setOpenWorkflowId] = useState<string | null>(null);
   const [debouncedSearch] = useDebounce(search, 500);
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -612,14 +610,6 @@ function Workflows() {
               )}
             </TableBody>
           </Table>
-          <WorkflowParametersDialog
-            open={openWorkflowId !== null}
-            onOpenChange={(open) => {
-              if (!open) setOpenWorkflowId(null);
-            }}
-            workflowId={openWorkflowId}
-            workflows={workflows}
-          />
           <div className="relative px-3 py-3">
             <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
               <span className="text-slate-400">Items per page</span>
