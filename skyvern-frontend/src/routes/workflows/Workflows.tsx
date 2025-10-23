@@ -36,12 +36,16 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import { NarrativeCard } from "./components/header/NarrativeCard";
 import { WorkflowParametersDialog } from "./components/WorkflowParametersDialog";
+import { FolderCard } from "./components/FolderCard";
+import { CreateFolderDialog } from "./components/CreateFolderDialog";
+import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
+import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
@@ -72,10 +76,28 @@ function Workflows() {
     ? Number(searchParams.get("page_size"))
     : 10;
 
+  // Folder state
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
+  const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
+  const [isViewAllFoldersOpen, setIsViewAllFoldersOpen] = useState(false);
+
+  // Fetch folders
+  const { data: allFolders = [] } = useFoldersQuery({ page_size: 10 });
+
+  // Sort folders by modified date (most recent first) and get top 5
+  const recentFolders = useMemo(() => {
+    return [...allFolders]
+      .sort(
+        (a, b) =>
+          new Date(b.modified_at).getTime() - new Date(a.modified_at).getTime()
+      )
+      .slice(0, 5);
+  }, [allFolders]);
+
   const { data: workflows = [], isLoading } = useQuery<
     Array<WorkflowApiResponse>
   >({
-    queryKey: ["workflows", debouncedSearch, page, itemsPerPage],
+    queryKey: ["workflows", debouncedSearch, page, itemsPerPage, selectedFolderId],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
@@ -84,6 +106,9 @@ function Workflows() {
       params.append("only_workflows", "true");
       if (debouncedSearch) {
         params.append("search_key", debouncedSearch);
+      }
+      if (selectedFolderId) {
+        params.append("folder_id", selectedFolderId);
       }
       return client
         .get(`/workflows`, {
@@ -94,7 +119,7 @@ function Workflows() {
   });
 
   const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
-    queryKey: ["workflows", debouncedSearch, page + 1, itemsPerPage],
+    queryKey: ["workflows", debouncedSearch, page + 1, itemsPerPage, selectedFolderId],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
@@ -103,6 +128,9 @@ function Workflows() {
       params.append("only_workflows", "true");
       if (debouncedSearch) {
         params.append("search_key", debouncedSearch);
+      }
+      if (selectedFolderId) {
+        params.append("folder_id", selectedFolderId);
       }
       return client
         .get(`/workflows`, {
@@ -191,8 +219,65 @@ function Workflows() {
         </div>
       </div>
       <div className="space-y-4">
-        <header>
+        {/* Folders Section */}
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <h2 className="text-lg font-semibold">Folders</h2>
+              <Button
+                variant="link"
+                size="sm"
+                className="h-auto p-0 text-blue-600 dark:text-blue-400"
+                onClick={() => setIsCreateFolderOpen(true)}
+              >
+                + New folder
+              </Button>
+            </div>
+            {allFolders.length > 5 && (
+              <Button
+                variant="link"
+                size="sm"
+                className="text-blue-600 dark:text-blue-400"
+                onClick={() => setIsViewAllFoldersOpen(true)}
+              >
+                View all
+              </Button>
+            )}
+          </div>
+
+          {recentFolders.length > 0 && (
+            <div className="grid grid-cols-5 gap-4">
+              {recentFolders.map((folder) => (
+                <FolderCard
+                  key={folder.folder_id}
+                  folder={folder}
+                  isSelected={selectedFolderId === folder.folder_id}
+                  onClick={() =>
+                    setSelectedFolderId(
+                      selectedFolderId === folder.folder_id
+                        ? null
+                        : folder.folder_id
+                    )
+                  }
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Workflows Section */}
+        <header className="flex items-center justify-between">
           <h1 className="text-xl">My Flows</h1>
+          {selectedFolderId && (
+            <Button
+              variant="link"
+              size="sm"
+              className="h-auto p-0 text-blue-600 dark:text-blue-400"
+              onClick={() => setSelectedFolderId(null)}
+            >
+              View all workflows
+            </Button>
+          )}
         </header>
         <div className="flex justify-between">
           <div className="relative">
@@ -403,6 +488,19 @@ function Workflows() {
             </Pagination>
           </div>
         </div>
+
+        {/* Folder Dialogs */}
+        <CreateFolderDialog
+          open={isCreateFolderOpen}
+          onOpenChange={setIsCreateFolderOpen}
+        />
+        <ViewAllFoldersDialog
+          open={isViewAllFoldersOpen}
+          onOpenChange={setIsViewAllFoldersOpen}
+          selectedFolderId={selectedFolderId}
+          onFolderSelect={setSelectedFolderId}
+        />
+
         <WorkflowTemplates />
       </div>
     </div>
