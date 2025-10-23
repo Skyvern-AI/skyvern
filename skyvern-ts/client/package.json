@@ -1,6 +1,6 @@
 {
     "name": "@skyvern/client",
-    "version": "0.0.94",
+    "version": "0.2.18",
     "private": false,
     "repository": "github:Skyvern-AI/skyvern-typescript",
     "type": "commonjs",
