@@ -1576,14 +1576,15 @@ class AgentDB:
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
         search_key: str | None = None,
+        folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
 
         Search semantics:
-        - If `search_key` is provided, its value is used as a unified search term for both
-          `workflows.title` and workflow parameter metadata (key, description, and default_value).
+        - If `search_key` is provided, its value is used as a unified search term for
+          `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value).
         - If `search_key` is not provided, no search filtering is applied.
         - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
         """
@@ -1606,11 +1607,15 @@ class AgentDB:
                     )
                     .subquery()
                 )
-                main_query = select(WorkflowModel).join(
-                    subquery,
-                    (WorkflowModel.organization_id == subquery.c.organization_id)
-                    & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
-                    & (WorkflowModel.version == subquery.c.max_version),
+                main_query = (
+                    select(WorkflowModel)
+                    .join(
+                        subquery,
+                        (WorkflowModel.organization_id == subquery.c.organization_id)
+                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                        & (WorkflowModel.version == subquery.c.max_version),
+                    )
+                    .outerjoin(FolderModel, WorkflowModel.folder_id == FolderModel.folder_id)
                 )
                 if only_saved_tasks:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
@@ -1618,9 +1623,12 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
                 if statuses:
                     main_query = main_query.where(WorkflowModel.status.in_(statuses))
+                if folder_id:
+                    main_query = main_query.where(WorkflowModel.folder_id == folder_id)
                 if search_key:
                     search_like = f"%{search_key}%"
                     title_like = WorkflowModel.title.ilike(search_like)
+                    folder_title_like = FolderModel.title.ilike(search_like)
 
                     parameter_filters = [
                         # WorkflowParameterModel
@@ -1742,7 +1750,7 @@ class AgentDB:
                             )
                         ),
                     ]
-                    main_query = main_query.where(or_(title_like, or_(*parameter_filters)))
+                    main_query = main_query.where(or_(title_like, folder_title_like, or_(*parameter_filters)))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )

@@ -2064,9 +2064,10 @@ async def get_workflows(
     only_workflows: bool = Query(False),
     search_key: str | None = Query(
         None,
-        description="Unified search across workflow title and parameter metadata (key, description, default_value).",
+        description="Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).",
     ),
     title: str = Query("", deprecated=True, description="Deprecated: use search_key instead."),
+    folder_id: str | None = Query(None, description="Filter workflows by folder ID"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
@@ -2074,8 +2075,8 @@ async def get_workflows(
     Get all workflows with the latest version for the organization.
 
     Search semantics:
-    - If `search_key` is provided, its value is used as a unified search term for both
-      `workflows.title` and workflow parameter metadata (key, description, and default_value for
+    - If `search_key` is provided, its value is used as a unified search term for
+      `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
       `WorkflowParameterModel`).
     - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
     - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -2111,6 +2112,7 @@ async def get_workflows(
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
         search_key=effective_search,
+        folder_id=folder_id,
         statuses=[WorkflowStatus.published, WorkflowStatus.draft],
     )
 

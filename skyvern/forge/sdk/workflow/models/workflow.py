@@ -83,6 +83,7 @@ class Workflow(BaseModel):
     cache_key: str | None = None
     run_sequentially: bool | None = None
     sequential_key: str | None = None
+    folder_id: str | None = None
 
     created_at: datetime
     modified_at: datetime

@@ -288,6 +288,7 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         cache_key=workflow_model.cache_key,
         run_sequentially=workflow_model.run_sequentially,
         sequential_key=workflow_model.sequential_key,
+        folder_id=workflow_model.folder_id,
     )
 
 
