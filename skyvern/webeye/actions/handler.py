@@ -55,6 +55,7 @@ from skyvern.exceptions import (
     OptionIndexOutOfBound,
     WrongElementToUploadFile,
 )
+from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -522,6 +523,9 @@ async def handle_click_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    # Get wait config once for this handler
+    wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
+
     dom = DomUtil(scraped_page=scraped_page, page=page)
     original_url = page.url
     if action.x is not None and action.y is not None:
@@ -567,7 +571,9 @@ async def handle_click_action(
         return [ActionSuccess()]
 
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
-    await asyncio.sleep(0.3)
+
+    # Wait after getting element to allow any dynamic changes
+    await asyncio.sleep(get_wait_time(wait_config, "post_click_delay", default=0.3))
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if await skyvern_element.is_disabled(dynamic=True):
@@ -1501,6 +1507,9 @@ async def handle_download_file_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    # Get wait config once for this handler
+    wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
+
     dom = DomUtil(scraped_page=scraped_page, page=page)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
 
@@ -1509,7 +1518,7 @@ async def handle_download_file_action(
     try:
         # Start waiting for the download
         async with page.expect_download() as download_info:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(get_wait_time(wait_config, "post_click_delay", default=0.3))
 
             locator = skyvern_element.locator
             await locator.click(
