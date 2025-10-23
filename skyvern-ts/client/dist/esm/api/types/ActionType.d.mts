@@ -1,0 +1,23 @@
+export declare const ActionType: {
+    readonly Click: "click";
+    readonly InputText: "input_text";
+    readonly UploadFile: "upload_file";
+    readonly DownloadFile: "download_file";
+    readonly SelectOption: "select_option";
+    readonly Checkbox: "checkbox";
+    readonly Wait: "wait";
+    readonly NullAction: "null_action";
+    readonly SolveCaptcha: "solve_captcha";
+    readonly Terminate: "terminate";
+    readonly Complete: "complete";
+    readonly ReloadPage: "reload_page";
+    readonly Extract: "extract";
+    readonly VerificationCode: "verification_code";
+    readonly GotoUrl: "goto_url";
+    readonly Scroll: "scroll";
+    readonly Keypress: "keypress";
+    readonly Move: "move";
+    readonly Drag: "drag";
+    readonly LeftMouse: "left_mouse";
+};
+export type ActionType = (typeof ActionType)[keyof typeof ActionType];

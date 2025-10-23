@@ -1,0 +1,10 @@
+export interface CredentialParameter {
+    key: string;
+    description?: string;
+    credential_parameter_id: string;
+    workflow_id: string;
+    credential_id: string;
+    created_at: string;
+    modified_at: string;
+    deleted_at?: string;
+}

@@ -1,0 +1,18 @@
+import type * as Skyvern from "../index.mjs";
+/**
+ * Model representing a file or directory in the file tree.
+ */
+export interface FileNode {
+    /** Type of node: 'file' or 'directory' */
+    type: string;
+    /** File size in bytes */
+    size?: number;
+    /** MIME type of the file */
+    mime_type?: string;
+    /** SHA256 hash of file content */
+    content_hash?: string;
+    /** Timestamp when the file was created */
+    created_at: string;
+    /** Child nodes for directories */
+    children?: Record<string, Skyvern.FileNode | undefined>;
+}

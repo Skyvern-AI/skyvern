@@ -1,0 +1,14 @@
+import type * as Skyvern from "../index.mjs";
+/**
+ * Password credential model that requires non-empty values.
+ */
+export interface NonEmptyPasswordCredential {
+    /** The password value (must not be empty) */
+    password: string;
+    /** The username associated with the credential (must not be empty) */
+    username: string;
+    /** Optional TOTP (Time-based One-Time Password) string used to generate 2FA codes */
+    totp?: string;
+    /** Type of 2FA method used for this credential */
+    totp_type?: Skyvern.TotpType;
+}

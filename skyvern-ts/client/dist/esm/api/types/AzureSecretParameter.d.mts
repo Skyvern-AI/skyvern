@@ -1,0 +1,10 @@
+export interface AzureSecretParameter {
+    key: string;
+    description?: string;
+    azure_secret_parameter_id: string;
+    workflow_id: string;
+    azure_key: string;
+    created_at: string;
+    modified_at: string;
+    deleted_at?: string;
+}

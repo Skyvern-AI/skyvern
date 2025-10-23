@@ -1,0 +1,28 @@
+export declare const ProxyLocation: {
+    readonly Residential: "RESIDENTIAL";
+    readonly UsCa: "US-CA";
+    readonly UsNy: "US-NY";
+    readonly UsTx: "US-TX";
+    readonly UsFl: "US-FL";
+    readonly UsWa: "US-WA";
+    readonly ResidentialEs: "RESIDENTIAL_ES";
+    readonly ResidentialIe: "RESIDENTIAL_IE";
+    readonly ResidentialGb: "RESIDENTIAL_GB";
+    readonly ResidentialIn: "RESIDENTIAL_IN";
+    readonly ResidentialJp: "RESIDENTIAL_JP";
+    readonly ResidentialFr: "RESIDENTIAL_FR";
+    readonly ResidentialDe: "RESIDENTIAL_DE";
+    readonly ResidentialNz: "RESIDENTIAL_NZ";
+    readonly ResidentialZa: "RESIDENTIAL_ZA";
+    readonly ResidentialAr: "RESIDENTIAL_AR";
+    readonly ResidentialAu: "RESIDENTIAL_AU";
+    readonly ResidentialBr: "RESIDENTIAL_BR";
+    readonly ResidentialTr: "RESIDENTIAL_TR";
+    readonly ResidentialCa: "RESIDENTIAL_CA";
+    readonly ResidentialMx: "RESIDENTIAL_MX";
+    readonly ResidentialIt: "RESIDENTIAL_IT";
+    readonly ResidentialNl: "RESIDENTIAL_NL";
+    readonly ResidentialIsp: "RESIDENTIAL_ISP";
+    readonly None: "NONE";
+};
+export type ProxyLocation = (typeof ProxyLocation)[keyof typeof ProxyLocation];

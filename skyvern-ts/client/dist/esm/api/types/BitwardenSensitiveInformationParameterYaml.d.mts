@@ -1,0 +1,10 @@
+export interface BitwardenSensitiveInformationParameterYaml {
+    key: string;
+    description?: string;
+    bitwarden_client_id_aws_secret_key: string;
+    bitwarden_client_secret_aws_secret_key: string;
+    bitwarden_master_password_aws_secret_key: string;
+    bitwarden_collection_id: string;
+    bitwarden_identity_key: string;
+    bitwarden_identity_fields: string[];
+}

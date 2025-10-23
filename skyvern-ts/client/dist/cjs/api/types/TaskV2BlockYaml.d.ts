@@ -1,0 +1,12 @@
+export interface TaskV2BlockYaml {
+    label: string;
+    continue_on_failure?: boolean;
+    model?: Record<string, unknown>;
+    prompt: string;
+    url?: string;
+    totp_verification_url?: string;
+    totp_identifier?: string;
+    max_iterations?: number;
+    max_steps?: number;
+    disable_cache?: boolean;
+}

@@ -1,0 +1,18 @@
+import type * as Skyvern from "../../index.js";
+/**
+ * @example
+ *     {
+ *         "x-max-steps-override": 1,
+ *         "x-user-agent": "x-user-agent",
+ *         template: true,
+ *         body: {
+ *             workflow_id: "wpid_123"
+ *         }
+ *     }
+ */
+export interface RunWorkflowRequest {
+    template?: boolean;
+    "x-max-steps-override"?: number;
+    "x-user-agent"?: string;
+    body: Skyvern.WorkflowRunRequest;
+}

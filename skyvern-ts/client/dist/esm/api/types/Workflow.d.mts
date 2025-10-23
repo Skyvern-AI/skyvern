@@ -1,0 +1,28 @@
+import type * as Skyvern from "../index.mjs";
+export interface Workflow {
+    workflow_id: string;
+    organization_id: string;
+    title: string;
+    workflow_permanent_id: string;
+    version: number;
+    is_saved_task: boolean;
+    description?: string;
+    workflow_definition: Skyvern.WorkflowDefinition;
+    proxy_location?: Skyvern.ProxyLocation;
+    webhook_callback_url?: string;
+    totp_verification_url?: string;
+    totp_identifier?: string;
+    persist_browser_session?: boolean;
+    model?: Record<string, unknown>;
+    status?: Skyvern.WorkflowStatus;
+    max_screenshot_scrolls?: number;
+    extra_http_headers?: Record<string, string | undefined>;
+    run_with?: string;
+    ai_fallback?: boolean;
+    cache_key?: string;
+    run_sequentially?: boolean;
+    sequential_key?: string;
+    created_at: string;
+    modified_at: string;
+    deleted_at?: string;
+}

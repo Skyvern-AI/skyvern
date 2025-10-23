@@ -1,0 +1,8 @@
+export interface InputOrSelectContext {
+    intention?: string;
+    field?: string;
+    is_required?: boolean;
+    is_search_bar?: boolean;
+    is_location_input?: boolean;
+    is_date_related?: boolean;
+}

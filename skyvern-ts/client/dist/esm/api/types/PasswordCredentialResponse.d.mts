@@ -1,0 +1,10 @@
+import type * as Skyvern from "../index.mjs";
+/**
+ * Response model for password credentials, containing only the username.
+ */
+export interface PasswordCredentialResponse {
+    /** The username associated with the credential */
+    username: string;
+    /** Type of 2FA method used for this credential */
+    totp_type?: Skyvern.TotpType;
+}

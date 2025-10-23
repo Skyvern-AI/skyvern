@@ -1,0 +1,11 @@
+import type * as Skyvern from "../index.js";
+export interface FileParserBlock {
+    label: string;
+    output_parameter: Skyvern.OutputParameter;
+    continue_on_failure?: boolean;
+    model?: Record<string, unknown>;
+    disable_cache?: boolean;
+    file_url: string;
+    file_type: Skyvern.FileType;
+    json_schema?: Record<string, unknown>;
+}

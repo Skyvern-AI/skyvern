@@ -1,0 +1,17 @@
+import type * as Skyvern from "../index.mjs";
+export interface FileUploadBlock {
+    label: string;
+    output_parameter: Skyvern.OutputParameter;
+    continue_on_failure?: boolean;
+    model?: Record<string, unknown>;
+    disable_cache?: boolean;
+    storage_type?: Skyvern.FileStorageType;
+    s3_bucket?: string;
+    aws_access_key_id?: string;
+    aws_secret_access_key?: string;
+    region_name?: string;
+    azure_storage_account_name?: string;
+    azure_storage_account_key?: string;
+    azure_blob_container_name?: string;
+    path?: string;
+}

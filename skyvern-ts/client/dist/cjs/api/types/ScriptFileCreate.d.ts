@@ -1,0 +1,14 @@
+import type * as Skyvern from "../index.js";
+/**
+ * Model representing a file in a script.
+ */
+export interface ScriptFileCreate {
+    /** File path relative to script root */
+    path: string;
+    /** Base64 encoded file content */
+    content: string;
+    /** Content encoding */
+    encoding?: Skyvern.FileEncoding;
+    /** MIME type (auto-detected if not provided) */
+    mime_type?: string;
+}
