@@ -1,9 +1,0 @@
-/**
- * Response model for credit card credentials, containing only the last four digits and brand.
- */
-export interface CreditCardCredentialResponse {
-    /** Last four digits of the credit card number */
-    last_four: string;
-    /** Brand of the credit card */
-    brand: string;
-}

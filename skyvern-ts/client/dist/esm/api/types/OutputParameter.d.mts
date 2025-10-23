@@ -1,9 +1,0 @@
-export interface OutputParameter {
-    key: string;
-    description?: string;
-    output_parameter_id: string;
-    workflow_id: string;
-    created_at: string;
-    modified_at: string;
-    deleted_at?: string;
-}

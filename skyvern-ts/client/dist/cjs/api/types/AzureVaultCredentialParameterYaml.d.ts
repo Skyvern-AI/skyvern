@@ -1,8 +1,0 @@
-export interface AzureVaultCredentialParameterYaml {
-    key: string;
-    description?: string;
-    vault_name: string;
-    username_key: string;
-    password_key: string;
-    totp_secret_key?: string;
-}
