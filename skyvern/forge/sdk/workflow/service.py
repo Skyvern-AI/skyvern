@@ -3007,6 +3007,17 @@ class WorkflowService:
             script=created_script,
             rendered_cache_key_value=rendered_cache_key_value,
         )
+        aio_task_primary_key = f"{created_script.script_id}_{created_script.version}"
+        if aio_task_primary_key in app.ARTIFACT_MANAGER.upload_aiotasks_map:
+            aio_tasks = app.ARTIFACT_MANAGER.upload_aiotasks_map[aio_task_primary_key]
+            if aio_tasks:
+                await asyncio.gather(*aio_tasks)
+            else:
+                LOG.warning(
+                    "No upload aio tasks found for script",
+                    script_id=created_script.script_id,
+                    version=created_script.version,
+                )
 
     def should_run_script(
         self,
