@@ -20,7 +20,7 @@ export class SkyvernClient {
                 "x-api-key": _options === null || _options === void 0 ? void 0 : _options.apiKey,
                 "X-Fern-Language": "JavaScript",
                 "X-Fern-SDK-Name": "@skyvern-fern/api-sdk",
-                "X-Fern-SDK-Version": "0.0.74",
+                "X-Fern-SDK-Version": "0.0.82",
                 "X-Fern-Runtime": core.RUNTIME.type,
                 "X-Fern-Runtime-Version": core.RUNTIME.version,
             }, _options === null || _options === void 0 ? void 0 : _options.headers) });

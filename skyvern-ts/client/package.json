@@ -1,7 +1,8 @@
 {
-    "name": "@skyvern-fern/api-sdk",
-    "version": "0.0.74",
+    "name": "@skyvern/client",
+    "version": "0.0.94",
     "private": false,
+    "repository": "github:Skyvern-AI/skyvern-typescript",
     "type": "commonjs",
     "main": "./dist/cjs/index.js",
     "module": "./dist/esm/index.mjs",
