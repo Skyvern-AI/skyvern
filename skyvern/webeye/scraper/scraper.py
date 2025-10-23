@@ -20,6 +20,7 @@ from skyvern.exceptions import (
     ScrapingFailedBlankPage,
     UnknownElementTreeFormat,
 )
+from skyvern.experimentation.wait_utils import empty_page_retry_wait
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -564,8 +565,8 @@ async def scrape_web_unsafe(
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     if not elements and not support_empty_page:
-        LOG.warning("No elements found on the page, wait for 3 seconds and retry")
-        await asyncio.sleep(3)
+        LOG.warning("No elements found on the page, wait and retry")
+        await empty_page_retry_wait()
         elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
 
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
