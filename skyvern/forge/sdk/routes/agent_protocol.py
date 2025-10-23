@@ -790,6 +790,8 @@ async def delete_workflow(
 
 
 ################# Folder Endpoints #################
+@legacy_base_router.post("/folders", response_model=Folder, tags=["agent"])
+@legacy_base_router.post("/folders/", response_model=Folder, include_in_schema=False)
 @base_router.post(
     "/folders",
     response_model=Folder,
@@ -827,6 +829,8 @@ async def create_folder(
     )
 
 
+@legacy_base_router.get("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.get("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 @base_router.get(
     "/folders/{folder_id}",
     response_model=Folder,
@@ -866,6 +870,8 @@ async def get_folder(
     )
 
 
+@legacy_base_router.get("/folders", response_model=list[Folder], tags=["agent"])
+@legacy_base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
 @base_router.get(
     "/folders",
     response_model=list[Folder],
@@ -912,6 +918,8 @@ async def get_folders(
     return result
 
 
+@legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"])
+@legacy_base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 @base_router.put(
     "/folders/{folder_id}",
     response_model=Folder,
@@ -954,6 +962,8 @@ async def update_folder(
     )
 
 
+@legacy_base_router.delete("/folders/{folder_id}", tags=["agent"])
+@legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 @base_router.delete(
     "/folders/{folder_id}",
     tags=["Workflows"],
@@ -980,6 +990,8 @@ async def delete_folder(
     return {"status": "deleted", "folder_id": folder_id}
 
 
+@legacy_base_router.put("/workflows/{workflow_id}/folder", response_model=Workflow, tags=["agent"])
+@legacy_base_router.put("/workflows/{workflow_id}/folder/", response_model=Workflow, include_in_schema=False)
 @base_router.put(
     "/workflows/{workflow_id}/folder",
     response_model=Workflow,
