@@ -218,6 +218,11 @@ class FailedToStopLoadingPage(SkyvernException):
         super().__init__(f"Failed to stop loading page url {url}. Error message: {error_message}")
 
 
+class EmptyBrowserContext(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Browser context is empty")
+
+
 class UnexpectedTaskStatus(SkyvernException):
     def __init__(self, task_id: str, status: str) -> None:
         super().__init__(f"Unexpected task status {status} for task {task_id}")
