@@ -30,6 +30,11 @@ class Workflow(UniversalBaseModel):
     status: typing.Optional[WorkflowStatus] = None
     max_screenshot_scrolls: typing.Optional[int] = None
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    run_with: typing.Optional[str] = None
+    ai_fallback: typing.Optional[bool] = None
+    cache_key: typing.Optional[str] = None
+    run_sequentially: typing.Optional[bool] = None
+    sequential_key: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

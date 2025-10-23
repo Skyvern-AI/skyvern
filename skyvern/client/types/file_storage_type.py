@@ -2,4 +2,4 @@
 
 import typing
 
-FileStorageType = typing.Literal["s3"]
+FileStorageType = typing.Union[typing.Literal["s3", "azure"], typing.Any]

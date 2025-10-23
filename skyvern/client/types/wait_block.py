@@ -14,6 +14,7 @@ class WaitBlock(UniversalBaseModel):
     output_parameter: OutputParameter
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
     wait_sec: int
     parameters: typing.Optional[typing.List[WaitBlockParametersItem]] = None
 

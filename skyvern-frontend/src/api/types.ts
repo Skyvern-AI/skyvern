@@ -244,6 +244,7 @@ export const ActionTypes = {
   Drag: "drag",
   LeftMouse: "left_mouse",
   GotoUrl: "goto_url",
+  ClosePage: "close_page",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -269,6 +270,7 @@ export const ReadableActionTypes: {
   drag: "Drag",
   left_mouse: "Left Mouse",
   goto_url: "Goto URL",
+  close_page: "Close Page",
 };
 
 export type Option = {

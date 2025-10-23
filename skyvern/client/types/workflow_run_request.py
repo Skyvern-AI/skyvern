@@ -25,9 +25,9 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     proxy_location: typing.Optional[ProxyLocation] = pydantic.Field(default=None)
     """
-
+    
     Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
-
+    
     Available geotargeting options:
     - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
     - RESIDENTIAL_ES: Spain
@@ -57,13 +57,13 @@ class WorkflowRunRequest(UniversalBaseModel):
 
     totp_url: typing.Optional[str] = pydantic.Field(default=None)
     """
-
+    
     URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
     """
 
     totp_identifier: typing.Optional[str] = pydantic.Field(default=None)
     """
-
+    
     Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
     """
 
@@ -80,6 +80,21 @@ class WorkflowRunRequest(UniversalBaseModel):
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
     """
     The extra HTTP headers for the requests in browser.
+    """
+
+    browser_address: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    The CDP address for the workflow run.
+    """
+
+    ai_fallback: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    Whether to fallback to AI if the workflow run fails.
+    """
+
+    run_with: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Whether to run the workflow with agent or code.
     """
 
     if IS_PYDANTIC_V2:

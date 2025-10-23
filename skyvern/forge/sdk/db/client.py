@@ -3786,6 +3786,31 @@ class AgentDB:
             await session.refresh(task_run)
             return Run.model_validate(task_run)
 
+    async def update_task_run(
+        self,
+        organization_id: str,
+        run_id: str,
+        title: str | None = None,
+        url: str | None = None,
+        url_hash: str | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            task_run = (
+                await session.scalars(
+                    select(TaskRunModel).filter_by(run_id=run_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if not task_run:
+                raise NotFoundError(f"TaskRun {run_id} not found")
+
+            if title:
+                task_run.title = title
+            if url:
+                task_run.url = url
+            if url_hash:
+                task_run.url_hash = url_hash
+            await session.commit()
+
     async def create_credential(
         self,
         organization_id: str,

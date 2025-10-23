@@ -25,6 +25,7 @@ from pydantic import BaseModel, PrivateAttr
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME, SKYVERN_DIR
 from skyvern.exceptions import (
+    EmptyBrowserContext,
     FailedToNavigateToUrl,
     FailedToReloadPage,
     FailedToStopLoadingPage,
@@ -898,6 +899,11 @@ class BrowserState:
         except Exception as e:
             LOG.exception(f"Error while stop loading the page: {repr(e)}")
             raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))
+
+    async def new_page(self) -> Page:
+        if self.browser_context is None:
+            raise EmptyBrowserContext()
+        return await self.browser_context.new_page()
 
     async def reload_page(self) -> None:
         page = await self.__assert_page()

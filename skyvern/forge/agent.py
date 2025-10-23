@@ -980,7 +980,7 @@ class ForgeAgent:
                     scraped_page=scraped_page,
                     llm_caller=llm_caller,
                 )
-            elif engine == RunEngine.ui_tars and not app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            elif engine == RunEngine.ui_tars and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                 "DISABLE_UI_TARS_CUA",
                 task.workflow_run_id or task.task_id,
                 properties={"organization_id": task.organization_id},
@@ -1374,7 +1374,7 @@ class ForgeAgent:
                 and complete_verification
                 and (task.navigation_goal or task.complete_criterion)
             ):
-                disable_user_goal_check = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                     "DISABLE_USER_GOAL_CHECK",
                     task.task_id,
                     properties={"task_url": task.url, "organization_id": task.organization_id},
@@ -1857,7 +1857,7 @@ class ForgeAgent:
         try:
             screenshot = await browser_state.take_post_action_screenshot(
                 scrolling_number=scrolling_number,
-                use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                     "ENABLE_PLAYWRIGHT_FULLPAGE",
                     task.workflow_run_id or task.task_id,
                     properties={"organization_id": task.organization_id},
@@ -2185,6 +2185,7 @@ class ForgeAgent:
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                     terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
                     parse_select_feature_enabled=context.enable_parse_select_in_extract,
+                    has_magic_link_page=context.has_magic_link_page(task.task_id),
                 )
 
                 # Store static prompt for caching and return dynamic prompt
@@ -2214,6 +2215,7 @@ class ForgeAgent:
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
+            has_magic_link_page=context.has_magic_link_page(task.task_id),
         )
 
         return full_prompt, use_caching
@@ -2487,7 +2489,7 @@ class ForgeAgent:
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
                     screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                             "ENABLE_PLAYWRIGHT_FULLPAGE",
                             task.workflow_run_id or task.task_id,
                             properties={"organization_id": task.organization_id},
@@ -3273,10 +3275,13 @@ class ForgeAgent:
         if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
             return []
 
-        # TODO: not sure whether all magic links can directly login + navigate to the homepage
+        # always open a new tab to navigate to the magic link
+        page = await browser_state.new_page()
+        context = skyvern_context.ensure_context()
+        context.add_magic_link_page(task.task_id, page)
+
         return [
             GotoUrlAction(
-                action_type=ActionType.GOTO_URL,
                 reasoning="Navigating to the magic link URL to verify the login",
                 intention="Navigating to the magic link URL to verify the login",
                 url=otp_value.value,
@@ -3286,6 +3291,7 @@ class ForgeAgent:
                 step_id=step.step_id,
                 step_order=step.order,
                 action_order=0,
+                is_magic_link=True,
             ),
         ]
 
