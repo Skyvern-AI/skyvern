@@ -31,7 +31,6 @@ import {
   LightningBoltIcon,
   MagnifyingGlassIcon,
   MixerHorizontalIcon,
-  Pencil2Icon,
   PlayIcon,
   PlusIcon,
   ReloadIcon,
@@ -46,6 +45,7 @@ import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
 import { WorkflowFolderSelector } from "./components/WorkflowFolderSelector";
+import { HighlightText } from "./components/HighlightText";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
@@ -82,6 +82,11 @@ function Workflows() {
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [isViewAllFoldersOpen, setIsViewAllFoldersOpen] = useState(false);
+
+  // Parameter expansion state
+  const [manuallyExpandedRows, setManuallyExpandedRows] = useState<Set<string>>(
+    new Set()
+  );
 
   // Fetch folders
   const { data: allFolders = [] } = useFoldersQuery({ page_size: 10 });
@@ -145,6 +150,64 @@ function Workflows() {
 
   const isNextDisabled =
     isLoading || !nextPageWorkflows || nextPageWorkflows.length === 0;
+
+  // Auto-expand rows when parameters match search
+  const autoExpandedRows = useMemo(() => {
+    if (!debouncedSearch.trim()) return new Set<string>();
+
+    const expanded = new Set<string>();
+    const lowerQuery = debouncedSearch.toLowerCase();
+
+    workflows.forEach((workflow) => {
+      const hasParameterMatch = workflow.workflow_definition.parameters?.some(
+        (param) => {
+          const keyMatch = param.key?.toLowerCase().includes(lowerQuery);
+          const descMatch = param.description?.toLowerCase().includes(lowerQuery);
+          const valueMatch =
+            param.parameter_type === "workflow" &&
+            param.default_value &&
+            String(param.default_value).toLowerCase().includes(lowerQuery);
+          return keyMatch || descMatch || valueMatch;
+        }
+      );
+
+      if (hasParameterMatch) {
+        expanded.add(workflow.workflow_permanent_id);
+      }
+    });
+
+    return expanded;
+  }, [workflows, debouncedSearch]);
+
+  // Combine manual and auto-expanded rows
+  const expandedRows = useMemo(() => {
+    return new Set([...manuallyExpandedRows, ...autoExpandedRows]);
+  }, [manuallyExpandedRows, autoExpandedRows]);
+
+  const toggleParametersExpanded = (workflowId: string) => {
+    const newExpanded = new Set(manuallyExpandedRows);
+    if (newExpanded.has(workflowId)) {
+      newExpanded.delete(workflowId);
+    } else {
+      newExpanded.add(workflowId);
+    }
+    setManuallyExpandedRows(newExpanded);
+  };
+
+  // Check if a specific parameter matches the search
+  const parameterMatchesSearch = (param: any): boolean => {
+    if (!debouncedSearch.trim()) return false;
+    const lowerQuery = debouncedSearch.toLowerCase();
+
+    const keyMatch = param.key?.toLowerCase().includes(lowerQuery);
+    const descMatch = param.description?.toLowerCase().includes(lowerQuery);
+    const valueMatch =
+      param.parameter_type === "workflow" &&
+      param.default_value &&
+      String(param.default_value).toLowerCase().includes(lowerQuery);
+
+    return keyMatch || descMatch || valueMatch;
+  };
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
@@ -339,120 +402,211 @@ function Workflows() {
                 </TableRow>
               ) : (
                 workflows?.map((workflow) => {
+                  const hasParameters =
+                    workflow.workflow_definition.parameters.filter(
+                      (p) => p.parameter_type !== "output"
+                    ).length > 0;
+                  const isExpanded = expandedRows.has(
+                    workflow.workflow_permanent_id
+                  );
+
                   return (
-                    <TableRow
-                      key={workflow.workflow_permanent_id}
-                      className="cursor-pointer"
-                    >
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
+                    <>
+                      {/* Main workflow row */}
+                      <TableRow
+                        key={workflow.workflow_permanent_id}
+                        className="cursor-pointer"
                       >
-                        {workflow.workflow_permanent_id}
-                      </TableCell>
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
-                      >
-                        {workflow.title}
-                      </TableCell>
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
-                      >
-                        {workflow.folder_id ? (
-                          <div className="flex items-center gap-1.5">
-                            <FileIcon className="h-3.5 w-3.5 text-blue-400" />
-                            <span className="text-sm">
-                              {allFolders.find((f) => f.folder_id === workflow.folder_id)?.title || workflow.folder_id}
-                            </span>
-                          </div>
-                        ) : (
-                          <span className="text-slate-400">-</span>
-                        )}
-                      </TableCell>
-                      <TableCell
-                        onClick={(event) => {
-                          handleRowClick(event, workflow.workflow_permanent_id);
-                        }}
-                        title={basicTimeFormat(workflow.created_at)}
-                      >
-                        {basicLocalTimeFormat(workflow.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex justify-end gap-2">
-                          <WorkflowFolderSelector
-                            workflowId={workflow.workflow_permanent_id}
-                            currentFolderId={workflow.folder_id}
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id
+                            );
+                          }}
+                        >
+                          <HighlightText
+                            text={workflow.workflow_permanent_id}
+                            query={debouncedSearch}
                           />
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    handleIconClick(
-                                      event,
-                                      `/workflows/${workflow.workflow_permanent_id}/debug`,
-                                    );
-                                  }}
-                                >
-                                  <Pencil2Icon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>Open in Editor</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    handleIconClick(
-                                      event,
-                                      `/workflows/${workflow.workflow_permanent_id}/run`,
-                                    );
-                                  }}
-                                >
-                                  <PlayIcon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>Create New Run</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                          <WorkflowActions workflow={workflow} />
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={() =>
-                                    setOpenWorkflowId(
-                                      workflow.workflow_permanent_id,
-                                    )
+                        </TableCell>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id
+                            );
+                          }}
+                        >
+                          <HighlightText
+                            text={workflow.title}
+                            query={debouncedSearch}
+                          />
+                        </TableCell>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id
+                            );
+                          }}
+                        >
+                          {workflow.folder_id ? (
+                            <div className="flex items-center gap-1.5">
+                              <FileIcon className="h-3.5 w-3.5 text-blue-400" />
+                              <span className="text-sm">
+                                <HighlightText
+                                  text={
+                                    allFolders.find(
+                                      (f) => f.folder_id === workflow.folder_id
+                                    )?.title || workflow.folder_id
                                   }
-                                  disabled={
-                                    !workflow.workflow_definition.parameters.some(
-                                      (p) => p.parameter_type !== "output",
-                                    )
-                                  }
-                                >
-                                  <MixerHorizontalIcon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>View Parameters</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                        </div>
-                      </TableCell>
-                    </TableRow>
+                                  query={debouncedSearch}
+                                />
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="text-slate-400">-</span>
+                          )}
+                        </TableCell>
+                        <TableCell
+                          onClick={(event) => {
+                            handleRowClick(
+                              event,
+                              workflow.workflow_permanent_id
+                            );
+                          }}
+                          title={basicTimeFormat(workflow.created_at)}
+                        >
+                          {basicLocalTimeFormat(workflow.created_at)}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex justify-end gap-2">
+                            <WorkflowFolderSelector
+                              workflowId={workflow.workflow_permanent_id}
+                              currentFolderId={workflow.folder_id}
+                            />
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="outline"
+                                    onClick={() =>
+                                      toggleParametersExpanded(
+                                        workflow.workflow_permanent_id
+                                      )
+                                    }
+                                    disabled={!hasParameters}
+                                    className={cn(
+                                      isExpanded && "text-blue-400"
+                                    )}
+                                  >
+                                    <MixerHorizontalIcon className="h-4 w-4" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  {hasParameters
+                                    ? isExpanded
+                                      ? "Hide Parameters"
+                                      : "Show Parameters"
+                                    : "No Parameters"}
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="outline"
+                                    onClick={(event) => {
+                                      handleIconClick(
+                                        event,
+                                        `/workflows/${workflow.workflow_permanent_id}/run`
+                                      );
+                                    }}
+                                  >
+                                    <PlayIcon className="h-4 w-4" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>Create New Run</TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                            <WorkflowActions workflow={workflow} />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+
+                      {/* Expanded parameters section */}
+                      {isExpanded && hasParameters && (
+                        <TableRow
+                          key={`${workflow.workflow_permanent_id}-params`}
+                        >
+                          <TableCell
+                            colSpan={5}
+                            className="bg-slate-50 dark:bg-slate-900/50"
+                          >
+                            <div className="ml-8 space-y-2 py-4">
+                              <div className="mb-3 text-sm font-medium">
+                                Parameters
+                              </div>
+                              <div className="space-y-2">
+                                {workflow.workflow_definition.parameters
+                                  .filter((p) => p.parameter_type !== "output")
+                                  .map((param, idx) => {
+                                    const matchesParam =
+                                      parameterMatchesSearch(param);
+
+                                    return (
+                                      <div
+                                        key={idx}
+                                        className={cn(
+                                          "grid grid-cols-[140px_1fr_2fr] gap-4 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
+                                          matchesParam &&
+                                            "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50"
+                                        )}
+                                      >
+                                        <div className="font-medium text-blue-600 dark:text-blue-400">
+                                          <HighlightText
+                                            text={param.key}
+                                            query={debouncedSearch}
+                                          />
+                                        </div>
+                                        <div className="truncate">
+                                          {param.parameter_type === "workflow" &&
+                                          param.default_value ? (
+                                            <HighlightText
+                                              text={String(param.default_value)}
+                                              query={debouncedSearch}
+                                            />
+                                          ) : (
+                                            <span className="text-slate-400">
+                                              -
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="text-slate-500">
+                                          {param.description ? (
+                                            <HighlightText
+                                              text={param.description}
+                                              query={debouncedSearch}
+                                            />
+                                          ) : (
+                                            <span className="text-slate-400">
+                                              No description
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                              </div>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </>
                   );
                 })
               )}
