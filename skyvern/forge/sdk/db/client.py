@@ -1851,7 +1851,7 @@ class AgentDB:
         self,
         organization_id: str,
         page: int = 1,
-        page_size: int = 100,
+        page_size: int = 10,
         search_query: str | None = None,
     ) -> list[FolderModel]:
         """Get all folders for an organization with pagination and optional search."""
