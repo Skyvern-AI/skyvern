@@ -1984,17 +1984,24 @@ class AgentDB:
         organization_id: str,
         folder_id: str | None,
     ) -> WorkflowModel | None:
-        """Update a workflow's folder assignment."""
+        """Update a workflow's folder assignment. workflow_id can be either workflow_id or workflow_permanent_id."""
         try:
             async with self.Session() as session:
-                # Get the workflow
+                # Try to find by workflow_id first, then by workflow_permanent_id
                 workflow_query = (
                     select(WorkflowModel)
-                    .filter_by(workflow_id=workflow_id, organization_id=organization_id)
+                    .filter(
+                        or_(
+                            WorkflowModel.workflow_id == workflow_id,
+                            WorkflowModel.workflow_permanent_id == workflow_id,
+                        )
+                    )
+                    .filter_by(organization_id=organization_id)
                     .filter(WorkflowModel.deleted_at.is_(None))
+                    .order_by(WorkflowModel.version.desc())  # Get latest version if permanent_id
                 )
                 result = await session.execute(workflow_query)
-                workflow = result.scalar_one_or_none()
+                workflow = result.scalars().first()
 
                 if not workflow:
                     return None
