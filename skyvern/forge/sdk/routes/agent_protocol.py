@@ -19,6 +19,7 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.utils import convert_to_workflow
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -85,6 +86,7 @@ from skyvern.schemas.runs import (
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
+from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
@@ -785,6 +787,229 @@ async def delete_workflow(
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
     await app.WORKFLOW_SERVICE.delete_workflow_by_permanent_id(workflow_id, current_org.organization_id)
+
+
+################# Folder Endpoints #################
+@base_router.post(
+    "/folders",
+    response_model=Folder,
+    tags=["Workflows"],
+    description="Create a new folder to organize workflows",
+    summary="Create folder",
+    responses={
+        200: {"description": "Successfully created folder"},
+        400: {"description": "Invalid request"},
+    },
+)
+@base_router.post("/folders/", response_model=Folder, include_in_schema=False)
+async def create_folder(
+    data: FolderCreate,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Folder:
+    analytics.capture("skyvern-oss-folder-create")
+    folder_model = await app.DATABASE.create_folder(
+        organization_id=current_org.organization_id,
+        title=data.title,
+        description=data.description,
+    )
+    workflow_count = await app.DATABASE.get_folder_workflow_count(
+        folder_id=folder_model.folder_id,
+        organization_id=current_org.organization_id,
+    )
+    return Folder(
+        folder_id=folder_model.folder_id,
+        organization_id=folder_model.organization_id,
+        title=folder_model.title,
+        description=folder_model.description,
+        workflow_count=workflow_count,
+        created_at=folder_model.created_at,
+        modified_at=folder_model.modified_at,
+    )
+
+
+@base_router.get(
+    "/folders/{folder_id}",
+    response_model=Folder,
+    tags=["Workflows"],
+    description="Get a specific folder by ID",
+    summary="Get folder",
+    responses={
+        200: {"description": "Successfully retrieved folder"},
+        404: {"description": "Folder not found"},
+    },
+)
+@base_router.get("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
+async def get_folder(
+    folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Folder:
+    folder = await app.DATABASE.get_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+    )
+    if not folder:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+
+    workflow_count = await app.DATABASE.get_folder_workflow_count(
+        folder_id=folder.folder_id,
+        organization_id=current_org.organization_id,
+    )
+
+    return Folder(
+        folder_id=folder.folder_id,
+        organization_id=folder.organization_id,
+        title=folder.title,
+        description=folder.description,
+        workflow_count=workflow_count,
+        created_at=folder.created_at,
+        modified_at=folder.modified_at,
+    )
+
+
+@base_router.get(
+    "/folders",
+    response_model=list[Folder],
+    tags=["Workflows"],
+    description="Get all folders for the organization",
+    summary="Get folders",
+    responses={
+        200: {"description": "Successfully retrieved folders"},
+    },
+)
+@base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
+async def get_folders(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
+    search: str | None = Query(None, description="Search folders by title or description"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[Folder]:
+    folders = await app.DATABASE.get_folders(
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        search_query=search,
+    )
+
+    # Get workflow counts for each folder
+    result = []
+    for folder in folders:
+        workflow_count = await app.DATABASE.get_folder_workflow_count(
+            folder_id=folder.folder_id,
+            organization_id=current_org.organization_id,
+        )
+        result.append(
+            Folder(
+                folder_id=folder.folder_id,
+                organization_id=folder.organization_id,
+                title=folder.title,
+                description=folder.description,
+                workflow_count=workflow_count,
+                created_at=folder.created_at,
+                modified_at=folder.modified_at,
+            )
+        )
+
+    return result
+
+
+@base_router.put(
+    "/folders/{folder_id}",
+    response_model=Folder,
+    tags=["Workflows"],
+    description="Update a folder's title or description",
+    summary="Update folder",
+    responses={
+        200: {"description": "Successfully updated folder"},
+        404: {"description": "Folder not found"},
+    },
+)
+@base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
+async def update_folder(
+    folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
+    data: FolderUpdate = ...,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Folder:
+    folder = await app.DATABASE.update_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+        title=data.title,
+        description=data.description,
+    )
+    if not folder:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+
+    workflow_count = await app.DATABASE.get_folder_workflow_count(
+        folder_id=folder.folder_id,
+        organization_id=current_org.organization_id,
+    )
+
+    return Folder(
+        folder_id=folder.folder_id,
+        organization_id=folder.organization_id,
+        title=folder.title,
+        description=folder.description,
+        workflow_count=workflow_count,
+        created_at=folder.created_at,
+        modified_at=folder.modified_at,
+    )
+
+
+@base_router.delete(
+    "/folders/{folder_id}",
+    tags=["Workflows"],
+    description="Delete a folder. All workflows in the folder will be unassigned.",
+    summary="Delete folder",
+    responses={
+        200: {"description": "Successfully deleted folder"},
+        404: {"description": "Folder not found"},
+    },
+)
+@base_router.delete("/folders/{folder_id}/", include_in_schema=False)
+async def delete_folder(
+    folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict:
+    analytics.capture("skyvern-oss-folder-delete")
+    success = await app.DATABASE.soft_delete_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+    )
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+
+    return {"status": "deleted", "folder_id": folder_id}
+
+
+@base_router.put(
+    "/workflows/{workflow_id}/folder",
+    response_model=Workflow,
+    tags=["Workflows"],
+    description="Update a workflow's folder assignment",
+    summary="Update workflow folder",
+    responses={
+        200: {"description": "Successfully updated workflow folder"},
+        404: {"description": "Workflow not found"},
+        400: {"description": "Folder not found"},
+    },
+)
+@base_router.put("/workflows/{workflow_id}/folder/", response_model=Workflow, include_in_schema=False)
+async def update_workflow_folder(
+    workflow_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
+    data: UpdateWorkflowFolderRequest = ...,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Workflow:
+    try:
+        workflow_model = await app.DATABASE.update_workflow_folder(
+            workflow_id=workflow_id,
+            organization_id=current_org.organization_id,
+            folder_id=data.folder_id,
+        )
+        if not workflow_model:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_id} not found")
+
+        return convert_to_workflow(workflow_model, app.DATABASE.debug_enabled)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @legacy_base_router.post(

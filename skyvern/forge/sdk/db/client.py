@@ -26,6 +26,7 @@ from skyvern.forge.sdk.db.models import (
     CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
+    FolderModel,
     OnePasswordCredentialParameterModel,
     OrganizationAuthTokenModel,
     OrganizationBitwardenCollectionModel,
@@ -1815,6 +1816,197 @@ class AgentDB:
             update_deleted_at_query = update_deleted_at_query.values(deleted_at=datetime.utcnow())
             await session.execute(update_deleted_at_query)
             await session.commit()
+
+    async def create_folder(
+        self,
+        organization_id: str,
+        title: str,
+        description: str | None = None,
+    ) -> FolderModel:
+        """Create a new folder."""
+        try:
+            async with self.Session() as session:
+                folder = FolderModel(
+                    organization_id=organization_id,
+                    title=title,
+                    description=description,
+                )
+                session.add(folder)
+                await session.commit()
+                await session.refresh(folder)
+                return folder
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in create_folder", exc_info=True)
+            raise
+
+    async def get_folders(
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 100,
+        search_query: str | None = None,
+    ) -> list[FolderModel]:
+        """Get all folders for an organization with pagination and optional search."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    select(FolderModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+
+                if search_query:
+                    search_pattern = f"%{search_query}%"
+                    stmt = stmt.filter(
+                        or_(
+                            FolderModel.title.ilike(search_pattern),
+                            FolderModel.description.ilike(search_pattern),
+                        )
+                    )
+
+                stmt = stmt.order_by(FolderModel.modified_at.desc())
+                stmt = stmt.offset((page - 1) * page_size).limit(page_size)
+
+                result = await session.execute(stmt)
+                return list(result.scalars().all())
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_folders", exc_info=True)
+            raise
+
+    async def get_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+    ) -> FolderModel | None:
+        """Get a folder by ID."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    select(FolderModel)
+                    .filter_by(folder_id=folder_id, organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+                result = await session.execute(stmt)
+                return result.scalar_one_or_none()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_folder", exc_info=True)
+            raise
+
+    async def update_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> FolderModel | None:
+        """Update a folder's title or description."""
+        try:
+            async with self.Session() as session:
+                folder = await self.get_folder(folder_id, organization_id)
+                if not folder:
+                    return None
+
+                if title is not None:
+                    folder.title = title
+                if description is not None:
+                    folder.description = description
+
+                folder.modified_at = datetime.utcnow()
+                session.add(folder)
+                await session.commit()
+                await session.refresh(folder)
+                return folder
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in update_folder", exc_info=True)
+            raise
+
+    async def soft_delete_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+    ) -> bool:
+        """Soft delete a folder and remove folder assignment from all its workflows."""
+        try:
+            async with self.Session() as session:
+                # Check if folder exists
+                folder = await self.get_folder(folder_id, organization_id)
+                if not folder:
+                    return False
+
+                # Soft delete the folder
+                folder.deleted_at = datetime.utcnow()
+                session.add(folder)
+
+                # Remove folder_id from all workflows in this folder
+                update_workflows_query = (
+                    update(WorkflowModel)
+                    .where(WorkflowModel.folder_id == folder_id)
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .values(folder_id=None, modified_at=datetime.utcnow())
+                )
+                await session.execute(update_workflows_query)
+                await session.commit()
+                return True
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in soft_delete_folder", exc_info=True)
+            raise
+
+    async def get_folder_workflow_count(
+        self,
+        folder_id: str,
+        organization_id: str,
+    ) -> int:
+        """Get the count of workflows in a folder."""
+        try:
+            async with self.Session() as session:
+                stmt = (
+                    select(func.count(WorkflowModel.workflow_id))
+                    .filter_by(organization_id=organization_id, folder_id=folder_id)
+                    .filter(WorkflowModel.deleted_at.is_(None))
+                )
+                result = await session.execute(stmt)
+                return result.scalar_one()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_folder_workflow_count", exc_info=True)
+            raise
+
+    async def update_workflow_folder(
+        self,
+        workflow_id: str,
+        organization_id: str,
+        folder_id: str | None,
+    ) -> WorkflowModel | None:
+        """Update a workflow's folder assignment."""
+        try:
+            async with self.Session() as session:
+                # Get the workflow
+                workflow_query = (
+                    select(WorkflowModel)
+                    .filter_by(workflow_id=workflow_id, organization_id=organization_id)
+                    .filter(WorkflowModel.deleted_at.is_(None))
+                )
+                result = await session.execute(workflow_query)
+                workflow = result.scalar_one_or_none()
+
+                if not workflow:
+                    return None
+
+                # Validate folder exists if folder_id is provided
+                if folder_id:
+                    folder = await self.get_folder(folder_id, organization_id)
+                    if not folder:
+                        raise ValueError(f"Folder {folder_id} not found")
+
+                # Update workflow's folder_id
+                workflow.folder_id = folder_id
+                workflow.modified_at = datetime.utcnow()
+                session.add(workflow)
+                await session.commit()
+                await session.refresh(workflow)
+                return workflow
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in update_workflow_folder", exc_info=True)
+            raise
 
     async def create_workflow_run(
         self,
