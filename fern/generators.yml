@@ -30,7 +30,9 @@ groups:
       - name: fernapi/fern-typescript-sdk
         version: 3.11.1
         output:
-#          location: npm
-#          package-name: "@skyvern/client"
+          location: npm
+          package-name: "@skyvern/client"
+        github:
+          repository: Skyvern-AI/skyvern-typescript
         config:
           namespaceExport: Skyvern
