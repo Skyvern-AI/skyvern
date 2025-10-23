@@ -27,6 +27,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
+  DotsHorizontalIcon,
   FileIcon,
   LightningBoltIcon,
   MagnifyingGlassIcon,
@@ -36,7 +37,7 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import { NarrativeCard } from "./components/header/NarrativeCard";
@@ -85,6 +86,37 @@ function Workflows() {
   const [manuallyExpandedRows, setManuallyExpandedRows] = useState<Set<string>>(
     new Set()
   );
+
+  // Track uploading workflows - persist to sessionStorage
+  const [uploadingWorkflows, setUploadingWorkflows] = useState<Set<string>>(() => {
+    const stored = sessionStorage.getItem("skyvern.uploadingWorkflows");
+    return stored ? new Set(JSON.parse(stored)) : new Set();
+  });
+  const [placeholderWorkflows, setPlaceholderWorkflows] = useState<
+    Map<string, WorkflowApiResponse>
+  >(() => {
+    const stored = sessionStorage.getItem("skyvern.placeholderWorkflows");
+    return stored ? new Map(Object.entries(JSON.parse(stored))) : new Map();
+  });
+
+  // Persist uploading state to sessionStorage whenever it changes
+  React.useEffect(() => {
+    if (uploadingWorkflows.size > 0) {
+      sessionStorage.setItem(
+        "skyvern.uploadingWorkflows",
+        JSON.stringify(Array.from(uploadingWorkflows))
+      );
+    }
+  }, [uploadingWorkflows]);
+
+  React.useEffect(() => {
+    if (placeholderWorkflows.size > 0) {
+      sessionStorage.setItem(
+        "skyvern.placeholderWorkflows",
+        JSON.stringify(Object.fromEntries(placeholderWorkflows))
+      );
+    }
+  }, [placeholderWorkflows]);
 
   // Fetch folders
   const { data: allFolders = [] } = useFoldersQuery({ page_size: 10 });
@@ -253,6 +285,92 @@ function Workflows() {
     setParamPatch({ page: String(page + 1) });
   }
 
+  // Import workflow handlers
+  const handleImportStart = (tempId: string, fileName: string) => {
+    const placeholderWorkflow: WorkflowApiResponse = {
+      workflow_id: tempId,
+      workflow_permanent_id: tempId,
+      organization_id: "",
+      is_saved_task: false,
+      title: `Importing ${fileName}...`,
+      version: 1,
+      description: "",
+      workflow_definition: { parameters: [], blocks: [] },
+      proxy_location: null,
+      webhook_callback_url: null,
+      extra_http_headers: null,
+      persist_browser_session: false,
+      model: null,
+      totp_verification_url: null,
+      totp_identifier: null,
+      max_screenshot_scrolls: null,
+      status: null,
+      created_at: new Date().toISOString(),
+      modified_at: new Date().toISOString(),
+      deleted_at: null,
+      run_with: null,
+      cache_key: null,
+      ai_fallback: null,
+      run_sequentially: null,
+      sequential_key: null,
+      folder_id: null,
+    };
+
+    setUploadingWorkflows((prev) => new Set(prev).add(tempId));
+    setPlaceholderWorkflows((prev) => new Map(prev).set(tempId, placeholderWorkflow));
+  };
+
+  const handleImportComplete = (tempId: string) => {
+    setUploadingWorkflows((prev) => {
+      const next = new Set(prev);
+      next.delete(tempId);
+      // Clean up sessionStorage if this was the last upload
+      if (next.size === 0) {
+        sessionStorage.removeItem("skyvern.uploadingWorkflows");
+      }
+      return next;
+    });
+    setPlaceholderWorkflows((prev) => {
+      const next = new Map(prev);
+      next.delete(tempId);
+      // Clean up sessionStorage if this was the last placeholder
+      if (next.size === 0) {
+        sessionStorage.removeItem("skyvern.placeholderWorkflows");
+      }
+      return next;
+    });
+  };
+
+  const handleImportError = (tempId: string) => {
+    setUploadingWorkflows((prev) => {
+      const next = new Set(prev);
+      next.delete(tempId);
+      // Clean up sessionStorage if this was the last upload
+      if (next.size === 0) {
+        sessionStorage.removeItem("skyvern.uploadingWorkflows");
+      }
+      return next;
+    });
+    setPlaceholderWorkflows((prev) => {
+      const next = new Map(prev);
+      next.delete(tempId);
+      // Clean up sessionStorage if this was the last placeholder
+      if (next.size === 0) {
+        sessionStorage.removeItem("skyvern.placeholderWorkflows");
+      }
+      return next;
+    });
+  };
+
+  // Merge placeholder workflows with real workflows (only on page 1)
+  const displayWorkflows = useMemo(() => {
+    if (page === 1) {
+      const placeholders = Array.from(placeholderWorkflows.values());
+      return [...placeholders, ...workflows];
+    }
+    return workflows;
+  }, [placeholderWorkflows, workflows, page]);
+
   return (
     <div className="space-y-10">
       <div className="flex h-32 justify-between gap-6">
@@ -358,7 +476,11 @@ function Workflows() {
             />
           </div>
           <div className="flex gap-4">
-            <ImportWorkflowButton />
+            <ImportWorkflowButton
+              onImportStart={handleImportStart}
+              onImportComplete={handleImportComplete}
+              onImportError={handleImportError}
+            />
             <Button
               disabled={createWorkflowMutation.isPending}
               onClick={() => {
@@ -394,12 +516,12 @@ function Workflows() {
                 <TableRow>
                   <TableCell colSpan={5}>Loading...</TableCell>
                 </TableRow>
-              ) : workflows?.length === 0 ? (
+              ) : displayWorkflows?.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={5}>No workflows found</TableCell>
                 </TableRow>
               ) : (
-                workflows?.map((workflow) => {
+                displayWorkflows?.map((workflow) => {
                   const hasParameters =
                     workflow.workflow_definition.parameters.filter(
                       (p) => p.parameter_type !== "output"
@@ -407,134 +529,173 @@ function Workflows() {
                   const isExpanded = expandedRows.has(
                     workflow.workflow_permanent_id
                   );
+                  const isUploading = uploadingWorkflows.has(
+                    workflow.workflow_permanent_id
+                  );
 
                   return (
                     <>
                       {/* Main workflow row */}
-                      <TableRow
-                        key={workflow.workflow_permanent_id}
-                        className="cursor-pointer"
-                      >
-                        <TableCell
-                          onClick={(event) => {
-                            handleRowClick(
-                              event,
-                              workflow.workflow_permanent_id
-                            );
-                          }}
+                      {isUploading ? (
+                        <TableRow
+                          key={workflow.workflow_permanent_id}
+                          className="opacity-70"
                         >
-                          <HighlightText
-                            text={workflow.workflow_permanent_id}
-                            query={debouncedSearch}
-                          />
-                        </TableCell>
-                        <TableCell
-                          onClick={(event) => {
-                            handleRowClick(
-                              event,
-                              workflow.workflow_permanent_id
-                            );
-                          }}
-                        >
-                          <HighlightText
-                            text={workflow.title}
-                            query={debouncedSearch}
-                          />
-                        </TableCell>
-                        <TableCell
-                          onClick={(event) => {
-                            handleRowClick(
-                              event,
-                              workflow.workflow_permanent_id
-                            );
-                          }}
-                        >
-                          {workflow.folder_id ? (
-                            <div className="flex items-center gap-1.5">
-                              <FileIcon className="h-3.5 w-3.5 text-blue-400" />
-                              <span className="text-sm">
-                                <HighlightText
-                                  text={
-                                    allFolders.find(
-                                      (f) => f.folder_id === workflow.folder_id
-                                    )?.title || workflow.folder_id
-                                  }
-                                  query={debouncedSearch}
-                                />
-                              </span>
+                          <TableCell colSpan={2}>
+                            <div className="flex items-center gap-2">
+                              <ReloadIcon className="h-4 w-4 animate-spin text-blue-400" />
+                              <span>{workflow.title}</span>
                             </div>
-                          ) : (
+                          </TableCell>
+                          <TableCell>
                             <span className="text-slate-400">-</span>
-                          )}
-                        </TableCell>
-                        <TableCell
-                          onClick={(event) => {
-                            handleRowClick(
-                              event,
-                              workflow.workflow_permanent_id
-                            );
-                          }}
-                          title={basicTimeFormat(workflow.created_at)}
+                          </TableCell>
+                          <TableCell>
+                            {basicLocalTimeFormat(workflow.created_at)}
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex justify-end gap-2">
+                              <Button size="icon" variant="ghost" disabled>
+                                <FileIcon className="h-4 w-4" />
+                              </Button>
+                              <Button size="icon" variant="ghost" disabled>
+                                <MixerHorizontalIcon className="h-4 w-4" />
+                              </Button>
+                              <Button size="icon" variant="ghost" disabled>
+                                <PlayIcon className="h-4 w-4" />
+                              </Button>
+                              <Button size="icon" variant="ghost" disabled>
+                                <DotsHorizontalIcon className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ) : (
+                        <TableRow
+                          key={workflow.workflow_permanent_id}
+                          className="cursor-pointer"
                         >
-                          {basicLocalTimeFormat(workflow.created_at)}
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex justify-end gap-2">
-                            <WorkflowFolderSelector
-                              workflowId={workflow.workflow_permanent_id}
-                              currentFolderId={workflow.folder_id}
+                          <TableCell
+                            onClick={(event) => {
+                              handleRowClick(
+                                event,
+                                workflow.workflow_permanent_id
+                              );
+                            }}
+                          >
+                            <HighlightText
+                              text={workflow.workflow_permanent_id}
+                              query={debouncedSearch}
                             />
-                            <TooltipProvider>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    size="icon"
-                                    variant="outline"
-                                    onClick={() =>
-                                      toggleParametersExpanded(
-                                        workflow.workflow_permanent_id
-                                      )
+                          </TableCell>
+                          <TableCell
+                            onClick={(event) => {
+                              handleRowClick(
+                                event,
+                                workflow.workflow_permanent_id
+                              );
+                            }}
+                          >
+                            <HighlightText
+                              text={workflow.title}
+                              query={debouncedSearch}
+                            />
+                          </TableCell>
+                          <TableCell
+                            onClick={(event) => {
+                              handleRowClick(
+                                event,
+                                workflow.workflow_permanent_id
+                              );
+                            }}
+                          >
+                            {workflow.folder_id ? (
+                              <div className="flex items-center gap-1.5">
+                                <FileIcon className="h-3.5 w-3.5 text-blue-400" />
+                                <span className="text-sm">
+                                  <HighlightText
+                                    text={
+                                      allFolders.find(
+                                        (f) => f.folder_id === workflow.folder_id
+                                      )?.title || workflow.folder_id
                                     }
-                                    disabled={!hasParameters}
-                                    className={cn(
-                                      isExpanded && "text-blue-400"
-                                    )}
-                                  >
-                                    <MixerHorizontalIcon className="h-4 w-4" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                  {hasParameters
-                                    ? isExpanded
-                                      ? "Hide Parameters"
-                                      : "Show Parameters"
-                                    : "No Parameters"}
-                                </TooltipContent>
-                              </Tooltip>
-                            </TooltipProvider>
-                            <TooltipProvider>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    size="icon"
-                                    variant="outline"
-                                    onClick={(event) => {
-                                      handleIconClick(
-                                        event,
-                                        `/workflows/${workflow.workflow_permanent_id}/run`
-                                      );
-                                    }}
-                                  >
-                                    <PlayIcon className="h-4 w-4" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>Create New Run</TooltipContent>
-                              </Tooltip>
-                            </TooltipProvider>
-                            <WorkflowActions workflow={workflow} />
-                          </div>
-                        </TableCell>
-                      </TableRow>
+                                    query={debouncedSearch}
+                                  />
+                                </span>
+                              </div>
+                            ) : (
+                              <span className="text-slate-400">-</span>
+                            )}
+                          </TableCell>
+                          <TableCell
+                            onClick={(event) => {
+                              handleRowClick(
+                                event,
+                                workflow.workflow_permanent_id
+                              );
+                            }}
+                            title={basicTimeFormat(workflow.created_at)}
+                          >
+                            {basicLocalTimeFormat(workflow.created_at)}
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex justify-end gap-2">
+                              <WorkflowFolderSelector
+                                workflowId={workflow.workflow_permanent_id}
+                                currentFolderId={workflow.folder_id}
+                              />
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      size="icon"
+                                      variant="outline"
+                                      onClick={() =>
+                                        toggleParametersExpanded(
+                                          workflow.workflow_permanent_id
+                                        )
+                                      }
+                                      disabled={!hasParameters}
+                                      className={cn(
+                                        isExpanded && "text-blue-400"
+                                      )}
+                                    >
+                                      <MixerHorizontalIcon className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    {hasParameters
+                                      ? isExpanded
+                                        ? "Hide Parameters"
+                                        : "Show Parameters"
+                                      : "No Parameters"}
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      size="icon"
+                                      variant="outline"
+                                      onClick={(event) => {
+                                        handleIconClick(
+                                          event,
+                                          `/workflows/${workflow.workflow_permanent_id}/run`
+                                        );
+                                      }}
+                                    >
+                                      <PlayIcon className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>Create New Run</TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                              <WorkflowActions workflow={workflow} />
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )}
 
                       {/* Expanded parameters section */}
                       {isExpanded && hasParameters && (
