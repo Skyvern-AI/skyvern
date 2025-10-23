@@ -27,6 +27,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
+  FileIcon,
   LightningBoltIcon,
   MagnifyingGlassIcon,
   MixerHorizontalIcon,
@@ -44,6 +45,7 @@ import { WorkflowParametersDialog } from "./components/WorkflowParametersDialog"
 import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
+import { WorkflowFolderSelector } from "./components/WorkflowFolderSelector";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
@@ -315,11 +317,12 @@ function Workflows() {
           <Table>
             <TableHeader className="rounded-t-lg bg-slate-elevation2">
               <TableRow>
-                <TableHead className="w-1/3 rounded-tl-lg text-slate-400">
+                <TableHead className="w-1/4 rounded-tl-lg text-slate-400">
                   ID
                 </TableHead>
-                <TableHead className="w-1/3 text-slate-400">Title</TableHead>
-                <TableHead className="w-1/3 text-slate-400">
+                <TableHead className="w-1/4 text-slate-400">Title</TableHead>
+                <TableHead className="w-1/6 text-slate-400">Folder</TableHead>
+                <TableHead className="w-1/6 text-slate-400">
                   Created At
                 </TableHead>
                 <TableHead className="rounded-tr-lg"></TableHead>
@@ -328,11 +331,11 @@ function Workflows() {
             <TableBody>
               {isLoading ? (
                 <TableRow>
-                  <TableCell colSpan={4}>Loading...</TableCell>
+                  <TableCell colSpan={5}>Loading...</TableCell>
                 </TableRow>
               ) : workflows?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={4}>No workflows found</TableCell>
+                  <TableCell colSpan={5}>No workflows found</TableCell>
                 </TableRow>
               ) : (
                 workflows?.map((workflow) => {
@@ -359,12 +362,32 @@ function Workflows() {
                         onClick={(event) => {
                           handleRowClick(event, workflow.workflow_permanent_id);
                         }}
+                      >
+                        {workflow.folder_id ? (
+                          <div className="flex items-center gap-1.5">
+                            <FileIcon className="h-3.5 w-3.5 text-blue-400" />
+                            <span className="text-sm">
+                              {allFolders.find((f) => f.folder_id === workflow.folder_id)?.title || workflow.folder_id}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="text-slate-400">-</span>
+                        )}
+                      </TableCell>
+                      <TableCell
+                        onClick={(event) => {
+                          handleRowClick(event, workflow.workflow_permanent_id);
+                        }}
                         title={basicTimeFormat(workflow.created_at)}
                       >
                         {basicLocalTimeFormat(workflow.created_at)}
                       </TableCell>
                       <TableCell>
                         <div className="flex justify-end gap-2">
+                          <WorkflowFolderSelector
+                            workflowId={workflow.workflow_permanent_id}
+                            currentFolderId={workflow.folder_id}
+                          />
                           <TooltipProvider>
                             <Tooltip>
                               <TooltipTrigger asChild>
