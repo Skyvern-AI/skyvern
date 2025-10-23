@@ -559,6 +559,7 @@ export type WorkflowApiResponse = {
   ai_fallback: boolean | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
+  folder_id: string | null;
 };
 
 export type WorkflowSettings = {
