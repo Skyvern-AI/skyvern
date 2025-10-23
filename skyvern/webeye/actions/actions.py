@@ -125,6 +125,10 @@ class Action(BaseModel):
                 return SolveCaptchaAction.model_validate(value)
             elif action_type is ActionType.RELOAD_PAGE:
                 return ReloadPageAction.model_validate(value)
+            elif action_type is ActionType.GOTO_URL:
+                return GotoUrlAction.model_validate(value)
+            elif action_type is ActionType.CLOSE_PAGE:
+                return ClosePageAction.model_validate(value)
             else:
                 raise ValueError(f"Unsupported action type: {action_type}")
         else:
@@ -151,6 +155,11 @@ class DecisiveAction(Action):
 # TODO: consider to implement this as a WebAction in the future
 class ReloadPageAction(Action):
     action_type: ActionType = ActionType.RELOAD_PAGE
+
+
+# TODO: right now, it's only enabled when there's magic link during login
+class ClosePageAction(Action):
+    action_type: ActionType = ActionType.CLOSE_PAGE
 
 
 class ClickAction(WebAction):
@@ -263,6 +272,7 @@ class KeypressAction(Action):
 class GotoUrlAction(Action):
     action_type: ActionType = ActionType.GOTO_URL
     url: str
+    is_magic_link: bool = False  # if True, shouldn't go to url directly when replaying the cache
 
 
 class MoveAction(Action):

@@ -17,6 +17,7 @@ class ActionType(StrEnum):
     TERMINATE = "terminate"
     COMPLETE = "complete"
     RELOAD_PAGE = "reload_page"
+    CLOSE_PAGE = "close_page"
 
     EXTRACT = "extract"
     VERIFICATION_CODE = "verification_code"

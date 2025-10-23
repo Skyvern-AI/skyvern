@@ -21,6 +21,8 @@ from websockets.exceptions import ConnectionClosedError
 
 import skyvern.forge.sdk.routes.streaming_clients as sc
 from skyvern.config import settings
+from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming_agent import connected_agent
 from skyvern.forge.sdk.routes.streaming_auth import auth
@@ -35,6 +37,28 @@ from skyvern.forge.sdk.routes.streaming_verify import (
 from skyvern.forge.sdk.utils.aio import collect
 
 LOG = structlog.get_logger()
+
+
+class Constants:
+    MissingXApiKey = "<missing-x-api-key>"
+
+
+async def get_x_api_key(organization_id: str) -> str:
+    token = await app.DATABASE.get_valid_org_auth_token(
+        organization_id,
+        OrganizationAuthTokenType.api.value,
+    )
+
+    if not token:
+        LOG.warning(
+            "No valid API key found for organization when streaming.",
+            organization_id=organization_id,
+        )
+        x_api_key = Constants.MissingXApiKey
+    else:
+        x_api_key = token.token
+
+    return x_api_key
 
 
 async def get_streaming_for_browser_session(
@@ -60,12 +84,15 @@ async def get_streaming_for_browser_session(
         )
         return None
 
+    x_api_key = await get_x_api_key(organization_id)
+
     streaming = sc.Streaming(
         client_id=client_id,
         interactor="agent",
         organization_id=organization_id,
         vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
         browser_session=browser_session,
+        x_api_key=x_api_key,
         websocket=websocket,
     )
 
@@ -99,11 +126,14 @@ async def get_streaming_for_task(
         LOG.info("No initial browser session found for task.", task_id=task_id, organization_id=organization_id)
         return None
 
+    x_api_key = await get_x_api_key(organization_id)
+
     streaming = sc.Streaming(
         client_id=client_id,
         interactor="agent",
         organization_id=organization_id,
         vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
+        x_api_key=x_api_key,
         websocket=websocket,
         browser_session=browser_session,
         task=task,
@@ -146,6 +176,8 @@ async def get_streaming_for_workflow_run(
         )
         return None
 
+    x_api_key = await get_x_api_key(organization_id)
+
     streaming = sc.Streaming(
         client_id=client_id,
         interactor="agent",
@@ -153,6 +185,7 @@ async def get_streaming_for_workflow_run(
         vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
         browser_session=browser_session,
         workflow_run=workflow_run,
+        x_api_key=x_api_key,
         websocket=websocket,
     )
 

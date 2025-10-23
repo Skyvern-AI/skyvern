@@ -137,7 +137,7 @@ async def aiohttp_post(
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     raise_exception: bool = True,
     retry_timeout: float = 0,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         count = 0
         while count <= retry:

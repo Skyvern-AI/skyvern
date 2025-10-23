@@ -108,6 +108,8 @@ async def _get_verification_code_from_url(
             totp_verification_url=url,
             reason=str(e),
         )
+    if not json_resp:
+        return None
     return json_resp.get("verification_code", None)
 
 
