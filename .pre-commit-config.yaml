@@ -23,7 +23,7 @@ repos:
         always_run: true
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.12.1
+    rev: v0.14.1
     hooks:
       # Run the linter.
       - id: ruff
@@ -35,7 +35,7 @@ repos:
       # Run the formatter.
       - id: ruff-format
   - repo: https://github.com/pycqa/isort
-    rev: 6.0.1
+    rev: 7.0.0
     hooks:
       - id: isort
         language_version: python3
@@ -52,7 +52,7 @@ repos:
       - id: python-no-log-warn
       - id: python-use-type-annotations
   - repo: https://github.com/asottile/pyupgrade
-    rev: v3.20.0
+    rev: v3.21.0
     hooks:
       - id: pyupgrade
         exclude: |
@@ -60,7 +60,7 @@ repos:
           ^skyvern/client/.*
           )
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.16.1
+    rev: v1.18.2
     hooks:
       - id: mypy
         args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs]
@@ -71,6 +71,8 @@ repos:
           - alembic
           - 'sqlalchemy[mypy]'
           - types-PyYAML
+          - types-toml
+          - types-redis
           - types-aiofiles
         exclude: |
           (?x)(

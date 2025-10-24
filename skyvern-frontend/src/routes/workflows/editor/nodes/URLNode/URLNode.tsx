@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { Flippable } from "@/components/Flippable";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import type { URLNode } from "./types";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { useState } from "react";
@@ -14,9 +14,9 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 function URLNode({ id, data, type }: NodeProps<URLNode>) {
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
@@ -30,18 +30,7 @@ function URLNode({ id, data, type }: NodeProps<URLNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
-  const [inputs, setInputs] = useState({
-    url: data.url,
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const update = useUpdate<URLNode["data"]>({ id, editable });
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -94,9 +83,9 @@ function URLNode({ id, data, type }: NodeProps<URLNode>) {
                 canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("url", value);
+                  update({ url: value });
                 }}
-                value={inputs.url}
+                value={data.url}
                 placeholder={placeholders[type]["url"]}
                 className="nopan text-xs"
               />

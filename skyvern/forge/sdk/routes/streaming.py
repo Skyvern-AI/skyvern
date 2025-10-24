@@ -5,7 +5,7 @@ from datetime import datetime
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
-from websockets.exceptions import ConnectionClosedOK
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import legacy_base_router
@@ -111,6 +111,13 @@ async def task_stream(
         LOG.info("WebSocket connection closed", task_id=task_id, organization_id=organization_id)
     except ConnectionClosedOK:
         LOG.info("ConnectionClosedOK error while streaming", task_id=task_id, organization_id=organization_id)
+        return
+    except ConnectionClosedError:
+        LOG.warning(
+            "ConnectionClosedError while streaming (client likely disconnected)",
+            task_id=task_id,
+            organization_id=organization_id,
+        )
         return
     except Exception:
         LOG.warning("Error while streaming", task_id=task_id, organization_id=organization_id, exc_info=True)
@@ -233,6 +240,13 @@ async def workflow_run_streaming(
     except ConnectionClosedOK:
         LOG.info(
             "WofklowRun Streaming: ConnectionClosedOK error while streaming",
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        return
+    except ConnectionClosedError:
+        LOG.warning(
+            "WofklowRun Streaming: ConnectionClosedError while streaming (client likely disconnected)",
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )

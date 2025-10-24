@@ -213,9 +213,6 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
-            litellm_params=LiteLLMParams(
-                drop_params=True,  # type: ignore
-            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -228,9 +225,6 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
-            litellm_params=LiteLLMParams(
-                drop_params=True,  # type: ignore
-            ),
         ),
     )
 
@@ -325,6 +319,16 @@ if settings.ENABLE_ANTHROPIC:
         "ANTHROPIC_CLAUDE4.5_SONNET",
         LLMConfig(
             "anthropic/claude-sonnet-4-5-20250929",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=64000,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.5_HAIKU",
+        LLMConfig(
+            "anthropic/claude-haiku-4-5-20251001",
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,

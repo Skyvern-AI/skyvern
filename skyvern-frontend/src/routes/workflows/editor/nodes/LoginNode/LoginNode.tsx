@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Flippable } from "@/components/Flippable";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import {
@@ -16,15 +16,7 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
-import { useState } from "react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
 import type { LoginNode } from "./types";
@@ -40,13 +32,12 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
 import { DisableCache } from "../DisableCache";
 
 function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
-  const { updateNodeData } = useReactFlow();
-  const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
   const script = blockScriptStore.scripts[label];
@@ -58,36 +49,15 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    url: data.url,
-    navigationGoal: data.navigationGoal,
-    errorCodeMapping: data.errorCodeMapping,
-    maxStepsOverride: data.maxStepsOverride,
-    continueOnFailure: data.continueOnFailure,
-    cacheActions: data.cacheActions,
-    disableCache: data.disableCache,
-    totpVerificationUrl: data.totpVerificationUrl,
-    totpIdentifier: data.totpIdentifier,
-    completeCriterion: data.completeCriterion,
-    terminateCriterion: data.terminateCriterion,
-    engine: data.engine,
-    model: data.model,
-  });
-
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const update = useUpdate<LoginNode["data"]>({ id, editable });
 
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
-
+  // Manage flippable facing state
+  const [facing, setFacing] = useState<"front" | "back">("front");
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
   }, [data.showCode]);
@@ -122,8 +92,8 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
             blockLabel={label}
             editable={editable}
             nodeId={id}
-            totpIdentifier={inputs.totpIdentifier}
-            totpUrl={inputs.totpVerificationUrl}
+            totpIdentifier={data.totpIdentifier}
+            totpUrl={data.totpVerificationUrl}
             type={type}
           />
           <div className="space-y-4">
@@ -143,10 +113,8 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
               <WorkflowBlockInputTextarea
                 canWriteTitle={true}
                 nodeId={id}
-                onChange={(value) => {
-                  handleChange("url", value);
-                }}
-                value={inputs.url}
+                onChange={(value) => update({ url: value })}
+                value={data.url}
                 placeholder={placeholders["login"]["url"]}
                 className="nopan text-xs"
               />
@@ -161,9 +129,9 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
               <WorkflowBlockInputTextarea
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("navigationGoal", value);
+                  update({ navigationGoal: value });
                 }}
-                value={inputs.navigationGoal}
+                value={data.navigationGoal}
                 placeholder={placeholders["login"]["navigationGoal"]}
                 className="nopan text-xs"
               />
@@ -181,7 +149,7 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                   if (!editable) {
                     return;
                   }
-                  updateNodeData(id, { parameterKeys: [value] });
+                  update({ parameterKeys: [value] });
                 }}
               />
             </div>
@@ -201,16 +169,16 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"
-                      value={inputs.model}
+                      value={data.model}
                       onChange={(value) => {
-                        handleChange("model", value);
+                        update({ model: value });
                       }}
                     />
                     <ParametersMultiSelect
                       availableOutputParameters={outputParameterKeys}
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
-                        updateNodeData(id, { parameterKeys });
+                        update({ parameterKeys });
                       }}
                     />
                   </div>
@@ -221,9 +189,9 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("completeCriterion", value);
+                        update({ completeCriterion: value });
                       }}
-                      value={inputs.completeCriterion}
+                      value={data.completeCriterion}
                       className="nopan text-xs"
                     />
                   </div>
@@ -235,9 +203,9 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                       </Label>
                     </div>
                     <RunEngineSelector
-                      value={inputs.engine}
+                      value={data.engine}
                       onChange={(value) => {
-                        handleChange("engine", value);
+                        update({ engine: value });
                       }}
                       className="nopan w-52 text-xs"
                     />
@@ -256,13 +224,13 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                       placeholder={placeholders["login"]["maxStepsOverride"]}
                       className="nopan w-52 text-xs"
                       min="0"
-                      value={inputs.maxStepsOverride ?? ""}
+                      value={data.maxStepsOverride ?? ""}
                       onChange={(event) => {
                         const value =
                           event.target.value === ""
                             ? null
                             : Number(event.target.value);
-                        handleChange("maxStepsOverride", value);
+                        update({ maxStepsOverride: value });
                       }}
                     />
                   </div>
@@ -277,29 +245,28 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                         />
                       </div>
                       <Checkbox
-                        checked={inputs.errorCodeMapping !== "null"}
+                        checked={data.errorCodeMapping !== "null"}
                         disabled={!editable}
                         onCheckedChange={(checked) => {
-                          handleChange(
-                            "errorCodeMapping",
-                            checked
+                          update({
+                            errorCodeMapping: checked
                               ? JSON.stringify(
                                   errorMappingExampleValue,
                                   null,
                                   2,
                                 )
                               : "null",
-                          );
+                          });
                         }}
                       />
                     </div>
-                    {inputs.errorCodeMapping !== "null" && (
+                    {data.errorCodeMapping !== "null" && (
                       <div>
                         <CodeEditor
                           language="json"
-                          value={inputs.errorCodeMapping}
+                          value={data.errorCodeMapping}
                           onChange={(value) => {
-                            handleChange("errorCodeMapping", value);
+                            update({ errorCodeMapping: value });
                           }}
                           className="nopan"
                           fontSize={8}
@@ -319,22 +286,22 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.continueOnFailure}
+                        checked={data.continueOnFailure}
                         onCheckedChange={(checked) => {
-                          handleChange("continueOnFailure", checked);
+                          update({ continueOnFailure: checked });
                         }}
                       />
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={inputs.cacheActions}
-                    disableCache={inputs.disableCache}
+                    cacheActions={data.cacheActions}
+                    disableCache={data.disableCache}
                     editable={editable}
                     onCacheActionsChange={(cacheActions) => {
-                      handleChange("cacheActions", cacheActions);
+                      update({ cacheActions });
                     }}
                     onDisableCacheChange={(disableCache) => {
-                      handleChange("disableCache", disableCache);
+                      update({ disableCache });
                     }}
                   />
                   <Separator />
@@ -350,9 +317,9 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpIdentifier", value);
+                        update({ totpIdentifier: value });
                       }}
-                      value={inputs.totpIdentifier ?? ""}
+                      value={data.totpIdentifier ?? ""}
                       placeholder={placeholders["login"]["totpIdentifier"]}
                       className="nopan text-xs"
                     />
@@ -369,9 +336,9 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpVerificationUrl", value);
+                        update({ totpVerificationUrl: value });
                       }}
-                      value={inputs.totpVerificationUrl ?? ""}
+                      value={data.totpVerificationUrl ?? ""}
                       placeholder={placeholders["login"]["totpVerificationUrl"]}
                       className="nopan text-xs"
                     />

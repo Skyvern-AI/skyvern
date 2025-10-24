@@ -16,14 +16,7 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
@@ -39,6 +32,7 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 import { BROWSER_DOWNLOAD_TIMEOUT_SECONDS } from "@/api/types";
 
@@ -52,7 +46,6 @@ const navigationGoalTooltip =
 const navigationGoalPlaceholder = "Tell Skyvern which file to download.";
 
 function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
@@ -65,34 +58,12 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    url: data.url,
-    navigationGoal: data.navigationGoal,
-    errorCodeMapping: data.errorCodeMapping,
-    maxStepsOverride: data.maxStepsOverride,
-    continueOnFailure: data.continueOnFailure,
-    cacheActions: data.cacheActions,
-    disableCache: data.disableCache,
-    downloadSuffix: data.downloadSuffix,
-    totpVerificationUrl: data.totpVerificationUrl,
-    totpIdentifier: data.totpIdentifier,
-    engine: data.engine,
-    model: data.model,
-    downloadTimeout: data.downloadTimeout,
-  });
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const update = useUpdate<FileDownloadNode["data"]>({ id, editable });
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -127,8 +98,8 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
             blockLabel={label}
             editable={editable}
             nodeId={id}
-            totpIdentifier={inputs.totpIdentifier}
-            totpUrl={inputs.totpVerificationUrl}
+            totpIdentifier={data.totpIdentifier}
+            totpUrl={data.totpVerificationUrl}
             type="file_download" // sic: the naming for this block is not consistent
           />
           <div className="space-y-4">
@@ -148,9 +119,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                 canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("url", value);
+                  update({ url: value });
                 }}
-                value={inputs.url}
+                value={data.url}
                 placeholder={urlPlaceholder}
                 className="nopan text-xs"
               />
@@ -163,9 +134,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
               <WorkflowBlockInputTextarea
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("navigationGoal", value);
+                  update({ navigationGoal: value });
                 }}
-                value={inputs.navigationGoal}
+                value={data.navigationGoal}
                 placeholder={navigationGoalPlaceholder}
                 className="nopan text-xs"
               />
@@ -181,7 +152,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
 
                 <Input
                   className="ml-auto w-16 text-right"
-                  value={inputs.downloadTimeout ?? undefined}
+                  value={data.downloadTimeout ?? undefined}
                   placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
                   onChange={(event) => {
                     const value =
@@ -190,7 +161,7 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                         : Number(event.target.value);
 
                     if (value) {
-                      handleChange("downloadTimeout", value);
+                      update({ downloadTimeout: value });
                     }
                   }}
                 />
@@ -215,16 +186,16 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"
-                      value={inputs.model}
+                      value={data.model}
                       onChange={(value) => {
-                        handleChange("model", value);
+                        update({ model: value });
                       }}
                     />
                     <ParametersMultiSelect
                       availableOutputParameters={outputParameterKeys}
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
-                        updateNodeData(id, { parameterKeys });
+                        update({ parameterKeys });
                       }}
                     />
                   </div>
@@ -235,9 +206,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       </Label>
                     </div>
                     <RunEngineSelector
-                      value={inputs.engine}
+                      value={data.engine}
                       onChange={(value) => {
-                        handleChange("engine", value);
+                        update({ engine: value });
                       }}
                       className="nopan w-52 text-xs"
                     />
@@ -256,13 +227,13 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                       placeholder={placeholders["download"]["maxStepsOverride"]}
                       className="nopan w-52 text-xs"
                       min="0"
-                      value={inputs.maxStepsOverride ?? ""}
+                      value={data.maxStepsOverride ?? ""}
                       onChange={(event) => {
                         const value =
                           event.target.value === ""
                             ? null
                             : Number(event.target.value);
-                        handleChange("maxStepsOverride", value);
+                        update({ maxStepsOverride: value });
                       }}
                     />
                   </div>
@@ -277,29 +248,28 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                         />
                       </div>
                       <Checkbox
-                        checked={inputs.errorCodeMapping !== "null"}
+                        checked={data.errorCodeMapping !== "null"}
                         disabled={!editable}
                         onCheckedChange={(checked) => {
-                          handleChange(
-                            "errorCodeMapping",
-                            checked
+                          update({
+                            errorCodeMapping: checked
                               ? JSON.stringify(
                                   errorMappingExampleValue,
                                   null,
                                   2,
                                 )
                               : "null",
-                          );
+                          });
                         }}
                       />
                     </div>
-                    {inputs.errorCodeMapping !== "null" && (
+                    {data.errorCodeMapping !== "null" && (
                       <div>
                         <CodeEditor
                           language="json"
-                          value={inputs.errorCodeMapping}
+                          value={data.errorCodeMapping}
                           onChange={(value) => {
-                            handleChange("errorCodeMapping", value);
+                            update({ errorCodeMapping: value });
                           }}
                           className="nopan"
                           fontSize={8}
@@ -319,22 +289,22 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.continueOnFailure}
+                        checked={data.continueOnFailure}
                         onCheckedChange={(checked) => {
-                          handleChange("continueOnFailure", checked);
+                          update({ continueOnFailure: checked });
                         }}
                       />
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={inputs.cacheActions}
-                    disableCache={inputs.disableCache}
+                    cacheActions={data.cacheActions}
+                    disableCache={data.disableCache}
                     editable={editable}
                     onCacheActionsChange={(cacheActions) => {
-                      handleChange("cacheActions", cacheActions);
+                      update({ cacheActions });
                     }}
                     onDisableCacheChange={(disableCache) => {
-                      handleChange("disableCache", disableCache);
+                      update({ disableCache });
                     }}
                   />
                   <Separator />
@@ -350,9 +320,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("downloadSuffix", value);
+                        update({ downloadSuffix: value });
                       }}
-                      value={inputs.downloadSuffix ?? ""}
+                      value={data.downloadSuffix ?? ""}
                       placeholder={placeholders["download"]["downloadSuffix"]}
                       className="nopan text-xs"
                     />
@@ -370,9 +340,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpIdentifier", value);
+                        update({ totpIdentifier: value });
                       }}
-                      value={inputs.totpIdentifier ?? ""}
+                      value={data.totpIdentifier ?? ""}
                       placeholder={placeholders["download"]["totpIdentifier"]}
                       className="nopan text-xs"
                     />
@@ -389,9 +359,9 @@ function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpVerificationUrl", value);
+                        update({ totpVerificationUrl: value });
                       }}
-                      value={inputs.totpVerificationUrl ?? ""}
+                      value={data.totpVerificationUrl ?? ""}
                       placeholder={placeholders["task"]["totpVerificationUrl"]}
                       className="nopan text-xs"
                     />

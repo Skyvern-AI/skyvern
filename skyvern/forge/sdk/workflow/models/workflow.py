@@ -110,6 +110,7 @@ class WorkflowRunStatus(StrEnum):
     canceled = "canceled"
     timed_out = "timed_out"
     completed = "completed"
+    paused = "paused"
 
     def is_final(self) -> bool:
         return self in [

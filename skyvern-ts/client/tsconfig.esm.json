@@ -1,0 +1,10 @@
+{
+    "extends": "./tsconfig.base.json",
+    "compilerOptions": {
+        "module": "esnext",
+        "outDir": "dist/esm",
+        "verbatimModuleSyntax": true
+    },
+    "include": ["src"],
+    "exclude": []
+}

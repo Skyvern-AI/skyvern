@@ -142,6 +142,9 @@ async def _get_otp_value_from_url(
             totp_verification_url=url,
             reason=str(e),
         )
+    if not json_resp:
+        return None
+
     code = json_resp.get("verification_code", None)
     if code:
         return OTPValue(value=code, type=OTPType.TOTP)

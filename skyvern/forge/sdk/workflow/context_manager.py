@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
+from onepassword import ItemFieldType
 from onepassword.client import Client as OnePasswordClient
 
 from skyvern.config import settings
@@ -147,7 +148,9 @@ class WorkflowRunContext:
             workflow_run_context.parameters[context_parameter.key] = context_parameter
 
         # Compute once and cache whether secrets should be included in templates
-        workflow_run_context.include_secrets_in_templates = workflow_run_context._should_include_secrets_in_templates()
+        workflow_run_context.include_secrets_in_templates = (
+            await workflow_run_context._should_include_secrets_in_templates()
+        )
 
         return workflow_run_context
 
@@ -202,12 +205,12 @@ class WorkflowRunContext:
             label = ""
         return self.blocks_metadata.get(label, BlockMetadata())
 
-    def _should_include_secrets_in_templates(self) -> bool:
+    async def _should_include_secrets_in_templates(self) -> bool:
         """
         Check if secrets should be included in template formatting based on experimentation provider.
         This check is done once per workflow run context to avoid repeated calls.
         """
-        return app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+        return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
             "CODE_BLOCK_ENABLED",
             self.workflow_run_id,
             properties={"organization_id": self.organization_id},
@@ -452,24 +455,61 @@ class WorkflowRunContext:
             "context": "These values are placeholders. When you type this in, the real value gets inserted (For security reasons)",
         }
 
-        # Process all fields
+        # Process all fields generically so it covers passwords and credit cards
         for field in item.fields:
-            if field.value is None:
+            if not field.value or field.field_type == ItemFieldType.UNSUPPORTED:
                 continue
-            random_secret_id = self.generate_random_secret_id()
+
+            # ignore irrelevant fields to avoid confusing AI
+            if field.id in ["validFrom", "interest", "issuenumber"]:
+                continue
+
             field_type = field.field_type.value.lower()
             if field_type == "totp":
+                random_secret_id = self.generate_random_secret_id()
                 totp_secret_id = f"{random_secret_id}_totp"
                 self.secrets[totp_secret_id] = OnePasswordConstants.TOTP
                 totp_secret_value = self.totp_secret_value_key(totp_secret_id)
                 self.secrets[totp_secret_value] = parse_totp_secret(field.value)
                 self.values[parameter.key]["totp"] = totp_secret_id
+            elif field.title and field.title.lower() in ["expire date", "expiry date", "expiration date"]:
+                parts = [part.strip() for part in field.value.strip().split("/")]
+
+                if len(parts) == 2:
+                    month, year_part = parts
+                    month = month.zfill(2)  # ensure '5' becomes '05'
+
+                    if len(year_part) == 4:
+                        year = year_part[2:]  # 2025 -> 25
+                    else:
+                        year = year_part
+
+                    self._add_secret_parameter_value(parameter, "card_exp_month", month)
+                    self._add_secret_parameter_value(parameter, "card_exp_year", year)
+                    if len(year) == 2:
+                        self._add_secret_parameter_value(parameter, "card_exp_mmyy", f"{month}/{year}")
+                        self._add_secret_parameter_value(parameter, "card_exp_mmyyyy", f"{month}/20{year}")
+                    else:
+                        # store the 1password-provided value additionally
+                        self._add_secret_parameter_value(parameter, "card_exp", field.value)
+                else:
+                    # fallback on the 1password-provided value
+                    self._add_secret_parameter_value(parameter, "card_exp", field.value)
             else:
-                # this will be the username or password or other field
-                key = field.id.replace(" ", "_")
-                secret_id = f"{random_secret_id}_{key}"
-                self.secrets[secret_id] = field.value
-                self.values[parameter.key][key] = secret_id
+                # using more descriptive keys than 1password provides by default
+                if field.id == "ccnum":
+                    self._add_secret_parameter_value(parameter, "card_number", field.value)
+                elif field.id == "cardholder":
+                    self._add_secret_parameter_value(parameter, "card_holder_name", field.value)
+                elif field.id == "cvv":
+                    self._add_secret_parameter_value(parameter, "card_cvv", field.value)
+                else:
+                    # this will be the username, password or other fields
+                    self._add_secret_parameter_value(parameter, field.id.replace(" ", "_"), field.value)
+
+        # Secure Note support
+        if item.notes:
+            self._add_secret_parameter_value(parameter, "notes", item.notes)
 
     async def register_bitwarden_login_credential_parameter_value(
         self,
@@ -980,6 +1020,15 @@ class WorkflowRunContext:
             # Use the DefaultAzureCredential if not configured on organization level
             azure_vault_client = AsyncAzureVaultClient.create_default()
         return azure_vault_client
+
+    def _add_secret_parameter_value(self, parameter: Parameter, key: str, value: str) -> None:
+        if parameter.key not in self.values:
+            raise ValueError(f"{parameter.key} is missing")
+
+        random_secret_id = self.generate_random_secret_id()
+        secret_id = f"{random_secret_id}_{key}"
+        self.secrets[secret_id] = value
+        self.values[parameter.key][key] = secret_id
 
 
 class WorkflowContextManager:

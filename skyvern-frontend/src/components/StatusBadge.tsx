@@ -4,7 +4,7 @@ import { cn } from "@/util/utils";
 
 type Props = {
   className?: string;
-  status: Status;
+  status: Status | "pending";
 };
 
 function StatusBadge({ className, status }: Props) {
@@ -24,7 +24,9 @@ function StatusBadge({ className, status }: Props) {
           status === Status.Canceled ||
           status === Status.TimedOut,
         "bg-yellow-900 text-yellow-50 hover:bg-yellow-900/80":
-          status === Status.Running || status === Status.Queued,
+          status === Status.Running ||
+          status === Status.Queued ||
+          status === "pending",
       })}
     >
       {statusText}

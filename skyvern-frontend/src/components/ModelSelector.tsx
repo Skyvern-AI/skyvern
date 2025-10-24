@@ -66,7 +66,6 @@ function ModelSelector({
             const newValue = v === constants.SkyvernOptimized ? null : v;
             const modelName = newValue ? reverseMap[newValue] : null;
             const value = modelName ? { model_name: modelName } : null;
-            console.log({ v, newValue, modelName, value });
             onChange(value);
           }}
         >

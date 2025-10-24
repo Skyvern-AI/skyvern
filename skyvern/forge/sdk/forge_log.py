@@ -29,6 +29,8 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
             event_dict["organization_id"] = context.organization_id
         if context.organization_name:
             event_dict["organization_name"] = context.organization_name
+        if context.step_id:
+            event_dict["step_id"] = context.step_id
         if context.task_id:
             event_dict["task_id"] = context.task_id
         if context.run_id:

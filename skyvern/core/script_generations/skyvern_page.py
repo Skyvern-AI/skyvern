@@ -23,6 +23,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.prompt_engine import load_prompt_with_elements
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -316,6 +317,7 @@ class SkyvernPage:
 
     async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
         url = render_template(url)
+        url = prepend_scheme_and_validate_url(url)
 
         # Print navigation in script mode
         context = skyvern_context.current()

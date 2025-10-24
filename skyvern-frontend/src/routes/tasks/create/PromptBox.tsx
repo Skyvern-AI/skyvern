@@ -8,6 +8,7 @@ import { InboxIcon } from "@/components/icons/InboxIcon";
 import { MessageIcon } from "@/components/icons/MessageIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
 import { ProxySelector } from "@/components/ProxySelector";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import {
@@ -45,6 +46,7 @@ import {
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 
 const exampleCases = [
   {
@@ -352,12 +354,30 @@ function PromptBox() {
                         information
                       </div>
                     </div>
-                    <Input
-                      value={webhookCallbackUrl ?? ""}
-                      onChange={(event) => {
-                        setWebhookCallbackUrl(event.target.value);
-                      }}
-                    />
+                    <div className="flex flex-col gap-2">
+                      <Input
+                        className="w-full"
+                        value={webhookCallbackUrl ?? ""}
+                        onChange={(event) => {
+                          setWebhookCallbackUrl(event.target.value);
+                        }}
+                      />
+                      <TestWebhookDialog
+                        runType="task"
+                        runId={null}
+                        initialWebhookUrl={webhookCallbackUrl ?? undefined}
+                        trigger={
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            className="self-start"
+                            disabled={!webhookCallbackUrl}
+                          >
+                            Test Webhook
+                          </Button>
+                        }
+                      />
+                    </div>
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">

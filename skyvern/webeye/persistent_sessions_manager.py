@@ -11,7 +11,11 @@ from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    PersistentBrowserSession,
+    PersistentBrowserSessionStatus,
+    is_final_status,
+)
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_factory import BrowserState
 
@@ -61,13 +65,19 @@ async def validate_session_for_renewal(
         )
         raise BrowserSessionNotRenewable("Browser session has not started yet", session_id)
 
-    if browser_session.status != "created":
+    if browser_session.status not in [
+        PersistentBrowserSessionStatus.created,
+        PersistentBrowserSessionStatus.retry,
+        PersistentBrowserSessionStatus.running,
+    ]:
         LOG.warning(
-            "Attempted to renew browser session that is not in the 'created' state",
+            "Attempted to renew browser session that is not in the 'created', 'retry' or 'running' state",
             browser_session_id=session_id,
             organization_id=organization_id,
         )
-        raise BrowserSessionNotRenewable("Browser session is not in the 'created' state", session_id)
+        raise BrowserSessionNotRenewable(
+            "Browser session is not in the 'created', 'retry' or 'running' state", session_id
+        )
 
     started_at_utc = (
         browser_session.started_at.replace(tzinfo=timezone.utc)
@@ -141,6 +151,12 @@ async def update_status(
             )
             return None
 
+    LOG.info(
+        "Updating browser session status",
+        browser_session_id=session_id,
+        organization_id=organization_id,
+        browser_status=status,
+    )
     persistent_browser_session = await db.update_persistent_browser_session(
         session_id,
         status=status,

@@ -10,7 +10,7 @@ export type WorkflowStartNodeData = {
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
-  extraHttpHeaders: string | null;
+  extraHttpHeaders: string | Record<string, unknown> | null;
   editable: boolean;
   runWith: string | null;
   scriptCacheKey: string | null;

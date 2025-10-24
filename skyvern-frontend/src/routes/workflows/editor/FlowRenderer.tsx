@@ -83,8 +83,6 @@ import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
 
-const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
-
 function convertToParametersYAML(
   parameters: ParametersState,
 ): Array<
@@ -278,7 +276,6 @@ function FlowRenderer({
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
-  const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const flowIsConstrained = debugStore.isDebugMode;
 
   useEffect(() => {
@@ -672,6 +669,7 @@ function FlowRenderer({
                 }
               }
             });
+
             if (dimensionChanges.length > 0) {
               doLayout(tempNodes, edges);
             }
@@ -687,20 +685,23 @@ function FlowRenderer({
               workflowChangesStore.setHasChanges(true);
             }
 
-            // only allow one update in _this_ render cycle
-            if (onNodesChangeTimeoutRef.current === null) {
-              onNodesChange(changes);
-              onNodesChangeTimeoutRef.current = setTimeout(() => {
-                onNodesChangeTimeoutRef.current = null;
-              }, 0);
-            } else {
-              // if we have an update in this render cycle already, then to
-              // prevent max recursion errors, defer the update to next render
-              // cycle
-              nextTick().then(() => {
-                onNodesChange(changes);
-              });
-            }
+            onNodesChange(changes);
+
+            // NOTE: should no longer be needed (woot!) - delete if true (want real-world testing first)
+            // // only allow one update in _this_ render cycle
+            // if (onNodesChangeTimeoutRef.current === null) {
+            //   onNodesChange(changes);
+            //   onNodesChangeTimeoutRef.current = setTimeout(() => {
+            //     onNodesChangeTimeoutRef.current = null;
+            //   }, 0);
+            // } else {
+            //   // if we have an update in this render cycle already, then to
+            //   // prevent max recursion errors, defer the update to next render
+            //   // cycle
+            //   nextTick().then(() => {
+            //     onNodesChange(changes);
+            //   });
+            // }
           }}
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}

@@ -3,8 +3,9 @@ import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
 import { html } from "@codemirror/lang-html";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cn } from "@/util/utils";
+import { useDebouncedCallback } from "use-debounce";
 
 import "./code-mirror-overrides.css";
 
@@ -50,6 +51,20 @@ function CodeEditor({
   fullHeight = false,
 }: Props) {
   const viewRef = useRef<EditorView | null>(null);
+  const [internalValue, setInternalValue] = useState(value);
+
+  useEffect(() => {
+    setInternalValue(value);
+  }, [value]);
+
+  const debouncedOnChange = useDebouncedCallback((newValue: string) => {
+    onChange?.(newValue);
+  }, 300);
+
+  const handleChange = (newValue: string) => {
+    setInternalValue(newValue);
+    debouncedOnChange(newValue);
+  };
 
   const extensions = language
     ? [getLanguageExtension(language), lineWrap ? EditorView.lineWrapping : []]
@@ -103,8 +118,8 @@ function CodeEditor({
 
   return (
     <CodeMirror
-      value={value}
-      onChange={onChange}
+      value={internalValue}
+      onChange={handleChange}
       extensions={extensions}
       theme={tokyoNightStorm}
       minHeight={minHeight}
@@ -117,6 +132,9 @@ function CodeEditor({
       }}
       onUpdate={(viewUpdate) => {
         if (!viewRef.current) viewRef.current = viewUpdate.view;
+      }}
+      onBlur={() => {
+        debouncedOnChange.flush();
       }}
     />
   );

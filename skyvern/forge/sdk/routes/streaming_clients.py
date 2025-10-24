@@ -22,30 +22,30 @@ Interactor = t.Literal["agent", "user"]
 Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
 
 
-# Commands
+# Messages
 
 
-# a global registry for WS command clients
-command_channels: dict[str, "CommandChannel"] = {}
+# a global registry for WS message clients
+message_channels: dict[str, "MessageChannel"] = {}
 
 
-def add_command_client(command_channel: "CommandChannel") -> None:
-    command_channels[command_channel.client_id] = command_channel
+def add_message_client(message_channel: "MessageChannel") -> None:
+    message_channels[message_channel.client_id] = message_channel
 
 
-def get_command_client(client_id: str) -> t.Union["CommandChannel", None]:
-    return command_channels.get(client_id, None)
+def get_message_client(client_id: str) -> t.Union["MessageChannel", None]:
+    return message_channels.get(client_id, None)
 
 
-def del_command_client(client_id: str) -> None:
+def del_message_client(client_id: str) -> None:
     try:
-        del command_channels[client_id]
+        del message_channels[client_id]
     except KeyError:
         pass
 
 
 @dataclasses.dataclass
-class CommandChannel:
+class MessageChannel:
     client_id: str
     organization_id: str
     websocket: WebSocket
@@ -56,10 +56,10 @@ class CommandChannel:
     workflow_run: WorkflowRun | None = None
 
     def __post_init__(self) -> None:
-        add_command_client(self)
+        add_message_client(self)
 
-    async def close(self, code: int = 1000, reason: str | None = None) -> "CommandChannel":
-        LOG.info("Closing command stream.", reason=reason, code=code)
+    async def close(self, code: int = 1000, reason: str | None = None) -> "MessageChannel":
+        LOG.info("Closing message stream.", reason=reason, code=code)
 
         self.browser_session = None
         self.workflow_run = None
@@ -69,7 +69,7 @@ class CommandChannel:
         except Exception:
             pass
 
-        del_command_client(self.client_id)
+        del_message_client(self.client_id)
 
         return self
 
@@ -81,43 +81,87 @@ class CommandChannel:
         if not self.workflow_run and not self.browser_session:
             return False
 
-        if not get_command_client(self.client_id):
+        if not get_message_client(self.client_id):
             return False
 
         return True
 
+    async def ask_for_clipboard(self, streaming: "Streaming") -> None:
+        try:
+            await self.websocket.send_json(
+                {
+                    "kind": "ask-for-clipboard",
+                }
+            )
+            LOG.info(
+                "Sent ask-for-clipboard to message channel",
+                organization_id=streaming.organization_id,
+            )
+        except Exception:
+            LOG.exception(
+                "Failed to send ask-for-clipboard to message channel",
+                organization_id=streaming.organization_id,
+            )
 
-CommandKinds = t.Literal["take-control", "cede-control"]
+    async def send_copied_text(self, copied_text: str, streaming: "Streaming") -> None:
+        try:
+            await self.websocket.send_json(
+                {
+                    "kind": "copied-text",
+                    "text": copied_text,
+                }
+            )
+            LOG.info(
+                "Sent copied text to message channel",
+                organization_id=streaming.organization_id,
+            )
+        except Exception:
+            LOG.exception(
+                "Failed to send copied text to message channel",
+                organization_id=streaming.organization_id,
+            )
+
+
+MessageKinds = t.Literal["take-control", "cede-control", "ask-for-clipboard-response"]
 
 
 @dataclasses.dataclass
-class Command:
-    kind: CommandKinds
+class Message:
+    kind: MessageKinds
 
 
 @dataclasses.dataclass
-class CommandTakeControl(Command):
+class MessageTakeControl(Message):
     kind: t.Literal["take-control"] = "take-control"
 
 
 @dataclasses.dataclass
-class CommandCedeControl(Command):
+class MessageCedeControl(Message):
     kind: t.Literal["cede-control"] = "cede-control"
 
 
-ChannelCommand = t.Union[CommandTakeControl, CommandCedeControl]
+@dataclasses.dataclass
+class MessageInAskForClipboardResponse(Message):
+    kind: t.Literal["ask-for-clipboard-response"] = "ask-for-clipboard-response"
+    text: str = ""
 
 
-def reify_channel_command(data: dict) -> ChannelCommand:
+ChannelMessage = t.Union[MessageTakeControl, MessageCedeControl, MessageInAskForClipboardResponse]
+
+
+def reify_channel_message(data: dict) -> ChannelMessage:
     kind = data.get("kind", None)
 
     match kind:
         case "take-control":
-            return CommandTakeControl()
+            return MessageTakeControl()
         case "cede-control":
-            return CommandCedeControl()
+            return MessageCedeControl()
+        case "ask-for-clipboard-response":
+            text = data.get("text") or ""
+            return MessageInAskForClipboardResponse(text=text)
         case _:
-            raise ValueError(f"Unknown command kind: '{kind}'")
+            raise ValueError(f"Unknown message kind: '{kind}'")
 
 
 # Streaming
@@ -159,7 +203,9 @@ class Keys:
         Ctrl = b"\x04\x01\x00\x00\x00\x00\xff\xe3"
         Cmd = b"\x04\x01\x00\x00\x00\x00\xff\xe9"
         Alt = b"\x04\x01\x00\x00\x00\x00\xff~"  # option
+        CKey = b"\x04\x01\x00\x00\x00\x00\x00c"
         OKey = b"\x04\x01\x00\x00\x00\x00\x00o"
+        VKey = b"\x04\x01\x00\x00\x00\x00\x00v"
 
     class Up:
         Ctrl = b"\x04\x00\x00\x00\x00\x00\xff\xe3"
@@ -181,7 +227,6 @@ class KeyState:
     ctrl_is_down: bool = False
     alt_is_down: bool = False
     cmd_is_down: bool = False
-    o_is_down: bool = False
 
     def is_forbidden(self, data: bytes) -> bool:
         """
@@ -194,6 +239,18 @@ class KeyState:
         Do not allow the opening of files.
         """
         return self.ctrl_is_down and data == Keys.Down.OKey
+
+    def is_copy(self, data: bytes) -> bool:
+        """
+        Detect Ctrl+C or Cmd+C for copy.
+        """
+        return (self.ctrl_is_down or self.cmd_is_down) and data == Keys.Down.CKey
+
+    def is_paste(self, data: bytes) -> bool:
+        """
+        Detect Ctrl+V or Cmd+V for paste.
+        """
+        return (self.ctrl_is_down or self.cmd_is_down) and data == Keys.Down.VKey
 
 
 @dataclasses.dataclass
@@ -214,6 +271,7 @@ class Streaming:
 
     organization_id: str
     vnc_port: int
+    x_api_key: str
     websocket: WebSocket
 
     # --

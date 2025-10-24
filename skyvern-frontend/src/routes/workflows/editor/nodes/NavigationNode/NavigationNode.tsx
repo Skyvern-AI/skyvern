@@ -18,14 +18,7 @@ import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
@@ -41,12 +34,12 @@ import { useParams } from "react-router-dom";
 import { NodeHeader } from "../components/NodeHeader";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 import { DisableCache } from "../DisableCache";
 
 function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const { blockLabel: urlBlockLabel } = useParams();
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
@@ -59,38 +52,11 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const rerender = useRerender({ prefix: "accordian" });
-  const [inputs, setInputs] = useState({
-    allowDownloads: data.allowDownloads,
-    cacheActions: data.cacheActions,
-    disableCache: data.disableCache,
-    completeCriterion: data.completeCriterion,
-    continueOnFailure: data.continueOnFailure,
-    downloadSuffix: data.downloadSuffix,
-    engine: data.engine,
-    errorCodeMapping: data.errorCodeMapping,
-    includeActionHistoryInVerification: data.includeActionHistoryInVerification,
-    maxStepsOverride: data.maxStepsOverride,
-    model: data.model,
-    navigationGoal: data.navigationGoal,
-    terminateCriterion: data.terminateCriterion,
-    totpIdentifier: data.totpIdentifier,
-    totpVerificationUrl: data.totpVerificationUrl,
-    url: data.url,
-  });
-
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const update = useUpdate<NavigationNode["data"]>({ id, editable });
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -127,8 +93,8 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
             blockLabel={label}
             editable={editable}
             nodeId={id}
-            totpIdentifier={inputs.totpIdentifier}
-            totpUrl={inputs.totpVerificationUrl}
+            totpIdentifier={data.totpIdentifier}
+            totpUrl={data.totpVerificationUrl}
             type={type}
           />
           <div
@@ -153,9 +119,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                 canWriteTitle={true}
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("url", value);
+                  update({ url: value });
                 }}
-                value={inputs.url}
+                value={data.url}
                 placeholder={placeholders["navigation"]["url"]}
                 className="nopan text-xs"
               />
@@ -172,9 +138,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
               <WorkflowBlockInputTextarea
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("navigationGoal", value);
+                  update({ navigationGoal: value });
                 }}
-                value={inputs.navigationGoal}
+                value={data.navigationGoal}
                 placeholder={placeholders["navigation"]["navigationGoal"]}
                 className="nopan text-xs"
               />
@@ -209,7 +175,7 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       availableOutputParameters={outputParameterKeys}
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
-                        updateNodeData(id, { parameterKeys });
+                        update({ parameterKeys });
                       }}
                     />
                   </div>
@@ -220,18 +186,18 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("completeCriterion", value);
+                        update({ completeCriterion: value });
                       }}
-                      value={inputs.completeCriterion}
+                      value={data.completeCriterion}
                       className="nopan text-xs"
                     />
                   </div>
                   <Separator />
                   <ModelSelector
                     className="nopan w-52 text-xs"
-                    value={inputs.model}
+                    value={data.model}
                     onChange={(value) => {
-                      handleChange("model", value);
+                      update({ model: value });
                     }}
                   />
                   <div className="flex items-center justify-between">
@@ -241,9 +207,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       </Label>
                     </div>
                     <RunEngineSelector
-                      value={inputs.engine}
+                      value={data.engine}
                       onChange={(value) => {
-                        handleChange("engine", value);
+                        update({ engine: value });
                       }}
                       className="nopan w-52 text-xs"
                     />
@@ -264,13 +230,13 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       }
                       className="nopan w-52 text-xs"
                       min="0"
-                      value={inputs.maxStepsOverride ?? ""}
+                      value={data.maxStepsOverride ?? ""}
                       onChange={(event) => {
                         const value =
                           event.target.value === ""
                             ? null
                             : Number(event.target.value);
-                        handleChange("maxStepsOverride", value);
+                        update({ maxStepsOverride: value });
                       }}
                     />
                   </div>
@@ -287,29 +253,28 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                         />
                       </div>
                       <Checkbox
-                        checked={inputs.errorCodeMapping !== "null"}
+                        checked={data.errorCodeMapping !== "null"}
                         disabled={!editable}
                         onCheckedChange={(checked) => {
-                          handleChange(
-                            "errorCodeMapping",
-                            checked
+                          update({
+                            errorCodeMapping: checked
                               ? JSON.stringify(
                                   errorMappingExampleValue,
                                   null,
                                   2,
                                 )
                               : "null",
-                          );
+                          });
                         }}
                       />
                     </div>
-                    {inputs.errorCodeMapping !== "null" && (
+                    {data.errorCodeMapping !== "null" && (
                       <div>
                         <CodeEditor
                           language="json"
-                          value={inputs.errorCodeMapping}
+                          value={data.errorCodeMapping}
                           onChange={(value) => {
-                            handleChange("errorCodeMapping", value);
+                            update({ errorCodeMapping: value });
                           }}
                           className="nopan"
                           fontSize={8}
@@ -333,12 +298,11 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.includeActionHistoryInVerification}
+                        checked={data.includeActionHistoryInVerification}
                         onCheckedChange={(checked) => {
-                          handleChange(
-                            "includeActionHistoryInVerification",
-                            checked,
-                          );
+                          update({
+                            includeActionHistoryInVerification: checked,
+                          });
                         }}
                       />
                     </div>
@@ -356,22 +320,22 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.continueOnFailure}
+                        checked={data.continueOnFailure}
                         onCheckedChange={(checked) => {
-                          handleChange("continueOnFailure", checked);
+                          update({ continueOnFailure: checked });
                         }}
                       />
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={inputs.cacheActions}
-                    disableCache={inputs.disableCache}
+                    cacheActions={data.cacheActions}
+                    disableCache={data.disableCache}
                     editable={editable}
                     onCacheActionsChange={(cacheActions) => {
-                      handleChange("cacheActions", cacheActions);
+                      update({ cacheActions });
                     }}
                     onDisableCacheChange={(disableCache) => {
-                      handleChange("disableCache", disableCache);
+                      update({ disableCache });
                     }}
                   />
                   <Separator />
@@ -388,9 +352,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.allowDownloads}
+                        checked={data.allowDownloads}
                         onCheckedChange={(checked) => {
-                          handleChange("allowDownloads", checked);
+                          update({ allowDownloads: checked });
                         }}
                       />
                     </div>
@@ -409,9 +373,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                       type="text"
                       placeholder={placeholders["navigation"]["downloadSuffix"]}
                       className="nopan w-52 text-xs"
-                      value={inputs.downloadSuffix ?? ""}
+                      value={data.downloadSuffix ?? ""}
                       onChange={(value) => {
-                        handleChange("downloadSuffix", value);
+                        update({ downloadSuffix: value });
                       }}
                     />
                   </div>
@@ -428,9 +392,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpIdentifier", value);
+                        update({ totpIdentifier: value });
                       }}
-                      value={inputs.totpIdentifier ?? ""}
+                      value={data.totpIdentifier ?? ""}
                       placeholder={placeholders["navigation"]["totpIdentifier"]}
                       className="nopan text-xs"
                     />
@@ -447,9 +411,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpVerificationUrl", value);
+                        update({ totpVerificationUrl: value });
                       }}
-                      value={inputs.totpVerificationUrl ?? ""}
+                      value={data.totpVerificationUrl ?? ""}
                       placeholder={placeholders["task"]["totpVerificationUrl"]}
                       className="nopan text-xs"
                     />

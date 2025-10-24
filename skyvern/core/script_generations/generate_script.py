@@ -481,7 +481,7 @@ def _build_block_fn(block: dict[str, Any], actions: list[dict[str, Any]]) -> Fun
     block_type = block.get("block_type")
     if block_type in SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION:
         complete_action = {"action_type": "complete"}
-        body_stmts.append(_action_to_stmt(complete_action, block, assign_to_output=assign_to_output))
+        body_stmts.append(_action_to_stmt(complete_action, block))
 
     # For extraction blocks, add return output statement if we have actions
     if is_extraction_block and any(
@@ -870,6 +870,13 @@ def _build_validate_statement(
     )
 
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
+def _build_human_interaction_statement(
+    block: dict[str, Any],
+) -> cst.SimpleStatementLine:
+    LOG.warning("Human interaction code generation is not yet implemented.", block=block)
+    return cst.SimpleStatementLine([cst.Expr(cst.Comment("# TODO: Implement human interaction logic"))])
 
 
 def _build_wait_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
@@ -1577,6 +1584,8 @@ def _build_block_statement(block: dict[str, Any], data_variable_name: str | None
             stmt = _build_navigate_statement(block_title, block, data_variable_name)
     elif block_type == "validation":
         stmt = _build_validate_statement(block_title, block, data_variable_name)
+    elif block_type == "human_interaction":
+        stmt = _build_human_interaction_statement(block)
     elif block_type == "task_v2":
         stmt = _build_run_task_statement(block_title, block, data_variable_name)
     elif block_type == "send_email":

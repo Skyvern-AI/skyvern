@@ -1,8 +1,7 @@
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import { useState } from "react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips } from "../../helpContent";
 import { type SendEmailNode } from "./types";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
@@ -13,9 +12,9 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
-  const { updateNodeData } = useReactFlow();
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -25,22 +24,8 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    recipients: data.recipients,
-    subject: data.subject,
-    body: data.body,
-    fileAttachments: data.fileAttachments,
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!data.editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const update = useUpdate<SendEmailNode["data"]>({ id, editable });
 
   return (
     <div>
@@ -86,9 +71,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           <WorkflowBlockInput
             nodeId={id}
             onChange={(value) => {
-              handleChange("recipients", value);
+              update({ recipients: value });
             }}
-            value={inputs.recipients}
+            value={data.recipients}
             placeholder="example@gmail.com, example2@gmail.com..."
             className="nopan text-xs"
           />
@@ -99,9 +84,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           <WorkflowBlockInput
             nodeId={id}
             onChange={(value) => {
-              handleChange("subject", value);
+              update({ subject: value });
             }}
-            value={inputs.subject}
+            value={data.subject}
             placeholder="What is the gist?"
             className="nopan text-xs"
           />
@@ -111,9 +96,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           <WorkflowBlockInputTextarea
             nodeId={id}
             onChange={(value) => {
-              handleChange("body", value);
+              update({ body: value });
             }}
-            value={inputs.body}
+            value={data.body}
             placeholder="What would you like to say?"
             className="nopan text-xs"
           />
@@ -128,9 +113,9 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           </div>
           <WorkflowBlockInput
             nodeId={id}
-            value={inputs.fileAttachments}
+            value={data.fileAttachments}
             onChange={(value) => {
-              handleChange("fileAttachments", value);
+              update({ fileAttachments: value });
             }}
             disabled
             className="nopan text-xs"

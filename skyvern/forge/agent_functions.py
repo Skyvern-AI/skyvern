@@ -146,8 +146,6 @@ async def _check_svg_eligibility(
         _mark_element_as_dropped(element, hashed_key=None)
         return False
 
-    task_id = task.task_id if task else None
-    step_id = step.step_id if step else None
     element_id = element.get("id", "")
 
     try:
@@ -172,8 +170,6 @@ async def _check_svg_eligibility(
         LOG.warning(
             "Failed to get the blocking element for the svg, going to continue parsing the svg",
             exc_info=True,
-            task_id=task_id,
-            step_id=step_id,
         )
 
     return True
@@ -185,8 +181,6 @@ async def _convert_svg_to_string(
     step: Step | None = None,
 ) -> None:
     """Convert an SVG element to a string description. Assumes element has already passed eligibility checks."""
-    task_id = task.task_id if task else None
-    step_id = step.step_id if step else None
     element_id = element.get("id", "")
 
     svg_element = _remove_skyvern_attributes(element)
@@ -202,8 +196,6 @@ async def _convert_svg_to_string(
     except Exception:
         LOG.warning(
             "Failed to loaded SVG cache",
-            task_id=task_id,
-            step_id=step_id,
             exc_info=True,
             key=svg_key,
         )
@@ -221,8 +213,6 @@ async def _convert_svg_to_string(
             LOG.warning(
                 "SVG element is too large to convert, going to drop the svg element.",
                 element_id=element_id,
-                task_id=task_id,
-                step_id=step_id,
                 length=len(svg_html),
                 key=svg_key,
             )
@@ -251,8 +241,6 @@ async def _convert_svg_to_string(
                 LOG.info(
                     "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt after 3s.",
                     exc_info=True,
-                    task_id=task_id,
-                    step_id=step_id,
                     element_id=element_id,
                     key=svg_key,
                     retry=retry,
@@ -273,8 +261,6 @@ async def _convert_svg_to_string(
                 LOG.info(
                     "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
                     exc_info=True,
-                    task_id=task_id,
-                    step_id=step_id,
                     element_id=element_id,
                     retry=retry,
                 )
@@ -286,8 +272,6 @@ async def _convert_svg_to_string(
             LOG.warning(
                 "Reaching the max try to convert svg element, going to drop the svg element.",
                 element_id=element_id,
-                task_id=task_id,
-                step_id=step_id,
                 key=svg_key,
                 length=len(svg_html),
             )
@@ -312,8 +296,6 @@ async def _convert_css_shape_to_string(
 ) -> None:
     element_id: str = element.get("id", "")
 
-    task_id = task.task_id if task else None
-    step_id = step.step_id if step else None
     shape_element = _remove_skyvern_attributes(element)
     svg_html = json_to_html(shape_element)
     hash_object = hashlib.sha256()
@@ -327,8 +309,6 @@ async def _convert_css_shape_to_string(
     except Exception:
         LOG.warning(
             "Failed to loaded CSS shape cache",
-            task_id=task_id,
-            step_id=step_id,
             exc_info=True,
             key=shape_key,
         )
@@ -344,8 +324,6 @@ async def _convert_css_shape_to_string(
             if await locater.count() == 0:
                 LOG.info(
                     "No locater found to convert css shape",
-                    task_id=task_id,
-                    step_id=step_id,
                     element_id=element_id,
                     key=shape_key,
                 )
@@ -354,8 +332,6 @@ async def _convert_css_shape_to_string(
             if not await locater.is_visible(timeout=settings.BROWSER_ACTION_TIMEOUT_MS):
                 LOG.info(
                     "element is not visible on the page, going to abort conversion",
-                    task_id=task_id,
-                    step_id=step_id,
                     element_id=element_id,
                     key=shape_key,
                 )
@@ -366,8 +342,6 @@ async def _convert_css_shape_to_string(
             if blocked:
                 LOG.debug(
                     "element is blocked by another element, going to abort conversion",
-                    task_id=task_id,
-                    step_id=step_id,
                     element_id=element_id,
                     key=shape_key,
                 )
@@ -380,8 +354,6 @@ async def _convert_css_shape_to_string(
                 LOG.info(
                     "Failed to make the element visible, going to abort conversion",
                     exc_info=True,
-                    task_id=task_id,
-                    step_id=step_id,
                     element_id=element_id,
                     key=shape_key,
                 )
@@ -411,8 +383,6 @@ async def _convert_css_shape_to_string(
                     LOG.info(
                         "Failed to convert css shape due to llm error. Will retry if haven't met the max try attempt after 3s.",
                         exc_info=True,
-                        task_id=task_id,
-                        step_id=step_id,
                         element_id=element_id,
                         retry=retry,
                         key=shape_key,
@@ -433,8 +403,6 @@ async def _convert_css_shape_to_string(
                     LOG.info(
                         "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
                         exc_info=True,
-                        task_id=task_id,
-                        step_id=step_id,
                         element_id=element_id,
                         retry=retry,
                         key=shape_key,
@@ -446,8 +414,6 @@ async def _convert_css_shape_to_string(
             else:
                 LOG.info(
                     "Max css shape convertion retry, going to abort the convertion.",
-                    task_id=task_id,
-                    step_id=step_id,
                     element_id=element_id,
                     key=shape_key,
                 )
@@ -457,8 +423,6 @@ async def _convert_css_shape_to_string(
             LOG.warning(
                 "Failed to convert css shape to string shape by LLM",
                 key=shape_key,
-                task_id=task_id,
-                step_id=step_id,
                 element_id=element_id,
                 exc_info=True,
             )

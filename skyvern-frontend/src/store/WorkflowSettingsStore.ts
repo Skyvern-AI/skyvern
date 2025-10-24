@@ -11,9 +11,14 @@ export interface WorkflowSettingsState {
   persistBrowserSession: boolean;
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
-  extraHttpHeaders: string | null;
+  extraHttpHeaders: string | Record<string, unknown> | null;
   setWorkflowSettings: (
-    settings: Partial<Omit<WorkflowSettingsState, "setWorkflowSettings">>,
+    settings: Partial<
+      Omit<
+        WorkflowSettingsState,
+        "setWorkflowSettings" | "resetWorkflowSettings"
+      >
+    >,
   ) => void;
   resetWorkflowSettings: () => void;
 }

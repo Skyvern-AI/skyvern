@@ -379,7 +379,7 @@ async def _take_workflow_run_block_screenshot(
         LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
         screenshot = await browser_state.take_fullpage_screenshot(
-            use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                 "ENABLE_PLAYWRIGHT_FULLPAGE",
                 workflow_run_id,
                 properties={"organization_id": str(organization_id)},
@@ -899,6 +899,8 @@ async def _regenerate_script_block_after_ai_fallback(
     2. create a completely new script, with only the current block's script being different as it's newly generated.
       -
     """
+    LOG.info("skipping script regeneration after AI fallback")
+    return None
     try:
         # Get the current script for this workflow and cache key value
         # Render the cache_key_value from workflow run parameters (same logic as generate_script_for_workflow)

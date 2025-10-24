@@ -401,7 +401,7 @@ class LLMAPIHandlerFactory:
                 # FIXME: volcengine doesn't support litellm cost calculation.
                 llm_cost = litellm.completion_cost(completion_response=response)
             except Exception as e:
-                LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
+                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
             prompt_tokens = 0
             completion_tokens = 0
@@ -705,7 +705,7 @@ class LLMAPIHandlerFactory:
                 # FIXME: volcengine doesn't support litellm cost calculation.
                 llm_cost = litellm.completion_cost(completion_response=response)
             except Exception as e:
-                LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
+                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
             prompt_tokens = 0
             completion_tokens = 0
@@ -1276,7 +1276,7 @@ class LLMCaller:
             try:
                 llm_cost = litellm.completion_cost(completion_response=response)
             except Exception as e:
-                LOG.info("Failed to calculate LLM cost", error=str(e), exc_info=True)
+                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
             input_tokens = 0
             output_tokens = 0

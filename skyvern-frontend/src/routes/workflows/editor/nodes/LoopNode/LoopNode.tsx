@@ -2,17 +2,10 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import type { Node } from "@xyflow/react";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useNodes } from "@xyflow/react";
 import { AppNode } from "..";
 import { helpTooltips } from "../../helpContent";
 import type { LoopNode } from "./types";
-import { useState } from "react";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { Checkbox } from "@/components/ui/checkbox";
 import { getLoopNodeWidth } from "../../workflowEditorUtils";
@@ -21,9 +14,9 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
-  const { updateNodeData } = useReactFlow();
   const nodes = useNodes<AppNode>();
   const node = nodes.find((n) => n.id === id);
   if (!node) {
@@ -38,13 +31,10 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    loopVariableReference: data.loopVariableReference,
-  });
-
+  const update = useUpdate<LoopNode["data"]>({ id, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
   const children = nodes.filter((node) => node.parentId === id);
+
   const furthestDownChild: Node | null = children.reduce(
     (acc, child) => {
       if (!acc) {
@@ -64,13 +54,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     24;
 
   const loopNodeWidth = getLoopNodeWidth(node, nodes);
-  function handleChange(key: string, value: unknown) {
-    if (!data.editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
 
   return (
     <div>
@@ -127,9 +110,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               </div>
               <WorkflowBlockInput
                 nodeId={id}
-                value={inputs.loopVariableReference}
+                value={data.loopVariableReference}
                 onChange={(value) => {
-                  handleChange("loopVariableReference", value);
+                  update({ loopVariableReference: value });
                 }}
               />
             </div>
@@ -141,7 +124,10 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       checked={data.completeIfEmpty}
                       disabled={!data.editable}
                       onCheckedChange={(checked) => {
-                        handleChange("completeIfEmpty", checked);
+                        update({
+                          completeIfEmpty:
+                            checked === "indeterminate" ? false : checked,
+                        });
                       }}
                     />
                     <Label className="text-xs text-slate-300">
@@ -155,7 +141,10 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
                       checked={data.continueOnFailure}
                       disabled={!data.editable}
                       onCheckedChange={(checked) => {
-                        handleChange("continueOnFailure", checked);
+                        update({
+                          continueOnFailure:
+                            checked === "indeterminate" ? false : checked,
+                        });
                       }}
                     />
                     <Label className="text-xs text-slate-300">

@@ -29,6 +29,7 @@ ArtifactType = typing.Union[
         "html_action",
         "trace",
         "har",
+        "script_file",
     ],
     typing.Any,
 ]

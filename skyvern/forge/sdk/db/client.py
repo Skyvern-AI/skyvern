@@ -1975,7 +1975,11 @@ class AgentDB:
             raise
 
     async def get_workflow_run(
-        self, workflow_run_id: str, organization_id: str | None = None, job_id: str | None = None
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        job_id: str | None = None,
+        status: WorkflowRunStatus | None = None,
     ) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
@@ -1984,6 +1988,8 @@ class AgentDB:
                     get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
                 if job_id:
                     get_workflow_run_query = get_workflow_run_query.filter_by(job_id=job_id)
+                if status:
+                    get_workflow_run_query = get_workflow_run_query.filter_by(status=status.value)
                 if workflow_run := (await session.scalars(get_workflow_run_query)).first():
                     return convert_to_workflow_run(workflow_run)
                 return None
@@ -3785,6 +3791,31 @@ class AgentDB:
             await session.commit()
             await session.refresh(task_run)
             return Run.model_validate(task_run)
+
+    async def update_task_run(
+        self,
+        organization_id: str,
+        run_id: str,
+        title: str | None = None,
+        url: str | None = None,
+        url_hash: str | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            task_run = (
+                await session.scalars(
+                    select(TaskRunModel).filter_by(run_id=run_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if not task_run:
+                raise NotFoundError(f"TaskRun {run_id} not found")
+
+            if title:
+                task_run.title = title
+            if url:
+                task_run.url = url
+            if url_hash:
+                task_run.url_hash = url_hash
+            await session.commit()
 
     async def create_credential(
         self,

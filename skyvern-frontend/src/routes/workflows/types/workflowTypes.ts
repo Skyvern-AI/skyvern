@@ -318,6 +318,7 @@ export type Taskv2Block = WorkflowBlockBase & {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_steps: number | null;
+  cache_actions?: boolean;
   disable_cache: boolean;
 };
 
