@@ -66,12 +66,30 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
     body_text = _sanitize_body(request, body_bytes, request.headers.get("content-type"))
 
     try:
-        return await call_next(request)
-    finally:
-        LOG.info(
+        response = await call_next(request)
+
+        if response.status_code >= 500:
+            log_method = LOG.error
+        elif response.status_code >= 400:
+            log_method = LOG.warning
+        else:
+            log_method = LOG.info
+        log_method(
             "api.raw_request",
             method=http_method,
             path=url_path,
             body=body_text,
             headers=sanitized_headers,
+            status_code=response.status_code,
         )
+        return response
+    except Exception:
+        LOG.error(
+            "api.raw_request",
+            method=http_method,
+            path=url_path,
+            body=body_text,
+            headers=sanitized_headers,
+            exc_info=True,
+        )
+        raise
