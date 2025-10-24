@@ -4,9 +4,10 @@ from email.message import EmailMessage
 import structlog
 from email_validator import EmailNotValidError, validate_email
 
-from skyvern.config import settings
+from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
+settings = SettingsManager.get_settings()
 
 
 async def _send(*, message: EmailMessage) -> bool:

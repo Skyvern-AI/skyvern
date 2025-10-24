@@ -1089,7 +1089,6 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         url: node.data.url,
-        disable_cache: node.data.disableCache ?? false,
       };
     }
     case "validation": {
@@ -1895,7 +1894,6 @@ function convertBlocksToBlockYAML(
           max_steps: block.max_steps,
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
-          disable_cache: block.disable_cache ?? false,
         };
         return blockYaml;
       }
