@@ -158,6 +158,7 @@ navigation:
       - api: API Reference
         snippets:
           python: skyvern
+          typescript: "@skyvern/client"
         layout:
           - section: Agent
             contents:
