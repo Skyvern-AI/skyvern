@@ -174,6 +174,7 @@ export type Taskv2BlockYAML = BlockYAMLBase & {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_steps: number | null;
+  disable_cache: boolean;
 };
 
 export type ValidationBlockYAML = BlockYAMLBase & {
