@@ -38,6 +38,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import TraceManager
@@ -60,6 +61,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     FileUploadBlock,
     ForLoopBlock,
     HttpRequestBlock,
+    HumanInteractionBlock,
     LoginBlock,
     NavigationBlock,
     PDFParserBlock,
@@ -333,6 +335,35 @@ class WorkflowService:
 
         return workflow_run
 
+    async def auto_create_browser_session_if_needed(
+        self,
+        organization_id: str,
+        workflow: Workflow,
+        *,
+        browser_session_id: str | None = None,
+        proxy_location: ProxyLocation | None = None,
+    ) -> PersistentBrowserSession | None:
+        if browser_session_id:  # the user has supplied an id, so no need to create one
+            return None
+
+        workflow_definition = workflow.workflow_definition
+        blocks = workflow_definition.blocks
+        human_interaction_blocks = [block for block in blocks if block.block_type == BlockType.HUMAN_INTERACTION]
+
+        if human_interaction_blocks:
+            timeouts = [getattr(block, "timeout_seconds", 60 * 60) for block in human_interaction_blocks]
+            timeout_seconds = sum(timeouts) + 60 * 60
+
+            browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                organization_id=organization_id,
+                timeout_minutes=timeout_seconds // 60,
+                proxy_location=proxy_location,
+            )
+
+            return browser_session
+
+        return None
+
     @TraceManager.traced_async(ignore_inputs=["organization", "api_key"])
     async def execute_workflow(
         self,
@@ -423,6 +454,17 @@ class WorkflowService:
                 close_browser_on_completion=close_browser_on_completion,
             )
             return workflow_run
+
+        browser_session = await self.auto_create_browser_session_if_needed(
+            organization.organization_id,
+            workflow,
+            browser_session_id=browser_session_id,
+            proxy_location=workflow_run.proxy_location,
+        )
+
+        if browser_session:
+            browser_session_id = browser_session.persistent_browser_session_id
+            close_browser_on_completion = True
 
         # Check if there's a related workflow script that should be used instead
         workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)
@@ -595,6 +637,7 @@ class WorkflowService:
         if not blocks:
             raise SkyvernException(f"No blocks found for the given block labels: {block_labels}")
 
+        #
         # Execute workflow blocks
         blocks_cnt = len(blocks)
         block_result = None
@@ -2742,6 +2785,21 @@ class WorkflowService:
                 terminate_criterion=block_yaml.terminate_criterion,
                 complete_verification=block_yaml.complete_verification,
                 include_action_history_in_verification=block_yaml.include_action_history_in_verification,
+            )
+
+        elif block_yaml.block_type == BlockType.HUMAN_INTERACTION:
+            return HumanInteractionBlock(
+                label=block_yaml.label,
+                output_parameter=output_parameter,
+                instructions=block_yaml.instructions,
+                positive_descriptor=block_yaml.positive_descriptor,
+                negative_descriptor=block_yaml.negative_descriptor,
+                timeout_seconds=block_yaml.timeout_seconds,
+                # --
+                sender=block_yaml.sender,
+                recipients=block_yaml.recipients,
+                subject=block_yaml.subject,
+                body=block_yaml.body,
             )
 
         elif block_yaml.block_type == BlockType.EXTRACTION:

@@ -37,6 +37,7 @@ class BlockType(StrEnum):
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
+    HUMAN_INTERACTION = "human_interaction"
 
 
 class BlockStatus(StrEnum):
@@ -429,6 +430,20 @@ class WaitBlockYAML(BlockYAML):
     wait_sec: int = 0
 
 
+class HumanInteractionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.HUMAN_INTERACTION] = BlockType.HUMAN_INTERACTION  # type: ignore
+
+    instructions: str = "Please review and approve or reject to continue the workflow."
+    positive_descriptor: str = "Approve"
+    negative_descriptor: str = "Reject"
+    timeout_seconds: int
+
+    sender: str
+    recipients: list[str]
+    subject: str
+    body: str
+
+
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
@@ -511,6 +526,7 @@ BLOCK_YAML_SUBCLASSES = (
     | ExtractionBlockYAML
     | LoginBlockYAML
     | WaitBlockYAML
+    | HumanInteractionBlockYAML
     | FileDownloadBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML

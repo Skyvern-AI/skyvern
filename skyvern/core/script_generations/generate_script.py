@@ -872,6 +872,13 @@ def _build_validate_statement(
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
+def _build_human_interaction_statement(
+    block: dict[str, Any],
+) -> cst.SimpleStatementLine:
+    LOG.warning("Human interaction code generation is not yet implemented.", block=block)
+    return cst.SimpleStatementLine([cst.Expr(cst.Comment("# TODO: Implement human interaction logic"))])
+
+
 def _build_wait_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.wait statement."""
     args = [
@@ -1577,6 +1584,8 @@ def _build_block_statement(block: dict[str, Any], data_variable_name: str | None
             stmt = _build_navigate_statement(block_title, block, data_variable_name)
     elif block_type == "validation":
         stmt = _build_validate_statement(block_title, block, data_variable_name)
+    elif block_type == "human_interaction":
+        stmt = _build_human_interaction_statement(block)
     elif block_type == "task_v2":
         stmt = _build_run_task_statement(block_title, block, data_variable_name)
     elif block_type == "send_email":
