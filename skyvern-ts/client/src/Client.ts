@@ -26,8 +26,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "0.2.18",
-                    "User-Agent": "@skyvern/client/0.2.18",
+                    "X-Fern-SDK-Version": "0.2.19",
+                    "User-Agent": "@skyvern/client/0.2.19",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -74,7 +74,6 @@ export class SkyvernClient {
             mergeOnlyDefinedHeaders({
                 "x-user-agent": userAgent != null ? userAgent : undefined,
                 "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
             }),
             requestOptions?.headers,
         );
@@ -173,7 +172,6 @@ export class SkyvernClient {
                 "x-max-steps-override": maxStepsOverride != null ? maxStepsOverride.toString() : undefined,
                 "x-user-agent": userAgent != null ? userAgent : undefined,
                 "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
             }),
             requestOptions?.headers,
         );
@@ -255,10 +253,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.GetRunResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -332,10 +327,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -463,10 +455,7 @@ export class SkyvernClient {
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -541,10 +530,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.Workflow>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -625,10 +611,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.Workflow>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -706,10 +689,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -787,10 +767,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.Artifact>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -880,10 +857,7 @@ export class SkyvernClient {
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -958,10 +932,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1040,10 +1011,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunTimeline[]>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1120,10 +1088,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.BrowserSessionResponse[]>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1201,10 +1166,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.BrowserSessionResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1285,10 +1247,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1369,10 +1328,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.BrowserSessionResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1456,10 +1412,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.TotpCode>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1550,10 +1503,7 @@ export class SkyvernClient {
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1636,10 +1586,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CredentialResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1717,10 +1664,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<void>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1797,10 +1741,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CredentialResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1879,10 +1820,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -1973,10 +1911,7 @@ export class SkyvernClient {
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -2051,10 +1986,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CreateScriptResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -2132,10 +2064,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.Script>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -2218,10 +2147,7 @@ export class SkyvernClient {
     ): Promise<core.WithRawResponse<Skyvern.CreateScriptResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -2275,10 +2201,5 @@ export class SkyvernClient {
                     rawResponse: _response.rawResponse,
                 });
         }
-    }
-
-    protected async _getCustomAuthorizationHeaders(): Promise<Record<string, string | undefined>> {
-        const xApiKeyValue = await core.Supplier.get(this._options.xApiKey);
-        return { "x-api-key": xApiKeyValue };
     }
 }

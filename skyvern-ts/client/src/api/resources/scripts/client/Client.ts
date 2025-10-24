@@ -41,10 +41,7 @@ export class Scripts {
     ): Promise<core.WithRawResponse<unknown>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-                ...(await this._getCustomAuthorizationHeaders()),
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -93,10 +90,5 @@ export class Scripts {
                     rawResponse: _response.rawResponse,
                 });
         }
-    }
-
-    protected async _getCustomAuthorizationHeaders(): Promise<Record<string, string | undefined>> {
-        const xApiKeyValue = await core.Supplier.get(this._options.xApiKey);
-        return { "x-api-key": xApiKeyValue };
     }
 }
