@@ -11,7 +11,7 @@ groups:
     generators:
       - name: fernapi/fern-python-sdk
         smart-casing: true
-        version: 4.3.17
+        version: 4.31.1
         output:
           location: pypi
           package-name: skyvern
@@ -19,3 +19,14 @@ groups:
           repository: Skyvern-AI/skyvern-python
         config:
           client_class_name: Skyvern
+  ts-sdk:
+    generators:
+      - name: fernapi/fern-typescript-sdk
+        version: 3.11.1
+        output:
+          location: npm
+          package-name: "@skyvern/client"
+        github:
+          repository: Skyvern-AI/skyvern-typescript
+        config:
+          namespaceExport: Skyvern
