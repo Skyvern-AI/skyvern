@@ -7,7 +7,7 @@ import { mockServerPool } from "../mock-server/MockServerPool";
 describe("SkyvernClient", () => {
     test("run_task (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { prompt: "Find the top 3 posts on Hacker News." };
         const rawResponseBody = {
             run_id: "tsk_123",
@@ -132,7 +132,7 @@ describe("SkyvernClient", () => {
 
     test("run_task (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { prompt: "prompt" };
         const rawResponseBody = { key: "value" };
         server
@@ -155,7 +155,7 @@ describe("SkyvernClient", () => {
 
     test("run_task (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { prompt: "prompt" };
         const rawResponseBody = { key: "value" };
         server
@@ -178,7 +178,7 @@ describe("SkyvernClient", () => {
 
     test("run_workflow (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { workflow_id: "wpid_123" };
         const rawResponseBody = {
             run_id: "tsk_123",
@@ -296,7 +296,7 @@ describe("SkyvernClient", () => {
 
     test("run_workflow (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { workflow_id: "workflow_id" };
         const rawResponseBody = { key: "value" };
         server
@@ -319,7 +319,7 @@ describe("SkyvernClient", () => {
 
     test("run_workflow (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { workflow_id: "workflow_id" };
         const rawResponseBody = { key: "value" };
         server
@@ -342,7 +342,7 @@ describe("SkyvernClient", () => {
 
     test("get_run (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = {
             run_type: "task_v1",
@@ -456,7 +456,7 @@ describe("SkyvernClient", () => {
 
     test("get_run (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server.mockEndpoint().get("/v1/runs/run_id").respondWith().statusCode(404).jsonBody(rawResponseBody).build();
@@ -468,7 +468,7 @@ describe("SkyvernClient", () => {
 
     test("get_run (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server.mockEndpoint().get("/v1/runs/run_id").respondWith().statusCode(422).jsonBody(rawResponseBody).build();
@@ -480,7 +480,7 @@ describe("SkyvernClient", () => {
 
     test("cancel_run (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -499,7 +499,7 @@ describe("SkyvernClient", () => {
 
     test("cancel_run (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -517,7 +517,7 @@ describe("SkyvernClient", () => {
 
     test("get_workflows (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = [
             {
@@ -646,7 +646,7 @@ describe("SkyvernClient", () => {
 
     test("get_workflows (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server.mockEndpoint().get("/v1/workflows").respondWith().statusCode(422).jsonBody(rawResponseBody).build();
@@ -658,7 +658,7 @@ describe("SkyvernClient", () => {
 
     test("create_workflow (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = {
             workflow_id: "workflow_id",
@@ -782,7 +782,7 @@ describe("SkyvernClient", () => {
 
     test("create_workflow (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = { key: "value" };
         server
@@ -801,7 +801,7 @@ describe("SkyvernClient", () => {
 
     test("update_workflow (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = {
             workflow_id: "workflow_id",
@@ -925,7 +925,7 @@ describe("SkyvernClient", () => {
 
     test("update_workflow (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = { key: "value" };
         server
@@ -944,7 +944,7 @@ describe("SkyvernClient", () => {
 
     test("delete_workflow (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -963,7 +963,7 @@ describe("SkyvernClient", () => {
 
     test("delete_workflow (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -981,7 +981,7 @@ describe("SkyvernClient", () => {
 
     test("get_artifact (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = {
             created_at: "2023-01-01T00:00:00Z",
@@ -1028,7 +1028,7 @@ describe("SkyvernClient", () => {
 
     test("get_artifact (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1046,7 +1046,7 @@ describe("SkyvernClient", () => {
 
     test("get_artifact (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1064,7 +1064,7 @@ describe("SkyvernClient", () => {
 
     test("get_run_artifacts (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = [
             {
@@ -1115,7 +1115,7 @@ describe("SkyvernClient", () => {
 
     test("get_run_artifacts (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1133,7 +1133,7 @@ describe("SkyvernClient", () => {
 
     test("retry_run_webhook (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1152,7 +1152,7 @@ describe("SkyvernClient", () => {
 
     test("retry_run_webhook (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1170,7 +1170,7 @@ describe("SkyvernClient", () => {
 
     test("get_run_timeline (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = [
             {
@@ -1327,7 +1327,7 @@ describe("SkyvernClient", () => {
 
     test("get_run_timeline (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1345,7 +1345,7 @@ describe("SkyvernClient", () => {
 
     test("get_run_timeline (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1363,7 +1363,7 @@ describe("SkyvernClient", () => {
 
     test("get_run_timeline (4)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1381,7 +1381,7 @@ describe("SkyvernClient", () => {
 
     test("get_browser_sessions (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = [
             {
@@ -1444,7 +1444,7 @@ describe("SkyvernClient", () => {
 
     test("get_browser_sessions (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1462,7 +1462,7 @@ describe("SkyvernClient", () => {
 
     test("get_browser_sessions (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1480,7 +1480,7 @@ describe("SkyvernClient", () => {
 
     test("create_browser_session (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = {
             browser_session_id: "pbs_123456",
@@ -1550,7 +1550,7 @@ describe("SkyvernClient", () => {
 
     test("create_browser_session (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = { key: "value" };
         server
@@ -1569,7 +1569,7 @@ describe("SkyvernClient", () => {
 
     test("create_browser_session (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = { key: "value" };
         server
@@ -1588,7 +1588,7 @@ describe("SkyvernClient", () => {
 
     test("close_browser_session (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1607,7 +1607,7 @@ describe("SkyvernClient", () => {
 
     test("close_browser_session (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1625,7 +1625,7 @@ describe("SkyvernClient", () => {
 
     test("close_browser_session (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1643,7 +1643,7 @@ describe("SkyvernClient", () => {
 
     test("get_browser_session (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = {
             browser_session_id: "pbs_123456",
@@ -1712,7 +1712,7 @@ describe("SkyvernClient", () => {
 
     test("get_browser_session (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1730,7 +1730,7 @@ describe("SkyvernClient", () => {
 
     test("get_browser_session (3)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1748,7 +1748,7 @@ describe("SkyvernClient", () => {
 
     test("get_browser_session (4)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1766,7 +1766,7 @@ describe("SkyvernClient", () => {
 
     test("send_totp_code (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {
             totp_identifier: "john.doe@example.com",
             content: "Hello, your verification code is 123456",
@@ -1818,7 +1818,7 @@ describe("SkyvernClient", () => {
 
     test("send_totp_code (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { totp_identifier: "totp_identifier", content: "content" };
         const rawResponseBody = { key: "value" };
         server
@@ -1840,7 +1840,7 @@ describe("SkyvernClient", () => {
 
     test("get_credentials (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = [
             {
@@ -1871,7 +1871,7 @@ describe("SkyvernClient", () => {
 
     test("get_credentials (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server.mockEndpoint().get("/v1/credentials").respondWith().statusCode(422).jsonBody(rawResponseBody).build();
@@ -1883,7 +1883,7 @@ describe("SkyvernClient", () => {
 
     test("create_credential (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {
             name: "My Credential",
             credential_type: "password",
@@ -1926,7 +1926,7 @@ describe("SkyvernClient", () => {
 
     test("create_credential (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {
             name: "name",
             credential_type: "password",
@@ -1956,7 +1956,7 @@ describe("SkyvernClient", () => {
 
     test("delete_credential (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         server.mockEndpoint().post("/v1/credentials/cred_1234567890/delete").respondWith().statusCode(200).build();
 
@@ -1966,7 +1966,7 @@ describe("SkyvernClient", () => {
 
     test("delete_credential (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -1984,7 +1984,7 @@ describe("SkyvernClient", () => {
 
     test("get_credential (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = {
             credential_id: "cred_1234567890",
@@ -2014,7 +2014,7 @@ describe("SkyvernClient", () => {
 
     test("get_credential (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -2032,7 +2032,7 @@ describe("SkyvernClient", () => {
 
     test("login (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { credential_type: "skyvern" };
         const rawResponseBody = {
             run_id: "tsk_123",
@@ -2143,7 +2143,7 @@ describe("SkyvernClient", () => {
 
     test("login (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { credential_type: "skyvern" };
         const rawResponseBody = { key: "value" };
         server
@@ -2164,7 +2164,7 @@ describe("SkyvernClient", () => {
 
     test("get_scripts (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = [
             {
@@ -2200,7 +2200,7 @@ describe("SkyvernClient", () => {
 
     test("get_scripts (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server.mockEndpoint().get("/v1/scripts").respondWith().statusCode(422).jsonBody(rawResponseBody).build();
@@ -2212,7 +2212,7 @@ describe("SkyvernClient", () => {
 
     test("create_script (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = {
             script_id: "s_abc123",
@@ -2262,7 +2262,7 @@ describe("SkyvernClient", () => {
 
     test("create_script (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {};
         const rawResponseBody = { key: "value" };
         server
@@ -2281,7 +2281,7 @@ describe("SkyvernClient", () => {
 
     test("get_script (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = {
             script_revision_id: "script_revision_id",
@@ -2316,7 +2316,7 @@ describe("SkyvernClient", () => {
 
     test("get_script (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
         const rawResponseBody = { key: "value" };
         server
@@ -2334,7 +2334,7 @@ describe("SkyvernClient", () => {
 
     test("deploy_script (1)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = { files: [{ path: "src/main.py", content: "content" }] };
         const rawResponseBody = {
             script_id: "s_abc123",
@@ -2391,7 +2391,7 @@ describe("SkyvernClient", () => {
 
     test("deploy_script (2)", async () => {
         const server = mockServerPool.createServer();
-        const client = new SkyvernClient({ xApiKey: "test", apiKey: "test", environment: server.baseUrl });
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
         const rawRequestBody = {
             files: [
                 { path: "path", content: "content" },

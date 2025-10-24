@@ -22,7 +22,7 @@ Instantiate and use the client with the following:
 ```typescript
 import { SkyvernClient } from "@skyvern/client";
 
-const client = new SkyvernClient({ xApiKey: "YOUR_X_API_KEY", apiKey: "YOUR_API_KEY" });
+const client = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await client.runTask({
     "x-user-agent": "x-user-agent",
     body: {
