@@ -1096,6 +1096,8 @@ class ForgeAgent:
                         status=ActionStatus.completed,
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
+                        task_id=task.task_id,
+                        step_id=step.step_id,
                         step_order=step.order,
                         action_order=action_idx,
                     )
