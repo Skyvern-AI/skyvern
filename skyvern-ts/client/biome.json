@@ -1,0 +1,69 @@
+{
+    "$schema": "https://biomejs.dev/schemas/2.2.5/schema.json",
+    "root": true,
+    "vcs": {
+        "enabled": false
+    },
+    "files": {
+        "ignoreUnknown": true,
+        "includes": [
+            "./**",
+            "!dist",
+            "!lib",
+            "!*.tsbuildinfo",
+            "!_tmp_*",
+            "!*.tmp",
+            "!.tmp/",
+            "!*.log",
+            "!.DS_Store",
+            "!Thumbs.db"
+        ]
+    },
+    "formatter": {
+        "enabled": true,
+        "indentStyle": "space",
+        "indentWidth": 4,
+        "lineWidth": 120
+    },
+    "javascript": {
+        "formatter": {
+            "quoteStyle": "double"
+        }
+    },
+    "assist": {
+        "enabled": true,
+        "actions": {
+            "source": {
+                "organizeImports": "on"
+            }
+        }
+    },
+    "linter": {
+        "rules": {
+            "style": {
+                "useNodejsImportProtocol": "off"
+            },
+            "suspicious": {
+                "noAssignInExpressions": "warn",
+                "noUselessEscapeInString": {
+                    "level": "warn",
+                    "fix": "none",
+                    "options": {}
+                },
+                "noThenProperty": "warn",
+                "useIterableCallbackReturn": "warn",
+                "noShadowRestrictedNames": "warn",
+                "noTsIgnore": {
+                    "level": "warn",
+                    "fix": "none",
+                    "options": {}
+                },
+                "noConfusingVoidType": {
+                    "level": "warn",
+                    "fix": "none",
+                    "options": {}
+                }
+            }
+        }
+    }
+}

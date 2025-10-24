@@ -179,7 +179,12 @@ async def verify_workflow_run(
 
         return None, None
 
-    if workflow_run.status not in [WorkflowRunStatus.created, WorkflowRunStatus.queued, WorkflowRunStatus.running]:
+    if workflow_run.status not in [
+        WorkflowRunStatus.created,
+        WorkflowRunStatus.queued,
+        WorkflowRunStatus.running,
+        WorkflowRunStatus.paused,
+    ]:
         LOG.info(
             "Workflow run is not running.",
             workflow_run_status=workflow_run.status,

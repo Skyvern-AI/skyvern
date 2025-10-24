@@ -46,6 +46,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
@@ -3049,6 +3050,223 @@ class WaitBlock(Block):
         )
 
 
+class HumanInteractionBlock(BaseTaskBlock):
+    """
+    A block for human/agent interaction.
+
+    For the first pass at this, the implicit behaviour is that the user is given a single binary
+    choice (a go//no-go).
+
+    If the human:
+      - chooses positively, the workflow continues
+      - chooses negatively, the workflow is terminated
+      - does not respond within the timeout period, the workflow terminates
+    """
+
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.HUMAN_INTERACTION] = BlockType.HUMAN_INTERACTION  # type: ignore
+
+    instructions: str = "Please review and approve or reject to continue the workflow."
+    positive_descriptor: str = "Approve"
+    negative_descriptor: str = "Reject"
+    timeout_seconds: int = 60 * 60 * 2  # two hours
+
+    # email options
+    sender: str = "hello@skyvern.com"
+    recipients: list[str] = []
+    subject: str = "Human interaction required for workflow run"
+    body: str = "Your interaction is required for a workflow run!"
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        super().format_potential_template_parameters(workflow_run_context)
+
+        self.instructions = self.format_block_parameter_template_from_workflow_run_context(
+            self.instructions, workflow_run_context
+        )
+
+        self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
+
+        self.subject = self.format_block_parameter_template_from_workflow_run_context(
+            self.subject, workflow_run_context
+        )
+
+        formatted: list[str] = []
+        for recipient in self.recipients:
+            formatted.append(
+                self.format_block_parameter_template_from_workflow_run_context(recipient, workflow_run_context)
+            )
+
+        self.recipients = formatted
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        # avoid circular import
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus  # noqa: PLC0415
+
+        LOG.info(
+            "Pausing workflow for human interaction",
+            workflow_run_id=workflow_run_id,
+            recipients=self.recipients,
+            timeout=self.timeout_seconds,
+            browser_session_id=browser_session_id,
+        )
+
+        await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            status=WorkflowRunStatus.paused,
+        )
+
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+
+        if not workflow_run:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Workflow run not found",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        workflow_permanent_id = workflow_run.workflow_permanent_id
+        app_url = f"{settings.SKYVERN_APP_URL}/workflows/{workflow_permanent_id}/{workflow_run_id}/overview"
+        body = f"{self.body}\n\nKindly visit {app_url}\n\n{self.instructions}\n\n"
+        subject = f"{self.subject} - Workflow Run ID: {workflow_run_id}"
+
+        try:
+            await email.send(
+                body=body,
+                sender=self.sender,
+                subject=subject,
+                recipients=self.recipients,
+            )
+
+            email_success = True
+            email_failure_reason = None
+        except Exception as ex:
+            LOG.error(
+                "Failed to send human interaction email",
+                workflow_run_id=workflow_run_id,
+                error=str(ex),
+                browser_session_id=browser_session_id,
+            )
+            email_success = False
+            email_failure_reason = str(ex)
+
+        if not email_success:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to send human interaction email: {email_failure_reason or 'email failed'}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # Wait for the timeout_seconds or until the workflow run status changes from paused
+        start_time = asyncio.get_event_loop().time()
+        check_interval = 5  # Check every 5 seconds
+        log_that_we_are_waiting = True
+        log_wait = 0
+
+        while True:
+            if not log_that_we_are_waiting:
+                log_wait += check_interval
+                if log_wait >= 60:  # Log every 1 minute
+                    log_that_we_are_waiting = True
+                    log_wait = 0
+
+            elapsed_time_seconds = asyncio.get_event_loop().time() - start_time
+
+            if log_that_we_are_waiting:
+                LOG.info(
+                    "Waiting for human interaction...",
+                    workflow_run_id=workflow_run_id,
+                    elapsed_time_seconds=elapsed_time_seconds,
+                    timeout_seconds=self.timeout_seconds,
+                    browser_session_id=browser_session_id,
+                )
+                log_that_we_are_waiting = False
+
+            # Check if timeout_seconds has elapsed
+            if elapsed_time_seconds >= self.timeout_seconds:
+                LOG.info(
+                    "Human Interaction block timeout_seconds reached",
+                    workflow_run_id=workflow_run_id,
+                    elapsed_time_seconds=elapsed_time_seconds,
+                    browser_session_id=browser_session_id,
+                )
+
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                success = False
+                reason = "Timeout elapsed with no human interaction"
+                result_dict = {"success": success, "reason": reason}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=success,
+                    failure_reason=reason,
+                    output_parameter_value=result_dict,
+                    status=BlockStatus.timed_out,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+
+            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
+                LOG.info(
+                    "Workflow run status changed from paused",
+                    workflow_run_id=workflow_run_id,
+                    new_status=workflow_run.status,
+                    browser_session_id=browser_session_id,
+                )
+
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                result_dict = {"success": True, "reason": f"status_changed:{workflow_run.status}"}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=result_dict,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            await asyncio.sleep(min(check_interval, self.timeout_seconds - elapsed_time_seconds))
+
+
 class ValidationBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -3521,6 +3739,7 @@ BlockSubclasses = Union[
     ExtractionBlock,
     LoginBlock,
     WaitBlock,
+    HumanInteractionBlock,
     FileDownloadBlock,
     UrlBlock,
     TaskV2Block,

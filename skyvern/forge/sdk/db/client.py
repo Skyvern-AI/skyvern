@@ -1975,7 +1975,11 @@ class AgentDB:
             raise
 
     async def get_workflow_run(
-        self, workflow_run_id: str, organization_id: str | None = None, job_id: str | None = None
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        job_id: str | None = None,
+        status: WorkflowRunStatus | None = None,
     ) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
@@ -1984,6 +1988,8 @@ class AgentDB:
                     get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
                 if job_id:
                     get_workflow_run_query = get_workflow_run_query.filter_by(job_id=job_id)
+                if status:
+                    get_workflow_run_query = get_workflow_run_query.filter_by(status=status.value)
                 if workflow_run := (await session.scalars(get_workflow_run_query)).first():
                     return convert_to_workflow_run(workflow_run)
                 return None
