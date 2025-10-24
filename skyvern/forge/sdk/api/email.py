@@ -24,7 +24,7 @@ async def _send(*, message: EmailMessage) -> bool:
 
         LOG.info("email: Email sent")
     except Exception as e:
-        LOG.error("email: Failed to send email", error=str(e))
+        LOG.error("email: Failed to send email", error=str(e), host=settings.SMTP_HOST, port=settings.SMTP_PORT)
         raise e
 
     return True
