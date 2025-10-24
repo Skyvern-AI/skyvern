@@ -36,6 +36,10 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.forge.sdk.schemas.actions import (
+    RunSdkActionRequest,
+    RunSdkActionResponse,
+)
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
@@ -58,6 +62,7 @@ from skyvern.forge.sdk.schemas.tasks import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.sdk_service import execute_sdk_action
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToCreateWorkflow,
     FailedToUpdateWorkflow,
@@ -2271,3 +2276,21 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         final_workflow_run_block_timeline.extend(thought_timeline)
     final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
     return final_workflow_run_block_timeline
+
+
+@base_router.post(
+    "/actions/run_sdk_action",
+    response_model=RunSdkActionResponse,
+    summary="Run an SDK action",
+    description="Execute a single SDK action with the specified parameters",
+    tags=["Agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "run_sdk_action",
+    },
+)
+@base_router.post("/actions/run_sdk_action/", include_in_schema=False)
+async def run_sdk_action(
+    action_request: RunSdkActionRequest,
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> RunSdkActionResponse:
+    return await execute_sdk_action(organization, action_request)
