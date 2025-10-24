@@ -1271,6 +1271,22 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
     await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
 
 
+async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> None:
+    workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        status=WorkflowRunStatus.paused,
+    )
+
+    if not workflow_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run not found {workflow_run_id}",
+        )
+
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id)
+
+
 @legacy_base_router.post(
     "/workflows/runs/{workflow_run_id}/cancel",
     tags=["agent"],
@@ -1285,6 +1301,18 @@ async def cancel_workflow_run(
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     await _cancel_workflow_run(workflow_run_id, current_org.organization_id, x_api_key)
+
+
+@base_router.post(
+    "/workflows/runs/{workflow_run_id}/continue",
+    include_in_schema=False,
+)
+@base_router.post("/workflows/runs/{workflow_run_id}/continue/", include_in_schema=False)
+async def continue_workflow_run(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    await _continue_workflow_run(workflow_run_id, current_org.organization_id)
 
 
 @legacy_base_router.post(

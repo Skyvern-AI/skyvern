@@ -95,6 +95,12 @@ class Settings(BaseSettings):
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
 
+    # email settings
+    SMTP_HOST: str = "localhost"
+    SMTP_PORT: int = 25
+    SMTP_USERNAME: str = "username"
+    SMTP_PASSWORD: str = "password"
+
     # browser settings
     BROWSER_LOCALE: str = "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
