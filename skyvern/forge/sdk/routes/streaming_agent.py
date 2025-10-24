@@ -21,7 +21,8 @@ class StreamingAgent:
     Specifically for operations during streaming sessions (like copy/pasting selected text, etc.).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, streaming: sc.Streaming) -> None:
+        self.streaming = streaming
         self.browser: Browser | None = None
         self.browser_context: BrowserContext | None = None
         self.page: Page | None = None
@@ -36,7 +37,27 @@ class StreamingAgent:
 
         self.pw = pw
 
-        self.browser = await pw.chromium.connect_over_cdp(url)
+        headers = {
+            "x-api-key": self.streaming.x_api_key,
+        }
+
+        self.browser = await pw.chromium.connect_over_cdp(url, headers=headers)
+
+        org_id = self.streaming.organization_id
+        browser_session_id = (
+            self.streaming.browser_session.persistent_browser_session_id if self.streaming.browser_session else None
+        )
+
+        if browser_session_id:
+            cdp_session = await self.browser.new_browser_cdp_session()
+            await cdp_session.send(
+                "Browser.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": f"/app/downloads/{org_id}/{browser_session_id}",
+                    "eventsEnabled": True,
+                },
+            )
 
         contexts = self.browser.contexts
         if contexts:
@@ -145,6 +166,7 @@ async def connected_agent(streaming: sc.Streaming | None) -> typing.AsyncIterato
         LOG.error(msg)
 
         raise Exception(msg)
+
     if not streaming.browser_session or not streaming.browser_session.browser_address:
         msg = "connected_agent: no browser session or browser address found for streaming client."
 
@@ -156,7 +178,7 @@ async def connected_agent(streaming: sc.Streaming | None) -> typing.AsyncIterato
 
         raise Exception(msg)
 
-    agent = StreamingAgent()
+    agent = StreamingAgent(streaming=streaming)
 
     try:
         await agent.connect(streaming.browser_session.browser_address)

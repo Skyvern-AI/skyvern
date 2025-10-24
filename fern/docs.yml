@@ -1,6 +1,6 @@
 instances:
   - url: skyvern.docs.buildwithfern.com/docs
-    custom-domain: skyvern.com/docs
+    custom-domain: www.skyvern.com/docs
 title: Skyvern
 favicon: images/skyvern_favicon_small.png
 logo:
@@ -158,6 +158,7 @@ navigation:
       - api: API Reference
         snippets:
           python: skyvern
+          typescript: "@skyvern/client"
         layout:
           - section: Agent
             contents:

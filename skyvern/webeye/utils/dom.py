@@ -25,6 +25,7 @@ from skyvern.exceptions import (
     NoneFrameError,
     SkyvernException,
 )
+from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, ScrapedPage, json_to_html, trim_element
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -613,35 +614,49 @@ class SkyvernElement:
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         await self.get_locator().clear(timeout=timeout)
 
-    async def check(self, delay: int = 2, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def check(
+        self,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> None:
         # HACK: sometimes playwright will raise exception when checking the element.
         # we need to trigger the hack to check again in several seconds
         try:
             await self.get_locator().check(timeout=timeout)
         except Exception:
             LOG.info(
-                f"Failed to check the element at the first time, trigger the hack to check again in {delay} seconds",
+                "Failed to check the element at the first time, trigger the hack to check again",
                 exc_info=True,
                 element_id=self.get_id(),
             )
-            await asyncio.sleep(delay)
+            wait_config = await get_or_create_wait_config(task_id, workflow_run_id, organization_id)
+            await asyncio.sleep(get_wait_time(wait_config, "checkbox_retry_delay", default=2.0))
             if await self.get_locator().count() == 0:
                 LOG.info("Element is not on the page, the checking should work", element_id=self.get_id())
                 return
             await self.get_locator().check(timeout=timeout)
 
-    async def uncheck(self, delay: int = 2, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def uncheck(
+        self,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> None:
         # HACK: sometimes playwright will raise exception when unchecking the element.
         # we need to trigger the hack to uncheck again in several seconds
         try:
             await self.get_locator().uncheck(timeout=timeout)
         except Exception:
             LOG.info(
-                f"Failed to uncheck the element at the first time, trigger the hack to uncheck again in {delay} seconds",
+                "Failed to uncheck the element at the first time, trigger the hack to uncheck again",
                 exc_info=True,
                 element_id=self.get_id(),
             )
-            await asyncio.sleep(delay)
+            wait_config = await get_or_create_wait_config(task_id, workflow_run_id, organization_id)
+            await asyncio.sleep(get_wait_time(wait_config, "checkbox_retry_delay", default=2.0))
             if await self.get_locator().count() == 0:
                 LOG.info("Element is not on the page, the unchecking should work", element_id=self.get_id())
                 return
@@ -772,7 +787,9 @@ class SkyvernElement:
             )
             await self.blur()
             await self.focus(timeout=timeout)
-        await asyncio.sleep(2)  # wait for scrolling into the target
+
+        # Wait for scrolling to complete
+        await scroll_into_view_wait()
 
     async def calculate_min_y_distance_to(
         self,

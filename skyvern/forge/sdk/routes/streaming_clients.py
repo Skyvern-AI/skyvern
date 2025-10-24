@@ -271,6 +271,7 @@ class Streaming:
 
     organization_id: str
     vnc_port: int
+    x_api_key: str
     websocket: WebSocket
 
     # --
