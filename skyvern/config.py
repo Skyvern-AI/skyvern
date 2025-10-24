@@ -395,11 +395,11 @@ class Settings(BaseSettings):
         if self.is_cloud_environment():
             return {
                 "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash-preview-09-2025": {
+                "gemini-2.5-flash": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
-                "gemini-2.5-flash-lite-preview-09-2025": {
+                "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",
                 },
@@ -431,11 +431,11 @@ class Settings(BaseSettings):
             # TODO: apparently the list for OSS is to be much larger
             return {
                 "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash-preview-09-2025": {
+                "gemini-2.5-flash": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
-                "gemini-2.5-flash-lite-preview-09-2025": {
+                "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",
                 },
