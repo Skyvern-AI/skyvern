@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 CURRENT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-fern generate --group ts-sdk --log-level debug --version $CURRENT_VERSION --preview
+fern generate --group ts-sdk --log-level debug --version "$CURRENT_VERSION" --preview
 
 (cd fern/.preview/fern-typescript-sdk \
   && npm install \
