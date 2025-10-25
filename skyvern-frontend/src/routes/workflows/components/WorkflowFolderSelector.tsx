@@ -8,12 +8,12 @@ import { useFoldersQuery } from "../hooks/useFoldersQuery";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
 
 interface WorkflowFolderSelectorProps {
-  workflowId: string;
+  workflowPermanentId: string;
   currentFolderId: string | null;
 }
 
 function WorkflowFolderSelector({
-  workflowId,
+  workflowPermanentId,
   currentFolderId,
 }: WorkflowFolderSelectorProps) {
   const [open, setOpen] = useState(false);
@@ -23,7 +23,7 @@ function WorkflowFolderSelector({
 
   const handleFolderSelect = async (folderId: string | null) => {
     await updateFolderMutation.mutateAsync({
-      workflowId,
+      workflowPermanentId,
       data: { folder_id: folderId },
     });
     setOpen(false);

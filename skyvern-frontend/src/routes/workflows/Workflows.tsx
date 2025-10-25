@@ -641,7 +641,7 @@ function Workflows() {
                           <TableCell>
                             <div className="flex justify-end gap-2">
                               <WorkflowFolderSelector
-                                workflowId={workflow.workflow_permanent_id}
+                                workflowPermanentId={workflow.workflow_permanent_id}
                                 currentFolderId={workflow.folder_id}
                               />
                               <TooltipProvider>

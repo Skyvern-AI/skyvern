@@ -936,6 +936,7 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         run_sequentially: bool = False,
         sequential_key: str | None = None,
+        folder_id: str | None = None,
     ) -> Workflow:
         return await app.DATABASE.create_workflow(
             title=title,
@@ -959,6 +960,7 @@ class WorkflowService:
             ai_fallback=False if ai_fallback is None else ai_fallback,
             run_sequentially=run_sequentially,
             sequential_key=sequential_key,
+            folder_id=folder_id,
         )
 
     async def create_workflow_from_prompt(
@@ -2455,6 +2457,7 @@ class WorkflowService:
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
                     sequential_key=request.sequential_key,
+                    folder_id=existing_latest_workflow.folder_id,
                 )
             else:
                 # NOTE: it's only potential, as it may be immediately deleted!

@@ -104,14 +104,14 @@ function useUpdateWorkflowFolderMutation() {
 
   return useMutation({
     mutationFn: async ({
-      workflowId,
+      workflowPermanentId,
       data,
     }: {
-      workflowId: string;
+      workflowPermanentId: string;
       data: UpdateWorkflowFolderRequest;
     }) => {
       const client = await getClient(credentialGetter);
-      return client.put(`/workflows/${workflowId}/folder`, data);
+      return client.put(`/workflows/${workflowPermanentId}/folder`, data);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });

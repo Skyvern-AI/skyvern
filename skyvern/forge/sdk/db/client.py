@@ -1404,6 +1404,7 @@ class AgentDB:
         cache_key: str | None = None,
         run_sequentially: bool = False,
         sequential_key: str | None = None,
+        folder_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             workflow = WorkflowModel(
@@ -1426,6 +1427,7 @@ class AgentDB:
                 cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
+                folder_id=folder_id,
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
@@ -1964,13 +1966,35 @@ class AgentDB:
         folder_id: str,
         organization_id: str,
     ) -> int:
-        """Get the count of workflows in a folder."""
+        """Get the count of workflows (latest versions only) in a folder."""
         try:
             async with self.Session() as session:
+                # Subquery to get the latest version for each workflow (same pattern as get_workflows_by_organization_id)
+                subquery = (
+                    select(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                        func.max(WorkflowModel.version).label("max_version"),
+                    )
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .group_by(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                    )
+                    .subquery()
+                )
+                
+                # Count workflows where the latest version is in this folder
                 stmt = (
-                    select(func.count(WorkflowModel.workflow_id))
-                    .filter_by(organization_id=organization_id, folder_id=folder_id)
-                    .filter(WorkflowModel.deleted_at.is_(None))
+                    select(func.count(WorkflowModel.workflow_permanent_id))
+                    .join(
+                        subquery,
+                        (WorkflowModel.organization_id == subquery.c.organization_id)
+                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                        & (WorkflowModel.version == subquery.c.max_version),
+                    )
+                    .where(WorkflowModel.folder_id == folder_id)
                 )
                 result = await session.execute(stmt)
                 return result.scalar_one()
@@ -1980,45 +2004,37 @@ class AgentDB:
 
     async def update_workflow_folder(
         self,
-        workflow_id: str,
+        workflow_permanent_id: str,
         organization_id: str,
         folder_id: str | None,
-    ) -> WorkflowModel | None:
-        """Update a workflow's folder assignment. workflow_id can be either workflow_id or workflow_permanent_id."""
+    ) -> Workflow | None:
+        """Update folder assignment for the latest version of a workflow."""
         try:
+            # Validate folder exists if folder_id is provided
+            if folder_id:
+                folder = await self.get_folder(folder_id, organization_id)
+                if not folder:
+                    raise ValueError(f"Folder {folder_id} not found")
+
+            # Get the latest version of the workflow
+            latest_workflow = await self.get_workflow_by_permanent_id(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            
+            if not latest_workflow:
+                return None
+            
             async with self.Session() as session:
-                # Try to find by workflow_id first, then by workflow_permanent_id
-                workflow_query = (
-                    select(WorkflowModel)
-                    .filter(
-                        or_(
-                            WorkflowModel.workflow_id == workflow_id,
-                            WorkflowModel.workflow_permanent_id == workflow_id,
-                        )
-                    )
-                    .filter_by(organization_id=organization_id)
-                    .filter(WorkflowModel.deleted_at.is_(None))
-                    .order_by(WorkflowModel.version.desc())  # Get latest version if permanent_id
-                )
-                result = await session.execute(workflow_query)
-                workflow = result.scalars().first()
-
-                if not workflow:
-                    return None
-
-                # Validate folder exists if folder_id is provided
-                if folder_id:
-                    folder = await self.get_folder(folder_id, organization_id)
-                    if not folder:
-                        raise ValueError(f"Folder {folder_id} not found")
-
-                # Update workflow's folder_id
-                workflow.folder_id = folder_id
-                workflow.modified_at = datetime.utcnow()
-                session.add(workflow)
-                await session.commit()
-                await session.refresh(workflow)
-                return workflow
+            # Update ONLY the latest version
+                workflow_model = await session.get(WorkflowModel, latest_workflow.workflow_id)
+                if workflow_model:
+                    workflow_model.folder_id = folder_id
+                    workflow_model.modified_at = datetime.utcnow()
+                    await session.commit()
+                    await session.refresh(workflow_model)
+                    return convert_to_workflow(workflow_model, self.debug_enabled)
+                return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError in update_workflow_folder", exc_info=True)
             raise

@@ -990,13 +990,13 @@ async def delete_folder(
     return {"status": "deleted", "folder_id": folder_id}
 
 
-@legacy_base_router.put("/workflows/{workflow_id}/folder", response_model=Workflow, tags=["agent"])
-@legacy_base_router.put("/workflows/{workflow_id}/folder/", response_model=Workflow, include_in_schema=False)
+@legacy_base_router.put("/workflows/{workflow_permanent_id}/folder", response_model=Workflow, tags=["agent"])
+@legacy_base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
 @base_router.put(
-    "/workflows/{workflow_id}/folder",
+    "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
     tags=["Workflows"],
-    description="Update a workflow's folder assignment",
+    description="Update a workflow's folder assignment for all versions",
     summary="Update workflow folder",
     responses={
         200: {"description": "Successfully updated workflow folder"},
@@ -1004,22 +1004,22 @@ async def delete_folder(
         400: {"description": "Folder not found"},
     },
 )
-@base_router.put("/workflows/{workflow_id}/folder/", response_model=Workflow, include_in_schema=False)
+@base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
 async def update_workflow_folder(
-    workflow_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
+    workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
     data: UpdateWorkflowFolderRequest = ...,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     try:
-        workflow_model = await app.DATABASE.update_workflow_folder(
-            workflow_id=workflow_id,
+        workflow = await app.DATABASE.update_workflow_folder(
+            workflow_permanent_id=workflow_permanent_id,
             organization_id=current_org.organization_id,
             folder_id=data.folder_id,
         )
-        if not workflow_model:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_id} not found")
+        if not workflow:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found")
 
-        return convert_to_workflow(workflow_model, app.DATABASE.debug_enabled)
+        return workflow
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
