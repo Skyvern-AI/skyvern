@@ -50,6 +50,7 @@ export const workflowBlockTitle: {
   upload_to_s3: "Upload To S3",
   file_upload: "Cloud Storage",
   validation: "Validation",
+  human_interaction: "Human Interaction",
   wait: "Wait",
   pdf_parser: "PDF Parser",
   task_v2: "Browser Task v2",

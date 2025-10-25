@@ -31,6 +31,7 @@ import {
   TextPromptBlockYAML,
   UploadToS3BlockYAML,
   ValidationBlockYAML,
+  HumanInteractionBlockYAML,
   NavigationBlockYAML,
   WorkflowCreateYAMLRequest,
   ExtractionBlockYAML,
@@ -87,6 +88,10 @@ import {
   isValidationNode,
   validationNodeDefaultData,
 } from "./nodes/ValidationNode/types";
+import {
+  isHumanInteractionNode,
+  humanInteractionNodeDefaultData,
+} from "./nodes/HumanInteractionNode/types";
 import { actionNodeDefaultData, isActionNode } from "./nodes/ActionNode/types";
 import {
   isNavigationNode,
@@ -333,6 +338,24 @@ function convertToNode(
           engine: block.engine ?? RunEngine.SkyvernV1,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
+        },
+      };
+    }
+    case "human_interaction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "human_interaction",
+        data: {
+          ...commonData,
+          instructions: block.instructions,
+          positiveDescriptor: block.positive_descriptor,
+          negativeDescriptor: block.negative_descriptor,
+          timeoutSeconds: block.timeout_seconds,
+          recipients: block.recipients.join(", "),
+          subject: block.subject,
+          body: block.body,
+          sender: block.sender,
         },
       };
     }
@@ -831,6 +854,17 @@ function createNode(
         },
       };
     }
+    case "human_interaction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "human_interaction",
+        data: {
+          ...humanInteractionNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "action": {
       return {
         ...identifiers,
@@ -1105,6 +1139,22 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         parameter_keys: node.data.parameterKeys,
       };
     }
+    case "human_interaction": {
+      return {
+        ...base,
+        block_type: "human_interaction",
+        instructions: node.data.instructions,
+        positive_descriptor: node.data.positiveDescriptor,
+        negative_descriptor: node.data.negativeDescriptor,
+        timeout_seconds: node.data.timeoutSeconds,
+        recipients: node.data.recipients
+          .split(",")
+          .map((recipient) => recipient.trim()),
+        subject: node.data.subject,
+        body: node.data.body,
+        sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
+      };
+    }
     case "action": {
       return {
         ...base,
@@ -1342,7 +1392,9 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       };
     }
     default: {
-      throw new Error("Invalid node type for getWorkflowBlock");
+      throw new Error(
+        `Invalid node type, '${node.type}', for getWorkflowBlock`,
+      );
     }
   }
 }
@@ -1910,6 +1962,23 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "human_interaction": {
+        const blockYaml: HumanInteractionBlockYAML = {
+          ...base,
+          block_type: "human_interaction",
+          // --
+          instructions: block.instructions,
+          positive_descriptor: block.positive_descriptor,
+          negative_descriptor: block.negative_descriptor,
+          timeout_seconds: block.timeout_seconds,
+          // --
+          sender: block.sender,
+          recipients: block.recipients,
+          subject: block.subject,
+          body: block.body,
+        };
+        return blockYaml;
+      }
       case "action": {
         const blockYaml: ActionBlockYAML = {
           ...base,
@@ -2246,6 +2315,11 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
         `${node.data.label}: At least one of completion or termination criteria must be provided`,
       );
     }
+  });
+
+  const interactionNodes = nodes.filter(isHumanInteractionNode);
+  interactionNodes.forEach((/* node */) => {
+    // pass for now
   });
 
   const navigationNodes = nodes.filter(isNavigationNode);
