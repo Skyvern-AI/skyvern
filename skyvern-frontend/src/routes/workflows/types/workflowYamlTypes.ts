@@ -127,6 +127,7 @@ export type BlockYAML =
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
   | ValidationBlockYAML
+  | HumanInteractionBlockYAML
   | ActionBlockYAML
   | NavigationBlockYAML
   | ExtractionBlockYAML
@@ -183,6 +184,20 @@ export type ValidationBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
+};
+
+export type HumanInteractionBlockYAML = BlockYAMLBase & {
+  block_type: "human_interaction";
+
+  instructions: string;
+  positive_descriptor: string;
+  negative_descriptor: string;
+  timeout_seconds: number;
+
+  sender: string;
+  recipients: Array<string>;
+  subject: string;
+  body: string;
 };
 
 export type ActionBlockYAML = BlockYAMLBase & {

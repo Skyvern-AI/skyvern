@@ -4,6 +4,12 @@ import {
   CubeIcon,
   ExternalLinkIcon,
 } from "@radix-ui/react-icons";
+import { useCallback } from "react";
+import { useParams, Link } from "react-router-dom";
+
+import { Status } from "@/api/types";
+import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import {
@@ -20,14 +26,16 @@ import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
-import { cn } from "@/util/utils";
-import { isTaskVariantBlock } from "../types/workflowTypes";
-import { Link } from "react-router-dom";
-import { useCallback } from "react";
-import { Status } from "@/api/types";
-import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { ThoughtCard } from "./ThoughtCard";
+import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { ObserverThought } from "../types/workflowRunTypes";
+import {
+  HumanInteractionBlock,
+  isTaskVariantBlock,
+  type WorkflowApiResponse,
+} from "../types/workflowTypes";
+import { WorkflowRunHumanInteraction } from "./WorkflowRunHumanInteraction";
+
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   block: WorkflowRunBlock;
@@ -35,6 +43,28 @@ type Props = {
   onBlockItemClick: (block: WorkflowRunBlock) => void;
   onActionClick: (action: ActionItem) => void;
   onThoughtCardClick: (thought: ObserverThought) => void;
+};
+
+const getHumanInteractionBlock = (
+  block: WorkflowRunBlock,
+  workflow?: WorkflowApiResponse,
+): HumanInteractionBlock | null => {
+  if (block.block_type !== "human_interaction") {
+    return null;
+  }
+
+  if (!workflow) {
+    return null;
+  }
+
+  const blocks = workflow.workflow_definition.blocks;
+  const candidate = blocks.find((b) => b.label === block.label);
+
+  if (!candidate || candidate.block_type !== "human_interaction") {
+    return null;
+  }
+
+  return candidate as HumanInteractionBlock;
 };
 
 function WorkflowRunTimelineBlockItem({
@@ -45,6 +75,12 @@ function WorkflowRunTimelineBlockItem({
   onActionClick,
   onThoughtCardClick,
 }: Props) {
+  const { workflowPermanentId } = useParams();
+  const { data: workflow } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+
+  const humanInteractionBlock = getHumanInteractionBlock(block, workflow);
   const actions = block.actions ?? [];
 
   const hasActiveAction =
@@ -166,6 +202,12 @@ function WorkflowRunTimelineBlockItem({
           <div className="text-xs text-slate-400">{block.description}</div>
         ) : null}
       </div>
+
+      {humanInteractionBlock && (
+        <WorkflowRunHumanInteraction
+          humanInteractionBlock={humanInteractionBlock}
+        />
+      )}
 
       {actions.map((action, index) => {
         return (
