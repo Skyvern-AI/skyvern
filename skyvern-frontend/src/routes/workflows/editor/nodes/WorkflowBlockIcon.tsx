@@ -9,6 +9,7 @@ import {
   ExternalLinkIcon,
   FileTextIcon,
   GlobeIcon,
+  HandIcon,
   ListBulletIcon,
   LockOpen1Icon,
   StopwatchIcon,
@@ -70,6 +71,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "validation": {
       return <CheckCircledIcon className={className} />;
+    }
+    case "human_interaction": {
+      return <HandIcon className={className} />;
     }
     case "wait": {
       return <StopwatchIcon className={className} />;

@@ -21,7 +21,8 @@ export function statusIsNotFinalized({ status }: { status: Status }): boolean {
   return (
     status === Status.Created ||
     status === Status.Queued ||
-    status === Status.Running
+    status === Status.Running ||
+    status === Status.Paused
   );
 }
 
