@@ -3192,6 +3192,7 @@
           "terminate",
           "complete",
           "reload_page",
+          "close_page",
           "extract",
           "verification_code",
           "goto_url",
@@ -4099,7 +4100,8 @@
           "file_download",
           "goto_url",
           "pdf_parser",
-          "http_request"
+          "http_request",
+          "human_interaction"
         ],
         "title": "BlockType"
       },
@@ -6576,6 +6578,9 @@
                   "$ref": "#/components/schemas/WaitBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/HumanInteractionBlock"
+                },
+                {
                   "$ref": "#/components/schemas/FileDownloadBlock"
                 },
                 {
@@ -6604,6 +6609,7 @@
                   "for_loop": "#/components/schemas/ForLoopBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
@@ -6782,6 +6788,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/WaitBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/HumanInteractionBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
@@ -7101,6 +7110,414 @@
           "label"
         ],
         "title": "HttpRequestBlockYAML"
+      },
+      "HumanInteractionBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "block_type": {
+            "type": "string",
+            "const": "human_interaction",
+            "title": "Block Type",
+            "default": "human_interaction"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "task_type": {
+            "type": "string",
+            "title": "Task Type",
+            "default": "general"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "default": ""
+          },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
+          "complete_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete Criterion"
+          },
+          "terminate_criterion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminate Criterion"
+          },
+          "navigation_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Navigation Goal"
+          },
+          "data_extraction_goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Extraction Goal"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Schema"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 0
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          },
+          "complete_on_download": {
+            "type": "boolean",
+            "title": "Complete On Download",
+            "default": false
+          },
+          "download_suffix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Suffix"
+          },
+          "totp_verification_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Verification Url"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier"
+          },
+          "cache_actions": {
+            "type": "boolean",
+            "title": "Cache Actions",
+            "default": false
+          },
+          "complete_verification": {
+            "type": "boolean",
+            "title": "Complete Verification",
+            "default": true
+          },
+          "include_action_history_in_verification": {
+            "type": "boolean",
+            "title": "Include Action History In Verification",
+            "default": false
+          },
+          "download_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Timeout"
+          },
+          "instructions": {
+            "type": "string",
+            "title": "Instructions",
+            "default": "Please review and approve or reject to continue the workflow."
+          },
+          "positive_descriptor": {
+            "type": "string",
+            "title": "Positive Descriptor",
+            "default": "Approve"
+          },
+          "negative_descriptor": {
+            "type": "string",
+            "title": "Negative Descriptor",
+            "default": "Reject"
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "title": "Timeout Seconds",
+            "default": 7200
+          },
+          "sender": {
+            "type": "string",
+            "title": "Sender",
+            "default": "hello@skyvern.com"
+          },
+          "recipients": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Recipients",
+            "default": []
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject",
+            "default": "Human interaction required for workflow run"
+          },
+          "body": {
+            "type": "string",
+            "title": "Body",
+            "default": "Your interaction is required for a workflow run!"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter"
+        ],
+        "title": "HumanInteractionBlock",
+        "description": "A block for human/agent interaction.\n\nFor the first pass at this, the implicit behaviour is that the user is given a single binary\nchoice (a go//no-go).\n\nIf the human:\n  - chooses positively, the workflow continues\n  - chooses negatively, the workflow is terminated\n  - does not respond within the timeout period, the workflow terminates"
+      },
+      "HumanInteractionBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "human_interaction",
+            "title": "Block Type",
+            "default": "human_interaction"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "instructions": {
+            "type": "string",
+            "title": "Instructions",
+            "default": "Please review and approve or reject to continue the workflow."
+          },
+          "positive_descriptor": {
+            "type": "string",
+            "title": "Positive Descriptor",
+            "default": "Approve"
+          },
+          "negative_descriptor": {
+            "type": "string",
+            "title": "Negative Descriptor",
+            "default": "Reject"
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "title": "Timeout Seconds"
+          },
+          "sender": {
+            "type": "string",
+            "title": "Sender"
+          },
+          "recipients": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Recipients"
+          },
+          "subject": {
+            "type": "string",
+            "title": "Subject"
+          },
+          "body": {
+            "type": "string",
+            "title": "Body"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "timeout_seconds",
+          "sender",
+          "recipients",
+          "subject",
+          "body"
+        ],
+        "title": "HumanInteractionBlockYAML"
       },
       "InputOrSelectContext": {
         "properties": {
@@ -12633,6 +13050,9 @@
                   "$ref": "#/components/schemas/WaitBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/HumanInteractionBlock"
+                },
+                {
                   "$ref": "#/components/schemas/FileDownloadBlock"
                 },
                 {
@@ -12661,6 +13081,7 @@
                   "for_loop": "#/components/schemas/ForLoopBlock",
                   "goto_url": "#/components/schemas/UrlBlock",
                   "http_request": "#/components/schemas/HttpRequestBlock",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlock",
                   "login": "#/components/schemas/LoginBlock",
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
@@ -12789,6 +13210,9 @@
                   "$ref": "#/components/schemas/WaitBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/HumanInteractionBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/FileDownloadBlockYAML"
                 },
                 {
@@ -12817,6 +13241,7 @@
                   "for_loop": "#/components/schemas/ForLoopBlockYAML",
                   "goto_url": "#/components/schemas/UrlBlockYAML",
                   "http_request": "#/components/schemas/HttpRequestBlockYAML",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
                   "login": "#/components/schemas/LoginBlockYAML",
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
