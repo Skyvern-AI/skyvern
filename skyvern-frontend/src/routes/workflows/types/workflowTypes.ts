@@ -200,6 +200,7 @@ export type WorkflowBlock =
   | SendEmailBlock
   | FileURLParserBlock
   | ValidationBlock
+  | HumanInteractionBlock
   | ActionBlock
   | NavigationBlock
   | ExtractionBlock
@@ -222,6 +223,7 @@ export const WorkflowBlockTypes = {
   SendEmail: "send_email",
   FileURLParser: "file_url_parser",
   Validation: "validation",
+  HumanInteraction: "human_interaction",
   Action: "action",
   Navigation: "navigation",
   Extraction: "extraction",
@@ -394,6 +396,20 @@ export type ValidationBlock = WorkflowBlockBase & {
   error_code_mapping: Record<string, string> | null;
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
+};
+
+export type HumanInteractionBlock = WorkflowBlockBase & {
+  block_type: "human_interaction";
+
+  instructions: string;
+  positive_descriptor: string;
+  negative_descriptor: string;
+  timeout_seconds: number;
+
+  sender: string;
+  recipients: Array<string>;
+  subject: string;
+  body: string;
 };
 
 export type ActionBlock = WorkflowBlockBase & {
