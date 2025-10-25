@@ -7,10 +7,10 @@ from email_validator import EmailNotValidError, validate_email
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
-settings = SettingsManager.get_settings()
 
 
 async def _send(*, message: EmailMessage) -> bool:
+    settings = SettingsManager.get_settings()
     try:
         smtp_host = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
 
