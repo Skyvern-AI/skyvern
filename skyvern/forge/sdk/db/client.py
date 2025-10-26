@@ -2018,6 +2018,25 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflow_runs_by_ids(
+        self,
+        workflow_run_ids: list[str],
+        workflow_permanent_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> list[WorkflowRun]:
+        try:
+            async with self.Session() as session:
+                query = select(WorkflowRunModel).filter(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
+                if workflow_permanent_id:
+                    query = query.filter_by(workflow_permanent_id=workflow_permanent_id)
+                if organization_id:
+                    query = query.filter_by(organization_id=organization_id)
+                workflow_runs = (await session.scalars(query)).all()
+                return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def get_last_running_workflow_run(
         self,
         workflow_permanent_id: str,
