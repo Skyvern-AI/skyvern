@@ -1,11 +1,12 @@
-import { useState } from "react";
-import { CheckIcon, Cross2Icon, FileIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
+import { useState, useMemo } from "react";
+import { CheckIcon, Cross2Icon, FileIcon, MagnifyingGlassIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/util/utils";
-import { useFoldersQuery } from "../hooks/useFoldersQuery";
+import { useInfiniteFoldersQuery } from "../hooks/useInfiniteFoldersQuery";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
+import { handleInfiniteScroll } from "@/util/utils";
 
 interface WorkflowFolderSelectorProps {
   workflowPermanentId: string;
@@ -18,7 +19,22 @@ function WorkflowFolderSelector({
 }: WorkflowFolderSelectorProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
-  const { data: folders = [] } = useFoldersQuery({ search, page_size: 100 });
+  
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useInfiniteFoldersQuery({
+    search,
+    page_size: 20,
+  });
+
+  // Flatten pages into a single array
+  const folders = useMemo(() => {
+    return data?.pages.flatMap((page) => page) ?? [];
+  }, [data]);
+
   const updateFolderMutation = useUpdateWorkflowFolderMutation();
 
   const handleFolderSelect = async (folderId: string | null) => {
@@ -59,7 +75,10 @@ function WorkflowFolderSelector({
             />
           </div>
         </div>
-        <div className="max-h-[300px] overflow-y-auto">
+        <div 
+          className="max-h-[300px] overflow-y-auto [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 dark:[&::-webkit-scrollbar-thumb]:border-slate-800"
+          onScroll={(e) => handleInfiniteScroll(e, fetchNextPage, hasNextPage, isFetchingNextPage)}
+        >
           {currentFolderId && (
             <button
               onClick={() => handleFolderSelect(null)}
@@ -77,32 +96,39 @@ function WorkflowFolderSelector({
               No folders found
             </div>
           ) : (
-            folders.map((folder) => {
-              const isCurrentFolder = currentFolderId === folder.folder_id;
-              return (
-                <button
-                  key={folder.folder_id}
-                  onClick={() => handleFolderSelect(folder.folder_id)}
-                  disabled={isCurrentFolder}
-                  className="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
-                >
-                  <div className="flex items-center gap-2">
-                    <FileIcon className="h-4 w-4 text-blue-400" />
-                    <div className="flex flex-col">
-                      <span>{folder.title}</span>
-                      {folder.description && (
-                        <span className="text-xs text-slate-400">
-                          {folder.description}
-                        </span>
-                      )}
+            <>
+              {folders.map((folder) => {
+                const isCurrentFolder = currentFolderId === folder.folder_id;
+                return (
+                  <button
+                    key={folder.folder_id}
+                    onClick={() => handleFolderSelect(folder.folder_id)}
+                    disabled={isCurrentFolder}
+                    className="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
+                  >
+                    <div className="flex items-center gap-2">
+                      <FileIcon className="h-4 w-4 text-blue-400" />
+                      <div className="flex flex-col">
+                        <span>{folder.title}</span>
+                        {folder.description && (
+                          <span className="text-xs text-slate-400">
+                            {folder.description}
+                          </span>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                  {isCurrentFolder && (
-                    <CheckIcon className="h-4 w-4 text-blue-400" />
-                  )}
-                </button>
-              );
-            })
+                    {isCurrentFolder && (
+                      <CheckIcon className="h-4 w-4 text-blue-400" />
+                    )}
+                  </button>
+                );
+              })}
+              {isFetchingNextPage && (
+                <div className="flex items-center justify-center py-2">
+                  <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
+                </div>
+              )}
+            </>
           )}
         </div>
       </PopoverContent>
