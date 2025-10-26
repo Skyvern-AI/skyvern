@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -5551,7 +5551,16 @@ dependencies = [
     { name = "websockets" },
 ]
 
-[package.dev-dependencies]
+[package.optional-dependencies]
+aws = [
+    { name = "aioboto3" },
+    { name = "types-boto3", extra = ["full"] },
+]
+azure = [
+    { name = "azure-identity" },
+    { name = "azure-keyvault-secrets" },
+    { name = "azure-storage-blob" },
+]
 cloud = [
     { name = "dramatiq" },
     { name = "redis" },
@@ -5585,76 +5594,232 @@ dev = [
     { name = "types-requests" },
     { name = "watchdog" },
 ]
+documents = [
+    { name = "filetype" },
+    { name = "openpyxl" },
+    { name = "pypdf" },
+]
+gcp = [
+    { name = "google-cloud-aiplatform" },
+]
+llm = [
+    { name = "anthropic" },
+    { name = "fastmcp" },
+    { name = "litellm" },
+    { name = "lmnr", extra = ["all"] },
+    { name = "openai" },
+    { name = "tiktoken" },
+]
+observability = [
+    { name = "alive-progress" },
+    { name = "ddtrace" },
+    { name = "posthog" },
+    { name = "structlog" },
+]
+playwright = [
+    { name = "playwright", version = "1.46.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "playwright", version = "1.55.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+
+[package.dev-dependencies]
+aws = [
+    { name = "aioboto3" },
+    { name = "types-boto3", extra = ["full"] },
+]
+azure = [
+    { name = "azure-identity" },
+    { name = "azure-keyvault-secrets" },
+    { name = "azure-storage-blob" },
+]
+cloud = [
+    { name = "dramatiq" },
+    { name = "redis" },
+    { name = "stripe" },
+    { name = "temporalio" },
+]
+dev = [
+    { name = "aiosqlite" },
+    { name = "autoflake" },
+    { name = "build" },
+    { name = "flake8" },
+    { name = "fpdf" },
+    { name = "freezegun" },
+    { name = "ipykernel" },
+    { name = "ipython" },
+    { name = "isort" },
+    { name = "mock" },
+    { name = "moto", extra = ["s3", "server"] },
+    { name = "mypy" },
+    { name = "notebook" },
+    { name = "pre-commit" },
+    { name = "pydevd-pycharm" },
+    { name = "pypdf" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "rich", extra = ["jupyter"] },
+    { name = "ruff" },
+    { name = "snoop" },
+    { name = "twine" },
+    { name = "typer" },
+    { name = "types-requests" },
+    { name = "watchdog" },
+]
+documents = [
+    { name = "filetype" },
+    { name = "openpyxl" },
+    { name = "pypdf" },
+]
+gcp = [
+    { name = "google-cloud-aiplatform" },
+]
+llm = [
+    { name = "anthropic" },
+    { name = "fastmcp" },
+    { name = "litellm" },
+    { name = "lmnr", extra = ["all"] },
+    { name = "openai" },
+    { name = "tiktoken" },
+]
+observability = [
+    { name = "alive-progress" },
+    { name = "ddtrace" },
+    { name = "posthog" },
+    { name = "structlog" },
+]
+playwright = [
+    { name = "playwright", version = "1.46.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "playwright", version = "1.55.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "aioboto3", specifier = ">=14.3.0,<15" },
+    { name = "aioboto3", marker = "extra == 'aws'", specifier = ">=14.3.0,<15" },
     { name = "aiofiles", specifier = ">=24.1.0,<25" },
     { name = "aiohttp", specifier = ">=3.8.5,<4" },
     { name = "aioredlock", specifier = ">=0.7.3,<0.8" },
+    { name = "aiosqlite", marker = "extra == 'dev'", specifier = ">=0.21.0,<0.22" },
     { name = "alembic", specifier = ">=1.12.1,<2" },
     { name = "alive-progress", specifier = ">=3.2.0,<4" },
+    { name = "alive-progress", marker = "extra == 'observability'", specifier = ">=3.2.0,<4" },
     { name = "anthropic", specifier = ">=0.50.0,<0.51" },
+    { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.50.0,<0.51" },
     { name = "asyncache", specifier = ">=0.3.1,<0.4" },
     { name = "asyncpg", specifier = ">=0.30.0,<0.31" },
+    { name = "autoflake", marker = "extra == 'dev'", specifier = ">=2.2.0,<3" },
     { name = "azure-identity", specifier = ">=1.24.0,<2" },
+    { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.24.0,<2" },
     { name = "azure-keyvault-secrets", specifier = ">=4.2.0,<5" },
+    { name = "azure-keyvault-secrets", marker = "extra == 'azure'", specifier = ">=4.2.0,<5" },
     { name = "azure-storage-blob", specifier = ">=12.26.0" },
+    { name = "azure-storage-blob", marker = "extra == 'azure'", specifier = ">=12.26.0" },
+    { name = "build", marker = "extra == 'dev'", specifier = ">=1.2.2.post1,<2" },
     { name = "cachetools", specifier = ">=5.3.2,<6" },
     { name = "colorama", specifier = ">=0.4.6,<0.5" },
     { name = "curlparser", specifier = ">=0.1.0,<0.2" },
     { name = "ddtrace", specifier = ">=2.3.2,<3" },
+    { name = "ddtrace", marker = "extra == 'observability'", specifier = ">=2.3.2,<3" },
+    { name = "dramatiq", extras = ["asyncio"], marker = "extra == 'cloud'", specifier = ">=1.18.0,<2" },
     { name = "email-validator", specifier = ">=2.2.0,<3" },
     { name = "fastapi", specifier = ">=0.115.4,<0.116" },
     { name = "fastmcp", specifier = ">=2.10.1,<3" },
+    { name = "fastmcp", marker = "extra == 'llm'", specifier = ">=2.10.1,<3" },
     { name = "filetype", specifier = ">=1.2.0,<2" },
+    { name = "filetype", marker = "extra == 'documents'", specifier = ">=1.2.0,<2" },
+    { name = "flake8", marker = "extra == 'dev'", specifier = ">=6.0.0,<7" },
+    { name = "fpdf", marker = "extra == 'dev'", specifier = ">=1.7.2,<2" },
+    { name = "freezegun", marker = "extra == 'dev'", specifier = ">=1.2.2,<2" },
     { name = "google-cloud-aiplatform", specifier = ">=1.90.0,<2" },
+    { name = "google-cloud-aiplatform", marker = "extra == 'gcp'", specifier = ">=1.90.0,<2" },
     { name = "greenlet", marker = "python_full_version == '3.11.*'", specifier = "==3.0.3" },
     { name = "greenlet", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">3.0.3" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
+    { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=6.26.0,<7" },
+    { name = "ipython", marker = "extra == 'dev'", specifier = ">=8.17.2,<9" },
+    { name = "isort", marker = "extra == 'dev'", specifier = ">=5.13.2" },
     { name = "jinja2", specifier = ">=3.1.2,<4" },
     { name = "json-repair", specifier = ">=0.34.0,<0.35" },
     { name = "lark", specifier = ">=1.2.2,<2" },
     { name = "libcst", specifier = ">=1.8.2,<2" },
     { name = "litellm", specifier = ">=1.75.8" },
+    { name = "litellm", marker = "extra == 'llm'", specifier = ">=1.75.8" },
     { name = "lmnr", extras = ["all"], specifier = ">=0.7.0,<0.8" },
+    { name = "lmnr", extras = ["all"], marker = "extra == 'llm'", specifier = ">=0.7.0,<0.8" },
+    { name = "mock", marker = "extra == 'dev'", specifier = ">=5.1.0,<6" },
+    { name = "moto", extras = ["s3", "server"], marker = "extra == 'dev'", specifier = ">=5.1.5,<6" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.18.2,<2" },
+    { name = "notebook", marker = "extra == 'dev'", specifier = ">=7.0.6,<8" },
     { name = "onepassword-sdk", specifier = "==0.3.0" },
     { name = "onnxruntime", marker = "python_full_version == '3.11.*'", specifier = "<1.17" },
     { name = "onnxruntime", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">=1.20.0,<1.23.0" },
     { name = "openai", specifier = ">=1.68.2" },
+    { name = "openai", marker = "extra == 'llm'", specifier = ">=1.68.2" },
     { name = "openpyxl", specifier = ">=3.1.5,<4" },
+    { name = "openpyxl", marker = "extra == 'documents'", specifier = ">=3.1.5,<4" },
     { name = "orjson", specifier = ">=3.9.10,<4" },
     { name = "pandas", specifier = ">=2.3.1,<3" },
     { name = "pillow", specifier = ">=10.1.0,<11" },
     { name = "playwright", marker = "python_full_version == '3.11.*'", specifier = "==1.46.0" },
+    { name = "playwright", marker = "python_full_version == '3.11.*' and extra == 'playwright'", specifier = "==1.46.0" },
     { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">1.46.0" },
+    { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14' and extra == 'playwright'", specifier = ">1.46.0" },
     { name = "posthog", specifier = ">=3.7.0,<4" },
+    { name = "posthog", marker = "extra == 'observability'", specifier = ">=3.7.0,<4" },
+    { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.2.0,<5" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version >= '3.11' and python_full_version < '3.13'", specifier = "==3.1.18" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "python_full_version == '3.13.*'", specifier = ">=3.2.2,<3.3.0" },
     { name = "pydantic", specifier = ">=2.5.2,<3" },
     { name = "pydantic-settings", specifier = ">=2.1.0,<3" },
+    { name = "pydevd-pycharm", marker = "extra == 'dev'", specifier = ">=233.6745.319,<234" },
     { name = "pyotp", specifier = ">=2.9.0,<3" },
     { name = "pypdf", specifier = ">=5.1.0,<6" },
+    { name = "pypdf", marker = "extra == 'dev'", specifier = ">=5.0.1,<6" },
+    { name = "pypdf", marker = "extra == 'documents'", specifier = ">=5.1.0,<6" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4.0,<8" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.1,<0.22" },
     { name = "python-dotenv", specifier = ">=1.0.0,<2" },
     { name = "python-jose", extras = ["cryptography"], specifier = ">=3.4.0,<4" },
     { name = "python-multipart", specifier = ">=0.0.18,<0.0.19" },
+    { name = "redis", marker = "extra == 'cloud'", specifier = ">=5.0.3,<6" },
     { name = "requests-toolbelt", specifier = ">=1.0.0,<2" },
     { name = "rich", extras = ["jupyter"], specifier = ">=13.7.0,<14" },
+    { name = "rich", extras = ["jupyter"], marker = "extra == 'dev'", specifier = ">=13.7.0,<14" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11.12,<0.12" },
+    { name = "snoop", marker = "extra == 'dev'", specifier = ">=0.4.3,<0.5" },
     { name = "sqlalchemy", extras = ["mypy"], specifier = ">=2.0.29,<3" },
     { name = "starlette-context", specifier = ">=0.3.6,<0.4" },
+    { name = "stripe", marker = "extra == 'cloud'", specifier = ">=9.7.0,<10" },
     { name = "structlog", specifier = ">=23.2.0,<24" },
+    { name = "structlog", marker = "extra == 'observability'", specifier = ">=23.2.0,<24" },
+    { name = "temporalio", marker = "extra == 'cloud'", specifier = ">=1.6.0,<2" },
     { name = "tiktoken", specifier = ">=0.9.0" },
+    { name = "tiktoken", marker = "extra == 'llm'", specifier = ">=0.9.0" },
     { name = "tldextract", specifier = ">=5.1.2,<6" },
     { name = "toml", specifier = ">=0.10.2,<0.11" },
+    { name = "twine", marker = "extra == 'dev'", specifier = ">=6.1.0,<7" },
     { name = "typer", specifier = ">=0.16.0" },
+    { name = "typer", marker = "extra == 'dev'", specifier = ">=0.16.0,<0.17" },
     { name = "types-boto3", extras = ["full"], specifier = ">=1.38.31,<2" },
+    { name = "types-boto3", extras = ["full"], marker = "extra == 'aws'", specifier = ">=1.38.31,<2" },
+    { name = "types-requests", marker = "extra == 'dev'", specifier = ">=2.31.0.2,<3" },
     { name = "types-toml", specifier = ">=0.10.8.7,<0.11" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24.0.post1,<0.25" },
+    { name = "watchdog", marker = "extra == 'dev'", specifier = ">=3.0.0,<4" },
     { name = "websockets", specifier = "~=12.0" },
 ]
+provides-extras = ["aws", "azure", "cloud", "dev", "documents", "gcp", "llm", "observability", "playwright"]
 
 [package.metadata.requires-dev]
+aws = [
+    { name = "aioboto3", specifier = ">=14.3.0,<15" },
+    { name = "types-boto3", extras = ["full"], specifier = ">=1.38.31,<2" },
+]
+azure = [
+    { name = "azure-identity", specifier = ">=1.24.0,<2" },
+    { name = "azure-keyvault-secrets", specifier = ">=4.2.0,<5" },
+    { name = "azure-storage-blob", specifier = ">=12.26.0" },
+]
 cloud = [
     { name = "dramatiq", extras = ["asyncio"], specifier = ">=1.18.0,<2" },
     { name = "redis", specifier = ">=5.0.3,<6" },
@@ -5687,6 +5852,30 @@ dev = [
     { name = "typer", specifier = ">=0.16.0,<0.17" },
     { name = "types-requests", specifier = ">=2.31.0.2,<3" },
     { name = "watchdog", specifier = ">=3.0.0,<4" },
+]
+documents = [
+    { name = "filetype", specifier = ">=1.2.0,<2" },
+    { name = "openpyxl", specifier = ">=3.1.5,<4" },
+    { name = "pypdf", specifier = ">=5.1.0,<6" },
+]
+gcp = [{ name = "google-cloud-aiplatform", specifier = ">=1.90.0,<2" }]
+llm = [
+    { name = "anthropic", specifier = ">=0.50.0,<0.51" },
+    { name = "fastmcp", specifier = ">=2.10.1,<3" },
+    { name = "litellm", specifier = ">=1.75.8" },
+    { name = "lmnr", extras = ["all"], specifier = ">=0.7.0,<0.8" },
+    { name = "openai", specifier = ">=1.68.2" },
+    { name = "tiktoken", specifier = ">=0.9.0" },
+]
+observability = [
+    { name = "alive-progress", specifier = ">=3.2.0,<4" },
+    { name = "ddtrace", specifier = ">=2.3.2,<3" },
+    { name = "posthog", specifier = ">=3.7.0,<4" },
+    { name = "structlog", specifier = ">=23.2.0,<24" },
+]
+playwright = [
+    { name = "playwright", marker = "python_full_version == '3.11.*'", specifier = "==1.46.0" },
+    { name = "playwright", marker = "python_full_version >= '3.12' and python_full_version < '3.14'", specifier = ">1.46.0" },
 ]
 
 [[package]]

@@ -91,6 +91,29 @@ Additionally, for Windows:
 - [Rust](https://rustup.rs/)
 - VS Code with C++ dev tools and Windows SDK
 
+### Optional dependency extras
+
+Skyvern will install its full runtime dependency set by default. If you want
+to manage dependencies more selectively, you can now into extras:
+
+| Extra | Purpose |
+| --- | --- |
+| `aws` | AWS client integrations (Boto3 tooling) |
+| `azure` | Azure storage and identity helpers |
+| `cloud` | Background job runners (`stripe`, `temporalio`, `dramatiq`, `redis`) |
+| `documents` | Document parsing helpers (`openpyxl`, `pypdf`, `filetype`) |
+| `gcp` | Google Cloud clients (`google-cloud-aiplatform`) |
+| `llm` | LLM provider SDKs (`openai`, `anthropic`, `litellm`, `fastmcp`, `lmnr`, `tiktoken`) |
+| `observability` | Telemetry and instrumentation (`ddtrace`, `posthog`, `structlog`) |
+| `playwright` | Browser automation binaries pinned per Python release |
+| `dev` | Tooling for local development, testing, formatting |
+
+Example:
+
+```bash
+pip install "skyvern[cloud,playwright]"
+```
+
 ### 1. Install Skyvern
 
 ```bash
