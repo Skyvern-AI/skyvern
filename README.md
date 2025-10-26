@@ -94,7 +94,7 @@ Additionally, for Windows:
 ### Optional dependency extras
 
 Skyvern will install its full runtime dependency set by default. If you want
-to manage dependencies more selectively, you can now into extras:
+to manage dependencies more selectively, you can now opt into extras:
 
 | Extra | Purpose |
 | --- | --- |
