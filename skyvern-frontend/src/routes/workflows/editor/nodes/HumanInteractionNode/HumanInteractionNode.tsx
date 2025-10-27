@@ -95,92 +95,77 @@ function HumanInteractionNode({
             </div>
             {/* TODO(jdo): 'instructions' allows templating; but it requires adding a column to the workflow_block_runs
             table, and I don't want to do that just yet (see /timeline endpoint) */}
-            <Input
-              onChange={(event) => {
-                update({ instructions: event.target.value });
+            <WorkflowBlockInput
+              nodeId={id}
+              onChange={(value) => {
+                update({ instructions: value });
               }}
               value={data.instructions}
               placeholder="Please review and approve or reject to continue the workflow."
               className="nopan text-xs"
             />
           </div>
-          <div className="flex gap-4">
-            <div className="flex-1 space-y-2">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
-                  Negative Button Label
-                </Label>
-                <HelpTooltip content={negativeDescriptorTooltip} />
-              </div>
-              <Input
-                onChange={(event) => {
-                  update({ negativeDescriptor: event.target.value });
-                }}
-                value={data.negativeDescriptor}
-                placeholder="Reject"
-                className="nopan text-xs"
-              />
-            </div>
-            <div className="flex-1 space-y-2">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
-                  Positive Button Label
-                </Label>
-                <HelpTooltip content={positiveDescriptorTooltip} />
-              </div>
-              <Input
-                onChange={(event) => {
-                  update({ positiveDescriptor: event.target.value });
-                }}
-                value={data.positiveDescriptor}
-                placeholder="Approve"
-                className="nopan text-xs"
-              />
-            </div>
-          </div>
-          {/* <div className="space-y-2">
-            <div className="flex gap-2">
-              <Label className="text-xs text-slate-300">
-                Timeout (seconds)
-              </Label>
-              <HelpTooltip content={timeoutTooltip} />
-            </div>
-            <Input
-              type="number"
-              className="nopan text-xs"
-              min="1"
-              value={data.timeoutSeconds}
-              onChange={(event) => {
-                if (!editable) {
-                  return;
-                }
-                const value = Number(event.target.value);
-                update({ timeoutSeconds: value });
-              }}
-              placeholder="7200"
-            />
-          </div> */}
           <div className="space-between flex items-center gap-2">
-            <Label className="text-xs text-slate-300">Timeout (seconds)</Label>
+            <Label className="text-xs text-slate-300">Timeout (minutes)</Label>
             <HelpTooltip content={timeoutTooltip} />
             <Input
               className="ml-auto w-16 text-right"
-              value={data.timeoutSeconds}
-              placeholder="7200"
+              value={data.timeoutSeconds / 60}
+              placeholder="120"
               onChange={(event) => {
                 if (!editable) {
                   return;
                 }
                 const value = Number(event.target.value);
-                update({ timeoutSeconds: value });
+                update({ timeoutSeconds: value * 60 });
               }}
             />
           </div>
-          <div className="rounded-md bg-slate-800 p-2">
+          <div className="flex items-center justify-center gap-2 rounded-md bg-slate-800 p-2">
+            <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
             <div className="space-y-1 text-xs text-slate-400">
-              Tip: The workflow will pause and send an email notification to the
+              The workflow will pause and send an email notification to the
               recipients. The workflow continues or terminates based on the
               user's response.
+            </div>
+          </div>
+          <div className="space-y-4 rounded-md bg-slate-800 p-4">
+            <h2>Email Settings</h2>
+            <div className="space-y-2">
+              <Label className="text-xs text-slate-300">Recipients</Label>
+              <WorkflowBlockInput
+                nodeId={id}
+                onChange={(value) => {
+                  update({ recipients: value });
+                }}
+                value={data.recipients}
+                placeholder="example@gmail.com, example2@gmail.com..."
+                className="nopan text-xs"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs text-slate-300">Subject</Label>
+              <WorkflowBlockInput
+                nodeId={id}
+                onChange={(value) => {
+                  update({ subject: value });
+                }}
+                value={data.subject}
+                placeholder="Human interaction required for workflow run"
+                className="nopan text-xs"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs text-slate-300">Body</Label>
+              <WorkflowBlockInputTextarea
+                nodeId={id}
+                onChange={(value) => {
+                  update({ body: value });
+                }}
+                value={data.body}
+                placeholder="Your interaction is required for a workflow run!"
+                className="nopan text-xs"
+              />
             </div>
           </div>
         </div>
@@ -194,44 +179,46 @@ function HumanInteractionNode({
           collapsible
         >
           <AccordionItem value="email" className="border-b-0">
-            <AccordionTrigger className="py-0">Email Settings</AccordionTrigger>
+            <AccordionTrigger className="py-0">
+              Advanced Settings
+            </AccordionTrigger>
             <AccordionContent className="pl-6 pr-1 pt-1">
-              <div key={rerender.key} className="space-y-4">
-                <div className="space-y-2">
-                  <Label className="text-xs text-slate-300">Recipients</Label>
-                  <WorkflowBlockInput
-                    nodeId={id}
-                    onChange={(value) => {
-                      update({ recipients: value });
-                    }}
-                    value={data.recipients}
-                    placeholder="example@gmail.com, example2@gmail.com..."
-                    className="nopan text-xs"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label className="text-xs text-slate-300">Subject</Label>
-                  <WorkflowBlockInput
-                    nodeId={id}
-                    onChange={(value) => {
-                      update({ subject: value });
-                    }}
-                    value={data.subject}
-                    placeholder="Human interaction required for workflow run"
-                    className="nopan text-xs"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label className="text-xs text-slate-300">Body</Label>
-                  <WorkflowBlockInputTextarea
-                    nodeId={id}
-                    onChange={(value) => {
-                      update({ body: value });
-                    }}
-                    value={data.body}
-                    placeholder="Your interaction is required for a workflow run!"
-                    className="nopan text-xs"
-                  />
+              <div key={rerender.key} className="space-y-4 pt-4">
+                <div className="flex gap-4">
+                  <div className="flex-1 space-y-2">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        Negative Button Label
+                      </Label>
+                      <HelpTooltip content={negativeDescriptorTooltip} />
+                    </div>
+                    <WorkflowBlockInput
+                      nodeId={id}
+                      onChange={(value) => {
+                        update({ negativeDescriptor: value });
+                      }}
+                      value={data.negativeDescriptor}
+                      placeholder="Reject"
+                      className="nopan text-xs"
+                    />
+                  </div>
+                  <div className="flex-1 space-y-2">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        Positive Button Label
+                      </Label>
+                      <HelpTooltip content={positiveDescriptorTooltip} />
+                    </div>
+                    <WorkflowBlockInput
+                      nodeId={id}
+                      onChange={(value) => {
+                        update({ positiveDescriptor: value });
+                      }}
+                      value={data.positiveDescriptor}
+                      placeholder="Approve"
+                      className="nopan text-xs"
+                    />
+                  </div>
                 </div>
               </div>
             </AccordionContent>
