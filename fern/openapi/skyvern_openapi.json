@@ -10,6 +10,13 @@
       "ApiKeyAuth": []
     }
   ],
+  "x-fern-global-headers": [
+    {
+      "header": "x-api-key",
+      "optional": true,
+      "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+    }
+  ],
   "paths": {
     "/v1/run/tasks": {
       "post": {

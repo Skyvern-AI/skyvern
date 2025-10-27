@@ -1,5 +1,9 @@
 # yaml-language-server: $schema=https://schema.buildwithfern.dev/generators-yml.json
 api:
+  headers:
+    custom_api_key:
+      name: api_key
+      type: string
   specs:
     - openapi: openapi/skyvern_openapi.json
       origin: https://api.skyvern.com/openapi.json
