@@ -3099,6 +3099,14 @@ class HumanInteractionBlock(BaseTaskBlock):
 
         self.recipients = formatted
 
+        self.negative_descriptor = self.format_block_parameter_template_from_workflow_run_context(
+            self.negative_descriptor, workflow_run_context
+        )
+
+        self.positive_descriptor = self.format_block_parameter_template_from_workflow_run_context(
+            self.positive_descriptor, workflow_run_context
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -3109,6 +3117,31 @@ class HumanInteractionBlock(BaseTaskBlock):
     ) -> BlockResult:
         # avoid circular import
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus  # noqa: PLC0415
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            recipients=self.recipients,
+            subject=self.subject,
+            body=self.body,
+            instructions=self.instructions,
+            positive_descriptor=self.positive_descriptor,
+            negative_descriptor=self.negative_descriptor,
+        )
 
         LOG.info(
             "Pausing workflow for human interaction",
@@ -3132,20 +3165,6 @@ class HumanInteractionBlock(BaseTaskBlock):
             return await self.build_block_result(
                 success=False,
                 failure_reason="Workflow run not found",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-
-        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-
-        try:
-            self.format_potential_template_parameters(workflow_run_context)
-        except Exception as e:
-            return await self.build_block_result(
-                success=False,
-                failure_reason=f"Failed to format jinja template: {str(e)}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,

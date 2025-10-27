@@ -53,6 +53,11 @@ class WorkflowRunBlock(BaseModel):
     subject: str | None = None
     body: str | None = None
 
+    # human interaction block
+    instructions: str | None = None
+    positive_descriptor: str | None = None
+    negative_descriptor: str | None = None
+
 
 class WorkflowRunTimelineType(StrEnum):
     thought = "thought"
