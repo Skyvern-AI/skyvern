@@ -523,6 +523,9 @@ def convert_to_workflow_run_block(
         body=workflow_run_block_model.body,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
+        instructions=workflow_run_block_model.instructions,
+        positive_descriptor=workflow_run_block_model.positive_descriptor,
+        negative_descriptor=workflow_run_block_model.negative_descriptor,
     )
     if task:
         if task.finished_at and task.started_at:
