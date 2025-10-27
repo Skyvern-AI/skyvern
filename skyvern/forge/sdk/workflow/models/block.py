@@ -23,6 +23,7 @@ import pandas as pd
 import pyotp
 import structlog
 from email_validator import EmailNotValidError, validate_email
+from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 from pydantic import BaseModel, Field
@@ -74,6 +75,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InsecureCodeDetected,
     InvalidEmailClientConfiguration,
     InvalidFileType,
+    MissingJinjaVariables,
     NoIterableValueFound,
     NoValidEmailRecipient,
 )
@@ -88,12 +90,13 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.utils.strings import generate_random_string
+from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
-jinja_sandbox_env = SandboxedEnvironment()
+jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
 
 
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
@@ -187,6 +190,7 @@ class Block(BaseModel, abc.ABC):
     ) -> str:
         if not potential_template:
             return potential_template
+
         template = jinja_sandbox_env.from_string(potential_template)
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
@@ -244,6 +248,12 @@ class Block(BaseModel, abc.ABC):
             template_data["workflow_permanent_id"] = workflow_run_context.workflow_permanent_id
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
+
+        if missing_variables := get_missing_variables(potential_template, template_data):
+            raise MissingJinjaVariables(
+                template=potential_template,
+                variables=missing_variables,
+            )
 
         return template.render(template_data)
 

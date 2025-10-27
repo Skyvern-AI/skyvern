@@ -121,6 +121,15 @@ class FailedToFormatJinjaStyleParameter(SkyvernException):
         )
 
 
+class MissingJinjaVariables(SkyvernException):
+    def __init__(self, template: str, variables: set[str]) -> None:
+        self.variables = variables
+
+        super().__init__(
+            f"There are missing variables for '{template}'. Please make sure the variables are supplied. Missing variables: {variables}"
+        )
+
+
 class NoIterableValueFound(SkyvernException):
     def __init__(self) -> None:
         super().__init__("No iterable value found for the loop block")
