@@ -2318,8 +2318,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   });
 
   const interactionNodes = nodes.filter(isHumanInteractionNode);
-  interactionNodes.forEach((/* node */) => {
-    // pass for now
+  interactionNodes.forEach((node) => {
+    if (node.data.recipients.trim().length === 0) {
+      errors.push(`${node.data.label}: Recipients is required.`);
+    }
   });
 
   const navigationNodes = nodes.filter(isNavigationNode);

@@ -5,7 +5,7 @@ import {
   ExternalLinkIcon,
 } from "@radix-ui/react-icons";
 import { useCallback } from "react";
-import { useParams, Link } from "react-router-dom";
+import { Link } from "react-router-dom";
 
 import { Status } from "@/api/types";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
@@ -27,13 +27,8 @@ import {
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
 import { ThoughtCard } from "./ThoughtCard";
-import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { ObserverThought } from "../types/workflowRunTypes";
-import {
-  HumanInteractionBlock,
-  isTaskVariantBlock,
-  type WorkflowApiResponse,
-} from "../types/workflowTypes";
+import { isTaskVariantBlock } from "../types/workflowTypes";
 import { WorkflowRunHumanInteraction } from "./WorkflowRunHumanInteraction";
 
 type Props = {
@@ -45,28 +40,6 @@ type Props = {
   onThoughtCardClick: (thought: ObserverThought) => void;
 };
 
-const getHumanInteractionBlock = (
-  block: WorkflowRunBlock,
-  workflow?: WorkflowApiResponse,
-): HumanInteractionBlock | null => {
-  if (block.block_type !== "human_interaction") {
-    return null;
-  }
-
-  if (!workflow) {
-    return null;
-  }
-
-  const blocks = workflow.workflow_definition.blocks;
-  const candidate = blocks.find((b) => b.label === block.label);
-
-  if (!candidate || candidate.block_type !== "human_interaction") {
-    return null;
-  }
-
-  return candidate as HumanInteractionBlock;
-};
-
 function WorkflowRunTimelineBlockItem({
   activeItem,
   block,
@@ -75,12 +48,6 @@ function WorkflowRunTimelineBlockItem({
   onActionClick,
   onThoughtCardClick,
 }: Props) {
-  const { workflowPermanentId } = useParams();
-  const { data: workflow } = useWorkflowQuery({
-    workflowPermanentId,
-  });
-
-  const humanInteractionBlock = getHumanInteractionBlock(block, workflow);
   const actions = block.actions ?? [];
 
   const hasActiveAction =
@@ -203,10 +170,8 @@ function WorkflowRunTimelineBlockItem({
         ) : null}
       </div>
 
-      {humanInteractionBlock && (
-        <WorkflowRunHumanInteraction
-          humanInteractionBlock={humanInteractionBlock}
-        />
+      {block.block_type === "human_interaction" && (
+        <WorkflowRunHumanInteraction workflowRunBlock={block} />
       )}
 
       {actions.map((action, index) => {
