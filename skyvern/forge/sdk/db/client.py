@@ -3289,6 +3289,10 @@ class AgentDB:
         http_request_timeout: int | None = None,
         http_request_follow_redirects: bool | None = None,
         ai_fallback_triggered: bool | None = None,
+        # human interaction block
+        instructions: str | None = None,
+        positive_descriptor: str | None = None,
+        negative_descriptor: str | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -3348,6 +3352,13 @@ class AgentDB:
                     workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 if ai_fallback_triggered is not None:
                     workflow_run_block.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
+                # human interaction block fields
+                if instructions:
+                    workflow_run_block.instructions = instructions
+                if positive_descriptor:
+                    workflow_run_block.positive_descriptor = positive_descriptor
+                if negative_descriptor:
+                    workflow_run_block.negative_descriptor = negative_descriptor
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:

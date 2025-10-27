@@ -680,6 +680,11 @@ class WorkflowRunBlockModel(Base):
     http_request_timeout = Column(Integer, nullable=True)
     http_request_follow_redirects = Column(Boolean, nullable=True)
 
+    # human interaction block
+    instructions = Column(String, nullable=True)
+    positive_descriptor = Column(String, nullable=True)
+    negative_descriptor = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
