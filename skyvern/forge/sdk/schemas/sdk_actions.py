@@ -11,7 +11,6 @@ class SdkActionType(str, Enum):
 
     AI_CLICK = "ai_click"
     AI_INPUT_TEXT = "ai_input_text"
-    AI_UPLOAD_FILE = "ai_upload_file"
     AI_SELECT_OPTION = "ai_select_option"
     EXTRACT = "extract"
 
@@ -47,17 +46,6 @@ class InputTextAction(SdkActionBase):
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
 
 
-class UploadFileAction(SdkActionBase):
-    """Upload file action parameters."""
-
-    type: Literal["ai_upload_file"] = "ai_upload_file"
-    selector: str = Field(default="", description="CSS selector for the element")
-    files: str = Field(default="", description="File URL for upload")
-    intention: str = Field(default="", description="The intention or goal of the upload")
-    data: str | dict[str, Any] | None = Field(None, description="Additional context data")
-    timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
-
-
 class SelectOptionAction(SdkActionBase):
     """Select option action parameters."""
 
@@ -82,7 +70,7 @@ class ExtractAction(SdkActionBase):
 
 # Discriminated union of all action types
 SdkAction = Annotated[
-    Union[ClickAction, InputTextAction, UploadFileAction, SelectOptionAction, ExtractAction],
+    Union[ClickAction, InputTextAction, SelectOptionAction, ExtractAction],
     Field(discriminator="type"),
 ]
 

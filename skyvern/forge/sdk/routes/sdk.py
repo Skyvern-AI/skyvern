@@ -17,7 +17,6 @@ from skyvern.forge.sdk.schemas.sdk_actions import (
     RunSdkActionRequest,
     RunSdkActionResponse,
     SelectOptionAction,
-    UploadFileAction,
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -155,14 +154,6 @@ async def run_sdk_action(
                 data=action.data,
                 totp_identifier=action.totp_identifier,
                 totp_url=action.totp_url,
-                timeout=action.timeout,
-            )
-        elif isinstance(action, UploadFileAction):
-            result = await page_ai.ai_upload_file(
-                selector=action.selector,
-                files=action.files,
-                intention=action.intention,
-                data=action.data,
                 timeout=action.timeout,
             )
         elif isinstance(action, SelectOptionAction):

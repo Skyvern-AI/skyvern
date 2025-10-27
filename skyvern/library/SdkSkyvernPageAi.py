@@ -10,7 +10,6 @@ from skyvern.forge.sdk.schemas.sdk_actions import (
     ExtractAction,
     InputTextAction,
     SelectOptionAction,
-    UploadFileAction,
 )
 
 if TYPE_CHECKING:
@@ -83,32 +82,6 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         self._browser.workflow_run_id = response.workflow_run_id
         return response.result if response.result else value
 
-    async def ai_upload_file(
-        self,
-        selector: str,
-        files: str,
-        intention: str,
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
-        """Upload a file using AI via API call."""
-
-        response = await self._browser.client.run_sdk_action(
-            url=self._page.url,
-            action=UploadFileAction(
-                selector=selector,
-                files=files,
-                intention=intention,
-                data=data,
-                timeout=timeout,
-            ),
-            browser_session_id=self._browser.browser_session_id,
-            browser_address=self._browser.browser_address,
-            workflow_run_id=self._browser.workflow_run_id,
-        )
-        self._browser.workflow_run_id = response.workflow_run_id
-        return response.result if response.result else files
-
     async def ai_select_option(
         self,
         selector: str,
@@ -134,6 +107,16 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         )
         self._browser.workflow_run_id = response.workflow_run_id
         return response.result if response.result else value
+
+    async def ai_upload_file(
+        self,
+        selector: str,
+        files: str,
+        intention: str,
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str:
+        raise NotImplementedError("Upload is not supported yet")
 
     async def ai_extract(
         self,

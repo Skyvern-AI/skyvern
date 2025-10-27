@@ -9515,58 +9515,6 @@
         "required": ["type"],
         "title": "InputTextAction"
       },
-      "UploadFileAction": {
-        "type": "object",
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_upload_file",
-            "title": "Type",
-            "default": "ai_upload_file"
-          },
-          "selector": {
-            "type": "string",
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "files": {
-            "type": "string",
-            "title": "Files",
-            "description": "File URL for upload",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the upload",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 30000
-          }
-        },
-        "required": ["type"],
-        "title": "UploadFileAction"
-      },
       "SelectOptionAction": {
         "type": "object",
         "properties": {
@@ -9707,9 +9655,6 @@
             "$ref": "#/components/schemas/InputTextAction"
           },
           {
-            "$ref": "#/components/schemas/UploadFileAction"
-          },
-          {
             "$ref": "#/components/schemas/SelectOptionAction"
           },
           {
@@ -9721,7 +9666,6 @@
           "mapping": {
             "ai_click": "#/components/schemas/ClickAction",
             "ai_input_text": "#/components/schemas/InputTextAction",
-            "ai_upload_file": "#/components/schemas/UploadFileAction",
             "ai_select_option": "#/components/schemas/SelectOptionAction",
             "extract": "#/components/schemas/ExtractAction"
           }
