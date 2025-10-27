@@ -5,9 +5,9 @@ from pydantic import BaseModel, Field
 from skyvern_langchain.schema import CreateTaskInput, GetTaskInput
 from skyvern_langchain.settings import settings
 
-from skyvern import Skyvern
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
+from skyvern.library.skyvern import Skyvern
 from skyvern.schemas.runs import RunEngine
 
 

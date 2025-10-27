@@ -9,7 +9,7 @@ from rich.prompt import Confirm, Prompt
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.library import Skyvern
+from skyvern.library.skyvern import Skyvern
 from skyvern.utils import detect_os, get_windows_appdata_roaming
 from skyvern.utils.env_paths import resolve_backend_env_path
 

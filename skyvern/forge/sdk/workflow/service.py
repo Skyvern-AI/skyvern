@@ -16,6 +16,7 @@ from skyvern import analytics
 from skyvern.client.types.output_parameter import OutputParameter as BlockOutputParameter
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
+from skyvern.core.script_generations import run_initializer
 from skyvern.exceptions import (
     BlockNotFound,
     BrowserSessionNotFound,
@@ -584,7 +585,7 @@ class WorkflowService:
                         if spec and spec.loader:
                             loaded_script_module = importlib.util.module_from_spec(spec)
                             spec.loader.exec_module(loaded_script_module)
-                            await skyvern.setup(
+                            await run_initializer.setup(
                                 script_parameters,
                                 generated_parameter_cls=loaded_script_module.GeneratedWorkflowParameters,
                             )

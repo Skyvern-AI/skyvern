@@ -5,9 +5,9 @@ from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSp
 from pydantic import BaseModel
 from skyvern_llamaindex.settings import settings
 
-from skyvern import Skyvern
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
+from skyvern.library.skyvern import Skyvern
 from skyvern.schemas.runs import RunEngine
 
 
