@@ -24,6 +24,7 @@ BlockType = typing.Union[
         "goto_url",
         "pdf_parser",
         "http_request",
+        "human_interaction",
     ],
     typing.Any,
 ]
