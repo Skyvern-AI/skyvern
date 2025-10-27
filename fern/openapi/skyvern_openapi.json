@@ -2337,7 +2337,7 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\nfrom skyvern.forge.sdk.schemas.sdk_actions import ClickAction\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nresponse = await skyvern.run_sdk_action(\n    url=\"https://example.com\",\n    browser_session_id=\"bs_123\",\n    action=ClickAction(\n        selector=\"button\",\n        intention=\"Click the submit button\"\n    )\n)\nprint(response.workflow_run_id)\n"
+                "code": "from skyvern import Skyvern\nfrom skyvern.forge.sdk.schemas.sdk_actions import ClickAction\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nresponse = await skyvern.run_sdk_action(\n    url=\"https://example.com\",\n    browser_session_id=\"pbs_123\",\n    action=ClickAction(\n        selector=\"button\",\n        intention=\"Click the submit button\"\n    )\n)\nprint(response.workflow_run_id)\n"
               }
             ]
           }

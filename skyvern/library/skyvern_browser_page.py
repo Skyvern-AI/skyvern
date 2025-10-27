@@ -306,7 +306,7 @@ class SkyvernBrowserPage:
         The browser then inputs the text using this newly generated text.
 
         If the prompt generation or parsing fails for any reason we fall back to
-        inputting the originally supplied ``text``.
+        inputting the originally supplied ``value``.
         """
 
         # format the text with the actual value of the parameter if it's a secret when running a workflow

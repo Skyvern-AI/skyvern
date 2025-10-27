@@ -1,4 +1,3 @@
-import json
 from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import Page
@@ -142,4 +141,4 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=self._browser.workflow_run_id,
         )
         self._browser.workflow_run_id = response.workflow_run_id
-        return json.loads(response.text) if response.text else None
+        return response.result if response.result else None
