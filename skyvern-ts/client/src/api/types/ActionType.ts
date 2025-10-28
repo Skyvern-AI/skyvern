@@ -13,6 +13,7 @@ export const ActionType = {
     Terminate: "terminate",
     Complete: "complete",
     ReloadPage: "reload_page",
+    ClosePage: "close_page",
     Extract: "extract",
     VerificationCode: "verification_code",
     GotoUrl: "goto_url",

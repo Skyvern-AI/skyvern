@@ -13,7 +13,7 @@ npm i -s @skyvern/client
 
 ## Reference
 
-A full reference for this library is available [here](https://github.com/Skyvern-AI/skyvern-typescript/blob/HEAD/./reference.md).
+A full reference for this library is available [here](https://github.com/Skyvern-AI/skyvern/blob/main/skyvern-ts/client/README.md).
 
 ## Usage
 
