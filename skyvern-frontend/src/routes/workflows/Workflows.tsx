@@ -54,6 +54,7 @@ import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTemplates } from "../discover/WorkflowTemplates";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
   title: "New Workflow",
@@ -73,6 +74,7 @@ function Workflows() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
+  const isTyping = search !== debouncedSearch;
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
     ? Number(searchParams.get("page_size"))
@@ -104,7 +106,7 @@ function Workflows() {
       .slice(0, 5);
   }, [allFolders]);
 
-  const { data: workflows = [], isLoading } = useQuery<
+  const { data: workflows = [], isFetching } = useQuery<
     Array<WorkflowApiResponse>
   >({
     queryKey: ["workflows", debouncedSearch, page, itemsPerPage, selectedFolderId],
@@ -152,7 +154,7 @@ function Workflows() {
   });
 
   const isNextDisabled =
-    isLoading || !nextPageWorkflows || nextPageWorkflows.length === 0;
+    isFetching || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
   // Auto-expand rows when parameters match search
   const autoExpandedRows = useMemo(() => {
@@ -432,10 +434,24 @@ function Workflows() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {isLoading ? (
-                <TableRow>
-                  <TableCell colSpan={5}>Loading...</TableCell>
-                </TableRow>
+              {(isFetching || isTyping) && displayWorkflows.length === 0 ? (
+                // Show 10 skeleton rows while typing or fetching
+                Array.from({ length: 10 }).map((_, index) => (
+                  <TableRow key={`skeleton-${index}`}>
+                    <TableCell><Skeleton className="h-5 w-full" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-full" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-20" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-32" /></TableCell>
+                    <TableCell>
+                      <div className="flex justify-end gap-2">
+                        <Skeleton className="h-8 w-8 rounded" />
+                        <Skeleton className="h-8 w-8 rounded" />
+                        <Skeleton className="h-8 w-8 rounded" />
+                        <Skeleton className="h-8 w-8 rounded" />
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))
               ) : displayWorkflows?.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={5}>No workflows found</TableCell>

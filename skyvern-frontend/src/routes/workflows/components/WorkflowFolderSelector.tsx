@@ -7,6 +7,8 @@ import { cn } from "@/util/utils";
 import { useInfiniteFoldersQuery } from "../hooks/useInfiniteFoldersQuery";
 import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
 import { handleInfiniteScroll } from "@/util/utils";
+import { useDebounce } from "use-debounce";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface WorkflowFolderSelectorProps {
   workflowPermanentId: string;
@@ -19,14 +21,17 @@ function WorkflowFolderSelector({
 }: WorkflowFolderSelectorProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
+  const [debouncedSearch] = useDebounce(search, 500);
+  const isTyping = search !== debouncedSearch;
   
   const {
     data,
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage,
+    isFetching,
   } = useInfiniteFoldersQuery({
-    search,
+    search: debouncedSearch,
     page_size: 20,
   });
 
@@ -91,7 +96,23 @@ function WorkflowFolderSelector({
             </button>
           )}
 
-          {folders.length === 0 ? (
+          {(isFetching || isTyping) && folders.length === 0 ? (
+            // Show 8 skeleton rows while typing or fetching
+            <>
+              {Array.from({ length: 8 }).map((_, index) => (
+                <div
+                  key={`skeleton-${index}`}
+                  className="flex w-full items-center gap-2 px-3 py-2"
+                >
+                  <Skeleton className="h-4 w-4" />
+                  <div className="flex flex-1 flex-col gap-1">
+                    <Skeleton className="h-4 w-3/4" />
+                    <Skeleton className="h-3 w-1/2" />
+                  </div>
+                </div>
+              ))}
+            </>
+          ) : folders.length === 0 ? (
             <div className="px-3 py-8 text-center text-sm text-slate-400">
               No folders found
             </div>
