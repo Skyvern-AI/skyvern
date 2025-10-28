@@ -4,7 +4,7 @@ import tempfile
 from typing import Any
 
 import structlog
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException
 from pypdf import PdfReader
 
 from skyvern.config import settings
@@ -161,9 +161,7 @@ class PDFImportService:
             # Clean up the temporary file
             os.unlink(temp_file_path)
 
-    async def create_workflow_from_sop_text(
-        self, sop_text: str, organization: Organization
-    ) -> dict[str, Any]:
+    async def create_workflow_from_sop_text(self, sop_text: str, organization: Organization) -> dict[str, Any]:
         """Convert SOP text to workflow using LLM and create it."""
         # Load and render the prompt template
         prompt = prompt_engine.load_prompt(
@@ -207,9 +205,7 @@ class PDFImportService:
                 response=str(response)[:500],
                 organization_id=organization.organization_id,
             )
-            raise HTTPException(
-                status_code=422, detail="LLM returned invalid response format - expected JSON object"
-            )
+            raise HTTPException(status_code=422, detail="LLM returned invalid response format - expected JSON object")
 
         # Validate that it has the required structure
         if "workflow_definition" not in response:

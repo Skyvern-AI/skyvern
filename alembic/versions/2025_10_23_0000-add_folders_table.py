@@ -37,7 +37,7 @@ def upgrade() -> None:
             ["organizations.organization_id"],
         ),
     )
-    
+
     # Create indexes on folders table
     op.create_index(
         "folder_organization_id_idx",
@@ -51,10 +51,10 @@ def upgrade() -> None:
         ["organization_id", "title"],
         unique=False,
     )
-    
+
     # Step 2: Add folder_id to workflows table
     op.add_column("workflows", sa.Column("folder_id", sa.String(), nullable=True))
-    
+
     # Create index on workflows.folder_id
     op.create_index(
         "workflow_folder_id_idx",
@@ -62,7 +62,7 @@ def upgrade() -> None:
         ["folder_id"],
         unique=False,
     )
-    
+
     # Create foreign key constraint
     op.create_foreign_key(
         "fk_workflows_folder_id",
@@ -80,10 +80,9 @@ def downgrade() -> None:
     op.drop_constraint("fk_workflows_folder_id", "workflows", type_="foreignkey")
     op.drop_index("workflow_folder_id_idx", table_name="workflows")
     op.drop_column("workflows", "folder_id")
-    
+
     # Step 2: Drop folders table
     op.drop_index("folder_organization_title_idx", table_name="folders")
     op.drop_index("folder_organization_id_idx", table_name="folders")
     op.drop_table("folders")
     # ### end Alembic commands ###
-

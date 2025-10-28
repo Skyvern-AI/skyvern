@@ -3,7 +3,19 @@ from typing import Annotated, Any
 
 import structlog
 import yaml
-from fastapi import BackgroundTasks, Depends, Header, HTTPException, Path, Query, Request, Response, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    Depends,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
@@ -19,7 +31,6 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.db.utils import convert_to_workflow
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -74,6 +85,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
+from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
     CUA_ENGINES,
     BlockRunRequest,
@@ -86,7 +98,6 @@ from skyvern.schemas.runs import (
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
-from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
@@ -644,13 +655,14 @@ async def import_workflow_from_pdf(
     )
 
     # Process PDF import in background (LLM call is the slow part)
-    async def process_pdf_import():
+    async def process_pdf_import() -> None:
         try:
             # Create workflow from extracted text (LLM processing)
-            result = await pdf_import_service.create_workflow_from_sop_text(
-                sop_text, current_org
-            )
+            result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
             workflow_id = result.get("workflow_permanent_id")
+
+            if not workflow_id:
+                raise ValueError("workflow_permanent_id not returned from PDF import")
 
             # Mark as completed
             await app.DATABASE.mark_workflow_import_completed(
@@ -998,7 +1010,7 @@ async def get_folders(
 @base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 async def update_folder(
     folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
-    data: FolderUpdate = ...,
+    data: FolderUpdate = Body(...),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Folder:
     folder = await app.DATABASE.update_folder(
@@ -1073,7 +1085,7 @@ async def delete_folder(
 @base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
 async def update_workflow_folder(
     workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
-    data: UpdateWorkflowFolderRequest = ...,
+    data: UpdateWorkflowFolderRequest = Body(...),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     try:
@@ -1083,7 +1095,9 @@ async def update_workflow_folder(
             folder_id=data.folder_id,
         )
         if not workflow:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found"
+            )
 
         return workflow
     except ValueError as e:
@@ -1108,11 +1122,11 @@ async def get_active_workflow_imports(
 ) -> list[dict[str, Any]]:
     """Get all active workflow imports."""
     analytics.capture("skyvern-oss-workflow-active-imports-get")
-    
+
     imports = await app.DATABASE.get_active_workflow_imports(
         organization_id=current_org.organization_id,
     )
-    
+
     return [
         {
             "import_id": imp.import_id,

@@ -1954,7 +1954,7 @@ class AgentDB:
                     )
                     .subquery()
                 )
-                
+
                 # Get workflow_permanent_ids where the latest version is in this folder
                 stmt = (
                     select(WorkflowModel.workflow_permanent_id)
@@ -1992,7 +1992,7 @@ class AgentDB:
                         folder_id=folder_id,
                         organization_id=organization_id,
                     )
-                    
+
                     # Delete each workflow by permanent ID
                     for workflow_permanent_id in workflow_permanent_ids:
                         await self.soft_delete_workflow_by_permanent_id(
@@ -2041,7 +2041,7 @@ class AgentDB:
                     )
                     .subquery()
                 )
-                
+
                 # Count workflows where the latest version is in this folder
                 stmt = (
                     select(func.count(WorkflowModel.workflow_permanent_id))
@@ -2078,10 +2078,10 @@ class AgentDB:
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
             )
-            
+
             if not latest_workflow:
                 return None
-            
+
             async with self.Session() as session:
                 workflow_model = await session.get(WorkflowModel, latest_workflow.workflow_id)
                 if workflow_model:
@@ -2089,7 +2089,7 @@ class AgentDB:
                     workflow_model.modified_at = datetime.utcnow()
                     await session.commit()
                     await session.refresh(workflow_model)
-                    
+
                     # Update folder's modified_at after successful workflow update
                     if folder_id:
                         async with self.Session() as folder_session:
@@ -2098,7 +2098,7 @@ class AgentDB:
                                 folder_model.modified_at = datetime.utcnow()
                                 await folder_session.commit()
                                 await folder_session.refresh(folder_model)
-                    
+
                     return convert_to_workflow(workflow_model, self.debug_enabled)
                 return None
         except SQLAlchemyError:
@@ -2134,10 +2134,7 @@ class AgentDB:
         """Get a workflow import by ID."""
         try:
             async with self.Session() as session:
-                stmt = (
-                    select(WorkflowImportModel)
-                    .filter_by(import_id=import_id, organization_id=organization_id)
-                )
+                stmt = select(WorkflowImportModel).filter_by(import_id=import_id, organization_id=organization_id)
                 result = await session.execute(stmt)
                 return result.scalar_one_or_none()
         except SQLAlchemyError:
@@ -2153,7 +2150,7 @@ class AgentDB:
             async with self.Session() as session:
                 # Get importing imports + completed/failed imports from last 10 seconds
                 recent_cutoff = datetime.utcnow() - timedelta(seconds=10)
-                
+
                 stmt = (
                     select(WorkflowImportModel)
                     .filter_by(organization_id=organization_id)
@@ -2162,8 +2159,8 @@ class AgentDB:
                             WorkflowImportModel.status == "importing",
                             and_(
                                 WorkflowImportModel.status.in_(["completed", "failed"]),
-                                WorkflowImportModel.completed_at >= recent_cutoff  # Check COMPLETION time
-                            )
+                                WorkflowImportModel.completed_at >= recent_cutoff,  # Check COMPLETION time
+                            ),
                         )
                     )
                     .order_by(WorkflowImportModel.created_at.desc())
@@ -2230,9 +2227,7 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 cutoff_time = datetime.utcnow() - timedelta(hours=max_age_hours)
-                stmt = delete(WorkflowImportModel).where(
-                    WorkflowImportModel.created_at < cutoff_time
-                )
+                stmt = delete(WorkflowImportModel).where(WorkflowImportModel.created_at < cutoff_time)
                 result = await session.execute(stmt)
                 await session.commit()
                 return result.rowcount  # type: ignore

@@ -11,8 +11,6 @@ class FolderBase(BaseModel):
 class FolderCreate(FolderBase):
     """Request model for creating a folder"""
 
-    pass
-
 
 class FolderUpdate(BaseModel):
     """Request model for updating a folder"""
@@ -41,4 +39,3 @@ class UpdateWorkflowFolderRequest(BaseModel):
         None,
         description="Folder ID to assign workflow to. Set to null to remove from folder.",
     )
-
