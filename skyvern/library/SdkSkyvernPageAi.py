@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import Page
 
+from skyvern.client import SdkAction_Extract, SdkAction_AiSelectOption, SdkAction_AiInputText, SdkAction_AiClick
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge.sdk.schemas.sdk_actions import (
@@ -35,18 +36,17 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Click an element using AI via API call."""
 
-        action = ClickAction(
-            selector=selector,
-            intention=intention,
-            data=data,
-            timeout=timeout,
-        )
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
             workflow_run_id=self._browser.workflow_run_id,
-            action=action,
+            action=SdkAction_AiClick(
+                selector=selector,
+                intention=intention,
+                data=data,
+                timeout=timeout,
+            ),
         )
         self._browser.workflow_run_id = response.workflow_run_id
         return response.result if response.result else selector
@@ -65,7 +65,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=InputTextAction(
+            action=SdkAction_AiInputText(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -93,7 +93,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=SelectOptionAction(
+            action=SdkAction_AiSelectOption(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -129,7 +129,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=ExtractAction(
+            action=SdkAction_Extract(
                 prompt=prompt,
                 extract_schema=schema,
                 error_code_mapping=error_code_mapping,

@@ -118,6 +118,18 @@ async def run_sdk_action(
         task_id=task.task_id,
     )
 
+    await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+        organization,
+        workflow_run.workflow_run_id,
+        workflow.title,
+        workflow.workflow_id,
+        workflow.workflow_permanent_id,
+        [],
+        [],
+        [],
+        [],
+    )
+
     context = skyvern_context.ensure_context()
     skyvern_context.set(
         SkyvernContext(
