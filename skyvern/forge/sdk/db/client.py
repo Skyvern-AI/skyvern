@@ -1878,6 +1878,7 @@ class AgentDB:
         sequential_key: str | None = None,
         ai_fallback: bool | None = None,
         depends_on_workflow_run_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1908,6 +1909,8 @@ class AgentDB:
                     workflow_run.ai_fallback = ai_fallback
                 if depends_on_workflow_run_id:
                     workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
+                if browser_session_id:
+                    workflow_run.browser_session_id = browser_session_id
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
