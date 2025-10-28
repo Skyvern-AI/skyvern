@@ -27,7 +27,9 @@ export function useActiveImportsPolling() {
     queryKey: ["active-imports"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      const response = await client.get<ActiveImport[]>("/workflows/active-imports");
+      const response = await client.get<ActiveImport[]>(
+        "/workflows/active-imports",
+      );
       return response.data;
     },
     enabled: shouldPoll, // Only run query when shouldPoll is true
@@ -40,52 +42,60 @@ export function useActiveImportsPolling() {
   useEffect(() => {
     const currentCount = activeImports.length;
     const previousCount = previousCountRef.current;
-    const importingCount = activeImports.filter((imp) => imp.status === "importing").length;
+    const importingCount = activeImports.filter(
+      (imp) => imp.status === "importing",
+    ).length;
 
-    console.log(`📊 Active imports: ${currentCount} (importing: ${importingCount}, previous: ${previousCount}), polling: ${shouldPoll}, justStarted: ${justStartedPollingRef.current}`);
+    console.log(
+      `📊 Active imports: ${currentCount} (importing: ${importingCount}, previous: ${previousCount}), polling: ${shouldPoll}, justStarted: ${justStartedPollingRef.current}`,
+    );
 
     // Check for status changes (importing -> failed/completed)
     activeImports.forEach((imp) => {
       const previousImport = previousImportsRef.current.get(imp.import_id);
-      
+
       // Failed import (new failure or status changed to failed)
-      if (imp.status === "failed" && !seenFailuresRef.current.has(imp.import_id)) {
+      if (
+        imp.status === "failed" &&
+        !seenFailuresRef.current.has(imp.import_id)
+      ) {
         console.log(`❌ Import failed: ${imp.import_id}`, imp.error);
         seenFailuresRef.current.add(imp.import_id);
-        
+
         toast({
           variant: "destructive",
           title: "Import failed",
-          description: imp.error || `Failed to import ${imp.file_name || "workflow"}`,
+          description:
+            imp.error || `Failed to import ${imp.file_name || "workflow"}`,
         });
-        
+
         // Refresh workflows to remove placeholder
         queryClient.invalidateQueries({ queryKey: ["workflows"] });
       }
-      
+
       // Completed import (status changed from "importing" to "completed")
       if (
-        imp.status === "completed" && 
+        imp.status === "completed" &&
         previousImport?.status === "importing" &&
         !seenCompletionsRef.current.has(imp.import_id)
       ) {
         console.log(`✅ Import completed: ${imp.import_id}`);
         seenCompletionsRef.current.add(imp.import_id);
-        
+
         toast({
           variant: "success",
           title: "Workflow imported",
           description: `Successfully imported ${imp.file_name || "workflow"}`,
         });
-        
+
         // Refresh workflows to show new workflow
         queryClient.invalidateQueries({ queryKey: ["workflows"] });
       }
     });
-    
+
     // Update previous imports map for next comparison
     previousImportsRef.current = new Map(
-      activeImports.map((imp) => [imp.import_id, imp])
+      activeImports.map((imp) => [imp.import_id, imp]),
     );
 
     // If we have active IMPORTING imports, make sure polling is enabled
@@ -102,7 +112,10 @@ export function useActiveImportsPolling() {
     }
 
     // Clear the "just started" flag once we have imports or if count changed
-    if (justStartedPollingRef.current && (currentCount > 0 || currentCount !== previousCount)) {
+    if (
+      justStartedPollingRef.current &&
+      (currentCount > 0 || currentCount !== previousCount)
+    ) {
       console.log("🔓 Clearing justStartedPolling flag");
       justStartedPollingRef.current = false;
     }
@@ -121,4 +134,3 @@ export function useActiveImportsPolling() {
 
   return { activeImports, startPolling };
 }
-

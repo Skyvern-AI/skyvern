@@ -87,7 +87,7 @@ function Workflows() {
 
   // Parameter expansion state
   const [manuallyExpandedRows, setManuallyExpandedRows] = useState<Set<string>>(
-    new Set()
+    new Set(),
   );
 
   // Poll for active imports
@@ -101,7 +101,7 @@ function Workflows() {
     return [...allFolders]
       .sort(
         (a, b) =>
-          new Date(b.modified_at).getTime() - new Date(a.modified_at).getTime()
+          new Date(b.modified_at).getTime() - new Date(a.modified_at).getTime(),
       )
       .slice(0, 5);
   }, [allFolders]);
@@ -109,7 +109,13 @@ function Workflows() {
   const { data: workflows = [], isFetching } = useQuery<
     Array<WorkflowApiResponse>
   >({
-    queryKey: ["workflows", debouncedSearch, page, itemsPerPage, selectedFolderId],
+    queryKey: [
+      "workflows",
+      debouncedSearch,
+      page,
+      itemsPerPage,
+      selectedFolderId,
+    ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
@@ -131,7 +137,13 @@ function Workflows() {
   });
 
   const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
-    queryKey: ["workflows", debouncedSearch, page + 1, itemsPerPage, selectedFolderId],
+    queryKey: [
+      "workflows",
+      debouncedSearch,
+      page + 1,
+      itemsPerPage,
+      selectedFolderId,
+    ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
@@ -167,13 +179,15 @@ function Workflows() {
       const hasParameterMatch = workflow.workflow_definition.parameters?.some(
         (param) => {
           const keyMatch = param.key?.toLowerCase().includes(lowerQuery);
-          const descMatch = param.description?.toLowerCase().includes(lowerQuery);
+          const descMatch = param.description
+            ?.toLowerCase()
+            .includes(lowerQuery);
           const valueMatch =
             param.parameter_type === "workflow" &&
             param.default_value &&
             String(param.default_value).toLowerCase().includes(lowerQuery);
           return keyMatch || descMatch || valueMatch;
-        }
+        },
       );
 
       if (hasParameterMatch) {
@@ -262,7 +276,9 @@ function Workflows() {
 
   // Create placeholder workflows from active imports (only on page 1, only for "importing" status)
   const displayWorkflows = useMemo(() => {
-    const importingOnly = activeImports.filter((imp) => imp.status === "importing");
+    const importingOnly = activeImports.filter(
+      (imp) => imp.status === "importing",
+    );
     if (page === 1 && importingOnly.length > 0) {
       const placeholders: WorkflowApiResponse[] = importingOnly.map((imp) => ({
         workflow_id: imp.import_id,
@@ -363,7 +379,7 @@ function Workflows() {
                     setSelectedFolderId(
                       selectedFolderId === folder.folder_id
                         ? null
-                        : folder.folder_id
+                        : folder.folder_id,
                     )
                   }
                 />
@@ -438,10 +454,18 @@ function Workflows() {
                 // Show 10 skeleton rows while typing or fetching
                 Array.from({ length: 10 }).map((_, index) => (
                   <TableRow key={`skeleton-${index}`}>
-                    <TableCell><Skeleton className="h-5 w-full" /></TableCell>
-                    <TableCell><Skeleton className="h-5 w-full" /></TableCell>
-                    <TableCell><Skeleton className="h-5 w-20" /></TableCell>
-                    <TableCell><Skeleton className="h-5 w-32" /></TableCell>
+                    <TableCell>
+                      <Skeleton className="h-5 w-full" />
+                    </TableCell>
+                    <TableCell>
+                      <Skeleton className="h-5 w-full" />
+                    </TableCell>
+                    <TableCell>
+                      <Skeleton className="h-5 w-20" />
+                    </TableCell>
+                    <TableCell>
+                      <Skeleton className="h-5 w-32" />
+                    </TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-2">
                         <Skeleton className="h-8 w-8 rounded" />
@@ -460,14 +484,16 @@ function Workflows() {
                 displayWorkflows?.map((workflow) => {
                   const hasParameters =
                     workflow.workflow_definition.parameters.filter(
-                      (p) => p.parameter_type !== "output"
+                      (p) => p.parameter_type !== "output",
                     ).length > 0;
                   const isExpanded = expandedRows.has(
-                    workflow.workflow_permanent_id
+                    workflow.workflow_permanent_id,
                   );
                   // Check if this is an importing placeholder
                   const isUploading = activeImports.some(
-                    (imp) => imp.import_id === workflow.workflow_permanent_id && imp.status === "importing"
+                    (imp) =>
+                      imp.import_id === workflow.workflow_permanent_id &&
+                      imp.status === "importing",
                   );
 
                   return (
@@ -516,7 +542,7 @@ function Workflows() {
                             onClick={(event) => {
                               handleRowClick(
                                 event,
-                                workflow.workflow_permanent_id
+                                workflow.workflow_permanent_id,
                               );
                             }}
                           >
@@ -529,7 +555,7 @@ function Workflows() {
                             onClick={(event) => {
                               handleRowClick(
                                 event,
-                                workflow.workflow_permanent_id
+                                workflow.workflow_permanent_id,
                               );
                             }}
                           >
@@ -542,7 +568,7 @@ function Workflows() {
                             onClick={(event) => {
                               handleRowClick(
                                 event,
-                                workflow.workflow_permanent_id
+                                workflow.workflow_permanent_id,
                               );
                             }}
                           >
@@ -553,7 +579,8 @@ function Workflows() {
                                   <HighlightText
                                     text={
                                       allFolders.find(
-                                        (f) => f.folder_id === workflow.folder_id
+                                        (f) =>
+                                          f.folder_id === workflow.folder_id,
                                       )?.title || workflow.folder_id
                                     }
                                     query={debouncedSearch}
@@ -568,7 +595,7 @@ function Workflows() {
                             onClick={(event) => {
                               handleRowClick(
                                 event,
-                                workflow.workflow_permanent_id
+                                workflow.workflow_permanent_id,
                               );
                             }}
                             title={basicTimeFormat(workflow.created_at)}
@@ -578,7 +605,9 @@ function Workflows() {
                           <TableCell>
                             <div className="flex justify-end gap-2">
                               <WorkflowFolderSelector
-                                workflowPermanentId={workflow.workflow_permanent_id}
+                                workflowPermanentId={
+                                  workflow.workflow_permanent_id
+                                }
                                 currentFolderId={workflow.folder_id}
                               />
                               <TooltipProvider>
@@ -589,12 +618,12 @@ function Workflows() {
                                       variant="outline"
                                       onClick={() =>
                                         toggleParametersExpanded(
-                                          workflow.workflow_permanent_id
+                                          workflow.workflow_permanent_id,
                                         )
                                       }
                                       disabled={!hasParameters}
                                       className={cn(
-                                        isExpanded && "text-blue-400"
+                                        isExpanded && "text-blue-400",
                                       )}
                                     >
                                       <MixerHorizontalIcon className="h-4 w-4" />
@@ -618,14 +647,16 @@ function Workflows() {
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
-                                          `/workflows/${workflow.workflow_permanent_id}/run`
+                                          `/workflows/${workflow.workflow_permanent_id}/run`,
                                         );
                                       }}
                                     >
                                       <PlayIcon className="h-4 w-4" />
                                     </Button>
                                   </TooltipTrigger>
-                                  <TooltipContent>Create New Run</TooltipContent>
+                                  <TooltipContent>
+                                    Create New Run
+                                  </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
                               <WorkflowActions workflow={workflow} />
@@ -660,7 +691,7 @@ function Workflows() {
                                         className={cn(
                                           "grid grid-cols-[140px_1fr_2fr] gap-4 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
                                           matchesParam &&
-                                            "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50"
+                                            "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50",
                                         )}
                                       >
                                         <div className="font-medium text-blue-600 dark:text-blue-400">
@@ -670,7 +701,8 @@ function Workflows() {
                                           />
                                         </div>
                                         <div className="truncate">
-                                          {param.parameter_type === "workflow" &&
+                                          {param.parameter_type ===
+                                            "workflow" &&
                                           param.default_value ? (
                                             <HighlightText
                                               text={String(param.default_value)}

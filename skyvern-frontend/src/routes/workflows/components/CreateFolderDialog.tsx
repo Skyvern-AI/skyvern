@@ -67,9 +67,7 @@ function CreateFolderDialog({ open, onOpenChange }: CreateFolderDialogProps) {
               />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="folder-description">
-                Description (optional)
-              </Label>
+              <Label htmlFor="folder-description">Description (optional)</Label>
               <Textarea
                 id="folder-description"
                 value={description}
@@ -101,4 +99,3 @@ function CreateFolderDialog({ open, onOpenChange }: CreateFolderDialogProps) {
 }
 
 export { CreateFolderDialog };
-

@@ -42,7 +42,7 @@ function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
           headers: {
             "Content-Type": "text/plain",
           },
-        }
+        },
       );
 
       queryClient.invalidateQueries({

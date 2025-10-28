@@ -28,9 +28,15 @@ type Props = {
 };
 
 function DeleteFolderButton({ folderId, folderTitle }: Props) {
-  const [deleteOption, setDeleteOption] = useState<"folder_only" | "folder_and_workflows">("folder_only");
+  const [deleteOption, setDeleteOption] = useState<
+    "folder_only" | "folder_and_workflows"
+  >("folder_only");
   const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const { mutate: deleteFolder, isPending: isDeleteFolderPending, isSuccess: isDeleteFolderSuccess } = useDeleteFolderMutation();
+  const {
+    mutate: deleteFolder,
+    isPending: isDeleteFolderPending,
+    isSuccess: isDeleteFolderSuccess,
+  } = useDeleteFolderMutation();
 
   // Close dialog when deletion succeeds
   if (isDeleteFolderSuccess && isDialogOpen) {
@@ -50,10 +56,10 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
             <DialogTrigger asChild>
               <button
                 onClick={(e) => e.stopPropagation()}
-                className="p-1.5 rounded hover:bg-red-500/20 text-red-400 hover:text-red-300 transition-colors"
+                className="rounded p-1.5 text-red-400 transition-colors hover:bg-red-500/20 hover:text-red-300"
                 aria-label="Delete folder"
               >
-                <GarbageIcon className="w-4 h-4" />
+                <GarbageIcon className="h-4 w-4" />
               </button>
             </DialogTrigger>
           </TooltipTrigger>
@@ -67,7 +73,12 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
             Choose how you want to delete this folder.
           </DialogDescription>
         </DialogHeader>
-        <RadioGroup value={deleteOption} onValueChange={(value) => setDeleteOption(value as typeof deleteOption)}>
+        <RadioGroup
+          value={deleteOption}
+          onValueChange={(value) =>
+            setDeleteOption(value as typeof deleteOption)
+          }
+        >
           <div className="flex items-center space-x-2">
             <RadioGroupItem value="folder_only" id="folder_only" />
             <Label htmlFor="folder_only" className="font-normal">
@@ -75,7 +86,10 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
             </Label>
           </div>
           <div className="flex items-center space-x-2">
-            <RadioGroupItem value="folder_and_workflows" id="folder_and_workflows" />
+            <RadioGroupItem
+              value="folder_and_workflows"
+              id="folder_and_workflows"
+            />
             <Label htmlFor="folder_and_workflows" className="font-normal">
               Delete folder and all workflows inside it
             </Label>
@@ -90,7 +104,7 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
             onClick={handleDelete}
             disabled={isDeleteFolderPending}
           >
-            {isDeleteFolderPending&& (
+            {isDeleteFolderPending && (
               <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
             Delete
@@ -102,4 +116,3 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
 }
 
 export { DeleteFolderButton };
-

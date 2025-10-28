@@ -1,7 +1,17 @@
 import { useState, useMemo } from "react";
-import { CheckIcon, Cross2Icon, FileIcon, MagnifyingGlassIcon, ReloadIcon } from "@radix-ui/react-icons";
+import {
+  CheckIcon,
+  Cross2Icon,
+  FileIcon,
+  MagnifyingGlassIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/util/utils";
 import { useInfiniteFoldersQuery } from "../hooks/useInfiniteFoldersQuery";
@@ -23,17 +33,12 @@ function WorkflowFolderSelector({
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const isTyping = search !== debouncedSearch;
-  
-  const {
-    data,
-    fetchNextPage,
-    hasNextPage,
-    isFetchingNextPage,
-    isFetching,
-  } = useInfiniteFoldersQuery({
-    search: debouncedSearch,
-    page_size: 20,
-  });
+
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isFetching } =
+    useInfiniteFoldersQuery({
+      search: debouncedSearch,
+      page_size: 20,
+    });
 
   // Flatten pages into a single array
   const folders = useMemo(() => {
@@ -59,7 +64,7 @@ function WorkflowFolderSelector({
           size="icon"
           className={cn(
             "h-8 w-8",
-            currentFolderId ? "text-blue-400" : "text-slate-400"
+            currentFolderId ? "text-blue-400" : "text-slate-400",
           )}
           title="Move to folder"
         >
@@ -80,9 +85,16 @@ function WorkflowFolderSelector({
             />
           </div>
         </div>
-        <div 
-          className="max-h-[300px] overflow-y-auto [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 dark:[&::-webkit-scrollbar-thumb]:border-slate-800"
-          onScroll={(e) => handleInfiniteScroll(e, fetchNextPage, hasNextPage, isFetchingNextPage)}
+        <div
+          className="max-h-[300px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
+          onScroll={(e) =>
+            handleInfiniteScroll(
+              e,
+              fetchNextPage,
+              hasNextPage,
+              isFetchingNextPage,
+            )
+          }
         >
           {currentFolderId && (
             <button
@@ -158,4 +170,3 @@ function WorkflowFolderSelector({
 }
 
 export { WorkflowFolderSelector };
-

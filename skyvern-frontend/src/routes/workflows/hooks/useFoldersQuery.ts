@@ -36,4 +36,3 @@ function useFoldersQuery(params?: UseFoldersQueryParams) {
 }
 
 export { useFoldersQuery };
-

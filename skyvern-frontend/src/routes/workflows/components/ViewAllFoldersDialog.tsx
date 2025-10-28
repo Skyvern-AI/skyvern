@@ -30,17 +30,12 @@ function ViewAllFoldersDialog({
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const isTyping = search !== debouncedSearch;
-  
-  const {
-    data,
-    fetchNextPage,
-    hasNextPage,
-    isFetchingNextPage,
-    isFetching,
-  } = useInfiniteFoldersQuery({
-    search: debouncedSearch,
-    page_size: 20, // Load 20 to ensure scrollbar appears
-  });
+
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isFetching } =
+    useInfiniteFoldersQuery({
+      search: debouncedSearch,
+      page_size: 20, // Load 20 to ensure scrollbar appears
+    });
 
   // Flatten pages into a single array
   const folders = useMemo(() => {
@@ -62,7 +57,7 @@ function ViewAllFoldersDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-4xl max-h-[90vh]">
+      <DialogContent className="max-h-[90vh] max-w-4xl">
         <DialogHeader>
           <DialogTitle>All Folders</DialogTitle>
           <DialogDescription>
@@ -81,9 +76,16 @@ function ViewAllFoldersDialog({
           />
         </div>
 
-        <div 
-          className="max-h-[500px] overflow-y-auto pr-2 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 dark:[&::-webkit-scrollbar-thumb]:border-slate-800"
-          onScroll={(e) => handleInfiniteScroll(e, fetchNextPage, hasNextPage, isFetchingNextPage)}
+        <div
+          className="max-h-[500px] overflow-y-auto pr-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
+          onScroll={(e) =>
+            handleInfiniteScroll(
+              e,
+              fetchNextPage,
+              hasNextPage,
+              isFetchingNextPage,
+            )
+          }
         >
           {(isFetching || isTyping) && folders.length === 0 ? (
             // Show 12 skeleton cards while typing or fetching
@@ -143,4 +145,3 @@ function ViewAllFoldersDialog({
 }
 
 export { ViewAllFoldersDialog };
-

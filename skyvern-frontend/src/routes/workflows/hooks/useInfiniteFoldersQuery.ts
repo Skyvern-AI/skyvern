@@ -18,7 +18,7 @@ function useInfiniteFoldersQuery(params?: UseInfiniteFoldersQueryParams) {
       const searchParams = new URLSearchParams();
 
       searchParams.append("page", String(pageParam));
-      
+
       if (params?.page_size) {
         searchParams.append("page_size", String(params.page_size));
       }
@@ -43,4 +43,3 @@ function useInfiniteFoldersQuery(params?: UseInfiniteFoldersQueryParams) {
 }
 
 export { useInfiniteFoldersQuery };
-

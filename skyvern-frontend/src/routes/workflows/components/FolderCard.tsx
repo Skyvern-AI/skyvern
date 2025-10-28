@@ -19,10 +19,10 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       className={cn(
-        "flex h-24 flex-col gap-3 rounded-lg border p-4 text-left transition-colors hover:border-blue-400 relative",
+        "relative flex h-24 flex-col gap-3 rounded-lg border p-4 text-left transition-colors hover:border-blue-400",
         isSelected
           ? "border-blue-400 bg-blue-50 ring-2 ring-blue-400/20 dark:bg-blue-950/20"
-          : "border-slate-200 bg-slate-elevation1 dark:border-slate-700"
+          : "border-slate-200 bg-slate-elevation1 dark:border-slate-700",
       )}
     >
       <div className="flex items-start gap-3">
@@ -34,11 +34,11 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
             <h3 className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
               {folder.title}
             </h3>
-            <div 
+            <div
               onClick={(e) => e.stopPropagation()}
               className={cn(
                 "transition-opacity",
-                isHovered ? "opacity-100" : "opacity-0"
+                isHovered ? "opacity-100" : "opacity-0",
               )}
             >
               <DeleteFolderButton
@@ -58,4 +58,3 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
 }
 
 export { FolderCard };
-

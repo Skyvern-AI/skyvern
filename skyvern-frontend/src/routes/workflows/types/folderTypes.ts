@@ -21,4 +21,3 @@ export interface FolderUpdate {
 export interface UpdateWorkflowFolderRequest {
   folder_id: string | null;
 }
-
