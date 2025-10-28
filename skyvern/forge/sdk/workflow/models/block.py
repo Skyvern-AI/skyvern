@@ -96,7 +96,11 @@ from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
-jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
+
+if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+    jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
+else:
+    jinja_sandbox_env = SandboxedEnvironment()
 
 
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
@@ -249,11 +253,12 @@ class Block(BaseModel, abc.ABC):
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
-        if missing_variables := get_missing_variables(potential_template, template_data):
-            raise MissingJinjaVariables(
-                template=potential_template,
-                variables=missing_variables,
-            )
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+            if missing_variables := get_missing_variables(potential_template, template_data):
+                raise MissingJinjaVariables(
+                    template=potential_template,
+                    variables=missing_variables,
+                )
 
         return template.render(template_data)
 
