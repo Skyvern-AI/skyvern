@@ -617,12 +617,76 @@ async def create_workflow_from_prompt(
 )
 async def import_workflow_from_pdf(
     file: UploadFile,
+    background_tasks: BackgroundTasks,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
 
-    return await pdf_import_service.import_workflow_from_pdf(file, current_org)
+    # Read file and validate early (before creating import record)
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    file_contents = await file.read()
+    file_name = file.filename
+
+    # Extract text and validate synchronously (fast, ~1-2 seconds)
+    try:
+        sop_text = pdf_import_service.extract_text_from_pdf(file_contents, file_name)
+    except HTTPException:
+        # Re-raise validation errors immediately
+        raise
+
+    # Validation passed! Create import record in database
+    import_record = await app.DATABASE.create_workflow_import(
+        organization_id=current_org.organization_id,
+        file_name=file_name,
+    )
+
+    # Process PDF import in background (LLM call is the slow part)
+    async def process_pdf_import():
+        try:
+            # Create workflow from extracted text (LLM processing)
+            result = await pdf_import_service.create_workflow_from_sop_text(
+                sop_text, current_org
+            )
+            workflow_id = result.get("workflow_permanent_id")
+
+            # Mark as completed
+            await app.DATABASE.mark_workflow_import_completed(
+                import_id=import_record.import_id,
+                organization_id=current_org.organization_id,
+                workflow_id=workflow_id,
+            )
+            LOG.info(
+                "Workflow import completed",
+                import_id=import_record.import_id,
+                workflow_id=workflow_id,
+                organization_id=current_org.organization_id,
+            )
+        except Exception as e:
+            # Mark as failed
+            await app.DATABASE.mark_workflow_import_failed(
+                import_id=import_record.import_id,
+                organization_id=current_org.organization_id,
+                error=str(e),
+            )
+            LOG.exception(
+                "Workflow import failed",
+                import_id=import_record.import_id,
+                error=str(e),
+                organization_id=current_org.organization_id,
+            )
+
+    background_tasks.add_task(process_pdf_import)
+
+    return {
+        "import_id": import_record.import_id,
+        "status": "importing",
+        "file_name": file.filename,
+        "organization_id": current_org.organization_id,
+        "created_at": import_record.created_at.isoformat(),
+    }
 
 
 @legacy_base_router.put(
@@ -1022,6 +1086,42 @@ async def update_workflow_folder(
         return workflow
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@legacy_base_router.get("/workflows/active-imports", response_model=list[dict[str, Any]], tags=["agent"])
+@legacy_base_router.get("/workflows/active-imports/", response_model=list[dict[str, Any]], include_in_schema=False)
+@base_router.get(
+    "/workflows/active-imports",
+    response_model=list[dict[str, Any]],
+    tags=["Workflows"],
+    description="Get all active workflow imports for the organization",
+    summary="Get active imports",
+    responses={
+        200: {"description": "Successfully retrieved active imports"},
+    },
+)
+@base_router.get("/workflows/active-imports/", response_model=list[dict[str, Any]], include_in_schema=False)
+async def get_active_workflow_imports(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[dict[str, Any]]:
+    """Get all active workflow imports."""
+    analytics.capture("skyvern-oss-workflow-active-imports-get")
+    
+    imports = await app.DATABASE.get_active_workflow_imports(
+        organization_id=current_org.organization_id,
+    )
+    
+    return [
+        {
+            "import_id": imp.import_id,
+            "status": imp.status,
+            "file_name": imp.file_name,
+            "workflow_id": imp.workflow_id,
+            "error": imp.error,
+            "created_at": imp.created_at.isoformat(),
+        }
+        for imp in imports
+    ]
 
 
 @legacy_base_router.post(

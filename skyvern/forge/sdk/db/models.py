@@ -50,6 +50,7 @@ from skyvern.forge.sdk.db.id import (
     generate_thought_id,
     generate_totp_code_id,
     generate_workflow_id,
+    generate_workflow_import_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
     generate_workflow_run_block_id,
@@ -238,6 +239,25 @@ class FolderModel(Base):
         nullable=False,
     )
     deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowImportModel(Base):
+    __tablename__ = "workflow_imports"
+    __table_args__ = (
+        Index("workflow_import_organization_id_idx", "organization_id"),
+        Index("workflow_import_status_idx", "status"),
+        Index("workflow_import_org_status_idx", "organization_id", "status"),
+    )
+
+    import_id = Column(String, primary_key=True, default=generate_workflow_import_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    file_name = Column(String, nullable=True)
+    status = Column(String, nullable=False)  # 'importing', 'completed', 'failed'
+    workflow_id = Column(String, nullable=True)  # Set when import completes
+    error = Column(String, nullable=True)  # Set when import fails
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)  # Set when import finishes (completed or failed)
 
 
 class WorkflowModel(Base):

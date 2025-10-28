@@ -24,27 +24,18 @@ function isJsonString(str: string): boolean {
 }
 
 interface ImportWorkflowButtonProps {
-  onImportStart?: (tempId: string, fileName: string) => void;
-  onImportComplete?: (tempId: string, workflow: WorkflowApiResponse) => void;
-  onImportError?: (tempId: string, error: Error) => void;
+  onImportStart?: () => void;
 }
 
-function ImportWorkflowButton({
-  onImportStart,
-  onImportComplete,
-  onImportError,
-}: ImportWorkflowButtonProps) {
+function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
   const inputId = useId();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
-  const createWorkflowFromYamlMutation = async (
-    yaml: string,
-    tempId: string
-  ) => {
+  const createWorkflowFromYamlMutation = async (yaml: string) => {
     try {
       const client = await getClient(credentialGetter);
-      const response = await client.post<string, { data: WorkflowApiResponse }>(
+      await client.post<string, { data: WorkflowApiResponse }>(
         "/workflows",
         yaml,
         {
@@ -61,7 +52,6 @@ function ImportWorkflowButton({
         title: "Workflow imported",
         description: "Successfully imported workflow",
       });
-      onImportComplete?.(tempId, response.data);
     } catch (error) {
       const err =
         error instanceof Error ? error : new Error("Failed to import workflow");
@@ -70,37 +60,28 @@ function ImportWorkflowButton({
         title: "Error importing workflow",
         description: err.message,
       });
-      onImportError?.(tempId, err);
     }
   };
 
-  const createWorkflowFromPdfMutation = async (
-    file: File,
-    tempId: string
-  ) => {
+  const createWorkflowFromPdfMutation = async (file: File) => {
     try {
       const formData = new FormData();
       formData.append("file", file);
 
       const client = await getClient(credentialGetter);
-      const response = await client.post<WorkflowApiResponse>(
-        "/workflows/import-pdf",
-        formData,
-        {
-          headers: {
-            "Content-Type": "multipart/form-data",
-          },
-        }
-      );
+      await client.post("/workflows/import-pdf", formData, {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      });
 
-      queryClient.invalidateQueries({
-        queryKey: ["workflows"],
-      });
+      // Notify parent to start polling
+      onImportStart?.();
+
       toast({
-        title: "Workflow imported",
-        description: "Successfully imported workflow from PDF",
+        title: "Import started",
+        description: `Importing ${file.name}...`,
       });
-      onImportComplete?.(tempId, response.data);
     } catch (error) {
       const err =
         error instanceof Error ? error : new Error("Failed to import PDF");
@@ -109,7 +90,6 @@ function ImportWorkflowButton({
         description: err.message,
         variant: "destructive",
       });
-      onImportError?.(tempId, err);
     }
   };
 
@@ -127,14 +107,10 @@ function ImportWorkflowButton({
                 if (event.target.files && event.target.files[0]) {
                   const file = event.target.files[0];
                   const fileName = file.name.toLowerCase();
-                  const tempId = `wpid_uploading_${Date.now()}`;
-
-                  // Notify parent that import is starting
-                  onImportStart?.(tempId, file.name);
 
                   if (fileName.endsWith(".pdf")) {
                     // Handle PDF file
-                    await createWorkflowFromPdfMutation(file, tempId);
+                    await createWorkflowFromPdfMutation(file);
                   } else {
                     // Non-pdf files like yaml, json
                     const fileTextContent = await file.text();
@@ -143,7 +119,7 @@ function ImportWorkflowButton({
                       ? convertToYAML(JSON.parse(fileTextContent))
                       : fileTextContent;
 
-                    await createWorkflowFromYamlMutation(content, tempId);
+                    await createWorkflowFromYamlMutation(content);
                   }
                 }
               }}

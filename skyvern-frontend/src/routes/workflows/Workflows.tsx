@@ -48,6 +48,7 @@ import { WorkflowFolderSelector } from "./components/WorkflowFolderSelector";
 import { HighlightText } from "./components/HighlightText";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
+import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
@@ -87,36 +88,8 @@ function Workflows() {
     new Set()
   );
 
-  // Track uploading workflows - persist to sessionStorage
-  const [uploadingWorkflows, setUploadingWorkflows] = useState<Set<string>>(() => {
-    const stored = sessionStorage.getItem("skyvern.uploadingWorkflows");
-    return stored ? new Set(JSON.parse(stored)) : new Set();
-  });
-  const [placeholderWorkflows, setPlaceholderWorkflows] = useState<
-    Map<string, WorkflowApiResponse>
-  >(() => {
-    const stored = sessionStorage.getItem("skyvern.placeholderWorkflows");
-    return stored ? new Map(Object.entries(JSON.parse(stored))) : new Map();
-  });
-
-  // Persist uploading state to sessionStorage whenever it changes
-  React.useEffect(() => {
-    if (uploadingWorkflows.size > 0) {
-      sessionStorage.setItem(
-        "skyvern.uploadingWorkflows",
-        JSON.stringify(Array.from(uploadingWorkflows))
-      );
-    }
-  }, [uploadingWorkflows]);
-
-  React.useEffect(() => {
-    if (placeholderWorkflows.size > 0) {
-      sessionStorage.setItem(
-        "skyvern.placeholderWorkflows",
-        JSON.stringify(Object.fromEntries(placeholderWorkflows))
-      );
-    }
-  }, [placeholderWorkflows]);
+  // Poll for active imports
+  const { activeImports, startPolling } = useActiveImportsPolling();
 
   // Fetch folders
   const { data: allFolders = [] } = useFoldersQuery({ page_size: 10 });
@@ -285,91 +258,42 @@ function Workflows() {
     setParamPatch({ page: String(page + 1) });
   }
 
-  // Import workflow handlers
-  const handleImportStart = (tempId: string, fileName: string) => {
-    const placeholderWorkflow: WorkflowApiResponse = {
-      workflow_id: tempId,
-      workflow_permanent_id: tempId,
-      organization_id: "",
-      is_saved_task: false,
-      title: `Importing ${fileName}...`,
-      version: 1,
-      description: "",
-      workflow_definition: { parameters: [], blocks: [] },
-      proxy_location: null,
-      webhook_callback_url: null,
-      extra_http_headers: null,
-      persist_browser_session: false,
-      model: null,
-      totp_verification_url: null,
-      totp_identifier: null,
-      max_screenshot_scrolls: null,
-      status: null,
-      created_at: new Date().toISOString(),
-      modified_at: new Date().toISOString(),
-      deleted_at: null,
-      run_with: null,
-      cache_key: null,
-      ai_fallback: null,
-      run_sequentially: null,
-      sequential_key: null,
-      folder_id: null,
-    };
-
-    setUploadingWorkflows((prev) => new Set(prev).add(tempId));
-    setPlaceholderWorkflows((prev) => new Map(prev).set(tempId, placeholderWorkflow));
-  };
-
-  const handleImportComplete = (tempId: string) => {
-    setUploadingWorkflows((prev) => {
-      const next = new Set(prev);
-      next.delete(tempId);
-      // Clean up sessionStorage if this was the last upload
-      if (next.size === 0) {
-        sessionStorage.removeItem("skyvern.uploadingWorkflows");
-      }
-      return next;
-    });
-    setPlaceholderWorkflows((prev) => {
-      const next = new Map(prev);
-      next.delete(tempId);
-      // Clean up sessionStorage if this was the last placeholder
-      if (next.size === 0) {
-        sessionStorage.removeItem("skyvern.placeholderWorkflows");
-      }
-      return next;
-    });
-  };
-
-  const handleImportError = (tempId: string) => {
-    setUploadingWorkflows((prev) => {
-      const next = new Set(prev);
-      next.delete(tempId);
-      // Clean up sessionStorage if this was the last upload
-      if (next.size === 0) {
-        sessionStorage.removeItem("skyvern.uploadingWorkflows");
-      }
-      return next;
-    });
-    setPlaceholderWorkflows((prev) => {
-      const next = new Map(prev);
-      next.delete(tempId);
-      // Clean up sessionStorage if this was the last placeholder
-      if (next.size === 0) {
-        sessionStorage.removeItem("skyvern.placeholderWorkflows");
-      }
-      return next;
-    });
-  };
-
-  // Merge placeholder workflows with real workflows (only on page 1)
+  // Create placeholder workflows from active imports (only on page 1, only for "importing" status)
   const displayWorkflows = useMemo(() => {
-    if (page === 1) {
-      const placeholders = Array.from(placeholderWorkflows.values());
+    const importingOnly = activeImports.filter((imp) => imp.status === "importing");
+    if (page === 1 && importingOnly.length > 0) {
+      const placeholders: WorkflowApiResponse[] = importingOnly.map((imp) => ({
+        workflow_id: imp.import_id,
+        workflow_permanent_id: imp.import_id,
+        organization_id: "",
+        is_saved_task: false,
+        title: `Importing ${imp.file_name || "workflow"}...`,
+        version: 1,
+        description: "",
+        workflow_definition: { parameters: [], blocks: [] },
+        proxy_location: null,
+        webhook_callback_url: null,
+        extra_http_headers: null,
+        persist_browser_session: false,
+        model: null,
+        totp_verification_url: null,
+        totp_identifier: null,
+        max_screenshot_scrolls: null,
+        status: null,
+        created_at: imp.created_at,
+        modified_at: imp.created_at,
+        deleted_at: null,
+        run_with: null,
+        cache_key: null,
+        ai_fallback: null,
+        run_sequentially: null,
+        sequential_key: null,
+        folder_id: null,
+      }));
       return [...placeholders, ...workflows];
     }
     return workflows;
-  }, [placeholderWorkflows, workflows, page]);
+  }, [activeImports, workflows, page]);
 
   return (
     <div className="space-y-10">
@@ -476,11 +400,7 @@ function Workflows() {
             />
           </div>
           <div className="flex gap-4">
-            <ImportWorkflowButton
-              onImportStart={handleImportStart}
-              onImportComplete={handleImportComplete}
-              onImportError={handleImportError}
-            />
+            <ImportWorkflowButton onImportStart={startPolling} />
             <Button
               disabled={createWorkflowMutation.isPending}
               onClick={() => {
@@ -529,8 +449,9 @@ function Workflows() {
                   const isExpanded = expandedRows.has(
                     workflow.workflow_permanent_id
                   );
-                  const isUploading = uploadingWorkflows.has(
-                    workflow.workflow_permanent_id
+                  // Check if this is an importing placeholder
+                  const isUploading = activeImports.some(
+                    (imp) => imp.import_id === workflow.workflow_permanent_id && imp.status === "importing"
                   );
 
                   return (

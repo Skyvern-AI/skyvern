@@ -133,21 +133,17 @@ class PDFImportService:
 
         return raw
 
-    async def import_workflow_from_pdf(self, file: UploadFile, organization: Organization) -> dict[str, Any]:
-        LOG.info("Starting PDF import", filename=file.filename, organization_id=organization.organization_id)
-
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    def extract_text_from_pdf(self, file_contents: bytes, file_name: str) -> str:
+        """Extract text from PDF file contents. Raises HTTPException if invalid."""
+        LOG.info("Extracting text from PDF", filename=file_name)
 
         # Save the uploaded file to a temporary location
-        LOG.info("Saving PDF to temporary file", filename=file.filename)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-            temp_file.write(await file.read())
+            temp_file.write(file_contents)
             temp_file_path = temp_file.name
 
         try:
             # Extract text from PDF
-            LOG.info("Extracting text from PDF", filename=file.filename, temp_file=temp_file_path)
             reader = PdfReader(temp_file_path)
             sop_text = ""
             for page_num, page in enumerate(reader.pages, 1):
@@ -155,134 +151,150 @@ class PDFImportService:
                 sop_text += page_text + "\n"
                 LOG.debug("Extracted text from page", page=page_num, text_length=len(page_text))
 
-            LOG.info(
-                "PDF text extraction complete",
-                total_text_length=len(sop_text),
-                organization_id=organization.organization_id,
-            )
+            LOG.info("PDF text extraction complete", total_text_length=len(sop_text))
 
             if not sop_text.strip():
                 raise HTTPException(status_code=400, detail="No readable content found in the PDF.")
 
-            # Load and render the prompt template
-            prompt = prompt_engine.load_prompt(
-                "build-workflow-from-pdf",
-                sop_text=sop_text,
-            )
-
-            # Use the LLM to convert SOP to workflow
-            llm_key = settings.LLM_KEY or "gpt-4o-mini"
-            LOG.info(
-                "Calling LLM to convert SOP to workflow",
-                llm_key=llm_key,
-                prompt_length=len(prompt),
-                sop_text_length=len(sop_text),
-                sop_chars_sent=len(sop_text),
-                organization_id=organization.organization_id,
-            )
-
-            llm_api_handler = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
-
-            response = await llm_api_handler(
-                prompt=prompt,
-                prompt_name="sop_to_workflow_conversion",
-                organization_id=organization.organization_id,
-                parameters={"max_completion_tokens": 32768},  # Override the default 4096 limit for PDF conversion
-            )
-
-            LOG.info(
-                "LLM response received",
-                response_type=type(response),
-                response_keys=list(response.keys()) if isinstance(response, dict) else None,
-                organization_id=organization.organization_id,
-            )
-
-            # The LLM API handler automatically parses JSON responses
-            # The response should be a dict with the workflow structure
-            if not isinstance(response, dict):
-                LOG.error(
-                    "LLM returned non-dict response",
-                    response_type=type(response),
-                    response=str(response)[:500],
-                    organization_id=organization.organization_id,
-                )
-                raise HTTPException(
-                    status_code=422, detail="LLM returned invalid response format - expected JSON object"
-                )
-
-            # Validate that it has the required structure
-            if "workflow_definition" not in response:
-                LOG.error(
-                    "LLM response missing workflow_definition",
-                    response_keys=list(response.keys()),
-                    organization_id=organization.organization_id,
-                )
-                raise HTTPException(status_code=422, detail="LLM response missing 'workflow_definition' field")
-
-            if "blocks" not in response.get("workflow_definition", {}):
-                LOG.error(
-                    "LLM workflow_definition missing blocks",
-                    workflow_def_keys=list(response.get("workflow_definition", {}).keys()),
-                    organization_id=organization.organization_id,
-                )
-                raise HTTPException(status_code=422, detail="LLM workflow definition missing 'blocks' field")
-
-            LOG.info(
-                "Workflow JSON validated",
-                title=response.get("title"),
-                block_count=len(response.get("workflow_definition", {}).get("blocks", [])),
-                organization_id=organization.organization_id,
-            )
-
-            LOG.info(
-                "Creating workflow from JSON",
-                response_keys=list(response.keys()),
-                organization_id=organization.organization_id,
-            )
-
-            try:
-                # Sanitize LLM output for Jinja and required fields before validation
-                response = self._sanitize_workflow_json(response)
-                workflow_create_request = WorkflowCreateYAMLRequest.model_validate(response)
-            except Exception as e:
-                LOG.error(
-                    "Failed to validate workflow request",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                    response_sample=str(response)[:1000],
-                    organization_id=organization.organization_id,
-                    exc_info=True,
-                )
-                raise HTTPException(status_code=422, detail=f"Failed to validate workflow structure: {str(e)}")
-
-            try:
-                workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
-                    organization=organization,
-                    request=workflow_create_request,
-                )
-            except Exception as e:
-                LOG.error(
-                    "Failed to create workflow",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                    organization_id=organization.organization_id,
-                    exc_info=True,
-                )
-                raise HTTPException(status_code=422, detail=f"Failed to create workflow: {str(e)}")
-
-            workflow_dict = workflow.model_dump(by_alias=True)
-            LOG.info(
-                "PDF import completed successfully",
-                workflow_id=workflow.workflow_permanent_id,
-                workflow_permanent_id_in_dict=workflow_dict.get("workflow_permanent_id"),
-                dict_keys=list(workflow_dict.keys()),
-                organization_id=organization.organization_id,
-            )
-            return workflow_dict
-
+            return sop_text
         finally:
             # Clean up the temporary file
             os.unlink(temp_file_path)
+
+    async def create_workflow_from_sop_text(
+        self, sop_text: str, organization: Organization
+    ) -> dict[str, Any]:
+        """Convert SOP text to workflow using LLM and create it."""
+        # Load and render the prompt template
+        prompt = prompt_engine.load_prompt(
+            "build-workflow-from-pdf",
+            sop_text=sop_text,
+        )
+
+        # Use the LLM to convert SOP to workflow
+        llm_key = settings.LLM_KEY or "gpt-4o-mini"
+        LOG.info(
+            "Calling LLM to convert SOP to workflow",
+            llm_key=llm_key,
+            prompt_length=len(prompt),
+            sop_text_length=len(sop_text),
+            sop_chars_sent=len(sop_text),
+            organization_id=organization.organization_id,
+        )
+
+        llm_api_handler = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+
+        response = await llm_api_handler(
+            prompt=prompt,
+            prompt_name="sop_to_workflow_conversion",
+            organization_id=organization.organization_id,
+            parameters={"max_completion_tokens": 32768},  # Override the default 4096 limit for PDF conversion
+        )
+
+        LOG.info(
+            "LLM response received",
+            response_type=type(response),
+            response_keys=list(response.keys()) if isinstance(response, dict) else None,
+            organization_id=organization.organization_id,
+        )
+
+        # The LLM API handler automatically parses JSON responses
+        # The response should be a dict with the workflow structure
+        if not isinstance(response, dict):
+            LOG.error(
+                "LLM returned non-dict response",
+                response_type=type(response),
+                response=str(response)[:500],
+                organization_id=organization.organization_id,
+            )
+            raise HTTPException(
+                status_code=422, detail="LLM returned invalid response format - expected JSON object"
+            )
+
+        # Validate that it has the required structure
+        if "workflow_definition" not in response:
+            LOG.error(
+                "LLM response missing workflow_definition",
+                response_keys=list(response.keys()),
+                organization_id=organization.organization_id,
+            )
+            raise HTTPException(status_code=422, detail="LLM response missing 'workflow_definition' field")
+
+        if "blocks" not in response.get("workflow_definition", {}):
+            LOG.error(
+                "LLM workflow_definition missing blocks",
+                workflow_def_keys=list(response.get("workflow_definition", {}).keys()),
+                organization_id=organization.organization_id,
+            )
+            raise HTTPException(status_code=422, detail="LLM workflow definition missing 'blocks' field")
+
+        LOG.info(
+            "Workflow JSON validated",
+            title=response.get("title"),
+            block_count=len(response.get("workflow_definition", {}).get("blocks", [])),
+            organization_id=organization.organization_id,
+        )
+
+        LOG.info(
+            "Creating workflow from JSON",
+            response_keys=list(response.keys()),
+            organization_id=organization.organization_id,
+        )
+
+        try:
+            # Sanitize LLM output for Jinja and required fields before validation
+            response = self._sanitize_workflow_json(response)
+            workflow_create_request = WorkflowCreateYAMLRequest.model_validate(response)
+        except Exception as e:
+            LOG.error(
+                "Failed to validate workflow request",
+                error=str(e),
+                error_type=type(e).__name__,
+                response_sample=str(response)[:1000],
+                organization_id=organization.organization_id,
+                exc_info=True,
+            )
+            raise HTTPException(status_code=422, detail=f"Failed to validate workflow structure: {str(e)}")
+
+        try:
+            workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=organization,
+                request=workflow_create_request,
+            )
+        except Exception as e:
+            LOG.error(
+                "Failed to create workflow",
+                error=str(e),
+                error_type=type(e).__name__,
+                organization_id=organization.organization_id,
+                exc_info=True,
+            )
+            raise HTTPException(status_code=422, detail=f"Failed to create workflow: {str(e)}")
+
+        workflow_dict = workflow.model_dump(by_alias=True)
+        LOG.info(
+            "PDF import completed successfully",
+            workflow_id=workflow.workflow_permanent_id,
+            workflow_permanent_id_in_dict=workflow_dict.get("workflow_permanent_id"),
+            dict_keys=list(workflow_dict.keys()),
+            organization_id=organization.organization_id,
+        )
+        return workflow_dict
+
+    async def import_workflow_from_pdf(
+        self, file_contents: bytes, file_name: str, organization: Organization
+    ) -> dict[str, Any]:
+        """Import a workflow from PDF file contents (full process)."""
+        LOG.info("Starting PDF import", filename=file_name, organization_id=organization.organization_id)
+
+        if not file_name.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+        # Extract text (sync validation)
+        sop_text = self.extract_text_from_pdf(file_contents, file_name)
+
+        # Process with LLM (slow part)
+        return await self.create_workflow_from_sop_text(sop_text, organization)
 
 
 pdf_import_service = PDFImportService()
