@@ -5,12 +5,18 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.code_samples import (
-    CREATE_CREDENTIAL_CODE_SAMPLE,
-    CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD,
-    DELETE_CREDENTIAL_CODE_SAMPLE,
-    GET_CREDENTIAL_CODE_SAMPLE,
-    GET_CREDENTIALS_CODE_SAMPLE,
-    SEND_TOTP_CODE_CODE_SAMPLE,
+    CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON,
+    CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_TS,
+    CREATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
+    CREATE_CREDENTIAL_CODE_SAMPLE_TS,
+    DELETE_CREDENTIAL_CODE_SAMPLE_PYTHON,
+    DELETE_CREDENTIAL_CODE_SAMPLE_TS,
+    GET_CREDENTIAL_CODE_SAMPLE_PYTHON,
+    GET_CREDENTIAL_CODE_SAMPLE_TS,
+    GET_CREDENTIALS_CODE_SAMPLE_PYTHON,
+    GET_CREDENTIALS_CODE_SAMPLE_TS,
+    SEND_TOTP_CODE_CODE_SAMPLE_PYTHON,
+    SEND_TOTP_CODE_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import (
@@ -60,7 +66,14 @@ async def fetch_credential_item_background(item_id: str) -> None:
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "send_totp_code",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": SEND_TOTP_CODE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": SEND_TOTP_CODE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.post(
@@ -125,8 +138,10 @@ async def send_totp_code(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE},
-                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD},
+                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE_PYTHON},
+                    {"sdk": "python", "code": CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON},
+                    {"sdk": "typescript", "code": CREATE_CREDENTIAL_CODE_SAMPLE_TS},
+                    {"sdk": "typescript", "code": CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_TS},
                 ]
             }
         ],
@@ -196,7 +211,14 @@ async def create_credential(
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_credential",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_CREDENTIAL_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": DELETE_CREDENTIAL_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": DELETE_CREDENTIAL_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.post(
@@ -243,7 +265,14 @@ async def delete_credential(
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_credential",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIAL_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_CREDENTIAL_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_CREDENTIAL_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.get(
@@ -275,7 +304,14 @@ async def get_credential(
     tags=["Credentials"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_credentials",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_CREDENTIALS_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_CREDENTIALS_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_CREDENTIALS_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.get(
