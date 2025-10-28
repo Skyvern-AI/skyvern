@@ -1931,12 +1931,54 @@ class AgentDB:
             LOG.error("SQLAlchemyError in update_folder", exc_info=True)
             raise
 
+    async def get_workflow_permanent_ids_in_folder(
+        self,
+        folder_id: str,
+        organization_id: str,
+    ) -> list[str]:
+        """Get workflow permanent IDs (latest versions only) in a folder."""
+        try:
+            async with self.Session() as session:
+                # Subquery to get the latest version for each workflow
+                subquery = (
+                    select(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                        func.max(WorkflowModel.version).label("max_version"),
+                    )
+                    .where(WorkflowModel.organization_id == organization_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
+                    .group_by(
+                        WorkflowModel.organization_id,
+                        WorkflowModel.workflow_permanent_id,
+                    )
+                    .subquery()
+                )
+                
+                # Get workflow_permanent_ids where the latest version is in this folder
+                stmt = (
+                    select(WorkflowModel.workflow_permanent_id)
+                    .join(
+                        subquery,
+                        (WorkflowModel.organization_id == subquery.c.organization_id)
+                        & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                        & (WorkflowModel.version == subquery.c.max_version),
+                    )
+                    .where(WorkflowModel.folder_id == folder_id)
+                )
+                result = await session.execute(stmt)
+                return list(result.scalars().all())
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_workflow_permanent_ids_in_folder", exc_info=True)
+            raise
+
     async def soft_delete_folder(
         self,
         folder_id: str,
         organization_id: str,
+        delete_workflows: bool = False,
     ) -> bool:
-        """Soft delete a folder and remove folder assignment from all its workflows."""
+        """Soft delete a folder. Optionally delete all workflows in the folder."""
         try:
             async with self.Session() as session:
                 # Check if folder exists
@@ -1944,18 +1986,32 @@ class AgentDB:
                 if not folder:
                     return False
 
+                # If delete_workflows is True, delete all workflows in the folder
+                if delete_workflows:
+                    workflow_permanent_ids = await self.get_workflow_permanent_ids_in_folder(
+                        folder_id=folder_id,
+                        organization_id=organization_id,
+                    )
+                    
+                    # Delete each workflow by permanent ID
+                    for workflow_permanent_id in workflow_permanent_ids:
+                        await self.soft_delete_workflow_by_permanent_id(
+                            workflow_permanent_id=workflow_permanent_id,
+                            organization_id=organization_id,
+                        )
+                else:
+                    # Just remove folder_id from all workflows in this folder
+                    update_workflows_query = (
+                        update(WorkflowModel)
+                        .where(WorkflowModel.folder_id == folder_id)
+                        .where(WorkflowModel.organization_id == organization_id)
+                        .values(folder_id=None, modified_at=datetime.utcnow())
+                    )
+                    await session.execute(update_workflows_query)
+
                 # Soft delete the folder
                 folder.deleted_at = datetime.utcnow()
                 session.add(folder)
-
-                # Remove folder_id from all workflows in this folder
-                update_workflows_query = (
-                    update(WorkflowModel)
-                    .where(WorkflowModel.folder_id == folder_id)
-                    .where(WorkflowModel.organization_id == organization_id)
-                    .values(folder_id=None, modified_at=datetime.utcnow())
-                )
-                await session.execute(update_workflows_query)
                 await session.commit()
                 return True
         except SQLAlchemyError:

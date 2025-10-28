@@ -1,6 +1,8 @@
 import { FileIcon } from "@radix-ui/react-icons";
 import { cn } from "@/util/utils";
 import type { Folder } from "../types/folderTypes";
+import { DeleteFolderButton } from "./DeleteFolderButton";
+import { useState } from "react";
 
 interface FolderCardProps {
   folder: Folder;
@@ -9,11 +11,15 @@ interface FolderCardProps {
 }
 
 function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
+  const [isHovered, setIsHovered] = useState(false);
+
   return (
     <button
       onClick={onClick}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
       className={cn(
-        "flex h-24 flex-col gap-3 rounded-lg border p-4 text-left transition-colors hover:border-blue-400",
+        "flex h-24 flex-col gap-3 rounded-lg border p-4 text-left transition-colors hover:border-blue-400 relative",
         isSelected
           ? "border-blue-400 bg-blue-50 ring-2 ring-blue-400/20 dark:bg-blue-950/20"
           : "border-slate-200 bg-slate-elevation1 dark:border-slate-700"
@@ -24,9 +30,23 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
           <FileIcon className="h-5 w-5 text-blue-400" />
         </div>
         <div className="flex min-w-0 flex-1 flex-col gap-1">
-          <h3 className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
-            {folder.title}
-          </h3>
+          <div className="flex items-start justify-between gap-2">
+            <h3 className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+              {folder.title}
+            </h3>
+            <div 
+              onClick={(e) => e.stopPropagation()}
+              className={cn(
+                "transition-opacity",
+                isHovered ? "opacity-100" : "opacity-0"
+              )}
+            >
+              <DeleteFolderButton
+                folderId={folder.folder_id}
+                folderTitle={folder.title}
+              />
+            </div>
+          </div>
           <p className="text-xs text-slate-500 dark:text-slate-400">
             {folder.workflow_count}{" "}
             {folder.workflow_count === 1 ? "workflow" : "workflows"}

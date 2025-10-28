@@ -1031,7 +1031,7 @@ async def update_folder(
 @base_router.delete(
     "/folders/{folder_id}",
     tags=["Workflows"],
-    description="Delete a folder. All workflows in the folder will be unassigned.",
+    description="Delete a folder. Optionally delete all workflows in the folder.",
     summary="Delete folder",
     responses={
         200: {"description": "Successfully deleted folder"},
@@ -1041,17 +1041,19 @@ async def update_folder(
 @base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 async def delete_folder(
     folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
+    delete_workflows: bool = Query(False, description="If true, also delete all workflows in this folder"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict:
     analytics.capture("skyvern-oss-folder-delete")
     success = await app.DATABASE.soft_delete_folder(
         folder_id=folder_id,
         organization_id=current_org.organization_id,
+        delete_workflows=delete_workflows,
     )
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
-    return {"status": "deleted", "folder_id": folder_id}
+    return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
 
 
 @legacy_base_router.put("/workflows/{workflow_permanent_id}/folder", response_model=Workflow, tags=["agent"])

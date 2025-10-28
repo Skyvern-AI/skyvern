@@ -76,16 +76,28 @@ function useDeleteFolderMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (folderId: string) => {
+    mutationFn: async ({
+      folderId,
+      deleteWorkflows,
+    }: {
+      folderId: string;
+      folderTitle: string;
+      deleteWorkflows: boolean;
+    }) => {
       const client = await getClient(credentialGetter);
-      return client.delete(`/folders/${folderId}`);
+      return client.delete(`/folders/${folderId}`, {
+        params: {
+          delete_workflows: deleteWorkflows,
+        },
+      });
     },
-    onSuccess: () => {
+    onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ["folders"] });
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       toast({
+        variant: "success",
         title: "Folder deleted",
-        description: "Successfully deleted folder",
+        description: `${variables.folderTitle} has been deleted successfully.`,
       });
     },
     onError: (error: Error) => {
