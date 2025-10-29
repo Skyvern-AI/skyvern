@@ -331,8 +331,8 @@ class SkyvernBrowserPage:
     async def fill(
         self,
         selector: str,
-        *,
         value: str,
+        *,
         prompt: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
@@ -346,7 +346,7 @@ class SkyvernBrowserPage:
         self,
         *,
         prompt: str,
-        value: str,
+        value: str | None = None,
         selector: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
@@ -358,8 +358,8 @@ class SkyvernBrowserPage:
     async def fill(
         self,
         selector: str | None = None,
+        value: str | None = None,
         *,
-        value: str,
         prompt: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
@@ -370,14 +370,14 @@ class SkyvernBrowserPage:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
 
         This method supports three modes:
-        - **Selector-based**: Fill the input field matching the CSS selector
-        - **AI-powered**: Use natural language to describe which field to fill
+        - **Selector-based**: Fill the input field with a value using CSS selector
+        - **AI-powered**: Use natural language prompt (AI extracts value from prompt)
         - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
 
         Args:
             selector: CSS selector for the target input element.
-            prompt: Natural language description of which field to fill.
             value: The text value to input into the field.
+            prompt: Natural language description of which field to fill and what value.
             ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
             data: Additional context data for AI processing.
             timeout: Maximum time to wait for the fill action in milliseconds.
@@ -389,23 +389,23 @@ class SkyvernBrowserPage:
 
         Examples:
             ```python
-            # Fill using a CSS selector
-            await page.fill("#email-input", value="user@example.com")
+            # Fill using selector and value (both positional)
+            await page.fill("#email-input", "user@example.com")
 
-            # Fill using AI with natural language
-            await page.fill(prompt="Fill in the email address", value="user@example.com")
+            # Fill using AI with natural language (prompt only)
+            await page.fill(prompt="Fill 'user@example.com' in the email address field")
 
             # Try selector first, fall back to AI if selector fails
             await page.fill(
                 "#email-input",
-                value="user@example.com",
-                prompt="Fill in the email address"
+                "user@example.com",
+                prompt="Fill the email address with user@example.com"
             )
             ```
         """
         return await self._input_text(
             selector=selector or "",
-            value=value,
+            value=value or "",
             ai=ai,
             intention=prompt,
             data=data,
@@ -437,9 +437,9 @@ class SkyvernBrowserPage:
     async def select_option(
         self,
         selector: str,
+        value: str,
         *,
         prompt: str | None = None,
-        value: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -451,6 +451,7 @@ class SkyvernBrowserPage:
         *,
         prompt: str,
         value: str | None = None,
+        selector: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -459,13 +460,47 @@ class SkyvernBrowserPage:
     async def select_option(
         self,
         selector: str | None = None,
+        value: str | None = None,
         *,
         prompt: str | None = None,
-        value: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
+        """Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
+
+        This method supports three modes:
+        - **Selector-based**: Select the option with a value using CSS selector
+        - **AI-powered**: Use natural language prompt (AI extracts value from prompt)
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+        Args:
+            selector: CSS selector for the target select/dropdown element.
+            value: The option value to select.
+            prompt: Natural language description of which option to select.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            data: Additional context data for AI processing.
+            timeout: Maximum time to wait for the select action in milliseconds.
+
+        Returns:
+            The value that was successfully selected.
+
+        Examples:
+            ```python
+            # Select using selector and value (both positional)
+            await page.select_option("#country", "us")
+
+            # Select using AI with natural language (prompt only)
+            await page.select_option(prompt="Select 'United States' from the country dropdown")
+
+            # Try selector first, fall back to AI if selector fails
+            await page.select_option(
+                "#country",
+                "us",
+                prompt="Select United States from country"
+            )
+            ```
+        """
         value = value or ""
         if ai == "fallback":
             error_to_raise = None
