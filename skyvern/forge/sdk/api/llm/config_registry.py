@@ -80,7 +80,7 @@ if settings.ENABLE_OPENAI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -92,7 +92,7 @@ if settings.ENABLE_OPENAI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -104,7 +104,7 @@ if settings.ENABLE_OPENAI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -606,7 +606,7 @@ if settings.ENABLE_AZURE_GPT5:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -631,7 +631,7 @@ if settings.ENABLE_AZURE_GPT5_MINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -656,7 +656,7 @@ if settings.ENABLE_AZURE_GPT5_NANO:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
