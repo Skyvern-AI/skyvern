@@ -39,12 +39,6 @@ function useTotpCodesQuery({
     if (params.workflow_run_id) {
       result.set("workflow_run_id", params.workflow_run_id);
     }
-    if (params.workflow_id) {
-      result.set("workflow_id", params.workflow_id);
-    }
-    if (params.task_id) {
-      result.set("task_id", params.task_id);
-    }
     if (params.otp_type) {
       result.set("otp_type", params.otp_type);
     }

@@ -503,8 +503,6 @@ export type TotpCode = {
 export type TotpCodeListParams = {
   totp_identifier?: string;
   workflow_run_id?: string;
-  workflow_id?: string;
-  task_id?: string;
   otp_type?: OtpType;
   limit?: number;
 };
