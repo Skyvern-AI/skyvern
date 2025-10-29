@@ -291,7 +291,7 @@ function FlowRenderer({
   const workflowChangesStore = useWorkflowHasChangesStore();
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
-  const saveWorkflow = useWorkflowSave();
+  const saveWorkflow = useWorkflowSave({ status: "published" });
   useShouldNotifyWhenClosingTab(workflowChangesStore.hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return (

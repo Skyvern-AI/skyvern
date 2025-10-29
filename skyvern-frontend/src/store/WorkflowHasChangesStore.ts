@@ -37,6 +37,10 @@ type WorkflowHasChangesStore = {
   setShowConfirmCodeCacheDeletion: (show: boolean) => void;
 };
 
+interface WorkflowSaveOpts {
+  status?: string;
+}
+
 const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   return {
     hasChanges: false,
@@ -62,7 +66,7 @@ const useWorkflowHasChangesStore = create<WorkflowHasChangesStore>((set) => {
   };
 });
 
-const useWorkflowSave = () => {
+const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const {
@@ -139,7 +143,7 @@ const useWorkflowSave = () => {
           blocks: saveData.blocks,
         },
         is_saved_task: saveData.workflow.is_saved_task,
-        status: saveData.workflow.status,
+        status: opts?.status ?? saveData.workflow.status,
         run_sequentially: saveData.settings.runSequentially,
         sequential_key: saveData.settings.sequentialKey,
       };
