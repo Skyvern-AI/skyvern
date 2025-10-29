@@ -368,7 +368,7 @@ function Workflows() {
             )}
           </div>
 
-          {recentFolders.length > 0 && (
+          {recentFolders.length > 0 ? (
             <div className="grid grid-cols-5 gap-4">
               {recentFolders.map((folder) => (
                 <FolderCard
@@ -384,6 +384,29 @@ function Workflows() {
                   }
                 />
               ))}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-200 bg-slate-elevation1 py-6 text-center dark:border-slate-700">
+              <div className="mx-auto max-w-md">
+                <FileIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
+                <h3 className="mb-2 text-slate-900 dark:text-slate-100">
+                  Organize Your Workflows with Folders
+                </h3>
+                <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
+                  Keep your workflows organized by creating folders. Group
+                  related workflows together by project, team, or workflow type
+                  for easier management.
+                </p>
+                <Button
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-blue-600 dark:text-blue-400"
+                  onClick={() => setIsCreateFolderOpen(true)}
+                >
+                  <PlusIcon className="mr-2 h-4 w-4" />
+                  Create Your First Folder
+                </Button>
+              </div>
             </div>
           )}
         </div>
