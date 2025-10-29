@@ -95,8 +95,8 @@ async def run_sdk_action(
     task = await app.DATABASE.create_task(
         organization_id=organization_id,
         url=action_request.url,
-        navigation_goal=None,
-        navigation_payload=None,
+        navigation_goal=action.intention,
+        navigation_payload=action.data,
         data_extraction_goal=None,
         title=f"SDK Action Task: {action_request.action.type}",
         workflow_run_id=workflow_run.workflow_run_id,
