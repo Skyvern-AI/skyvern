@@ -187,6 +187,11 @@ function WorkflowRun() {
         ))
     : null;
 
+  const failureReasonTitle =
+    workflowRun?.status === Status.Terminated
+      ? "Termination Reason"
+      : "Failure Reason";
+
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div
       className="space-y-2 rounded-md border border-red-600 p-4"
@@ -194,7 +199,7 @@ function WorkflowRun() {
         backgroundColor: "rgba(220, 38, 38, 0.10)",
       }}
     >
-      <div className="font-bold">Workflow Failure Reason</div>
+      <div className="font-bold">{failureReasonTitle}</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
     </div>
