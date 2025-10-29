@@ -465,6 +465,10 @@ class WorkflowService:
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
             close_browser_on_completion = True
+            await app.DATABASE.update_workflow_run(
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
 
         # Check if there's a related workflow script that should be used instead
         workflow_script, _ = await workflow_script_service.get_workflow_script(workflow, workflow_run, block_labels)

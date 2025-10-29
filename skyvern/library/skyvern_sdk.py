@@ -104,7 +104,6 @@ class SkyvernSdk:
             environment=environment,
             base_url=base_url,
             api_key=self._api_key,
-            x_api_key=self._api_key,
             timeout=timeout,
             follow_redirects=follow_redirects,
             httpx_client=httpx_client,

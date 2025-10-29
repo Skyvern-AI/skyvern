@@ -476,6 +476,11 @@ function BrowserStream({
     }
   }, [task, workflow]);
 
+  useEffect(() => {
+    if (!interactive) {
+      setUserIsControlling(false);
+    }
+  }, [interactive]);
   /**
    * TODO(jdo): could use zod or smth similar
    */

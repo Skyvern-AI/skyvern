@@ -13,6 +13,7 @@ export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.ForLoop
     | Skyvern.WorkflowDefinitionYamlBlocksItem.GotoUrl
     | Skyvern.WorkflowDefinitionYamlBlocksItem.HttpRequest
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.HumanInteraction
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Login
     | Skyvern.WorkflowDefinitionYamlBlocksItem.Navigation
     | Skyvern.WorkflowDefinitionYamlBlocksItem.PdfParser
@@ -63,6 +64,10 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface HttpRequest extends Skyvern.HttpRequestBlockYaml {
         block_type: "http_request";
+    }
+
+    export interface HumanInteraction extends Skyvern.HumanInteractionBlockYaml {
+        block_type: "human_interaction";
     }
 
     export interface Login extends Skyvern.LoginBlockYaml {

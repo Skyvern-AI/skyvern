@@ -790,13 +790,7 @@ function isInteractableInput(element, hoverStylesMap) {
   // "city", "state", "zip", "country"
   // That's the reason I (Kerem) removed the valid input types check
   var type = element.getAttribute("type")?.toLowerCase().trim() ?? "text";
-  var readOnly = isReadonlyElement(element);
-
-  return (
-    isHoverPointerElement(element, hoverStylesMap) ||
-    isReadonlyInputDropdown(element) ||
-    (!readOnly && type !== "hidden")
-  );
+  return isHoverPointerElement(element, hoverStylesMap) || type !== "hidden";
 }
 
 function isValidCSSSelector(selector) {
