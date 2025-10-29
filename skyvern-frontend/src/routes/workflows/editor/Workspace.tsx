@@ -213,7 +213,7 @@ function Workspace({
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const saveWorkflow = useWorkflowSave();
+  const saveWorkflow = useWorkflowSave({ status: "published" });
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
