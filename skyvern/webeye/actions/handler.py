@@ -38,6 +38,7 @@ from skyvern.exceptions import (
     IllegitComplete,
     ImaginaryFileUrl,
     InputToInvisibleElement,
+    InputToReadonlyElement,
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
@@ -1105,6 +1106,8 @@ async def handle_input_text_action(
     # check if it's selectable
     if (
         not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
+        and not is_totp_value
+        and not is_secret_value
         and skyvern_element.get_tag_name() == InteractiveElement.INPUT
         and not await skyvern_element.is_raw_input()
     ):
@@ -1222,6 +1225,17 @@ async def handle_input_text_action(
 
     # force to move focus back to the element
     await skyvern_element.get_locator().focus(timeout=timeout)
+
+    # check if the element is readonly(some elements will be non-readonly after focused)
+    if await skyvern_element.is_readonly(dynamic=True):
+        LOG.warning(
+            "Try to input text on a readonly element",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            element_id=skyvern_element.get_id(),
+            action=action,
+        )
+        return [ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))]
 
     # check the phone number format when type=tel and the text is not a secret value
     if not is_secret_value and await skyvern_element.get_attr("type") == "tel":
@@ -2937,6 +2951,13 @@ async def select_from_emerging_elements(
         if current_text == actual_value:
             return ActionSuccess()
 
+        if await input_element.is_readonly(dynamic=True):
+            LOG.warning(
+                "Try to input text on a readonly element",
+                element_id=element_id,
+            )
+            return ActionFailure(InputToReadonlyElement(element_id=element_id))
+
         await input_element.input_clear()
         await input_element.input_sequentially(actual_value)
         return ActionSuccess()
@@ -3080,6 +3101,16 @@ async def select_from_dropdown(
             current_text = await get_input_value(input_element.get_tag_name(), input_element.get_locator())
             if current_text == actual_value:
                 single_select_result.action_result = ActionSuccess()
+                return single_select_result
+
+            if await input_element.is_readonly(dynamic=True):
+                LOG.warning(
+                    "Try to input text on a readonly element",
+                    element_id=element_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+                single_select_result.action_result = ActionFailure(InputToReadonlyElement(element_id=element_id))
                 return single_select_result
 
             await input_element.input_clear()

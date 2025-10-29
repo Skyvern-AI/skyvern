@@ -668,6 +668,13 @@ class InputToInvisibleElement(SkyvernException):
         )
 
 
+class InputToReadonlyElement(SkyvernException):
+    def __init__(self, element_id: str):
+        super().__init__(
+            f"The element(id={element_id}) now is readonly. Try to interact with other elements, or try to interact with it later when it's not readonly."
+        )
+
+
 class FailedToParseActionInstruction(SkyvernException):
     def __init__(self, reason: str | None, error_type: str | None):
         super().__init__(
