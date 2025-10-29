@@ -38,7 +38,7 @@ jobs:
       - name: Create test dir
         run: mkdir -p codeflash-tests
       - name: Run Codeflash to optimize code
-        run: uv run codeflash
+        run: uv run codeflash --async
       - name: remove test dir
         run: |-
           rm -rf codeflash-tests
