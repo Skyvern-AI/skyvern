@@ -2248,6 +2248,101 @@
           }
         }
       }
+    },
+    "/v1/sdk/run_action": {
+      "post": {
+        "tags": [
+          "SDK"
+        ],
+        "summary": "Run an SDK action",
+        "description": "Execute a single SDK action with the specified parameters",
+        "operationId": "run_sdk_action_v1_sdk_run_action_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Agent"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunSdkActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully executed SDK action",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunSdkActionResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "400": {
+            "description": "Invalid operation"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "run_sdk_action",
+        "x-fern-examples": [
+          {
+            "code-samples": [
+              {
+                "sdk": "python",
+                "code": "from skyvern import Skyvern\nfrom skyvern.forge.sdk.schemas.sdk_actions import ClickAction\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nresponse = await skyvern.run_sdk_action(\n    url=\"https://example.com\",\n    browser_session_id=\"pbs_123\",\n    action=ClickAction(\n        selector=\"button\",\n        intention=\"Click the submit button\"\n    )\n)\nprint(response.workflow_run_id)\n"
+              }
+            ]
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -9297,6 +9392,353 @@
           "canceled"
         ],
         "title": "RunStatus"
+      },
+      "ClickAction": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_click",
+            "title": "Type",
+            "default": "ai_click"
+          },
+          "selector": {
+            "type": "string",
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the click",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 30000
+          }
+        },
+        "required": ["type"],
+        "title": "ClickAction"
+      },
+      "InputTextAction": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_input_text",
+            "title": "Type",
+            "default": "ai_input_text"
+          },
+          "selector": {
+            "type": "string",
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Value to input",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the input",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "TOTP identifier for input_text actions"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL for input_text actions"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 30000
+          }
+        },
+        "required": ["type"],
+        "title": "InputTextAction"
+      },
+      "SelectOptionAction": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_select_option",
+            "title": "Type",
+            "default": "ai_select_option"
+          },
+          "selector": {
+            "type": "string",
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Value to select",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the selection",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 30000
+          }
+        },
+        "required": ["type"],
+        "title": "SelectOptionAction"
+      },
+      "ExtractAction": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "extract",
+            "title": "Type",
+            "default": "extract"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Extraction prompt",
+            "default": ""
+          },
+          "extract_schema": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extract Schema",
+            "description": "Schema for extraction"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping",
+            "description": "Error code mapping for extraction"
+          },
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention",
+            "description": "The intention or goal of the extraction"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          }
+        },
+        "required": ["type"],
+        "title": "ExtractAction"
+      },
+      "SdkAction": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ClickAction"
+          },
+          {
+            "$ref": "#/components/schemas/InputTextAction"
+          },
+          {
+            "$ref": "#/components/schemas/SelectOptionAction"
+          },
+          {
+            "$ref": "#/components/schemas/ExtractAction"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "ai_click": "#/components/schemas/ClickAction",
+            "ai_input_text": "#/components/schemas/InputTextAction",
+            "ai_select_option": "#/components/schemas/SelectOptionAction",
+            "extract": "#/components/schemas/ExtractAction"
+          }
+        },
+        "title": "SdkAction"
+      },
+      "RunSdkActionRequest": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url",
+            "description": "The URL where the action should be executed"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "The browser session ID"
+          },
+          "browser_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Address",
+            "description": "The browser address"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id",
+            "description": "Optional workflow run ID to continue an existing workflow run"
+          },
+          "action": {
+            "$ref": "#/components/schemas/SdkAction",
+            "description": "The action to execute with its specific parameters"
+          }
+        },
+        "required": ["url", "action"],
+        "title": "RunSdkActionRequest"
+      },
+      "RunSdkActionResponse": {
+        "type": "object",
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id",
+            "description": "The workflow run ID used for this action"
+          },
+          "result": {
+            "title": "Result",
+            "description": "The result from the action (e.g., selector, value, extracted data)"
+          }
+        },
+        "required": ["workflow_run_id"],
+        "title": "RunSdkActionResponse"
       },
       "Script": {
         "properties": {

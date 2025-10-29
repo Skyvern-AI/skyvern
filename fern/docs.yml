@@ -204,6 +204,10 @@ navigation:
               - POST /v1/scripts/{script_id}/deploy
               - GET /v1/scripts/{script_id}
               - GET /v1/scripts
+          - section: SDK
+            hidden: true
+            contents:
+              - POST /v1/sdk/run_action
   - tab: blog
   - tab: community
   - tab: github

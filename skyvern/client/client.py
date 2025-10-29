@@ -19,8 +19,10 @@ from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
 from .types.run_engine import RunEngine
+from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
+from .types.sdk_action import SdkAction
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
@@ -1492,6 +1494,71 @@ class Skyvern:
         )
         """
         _response = self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
+        return _response.data
+
+    def run_sdk_action(
+        self,
+        *,
+        url: str,
+        action: SdkAction,
+        user_agent: typing.Optional[str] = None,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> RunSdkActionResponse:
+        """
+        Execute a single SDK action with the specified parameters
+
+        Parameters
+        ----------
+        url : str
+            The URL where the action should be executed
+
+        action : SdkAction
+            The action to execute with its specific parameters
+
+        user_agent : typing.Optional[str]
+
+        browser_session_id : typing.Optional[str]
+            The browser session ID
+
+        browser_address : typing.Optional[str]
+            The browser address
+
+        workflow_run_id : typing.Optional[str]
+            Optional workflow run ID to continue an existing workflow run
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        RunSdkActionResponse
+            Successfully executed SDK action
+
+        Examples
+        --------
+        from skyvern import SdkAction_AiClick, Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.run_sdk_action(
+            user_agent="x-user-agent",
+            url="url",
+            action=SdkAction_AiClick(),
+        )
+        """
+        _response = self._raw_client.run_sdk_action(
+            url=url,
+            action=action,
+            user_agent=user_agent,
+            browser_session_id=browser_session_id,
+            browser_address=browser_address,
+            workflow_run_id=workflow_run_id,
+            request_options=request_options,
+        )
         return _response.data
 
     @property
@@ -3172,6 +3239,79 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.deploy_script(script_id, files=files, request_options=request_options)
+        return _response.data
+
+    async def run_sdk_action(
+        self,
+        *,
+        url: str,
+        action: SdkAction,
+        user_agent: typing.Optional[str] = None,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> RunSdkActionResponse:
+        """
+        Execute a single SDK action with the specified parameters
+
+        Parameters
+        ----------
+        url : str
+            The URL where the action should be executed
+
+        action : SdkAction
+            The action to execute with its specific parameters
+
+        user_agent : typing.Optional[str]
+
+        browser_session_id : typing.Optional[str]
+            The browser session ID
+
+        browser_address : typing.Optional[str]
+            The browser address
+
+        workflow_run_id : typing.Optional[str]
+            Optional workflow run ID to continue an existing workflow run
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        RunSdkActionResponse
+            Successfully executed SDK action
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern, SdkAction_AiClick
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.run_sdk_action(
+                user_agent="x-user-agent",
+                url="url",
+                action=SdkAction_AiClick(),
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.run_sdk_action(
+            url=url,
+            action=action,
+            user_agent=user_agent,
+            browser_session_id=browser_session_id,
+            browser_address=browser_address,
+            workflow_run_id=workflow_run_id,
+            request_options=request_options,
+        )
         return _response.data
 
     @property

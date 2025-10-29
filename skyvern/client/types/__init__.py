@@ -41,6 +41,8 @@ if typing.TYPE_CHECKING:
     from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
     from .block_type import BlockType
     from .browser_session_response import BrowserSessionResponse
+    from .click_action import ClickAction
+    from .click_action_data import ClickActionData
     from .code_block import CodeBlock
     from .code_block_parameters_item import (
         CodeBlockParametersItem,
@@ -84,6 +86,9 @@ if typing.TYPE_CHECKING:
     from .credit_card_credential_response import CreditCardCredentialResponse
     from .download_to_s3block import DownloadToS3Block
     from .download_to_s3block_yaml import DownloadToS3BlockYaml
+    from .extract_action import ExtractAction
+    from .extract_action_data import ExtractActionData
+    from .extract_action_extract_schema import ExtractActionExtractSchema
     from .extraction_block import ExtractionBlock
     from .extraction_block_data_schema import ExtractionBlockDataSchema
     from .extraction_block_parameters_item import (
@@ -236,6 +241,8 @@ if typing.TYPE_CHECKING:
     )
     from .human_interaction_block_yaml import HumanInteractionBlockYaml
     from .input_or_select_context import InputOrSelectContext
+    from .input_text_action import InputTextAction
+    from .input_text_action_data import InputTextActionData
     from .login_block import LoginBlock
     from .login_block_data_schema import LoginBlockDataSchema
     from .login_block_parameters_item import (
@@ -282,11 +289,21 @@ if typing.TYPE_CHECKING:
     from .pdf_parser_block_yaml import PdfParserBlockYaml
     from .proxy_location import ProxyLocation
     from .run_engine import RunEngine
+    from .run_sdk_action_response import RunSdkActionResponse
     from .run_status import RunStatus
     from .script import Script
     from .script_file_create import ScriptFileCreate
     from .script_run_response import ScriptRunResponse
+    from .sdk_action import (
+        SdkAction,
+        SdkAction_AiClick,
+        SdkAction_AiInputText,
+        SdkAction_AiSelectOption,
+        SdkAction_Extract,
+    )
     from .select_option import SelectOption
+    from .select_option_action import SelectOptionAction
+    from .select_option_action_data import SelectOptionActionData
     from .send_email_block import SendEmailBlock
     from .send_email_block_yaml import SendEmailBlockYaml
     from .skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
@@ -520,6 +537,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BitwardenSensitiveInformationParameterYaml": ".bitwarden_sensitive_information_parameter_yaml",
     "BlockType": ".block_type",
     "BrowserSessionResponse": ".browser_session_response",
+    "ClickAction": ".click_action",
+    "ClickActionData": ".click_action_data",
     "CodeBlock": ".code_block",
     "CodeBlockParametersItem": ".code_block_parameters_item",
     "CodeBlockParametersItem_AwsSecret": ".code_block_parameters_item",
@@ -559,6 +578,9 @@ _dynamic_imports: typing.Dict[str, str] = {
     "CreditCardCredentialResponse": ".credit_card_credential_response",
     "DownloadToS3Block": ".download_to_s3block",
     "DownloadToS3BlockYaml": ".download_to_s3block_yaml",
+    "ExtractAction": ".extract_action",
+    "ExtractActionData": ".extract_action_data",
+    "ExtractActionExtractSchema": ".extract_action_extract_schema",
     "ExtractionBlock": ".extraction_block",
     "ExtractionBlockDataSchema": ".extraction_block_data_schema",
     "ExtractionBlockParametersItem": ".extraction_block_parameters_item",
@@ -695,6 +717,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "HumanInteractionBlockParametersItem_Workflow": ".human_interaction_block_parameters_item",
     "HumanInteractionBlockYaml": ".human_interaction_block_yaml",
     "InputOrSelectContext": ".input_or_select_context",
+    "InputTextAction": ".input_text_action",
+    "InputTextActionData": ".input_text_action_data",
     "LoginBlock": ".login_block",
     "LoginBlockDataSchema": ".login_block_data_schema",
     "LoginBlockParametersItem": ".login_block_parameters_item",
@@ -737,11 +761,19 @@ _dynamic_imports: typing.Dict[str, str] = {
     "PdfParserBlockYaml": ".pdf_parser_block_yaml",
     "ProxyLocation": ".proxy_location",
     "RunEngine": ".run_engine",
+    "RunSdkActionResponse": ".run_sdk_action_response",
     "RunStatus": ".run_status",
     "Script": ".script",
     "ScriptFileCreate": ".script_file_create",
     "ScriptRunResponse": ".script_run_response",
+    "SdkAction": ".sdk_action",
+    "SdkAction_AiClick": ".sdk_action",
+    "SdkAction_AiInputText": ".sdk_action",
+    "SdkAction_AiSelectOption": ".sdk_action",
+    "SdkAction_Extract": ".sdk_action",
     "SelectOption": ".select_option",
+    "SelectOptionAction": ".select_option_action",
+    "SelectOptionActionData": ".select_option_action_data",
     "SendEmailBlock": ".send_email_block",
     "SendEmailBlockYaml": ".send_email_block_yaml",
     "SkyvernForgeSdkSchemasCredentialsCredentialType": ".skyvern_forge_sdk_schemas_credentials_credential_type",
@@ -981,6 +1013,8 @@ __all__ = [
     "BitwardenSensitiveInformationParameterYaml",
     "BlockType",
     "BrowserSessionResponse",
+    "ClickAction",
+    "ClickActionData",
     "CodeBlock",
     "CodeBlockParametersItem",
     "CodeBlockParametersItem_AwsSecret",
@@ -1020,6 +1054,9 @@ __all__ = [
     "CreditCardCredentialResponse",
     "DownloadToS3Block",
     "DownloadToS3BlockYaml",
+    "ExtractAction",
+    "ExtractActionData",
+    "ExtractActionExtractSchema",
     "ExtractionBlock",
     "ExtractionBlockDataSchema",
     "ExtractionBlockParametersItem",
@@ -1156,6 +1193,8 @@ __all__ = [
     "HumanInteractionBlockParametersItem_Workflow",
     "HumanInteractionBlockYaml",
     "InputOrSelectContext",
+    "InputTextAction",
+    "InputTextActionData",
     "LoginBlock",
     "LoginBlockDataSchema",
     "LoginBlockParametersItem",
@@ -1198,11 +1237,19 @@ __all__ = [
     "PdfParserBlockYaml",
     "ProxyLocation",
     "RunEngine",
+    "RunSdkActionResponse",
     "RunStatus",
     "Script",
     "ScriptFileCreate",
     "ScriptRunResponse",
+    "SdkAction",
+    "SdkAction_AiClick",
+    "SdkAction_AiInputText",
+    "SdkAction_AiSelectOption",
+    "SdkAction_Extract",
     "SelectOption",
+    "SelectOptionAction",
+    "SelectOptionActionData",
     "SendEmailBlock",
     "SendEmailBlockYaml",
     "SkyvernForgeSdkSchemasCredentialsCredentialType",

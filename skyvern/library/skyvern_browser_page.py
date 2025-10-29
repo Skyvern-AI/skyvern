@@ -1,11 +1,18 @@
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import Page
 
-from skyvern.client import AsyncSkyvern, GetRunResponse
+from skyvern.client import GetRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
+from skyvern.config import settings
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
+from skyvern.library.SdkSkyvernPageAi import SdkSkyvernPageAi
+from skyvern.webeye.actions import handler_utils
+
+if TYPE_CHECKING:
+    from skyvern.library.skyvern_browser import SkyvernBrowser
+
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import RunEngine, RunStatus, TaskRunResponse
 
@@ -18,13 +25,9 @@ class SkyvernPageRun:
     and pre-defined workflows with automatic waiting for completion.
     """
 
-    def __init__(
-        self, page: Page, browser_session_id: str | None, browser_address: str | None, client: AsyncSkyvern
-    ) -> None:
+    def __init__(self, browser: "SkyvernBrowser", page: Page) -> None:
+        self._browser = browser
         self._page = page
-        self._browser_session_id = browser_session_id
-        self._browser_address = browser_address
-        self._client = client
 
     async def run_task(
         self,
@@ -63,7 +66,7 @@ class SkyvernPageRun:
             TaskRunResponse containing the task execution results.
         """
 
-        task_run = await self._client.run_task(
+        task_run = await self._browser.client.run_task(
             prompt=prompt,
             engine=engine,
             model=model,
@@ -75,8 +78,8 @@ class SkyvernPageRun:
             error_code_mapping=error_code_mapping,
             data_extraction_schema=data_extraction_schema,
             max_steps=max_steps,
-            browser_session_id=self._browser_session_id,
-            browser_address=self._browser_address,
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
             user_agent=user_agent,
         )
 
@@ -121,7 +124,7 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the login workflow execution results.
         """
 
-        workflow_run = await self._client.login(
+        workflow_run = await self._browser.client.login(
             credential_type=credential_type,
             url=url or self._get_page_url(),
             credential_id=credential_id,
@@ -133,8 +136,8 @@ class SkyvernPageRun:
             webhook_url=webhook_url,
             totp_identifier=totp_identifier,
             totp_url=totp_url,
-            browser_session_id=self._browser_session_id,
-            browser_address=self._browser_address,
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
             extra_http_headers=extra_http_headers,
         )
 
@@ -167,7 +170,7 @@ class SkyvernPageRun:
         Returns:
             WorkflowRunResponse containing the workflow execution results.
         """
-        workflow_run = await self._client.run_workflow(
+        workflow_run = await self._browser.client.run_workflow(
             workflow_id=workflow_id,
             parameters=parameters,
             template=template,
@@ -175,8 +178,8 @@ class SkyvernPageRun:
             webhook_url=webhook_url,
             totp_url=totp_url,
             totp_identifier=totp_identifier,
-            browser_session_id=self._browser_session_id,
-            browser_address=self._browser_address,
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
         )
 
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
@@ -185,7 +188,7 @@ class SkyvernPageRun:
     async def _wait_for_run_completion(self, run_id: str, timeout: float) -> GetRunResponse:
         async with asyncio.timeout(timeout):
             while True:
-                task_run = await self._client.get_run(run_id)
+                task_run = await self._browser.client.get_run(run_id)
                 if RunStatus(task_run.status).is_final():
                     break
                 await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
@@ -221,28 +224,150 @@ class SkyvernBrowserPage:
         run: SkyvernPageRun instance for executing AI-powered tasks and workflows.
     """
 
-    def __init__(self, page: Page, run: SkyvernPageRun):
-        self.run = run
-        self._playwright_page = page
+    def __init__(self, browser: "SkyvernBrowser", page: Page):
+        self._browser = browser
+        self._page = page
+        self._ai = SdkSkyvernPageAi(browser, page)
+        self.run = SkyvernPageRun(browser, page)
 
-    async def click(self, selector: str, **kwargs: Any) -> None:
-        """Click an element matching the selector.
+    async def click(
+        self,
+        *,
+        selector: str | None = None,
+        intention: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str | None:
+        """Click an element identified by ``selector``.
 
-        Args:
-            selector: A selector to search for an element to click.
-            **kwargs: Additional options like timeout, force, position, etc.
+        When ``intention`` and ``data`` are provided a new click action is
+        generated via the ``single-click-action`` prompt.  The model returns a
+        fresh "xpath=..." selector based on the current DOM and the updated data for this run.
+        The browser then clicks the element using this newly generated xpath selector.
+
+        If the prompt generation or parsing fails for any reason we fall back to
+        clicking the originally supplied ``selector``.
         """
-        await self._playwright_page.click(selector, **kwargs)
 
-    async def fill(self, selector: str, value: str, **kwargs: Any) -> None:
-        """Fill an input field with the given value.
+        if ai == "fallback":
+            # try to click the element with the original selector first
+            error_to_raise = None
+            if selector:
+                try:
+                    locator = self._page.locator(selector)
+                    await locator.click(timeout=timeout)
+                    return selector
+                except Exception as e:
+                    error_to_raise = e
 
-        Args:
-            selector: A selector to search for an element to fill.
-            value: Value to fill for the input field.
-            **kwargs: Additional options like timeout, force, no_wait_after, etc.
+            # if the original selector doesn't work, try to click the element with the ai generated selector
+            if intention:
+                return await self._ai.ai_click(
+                    selector=selector or "",
+                    intention=intention,
+                    data=data,
+                    timeout=timeout,
+                )
+            if error_to_raise:
+                raise error_to_raise
+            else:
+                return selector
+        elif ai == "proactive":
+            if intention:
+                return await self._ai.ai_click(
+                    selector=selector or "",
+                    intention=intention,
+                    data=data,
+                    timeout=timeout,
+                )
+
+        if selector:
+            locator = self._page.locator(selector)
+            await locator.click(timeout=timeout)
+        return selector
+
+    async def _input_text(
+        self,
+        selector: str,
+        value: str,
+        ai: str | None = "fallback",
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str:
+        """Input text into an element identified by ``selector``.
+
+        When ``intention`` and ``data`` are provided a new input text action is
+        generated via the `script-generation-input-text-generation` prompt.  The model returns a
+        fresh text based on the current DOM and the updated data for this run.
+        The browser then inputs the text using this newly generated text.
+
+        If the prompt generation or parsing fails for any reason we fall back to
+        inputting the originally supplied ``value``.
         """
-        await self._playwright_page.fill(selector, value, **kwargs)
+
+        # format the text with the actual value of the parameter if it's a secret when running a workflow
+        if ai == "fallback":
+            error_to_raise = None
+            try:
+                locator = self._page.locator(selector)
+                await handler_utils.input_sequentially(locator, value, timeout=timeout)
+                return value
+            except Exception as e:
+                error_to_raise = e
+
+            if intention:
+                return await self._ai.ai_input_text(
+                    selector=selector,
+                    value=value,
+                    intention=intention,
+                    data=data,
+                    totp_identifier=totp_identifier,
+                    totp_url=totp_url,
+                    timeout=timeout,
+                )
+            if error_to_raise:
+                raise error_to_raise
+            else:
+                return value
+        elif ai == "proactive" and intention:
+            return await self._ai.ai_input_text(
+                selector=selector,
+                value=value,
+                intention=intention,
+                data=data,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+                timeout=timeout,
+            )
+        locator = self._page.locator(selector)
+        await handler_utils.input_sequentially(locator, value, timeout=timeout)
+        return value
+
+    async def fill(
+        self,
+        selector: str,
+        value: str,
+        ai: str | None = "fallback",
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        return await self._input_text(
+            selector=selector,
+            value=value,
+            ai=ai,
+            intention=intention,
+            data=data,
+            timeout=timeout,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+        )
 
     async def goto(self, url: str, **kwargs: Any) -> None:
         """Navigate to the given URL.
@@ -251,7 +376,7 @@ class SkyvernBrowserPage:
             url: URL to navigate page to.
             **kwargs: Additional options like timeout, wait_until, referer, etc.
         """
-        await self._playwright_page.goto(url, **kwargs)
+        await self._page.goto(url, **kwargs)
 
     async def type(self, selector: str, text: str, **kwargs: Any) -> None:
         """Type text into an element character by character.
@@ -261,7 +386,7 @@ class SkyvernBrowserPage:
             text: Text to type into the element.
             **kwargs: Additional options like delay, timeout, no_wait_after, etc.
         """
-        await self._playwright_page.type(selector, text, **kwargs)
+        await self._page.type(selector, text, **kwargs)
 
     async def select_option(self, selector: str, value: Any = None, **kwargs: Any) -> list[str]:
         """Select option(s) in a <select> element.
@@ -274,7 +399,7 @@ class SkyvernBrowserPage:
         Returns:
             List of option values that have been successfully selected.
         """
-        return await self._playwright_page.select_option(selector, value, **kwargs)
+        return await self._page.select_option(selector, value, **kwargs)
 
     async def reload(self, **kwargs: Any) -> None:
         """Reload the current page.
@@ -282,7 +407,7 @@ class SkyvernBrowserPage:
         Args:
             **kwargs: Additional options like timeout, wait_until, etc.
         """
-        await self._playwright_page.reload(**kwargs)
+        await self._page.reload(**kwargs)
 
     async def screenshot(self, **kwargs: Any) -> bytes:
         """Take a screenshot of the page.
@@ -293,4 +418,4 @@ class SkyvernBrowserPage:
         Returns:
             bytes: The screenshot as bytes (unless path is specified, then saves to file).
         """
-        return await self._playwright_page.screenshot(**kwargs)
+        return await self._page.screenshot(**kwargs)

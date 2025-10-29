@@ -5,6 +5,7 @@ from skyvern.forge.sdk.routes import debug_sessions  # noqa: F401
 from skyvern.forge.sdk.routes import pylon  # noqa: F401
 from skyvern.forge.sdk.routes import run_blocks  # noqa: F401
 from skyvern.forge.sdk.routes import scripts  # noqa: F401
+from skyvern.forge.sdk.routes import sdk  # noqa: F401
 from skyvern.forge.sdk.routes import streaming  # noqa: F401
 from skyvern.forge.sdk.routes import streaming_messages  # noqa: F401
 from skyvern.forge.sdk.routes import streaming_vnc  # noqa: F401
