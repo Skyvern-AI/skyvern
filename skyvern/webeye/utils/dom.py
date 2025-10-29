@@ -209,6 +209,12 @@ class SkyvernElement:
         if await self.get_attr("min") or await self.get_attr("max") or await self.get_attr("step"):
             return True
 
+        # maxlength=6 or maxlength=1 usually means it's an OTP input field
+        # already consider type="tel" or type="number" as raw_input in the previous logic, so need to confirm it for the OTP field
+        max_length = str(await self.get_attr("maxlength", mode="static"))
+        if input_type.lower() == "text" and max_length in ["1", "6"]:
+            return True
+
         return False
 
     async def is_spinbtn_input(self) -> bool:
