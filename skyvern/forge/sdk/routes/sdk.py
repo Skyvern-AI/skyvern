@@ -11,12 +11,8 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.sdk_actions import (
-    ClickAction,
-    ExtractAction,
-    InputTextAction,
     RunSdkActionRequest,
     RunSdkActionResponse,
-    SelectOptionAction,
 )
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -122,8 +118,10 @@ async def run_sdk_action(
         task_id=task.task_id,
     )
 
+    context = skyvern_context.ensure_context()
     skyvern_context.set(
         SkyvernContext(
+            request_id=context.request_id,
             organization_id=task.organization_id,
             task_id=task.task_id,
             step_id=step.step_id,
@@ -139,14 +137,14 @@ async def run_sdk_action(
         page = await scraped_page._browser_state.must_get_working_page()
         page_ai = RealSkyvernPageAi(scraped_page, page)
 
-        if isinstance(action, ClickAction):
+        if action.type == "ai_click":
             result = await page_ai.ai_click(
                 selector=action.selector,
                 intention=action.intention,
                 data=action.data,
                 timeout=action.timeout,
             )
-        elif isinstance(action, InputTextAction):
+        elif action.type == "ai_input_text":
             result = await page_ai.ai_input_text(
                 selector=action.selector,
                 value=action.value,
@@ -156,7 +154,7 @@ async def run_sdk_action(
                 totp_url=action.totp_url,
                 timeout=action.timeout,
             )
-        elif isinstance(action, SelectOptionAction):
+        elif action.type == "ai_select_option":
             result = await page_ai.ai_select_option(
                 selector=action.selector,
                 value=action.value,
@@ -164,7 +162,7 @@ async def run_sdk_action(
                 data=action.data,
                 timeout=action.timeout,
             )
-        elif isinstance(action, ExtractAction):
+        elif action.type == "extract":
             extract_result = await page_ai.ai_extract(
                 prompt=action.prompt,
                 schema=action.extract_schema,
