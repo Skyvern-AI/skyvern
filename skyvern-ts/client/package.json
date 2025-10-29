@@ -1,6 +1,6 @@
 {
     "name": "@skyvern/client",
-    "version": "0.2.20",
+    "version": "0.2.21",
     "private": false,
     "repository": "github:Skyvern-AI/skyvern",
     "type": "commonjs",

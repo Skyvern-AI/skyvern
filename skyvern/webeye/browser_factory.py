@@ -690,13 +690,9 @@ class BrowserState:
             page: Page | None = None
             use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
-                pages = [
-                    http_page
-                    for http_page in self.browser_context.pages
-                    if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
-                ]
+                pages = await self.list_valid_pages()
                 if len(pages) > 0:
-                    page = pages[0]
+                    page = pages[-1]
                     use_existing_page = True
             if page is None:
                 page = await self.browser_context.new_page()
@@ -749,14 +745,34 @@ class BrowserState:
     async def get_working_page(self) -> Page | None:
         # HACK: currently, assuming the last page is always the working page.
         # Need to refactor this logic when we want to manipulate multi pages together
-        if self.__page is None or self.browser_context is None or len(self.browser_context.pages) == 0:
+        # TODO: do not use index of pages, it should be more robust if we want to fully support multi pages manipulation
+        if self.__page is None or self.browser_context is None:
             return None
 
-        last_page = self.browser_context.pages[-1]
+        # pick the last and http/https page as the working page
+        pages = await self.list_valid_pages()
+        if len(pages) == 0:
+            LOG.info("No http, https or blank page found in the browser context, return None")
+            return None
+
+        last_page = pages[-1]
         if self.__page == last_page:
             return self.__page
-        await self.set_working_page(last_page, len(self.browser_context.pages) - 1)
+        await self.set_working_page(last_page, len(pages) - 1)
         return last_page
+
+    async def list_valid_pages(self) -> list[Page]:
+        # List all valid pages(blank page, and http/https page) in the browser context
+        # MSEdge CDP bug(?)
+        # when using CDP connect to a MSEdge, the download hub will be included in the context.pages
+        if self.browser_context is None:
+            return []
+
+        return [
+            http_page
+            for http_page in self.browser_context.pages
+            if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
+        ]
 
     async def validate_browser_context(self, page: Page) -> bool:
         # validate the content

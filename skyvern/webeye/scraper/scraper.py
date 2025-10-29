@@ -37,10 +37,11 @@ ScrapeExcludeFunc = Callable[[Page, Frame], Awaitable[bool]]
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
     "alt",
-    "shape-description",  # for css shape
     "aria-checked",  # for option tag
     "aria-current",
+    "aria-disabled",
     "aria-label",
+    "aria-readonly",
     "aria-required",
     "aria-role",
     "aria-selected",  # for option tag
@@ -48,7 +49,6 @@ RESERVED_ATTRIBUTES = {
     "data-original-title",  # for bootstrap tooltip
     "data-ui",
     "disabled",  # for button
-    "aria-disabled",
     "for",
     "href",  # For a tags
     "maxlength",
@@ -58,6 +58,7 @@ RESERVED_ATTRIBUTES = {
     "readonly",
     "required",
     "selected",  # for option tag
+    "shape-description",  # for css shape
     "src",  # do we need this?
     "text-value",
     "title",
@@ -897,16 +898,23 @@ class IncrementalScrapePage(ElementTreeBuilder):
 
 def _should_keep_unique_id(element: dict) -> bool:
     # case where we shouldn't keep unique_id
-    # 1. not disable attr and no interactable
-    # 2. disable=false and intrecatable=false
+    # 1. no readonly attr and not disable attr and no interactable
+    # 2. readonly=false and disable=false and interactable=false
 
     attributes = element.get("attributes", {})
-    if "disabled" not in attributes and "aria-disabled" not in attributes:
+    if (
+        "disabled" not in attributes
+        and "aria-disabled" not in attributes
+        and "readonly" not in attributes
+        and "aria-readonly" not in attributes
+    ):
         return element.get("interactable", False)
 
     disabled = attributes.get("disabled")
     aria_disabled = attributes.get("aria-disabled")
-    if disabled or aria_disabled:
+    readonly = attributes.get("readonly")
+    aria_readonly = attributes.get("aria-readonly")
+    if disabled or aria_disabled or readonly or aria_readonly:
         return True
     return element.get("interactable", False)
 

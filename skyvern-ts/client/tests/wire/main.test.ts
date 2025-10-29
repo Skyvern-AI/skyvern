@@ -1209,6 +1209,9 @@ describe("SkyvernClient", () => {
                     attachments: ["attachments"],
                     subject: "subject",
                     body: "body",
+                    instructions: "instructions",
+                    positive_descriptor: "positive_descriptor",
+                    negative_descriptor: "negative_descriptor",
                 },
                 thought: {
                     thought_id: "thought_id",
@@ -1293,6 +1296,9 @@ describe("SkyvernClient", () => {
                     attachments: ["attachments"],
                     subject: "subject",
                     body: "body",
+                    instructions: "instructions",
+                    positive_descriptor: "positive_descriptor",
+                    negative_descriptor: "negative_descriptor",
                 },
                 thought: {
                     thought_id: "thought_id",
