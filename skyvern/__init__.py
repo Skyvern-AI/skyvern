@@ -65,10 +65,10 @@ _lazy_imports = {
 def _initialize_tracing_and_logging() -> None:
     """Initialize ddtrace and logger configuration on first use."""
     try:
-        from ddtrace import tracer
-        from ddtrace.trace import TraceFilter, Span
-        from ddtrace.ext import http
-        import re
+        from ddtrace import tracer  # noqa: PLC0415
+        from ddtrace.trace import TraceFilter, Span  # noqa: PLC0415
+        from ddtrace.ext import http  # noqa: PLC0415
+        import re  # noqa: PLC0415
 
         class FilterHeartbeat(TraceFilter):
             _HB_URL = re.compile(r"http://.*/heartbeat$")
@@ -86,12 +86,12 @@ def _initialize_tracing_and_logging() -> None:
         # ddtrace not available, skip tracing configuration
         pass
 
-    from skyvern.forge.sdk.forge_log import setup_logger
+    from skyvern.forge.sdk.forge_log import setup_logger  # noqa: PLC0415
 
     setup_logger()
 
     # Import app to avoid circular import issues with other modules
-    from skyvern.forge import app  # noqa: F401
+    from skyvern.forge import app  # noqa: F401, PLC0415
 
 
 def __getattr__(name: str) -> Any:
@@ -105,7 +105,7 @@ def __getattr__(name: str) -> Any:
             _initialized = True
 
         module_path = _lazy_imports[name]
-        from importlib import import_module
+        from importlib import import_module  # noqa: PLC0415
 
         module = import_module(module_path)
 
