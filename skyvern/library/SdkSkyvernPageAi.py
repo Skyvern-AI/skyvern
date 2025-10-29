@@ -2,15 +2,9 @@ from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import Page
 
-from skyvern.client import SdkAction_Extract, SdkAction_AiSelectOption, SdkAction_AiInputText, SdkAction_AiClick
+from skyvern.client import SdkAction_AiClick, SdkAction_AiInputText, SdkAction_AiSelectOption, SdkAction_Extract
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.forge.sdk.schemas.sdk_actions import (
-    ClickAction,
-    ExtractAction,
-    InputTextAction,
-    SelectOptionAction,
-)
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser

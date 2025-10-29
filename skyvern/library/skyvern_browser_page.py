@@ -235,41 +235,59 @@ class SkyvernBrowserPage:
         self,
         selector: str,
         *,
-        intention: str | None = None,
+        prompt: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str | None:
-        ...
+    ) -> str | None: ...
 
     @overload
     async def click(
         self,
         *,
-        intention: str,
+        prompt: str,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str | None:
-        ...
+    ) -> str | None: ...
 
     async def click(
         self,
         selector: str | None = None,
-        intention: str | None = None,
+        *,
+        prompt: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str | None:
-        """Click an element identified by ``selector``.
+        """Click an element using a CSS selector, AI-powered prompt matching, or both.
 
-        When ``intention`` and ``data`` are provided a new click action is
-        generated via the ``single-click-action`` prompt.  The model returns a
-        fresh "xpath=..." selector based on the current DOM and the updated data for this run.
-        The browser then clicks the element using this newly generated xpath selector.
+        This method supports three modes:
+        - **Selector-based**: Click the element matching the CSS selector
+        - **AI-powered**: Use natural language to describe which element to click
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
 
-        If the prompt generation or parsing fails for any reason we fall back to
-        clicking the originally supplied ``selector``.
+        Args:
+            selector: CSS selector for the target element.
+            prompt: Natural language description of which element to click.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            data: Additional context data for AI processing.
+            timeout: Maximum time to wait for the click action in milliseconds.
+
+        Returns:
+            The selector string that was successfully used to click the element, or None.
+
+        Examples:
+            ```python
+            # Click using a CSS selector
+            await page.click("#open-invoice-button")
+
+            # Click using AI with natural language
+            await page.click(prompt="Click on the 'Open Invoice' button")
+
+            # Try selector first, fall back to AI if selector fails
+            await page.click("#open-invoice-button", prompt="Click on the 'Open Invoice' button")
+            ```
         """
 
         if ai == "fallback":
@@ -284,10 +302,10 @@ class SkyvernBrowserPage:
                     error_to_raise = e
 
             # if the original selector doesn't work, try to click the element with the ai generated selector
-            if intention:
+            if prompt:
                 return await self._ai.ai_click(
                     selector=selector or "",
-                    intention=intention,
+                    intention=prompt,
                     data=data,
                     timeout=timeout,
                 )
@@ -296,10 +314,10 @@ class SkyvernBrowserPage:
             else:
                 return selector
         elif ai == "proactive":
-            if intention:
+            if prompt:
                 return await self._ai.ai_click(
                     selector=selector or "",
-                    intention=intention,
+                    intention=prompt,
                     data=data,
                     timeout=timeout,
                 )
@@ -308,6 +326,209 @@ class SkyvernBrowserPage:
             locator = self._page.locator(selector)
             await locator.click(timeout=timeout)
         return selector
+
+    @overload
+    async def fill(
+        self,
+        selector: str,
+        *,
+        value: str,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str: ...
+
+    @overload
+    async def fill(
+        self,
+        *,
+        prompt: str,
+        value: str,
+        selector: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str: ...
+
+    async def fill(
+        self,
+        selector: str | None = None,
+        *,
+        value: str,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> str:
+        """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
+
+        This method supports three modes:
+        - **Selector-based**: Fill the input field matching the CSS selector
+        - **AI-powered**: Use natural language to describe which field to fill
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+        Args:
+            selector: CSS selector for the target input element.
+            prompt: Natural language description of which field to fill.
+            value: The text value to input into the field.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            data: Additional context data for AI processing.
+            timeout: Maximum time to wait for the fill action in milliseconds.
+            totp_identifier: TOTP identifier for time-based one-time password fields.
+            totp_url: URL to fetch TOTP codes from for authentication.
+
+        Returns:
+            The value that was successfully filled into the field.
+
+        Examples:
+            ```python
+            # Fill using a CSS selector
+            await page.fill("#email-input", value="user@example.com")
+
+            # Fill using AI with natural language
+            await page.fill(prompt="Fill in the email address", value="user@example.com")
+
+            # Try selector first, fall back to AI if selector fails
+            await page.fill(
+                "#email-input",
+                value="user@example.com",
+                prompt="Fill in the email address"
+            )
+            ```
+        """
+        return await self._input_text(
+            selector=selector or "",
+            value=value,
+            ai=ai,
+            intention=prompt,
+            data=data,
+            timeout=timeout,
+            totp_identifier=totp_identifier,
+            totp_url=totp_url,
+        )
+
+    async def goto(self, url: str, **kwargs: Any) -> None:
+        """Navigate to the given URL.
+
+        Args:
+            url: URL to navigate page to.
+            **kwargs: Additional options like timeout, wait_until, referer, etc.
+        """
+        await self._page.goto(url, **kwargs)
+
+    async def type(self, selector: str, text: str, **kwargs: Any) -> None:
+        """Type text into an element character by character.
+
+        Args:
+            selector: A selector to search for an element to type into.
+            text: Text to type into the element.
+            **kwargs: Additional options like delay, timeout, no_wait_after, etc.
+        """
+        await self._page.type(selector, text, **kwargs)
+
+    @overload
+    async def select_option(
+        self,
+        selector: str,
+        *,
+        prompt: str | None = None,
+        value: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str: ...
+
+    @overload
+    async def select_option(
+        self,
+        *,
+        prompt: str,
+        value: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str: ...
+
+    async def select_option(
+        self,
+        selector: str | None = None,
+        *,
+        prompt: str | None = None,
+        value: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str:
+        value = value or ""
+        if ai == "fallback":
+            error_to_raise = None
+            if selector:
+                try:
+                    locator = self._page.locator(selector)
+                    await locator.select_option(value, timeout=timeout)
+                    return value
+                except Exception as e:
+                    error_to_raise = e
+            if prompt:
+                return await self._ai.ai_select_option(
+                    selector=selector or "",
+                    value=value,
+                    intention=prompt,
+                    data=data,
+                    timeout=timeout,
+                )
+            if error_to_raise:
+                raise error_to_raise
+            else:
+                return value
+        elif ai == "proactive" and prompt:
+            return await self._ai.ai_select_option(
+                selector=selector or "",
+                value=value,
+                intention=prompt,
+                data=data,
+                timeout=timeout,
+            )
+        if selector:
+            locator = self._page.locator(selector)
+            await locator.select_option(value, timeout=timeout)
+        return value
+
+    async def extract(
+        self,
+        prompt: str,
+        schema: dict[str, Any] | list | str | None = None,
+        error_code_mapping: dict[str, str] | None = None,
+        intention: str | None = None,
+        data: str | dict[str, Any] | None = None,
+    ) -> dict[str, Any] | list | str | None:
+        return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
+
+    async def reload(self, **kwargs: Any) -> None:
+        """Reload the current page.
+
+        Args:
+            **kwargs: Additional options like timeout, wait_until, etc.
+        """
+        await self._page.reload(**kwargs)
+
+    async def screenshot(self, **kwargs: Any) -> bytes:
+        """Take a screenshot of the page.
+
+        Args:
+            **kwargs: Additional options like path, full_page, clip, type, quality, etc.
+
+        Returns:
+            bytes: The screenshot as bytes (unless path is specified, then saves to file).
+        """
+        return await self._page.screenshot(**kwargs)
 
     async def _input_text(
         self,
@@ -368,173 +589,3 @@ class SkyvernBrowserPage:
         locator = self._page.locator(selector)
         await handler_utils.input_sequentially(locator, value, timeout=timeout)
         return value
-
-    @overload
-    async def fill(
-        self,
-        *,
-        selector: str,
-        intention: str | None = None,
-        value: str,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-    ) -> str:
-        ...
-
-    @overload
-    async def fill(
-        self,
-        *,
-        selector: str = "",
-        intention: str,
-        value: str,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-    ) -> str:
-        ...
-
-    async def fill(
-        self,
-        *,
-        selector: str = "",
-        intention: str | None = None,
-        value: str,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-    ) -> str:
-        return await self._input_text(
-            selector=selector,
-            value=value,
-            ai=ai,
-            intention=intention,
-            data=data,
-            timeout=timeout,
-            totp_identifier=totp_identifier,
-            totp_url=totp_url,
-        )
-
-    async def goto(self, url: str, **kwargs: Any) -> None:
-        """Navigate to the given URL.
-
-        Args:
-            url: URL to navigate page to.
-            **kwargs: Additional options like timeout, wait_until, referer, etc.
-        """
-        await self._page.goto(url, **kwargs)
-
-    async def type(self, selector: str, text: str, **kwargs: Any) -> None:
-        """Type text into an element character by character.
-
-        Args:
-            selector: A selector to search for an element to type into.
-            text: Text to type into the element.
-            **kwargs: Additional options like delay, timeout, no_wait_after, etc.
-        """
-        await self._page.type(selector, text, **kwargs)
-
-    @overload
-    async def select_option(
-        self,
-        *,
-        selector: str,
-        intention: str | None = None,
-        value: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
-        ...
-
-    @overload
-    async def select_option(
-        self,
-        *,
-        selector: str = "",
-        intention: str,
-        value: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
-        ...
-
-    async def select_option(
-        self,
-        *,
-        selector: str = "",
-        intention: str | None = None,
-        value: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
-        value = value or ""
-        if ai == "fallback":
-            error_to_raise = None
-            try:
-                locator = self._page.locator(selector)
-                await locator.select_option(value, timeout=timeout)
-                return value
-            except Exception as e:
-                error_to_raise = e
-            if intention:
-                return await self._ai.ai_select_option(
-                    selector=selector,
-                    value=value,
-                    intention=intention,
-                    data=data,
-                    timeout=timeout,
-                )
-            if error_to_raise:
-                raise error_to_raise
-            else:
-                return value
-        elif ai == "proactive" and intention:
-            return await self._ai.ai_select_option(
-                selector=selector,
-                value=value,
-                intention=intention,
-                data=data,
-                timeout=timeout,
-            )
-        locator = self._page.locator(selector)
-        await locator.select_option(value, timeout=timeout)
-        return value
-
-    async def extract(
-        self,
-        prompt: str,
-        schema: dict[str, Any] | list | str | None = None,
-        error_code_mapping: dict[str, str] | None = None,
-        intention: str | None = None,
-        data: str | dict[str, Any] | None = None,
-    ) -> dict[str, Any] | list | str | None:
-        return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
-
-    async def reload(self, **kwargs: Any) -> None:
-        """Reload the current page.
-
-        Args:
-            **kwargs: Additional options like timeout, wait_until, etc.
-        """
-        await self._page.reload(**kwargs)
-
-    async def screenshot(self, **kwargs: Any) -> bytes:
-        """Take a screenshot of the page.
-
-        Args:
-            **kwargs: Additional options like path, full_page, clip, type, quality, etc.
-
-        Returns:
-            bytes: The screenshot as bytes (unless path is specified, then saves to file).
-        """
-        return await self._page.screenshot(**kwargs)

@@ -7,6 +7,7 @@ export type { GetRunArtifactsRequest } from "./GetRunArtifactsRequest.js";
 export type { GetScriptsRequest } from "./GetScriptsRequest.js";
 export type { GetWorkflowsRequest } from "./GetWorkflowsRequest.js";
 export type { LoginRequest } from "./LoginRequest.js";
+export type { RunSdkActionRequest } from "./RunSdkActionRequest.js";
 export type { RunTaskRequest } from "./RunTaskRequest.js";
 export type { RunWorkflowRequest } from "./RunWorkflowRequest.js";
 export type { TotpCodeCreate } from "./TotpCodeCreate.js";

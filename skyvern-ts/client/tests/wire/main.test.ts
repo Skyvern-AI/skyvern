@@ -2429,4 +2429,128 @@ describe("SkyvernClient", () => {
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
+
+    test("run_sdk_action (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
+        const rawResponseBody = { workflow_run_id: "workflow_run_id", result: "result" };
+        server
+            .mockEndpoint()
+            .post("/v1/sdk/run_action")
+            .header("x-user-agent", "x-user-agent")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.runSdkAction({
+            "x-user-agent": "x-user-agent",
+            url: "url",
+            action: {
+                type: "ai_click",
+            },
+        });
+        expect(response).toEqual({
+            workflow_run_id: "workflow_run_id",
+            result: "result",
+        });
+    });
+
+    test("run_sdk_action (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/sdk/run_action")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(400)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.runSdkAction({
+                url: "url",
+                action: {
+                    type: "ai_click",
+                },
+            });
+        }).rejects.toThrow(Skyvern.BadRequestError);
+    });
+
+    test("run_sdk_action (3)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/sdk/run_action")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(403)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.runSdkAction({
+                url: "url",
+                action: {
+                    type: "ai_click",
+                },
+            });
+        }).rejects.toThrow(Skyvern.ForbiddenError);
+    });
+
+    test("run_sdk_action (4)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/sdk/run_action")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(404)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.runSdkAction({
+                url: "url",
+                action: {
+                    type: "ai_click",
+                },
+            });
+        }).rejects.toThrow(Skyvern.NotFoundError);
+    });
+
+    test("run_sdk_action (5)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { url: "url", action: { type: "ai_click" } };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/sdk/run_action")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.runSdkAction({
+                url: "url",
+                action: {
+                    type: "ai_click",
+                },
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
 });
