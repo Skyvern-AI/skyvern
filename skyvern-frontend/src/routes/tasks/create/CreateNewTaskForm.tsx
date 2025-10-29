@@ -755,19 +755,30 @@ function CreateNewTaskForm({ initialValues }: Props) {
 
         <div className="flex justify-end gap-3">
           <CopyApiCommandDropdown
-            getOptions={() =>
-              ({
+            getOptions={() => {
+              const formValues = form.getValues();
+              const includeOverrideHeader =
+                formValues.maxStepsOverride !== null &&
+                formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;
+
+              const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                "x-api-key": apiCredential ?? "<your-api-key>",
+              };
+
+              if (includeOverrideHeader) {
+                headers["x-max-steps-override"] = String(
+                  formValues.maxStepsOverride,
+                );
+              }
+
+              return {
                 method: "POST",
                 url: `${runsApiBaseUrl}/run/tasks`,
-                body: buildTaskRunPayload(
-                  createTaskRequestObject(form.getValues()),
-                ),
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
-              }) satisfies ApiCommandOptions
-            }
+                body: buildTaskRunPayload(createTaskRequestObject(formValues)),
+                headers,
+              } satisfies ApiCommandOptions;
+            }}
           />
           <Button type="submit" disabled={mutation.isPending}>
             {mutation.isPending && (

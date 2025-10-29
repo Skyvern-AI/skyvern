@@ -34,6 +34,7 @@ import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { statusIsFinalized } from "../types";
+import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 
 function createTaskRequestObject(values: TaskApiResponse) {
@@ -207,14 +208,27 @@ function TaskDetails() {
                     },
                   } satisfies ApiCommandOptions;
                 }
+
+                const includeOverrideHeader =
+                  task.max_steps_per_run !== null &&
+                  task.max_steps_per_run !== MAX_STEPS_DEFAULT;
+
+                const headers: Record<string, string> = {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                };
+
+                if (includeOverrideHeader) {
+                  headers["x-max-steps-override"] = String(
+                    task.max_steps_per_run,
+                  );
+                }
+
                 return {
                   method: "POST",
                   url: `${runsApiBaseUrl}/run/tasks`,
                   body: buildTaskRunPayload(createTaskRequestObject(task)),
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiCredential ?? "<your-api-key>",
-                  },
+                  headers,
                 } satisfies ApiCommandOptions;
               }}
               webhookDisabled={taskIsLoading || !taskHasTerminalState}

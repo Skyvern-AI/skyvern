@@ -319,14 +319,24 @@ function WorkflowRun() {
                   "x-api-key": apiCredential ?? "<your-api-key>",
                 };
 
+                const body: Record<string, unknown> = {
+                  workflow_id: workflowPermanentId,
+                  parameters: workflowRun?.parameters,
+                  proxy_location: proxyLocation,
+                };
+
+                if (maxScreenshotScrolls !== null) {
+                  body.max_screenshot_scrolls = maxScreenshotScrolls;
+                }
+
+                if (workflowRun?.webhook_callback_url) {
+                  body.webhook_url = workflowRun.webhook_callback_url;
+                }
+
                 return {
                   method: "POST",
                   url: `${runsApiBaseUrl}/run/workflows`,
-                  body: {
-                    workflow_id: workflowPermanentId,
-                    parameters: workflowRun?.parameters,
-                    proxy_location: "RESIDENTIAL",
-                  },
+                  body,
                   headers,
                 } satisfies ApiCommandOptions;
               }}
