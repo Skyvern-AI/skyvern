@@ -1384,7 +1384,7 @@ function Workspace({
                 {/* timeline */}
                 <div
                   className={cn(
-                    "z-15 h-full w-[5rem] overflow-visible",
+                    "z-[15] h-full w-[5rem] overflow-visible",
                     {
                       "skyvern-animate-nudge": nudge,
                     },
