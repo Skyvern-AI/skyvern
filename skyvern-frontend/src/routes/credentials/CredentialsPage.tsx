@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { CardStackIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
@@ -21,6 +22,8 @@ const subHeaderText =
 
 function CredentialsPage() {
   const { setIsOpen, setType } = useCredentialModalState();
+  const [activeTab, setActiveTab] = useState("passwords");
+
   return (
     <div className="space-y-5">
       <h1 className="text-2xl">Credentials</h1>
@@ -56,7 +59,11 @@ function CredentialsPage() {
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
-      <Tabs defaultValue="passwords" className="space-y-4">
+      <Tabs
+        defaultValue="passwords"
+        className="space-y-4"
+        onValueChange={setActiveTab}
+      >
         <TabsList className="bg-slate-elevation1">
           <TabsTrigger value="passwords">Passwords</TabsTrigger>
           <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
@@ -77,42 +84,44 @@ function CredentialsPage() {
       </Tabs>
       <CredentialsModal />
 
-      {/* Footer note */}
-      <div className="mt-8 border-t border-slate-700 pt-4">
-        <div className="text-sm italic text-slate-400">
-          <strong>Note:</strong> This feature requires a Bitwarden-compatible
-          server ({" "}
-          <a
-            href="https://bitwarden.com/help/self-host-an-organization/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-blue-400 underline hover:text-blue-300"
-          >
-            self-hosted Bitwarden
-          </a>{" "}
-          ) or{" "}
-          <a
-            href="https://github.com/dani-garcia/vaultwarden"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-blue-400 underline hover:text-blue-300"
-          >
-            this community version
-          </a>{" "}
-          or a paid Bitwarden account. Make sure the relevant
-          `SKYVERN_AUTH_BITWARDEN_*` environment variables are configured. See
-          details{" "}
-          <a
-            href="https://docs.skyvern.com/credentials/bitwarden"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-blue-400 underline hover:text-blue-300"
-          >
-            here
-          </a>
-          .
+      {/* Footer note - only for Passwords and Credit Cards tabs */}
+      {activeTab !== "twoFactor" && (
+        <div className="mt-8 border-t border-slate-700 pt-4">
+          <div className="text-sm italic text-slate-400">
+            <strong>Note:</strong> This feature requires a Bitwarden-compatible
+            server ({" "}
+            <a
+              href="https://bitwarden.com/help/self-host-an-organization/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-400 underline hover:text-blue-300"
+            >
+              self-hosted Bitwarden
+            </a>{" "}
+            ) or{" "}
+            <a
+              href="https://github.com/dani-garcia/vaultwarden"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-400 underline hover:text-blue-300"
+            >
+              this community version
+            </a>{" "}
+            or a paid Bitwarden account. Make sure the relevant
+            `SKYVERN_AUTH_BITWARDEN_*` environment variables are configured. See
+            details{" "}
+            <a
+              href="https://docs.skyvern.com/credentials/bitwarden"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-400 underline hover:text-blue-300"
+            >
+              here
+            </a>
+            .
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

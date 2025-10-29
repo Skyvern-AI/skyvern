@@ -62,16 +62,10 @@ function CredentialsTotpTab() {
     };
   }, [identifierFilter, limit, otpTypeFilter]);
 
-  const {
-    data,
-    isLoading,
-    isFetching,
-    isFeatureUnavailable,
-    isCredentialAccountMissing,
-    error,
-  } = useTotpCodesQuery({
-    params: queryParams,
-  });
+  const { data, isLoading, isFetching, isFeatureUnavailable } =
+    useTotpCodesQuery({
+      params: queryParams,
+    });
 
   const codes = data ?? [];
   const hasFilters =
@@ -175,17 +169,7 @@ function CredentialsTotpTab() {
           </Alert>
         )}
 
-        {isCredentialAccountMissing && !isFeatureUnavailable && (
-          <Alert>
-            <AlertTitle>Credential vault not configured</AlertTitle>
-            <AlertDescription>
-              Set up your Bitwarden (or compatible) credential account in the
-              backend configuration so Skyvern can store and retrieve codes.
-            </AlertDescription>
-          </Alert>
-        )}
-
-        {!isFeatureUnavailable && !isCredentialAccountMissing && (
+        {!isFeatureUnavailable && (
           <div className="rounded-lg border border-slate-700 bg-slate-elevation1">
             <Table>
               <TableHeader>
@@ -256,12 +240,6 @@ function CredentialsTotpTab() {
                   ))}
               </TableBody>
             </Table>
-            {Boolean(error) && !isFeatureUnavailable && (
-              <div className="border-t border-slate-700 px-4 py-3 text-sm text-red-400">
-                Failed to load codes. Try adjusting filters or refreshing the
-                page.
-              </div>
-            )}
           </div>
         )}
       </div>
