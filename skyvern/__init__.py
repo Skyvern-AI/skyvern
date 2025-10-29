@@ -1,7 +1,27 @@
+import re
 from typing import Any
 
-_initialized = False
+from ddtrace import tracer
+from ddtrace.ext import http
+from ddtrace.trace import TraceFilter, Span
 
+from skyvern.forge.sdk.forge_log import setup_logger
+
+
+class FilterHeartbeat(TraceFilter):
+    _HB_URL = re.compile(r"http://.*/heartbeat$")
+
+    def process_trace(self, trace: list[Span]) -> list[Span] | None:
+        for span in trace:
+            url = span.get_tag(http.URL)
+            if span.parent_id is None and url is not None and self._HB_URL.match(url):
+                # drop the full trace chunk
+                return None
+        return trace
+
+
+tracer.configure(trace_processors=[FilterHeartbeat()])
+setup_logger()
 
 # noinspection PyUnresolvedReferences
 __all__ = [
@@ -30,7 +50,6 @@ __all__ = [
     "validate",
     "wait",
     "workflow",
-    "_initialize_tracing_and_logging",
 ]
 
 _lazy_imports = {
@@ -62,48 +81,8 @@ _lazy_imports = {
 }
 
 
-def _initialize_tracing_and_logging() -> None:
-    """Initialize ddtrace and logger configuration on first use."""
-    try:
-        from ddtrace import tracer  # noqa: PLC0415
-        from ddtrace.trace import TraceFilter, Span  # noqa: PLC0415
-        from ddtrace.ext import http  # noqa: PLC0415
-        import re  # noqa: PLC0415
-
-        class FilterHeartbeat(TraceFilter):
-            _HB_URL = re.compile(r"http://.*/heartbeat$")
-
-            def process_trace(self, trace: list[Span]) -> list[Span] | None:
-                for span in trace:
-                    url = span.get_tag(http.URL)
-                    if span.parent_id is None and url is not None and self._HB_URL.match(url):
-                        # drop the full trace chunk
-                        return None
-                return trace
-
-        tracer.configure(trace_processors=[FilterHeartbeat()])
-    except ImportError:
-        # ddtrace not available, skip tracing configuration
-        pass
-
-    from skyvern.forge.sdk.forge_log import setup_logger  # noqa: PLC0415
-
-    setup_logger()
-
-    # Import app to avoid circular import issues with other modules
-    from skyvern.forge import app  # noqa: F401, PLC0415
-
-
 def __getattr__(name: str) -> Any:
-    """Lazily import module attributes."""
-    global _initialized
-
     if name in _lazy_imports:
-        # Initialize on first lazy import to avoid circular dependencies
-        if not _initialized:
-            _initialize_tracing_and_logging()
-            _initialized = True
-
         module_path = _lazy_imports[name]
         from importlib import import_module  # noqa: PLC0415
 
