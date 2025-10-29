@@ -1705,11 +1705,43 @@ class ForgeAgent:
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
 
-        # this prompt is critical to our agent so let's use the primary LLM API handler
+        # This prompt is critical for our agent, we probably should use the primary LLM handler
+        # but we're experimenting with using the dedicated check-user-goal handler
+        use_check_user_goal_handler = False
+        try:
+            # Use task_id or workflow_run_id as distinct_id
+            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+            use_check_user_goal_handler = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "USE_CHECK_USER_GOAL_HANDLER_FOR_VERIFICATION",
+                distinct_id,
+                properties={"organization_id": task.organization_id},
+            )
+            if use_check_user_goal_handler:
+                LOG.info(
+                    "Experiment enabled: using CHECK_USER_GOAL_LLM_API_HANDLER for complete verification",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    organization_id=task.organization_id,
+                )
+        except Exception as e:
+            LOG.warning(
+                "Failed to check USE_CHECK_USER_GOAL_HANDLER_FOR_VERIFICATION experiment; using legacy behavior",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                error=str(e),
+            )
 
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            llm_key_override, default=app.LLM_API_HANDLER
-        )
+        if use_check_user_goal_handler:
+            # Use the dedicated check-user-goal handler (new behavior)
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                llm_key_override, default=app.CHECK_USER_GOAL_LLM_API_HANDLER
+            )
+        else:
+            # Use the primary LLM handler (legacy behavior)
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                llm_key_override, default=app.LLM_API_HANDLER
+            )
+
         verification_result = await llm_api_handler(
             prompt=verification_prompt,
             step=step,
