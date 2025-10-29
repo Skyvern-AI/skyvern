@@ -281,6 +281,43 @@ class SkyvernElement:
 
         return disabled or aria_disabled or style_disabled
 
+    async def is_readonly(self, dynamic: bool = False) -> bool:
+        # if attr not exist, return None
+        # if attr is like 'readonly', return empty string or True
+        # if attr is like `readonly=false`, return the value
+        readonly = False
+        aria_readonly = False
+
+        readonly_attr: bool | str | None = None
+        aria_readonly_attr: bool | str | None = None
+        mode: typing.Literal["auto", "dynamic"] = "dynamic" if dynamic else "auto"
+
+        try:
+            readonly_attr = await self.get_attr("readonly", mode=mode)
+            aria_readonly_attr = await self.get_attr("aria-readonly", mode=mode)
+        except Exception:
+            LOG.exception(
+                "Failed to get the readonly attribute",
+                element=self.__static_element,
+                element_id=self.get_id(),
+            )
+
+        if readonly_attr is not None:
+            # readonly_attr should be bool or str
+            if isinstance(readonly_attr, bool):
+                readonly = readonly_attr
+            if isinstance(readonly_attr, str):
+                readonly = readonly_attr.lower() != "false"
+
+        if aria_readonly_attr is not None:
+            # aria_readonly_attr should be bool or str
+            if isinstance(aria_readonly_attr, bool):
+                aria_readonly = aria_readonly_attr
+            if isinstance(aria_readonly_attr, str):
+                aria_readonly = aria_readonly_attr.lower() != "false"
+
+        return readonly or aria_readonly
+
     async def is_selectable(self) -> bool:
         return await self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
