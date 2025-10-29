@@ -18,6 +18,7 @@ export type ForLoopBlockYamlLoopBlocksItem =
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.Extraction
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.Login
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.Wait
+    | Skyvern.ForLoopBlockYamlLoopBlocksItem.HumanInteraction
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.FileDownload
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.GotoUrl
     | Skyvern.ForLoopBlockYamlLoopBlocksItem.PdfParser
@@ -83,6 +84,10 @@ export namespace ForLoopBlockYamlLoopBlocksItem {
 
     export interface Wait extends Skyvern.WaitBlockYaml {
         block_type: "wait";
+    }
+
+    export interface HumanInteraction extends Skyvern.HumanInteractionBlockYaml {
+        block_type: "human_interaction";
     }
 
     export interface FileDownload extends Skyvern.FileDownloadBlockYaml {

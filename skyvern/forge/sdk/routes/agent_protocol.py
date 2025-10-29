@@ -22,18 +22,28 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
-    CANCEL_RUN_CODE_SAMPLE,
-    CREATE_WORKFLOW_CODE_SAMPLE,
+    CANCEL_RUN_CODE_SAMPLE_PYTHON,
+    CANCEL_RUN_CODE_SAMPLE_TS,
+    CREATE_WORKFLOW_CODE_SAMPLE_CURL,
     CREATE_WORKFLOW_CODE_SAMPLE_PYTHON,
-    DELETE_WORKFLOW_CODE_SAMPLE,
-    GET_RUN_CODE_SAMPLE,
-    GET_RUN_TIMELINE_CODE_SAMPLE,
-    GET_WORKFLOWS_CODE_SAMPLE,
-    RETRY_RUN_WEBHOOK_CODE_SAMPLE,
-    RUN_TASK_CODE_SAMPLE,
-    RUN_WORKFLOW_CODE_SAMPLE,
-    UPDATE_WORKFLOW_CODE_SAMPLE,
+    CREATE_WORKFLOW_CODE_SAMPLE_TS,
+    DELETE_WORKFLOW_CODE_SAMPLE_PYTHON,
+    DELETE_WORKFLOW_CODE_SAMPLE_TS,
+    GET_RUN_CODE_SAMPLE_PYTHON,
+    GET_RUN_CODE_SAMPLE_TS,
+    GET_RUN_TIMELINE_CODE_SAMPLE_PYTHON,
+    GET_RUN_TIMELINE_CODE_SAMPLE_TS,
+    GET_WORKFLOWS_CODE_SAMPLE_PYTHON,
+    GET_WORKFLOWS_CODE_SAMPLE_TS,
+    RETRY_RUN_WEBHOOK_CODE_SAMPLE_PYTHON,
+    RETRY_RUN_WEBHOOK_CODE_SAMPLE_TS,
+    RUN_TASK_CODE_SAMPLE_PYTHON,
+    RUN_TASK_CODE_SAMPLE_TS,
+    RUN_WORKFLOW_CODE_SAMPLE_PYTHON,
+    RUN_WORKFLOW_CODE_SAMPLE_TS,
+    UPDATE_WORKFLOW_CODE_SAMPLE_CURL,
     UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON,
+    UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
@@ -106,10 +116,8 @@ class AISuggestionType(str, Enum):
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": RUN_TASK_CODE_SAMPLE,
-                    }
+                    {"sdk": "python", "code": RUN_TASK_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": RUN_TASK_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -287,10 +295,8 @@ async def run_task(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": RUN_WORKFLOW_CODE_SAMPLE,
-                    }
+                    {"sdk": "python", "code": RUN_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": RUN_WORKFLOW_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -375,7 +381,14 @@ async def run_workflow(
     summary="Get a run by id",
     openapi_extra={
         "x-fern-sdk-method-name": "get_run",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_RUN_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_RUN_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     responses={
         200: {"description": "Successfully got run"},
@@ -407,7 +420,14 @@ async def get_run(
     tags=["Agent", "Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "cancel_run",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": CANCEL_RUN_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Cancel a run (task or workflow)",
     summary="Cancel a run by id",
@@ -478,8 +498,9 @@ async def create_workflow_legacy(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE},
+                    {"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE_CURL},
                     {"sdk": "python", "code": CREATE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": CREATE_WORKFLOW_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -695,8 +716,9 @@ async def update_workflow_legacy(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE},
+                    {"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE_CURL},
                     {"sdk": "python", "code": UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": UPDATE_WORKFLOW_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -770,7 +792,14 @@ async def update_workflow(
     tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_workflow",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": DELETE_WORKFLOW_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Delete a workflow",
     summary="Delete a workflow",
@@ -935,7 +964,14 @@ async def get_run_artifacts(
     tags=["Agent"],
     openapi_extra={
         "x-fern-sdk-method-name": "retry_run_webhook",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Retry sending the webhook for a run",
     summary="Retry run webhook",
@@ -956,7 +992,14 @@ async def retry_run_webhook(
     response_model=list[WorkflowRunTimeline],
     openapi_extra={
         "x-fern-sdk-method-name": "get_run_timeline",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_TIMELINE_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_RUN_TIMELINE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_RUN_TIMELINE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Get timeline for a run (workflow run or task_v2 run)",
     summary="Get run timeline",
@@ -1828,7 +1871,14 @@ async def get_workflow_run(
     tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflows",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_WORKFLOWS_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_WORKFLOWS_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_WORKFLOWS_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)

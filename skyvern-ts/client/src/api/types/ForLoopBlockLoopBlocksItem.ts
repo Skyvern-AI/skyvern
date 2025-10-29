@@ -13,6 +13,7 @@ export type ForLoopBlockLoopBlocksItem =
     | Skyvern.ForLoopBlockLoopBlocksItem.ForLoop
     | Skyvern.ForLoopBlockLoopBlocksItem.GotoUrl
     | Skyvern.ForLoopBlockLoopBlocksItem.HttpRequest
+    | Skyvern.ForLoopBlockLoopBlocksItem.HumanInteraction
     | Skyvern.ForLoopBlockLoopBlocksItem.Login
     | Skyvern.ForLoopBlockLoopBlocksItem.Navigation
     | Skyvern.ForLoopBlockLoopBlocksItem.PdfParser
@@ -63,6 +64,10 @@ export namespace ForLoopBlockLoopBlocksItem {
 
     export interface HttpRequest extends Skyvern.HttpRequestBlock {
         block_type: "http_request";
+    }
+
+    export interface HumanInteraction extends Skyvern.HumanInteractionBlock {
+        block_type: "human_interaction";
     }
 
     export interface Login extends Skyvern.LoginBlock {

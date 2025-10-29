@@ -2,7 +2,7 @@
     "name": "@skyvern/client",
     "version": "0.2.20",
     "private": false,
-    "repository": "github:Skyvern-AI/skyvern-typescript",
+    "repository": "github:Skyvern-AI/skyvern",
     "type": "commonjs",
     "main": "./dist/cjs/index.js",
     "module": "./dist/esm/index.mjs",

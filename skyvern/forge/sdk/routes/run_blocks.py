@@ -8,9 +8,12 @@ from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.routes.code_samples import (
-    LOGIN_CODE_SAMPLE_BITWARDEN,
-    LOGIN_CODE_SAMPLE_ONEPASSWORD,
-    LOGIN_CODE_SAMPLE_SKYVERN,
+    LOGIN_CODE_SAMPLE_BITWARDEN_PYTHON,
+    LOGIN_CODE_SAMPLE_BITWARDEN_TS,
+    LOGIN_CODE_SAMPLE_ONEPASSWORD_PYTHON,
+    LOGIN_CODE_SAMPLE_ONEPASSWORD_TS,
+    LOGIN_CODE_SAMPLE_SKYVERN_PYTHON,
+    LOGIN_CODE_SAMPLE_SKYVERN_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -49,18 +52,12 @@ If login is completed, you're successful."""
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": LOGIN_CODE_SAMPLE_SKYVERN,
-                    },
-                    {
-                        "sdk": "python",
-                        "code": LOGIN_CODE_SAMPLE_BITWARDEN,
-                    },
-                    {
-                        "sdk": "python",
-                        "code": LOGIN_CODE_SAMPLE_ONEPASSWORD,
-                    },
+                    {"sdk": "python", "code": LOGIN_CODE_SAMPLE_SKYVERN_PYTHON},
+                    {"sdk": "python", "code": LOGIN_CODE_SAMPLE_BITWARDEN_PYTHON},
+                    {"sdk": "python", "code": LOGIN_CODE_SAMPLE_ONEPASSWORD_PYTHON},
+                    {"sdk": "typescript", "code": LOGIN_CODE_SAMPLE_SKYVERN_TS},
+                    {"sdk": "typescript", "code": LOGIN_CODE_SAMPLE_BITWARDEN_TS},
+                    {"sdk": "typescript", "code": LOGIN_CODE_SAMPLE_ONEPASSWORD_TS},
                 ]
             }
         ],

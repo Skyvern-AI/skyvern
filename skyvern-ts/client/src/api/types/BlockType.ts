@@ -21,5 +21,6 @@ export const BlockType = {
     GotoUrl: "goto_url",
     PdfParser: "pdf_parser",
     HttpRequest: "http_request",
+    HumanInteraction: "human_interaction",
 } as const;
 export type BlockType = (typeof BlockType)[keyof typeof BlockType];
