@@ -23,7 +23,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/useCloseBrowserSessionMutation";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
-import { cn } from "@/util/utils";
 
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 
@@ -183,20 +182,28 @@ function BrowserSession() {
         {/* Tab Content */}
         <div className="relative min-h-0 w-full flex-1 rounded-lg border p-4">
           <div
-            className={cn(
-              "absolute left-0 top-0 z-10 flex h-full w-full items-center justify-center",
-              {
-                hidden: activeTab !== "stream",
-              },
-            )}
+            className="absolute left-0 top-0 z-10 flex h-full w-full items-center justify-center"
+            style={{
+              visibility: activeTab === "stream" ? "visible" : "hidden",
+              pointerEvents: activeTab === "stream" ? "auto" : "none",
+            }}
           >
             <BrowserStream
               browserSessionId={browserSessionId}
               interactive={false}
               showControlButtons={true}
+              isVisible={activeTab === "stream"}
             />
           </div>
-          {activeTab === "videos" && <BrowserSessionVideo />}
+          <div
+            className="h-full w-full"
+            style={{
+              visibility: activeTab === "videos" ? "visible" : "hidden",
+              pointerEvents: activeTab === "videos" ? "auto" : "none",
+            }}
+          >
+            <BrowserSessionVideo />
+          </div>
         </div>
       </div>
       <Toaster />
