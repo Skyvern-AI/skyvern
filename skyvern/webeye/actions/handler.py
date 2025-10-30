@@ -1971,13 +1971,6 @@ async def handle_complete_action(
         )
         action.verified = True
 
-        if not task.data_extraction_goal and verification_result.thoughts:
-            await app.DATABASE.update_task(
-                task.task_id,
-                organization_id=task.organization_id,
-                extracted_information=verification_result.thoughts,
-            )
-
     return [ActionSuccess()]
 
 

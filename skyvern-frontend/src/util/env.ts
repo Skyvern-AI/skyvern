@@ -43,6 +43,19 @@ try {
   newWssBaseUrl = wssBaseUrl.replace("/api", "");
 }
 
+// Base URL for the Runs API (strip a leading `/api` segment: /api/v1 -> /v1)
+const runsApiBaseUrl = (() => {
+  try {
+    const url = new URL(apiBaseUrl);
+    if (url.pathname.startsWith("/api")) {
+      url.pathname = url.pathname.replace(/^\/api/, "");
+    }
+    return `${url.origin}${url.pathname}`;
+  } catch (e) {
+    return apiBaseUrl.replace("/api", "");
+  }
+})();
+
 let runtimeApiKey: string | null | undefined;
 
 function readPersistedApiKey(): string | null {
@@ -83,6 +96,7 @@ function clearRuntimeApiKey(): void {
 
 export {
   apiBaseUrl,
+  runsApiBaseUrl,
   environment,
   artifactApiBaseUrl,
   apiPathPrefix,

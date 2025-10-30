@@ -40,6 +40,8 @@ function useWorkflowRunQuery() {
       }
       return false;
     },
+    // required for OS-level notifications to work (workflow run completion)
+    refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
     refetchOnMount: (query) => {
       if (!query.state.data) {
