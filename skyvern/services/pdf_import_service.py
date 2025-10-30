@@ -245,11 +245,13 @@ class PDFImportService:
                 "Failed to validate workflow request",
                 error=str(e),
                 error_type=type(e).__name__,
-                response_sample=str(response)[:1000],
                 organization_id=organization.organization_id,
                 exc_info=True,
             )
-            raise HTTPException(status_code=422, detail=f"Failed to validate workflow structure: {str(e)}")
+            raise HTTPException(
+                status_code=422,
+                detail=f"Failed to validate workflow structure: {e!s}",
+            ) from e
 
         # Return the validated request as a dict (caller will create the workflow)
         return workflow_create_request.model_dump(by_alias=True)
