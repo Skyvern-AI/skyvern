@@ -133,6 +133,7 @@ async def send_totp_code(
     openapi_extra={
         "x-fern-sdk-method-name": "get_totp_codes",
     },
+    include_in_schema=False,
 )
 @base_router.get(
     "/credentials/totp/",

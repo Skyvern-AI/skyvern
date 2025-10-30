@@ -102,7 +102,7 @@ function PushTotpCodeForm({
 
   const mutation = useMutation({
     mutationFn: async (payload: SendTotpCodeRequest) => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       return client.post("/credentials/totp", payload);
     },
     onSuccess: () => {

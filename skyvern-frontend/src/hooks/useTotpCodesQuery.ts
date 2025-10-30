@@ -52,7 +52,7 @@ function useTotpCodesQuery({
     queryKey: ["totpCodes", params],
     enabled,
     queryFn: async () => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.get<QueryFnData>("/credentials/totp", {
         params: searchParams,
       });
