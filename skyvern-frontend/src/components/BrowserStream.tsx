@@ -112,7 +112,7 @@ function BrowserStream({
   }
 
   useQuery({
-    queryKey: ["browserSession", browserSessionId],
+    queryKey: ["hasBrowserSession", browserSessionId],
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
 
