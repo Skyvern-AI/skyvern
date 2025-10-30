@@ -142,11 +142,10 @@ class PDFImportService:
             temp_file_path = temp_file.name
 
         try:
-            # Extract text from PDF
             reader = PdfReader(temp_file_path)
             sop_text = ""
             for page_num, page in enumerate(reader.pages, 1):
-                page_text = page.extract_text()
+                page_text = page.extract_text() or ""
                 sop_text += page_text + "\n"
                 LOG.debug("Extracted text from page", page=page_num, text_length=len(page_text))
 
@@ -156,6 +155,13 @@ class PDFImportService:
                 raise HTTPException(status_code=400, detail="No readable content found in the PDF.")
 
             return sop_text
+        except Exception as e:
+            LOG.warning(
+                "Failed to read/extract text from PDF",
+                filename=file_name,
+                error=str(e),
+            )
+            raise HTTPException(status_code=400, detail="Invalid or unreadable PDF file.") from e
         finally:
             # Clean up the temporary file
             os.unlink(temp_file_path)
