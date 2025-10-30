@@ -1,5 +1,5 @@
 import asyncio
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, Pattern, overload
 
 from playwright.async_api import Page
 
@@ -8,6 +8,7 @@ from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.config import settings
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
 from skyvern.library.SdkSkyvernPageAi import SdkSkyvernPageAi
+from skyvern.library.skyvern_locator import SkyvernLocator
 from skyvern.webeye.actions import handler_utils
 
 if TYPE_CHECKING:
@@ -29,7 +30,7 @@ class SkyvernPageRun:
         self._browser = browser
         self._page = page
 
-    async def run_task(
+    async def task(
         self,
         prompt: str,
         engine: RunEngine = RunEngine.skyvern_v2,
@@ -144,7 +145,7 @@ class SkyvernPageRun:
         workflow_run = await self._wait_for_run_completion(workflow_run.run_id, timeout)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
-    async def run_workflow(
+    async def workflow(
         self,
         workflow_id: str,
         parameters: dict[str, Any] | None = None,
@@ -239,6 +240,7 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str | None: ...
 
     @overload
@@ -249,6 +251,7 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str | None: ...
 
     async def click(
@@ -259,6 +262,7 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str | None:
         """Click an element using a CSS selector, AI-powered prompt matching, or both.
 
@@ -296,7 +300,7 @@ class SkyvernBrowserPage:
             if selector:
                 try:
                     locator = self._page.locator(selector)
-                    await locator.click(timeout=timeout)
+                    await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
                     error_to_raise = e
@@ -323,7 +327,7 @@ class SkyvernBrowserPage:
                 )
 
         if selector:
-            locator = self._page.locator(selector)
+            locator = self._page.locator(selector, **kwargs)
             await locator.click(timeout=timeout)
         return selector
 
@@ -437,12 +441,13 @@ class SkyvernBrowserPage:
     async def select_option(
         self,
         selector: str,
-        value: str,
+        value: str | None = None,
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str: ...
 
     @overload
@@ -455,6 +460,7 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str: ...
 
     async def select_option(
@@ -466,6 +472,7 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str:
         """Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
 
@@ -507,7 +514,7 @@ class SkyvernBrowserPage:
             if selector:
                 try:
                     locator = self._page.locator(selector)
-                    await locator.select_option(value, timeout=timeout)
+                    await locator.select_option(value, timeout=timeout, **kwargs)
                     return value
                 except Exception as e:
                     error_to_raise = e
@@ -533,7 +540,7 @@ class SkyvernBrowserPage:
             )
         if selector:
             locator = self._page.locator(selector)
-            await locator.select_option(value, timeout=timeout)
+            await locator.select_option(value, timeout=timeout, **kwargs)
         return value
 
     async def extract(
@@ -544,6 +551,35 @@ class SkyvernBrowserPage:
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
+        """Extract structured data from the page using AI.
+
+        Args:
+            prompt: Natural language description of what data to extract.
+            schema: JSON Schema defining the structure of data to extract.
+            error_code_mapping: Mapping of error codes to custom error messages.
+            intention: Additional context about the extraction intent.
+            data: Additional context data for AI processing.
+
+        Returns:
+            Extracted data matching the provided schema, or None if extraction fails.
+
+        Examples:
+            ```python
+            # Extract structured data with JSON Schema
+            result = await page.extract(
+                prompt="Extract product information",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Product name"},
+                        "price": {"type": "number", "description": "Product price"}
+                    },
+                    "required": ["name", "price"]
+                }
+            )
+            # Returns: {"name": "...", "price": 29.99}
+            ```
+        """
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
     async def reload(self, **kwargs: Any) -> None:
@@ -564,6 +600,101 @@ class SkyvernBrowserPage:
             bytes: The screenshot as bytes (unless path is specified, then saves to file).
         """
         return await self._page.screenshot(**kwargs)
+
+    def locator(self, selector: str, **kwargs: Any) -> SkyvernLocator:
+        """Find an element using a CSS selector or other selector syntax.
+
+        Args:
+            selector: CSS selector or other selector syntax (xpath=, text=, etc.).
+            **kwargs: Additional options like has, has_text, has_not, etc.
+
+        Returns:
+            SkyvernLocator object that can be used to perform actions or assertions.
+        """
+        return SkyvernLocator(self._page.locator(selector, **kwargs))
+
+    def get_by_label(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
+        """Find an input element by its associated label text.
+
+        Args:
+            text: Label text to search for (supports substring and regex matching).
+            **kwargs: Additional options like exact.
+
+        Returns:
+            SkyvernLocator object for the labeled input element.
+        """
+        return SkyvernLocator(self._page.get_by_label(text, **kwargs))
+
+    def get_by_text(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
+        """Find an element containing the specified text.
+
+        Args:
+            text: Text content to search for (supports substring and regex matching).
+            **kwargs: Additional options like exact.
+
+        Returns:
+            SkyvernLocator object for the element containing the text.
+        """
+        return SkyvernLocator(self._page.get_by_text(text, **kwargs))
+
+    def get_by_title(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
+        """Find an element by its title attribute.
+
+        Args:
+            text: Title attribute value to search for (supports substring and regex matching).
+            **kwargs: Additional options like exact.
+
+        Returns:
+            SkyvernLocator object for the element with matching title.
+        """
+        return SkyvernLocator(self._page.get_by_title(text, **kwargs))
+
+    def get_by_role(self, role: str, **kwargs: Any) -> SkyvernLocator:
+        """Find an element by its ARIA role.
+
+        Args:
+            role: ARIA role (e.g., "button", "textbox", "link").
+            **kwargs: Additional options like name, checked, pressed, etc.
+
+        Returns:
+            SkyvernLocator object for the element with matching role.
+        """
+        return SkyvernLocator(self._page.get_by_role(role, **kwargs))
+
+    def get_by_placeholder(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
+        """Find an input element by its placeholder text.
+
+        Args:
+            text: Placeholder text to search for (supports substring and regex matching).
+            **kwargs: Additional options like exact.
+
+        Returns:
+            SkyvernLocator object for the input element with matching placeholder.
+        """
+        return SkyvernLocator(self._page.get_by_placeholder(text, **kwargs))
+
+    def get_by_alt_text(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
+        """Find an element by its alt text (typically images).
+
+        Args:
+            text: Alt text to search for (supports substring and regex matching).
+            **kwargs: Additional options like exact.
+
+        Returns:
+            SkyvernLocator object for the element with matching alt text.
+        """
+        return SkyvernLocator(self._page.get_by_alt_text(text, **kwargs))
+
+    def get_by_test_id(self, test_id: str) -> SkyvernLocator:
+        """Find an element by its test ID attribute.
+
+        Args:
+            test_id: Test ID value to search for.
+
+        Returns:
+            SkyvernLocator object for the element with matching test ID.
+        """
+        return SkyvernLocator(self._page.get_by_test_id(test_id))
 
     async def _input_text(
         self,
