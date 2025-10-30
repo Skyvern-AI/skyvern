@@ -485,13 +485,10 @@ function Workflows() {
                   const isUploading = workflow.status === "importing";
 
                   return (
-                    <>
+                    <React.Fragment key={workflow.workflow_permanent_id}>
                       {/* Main workflow row */}
                       {isUploading ? (
-                        <TableRow
-                          key={workflow.workflow_permanent_id}
-                          className="opacity-70"
-                        >
+                        <TableRow className="opacity-70">
                           <TableCell colSpan={2}>
                             <div className="flex items-center gap-2">
                               <ReloadIcon className="h-4 w-4 animate-spin text-blue-400" />
@@ -522,10 +519,7 @@ function Workflows() {
                           </TableCell>
                         </TableRow>
                       ) : (
-                        <TableRow
-                          key={workflow.workflow_permanent_id}
-                          className="cursor-pointer"
-                        >
+                        <TableRow className="cursor-pointer">
                           <TableCell
                             onClick={(event) => {
                               handleRowClick(
@@ -720,7 +714,7 @@ function Workflows() {
                           </TableCell>
                         </TableRow>
                       )}
-                    </>
+                    </React.Fragment>
                   );
                 })
               )}
