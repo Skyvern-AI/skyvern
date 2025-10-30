@@ -595,6 +595,22 @@ async def create_workflow_from_prompt(
     return workflow.model_dump(by_alias=True)
 
 
+async def _validate_file_size(file: UploadFile) -> UploadFile:
+    try:
+        file.file.seek(0, 2)  # Move the pointer to the end of the file
+        size = file.file.tell()  # Get the current position of the pointer, which represents the file size
+        file.file.seek(0)  # Reset the pointer back to the beginning
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Could not determine file size.") from e
+
+    if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE / 1024 / 1024} MB)",
+        )
+    return file
+
+
 @legacy_base_router.post(
     "/workflows/import-pdf",
     response_model=dict[str, Any],
@@ -627,8 +643,8 @@ async def create_workflow_from_prompt(
     include_in_schema=False,
 )
 async def import_workflow_from_pdf(
-    file: UploadFile,
     background_tasks: BackgroundTasks,
+    file: UploadFile = Depends(_validate_file_size),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
@@ -638,8 +654,12 @@ async def import_workflow_from_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    file_contents = await file.read()
-    file_name = file.filename
+    try:
+        file_contents = await file.read()
+        file_name = file.filename
+    finally:
+        # Release underlying SpooledTemporaryFile ASAP
+        await file.close()
 
     # Extract text and validate synchronously (fast, ~1-2 seconds)
     try:
@@ -2423,22 +2443,6 @@ async def get_api_keys(
     if org_auth_token:
         api_keys.append(org_auth_token)
     return GetOrganizationAPIKeysResponse(api_keys=api_keys)
-
-
-async def _validate_file_size(file: UploadFile) -> UploadFile:
-    try:
-        file.file.seek(0, 2)  # Move the pointer to the end of the file
-        size = file.file.tell()  # Get the current position of the pointer, which represents the file size
-        file.file.seek(0)  # Reset the pointer back to the beginning
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Could not determine file size.") from e
-
-    if size > app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File size exceeds the maximum allowed size ({app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE / 1024 / 1024} MB)",
-        )
-    return file
 
 
 @legacy_base_router.post(
