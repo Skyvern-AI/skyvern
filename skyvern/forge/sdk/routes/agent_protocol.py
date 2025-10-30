@@ -712,7 +712,7 @@ async def import_workflow_from_pdf(
 
             # Provide sanitized user-facing error message (don't expose internal details/PII)
             sanitized_error = "Import failed. Please verify the PDF content and try again."
-            
+
             # Mark v1 as import_failed with sanitized error
             await app.DATABASE.update_workflow(
                 workflow_id=empty_workflow.workflow_id,
