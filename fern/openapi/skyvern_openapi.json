@@ -2317,6 +2317,9 @@
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
           },
+          "404": {
+            "description": "Workflow run or workflow not found"
+          },
           "400": {
             "description": "Invalid operation"
           },
@@ -9733,6 +9736,26 @@
             "description": "The workflow run ID used for this action"
           },
           "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object"
+              },
+              {
+                "type": "array"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Result",
             "description": "The result from the action (e.g., selector, value, extracted data)"
           }

@@ -1,4 +1,4 @@
-import json
+from typing import Any
 
 import structlog
 from fastapi import Depends, HTTPException, status
@@ -95,8 +95,8 @@ async def run_sdk_action(
     task = await app.DATABASE.create_task(
         organization_id=organization_id,
         url=action_request.url,
-        navigation_goal=None,
-        navigation_payload=None,
+        navigation_goal=action.intention,
+        navigation_payload=action.data,
         data_extraction_goal=None,
         title=f"SDK Action Task: {action_request.action.type}",
         workflow_run_id=workflow_run.workflow_run_id,
@@ -118,6 +118,18 @@ async def run_sdk_action(
         task_id=task.task_id,
     )
 
+    await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+        organization,
+        workflow_run.workflow_run_id,
+        workflow.title,
+        workflow.workflow_id,
+        workflow.workflow_permanent_id,
+        [],
+        [],
+        [],
+        [],
+    )
+
     context = skyvern_context.ensure_context()
     skyvern_context.set(
         SkyvernContext(
@@ -131,7 +143,7 @@ async def run_sdk_action(
             workflow_run_id=workflow_run.workflow_run_id,
         )
     )
-    result = None
+    result: Any | None = None
     try:
         scraped_page = await SkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
         page = await scraped_page._browser_state.must_get_working_page()
@@ -170,7 +182,7 @@ async def run_sdk_action(
                 intention=action.intention,
                 data=action.data,
             )
-            result = json.dumps(extract_result)
+            result = extract_result
     finally:
         skyvern_context.reset()
 
