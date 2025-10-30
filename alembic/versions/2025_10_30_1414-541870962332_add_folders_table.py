@@ -34,6 +34,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(
             ["organization_id"],
             ["organizations.organization_id"],
+            ondelete="CASCADE",
         ),
     )
 
@@ -69,6 +70,7 @@ def upgrade() -> None:
         "folders",
         ["folder_id"],
         ["folder_id"],
+        ondelete="SET NULL",
     )
     # ### end Alembic commands ###
 
