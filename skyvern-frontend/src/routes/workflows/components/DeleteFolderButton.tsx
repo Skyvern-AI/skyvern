@@ -19,7 +19,7 @@ import {
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useDeleteFolderMutation } from "../hooks/useFolderMutations";
 
 type Props = {
@@ -39,9 +39,9 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
   } = useDeleteFolderMutation();
 
   // Close dialog when deletion succeeds
-  if (isDeleteFolderSuccess && isDialogOpen) {
-    setIsDialogOpen(false);
-  }
+  useEffect(() => {
+    if (isDeleteFolderSuccess) setIsDialogOpen(false);
+  }, [isDeleteFolderSuccess]);
 
   const handleDelete = () => {
     const deleteWorkflows = deleteOption === "folder_and_workflows";
