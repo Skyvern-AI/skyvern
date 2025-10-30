@@ -1105,7 +1105,7 @@ async def delete_folder(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
     tags=["Workflows"],
-    description="Update a workflow's folder assignment for all versions",
+    description="Update a workflow's folder assignment for the latest version",
     summary="Update workflow folder",
     responses={
         200: {"description": "Successfully updated workflow folder"},
@@ -1132,7 +1132,7 @@ async def update_workflow_folder(
 
         return workflow
     except ValueError as e:
-        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e))
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
 
 @legacy_base_router.post(
