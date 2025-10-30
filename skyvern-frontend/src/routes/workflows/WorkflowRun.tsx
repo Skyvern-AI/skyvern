@@ -21,7 +21,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import {
   CodeIcon,
   FileIcon,
@@ -312,20 +312,34 @@ function WorkflowRun() {
 
           <div className="flex gap-2">
             <ApiWebhookActionsMenu
-              getOptions={() =>
-                ({
+              getOptions={() => {
+                // Build headers - x-max-steps-override is optional and can be added manually if needed
+                const headers: Record<string, string> = {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                };
+
+                const body: Record<string, unknown> = {
+                  workflow_id: workflowPermanentId,
+                  parameters: workflowRun?.parameters,
+                  proxy_location: proxyLocation,
+                };
+
+                if (maxScreenshotScrolls !== null) {
+                  body.max_screenshot_scrolls = maxScreenshotScrolls;
+                }
+
+                if (workflowRun?.webhook_callback_url) {
+                  body.webhook_url = workflowRun.webhook_callback_url;
+                }
+
+                return {
                   method: "POST",
-                  url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                  body: {
-                    data: workflowRun?.parameters,
-                    proxy_location: "RESIDENTIAL",
-                  },
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiCredential ?? "<your-api-key>",
-                  },
-                }) satisfies ApiCommandOptions
-              }
+                  url: `${runsApiBaseUrl}/run/workflows`,
+                  body,
+                  headers,
+                } satisfies ApiCommandOptions;
+              }}
               webhookDisabled={workflowRunIsLoading || !workflowRunIsFinalized}
               onTestWebhook={() => setReplayOpen(true)}
             />
