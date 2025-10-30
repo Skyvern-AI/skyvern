@@ -2391,7 +2391,7 @@ class ForgeAgent:
         # log the task status as an event
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
-        # Add task completion tag to Laminar trace
+        # Add task completion tag to trace
         TraceManager.add_task_completion_tag(task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state

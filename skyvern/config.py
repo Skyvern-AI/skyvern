@@ -361,7 +361,7 @@ class Settings(BaseSettings):
 
     # Trace settings
     TRACE_ENABLED: bool = False
-    TRACE_PROVIDER: str = "lmnr"
+    TRACE_PROVIDER: str = ""
     TRACE_PROVIDER_HOST: str | None = None
     TRACE_PROVIDER_API_KEY: str = "fillmein"
 
