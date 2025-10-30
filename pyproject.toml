@@ -30,6 +30,7 @@ dependencies = [
     "cachetools>=5.3.2,<6",
     "aioboto3>=14.3.0,<15",
     "asyncache>=0.3.1,<0.4",
+    "orjson>=3.9.10,<4",
     "structlog>=23.2.0,<24",
     "typer>=0.16.0",
     "httpx[socks]>=0.27.0",
