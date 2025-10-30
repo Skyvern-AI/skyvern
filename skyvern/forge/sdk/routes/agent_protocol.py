@@ -648,10 +648,12 @@ async def import_workflow_from_pdf(
         # Re-raise validation errors immediately
         raise
 
-    # Validation passed! Create import record in database
-    import_record = await app.DATABASE.create_workflow_import(
+    # Validation passed! Create empty workflow v1 with status='importing'
+    empty_workflow = await app.DATABASE.create_workflow(
+        title=f"Importing {file_name}",
+        workflow_definition={"parameters": [], "blocks": []},
         organization_id=current_org.organization_id,
-        file_name=file_name,
+        status=WorkflowStatus.importing,
     )
 
     # Process PDF import in background (LLM call is the slow part)
@@ -659,33 +661,38 @@ async def import_workflow_from_pdf(
         try:
             # Create workflow from extracted text (LLM processing)
             result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
-            workflow_id = result.get("workflow_permanent_id")
 
-            if not workflow_id:
-                raise ValueError("workflow_permanent_id not returned from PDF import")
-
-            # Mark as completed
-            await app.DATABASE.mark_workflow_import_completed(
-                import_id=import_record.import_id,
-                organization_id=current_org.organization_id,
-                workflow_id=workflow_id,
+            # Create v2 with real content
+            await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=current_org,
+                request=WorkflowCreateYAMLRequest.model_validate(result),
+                workflow_permanent_id=empty_workflow.workflow_permanent_id,
             )
+
+            # Update v1 status to published (v1 won't show in list since v2 is latest version)
+            await app.DATABASE.update_workflow(
+                workflow_id=empty_workflow.workflow_id,
+                organization_id=current_org.organization_id,
+                status=WorkflowStatus.published,
+            )
+
             LOG.info(
                 "Workflow import completed",
-                import_id=import_record.import_id,
-                workflow_id=workflow_id,
+                workflow_permanent_id=empty_workflow.workflow_permanent_id,
                 organization_id=current_org.organization_id,
             )
         except Exception as e:
-            # Mark as failed
-            await app.DATABASE.mark_workflow_import_failed(
-                import_id=import_record.import_id,
+            # Mark v1 as import_failed with error message
+            await app.DATABASE.update_workflow(
+                workflow_id=empty_workflow.workflow_id,
                 organization_id=current_org.organization_id,
-                error=str(e),
+                status=WorkflowStatus.import_failed,
+                import_error=str(e),
             )
+
             LOG.exception(
                 "Workflow import failed",
-                import_id=import_record.import_id,
+                workflow_permanent_id=empty_workflow.workflow_permanent_id,
                 error=str(e),
                 organization_id=current_org.organization_id,
             )
@@ -693,11 +700,11 @@ async def import_workflow_from_pdf(
     background_tasks.add_task(process_pdf_import)
 
     return {
-        "import_id": import_record.import_id,
+        "workflow_permanent_id": empty_workflow.workflow_permanent_id,
         "status": "importing",
         "file_name": file.filename,
         "organization_id": current_org.organization_id,
-        "created_at": import_record.created_at.isoformat(),
+        "created_at": empty_workflow.created_at.isoformat(),
     }
 
 
@@ -1102,42 +1109,6 @@ async def update_workflow_folder(
         return workflow
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-
-@legacy_base_router.get("/workflows/active-imports", response_model=list[dict[str, Any]], tags=["agent"])
-@legacy_base_router.get("/workflows/active-imports/", response_model=list[dict[str, Any]], include_in_schema=False)
-@base_router.get(
-    "/workflows/active-imports",
-    response_model=list[dict[str, Any]],
-    tags=["Workflows"],
-    description="Get all active workflow imports for the organization",
-    summary="Get active imports",
-    responses={
-        200: {"description": "Successfully retrieved active imports"},
-    },
-)
-@base_router.get("/workflows/active-imports/", response_model=list[dict[str, Any]], include_in_schema=False)
-async def get_active_workflow_imports(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> list[dict[str, Any]]:
-    """Get all active workflow imports."""
-    analytics.capture("skyvern-oss-workflow-active-imports-get")
-
-    imports = await app.DATABASE.get_active_workflow_imports(
-        organization_id=current_org.organization_id,
-    )
-
-    return [
-        {
-            "import_id": imp.import_id,
-            "status": imp.status,
-            "file_name": imp.file_name,
-            "workflow_id": imp.workflow_id,
-            "error": imp.error,
-            "created_at": imp.created_at.isoformat(),
-        }
-        for imp in imports
-    ]
 
 
 @legacy_base_router.post(
@@ -2196,6 +2167,7 @@ async def get_workflows(
     ),
     title: str = Query("", deprecated=True, description="Deprecated: use search_key instead."),
     folder_id: str | None = Query(None, description="Filter workflows by folder ID"),
+    status: Annotated[list[WorkflowStatus] | None, Query()] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
@@ -2214,6 +2186,9 @@ async def get_workflows(
     # Determine the effective search term: prioritize search_key, fallback to title
     effective_search = search_key or (title if title else None)
 
+    # Default to published and draft if no status filter provided
+    effective_statuses = status if status else [WorkflowStatus.published, WorkflowStatus.draft]
+
     if template:
         global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
         if not global_workflows_permanent_ids:
@@ -2223,7 +2198,7 @@ async def get_workflows(
             page=page,
             page_size=page_size,
             search_key=effective_search or "",
-            statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+            statuses=effective_statuses,
         )
         return workflows
 
@@ -2241,7 +2216,7 @@ async def get_workflows(
         only_workflows=only_workflows,
         search_key=effective_search,
         folder_id=folder_id,
-        statuses=[WorkflowStatus.published, WorkflowStatus.draft],
+        statuses=effective_statuses,
     )
 
 

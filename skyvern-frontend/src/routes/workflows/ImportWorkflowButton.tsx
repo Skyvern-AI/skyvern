@@ -49,6 +49,7 @@ function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
         queryKey: ["workflows"],
       });
       toast({
+        variant: "success",
         title: "Workflow imported",
         description: "Successfully imported workflow",
       });

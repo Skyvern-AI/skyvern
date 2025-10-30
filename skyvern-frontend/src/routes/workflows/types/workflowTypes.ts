@@ -560,6 +560,7 @@ export type WorkflowApiResponse = {
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
+  import_error: string | null;
 };
 
 export type WorkflowSettings = {

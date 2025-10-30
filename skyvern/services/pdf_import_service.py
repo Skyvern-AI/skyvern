@@ -8,7 +8,6 @@ from fastapi import HTTPException
 from pypdf import PdfReader
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -162,7 +161,7 @@ class PDFImportService:
             os.unlink(temp_file_path)
 
     async def create_workflow_from_sop_text(self, sop_text: str, organization: Organization) -> dict[str, Any]:
-        """Convert SOP text to workflow using LLM and create it."""
+        """Convert SOP text to workflow definition using LLM (does not create the workflow)."""
         # Load and render the prompt template
         prompt = prompt_engine.load_prompt(
             "build-workflow-from-pdf",
@@ -224,23 +223,17 @@ class PDFImportService:
             )
             raise HTTPException(status_code=422, detail="LLM workflow definition missing 'blocks' field")
 
-        LOG.info(
-            "Workflow JSON validated",
-            title=response.get("title"),
-            block_count=len(response.get("workflow_definition", {}).get("blocks", [])),
-            organization_id=organization.organization_id,
-        )
-
-        LOG.info(
-            "Creating workflow from JSON",
-            response_keys=list(response.keys()),
-            organization_id=organization.organization_id,
-        )
-
         try:
             # Sanitize LLM output for Jinja and required fields before validation
             response = self._sanitize_workflow_json(response)
             workflow_create_request = WorkflowCreateYAMLRequest.model_validate(response)
+
+            LOG.info(
+                "Workflow JSON validated successfully",
+                title=response.get("title"),
+                block_count=len(response.get("workflow_definition", {}).get("blocks", [])),
+                organization_id=organization.organization_id,
+            )
         except Exception as e:
             LOG.error(
                 "Failed to validate workflow request",
@@ -252,45 +245,8 @@ class PDFImportService:
             )
             raise HTTPException(status_code=422, detail=f"Failed to validate workflow structure: {str(e)}")
 
-        try:
-            workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
-                organization=organization,
-                request=workflow_create_request,
-            )
-        except Exception as e:
-            LOG.error(
-                "Failed to create workflow",
-                error=str(e),
-                error_type=type(e).__name__,
-                organization_id=organization.organization_id,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=422, detail=f"Failed to create workflow: {str(e)}")
-
-        workflow_dict = workflow.model_dump(by_alias=True)
-        LOG.info(
-            "PDF import completed successfully",
-            workflow_id=workflow.workflow_permanent_id,
-            workflow_permanent_id_in_dict=workflow_dict.get("workflow_permanent_id"),
-            dict_keys=list(workflow_dict.keys()),
-            organization_id=organization.organization_id,
-        )
-        return workflow_dict
-
-    async def import_workflow_from_pdf(
-        self, file_contents: bytes, file_name: str, organization: Organization
-    ) -> dict[str, Any]:
-        """Import a workflow from PDF file contents (full process)."""
-        LOG.info("Starting PDF import", filename=file_name, organization_id=organization.organization_id)
-
-        if not file_name.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-        # Extract text (sync validation)
-        sop_text = self.extract_text_from_pdf(file_contents, file_name)
-
-        # Process with LLM (slow part)
-        return await self.create_workflow_from_sop_text(sop_text, organization)
+        # Return the validated request as a dict (caller will create the workflow)
+        return workflow_create_request.model_dump(by_alias=True)
 
 
 pdf_import_service = PDFImportService()

@@ -84,6 +84,7 @@ class Workflow(BaseModel):
     run_sequentially: bool | None = None
     sequential_key: str | None = None
     folder_id: str | None = None
+    import_error: str | None = None
 
     created_at: datetime
     modified_at: datetime

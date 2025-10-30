@@ -43,7 +43,6 @@ from skyvern.forge.sdk.db.models import (
     TaskV2Model,
     ThoughtModel,
     TOTPCodeModel,
-    WorkflowImportModel,
     WorkflowModel,
     WorkflowParameterModel,
     WorkflowRunBlockModel,
@@ -1773,6 +1772,8 @@ class AgentDB:
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
+        status: str | None = None,
+        import_error: str | None = None,
     ) -> Workflow:
         try:
             async with self.Session() as session:
@@ -1794,6 +1795,10 @@ class AgentDB:
                         workflow.run_with = run_with
                     if cache_key is not None:
                         workflow.cache_key = cache_key
+                    if status is not None:
+                        workflow.status = status
+                    if import_error is not None:
+                        workflow.import_error = import_error
                     await session.commit()
                     await session.refresh(workflow)
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -2103,136 +2108,6 @@ class AgentDB:
                 return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError in update_workflow_folder", exc_info=True)
-            raise
-
-    async def create_workflow_import(
-        self,
-        organization_id: str,
-        file_name: str | None = None,
-    ) -> WorkflowImportModel:
-        """Create a new workflow import record."""
-        try:
-            async with self.Session() as session:
-                workflow_import = WorkflowImportModel(
-                    organization_id=organization_id,
-                    file_name=file_name,
-                    status="importing",
-                )
-                session.add(workflow_import)
-                await session.commit()
-                await session.refresh(workflow_import)
-                return workflow_import
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in create_workflow_import", exc_info=True)
-            raise
-
-    async def get_workflow_import(
-        self,
-        import_id: str,
-        organization_id: str,
-    ) -> WorkflowImportModel | None:
-        """Get a workflow import by ID."""
-        try:
-            async with self.Session() as session:
-                stmt = select(WorkflowImportModel).filter_by(import_id=import_id, organization_id=organization_id)
-                result = await session.execute(stmt)
-                return result.scalar_one_or_none()
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in get_workflow_import", exc_info=True)
-            raise
-
-    async def get_active_workflow_imports(
-        self,
-        organization_id: str,
-    ) -> list[WorkflowImportModel]:
-        """Get all active (importing), recently completed, and recently failed workflow imports."""
-        try:
-            async with self.Session() as session:
-                # Get importing imports + completed/failed imports from last 10 seconds
-                recent_cutoff = datetime.utcnow() - timedelta(seconds=10)
-
-                stmt = (
-                    select(WorkflowImportModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter(
-                        or_(
-                            WorkflowImportModel.status == "importing",
-                            and_(
-                                WorkflowImportModel.status.in_(["completed", "failed"]),
-                                WorkflowImportModel.completed_at >= recent_cutoff,  # Check COMPLETION time
-                            ),
-                        )
-                    )
-                    .order_by(WorkflowImportModel.created_at.desc())
-                )
-                result = await session.execute(stmt)
-                return list(result.scalars().all())
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in get_active_workflow_imports", exc_info=True)
-            raise
-
-    async def mark_workflow_import_completed(
-        self,
-        import_id: str,
-        organization_id: str,
-        workflow_id: str,
-    ) -> WorkflowImportModel | None:
-        """Mark a workflow import as completed."""
-        try:
-            async with self.Session() as session:
-                workflow_import = await self.get_workflow_import(import_id, organization_id)
-                if not workflow_import:
-                    return None
-
-                workflow_import.status = "completed"
-                workflow_import.workflow_id = workflow_id
-                workflow_import.completed_at = datetime.utcnow()  # Track when it completed
-                session.add(workflow_import)
-                await session.commit()
-                await session.refresh(workflow_import)
-                return workflow_import
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in mark_workflow_import_completed", exc_info=True)
-            raise
-
-    async def mark_workflow_import_failed(
-        self,
-        import_id: str,
-        organization_id: str,
-        error: str,
-    ) -> WorkflowImportModel | None:
-        """Mark a workflow import as failed."""
-        try:
-            async with self.Session() as session:
-                workflow_import = await self.get_workflow_import(import_id, organization_id)
-                if not workflow_import:
-                    return None
-
-                workflow_import.status = "failed"
-                workflow_import.error = error
-                workflow_import.completed_at = datetime.utcnow()  # Track when it failed
-                session.add(workflow_import)
-                await session.commit()
-                await session.refresh(workflow_import)
-                return workflow_import
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in mark_workflow_import_failed", exc_info=True)
-            raise
-
-    async def delete_old_workflow_imports(
-        self,
-        max_age_hours: int = 1,
-    ) -> int:
-        """Delete workflow import records older than max_age_hours."""
-        try:
-            async with self.Session() as session:
-                cutoff_time = datetime.utcnow() - timedelta(hours=max_age_hours)
-                stmt = delete(WorkflowImportModel).where(WorkflowImportModel.created_at < cutoff_time)
-                result = await session.execute(stmt)
-                await session.commit()
-                return result.rowcount  # type: ignore
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError in delete_old_workflow_imports", exc_info=True)
             raise
 
     async def create_workflow_run(

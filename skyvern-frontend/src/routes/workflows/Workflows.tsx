@@ -96,6 +96,11 @@ function Workflows() {
   // Fetch folders
   const { data: allFolders = [] } = useFoldersQuery({ page_size: 10 });
 
+  // Create folders map for O(1) lookup
+  const foldersMap = useMemo(() => {
+    return new Map(allFolders.map((f) => [f.folder_id, f]));
+  }, [allFolders]);
+
   // Sort folders by modified date (most recent first) and get top 5
   const recentFolders = useMemo(() => {
     return [...allFolders]
@@ -168,26 +173,30 @@ function Workflows() {
   const isNextDisabled =
     isFetching || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
+  // Check if a specific parameter matches the search
+  const parameterMatchesSearch = (param: any): boolean => {
+    if (!debouncedSearch.trim()) return false;
+    const lowerQuery = debouncedSearch.toLowerCase();
+
+    const keyMatch = param.key?.toLowerCase().includes(lowerQuery);
+    const descMatch = param.description?.toLowerCase().includes(lowerQuery);
+    const valueMatch =
+      param.parameter_type === "workflow" &&
+      param.default_value &&
+      String(param.default_value).toLowerCase().includes(lowerQuery);
+
+    return keyMatch || descMatch || valueMatch;
+  };
+
   // Auto-expand rows when parameters match search
   const autoExpandedRows = useMemo(() => {
     if (!debouncedSearch.trim()) return new Set<string>();
 
     const expanded = new Set<string>();
-    const lowerQuery = debouncedSearch.toLowerCase();
 
     workflows.forEach((workflow) => {
       const hasParameterMatch = workflow.workflow_definition.parameters?.some(
-        (param) => {
-          const keyMatch = param.key?.toLowerCase().includes(lowerQuery);
-          const descMatch = param.description
-            ?.toLowerCase()
-            .includes(lowerQuery);
-          const valueMatch =
-            param.parameter_type === "workflow" &&
-            param.default_value &&
-            String(param.default_value).toLowerCase().includes(lowerQuery);
-          return keyMatch || descMatch || valueMatch;
-        },
+        (param) => parameterMatchesSearch(param),
       );
 
       if (hasParameterMatch) {
@@ -211,21 +220,6 @@ function Workflows() {
       newExpanded.add(workflowId);
     }
     setManuallyExpandedRows(newExpanded);
-  };
-
-  // Check if a specific parameter matches the search
-  const parameterMatchesSearch = (param: any): boolean => {
-    if (!debouncedSearch.trim()) return false;
-    const lowerQuery = debouncedSearch.toLowerCase();
-
-    const keyMatch = param.key?.toLowerCase().includes(lowerQuery);
-    const descMatch = param.description?.toLowerCase().includes(lowerQuery);
-    const valueMatch =
-      param.parameter_type === "workflow" &&
-      param.default_value &&
-      String(param.default_value).toLowerCase().includes(lowerQuery);
-
-    return keyMatch || descMatch || valueMatch;
   };
 
   function handleRowClick(
@@ -274,41 +268,14 @@ function Workflows() {
     setParamPatch({ page: String(page + 1) });
   }
 
-  // Create placeholder workflows from active imports (only on page 1, only for "importing" status)
+  // Show importing workflows from polling hook (only on page 1)
   const displayWorkflows = useMemo(() => {
     const importingOnly = activeImports.filter(
       (imp) => imp.status === "importing",
     );
+
     if (page === 1 && importingOnly.length > 0) {
-      const placeholders: WorkflowApiResponse[] = importingOnly.map((imp) => ({
-        workflow_id: imp.import_id,
-        workflow_permanent_id: imp.import_id,
-        organization_id: "",
-        is_saved_task: false,
-        title: `Importing ${imp.file_name || "workflow"}...`,
-        version: 1,
-        description: "",
-        workflow_definition: { parameters: [], blocks: [] },
-        proxy_location: null,
-        webhook_callback_url: null,
-        extra_http_headers: null,
-        persist_browser_session: false,
-        model: null,
-        totp_verification_url: null,
-        totp_identifier: null,
-        max_screenshot_scrolls: null,
-        status: null,
-        created_at: imp.created_at,
-        modified_at: imp.created_at,
-        deleted_at: null,
-        run_with: null,
-        cache_key: null,
-        ai_fallback: null,
-        run_sequentially: null,
-        sequential_key: null,
-        folder_id: null,
-      }));
-      return [...placeholders, ...workflows];
+      return [...importingOnly, ...workflows];
     }
     return workflows;
   }, [activeImports, workflows, page]);
@@ -512,12 +479,8 @@ function Workflows() {
                   const isExpanded = expandedRows.has(
                     workflow.workflow_permanent_id,
                   );
-                  // Check if this is an importing placeholder
-                  const isUploading = activeImports.some(
-                    (imp) =>
-                      imp.import_id === workflow.workflow_permanent_id &&
-                      imp.status === "importing",
-                  );
+                  // Check if this is an importing workflow
+                  const isUploading = workflow.status === "importing";
 
                   return (
                     <>
@@ -601,10 +564,8 @@ function Workflows() {
                                 <span className="text-sm">
                                   <HighlightText
                                     text={
-                                      allFolders.find(
-                                        (f) =>
-                                          f.folder_id === workflow.folder_id,
-                                      )?.title || workflow.folder_id
+                                      foldersMap.get(workflow.folder_id)
+                                        ?.title || workflow.folder_id
                                     }
                                     query={debouncedSearch}
                                   />
