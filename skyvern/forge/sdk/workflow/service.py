@@ -1465,7 +1465,7 @@ class WorkflowService:
             workflow_status="completed",
         )
 
-        # Add workflow completion tag to Laminar trace
+        # Add workflow completion tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.completed)
 
         return await self._update_workflow_run_status(
@@ -1487,7 +1487,7 @@ class WorkflowService:
             failure_reason=failure_reason,
         )
 
-        # Add workflow failure tag to Laminar trace
+        # Add workflow failure tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.failed)
 
         return await self._update_workflow_run_status(
@@ -1523,7 +1523,7 @@ class WorkflowService:
             failure_reason=failure_reason,
         )
 
-        # Add workflow terminated tag to Laminar trace
+        # Add workflow terminated tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.terminated)
 
         return await self._update_workflow_run_status(
@@ -1540,7 +1540,7 @@ class WorkflowService:
             workflow_status="canceled",
         )
 
-        # Add workflow canceled tag to Laminar trace
+        # Add workflow canceled tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.canceled)
 
         return await self._update_workflow_run_status(
@@ -1561,7 +1561,7 @@ class WorkflowService:
             workflow_status="timed_out",
         )
 
-        # Add workflow timed out tag to Laminar trace
+        # Add workflow timed out tag to trace
         TraceManager.add_task_completion_tag(WorkflowRunStatus.timed_out)
 
         return await self._update_workflow_run_status(

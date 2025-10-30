@@ -1516,7 +1516,7 @@ async def mark_task_v2_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
         )
 
-    # Add task failure tag to Laminar trace
+    # Add task failure tag to trace
     TraceManager.add_task_completion_tag("failed")
 
     await send_task_v2_webhook(task_v2)
@@ -1540,7 +1540,7 @@ async def mark_task_v2_as_completed(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
-    # Add task completion tag to Laminar trace
+    # Add task completion tag to trace
     TraceManager.add_task_completion_tag("completed")
 
     await send_task_v2_webhook(task_v2)
@@ -1560,7 +1560,7 @@ async def mark_task_v2_as_canceled(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
-    # Add task canceled tag to Laminar trace
+    # Add task canceled tag to trace
     TraceManager.add_task_completion_tag("canceled")
 
     await send_task_v2_webhook(task_v2)
@@ -1581,7 +1581,7 @@ async def mark_task_v2_as_terminated(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
 
-    # Add task terminated tag to Laminar trace
+    # Add task terminated tag to trace
     TraceManager.add_task_completion_tag("terminated")
 
     await send_task_v2_webhook(task_v2)
@@ -1602,7 +1602,7 @@ async def mark_task_v2_as_timed_out(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
 
-    # Add task timed out tag to Laminar trace
+    # Add task timed out tag to trace
     TraceManager.add_task_completion_tag("timed_out")
 
     await send_task_v2_webhook(task_v2)
