@@ -226,7 +226,7 @@ class FolderModel(Base):
     )
 
     folder_id = Column(String, primary_key=True, default=generate_folder_id)
-    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
     title = Column(String, nullable=False)
     description = Column(String, nullable=True)
 
@@ -274,7 +274,7 @@ class WorkflowModel(Base):
     cache_key = Column(String, nullable=True)
     run_sequentially = Column(Boolean, nullable=True)
     sequential_key = Column(String, nullable=True)
-    folder_id = Column(String, ForeignKey("folders.folder_id"), nullable=True, index=True)
+    folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True, index=True)
     import_error = Column(String, nullable=True)  # Error message if import failed
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
