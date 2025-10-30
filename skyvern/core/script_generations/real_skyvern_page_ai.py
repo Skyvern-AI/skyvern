@@ -137,6 +137,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
             payload_str = _get_context_data(data)
             refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
             element_tree = refreshed_page.build_element_tree()
+
+            organization_id = context.organization_id if context else None
+            step_id = context.step_id if context else None
+            step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
             single_click_prompt = prompt_engine.load_prompt(
                 template="single-click-action",
                 navigation_goal=intention,
@@ -149,15 +153,13 @@ class RealSkyvernPageAi(SkyvernPageAi):
             json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
                 prompt=single_click_prompt,
                 prompt_name="single-click-action",
+                step=step,
                 organization_id=context.organization_id,
             )
             actions_json = json_response.get("actions", [])
             if actions_json:
-                organization_id = context.organization_id if context else None
                 task_id = context.task_id if context else None
-                step_id = context.step_id if context else None
                 task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
-                step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
                 if organization_id and task and step:
                     actions = parse_actions(
                         task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
@@ -241,6 +243,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
                     prompt=script_generation_input_text_prompt,
                     prompt_name="script-generation-input-text-generatiion",
+                    step=step,
                     organization_id=organization_id,
                 )
                 value = json_response.get("answer", value)
@@ -342,6 +345,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     json_response = await app.SELECT_AGENT_LLM_API_HANDLER(
                         prompt=single_select_prompt,
                         prompt_name="single-select-action",
+                        step=step,
                         organization_id=context.organization_id if context else None,
                     )
                     actions = parse_actions(
