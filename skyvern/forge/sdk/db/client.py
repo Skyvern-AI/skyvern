@@ -2130,17 +2130,15 @@ class AgentDB:
                 if workflow_model:
                     workflow_model.folder_id = folder_id
                     workflow_model.modified_at = datetime.utcnow()
+
+                    # Update folder's modified_at in the same transaction
+                    if folder_id:
+                        folder_model = await session.get(FolderModel, folder_id)
+                        if folder_model:
+                            folder_model.modified_at = datetime.utcnow()
+
                     await session.commit()
                     await session.refresh(workflow_model)
-
-                    # Update folder's modified_at after successful workflow update
-                    if folder_id:
-                        async with self.Session() as folder_session:
-                            folder_model = await folder_session.get(FolderModel, folder_id)
-                            if folder_model:
-                                folder_model.modified_at = datetime.utcnow()
-                                await folder_session.commit()
-                                await folder_session.refresh(folder_model)
 
                     return convert_to_workflow(workflow_model, self.debug_enabled)
                 return None
