@@ -1992,23 +1992,57 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 # Check if folder exists
-                folder = await self.get_folder(folder_id, organization_id)
+                folder_stmt = (
+                    select(FolderModel)
+                    .filter_by(folder_id=folder_id, organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+                folder_result = await session.execute(folder_stmt)
+                folder = folder_result.scalar_one_or_none()
                 if not folder:
                     return False
 
                 # If delete_workflows is True, delete all workflows in the folder
                 if delete_workflows:
-                    workflow_permanent_ids = await self.get_workflow_permanent_ids_in_folder(
-                        folder_id=folder_id,
-                        organization_id=organization_id,
+                    # Get workflow permanent IDs in the folder (inline logic)
+                    subquery = (
+                        select(
+                            WorkflowModel.organization_id,
+                            WorkflowModel.workflow_permanent_id,
+                            func.max(WorkflowModel.version).label("max_version"),
+                        )
+                        .where(WorkflowModel.organization_id == organization_id)
+                        .where(WorkflowModel.deleted_at.is_(None))
+                        .group_by(
+                            WorkflowModel.organization_id,
+                            WorkflowModel.workflow_permanent_id,
+                        )
+                        .subquery()
                     )
 
-                    # Delete each workflow by permanent ID
-                    for workflow_permanent_id in workflow_permanent_ids:
-                        await self.soft_delete_workflow_by_permanent_id(
-                            workflow_permanent_id=workflow_permanent_id,
-                            organization_id=organization_id,
+                    workflow_permanent_ids_stmt = (
+                        select(WorkflowModel.workflow_permanent_id)
+                        .join(
+                            subquery,
+                            (WorkflowModel.organization_id == subquery.c.organization_id)
+                            & (WorkflowModel.workflow_permanent_id == subquery.c.workflow_permanent_id)
+                            & (WorkflowModel.version == subquery.c.max_version),
                         )
+                        .where(WorkflowModel.folder_id == folder_id)
+                    )
+                    result = await session.execute(workflow_permanent_ids_stmt)
+                    workflow_permanent_ids = list(result.scalars().all())
+
+                    # Soft delete all workflows with these permanent IDs in a single bulk update
+                    if workflow_permanent_ids:
+                        update_workflows_query = (
+                            update(WorkflowModel)
+                            .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
+                            .where(WorkflowModel.organization_id == organization_id)
+                            .where(WorkflowModel.deleted_at.is_(None))
+                            .values(deleted_at=datetime.utcnow())
+                        )
+                        await session.execute(update_workflows_query)
                 else:
                     # Just remove folder_id from all workflows in this folder
                     update_workflows_query = (
@@ -2021,7 +2055,6 @@ class AgentDB:
 
                 # Soft delete the folder
                 folder.deleted_at = datetime.utcnow()
-                session.add(folder)
                 await session.commit()
                 return True
         except SQLAlchemyError:
