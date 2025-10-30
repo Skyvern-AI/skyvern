@@ -10409,6 +10409,9 @@
                 "$ref": "#/components/schemas/SelectOptionAction"
               },
               {
+                "$ref": "#/components/schemas/UploadFileAction"
+              },
+              {
                 "$ref": "#/components/schemas/ActAction"
               },
               {
@@ -10424,6 +10427,7 @@
                 "ai_click": "#/components/schemas/ClickAction",
                 "ai_input_text": "#/components/schemas/InputTextAction",
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
+                "ai_upload_file": "#/components/schemas/UploadFileAction",
                 "extract": "#/components/schemas/ExtractAction"
               }
             }
@@ -10690,6 +10694,73 @@
         "type": "object",
         "title": "SelectOptionAction",
         "description": "Select option action parameters."
+      },
+      "UploadFileAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_upload_file",
+            "title": "Type",
+            "default": "ai_upload_file"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "file_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Url",
+            "description": "File URL for upload",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the upload",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "UploadFileAction",
+        "description": "Upload file action parameters."
       },
       "SendEmailBlock": {
         "properties": {

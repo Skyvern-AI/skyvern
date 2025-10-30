@@ -7,6 +7,7 @@ from skyvern.client.types.sdk_action import (
     SdkAction_AiClick,
     SdkAction_AiInputText,
     SdkAction_AiSelectOption,
+    SdkAction_AiUploadFile,
     SdkAction_Extract,
 )
 from skyvern.config import settings
@@ -113,12 +114,30 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     async def ai_upload_file(
         self,
         selector: str | None,
-        files: str,
+        files: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        public_url_only: bool = False,
     ) -> str:
-        raise NotImplementedError("Upload is not supported yet")
+        """Upload a file using AI via API call."""
+
+        await self._browser.sdk.ensure_has_server()
+        response = await self._browser.client.run_sdk_action(
+            url=self._page.url,
+            action=SdkAction_AiUploadFile(
+                selector=selector,
+                file_url=files,
+                intention=intention,
+                data=data,
+                timeout=timeout,
+            ),
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
+            workflow_run_id=self._browser.workflow_run_id,
+        )
+        self._browser.workflow_run_id = response.workflow_run_id
+        return response.result if response.result else files or ""
 
     async def ai_extract(
         self,

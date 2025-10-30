@@ -299,6 +299,7 @@ if typing.TYPE_CHECKING:
         RunSdkActionRequestAction_AiClick,
         RunSdkActionRequestAction_AiInputText,
         RunSdkActionRequestAction_AiSelectOption,
+        RunSdkActionRequestAction_AiUploadFile,
         RunSdkActionRequestAction_Extract,
     )
     from .run_sdk_action_response import RunSdkActionResponse
@@ -358,6 +359,8 @@ if typing.TYPE_CHECKING:
     from .thought_type import ThoughtType
     from .totp_code import TotpCode
     from .totp_type import TotpType
+    from .upload_file_action import UploadFileAction
+    from .upload_file_action_data import UploadFileActionData
     from .upload_to_s3block import UploadToS3Block
     from .upload_to_s3block_yaml import UploadToS3BlockYaml
     from .url_block import UrlBlock
@@ -775,6 +778,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "RunSdkActionRequestAction_AiClick": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_AiInputText": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_AiSelectOption": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiUploadFile": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_Extract": ".run_sdk_action_request_action",
     "RunSdkActionResponse": ".run_sdk_action_response",
     "RunStatus": ".run_status",
@@ -829,6 +833,8 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ThoughtType": ".thought_type",
     "TotpCode": ".totp_code",
     "TotpType": ".totp_type",
+    "UploadFileAction": ".upload_file_action",
+    "UploadFileActionData": ".upload_file_action_data",
     "UploadToS3Block": ".upload_to_s3block",
     "UploadToS3BlockYaml": ".upload_to_s3block_yaml",
     "UrlBlock": ".url_block",
@@ -1256,6 +1262,7 @@ __all__ = [
     "RunSdkActionRequestAction_AiClick",
     "RunSdkActionRequestAction_AiInputText",
     "RunSdkActionRequestAction_AiSelectOption",
+    "RunSdkActionRequestAction_AiUploadFile",
     "RunSdkActionRequestAction_Extract",
     "RunSdkActionResponse",
     "RunStatus",
@@ -1310,6 +1317,8 @@ __all__ = [
     "ThoughtType",
     "TotpCode",
     "TotpType",
+    "UploadFileAction",
+    "UploadFileActionData",
     "UploadToS3Block",
     "UploadToS3BlockYaml",
     "UrlBlock",

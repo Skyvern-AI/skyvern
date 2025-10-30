@@ -411,13 +411,38 @@ class SkyvernPage:
         await handler_utils.input_sequentially(locator, value, timeout=timeout)
         return value
 
+    @overload
+    async def upload_file(
+        self,
+        selector: str,
+        files: str,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str: ...
+
+    @overload
+    async def upload_file(
+        self,
+        *,
+        prompt: str,
+        files: str | None = None,
+        selector: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str: ...
+
     @action_wrap(ActionType.UPLOAD_FILE)
     async def upload_file(
         self,
-        selector: str | None,
-        files: str,
-        ai: str | None = "fallback",
+        selector: str | None = None,
+        files: str | None = None,
+        *,
         prompt: str | None = None,
+        ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         intention: str | None = None,  # backward compatibility
@@ -433,8 +458,11 @@ class SkyvernPage:
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
         if ai == "fallback":
+            if not files and not prompt:
+                raise ValueError("Missing input: files should be provided explicitly or in prompt")
+
             error_to_raise = None
-            if selector:
+            if selector and files:
                 try:
                     file_path = await download_file(files)
                     locator = self.page.locator(selector)
@@ -453,6 +481,8 @@ class SkyvernPage:
                 )
             if error_to_raise:
                 raise error_to_raise
+            elif not files:
+                raise ValueError("Parameter 'files' is required but was not provided")
             else:
                 return files
         elif ai == "proactive" and prompt:
@@ -466,6 +496,8 @@ class SkyvernPage:
 
         if not selector:
             raise ValueError("Selector is required but was not provided")
+        if not files:
+            raise ValueError("Parameter 'files' is required but was not provided")
 
         file_path = await download_file(files)
         locator = self.page.locator(selector)

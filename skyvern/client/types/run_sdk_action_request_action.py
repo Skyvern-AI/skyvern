@@ -12,6 +12,7 @@ from .extract_action_data import ExtractActionData
 from .extract_action_extract_schema import ExtractActionExtractSchema
 from .input_text_action_data import InputTextActionData
 from .select_option_action_data import SelectOptionActionData
+from .upload_file_action_data import UploadFileActionData
 
 
 class RunSdkActionRequestAction_AiAct(UniversalBaseModel):
@@ -100,6 +101,28 @@ class RunSdkActionRequestAction_AiSelectOption(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class RunSdkActionRequestAction_AiUploadFile(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
+    type: typing.Literal["ai_upload_file"] = "ai_upload_file"
+    selector: typing.Optional[str] = None
+    file_url: typing.Optional[str] = None
+    intention: typing.Optional[str] = None
+    data: typing.Optional[UploadFileActionData] = None
+    timeout: typing.Optional[float] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class RunSdkActionRequestAction_Extract(UniversalBaseModel):
     """
     The action to execute with its specific parameters
@@ -127,5 +150,6 @@ RunSdkActionRequestAction = typing.Union[
     RunSdkActionRequestAction_AiClick,
     RunSdkActionRequestAction_AiInputText,
     RunSdkActionRequestAction_AiSelectOption,
+    RunSdkActionRequestAction_AiUploadFile,
     RunSdkActionRequestAction_Extract,
 ]

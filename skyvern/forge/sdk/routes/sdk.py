@@ -6,6 +6,7 @@ from fastapi import Depends, HTTPException, status
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.routers import base_router
@@ -95,8 +96,8 @@ async def run_sdk_action(
     task = await app.DATABASE.create_task(
         organization_id=organization_id,
         url=action_request.url,
-        navigation_goal=action.intention,
-        navigation_payload=action.data,
+        navigation_goal=action.get_navigation_goal(),
+        navigation_payload=action.get_navigation_payload(),
         data_extraction_goal=None,
         title=f"SDK Action Task: {action_request.action.type}",
         workflow_run_id=workflow_run.workflow_run_id,
@@ -170,6 +171,16 @@ async def run_sdk_action(
             result = await page_ai.ai_select_option(
                 selector=action.selector,
                 value=action.value,
+                intention=action.intention,
+                data=action.data,
+                timeout=action.timeout,
+            )
+        elif action.type == "ai_upload_file":
+            if action.file_url and not validate_download_url(action.file_url):
+                raise HTTPException(status_code=400, detail="Unsupported file url")
+            result = await page_ai.ai_upload_file(
+                selector=action.selector,
+                files=action.file_url,
                 intention=action.intention,
                 data=action.data,
                 timeout=action.timeout,
