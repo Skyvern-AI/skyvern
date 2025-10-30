@@ -769,6 +769,9 @@ async def generate_cua_fallback_actions(
     LOG.info("Fallback action response", action_response=action_response)
     skyvern_action_type = action_response.get("action")
     useful_information = action_response.get("useful_information")
+
+    # use 'other' action as fallback in the 'cua-fallback-action' prompt
+    # it can avoid LLM returning unreasonable actions, and fallback to use 'wait' action in agent instead
     action = WaitAction(
         seconds=5,
         reasoning=reasoning,
