@@ -40,7 +40,6 @@ CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
-WORKFLOW_IMPORT_PREFIX = "wimp"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -219,11 +218,6 @@ def generate_debug_session_id() -> str:
 def generate_folder_id() -> str:
     int_id = generate_id()
     return f"{FOLDER_PREFIX}_{int_id}"
-
-
-def generate_workflow_import_id() -> str:
-    int_id = generate_id()
-    return f"{WORKFLOW_IMPORT_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:
