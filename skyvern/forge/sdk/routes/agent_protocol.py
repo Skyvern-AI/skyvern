@@ -14,8 +14,8 @@ from fastapi import (
     Request,
     Response,
     UploadFile,
-    status,
 )
+from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
 
 from skyvern import analytics
@@ -409,7 +409,7 @@ async def get_run(
     run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
     if not run_response:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task run not found {run_id}",
         )
     return run_response
@@ -935,7 +935,7 @@ async def get_folder(
         organization_id=current_org.organization_id,
     )
     if not folder:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
     workflow_count = await app.DATABASE.get_folder_workflow_count(
         folder_id=folder.folder_id,
@@ -1027,7 +1027,7 @@ async def update_folder(
         description=data.description,
     )
     if not folder:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
     workflow_count = await app.DATABASE.get_folder_workflow_count(
         folder_id=folder.folder_id,
@@ -1070,7 +1070,7 @@ async def delete_folder(
         delete_workflows=delete_workflows,
     )
     if not success:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
 
     return {"status": "deleted", "folder_id": folder_id, "workflows_deleted": delete_workflows}
 
@@ -1103,12 +1103,12 @@ async def update_workflow_folder(
         )
         if not workflow:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found"
+                status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Workflow {workflow_permanent_id} not found"
             )
 
         return workflow
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @legacy_base_router.post(
@@ -1190,7 +1190,7 @@ async def get_artifact(
     )
     if not artifact:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Artifact not found {artifact_id}",
         )
     if settings.ENV != "local" or settings.GENERATE_PRESIGNED_URLS:
@@ -1307,7 +1307,7 @@ async def get_run_timeline(
     run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
     if not run_response:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Run not found {run_id}",
         )
 
@@ -1320,13 +1320,13 @@ async def get_run_timeline(
         task_v2 = await app.DATABASE.get_task_v2(task_v2_id=run_id, organization_id=current_org.organization_id)
         if not task_v2:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=http_status.HTTP_404_NOT_FOUND,
                 detail=f"Task v2 not found {run_id}",
             )
 
         if not task_v2.workflow_run_id:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=http_status.HTTP_400_BAD_REQUEST,
                 detail=f"Task v2 {run_id} has no associated workflow run",
             )
 
@@ -1334,7 +1334,7 @@ async def get_run_timeline(
 
     # Timeline not available for other run types
     raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
+        status_code=http_status.HTTP_400_BAD_REQUEST,
         detail=f"Timeline not available for run type {run_response.run_type}",
     )
 
@@ -1429,7 +1429,7 @@ async def webhook(
             payload=payload,
         )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="Missing webhook signature or timestamp",
         )
 
@@ -1550,7 +1550,7 @@ async def cancel_task(
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task not found {task_id}",
         )
     task = await app.agent.update_task(task_obj, status=TaskStatus.canceled)
@@ -1568,7 +1568,7 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
 
     if not workflow_run:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
@@ -1604,7 +1604,7 @@ async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> 
 
     if not workflow_run:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
@@ -1678,7 +1678,7 @@ async def retry_webhook(
     task_obj = await app.DATABASE.get_task(task_id, organization_id=current_org.organization_id)
     if not task_obj:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task not found {task_id}",
         )
 
@@ -1732,7 +1732,7 @@ async def get_tasks(
     analytics.capture("skyvern-oss-agent-tasks-get")
     if only_standalone_tasks and workflow_run_id:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="only_standalone_tasks and workflow_run_id cannot be used together",
         )
     tasks = await app.DATABASE.get_tasks(
@@ -1840,7 +1840,7 @@ async def get_artifacts(
 
     if entity_type not in entity_type_to_param:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid entity_type: {entity_type}",
         )
 
@@ -2204,7 +2204,7 @@ async def get_workflows(
 
     if only_saved_tasks and only_workflows:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=http_status.HTTP_400_BAD_REQUEST,
             detail="only_saved_tasks and only_workflows cannot be used together",
         )
 
