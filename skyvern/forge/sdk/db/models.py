@@ -274,7 +274,7 @@ class WorkflowModel(Base):
     cache_key = Column(String, nullable=True)
     run_sequentially = Column(Boolean, nullable=True)
     sequential_key = Column(String, nullable=True)
-    folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True, index=True)
+    folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
     import_error = Column(String, nullable=True)  # Error message if import failed
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
