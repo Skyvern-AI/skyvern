@@ -1918,7 +1918,13 @@ class AgentDB:
         """Update a folder's title or description."""
         try:
             async with self.Session() as session:
-                folder = await self.get_folder(folder_id, organization_id)
+                stmt = (
+                    select(FolderModel)
+                    .filter_by(folder_id=folder_id, organization_id=organization_id)
+                    .filter(FolderModel.deleted_at.is_(None))
+                )
+                result = await session.execute(stmt)
+                folder = result.scalar_one_or_none()
                 if not folder:
                     return None
 
@@ -1928,7 +1934,6 @@ class AgentDB:
                     folder.description = description
 
                 folder.modified_at = datetime.utcnow()
-                session.add(folder)
                 await session.commit()
                 await session.refresh(folder)
                 return folder
