@@ -8,8 +8,7 @@ function HighlightText({ text, query }: HighlightTextProps) {
     return <>{text}</>;
   }
 
-  const escapeRegExp = (s: string) =>
-    s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const q = query.trim();
   const regex = new RegExp(`(${escapeRegExp(q)})`, "gi");
   const parts = text.split(regex);

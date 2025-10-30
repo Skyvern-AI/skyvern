@@ -173,6 +173,40 @@ function Workflows() {
   const isNextDisabled =
     isFetching || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
+  // Auto-expand rows when parameters match search
+  const autoExpandedRows = useMemo(() => {
+    if (!debouncedSearch.trim()) return new Set<string>();
+
+    const parameterMatchesSearch = (param: Parameter): boolean => {
+      const lowerQuery = debouncedSearch.toLowerCase();
+
+      const keyMatch = param.key?.toLowerCase().includes(lowerQuery) ?? false;
+      const descMatch =
+        param.description?.toLowerCase().includes(lowerQuery) ?? false;
+      const valueMatch = Boolean(
+        param.parameter_type === "workflow" &&
+          param.default_value &&
+          String(param.default_value).toLowerCase().includes(lowerQuery),
+      );
+
+      return keyMatch || descMatch || valueMatch;
+    };
+
+    const expanded = new Set<string>();
+
+    workflows.forEach((workflow) => {
+      const hasParameterMatch = workflow.workflow_definition.parameters?.some(
+        (param) => parameterMatchesSearch(param),
+      );
+
+      if (hasParameterMatch) {
+        expanded.add(workflow.workflow_permanent_id);
+      }
+    });
+
+    return expanded;
+  }, [workflows, debouncedSearch]);
+
   // Check if a specific parameter matches the search
   const parameterMatchesSearch = (param: Parameter): boolean => {
     if (!debouncedSearch.trim()) return false;
@@ -189,25 +223,6 @@ function Workflows() {
 
     return keyMatch || descMatch || valueMatch;
   };
-
-  // Auto-expand rows when parameters match search
-  const autoExpandedRows = useMemo(() => {
-    if (!debouncedSearch.trim()) return new Set<string>();
-
-    const expanded = new Set<string>();
-
-    workflows.forEach((workflow) => {
-      const hasParameterMatch = workflow.workflow_definition.parameters?.some(
-        (param) => parameterMatchesSearch(param),
-      );
-
-      if (hasParameterMatch) {
-        expanded.add(workflow.workflow_permanent_id);
-      }
-    });
-
-    return expanded;
-  }, [workflows, debouncedSearch]);
 
   // Combine manual and auto-expanded rows
   const expandedRows = useMemo(() => {
