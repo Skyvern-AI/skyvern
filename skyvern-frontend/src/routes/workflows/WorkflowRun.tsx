@@ -47,6 +47,7 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
+import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowRunStatusAlert";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -460,7 +461,18 @@ function WorkflowRun() {
         </div>
       )}
       {workflowFailureReason}
-      {!isEmbedded && <SwitchBarNavigation options={switchBarOptions} />}
+      {!isEmbedded && (
+        <div className="flex items-center justify-between">
+          <SwitchBarNavigation options={switchBarOptions} />
+          {workflowRun && (
+            <WorkflowRunStatusAlert
+              status={workflowRun.status}
+              title={workflow?.title}
+              visible={workflowRun && !isFinalized}
+            />
+          )}
+        </div>
+      )}
       <div className="flex h-[42rem] gap-6">
         <div className="w-2/3">
           <Outlet />
