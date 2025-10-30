@@ -1,20 +1,19 @@
-"""add folders table
+"""add_folders_table
 
-Revision ID: add_folders_table
-Revises: b80c42316c94
-Create Date: 2025-10-23 00:00:00.000000+00:00
+Revision ID: 541870962332
+Revises: d135e472622c
+Create Date: 2025-10-30 14:14:37.593691+00:00
 
 """
-
 from typing import Sequence, Union
 
+from alembic import op
 import sqlalchemy as sa
 
-from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "add_folders_table"
-down_revision: Union[str, None] = "b80c42316c94"
+revision: str = '541870962332'
+down_revision: Union[str, None] = 'd135e472622c'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
