@@ -69,6 +69,59 @@ def is_valid_mime_type(file_path: str) -> bool:
     return mime_type is not None
 
 
+def validate_download_url(url: str) -> tuple[bool, str | None]:
+    """Validate if a URL is supported for downloading.
+
+    Security validation for URL downloads to prevent:
+    - File system access outside allowed directories
+    - Access to local file system in non-local environments
+    - Unsupported or dangerous URL schemes
+
+    Args:
+        url: The URL to validate
+
+    Returns:
+        Tuple of (is_valid, error_message). If valid, error_message is None.
+
+    Raises:
+        ValueError: If URL parsing fails
+    """
+    try:
+        parsed_url = urlparse(url)
+        scheme = parsed_url.scheme.lower()
+
+        # Allow http/https URLs (includes Google Drive which uses https)
+        if scheme in ("http", "https"):
+            return True, None
+
+        # Allow S3 URIs for Skyvern uploads bucket
+        if scheme == "s3":
+            if url.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"):
+                return True, None
+            return False, f"S3 URI not in allowed bucket: {url}"
+
+        # Allow file:// URLs only in local environment
+        if scheme == "file":
+            if settings.ENV != "local":
+                return False, "file:// URLs are only supported in local environment"
+
+            # Validate the file path is within allowed directories
+            try:
+                file_path = parse_uri_to_path(url)
+                allowed_prefix = f"{REPO_ROOT_DIR}/downloads"
+                if not file_path.startswith(allowed_prefix):
+                    return False, f"file:// URLs must be within {allowed_prefix} directory"
+                return True, None
+            except ValueError as e:
+                return False, f"Invalid file:// URL: {e}"
+
+        # Reject unsupported schemes
+        return False, f"Unsupported URL scheme: {scheme}"
+
+    except Exception as e:
+        return False, f"Failed to parse URL: {e}"
+
+
 async def download_file(url: str, max_size_mb: int | None = None) -> str:
     try:
         # Check if URL is a Google Drive link

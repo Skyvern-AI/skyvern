@@ -6,6 +6,7 @@ from playwright.async_api import Page
 from skyvern.client import GetRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.config import settings
+from skyvern.forge.sdk.api.files import download_file
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.library.skyvern_locator import SkyvernLocator
@@ -546,6 +547,81 @@ class SkyvernBrowserPage:
             locator = self._page.locator(selector)
             await locator.select_option(value, timeout=timeout, **kwargs)
         return value
+
+    @overload
+    async def upload_file(
+        self,
+        selector: str,
+        files: str,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str: ...
+
+    @overload
+    async def upload_file(
+        self,
+        *,
+        prompt: str,
+        files: str | None = None,
+        selector: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str: ...
+
+    async def upload_file(
+        self,
+        selector: str | None = None,
+        files: str | None = None,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+    ) -> str:
+        files = files or ""
+
+        if ai == "fallback":
+            error_to_raise = None
+            if selector:
+                try:
+                    file_path = await download_file(files)
+                    locator = self._page.locator(selector)
+                    await locator.set_input_files(file_path)
+                except Exception as e:
+                    error_to_raise = e
+
+            if prompt:
+                return await self._ai.ai_upload_file(
+                    selector=selector,
+                    files=files,
+                    intention=prompt,
+                    data=data,
+                    timeout=timeout,
+                )
+            if error_to_raise:
+                raise error_to_raise
+            else:
+                return files
+        elif ai == "proactive" and prompt:
+            return await self._ai.ai_upload_file(
+                selector=selector,
+                files=files,
+                intention=prompt,
+                data=data,
+                timeout=timeout,
+            )
+
+        if not selector:
+            raise ValueError("Selector is required but was not provided")
+
+        file_path = await download_file(files)
+        locator = self._page.locator(selector)
+        await locator.set_input_files(file_path, timeout=timeout)
+        return files
 
     async def extract(
         self,
