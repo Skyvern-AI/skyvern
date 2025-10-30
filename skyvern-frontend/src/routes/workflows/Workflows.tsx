@@ -50,7 +50,7 @@ import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
-import { WorkflowApiResponse } from "./types/workflowTypes";
+import { Parameter, WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTemplates } from "../discover/WorkflowTemplates";
@@ -174,16 +174,18 @@ function Workflows() {
     isFetching || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
   // Check if a specific parameter matches the search
-  const parameterMatchesSearch = (param: any): boolean => {
+  const parameterMatchesSearch = (param: Parameter): boolean => {
     if (!debouncedSearch.trim()) return false;
     const lowerQuery = debouncedSearch.toLowerCase();
 
-    const keyMatch = param.key?.toLowerCase().includes(lowerQuery);
-    const descMatch = param.description?.toLowerCase().includes(lowerQuery);
-    const valueMatch =
+    const keyMatch = param.key?.toLowerCase().includes(lowerQuery) ?? false;
+    const descMatch =
+      param.description?.toLowerCase().includes(lowerQuery) ?? false;
+    const valueMatch = Boolean(
       param.parameter_type === "workflow" &&
-      param.default_value &&
-      String(param.default_value).toLowerCase().includes(lowerQuery);
+        param.default_value &&
+        String(param.default_value).toLowerCase().includes(lowerQuery),
+    );
 
     return keyMatch || descMatch || valueMatch;
   };
