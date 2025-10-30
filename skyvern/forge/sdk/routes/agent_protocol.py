@@ -702,19 +702,23 @@ async def import_workflow_from_pdf(
                 organization_id=current_org.organization_id,
             )
         except Exception as e:
-            # Mark v1 as import_failed with error message
-            await app.DATABASE.update_workflow(
-                workflow_id=empty_workflow.workflow_id,
-                organization_id=current_org.organization_id,
-                status=WorkflowStatus.import_failed,
-                import_error=str(e),
-            )
-
+            # Log full error server-side for debugging
             LOG.exception(
                 "Workflow import failed",
                 workflow_permanent_id=empty_workflow.workflow_permanent_id,
                 error=str(e),
                 organization_id=current_org.organization_id,
+            )
+
+            # Provide sanitized user-facing error message (don't expose internal details/PII)
+            sanitized_error = "Import failed. Please verify the PDF content and try again."
+            
+            # Mark v1 as import_failed with sanitized error
+            await app.DATABASE.update_workflow(
+                workflow_id=empty_workflow.workflow_id,
+                organization_id=current_org.organization_id,
+                status=WorkflowStatus.import_failed,
+                import_error=sanitized_error,
             )
 
     background_tasks.add_task(process_pdf_import)
