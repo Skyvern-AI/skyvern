@@ -31,7 +31,6 @@ function BrowserSessionVideo() {
     enabled: !!browserSessionId,
   });
 
-  // Extract recordings from browser session data
   const recordings = browserSession?.recordings || [];
 
   if (isLoading) {
