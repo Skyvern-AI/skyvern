@@ -104,7 +104,7 @@ to manage dependencies more selectively, you can now opt into extras:
 | `documents` | Document parsing helpers (`openpyxl`, `pypdf`, `filetype`) |
 | `gcp` | Google Cloud clients (`google-cloud-aiplatform`) |
 | `llm` | LLM provider SDKs (`openai`, `anthropic`, `litellm`, `fastmcp`, `lmnr`, `tiktoken`) |
-| `observability` | Telemetry and instrumentation (`ddtrace`, `posthog`, `structlog`) |
+| `observability` | Telemetry and instrumentation (`ddtrace`, `posthog`, `structlog`, `alive-progress`) |
 | `playwright` | Browser automation binaries pinned per Python release |
 | `dev` | Tooling for local development, testing, formatting |
 
