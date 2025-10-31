@@ -204,7 +204,7 @@ class SkyvernSdk:
         if self._verified_has_server:
             return
 
-        if self._environment == SkyvernEnvironment.DEVELOPMENT:
+        if self._environment == SkyvernEnvironment.LOCAL:
             await ensure_local_server_running()
 
         self._verified_has_server = True
