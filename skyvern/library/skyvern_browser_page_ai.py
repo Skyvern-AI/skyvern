@@ -30,6 +30,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Click an element using AI via API call."""
 
+        await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             browser_session_id=self._browser.browser_session_id,
@@ -57,6 +58,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Input text into an element using AI via API call."""
 
+        await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=SdkAction_AiInputText(
@@ -85,6 +87,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Select an option from a dropdown using AI via API call."""
 
+        await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=SdkAction_AiSelectOption(
@@ -121,6 +124,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI via API call."""
 
+        await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=SdkAction_Extract(

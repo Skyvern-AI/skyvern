@@ -7,7 +7,7 @@ from skyvern.client import GetRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.config import settings
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
-from skyvern.library.SdkSkyvernPageAi import SdkSkyvernPageAi
+from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.library.skyvern_locator import SkyvernLocator
 from skyvern.webeye.actions import handler_utils
 
@@ -67,6 +67,7 @@ class SkyvernPageRun:
             TaskRunResponse containing the task execution results.
         """
 
+        await self._browser.sdk.ensure_has_server()
         task_run = await self._browser.client.run_task(
             prompt=prompt,
             engine=engine,
@@ -125,6 +126,7 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the login workflow execution results.
         """
 
+        await self._browser.sdk.ensure_has_server()
         workflow_run = await self._browser.client.login(
             credential_type=credential_type,
             url=url or self._get_page_url(),
@@ -171,6 +173,8 @@ class SkyvernPageRun:
         Returns:
             WorkflowRunResponse containing the workflow execution results.
         """
+
+        await self._browser.sdk.ensure_has_server()
         workflow_run = await self._browser.client.run_workflow(
             workflow_id=workflow_id,
             parameters=parameters,
