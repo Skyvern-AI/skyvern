@@ -87,9 +87,13 @@ async def ensure_local_server_running(port: int | None = None) -> None:
     from skyvern.forge.api_app import app  # noqa: PLC0415
 
     # Create uvicorn server configuration (disable reload in programmatic mode)
-    config = create_uvicorn_config(app, port=port, reload=False)
+    uvicorn_config = create_uvicorn_config(
+        app=app,
+        port=port,
+        reload=False
+    )
 
-    _server = uvicorn.Server(config)
+    _server = uvicorn.Server(uvicorn_config)
 
     # Run server in a separate thread with its own event loop
     def _run_server_in_thread() -> None:
@@ -107,11 +111,11 @@ async def ensure_local_server_running(port: int | None = None) -> None:
         LOG.info("Local Skyvern server started successfully")
     else:
         LOG.error("Failed to start local Skyvern server (timeout)")
-        await stop_local_server()
+        await _stop_local_server()
         raise RuntimeError(f"Local Skyvern server failed to start on port {port}")
 
 
-async def stop_local_server() -> None:
+async def _stop_local_server() -> None:
     """Stop the local server if it was started by this process."""
     global _server, _server_thread
 
