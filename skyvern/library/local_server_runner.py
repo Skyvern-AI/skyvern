@@ -56,7 +56,7 @@ async def _wait_for_server(port: int, timeout: float = 10.0, interval: float = 0
 
 
 async def ensure_local_server_running() -> None:
-    """Ensure a local Skyvern server is running on the specified port.
+    """Ensure a local Skyvern server is running.
 
     If the server is not running, starts it in a separate thread with its own event loop.
     The server will automatically stop when the process exits.
