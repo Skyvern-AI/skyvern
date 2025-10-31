@@ -13,6 +13,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { AxiosError } from "axios";
 
 function isJsonString(str: string): boolean {
   try {
@@ -21,6 +22,15 @@ function isJsonString(str: string): boolean {
     return false;
   }
   return true;
+}
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof AxiosError) {
+    return error.response?.data?.detail || error.message || fallback;
+  } else if (error instanceof Error) {
+    return error.message;
+  }
+  return fallback;
 }
 
 interface ImportWorkflowButtonProps {
@@ -54,12 +64,10 @@ function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
         description: "Successfully imported workflow",
       });
     } catch (error) {
-      const err =
-        error instanceof Error ? error : new Error("Failed to import workflow");
       toast({
         variant: "destructive",
         title: "Error importing workflow",
-        description: err.message,
+        description: getErrorMessage(error, "Failed to import workflow"),
       });
     }
   };
@@ -84,11 +92,9 @@ function ImportWorkflowButton({ onImportStart }: ImportWorkflowButtonProps) {
         description: `Importing ${file.name}...`,
       });
     } catch (error) {
-      const err =
-        error instanceof Error ? error : new Error("Failed to import PDF");
       toast({
         title: "Import Failed",
-        description: err.message,
+        description: getErrorMessage(error, "Failed to import PDF"),
         variant: "destructive",
       });
     }

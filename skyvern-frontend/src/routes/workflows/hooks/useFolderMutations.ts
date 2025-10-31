@@ -22,10 +22,6 @@ function useCreateFolderMutation() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["folders"] });
-      toast({
-        title: "Folder created",
-        description: "Successfully created folder",
-      });
     },
     onError: (error: Error) => {
       toast({
@@ -56,10 +52,6 @@ function useUpdateFolderMutation() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["folders"] });
-      toast({
-        title: "Folder updated",
-        description: "Successfully updated folder",
-      });
     },
     onError: (error: Error) => {
       toast({
@@ -91,14 +83,9 @@ function useDeleteFolderMutation() {
         },
       });
     },
-    onSuccess: (_, variables) => {
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["folders"] });
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
-      toast({
-        variant: "success",
-        title: "Folder deleted",
-        description: `${variables.folderTitle} has been deleted successfully.`,
-      });
     },
     onError: (error: Error) => {
       toast({
@@ -128,17 +115,6 @@ function useUpdateWorkflowFolderMutation() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["folders"] });
-      toast({
-        title: "Workflow folder updated",
-        description: "Successfully updated workflow folder",
-      });
-    },
-    onError: (error: Error) => {
-      toast({
-        variant: "destructive",
-        title: "Failed to update workflow folder",
-        description: error.message,
-      });
     },
   });
 }
