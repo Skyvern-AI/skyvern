@@ -651,7 +651,7 @@ async def import_workflow_from_pdf(
     analytics.capture("skyvern-oss-workflow-import-pdf")
 
     # Read file and validate early (before creating import record)
-    if not file.filename.lower().endswith(".pdf"):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     try:
@@ -1003,20 +1003,26 @@ async def get_folders(
         search_query=search,
     )
 
-    # Get workflow counts for each folder
-    result = []
-    for folder in folders:
-        workflow_count = await app.DATABASE.get_folder_workflow_count(
-            folder_id=folder.folder_id,
+    # Get workflow counts for all folders in a single query
+    if folders:
+        folder_ids = [folder.folder_id for folder in folders]
+        workflow_counts = await app.DATABASE.get_folder_workflow_counts_batch(
+            folder_ids=folder_ids,
             organization_id=current_org.organization_id,
         )
+    else:
+        workflow_counts = {}
+
+    # Build result with workflow counts
+    result = []
+    for folder in folders:
         result.append(
             Folder(
                 folder_id=folder.folder_id,
                 organization_id=folder.organization_id,
                 title=folder.title,
                 description=folder.description,
-                workflow_count=workflow_count,
+                workflow_count=workflow_counts.get(folder.folder_id, 0),
                 created_at=folder.created_at,
                 modified_at=folder.modified_at,
             )

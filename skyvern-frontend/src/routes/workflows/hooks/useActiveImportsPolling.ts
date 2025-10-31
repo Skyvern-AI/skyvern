@@ -28,6 +28,14 @@ export function useActiveImportsPolling() {
       (imp) => imp.status === "importing",
     ).length;
 
+    // Reset completion/failure tracking when an import restarts
+    activeImports.forEach((imp) => {
+      if (imp.status === "importing") {
+        seenCompletionsRef.current.delete(imp.workflow_permanent_id);
+        seenFailuresRef.current.delete(imp.workflow_permanent_id);
+      }
+    });
+
     // Check for status changes and disappeared workflows
     const currentPermanentIds = new Set(
       activeImports.map((imp) => imp.workflow_permanent_id),

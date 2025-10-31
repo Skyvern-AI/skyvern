@@ -37,7 +37,7 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import { NarrativeCard } from "./components/header/NarrativeCard";
@@ -173,11 +173,10 @@ function Workflows() {
   const isNextDisabled =
     isFetching || !nextPageWorkflows || nextPageWorkflows.length === 0;
 
-  // Auto-expand rows when parameters match search
-  const autoExpandedRows = useMemo(() => {
-    if (!debouncedSearch.trim()) return new Set<string>();
-
-    const parameterMatchesSearch = (param: Parameter): boolean => {
+  // Check if a specific parameter matches the search
+  const parameterMatchesSearch = useCallback(
+    (param: Parameter): boolean => {
+      if (!debouncedSearch.trim()) return false;
       const lowerQuery = debouncedSearch.toLowerCase();
 
       const keyMatch = param.key?.toLowerCase().includes(lowerQuery) ?? false;
@@ -190,7 +189,13 @@ function Workflows() {
       );
 
       return keyMatch || descMatch || valueMatch;
-    };
+    },
+    [debouncedSearch],
+  );
+
+  // Auto-expand rows when parameters match search
+  const autoExpandedRows = useMemo(() => {
+    if (!debouncedSearch.trim()) return new Set<string>();
 
     const expanded = new Set<string>();
 
@@ -205,24 +210,7 @@ function Workflows() {
     });
 
     return expanded;
-  }, [workflows, debouncedSearch]);
-
-  // Check if a specific parameter matches the search
-  const parameterMatchesSearch = (param: Parameter): boolean => {
-    if (!debouncedSearch.trim()) return false;
-    const lowerQuery = debouncedSearch.toLowerCase();
-
-    const keyMatch = param.key?.toLowerCase().includes(lowerQuery) ?? false;
-    const descMatch =
-      param.description?.toLowerCase().includes(lowerQuery) ?? false;
-    const valueMatch = Boolean(
-      param.parameter_type === "workflow" &&
-        param.default_value &&
-        String(param.default_value).toLowerCase().includes(lowerQuery),
-    );
-
-    return keyMatch || descMatch || valueMatch;
-  };
+  }, [workflows, debouncedSearch, parameterMatchesSearch]);
 
   // Combine manual and auto-expanded rows
   const expandedRows = useMemo(() => {
