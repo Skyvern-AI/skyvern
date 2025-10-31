@@ -88,6 +88,7 @@ async def poll_otp_value(
         otp_value: OTPValue | None = None
         if totp_verification_url:
             otp_value = await _get_otp_value_from_url(
+                organization_id,
                 totp_verification_url,
                 org_token.token,
                 task_id=task_id,
@@ -107,6 +108,7 @@ async def poll_otp_value(
 
 
 async def _get_otp_value_from_url(
+    organization_id: str,
     url: str,
     api_key: str,
     task_id: str | None = None,
@@ -145,14 +147,25 @@ async def _get_otp_value_from_url(
     if not json_resp:
         return None
 
-    code = json_resp.get("verification_code", None)
-    if code:
-        return OTPValue(value=code, type=OTPType.TOTP)
+    content = json_resp.get("verification_code", None)
+    if not content:
+        return None
 
-    magic_link = json_resp.get("magic_link", None)
-    if magic_link:
-        return OTPValue(value=magic_link, type=OTPType.MAGIC_LINK)
-    return None
+    otp_value: OTPValue | None = OTPValue(value=content, type=OTPType.TOTP)
+    if isinstance(content, str) and len(content) > 10:
+        try:
+            otp_value = await parse_otp_login(content, organization_id)
+        except Exception:
+            LOG.warning("faile to parse content by LLM call", exc_info=True)
+
+    if not otp_value:
+        LOG.warning(
+            "Failed to parse otp login from the totp url",
+            content=content,
+        )
+        return None
+
+    return otp_value
 
 
 async def _get_otp_value_from_db(

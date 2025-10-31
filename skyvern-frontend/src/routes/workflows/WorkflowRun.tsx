@@ -21,7 +21,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import {
   CodeIcon,
   FileIcon,
@@ -47,6 +47,7 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
+import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowRunStatusAlert";
 
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -187,6 +188,11 @@ function WorkflowRun() {
         ))
     : null;
 
+  const failureReasonTitle =
+    workflowRun?.status === Status.Terminated
+      ? "Termination Reason"
+      : "Failure Reason";
+
   const workflowFailureReason = workflowRun?.failure_reason ? (
     <div
       className="space-y-2 rounded-md border border-red-600 p-4"
@@ -194,7 +200,7 @@ function WorkflowRun() {
         backgroundColor: "rgba(220, 38, 38, 0.10)",
       }}
     >
-      <div className="font-bold">Workflow Failure Reason</div>
+      <div className="font-bold">{failureReasonTitle}</div>
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
     </div>
@@ -307,20 +313,34 @@ function WorkflowRun() {
 
           <div className="flex gap-2">
             <ApiWebhookActionsMenu
-              getOptions={() =>
-                ({
+              getOptions={() => {
+                // Build headers - x-max-steps-override is optional and can be added manually if needed
+                const headers: Record<string, string> = {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                };
+
+                const body: Record<string, unknown> = {
+                  workflow_id: workflowPermanentId,
+                  parameters: workflowRun?.parameters,
+                  proxy_location: proxyLocation,
+                };
+
+                if (maxScreenshotScrolls !== null) {
+                  body.max_screenshot_scrolls = maxScreenshotScrolls;
+                }
+
+                if (workflowRun?.webhook_callback_url) {
+                  body.webhook_url = workflowRun.webhook_callback_url;
+                }
+
+                return {
                   method: "POST",
-                  url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                  body: {
-                    data: workflowRun?.parameters,
-                    proxy_location: "RESIDENTIAL",
-                  },
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiCredential ?? "<your-api-key>",
-                  },
-                }) satisfies ApiCommandOptions
-              }
+                  url: `${runsApiBaseUrl}/run/workflows`,
+                  body,
+                  headers,
+                } satisfies ApiCommandOptions;
+              }}
               webhookDisabled={workflowRunIsLoading || !workflowRunIsFinalized}
               onTestWebhook={() => setReplayOpen(true)}
             />
@@ -441,7 +461,18 @@ function WorkflowRun() {
         </div>
       )}
       {workflowFailureReason}
-      {!isEmbedded && <SwitchBarNavigation options={switchBarOptions} />}
+      {!isEmbedded && (
+        <div className="flex items-center justify-between">
+          <SwitchBarNavigation options={switchBarOptions} />
+          {workflowRun && (
+            <WorkflowRunStatusAlert
+              status={workflowRun.status}
+              title={workflow?.title}
+              visible={workflowRun && !isFinalized}
+            />
+          )}
+        </div>
+      )}
       <div className="flex h-[42rem] gap-6">
         <div className="w-2/3">
           <Outlet />

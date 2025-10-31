@@ -192,6 +192,7 @@ navigation:
               - POST /v1/credentials/{credential_id}/delete
               - GET /v1/credentials
               - POST /v1/credentials/totp
+              - GET /v1/credentials/totp
           - section: Artifacts
             contents:
               - GET /v1/artifacts/{artifact_id}
@@ -204,6 +205,10 @@ navigation:
               - POST /v1/scripts/{script_id}/deploy
               - GET /v1/scripts/{script_id}
               - GET /v1/scripts
+          - section: SDK
+            hidden: true
+            contents:
+              - POST /v1/sdk/run_action
   - tab: blog
   - tab: community
   - tab: github

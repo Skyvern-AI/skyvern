@@ -36,6 +36,9 @@ export interface WorkflowRunBlock {
     attachments?: string[];
     subject?: string;
     body?: string;
+    instructions?: string;
+    positive_descriptor?: string;
+    negative_descriptor?: string;
 }
 
 export namespace WorkflowRunBlock {

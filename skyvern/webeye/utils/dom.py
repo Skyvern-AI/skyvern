@@ -209,6 +209,12 @@ class SkyvernElement:
         if await self.get_attr("min") or await self.get_attr("max") or await self.get_attr("step"):
             return True
 
+        # maxlength=6 or maxlength=1 usually means it's an OTP input field
+        # already consider type="tel" or type="number" as raw_input in the previous logic, so need to confirm it for the OTP field
+        max_length = str(await self.get_attr("maxlength", mode="static"))
+        if input_type.lower() == "text" and max_length in ["1", "6"]:
+            return True
+
         return False
 
     async def is_spinbtn_input(self) -> bool:
@@ -274,6 +280,43 @@ class SkyvernElement:
                 aria_disabled = aria_disabled_attr.lower() != "false"
 
         return disabled or aria_disabled or style_disabled
+
+    async def is_readonly(self, dynamic: bool = False) -> bool:
+        # if attr not exist, return None
+        # if attr is like 'readonly', return empty string or True
+        # if attr is like `readonly=false`, return the value
+        readonly = False
+        aria_readonly = False
+
+        readonly_attr: bool | str | None = None
+        aria_readonly_attr: bool | str | None = None
+        mode: typing.Literal["auto", "dynamic"] = "dynamic" if dynamic else "auto"
+
+        try:
+            readonly_attr = await self.get_attr("readonly", mode=mode)
+            aria_readonly_attr = await self.get_attr("aria-readonly", mode=mode)
+        except Exception:
+            LOG.exception(
+                "Failed to get the readonly attribute",
+                element=self.__static_element,
+                element_id=self.get_id(),
+            )
+
+        if readonly_attr is not None:
+            # readonly_attr should be bool or str
+            if isinstance(readonly_attr, bool):
+                readonly = readonly_attr
+            if isinstance(readonly_attr, str):
+                readonly = readonly_attr.lower() != "false"
+
+        if aria_readonly_attr is not None:
+            # aria_readonly_attr should be bool or str
+            if isinstance(aria_readonly_attr, bool):
+                aria_readonly = aria_readonly_attr
+            if isinstance(aria_readonly_attr, str):
+                aria_readonly = aria_readonly_attr.lower() != "false"
+
+        return readonly or aria_readonly
 
     async def is_selectable(self) -> bool:
         return await self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT

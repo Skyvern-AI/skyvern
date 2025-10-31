@@ -114,7 +114,7 @@ class Settings(BaseSettings):
 
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
-    WORKFLOW_TEMPLATING_STRICTNESS: str = "strict"  # options: "strict", "lax"
+    WORKFLOW_TEMPLATING_STRICTNESS: str = "lax"  # options: "strict", "lax"
     WORKFLOW_WAIT_BLOCK_MAX_SEC: int = 30 * 60
 
     # Saved browser session settings
@@ -361,7 +361,7 @@ class Settings(BaseSettings):
 
     # Trace settings
     TRACE_ENABLED: bool = False
-    TRACE_PROVIDER: str = "lmnr"
+    TRACE_PROVIDER: str = ""
     TRACE_PROVIDER_HOST: str | None = None
     TRACE_PROVIDER_API_KEY: str = "fillmein"
 

@@ -24,8 +24,10 @@ from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
 from .types.run_engine import RunEngine
+from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
+from .types.sdk_action import SdkAction
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
@@ -2052,6 +2054,125 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    def run_sdk_action(
+        self,
+        *,
+        url: str,
+        action: SdkAction,
+        user_agent: typing.Optional[str] = None,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[RunSdkActionResponse]:
+        """
+        Execute a single SDK action with the specified parameters
+
+        Parameters
+        ----------
+        url : str
+            The URL where the action should be executed
+
+        action : SdkAction
+            The action to execute with its specific parameters
+
+        user_agent : typing.Optional[str]
+
+        browser_session_id : typing.Optional[str]
+            The browser session ID
+
+        browser_address : typing.Optional[str]
+            The browser address
+
+        workflow_run_id : typing.Optional[str]
+            Optional workflow run ID to continue an existing workflow run
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[RunSdkActionResponse]
+            Successfully executed SDK action
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            "v1/sdk/run_action",
+            method="POST",
+            json={
+                "url": url,
+                "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
+                "workflow_run_id": workflow_run_id,
+                "action": convert_and_respect_annotation_metadata(
+                    object_=action, annotation=SdkAction, direction="write"
+                ),
+            },
+            headers={
+                "content-type": "application/json",
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    RunSdkActionResponse,
+                    parse_obj_as(
+                        type_=RunSdkActionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 403:
+                raise ForbiddenError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
 
 class AsyncRawSkyvern:
     def __init__(self, *, client_wrapper: AsyncClientWrapper):
@@ -4049,6 +4170,125 @@ class AsyncRawSkyvern:
                     ),
                 )
                 return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def run_sdk_action(
+        self,
+        *,
+        url: str,
+        action: SdkAction,
+        user_agent: typing.Optional[str] = None,
+        browser_session_id: typing.Optional[str] = OMIT,
+        browser_address: typing.Optional[str] = OMIT,
+        workflow_run_id: typing.Optional[str] = OMIT,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[RunSdkActionResponse]:
+        """
+        Execute a single SDK action with the specified parameters
+
+        Parameters
+        ----------
+        url : str
+            The URL where the action should be executed
+
+        action : SdkAction
+            The action to execute with its specific parameters
+
+        user_agent : typing.Optional[str]
+
+        browser_session_id : typing.Optional[str]
+            The browser session ID
+
+        browser_address : typing.Optional[str]
+            The browser address
+
+        workflow_run_id : typing.Optional[str]
+            Optional workflow run ID to continue an existing workflow run
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[RunSdkActionResponse]
+            Successfully executed SDK action
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            "v1/sdk/run_action",
+            method="POST",
+            json={
+                "url": url,
+                "browser_session_id": browser_session_id,
+                "browser_address": browser_address,
+                "workflow_run_id": workflow_run_id,
+                "action": convert_and_respect_annotation_metadata(
+                    object_=action, annotation=SdkAction, direction="write"
+                ),
+            },
+            headers={
+                "content-type": "application/json",
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    RunSdkActionResponse,
+                    parse_obj_as(
+                        type_=RunSdkActionResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 403:
+                raise ForbiddenError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
             if _response.status_code == 422:
                 raise UnprocessableEntityError(
                     headers=dict(_response.headers),

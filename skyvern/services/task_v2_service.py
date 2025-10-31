@@ -263,7 +263,6 @@ async def initialize_task_v2_metadata(
     user_prompt: str | None,
     current_browser_url: str | None,
     user_url: str | None,
-    current_run_id: str,
 ) -> TaskV2:
     thought = await app.DATABASE.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -272,35 +271,17 @@ async def initialize_task_v2_metadata(
         thought_scenario=ThoughtScenario.generate_metadata,
     )
 
-    enable_current_url_validation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-        "ENABLE_TASKV2_METADATA_CURRENT_URL_VALIDATION",
-        current_run_id,
-        properties={"organization_id": task_v2.organization_id},
+    metadata_prompt = prompt_engine.load_prompt(
+        "task_v2_generate_metadata",
+        user_goal=user_prompt,
+        current_browser_url=current_browser_url or "about:blank",
+        user_url=user_url,
     )
-
-    if enable_current_url_validation:
-        metadata_prompt = prompt_engine.load_prompt(
-            "task_v2_generate_metadata_with_current_url",
-            user_goal=user_prompt,
-            current_browser_url=current_browser_url or "about:blank",
-            user_url=user_url,
-        )
-        metadata_response = await app.LLM_API_HANDLER(
-            prompt=metadata_prompt,
-            thought=thought,
-            prompt_name="task_v2_generate_metadata_with_current_url",
-        )
-    else:
-        metadata_prompt = prompt_engine.load_prompt(
-            "task_v2_generate_metadata",
-            user_goal=user_prompt,
-            user_url=user_url,
-        )
-        metadata_response = await app.LLM_API_HANDLER(
-            prompt=metadata_prompt,
-            thought=thought,
-            prompt_name="task_v2_generate_metadata",
-        )
+    metadata_response = await app.LLM_API_HANDLER(
+        prompt=metadata_prompt,
+        thought=thought,
+        prompt_name="task_v2_generate_metadata",
+    )
 
     # validate
     LOG.info(f"Initialized task v2 initial response: {metadata_response}")
@@ -587,7 +568,6 @@ async def run_task_v2_helper(
         user_prompt=task_v2.prompt,
         current_browser_url=current_url,
         user_url=task_v2.url,
-        current_run_id=current_run_id,
     )
     url = str(task_v2.url)
 
@@ -1536,7 +1516,7 @@ async def mark_task_v2_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
         )
 
-    # Add task failure tag to Laminar trace
+    # Add task failure tag to trace
     TraceManager.add_task_completion_tag("failed")
 
     await send_task_v2_webhook(task_v2)
@@ -1560,7 +1540,7 @@ async def mark_task_v2_as_completed(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
-    # Add task completion tag to Laminar trace
+    # Add task completion tag to trace
     TraceManager.add_task_completion_tag("completed")
 
     await send_task_v2_webhook(task_v2)
@@ -1580,7 +1560,7 @@ async def mark_task_v2_as_canceled(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
-    # Add task canceled tag to Laminar trace
+    # Add task canceled tag to trace
     TraceManager.add_task_completion_tag("canceled")
 
     await send_task_v2_webhook(task_v2)
@@ -1601,7 +1581,7 @@ async def mark_task_v2_as_terminated(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
 
-    # Add task terminated tag to Laminar trace
+    # Add task terminated tag to trace
     TraceManager.add_task_completion_tag("terminated")
 
     await send_task_v2_webhook(task_v2)
@@ -1622,7 +1602,7 @@ async def mark_task_v2_as_timed_out(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
 
-    # Add task timed out tag to Laminar trace
+    # Add task timed out tag to trace
     TraceManager.add_task_completion_tag("timed_out")
 
     await send_task_v2_webhook(task_v2)

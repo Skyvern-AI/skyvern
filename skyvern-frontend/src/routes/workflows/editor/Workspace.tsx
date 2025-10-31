@@ -213,7 +213,7 @@ function Workspace({
     useWorkflowPanelStore();
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const saveWorkflow = useWorkflowSave();
+  const saveWorkflow = useWorkflowSave({ status: "published" });
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
@@ -1384,7 +1384,7 @@ function Workspace({
                 {/* timeline */}
                 <div
                   className={cn(
-                    "z-15 h-full w-[5rem] overflow-visible",
+                    "z-[15] h-full w-[5rem] overflow-visible",
                     {
                       "skyvern-animate-nudge": nudge,
                     },
