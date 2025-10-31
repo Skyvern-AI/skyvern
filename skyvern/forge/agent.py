@@ -71,6 +71,7 @@ from skyvern.forge.sdk.api.files import (
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
+from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE, LLM_PROVIDER_ERROR_TYPE
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -2862,6 +2863,8 @@ class ForgeAgent:
         page: Page | None,
     ) -> MaxStepsReasonResponse:
         steps_results = []
+        llm_errors: list[str] = []
+
         try:
             steps = await app.DATABASE.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
@@ -2888,11 +2891,36 @@ class ForgeAgent:
                 for action, action_results in step.output.actions_and_results:
                     if len(action_results) == 0:
                         continue
+                    last_result = action_results[-1]
+
+                    # Check if this is an LLM provider error
+                    if not last_result.success:
+                        exception_type = last_result.exception_type or ""
+                        exception_message = last_result.exception_message or ""
+                        if (
+                            exception_type in (LLM_PROVIDER_ERROR_TYPE, LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE)
+                            or "LLMProvider" in exception_message
+                        ):
+                            llm_errors.append(f"Step {step_cnt}: {exception_message}")
+
                     action_result_summary.append(
-                        f"{action.reasoning}(action_type={action.action_type}, result={'success' if action_results[-1].success else 'failed'})"
+                        f"{action.reasoning}(action_type={action.action_type}, result={'success' if last_result.success else 'failed'})"
                     )
                 step_result["actions_result"] = action_result_summary
                 steps_results.append(step_result)
+
+            # If we detected LLM errors, return a clear message without calling the LLM
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
+                )
 
             scroll = True
             if await service_utils.is_cua_task(task=task):
@@ -2917,6 +2945,17 @@ class ForgeAgent:
             return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning("Failed to summary the failure reason")
+            # Check if we have LLM errors even if the summarization failed
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
+                )
             if steps_results:
                 last_step_result = steps_results[-1]
                 return MaxStepsReasonResponse(
@@ -2941,11 +2980,21 @@ class ForgeAgent:
         html = ""
         screenshots: list[bytes] = []
         steps_results = []
+        llm_errors: list[str] = []
+        steps_without_actions = 0
+
         try:
             steps = await app.DATABASE.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
+
+            # Check for LLM provider errors in the failed steps
             for step_cnt, cur_step in enumerate(steps[-max_retries:]):
+                if cur_step.status == StepStatus.failed:
+                    # If step failed with no actions, it might be an LLM error during action extraction
+                    if not cur_step.output or not cur_step.output.actions_and_results:
+                        steps_without_actions += 1
+
                 if cur_step.output and cur_step.output.actions_and_results:
                     action_result_summary: list[str] = []
                     step_result: dict[str, Any] = {
@@ -2958,11 +3007,37 @@ class ForgeAgent:
                         if last_result.success:
                             continue
                         reason = last_result.exception_message or ""
+
+                        # Check if this is an LLM provider error
+                        exception_type = last_result.exception_type or ""
+                        if (
+                            exception_type in (LLM_PROVIDER_ERROR_TYPE, LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE)
+                            or "LLMProvider" in reason
+                        ):
+                            llm_errors.append(f"Step {step_cnt}: {reason}")
+
                         action_result_summary.append(
                             f"{action.reasoning}(action_type={action.action_type}, result=failed, reason={reason})"
                         )
                     step_result["actions_result"] = action_result_summary
                     steps_results.append(step_result)
+
+            # If we detected LLM errors, return a clear message without calling the LLM
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return (
+                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                    f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
+                    f"Error details: {llm_error_details}"
+                )
+
+            # If multiple steps failed without producing any actions, it's likely an LLM error during action extraction
+            if steps_without_actions >= max_retries:
+                return (
+                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                    f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
+                    f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                )
 
             if page is not None:
                 skyvern_frame = await SkyvernFrame.create_instance(frame=page)
@@ -2987,6 +3062,19 @@ class ForgeAgent:
             return json_response.get("reasoning", "")
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
+            # Check if we have LLM errors even if the summarization failed
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return (
+                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                    f"Error details: {llm_error_details}"
+                )
+            # If multiple steps failed without actions during summarization failure, still report it
+            if steps_without_actions >= max_retries:
+                return (
+                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                    f"This is typically caused by LLM service errors during action extraction."
+                )
             if steps_results:
                 last_step_result = steps_results[-1]
                 return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
