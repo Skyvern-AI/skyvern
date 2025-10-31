@@ -9,7 +9,11 @@ from skyvern.config import settings
 LOG = structlog.stdlib.get_logger()
 
 
-def create_uvicorn_config(app: FastAPI | str, port: int | None = None, reload: bool | None = None) -> uvicorn.Config:
+def create_uvicorn_config(
+    app: FastAPI | str,
+    port: int | None = None,
+    reload: bool | None = None,
+) -> uvicorn.Config:
     """Create a uvicorn configuration for the Skyvern server.
 
     Args:
