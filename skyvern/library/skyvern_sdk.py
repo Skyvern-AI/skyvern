@@ -94,15 +94,11 @@ class SkyvernSdk:
             if os.path.exists(".env"):
                 load_dotenv(".env")
             elif environment == SkyvernEnvironment.LOCAL:
-                raise ValueError(
-                    "Please run `skyvern quickstart` to set up your local Skyvern environment"
-                )
+                raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
 
             env_key = os.getenv("SKYVERN_API_KEY")
             if not env_key:
-                raise ValueError(
-                    "SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file."
-                )
+                raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
             self._api_key = env_key
         else:
             self._api_key = api_key
