@@ -40,7 +40,7 @@ class Skyvern(AsyncSkyvern):
         cdp_url: str | None = None,
         browser_path: str | None = None,
         browser_type: str | None = None,
-        environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
+        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
