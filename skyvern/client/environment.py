@@ -4,6 +4,6 @@ import enum
 
 
 class SkyvernEnvironment(enum.Enum):
-    PRODUCTION = "https://api.skyvern.com"
+    CLOUD = "https://api.skyvern.com"
     STAGING = "https://api-staging.skyvern.com"
-    DEVELOPMENT = "http://localhost:8000"
+    LOCAL = "http://localhost:8000"

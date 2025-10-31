@@ -81,7 +81,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/run/tasks",
             ),
             method: "POST",
@@ -179,7 +179,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/run/workflows",
             ),
             method: "POST",
@@ -260,7 +260,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}`,
             ),
             method: "GET",
@@ -334,7 +334,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/cancel`,
             ),
             method: "POST",
@@ -462,7 +462,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/workflows",
             ),
             method: "GET",
@@ -537,7 +537,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/workflows",
             ),
             method: "POST",
@@ -618,7 +618,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/workflows/${core.url.encodePathParam(workflowId)}`,
             ),
             method: "POST",
@@ -696,7 +696,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/workflows/${core.url.encodePathParam(workflowId)}/delete`,
             ),
             method: "POST",
@@ -774,7 +774,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/artifacts/${core.url.encodePathParam(artifactId)}`,
             ),
             method: "GET",
@@ -864,7 +864,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/artifacts`,
             ),
             method: "GET",
@@ -939,7 +939,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/retry_webhook`,
             ),
             method: "POST",
@@ -1018,7 +1018,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/runs/${core.url.encodePathParam(runId)}/timeline`,
             ),
             method: "GET",
@@ -1095,7 +1095,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/browser_sessions",
             ),
             method: "GET",
@@ -1173,7 +1173,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/browser_sessions",
             ),
             method: "POST",
@@ -1254,7 +1254,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/browser_sessions/${core.url.encodePathParam(browserSessionId)}/close`,
             ),
             method: "POST",
@@ -1335,7 +1335,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/browser_sessions/${core.url.encodePathParam(browserSessionId)}`,
             ),
             method: "GET",
@@ -1419,7 +1419,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/credentials/totp",
             ),
             method: "POST",
@@ -1510,7 +1510,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/credentials",
             ),
             method: "GET",
@@ -1593,7 +1593,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/credentials",
             ),
             method: "POST",
@@ -1671,7 +1671,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/credentials/${core.url.encodePathParam(credentialId)}/delete`,
             ),
             method: "POST",
@@ -1748,7 +1748,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/credentials/${core.url.encodePathParam(credentialId)}`,
             ),
             method: "GET",
@@ -1827,7 +1827,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/run/tasks/login",
             ),
             method: "POST",
@@ -1918,7 +1918,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/scripts",
             ),
             method: "GET",
@@ -1993,7 +1993,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/scripts",
             ),
             method: "POST",
@@ -2071,7 +2071,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/scripts/${core.url.encodePathParam(scriptId)}`,
             ),
             method: "GET",
@@ -2154,7 +2154,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 `v1/scripts/${core.url.encodePathParam(scriptId)}/deploy`,
             ),
             method: "POST",
@@ -2247,7 +2247,7 @@ export class SkyvernClient {
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
                     (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Production,
+                    environments.SkyvernEnvironment.Cloud,
                 "v1/sdk/run_action",
             ),
             method: "POST",
