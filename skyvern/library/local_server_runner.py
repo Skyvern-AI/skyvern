@@ -7,7 +7,6 @@ import structlog
 import uvicorn
 
 from skyvern.config import settings
-from skyvern.forge.forge_uvicorn import create_uvicorn_config
 
 LOG = structlog.get_logger()
 
@@ -87,10 +86,13 @@ async def ensure_local_server_running(port: int | None = None) -> None:
     from skyvern.forge.api_app import app  # noqa: PLC0415
 
     # Create uvicorn server configuration (disable reload in programmatic mode)
-    uvicorn_config = create_uvicorn_config(
+    uvicorn_config = uvicorn.Config(
         app=app,
+        host="0.0.0.0",
         port=port,
-        reload=False
+        log_level="info",
+        reload=False,
+        access_log=False,
     )
 
     _server = uvicorn.Server(uvicorn_config)
