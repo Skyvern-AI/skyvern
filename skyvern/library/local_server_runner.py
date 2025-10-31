@@ -1,7 +1,7 @@
 import asyncio
 import atexit
-import logging
 import socket
+import threading
 
 import structlog
 import uvicorn
@@ -13,7 +13,7 @@ LOG = structlog.get_logger()
 
 # Global server tracker for cleanup
 _server: uvicorn.Server | None = None
-_server_task: asyncio.Task | None = None
+_server_thread: threading.Thread | None = None
 
 
 def _is_port_in_use(port: int) -> bool:
@@ -28,7 +28,7 @@ def _is_port_in_use(port: int) -> bool:
 
 def _cleanup_on_exit() -> None:
     """Synchronous cleanup handler for atexit."""
-    global _server, _server_task
+    global _server, _server_thread
 
     if _server is None:
         return
@@ -38,12 +38,12 @@ def _cleanup_on_exit() -> None:
     # Signal server to exit
     _server.should_exit = True
 
-    # If there's a running event loop, try to cancel the task
-    if _server_task is not None and not _server_task.done():
-        _server_task.cancel()
+    # Wait for server thread to finish
+    if _server_thread is not None and _server_thread.is_alive():
+        _server_thread.join(timeout=5.0)
 
     _server = None
-    _server_task = None
+    _server_thread = None
 
 
 async def _wait_for_server(port: int, timeout: float = 10.0, interval: float = 0.5) -> bool:
@@ -59,13 +59,13 @@ async def _wait_for_server(port: int, timeout: float = 10.0, interval: float = 0
 async def ensure_local_server_running(port: int | None = None) -> None:
     """Ensure a local Skyvern server is running on the specified port.
 
-    If the server is not running, starts it in the current event loop as a background task.
-    The server will automatically stop when stop_local_server() is called.
+    If the server is not running, starts it in a separate thread with its own event loop.
+    The server will automatically stop when the process exits.
 
     Args:
         port: The port number the server should run on. Defaults to settings.PORT.
     """
-    global _server, _server_task
+    global _server, _server_thread
 
     if port is None:
         port = settings.PORT
@@ -80,42 +80,26 @@ async def ensure_local_server_running(port: int | None = None) -> None:
         LOG.info("Local Skyvern server already started by this process")
         return
 
-    # Server not running, start it in the current event loop
+    # Server not running, start it in a separate thread
     LOG.info(f"Starting local Skyvern server on port {port}...")
 
     # Import here to avoid circular imports
     from skyvern.forge.api_app import app  # noqa: PLC0415
-
-    # Suppress CancelledError logs from uvicorn during shutdown
-    # When asyncio.run() closes the event loop, it cancels all remaining tasks.
-    # This includes uvicorn's lifespan receive queue, which logs a CancelledError.
-    # This error is expected and harmless - the server is shutting down cleanly.
-    # We can't catch this with try-except because it happens inside uvicorn's internals.
-    class _SuppressCancelledErrorFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            return not (record.exc_info and isinstance(record.exc_info[1], asyncio.CancelledError))
-
-    logging.getLogger("uvicorn.error").addFilter(_SuppressCancelledErrorFilter())
 
     # Create uvicorn server configuration (disable reload in programmatic mode)
     config = create_uvicorn_config(app, port=port, reload=False)
 
     _server = uvicorn.Server(config)
 
-    # Wrap server in a task that handles cancellation gracefully
-    async def _run_server() -> None:
-        """Run server and handle cancellation during event loop shutdown."""
-        try:
-            await _server.serve()
-        except asyncio.CancelledError:
-            # Expected when event loop closes - suppress the error
-            LOG.debug("Server task cancelled during shutdown")
-            pass
+    # Run server in a separate thread with its own event loop
+    def _run_server_in_thread() -> None:
+        """Run the server in a separate thread with its own event loop."""
+        asyncio.run(_server.serve())
 
-    # Start server as a background task
-    _server_task = asyncio.create_task(_run_server())
+    _server_thread = threading.Thread(target=_run_server_in_thread, daemon=True, name="skyvern-server")
+    _server_thread.start()
 
-    # Register atexit handler as final fallback
+    # Register atexit handler to ensure cleanup
     atexit.register(_cleanup_on_exit)
 
     # Wait for server to start
@@ -129,21 +113,17 @@ async def ensure_local_server_running(port: int | None = None) -> None:
 
 async def stop_local_server() -> None:
     """Stop the local server if it was started by this process."""
-    global _server, _server_task
+    global _server, _server_thread
 
     if _server is not None:
         LOG.info("Shutting down local Skyvern server...")
         _server.should_exit = True
-        if _server_task is not None:
-            try:
-                await asyncio.wait_for(_server_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                LOG.warning("Server did not stop gracefully within timeout")
-                _server_task.cancel()
-                try:
-                    await _server_task
-                except asyncio.CancelledError:
-                    pass
-            _server_task = None
+
+        # Wait for server thread to finish (in a thread pool to avoid blocking event loop)
+        if _server_thread is not None and _server_thread.is_alive():
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _server_thread.join, 5.0)
+
+        _server_thread = None
         _server = None
         LOG.info("Local Skyvern server stopped")
