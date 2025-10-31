@@ -43,9 +43,9 @@ def custom_openapi() -> dict:
         routes=app.routes,
     )
     openapi_schema["servers"] = [
-        {"url": "https://api.skyvern.com", "x-fern-server-name": "Production"},
+        {"url": "https://api.skyvern.com", "x-fern-server-name": "Cloud"},
         {"url": "https://api-staging.skyvern.com", "x-fern-server-name": "Staging"},
-        {"url": "http://localhost:8000", "x-fern-server-name": "Development"},
+        {"url": "http://localhost:8000", "x-fern-server-name": "Local"},
     ]
     app.openapi_schema = openapi_schema
     return app.openapi_schema

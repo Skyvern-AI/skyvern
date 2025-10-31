@@ -19,7 +19,7 @@ class SkyvernSdk:
     Example:
         ```python
         # Initialize with environment and API key
-        skyvern = SkyvernSdk(environment=SkyvernEnvironment.PRODUCTION, api_key="your-api-key")
+        skyvern = SkyvernSdk(environment=SkyvernEnvironment.CLOUD, api_key="your-api-key")
 
         # Launch a local browser
         browser = await skyvern.launch_local_browser(headless=False)
@@ -76,7 +76,7 @@ class SkyvernSdk:
         """Initialize the Skyvern SDK client.
 
         Args:
-            environment: The Skyvern environment to connect to (LOCAL or PRODUCTION).
+            environment: The Skyvern environment to connect to (LOCAL or CLOUD).
             base_url: Custom base URL for the Skyvern API. Overrides environment setting.
             api_key: Skyvern API key. If not provided, loads from SKYVERN_API_KEY environment variable.
             timeout: HTTP request timeout in seconds.
