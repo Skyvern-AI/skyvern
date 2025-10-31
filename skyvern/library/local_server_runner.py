@@ -55,19 +55,15 @@ async def _wait_for_server(port: int, timeout: float = 10.0, interval: float = 0
     return False
 
 
-async def ensure_local_server_running(port: int | None = None) -> None:
+async def ensure_local_server_running() -> None:
     """Ensure a local Skyvern server is running on the specified port.
 
     If the server is not running, starts it in a separate thread with its own event loop.
     The server will automatically stop when the process exits.
-
-    Args:
-        port: The port number the server should run on. Defaults to settings.PORT.
     """
     global _server, _server_thread
 
-    if port is None:
-        port = settings.PORT
+    port = settings.PORT
 
     # Check if server is already running
     if _is_port_in_use(port):
@@ -88,7 +84,7 @@ async def ensure_local_server_running(port: int | None = None) -> None:
     # Create uvicorn server configuration (disable reload in programmatic mode)
     uvicorn_config = uvicorn.Config(
         app=app,
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=port,
         log_level="info",
         reload=False,
