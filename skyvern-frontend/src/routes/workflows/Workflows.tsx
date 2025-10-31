@@ -73,8 +73,7 @@ function Workflows() {
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
-  const [debouncedSearch] = useDebounce(search, 500);
-  const isTyping = search !== debouncedSearch;
+  const [debouncedSearch] = useDebounce(search, 250);
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
     ? Number(searchParams.get("page_size"))
@@ -111,9 +110,11 @@ function Workflows() {
       .slice(0, 5);
   }, [allFolders]);
 
-  const { data: workflows = [], isFetching } = useQuery<
-    Array<WorkflowApiResponse>
-  >({
+  const {
+    data: workflows = [],
+    isFetching,
+    isPlaceholderData,
+  } = useQuery<Array<WorkflowApiResponse>>({
     queryKey: [
       "workflows",
       debouncedSearch,
@@ -139,6 +140,7 @@ function Workflows() {
         })
         .then((response) => response.data);
     },
+    placeholderData: (previousData) => previousData,
   });
 
   const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
@@ -445,8 +447,10 @@ function Workflows() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {(isFetching || isTyping) && displayWorkflows.length === 0 ? (
-                // Show 10 skeleton rows while typing or fetching
+              {isFetching &&
+              !isPlaceholderData &&
+              displayWorkflows.length === 0 ? (
+                // Show skeleton rows only on initial load (not during search refinement)
                 Array.from({ length: 10 }).map((_, index) => (
                   <TableRow key={`skeleton-${index}`}>
                     <TableCell>
