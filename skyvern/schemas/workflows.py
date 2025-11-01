@@ -14,6 +14,8 @@ class WorkflowStatus(StrEnum):
     published = "published"
     draft = "draft"
     auto_generated = "auto_generated"
+    importing = "importing"
+    import_failed = "import_failed"
 
 
 class BlockType(StrEnum):

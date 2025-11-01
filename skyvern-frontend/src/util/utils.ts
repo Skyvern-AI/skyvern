@@ -67,3 +67,31 @@ export function formatDate(date: Date): string {
   };
   return date.toLocaleString("en-US", options);
 }
+
+/**
+ * Handle infinite scroll logic for loading more items
+ * @param event - React scroll event
+ * @param fetchNextPage - Function to fetch next page
+ * @param hasNextPage - Whether there are more pages to fetch
+ * @param isFetchingNextPage - Whether currently fetching
+ * @param scrollThreshold - Percentage threshold to trigger fetch (default 0.8)
+ */
+export const handleInfiniteScroll = (
+  event: React.UIEvent<HTMLDivElement>,
+  fetchNextPage: () => void,
+  hasNextPage: boolean,
+  isFetchingNextPage: boolean,
+  scrollThreshold: number = 0.8,
+) => {
+  const target = event.currentTarget;
+  const scrollPercentage =
+    (target.scrollTop + target.clientHeight) / target.scrollHeight;
+
+  if (
+    scrollPercentage >= scrollThreshold &&
+    hasNextPage &&
+    !isFetchingNextPage
+  ) {
+    fetchNextPage();
+  }
+};
