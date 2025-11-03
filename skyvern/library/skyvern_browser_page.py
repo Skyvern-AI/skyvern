@@ -590,7 +590,6 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
-        files = files or ""
         """Upload a file to an input element using a CSS selector, AI-powered prompt matching, or both.
 
         This method supports three modes:
@@ -625,6 +624,8 @@ class SkyvernBrowserPage:
             )
             ```
         """
+
+        files = files or ""
 
         if ai == "fallback":
             error_to_raise = None
