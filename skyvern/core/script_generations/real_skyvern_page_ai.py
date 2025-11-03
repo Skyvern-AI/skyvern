@@ -13,7 +13,6 @@ from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import download_file
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services.otp_service import poll_otp_value
@@ -22,11 +21,13 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     InputTextAction,
+    UploadFileAction,
 )
 from skyvern.webeye.actions.handler import (
     handle_click_action,
     handle_input_text_action,
     handle_select_option_action,
+    handle_upload_file_action,
 )
 from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.scraper.scraper import ScrapedPage
@@ -39,6 +40,9 @@ INPUT_GOAL = """- The intention to fill out an input: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
 
 SELECT_OPTION_GOAL = """- The intention to select an option: {intention}.
+- The overall goal that the user wants to achieve: {prompt}."""
+
+UPLOAD_GOAL = """- The intention to upload a file: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
 
 
@@ -312,7 +316,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
     async def ai_upload_file(
         self,
-        selector: str,
+        selector: str | None,
         files: str,
         intention: str,
         data: str | dict[str, Any] | None = None,
@@ -320,30 +324,90 @@ class RealSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Upload a file using AI to process the file URL."""
 
+        context = skyvern_context.ensure_context()
+        files = files or ""
+        action: UploadFileAction | None = None
+        organization_id = context.organization_id
+        task_id = context.task_id
+        step_id = context.step_id
+        workflow_run_id = context.workflow_run_id
+        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+
         if intention:
             try:
-                context = skyvern_context.current()
-                prompt = context.prompt if context else None
-                data = _get_context_data(data)
-                script_generation_file_url_prompt = prompt_engine.load_prompt(
-                    template="script-generation-file-url-generation",
-                    intention=intention,
-                    data=data,
-                    goal=prompt,
-                )
-                json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
-                    prompt=script_generation_file_url_prompt,
-                    prompt_name="script-generation-file-url-generation",
-                    organization_id=context.organization_id if context else None,
-                )
-                files = json_response.get("answer", files)
+                prompt = context.prompt
+                data = data or {}
+
+                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+                self.scraped_page = refreshed_page
+
+                # Try to get element_id from selector if selector is provided
+                element_id = await _get_element_id_by_selector(selector, self.page) if selector else None
+
+                if element_id:
+                    # The selector/element is valid, using a simpler/smaller prompt
+                    script_generation_file_url_prompt = prompt_engine.load_prompt(
+                        template="script-generation-file-url-generation",
+                        intention=intention,
+                        data=data,
+                        goal=prompt,
+                    )
+                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                        prompt=script_generation_file_url_prompt,
+                        prompt_name="script-generation-file-url-generation",
+                        step=step,
+                        organization_id=organization_id,
+                    )
+                    files = json_response.get("answer", files)
+
+                    action = UploadFileAction(
+                        element_id=element_id,
+                        file_url=files,
+                        status=ActionStatus.pending,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        step_id=context.step_id if context else None,
+                        reasoning=intention,
+                        intention=intention,
+                        response=files,
+                    )
+                else:
+                    # Use a heavier single-upload-action when selector is not found
+                    element_tree = refreshed_page.build_element_tree()
+                    payload_str = _get_context_data(data)
+                    merged_goal = UPLOAD_GOAL.format(intention=intention, prompt=prompt)
+
+                    single_upload_prompt = prompt_engine.load_prompt(
+                        template="single-upload-action",
+                        navigation_goal=merged_goal,
+                        navigation_payload_str=payload_str,
+                        current_url=self.page.url,
+                        elements=element_tree,
+                        local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+                    )
+                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                        prompt=single_upload_prompt,
+                        prompt_name="single-upload-action",
+                        step=step,
+                        organization_id=organization_id,
+                    )
+
+                    actions_json = json_response.get("actions", [])
+                    if actions_json and task and step:
+                        actions = parse_actions(task, step.step_id, step.order, refreshed_page, actions_json)
+                        if actions and isinstance(actions[0], UploadFileAction):
+                            action = cast(UploadFileAction, actions[0])
+                            files = action.file_url
             except Exception:
-                LOG.exception(f"Failed to adapt value for input text action on selector={selector}, file={files}")
-        if not files:
-            raise ValueError("file url must be provided")
-        file_path = await download_file(files)
-        locator = self.page.locator(selector)
-        await locator.set_input_files(file_path, timeout=timeout)
+                LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
+
+        if action and organization_id and task and step:
+            result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
+            if result and result[-1].success is False:
+                raise Exception(result[-1].exception_message)
+
         return files
 
     async def ai_select_option(

@@ -616,7 +616,7 @@ class SkyvernPage:
     @action_wrap(ActionType.UPLOAD_FILE)
     async def upload_file(
         self,
-        selector: str,
+        selector: str | None,
         files: str,
         ai: str | None = "fallback",
         intention: str | None = None,
@@ -628,12 +628,14 @@ class SkyvernPage:
             ai = context.ai_mode_override
         if ai == "fallback":
             error_to_raise = None
-            try:
-                file_path = await download_file(files)
-                locator = self.page.locator(selector)
-                await locator.set_input_files(file_path)
-            except Exception as e:
-                error_to_raise = e
+            if selector:
+                try:
+                    file_path = await download_file(files)
+                    locator = self.page.locator(selector)
+                    await locator.set_input_files(file_path)
+                except Exception as e:
+                    error_to_raise = e
+
             if intention:
                 return await self._ai.ai_upload_file(
                     selector=selector,
@@ -654,6 +656,10 @@ class SkyvernPage:
                 data=data,
                 timeout=timeout,
             )
+
+        if not selector:
+            raise ValueError("Selector is required but was not provided")
+
         file_path = await download_file(files)
         locator = self.page.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout)
