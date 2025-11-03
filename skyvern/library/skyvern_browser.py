@@ -1,7 +1,12 @@
+from typing import TYPE_CHECKING
+
 from playwright.async_api import BrowserContext, Page
 
 from skyvern.client import AsyncSkyvern
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+
+if TYPE_CHECKING:
+    from skyvern.library.skyvern_sdk import SkyvernSdk
 
 
 class SkyvernBrowser:
@@ -33,16 +38,16 @@ class SkyvernBrowser:
 
     def __init__(
         self,
+        sdk: "SkyvernSdk",
         browser_context: BrowserContext,
-        client: AsyncSkyvern,
         *,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
     ):
+        self._sdk = sdk
         self._browser_context = browser_context
         self._browser_session_id = browser_session_id
         self._browser_address = browser_address
-        self._client = client
 
         self.workflow_run_id: None | str = None
 
@@ -56,7 +61,11 @@ class SkyvernBrowser:
 
     @property
     def client(self) -> AsyncSkyvern:
-        return self._client
+        return self._sdk.api
+
+    @property
+    def sdk(self) -> "SkyvernSdk":
+        return self._sdk
 
     async def get_working_page(self) -> SkyvernBrowserPage:
         """Get the most recent page or create a new one if none exists.
