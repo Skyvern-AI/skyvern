@@ -246,7 +246,8 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str | None: ...
+    ) -> str | None:
+        ...
 
     @overload
     async def click(
@@ -257,7 +258,8 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str | None: ...
+    ) -> str | None:
+        ...
 
     async def click(
         self,
@@ -348,7 +350,8 @@ class SkyvernBrowserPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-    ) -> str: ...
+    ) -> str:
+        ...
 
     @overload
     async def fill(
@@ -362,7 +365,8 @@ class SkyvernBrowserPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-    ) -> str: ...
+    ) -> str:
+        ...
 
     async def fill(
         self,
@@ -453,7 +457,8 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str: ...
+    ) -> str:
+        ...
 
     @overload
     async def select_option(
@@ -466,7 +471,8 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str: ...
+    ) -> str:
+        ...
 
     async def select_option(
         self,
@@ -558,7 +564,8 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str: ...
+    ) -> str:
+        ...
 
     @overload
     async def upload_file(
@@ -570,7 +577,8 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str: ...
+    ) -> str:
+        ...
 
     async def upload_file(
         self,
@@ -583,6 +591,40 @@ class SkyvernBrowserPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
         files = files or ""
+        """Upload a file to an input element using a CSS selector, AI-powered prompt matching, or both.
+
+        This method supports three modes:
+        - **Selector-based**: Upload a file to the element matching the CSS selector
+        - **AI-powered**: Use natural language to describe where to upload the file
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+        Args:
+            selector: CSS selector for the target file input element.
+            files: URL of the file to upload (supports http/https, S3, and local file:// in local env).
+            prompt: Natural language description of where to upload the file.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            data: Additional context data for AI processing.
+            timeout: Maximum time to wait for the upload action in milliseconds.
+
+        Returns:
+            The file URL that was successfully used for upload.
+
+        Examples:
+            ```python
+            # Upload using a CSS selector
+            await page.upload_file("#file-input", "https://example.com/document.pdf")
+
+            # Upload using AI with natural language
+            await page.upload_file(prompt="Upload the document to the resume field", files="https://example.com/resume.pdf")
+
+            # Try selector first, fall back to AI if selector fails
+            await page.upload_file(
+                "#file-input",
+                "https://example.com/document.pdf",
+                prompt="Upload the document to the file input"
+            )
+            ```
+        """
 
         if ai == "fallback":
             error_to_raise = None
