@@ -33,7 +33,7 @@ class SkyvernPageAi(Protocol):
 
     async def ai_upload_file(
         self,
-        selector: str,
+        selector: str | None,
         files: str,
         intention: str,
         data: str | dict[str, Any] | None = None,
