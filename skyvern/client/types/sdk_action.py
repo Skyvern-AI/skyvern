@@ -68,6 +68,20 @@ class SdkAction_AiSelectOption(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class SdkAction_AiAct(UniversalBaseModel):
+    type: typing.Literal["ai_act"] = "ai_act"
+    intention: typing.Optional[str] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class SdkAction_Extract(UniversalBaseModel):
     type: typing.Literal["extract"] = "extract"
     prompt: typing.Optional[str] = None
@@ -86,4 +100,6 @@ class SdkAction_Extract(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-SdkAction = typing.Union[SdkAction_AiClick, SdkAction_AiInputText, SdkAction_AiSelectOption, SdkAction_Extract]
+SdkAction = typing.Union[
+    SdkAction_AiClick, SdkAction_AiInputText, SdkAction_AiSelectOption, SdkAction_AiAct, SdkAction_Extract
+]

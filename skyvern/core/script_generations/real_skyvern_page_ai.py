@@ -20,7 +20,9 @@ from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.actions import (
     ActionStatus,
+    ClickAction,
     InputTextAction,
+    SelectOptionAction,
     UploadFileAction,
 )
 from skyvern.webeye.actions.handler import (
@@ -171,7 +173,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     actions = parse_actions(
                         task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
                     )
-                    action = actions[0]
+                    action = cast(ClickAction, actions[0])
                     result = await handle_click_action(action, self.page, self.scraped_page, task, step)
                     if result and result[-1].success is False:
                         raise Exception(result[-1].exception_message)
@@ -452,7 +454,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
                     )
                     if actions:
-                        action = actions[0]
+                        action = cast(SelectOptionAction, actions[0])
                         if not action.option:
                             raise ValueError("SelectOptionAction requires an 'option' field")
                         option_value = action.option.value or action.option.label or ""
@@ -530,6 +532,88 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 print(result)
             print(f"{'-' * 50}\n")
         return result
+
+    async def ai_act(
+        self,
+        prompt: str,
+    ) -> None:
+        """Perform an action on the page using AI based on a natural language prompt."""
+
+        context = skyvern_context.current()
+        organization_id = context.organization_id if context else None
+        step_id = context.step_id if context else None
+
+        # First, infer the action type from the prompt
+        infer_action_type_prompt = prompt_engine.load_prompt(
+            template="infer-action-type",
+            navigation_goal=prompt,
+        )
+
+        step = None
+        if context and organization_id and step_id:
+            step = await app.DATABASE.get_step(step_id, organization_id)
+
+        json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+            prompt=infer_action_type_prompt,
+            prompt_name="infer-action-type",
+            step=step,
+            organization_id=organization_id,
+        )
+
+        if not json_response or "inferred_actions" not in json_response:
+            LOG.warning("ai_act: failed to infer action type", prompt=prompt, response=json_response)
+            return
+
+        inferred_actions = json_response.get("inferred_actions", [])
+        if not inferred_actions:
+            error = json_response.get("error")
+            LOG.warning("ai_act: no action type inferred", prompt=prompt, error=error)
+            return
+
+        action_info = inferred_actions[0]
+        action_type = action_info.get("action_type")
+        confidence = action_info.get("confidence_float", 0.0)
+
+        LOG.info(
+            "ai_act: inferred action type",
+            prompt=prompt,
+            action_type=action_type,
+            confidence=confidence,
+            reasoning=action_info.get("reasoning"),
+        )
+
+        try:
+            if action_type == "CLICK":
+                await self.ai_click(
+                    selector="",
+                    intention=prompt,
+                    data=None,
+                )
+            elif action_type == "INPUT_TEXT":
+                await self.ai_input_text(
+                    selector=None,
+                    value="",
+                    intention=prompt,
+                    data=None,
+                )
+            elif action_type == "UPLOAD_FILE":
+                await self.ai_upload_file(
+                    selector=None,
+                    files="",
+                    intention=prompt,
+                    data=None,
+                )
+            elif action_type == "SELECT_OPTION":
+                await self.ai_select_option(
+                    selector="",
+                    value="",
+                    intention=prompt,
+                    data=None,
+                )
+            else:
+                LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
+        except Exception:
+            LOG.exception("ai_act: failed to execute action", action_type=action_type, prompt=prompt)
 
 
 async def _get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
