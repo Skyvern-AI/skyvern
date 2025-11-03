@@ -60,7 +60,12 @@ import {
   BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
 } from "./constants";
 import { edgeTypes } from "./edges";
-import { AppNode, isWorkflowBlockNode, nodeTypes } from "./nodes";
+import {
+  AppNode,
+  isWorkflowBlockNode,
+  nodeTypes,
+  WorkflowBlockNode,
+} from "./nodes";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -71,6 +76,7 @@ import {
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
+  createNode,
   descendants,
   getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
@@ -484,6 +490,30 @@ function FlowRenderer({
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
+  function transmuteNode(id: string, nodeType: string) {
+    const nodeToTransmute = nodes.find((node) => node.id === id);
+
+    if (!nodeToTransmute || !isWorkflowBlockNode(nodeToTransmute)) {
+      return;
+    }
+
+    const newNode = createNode(
+      { id: nodeToTransmute.id, parentId: nodeToTransmute.parentId },
+      nodeType as NonNullable<WorkflowBlockNode["type"]>,
+      nodeToTransmute.data.label,
+    );
+
+    const newNodes = nodes.map((node) => {
+      if (node.id === id) {
+        return newNode;
+      }
+      return node;
+    });
+
+    workflowChangesStore.setHasChanges(true);
+    doLayout(newNodes, edges);
+  }
+
   function toggleScript({
     id,
     label,
@@ -646,6 +676,8 @@ function FlowRenderer({
            */
           deleteNodeCallback: (id: string) =>
             setTimeout(() => deleteNode(id), 0),
+          transmuteNodeCallback: (id: string, nodeName: string) =>
+            setTimeout(() => transmuteNode(id, nodeName), 0),
           toggleScriptForNodeCallback: toggleScript,
         }}
       >
