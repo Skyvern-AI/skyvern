@@ -20,7 +20,7 @@ class SkyvernPageAi(Protocol):
 
     async def ai_input_text(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         intention: str,
         data: str | dict[str, Any] | None = None,

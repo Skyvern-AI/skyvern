@@ -37,7 +37,7 @@ class InputTextAction(SdkActionBase):
     """Input text action parameters."""
 
     type: Literal["ai_input_text"] = "ai_input_text"
-    selector: str = Field(default="", description="CSS selector for the element")
+    selector: str | None = Field(default="", description="CSS selector for the element")
     value: str = Field(default="", description="Value to input")
     intention: str = Field(default="", description="The intention or goal of the input")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")

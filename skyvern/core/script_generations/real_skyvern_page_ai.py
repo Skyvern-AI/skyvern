@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
@@ -34,6 +34,9 @@ from skyvern.webeye.scraper.scraper import ScrapedPage
 jinja_sandbox_env = SandboxedEnvironment()
 
 LOG = structlog.get_logger()
+
+INPUT_GOAL = """- The intention to fill out an input: {intention}.
+- The overall goal that the user wants to achieve: {prompt}."""
 
 SELECT_OPTION_GOAL = """- The intention to select an option: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
@@ -183,7 +186,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
     async def ai_input_text(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         intention: str,
         data: str | dict[str, Any] | None = None,
@@ -193,19 +196,20 @@ class RealSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Input text into an element using AI to determine the value."""
 
-        context = skyvern_context.current()
+        context = skyvern_context.ensure_context()
         value = value or ""
         transformed_value = value
-        element_id: str | None = None
-        organization_id = context.organization_id if context else None
-        task_id = context.task_id if context else None
-        step_id = context.step_id if context else None
-        workflow_run_id = context.workflow_run_id if context else None
+        action: InputTextAction | None = None
+        organization_id = context.organization_id
+        task_id = context.task_id
+        step_id = context.step_id
+        workflow_run_id = context.workflow_run_id
         task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
         step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+
         if intention:
             try:
-                prompt = context.prompt if context else None
+                prompt = context.prompt
                 data = data or {}
                 if (totp_identifier or totp_url) and context and organization_id and task_id:
                     if totp_identifier:
@@ -232,40 +236,72 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
                 refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                 self.scraped_page = refreshed_page
-                # get the element_id by the selector
-                element_id = await _get_element_id_by_selector(selector, self.page)
-                script_generation_input_text_prompt = prompt_engine.load_prompt(
-                    template="script-generation-input-text-generatiion",
-                    intention=intention,
-                    goal=prompt,
-                    data=data,
-                )
-                json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
-                    prompt=script_generation_input_text_prompt,
-                    prompt_name="script-generation-input-text-generatiion",
-                    step=step,
-                    organization_id=organization_id,
-                )
-                value = json_response.get("answer", value)
+
+                # Try to get element_id from selector if selector is provided
+                element_id = await _get_element_id_by_selector(selector, self.page) if selector else None
+
+                if element_id:
+                    # The selector/element is valid, using a simpler/smaller prompt
+                    script_generation_input_text_prompt = prompt_engine.load_prompt(
+                        template="script-generation-input-text-generatiion",
+                        intention=intention,
+                        goal=prompt,
+                        data=data,
+                    )
+                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                        prompt=script_generation_input_text_prompt,
+                        prompt_name="script-generation-input-text-generatiion",
+                        step=step,
+                        organization_id=organization_id,
+                    )
+                    value = json_response.get("answer", value)
+
+                    if context and context.workflow_run_id:
+                        transformed_value = await _get_actual_value_of_parameter_if_secret(
+                            context.workflow_run_id, str(value)
+                        )
+                    action = InputTextAction(
+                        element_id=element_id,
+                        text=value,
+                        status=ActionStatus.pending,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        task_id=task_id,
+                        step_id=context.step_id if context else None,
+                        reasoning=intention,
+                        intention=intention,
+                        response=value,
+                    )
+                else:
+                    # Use a heavier single-input-action when selector is not found
+                    element_tree = refreshed_page.build_element_tree()
+                    payload_str = _get_context_data(data)
+                    merged_goal = INPUT_GOAL.format(intention=intention, prompt=prompt)
+
+                    single_input_prompt = prompt_engine.load_prompt(
+                        template="single-input-action",
+                        navigation_goal=merged_goal,
+                        navigation_payload_str=payload_str,
+                        current_url=self.page.url,
+                        elements=element_tree,
+                        local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+                    )
+                    json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
+                        prompt=single_input_prompt,
+                        prompt_name="single-input-action",
+                        step=step,
+                        organization_id=organization_id,
+                    )
+
+                    actions_json = json_response.get("actions", [])
+                    if actions_json and task and step:
+                        actions = parse_actions(task, step.step_id, step.order, refreshed_page, actions_json)
+                        if actions and isinstance(actions[0], InputTextAction):
+                            action = cast(InputTextAction, actions[0])
             except Exception:
                 LOG.exception(f"Failed to adapt value for input text action on selector={selector}, value={value}")
 
-        if context and context.workflow_run_id:
-            transformed_value = await _get_actual_value_of_parameter_if_secret(context.workflow_run_id, str(value))
-
-        if element_id and organization_id and task and step:
-            action = InputTextAction(
-                element_id=element_id,
-                text=value,
-                status=ActionStatus.pending,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                task_id=task_id,
-                step_id=context.step_id if context else None,
-                reasoning=intention,
-                intention=intention,
-                response=value,
-            )
+        if action and organization_id and task and step:
             result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)
