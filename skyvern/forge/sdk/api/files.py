@@ -213,11 +213,20 @@ async def wait_for_download_finished(downloading_files: list[str], timeout: floa
                 new_downloading_files: list[str] = []
                 for path in cur_downloading_files:
                     if path.startswith("s3://"):
-                        metadata = await aws_client.get_file_metadata(path, log_exception=False)
-                        if not metadata:
+                        try:
+                            await aws_client.get_object_info(path)
+                        except Exception:
+                            LOG.debug(
+                                "downloading file is not found in s3, means the file finished downloading", path=path
+                            )
                             continue
-                    if not Path(path).exists():
-                        continue
+                    else:
+                        if not Path(path).exists():
+                            LOG.debug(
+                                "downloading file is not found in the local file system, means the file finished downloading",
+                                path=path,
+                            )
+                            continue
                     new_downloading_files.append(path)
                 cur_downloading_files = new_downloading_files
                 await asyncio.sleep(1)
