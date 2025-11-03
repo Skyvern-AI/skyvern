@@ -502,7 +502,7 @@ class SkyvernPage:
     @action_wrap(ActionType.INPUT_TEXT)
     async def fill(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         ai: str | None = "fallback",
         intention: str | None = None,
@@ -525,7 +525,7 @@ class SkyvernPage:
     @action_wrap(ActionType.INPUT_TEXT)
     async def type(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         ai: str | None = "fallback",
         intention: str | None = None,
@@ -547,7 +547,7 @@ class SkyvernPage:
 
     async def _input_text(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         ai: str | None = "fallback",
         intention: str | None = None,
@@ -569,15 +569,17 @@ class SkyvernPage:
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
+
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
-            try:
-                locator = self.page.locator(selector)
-                await handler_utils.input_sequentially(locator, value, timeout=timeout)
-                return value
-            except Exception as e:
-                error_to_raise = e
+            if selector:
+                try:
+                    locator = self.page.locator(selector)
+                    await handler_utils.input_sequentially(locator, value, timeout=timeout)
+                    return value
+                except Exception as e:
+                    error_to_raise = e
 
             if intention:
                 return await self._ai.ai_input_text(
@@ -603,6 +605,10 @@ class SkyvernPage:
                 totp_url=totp_url,
                 timeout=timeout,
             )
+
+        if not selector:
+            raise ValueError("Selector is required but was not provided")
+
         locator = self.page.locator(selector)
         await handler_utils.input_sequentially(locator, value, timeout=timeout)
         return value

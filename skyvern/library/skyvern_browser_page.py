@@ -408,7 +408,7 @@ class SkyvernBrowserPage:
             ```
         """
         return await self._input_text(
-            selector=selector or "",
+            selector=selector,
             value=value or "",
             ai=ai,
             intention=prompt,
@@ -698,7 +698,7 @@ class SkyvernBrowserPage:
 
     async def _input_text(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         ai: str | None = "fallback",
         intention: str | None = None,
@@ -721,12 +721,13 @@ class SkyvernBrowserPage:
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
-            try:
-                locator = self._page.locator(selector)
-                await handler_utils.input_sequentially(locator, value, timeout=timeout)
-                return value
-            except Exception as e:
-                error_to_raise = e
+            if selector:
+                try:
+                    locator = self._page.locator(selector)
+                    await handler_utils.input_sequentially(locator, value, timeout=timeout)
+                    return value
+                except Exception as e:
+                    error_to_raise = e
 
             if intention:
                 return await self._ai.ai_input_text(
@@ -752,6 +753,10 @@ class SkyvernBrowserPage:
                 totp_url=totp_url,
                 timeout=timeout,
             )
+
+        if not selector:
+            raise ValueError("Selector is required but was not provided")
+
         locator = self._page.locator(selector)
         await handler_utils.input_sequentially(locator, value, timeout=timeout)
         return value
