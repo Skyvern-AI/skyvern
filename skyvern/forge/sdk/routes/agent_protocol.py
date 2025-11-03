@@ -1,3 +1,4 @@
+import asyncio
 from enum import Enum
 from typing import Annotated, Any
 
@@ -682,9 +683,13 @@ async def import_workflow_from_pdf(
         # Release underlying SpooledTemporaryFile ASAP
         await file.close()
 
-    # Extract text and validate synchronously (fast, ~1-2 seconds)
+    # Extract text in executor to avoid blocking event loop (1-2 seconds)
     try:
-        sop_text = pdf_import_service.extract_text_from_pdf(file_contents, file_name)
+        sop_text = await asyncio.to_thread(
+            pdf_import_service.extract_text_from_pdf,
+            file_contents,
+            file_name,
+        )
     except HTTPException:
         # Re-raise validation errors immediately
         raise
