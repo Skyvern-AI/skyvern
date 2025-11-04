@@ -21,6 +21,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
+    Credential,
     CredentialResponse,
     CredentialType,
     CredentialVaultType,
@@ -226,7 +227,7 @@ async def create_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
+    credential_service = await _get_credential_vault_service()
 
     credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
 
@@ -348,9 +349,13 @@ async def get_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
+    credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail="Credential not found")
 
-    return await credential_service.get_credential(current_org.organization_id, credential_id)
+    return await _convert_to_response(credential)
 
 
 @legacy_base_router.get("/credentials")
@@ -395,9 +400,8 @@ async def get_credentials(
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
 ) -> list[CredentialResponse]:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
-
-    return await credential_service.get_credentials(current_org.organization_id, page, page_size)
+    credentials = await app.DATABASE.get_credentials(current_org.organization_id, page=page, page_size=page_size)
+    return [_convert_to_response(credential) for credential in credentials]
 
 
 @base_router.get(
@@ -606,10 +610,8 @@ async def update_azure_client_secret_credential(
         )
 
 
-async def _get_credential_vault_service(organization_id: str) -> CredentialVaultService:
-    org_collection = await app.DATABASE.get_organization_bitwarden_collection(organization_id)
-
-    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN or org_collection:
+async def _get_credential_vault_service() -> CredentialVaultService:
+    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
@@ -617,3 +619,30 @@ async def _get_credential_vault_service(organization_id: str) -> CredentialVault
         return app.AZURE_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
+
+
+def _convert_to_response(credential: Credential) -> CredentialResponse:
+    if credential.credential_type == CredentialType.PASSWORD:
+        credential_response = PasswordCredentialResponse(
+            username=credential.username or credential.credential_id,
+            totp_type=credential.totp_type,
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    elif credential.credential_type == CredentialType.CREDIT_CARD:
+        credential_response = CreditCardCredentialResponse(
+            last_four=credential.card_last4 or "****",
+            brand=credential.card_brand or "Card Brand",
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Credential type not supported")
