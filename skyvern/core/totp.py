@@ -1,5 +1,4 @@
 import asyncio
-import json
 from datetime import datetime, timedelta
 
 import structlog
@@ -8,7 +7,7 @@ from skyvern.config import settings
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_post
-from skyvern.forge.sdk.core.security import generate_skyvern_signature
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
@@ -86,19 +85,9 @@ async def _get_verification_code_from_url(
         request_data["workflow_run_id"] = workflow_run_id
     if workflow_permanent_id:
         request_data["workflow_permanent_id"] = workflow_permanent_id
-    payload = json.dumps(request_data)
-    signature = generate_skyvern_signature(
-        payload=payload,
-        api_key=api_key,
-    )
-    timestamp = str(int(datetime.utcnow().timestamp()))
-    headers = {
-        "x-skyvern-timestamp": timestamp,
-        "x-skyvern-signature": signature,
-        "Content-Type": "application/json",
-    }
+    signed_data = generate_skyvern_webhook_signature(payload=request_data, api_key=api_key)
     try:
-        json_resp = await aiohttp_post(url=url, data=request_data, headers=headers, raise_exception=False)
+        json_resp = await aiohttp_post(url=url, data=request_data, headers=signed_data.headers, raise_exception=False)
     except Exception as e:
         LOG.error("Failed to get verification code from url", exc_info=True)
         raise FailedToGetTOTPVerificationCode(

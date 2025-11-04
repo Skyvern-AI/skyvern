@@ -1516,6 +1516,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "json": json,
             "Exception": Exception,
         }
 
