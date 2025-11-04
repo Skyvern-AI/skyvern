@@ -75,7 +75,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TA
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -2592,19 +2592,23 @@ class ForgeAgent:
             payload_dict = json.loads(payload_json)
             if task_run_response_json:
                 payload_dict.update(json.loads(task_run_response_json))
-            payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-            headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
+
+            signed_data = generate_skyvern_webhook_signature(payload=payload_dict, api_key=api_key)
+
             LOG.info(
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=payload,
-                headers=headers,
+                payload=signed_data.signed_payload,
+                headers=signed_data.headers,
             )
 
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    task.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+                    task.webhook_callback_url,
+                    data=signed_data.signed_payload,
+                    headers=signed_data.headers,
+                    timeout=httpx.Timeout(30.0),
                 )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
