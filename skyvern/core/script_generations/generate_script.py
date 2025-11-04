@@ -229,7 +229,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     """
     Turn one Action dict into:
 
-        await page.<method>(selector=..., intention=..., data=context.parameters)
+        await page.<method>(selector=..., prompt=..., data=context.parameters)
 
     Or if assign_to_output is True for extract actions:
 
@@ -420,12 +420,12 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                     comma=cst.Comma(),
                 )
             )
-    intention = act.get("intention") or act.get("reasoning") or ""
+    intention = act.get("intention") or act.get("prompt") or act.get("reasoning") or ""
     if intention:
         args.extend(
             [
                 cst.Arg(
-                    keyword=cst.Name("intention"),
+                    keyword=cst.Name("prompt"),
                     value=_value(intention),
                     whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
                     comma=cst.Comma(),
