@@ -355,7 +355,7 @@ async def get_credential(
     if not credential:
         raise HTTPException(status_code=404, detail="Credential not found")
 
-    return await _convert_to_response(credential)
+    return _convert_to_response(credential)
 
 
 @legacy_base_router.get("/credentials")
