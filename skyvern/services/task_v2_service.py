@@ -20,7 +20,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1817,17 +1817,19 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         payload_json = task_v2.model_dump_json(by_alias=True)
         payload_dict = json.loads(payload_json)
         payload_dict.update(json.loads(task_run_response_json))
-        payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-        headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
+        signed_data = generate_skyvern_webhook_signature(payload=payload_dict, api_key=api_key.token)
         LOG.info(
             "Sending task v2 response to webhook callback url",
             task_v2_id=task_v2.observer_cruise_id,
             webhook_callback_url=task_v2.webhook_callback_url,
-            payload=payload,
-            headers=headers,
+            payload=signed_data.signed_payload,
+            headers=signed_data.headers,
         )
         resp = await httpx.AsyncClient().post(
-            task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+            task_v2.webhook_callback_url,
+            data=signed_data.signed_payload,
+            headers=signed_data.headers,
+            timeout=httpx.Timeout(30.0),
         )
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
