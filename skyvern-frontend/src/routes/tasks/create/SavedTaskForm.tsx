@@ -36,6 +36,7 @@ import {
   CreateTaskRequest,
   OrganizationApiResponse,
   ProxyLocation,
+  RunEngine,
 } from "@/api/types";
 import { ProxySelector } from "@/components/ProxySelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
@@ -786,7 +787,10 @@ function SavedTaskForm({ initialValues }: Props) {
               return {
                 method: "POST",
                 url: `${runsApiBaseUrl}/run/tasks`,
-                body: buildTaskRunPayload(createTaskRequestObject(formValues)),
+                body: buildTaskRunPayload(
+                  createTaskRequestObject(formValues),
+                  RunEngine.SkyvernV1,
+                ),
                 headers,
               } satisfies ApiCommandOptions;
             }}

@@ -27,6 +27,10 @@ Reply in JSON format with the following keys:
             "label": str, // the label of the option if any. MAKE SURE YOU USE THIS LABEL TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION LABEL HERE
             "index": int, // the index corresponding to the option index under the select element.
             "value": str // the value of the option. MAKE SURE YOU USE THIS VALUE TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION VALUE HERE
+        },
+        "click_context": {  // The context for CLICK action only. null if not CLICK action
+            "thought": str, // Describe how you decided that this action is a single choice option or multi-choice option.
+            "single_option_click": bool, // True if the click is the only choice to proceed towards the goal, regardless of different user context or input. False if there are multiple valid options that depend on user input. Examples: clicking a login button to login is True (it's the only way to login); clicking a radio button for a multi-choice question (e.g., selecting "male", "female", or "other" for gender) is False (the choice depends on user input). When clicking on radio buttons, dropdown options, or any element that represents one of multiple possible selections, this should be False.
         }{% if parse_select_feature_enabled %},
         "context": { // The context for INPUT_TEXT or SELECT_OPTION action only. null if not INPUT_TEXT or SELECT_OPTION action. Extract the following detailed information from the "reasoning", and double-check the information by analysing the HTML elements.
             "thought": str, // A string to describe how you double-check the context information to ensure the accuracy.

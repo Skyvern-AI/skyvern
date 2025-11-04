@@ -32,7 +32,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -1454,7 +1454,8 @@ class WorkflowService:
                 duration_seconds=duration_seconds,
                 workflow_run_status=workflow_run.status,
                 organization_id=workflow_run.organization_id,
-                run_with=run_with,
+                run_with=workflow_run.run_with,
+                ai_fallback=workflow_run.ai_fallback,
             )
         return workflow_run
 
@@ -2076,12 +2077,11 @@ class WorkflowService:
             ),
             errors=workflow_run_status_response.errors,
         )
-        payload_dict = json.loads(workflow_run_status_response.model_dump_json())
+        payload_dict: dict = json.loads(workflow_run_status_response.model_dump_json())
         workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
         payload_dict.update(workflow_run_response_dict)
-        payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-        headers = generate_skyvern_webhook_headers(
-            payload=payload,
+        signed_data = generate_skyvern_webhook_signature(
+            payload=payload_dict,
             api_key=api_key,
         )
         LOG.info(
@@ -2089,13 +2089,16 @@ class WorkflowService:
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            payload=payload,
-            headers=headers,
+            payload=signed_data.signed_payload,
+            headers=signed_data.headers,
         )
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    url=workflow_run.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+                    url=workflow_run.webhook_callback_url,
+                    data=signed_data.signed_payload,
+                    headers=signed_data.headers,
+                    timeout=httpx.Timeout(30.0),
                 )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
@@ -2114,7 +2117,7 @@ class WorkflowService:
                     "Webhook failed",
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
-                    webhook_data=payload,
+                    webhook_data=signed_data.signed_payload,
                     resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
