@@ -50,6 +50,11 @@ class InputOrSelectContext(BaseModel):
         return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
 
 
+class ClickContext(BaseModel):
+    thought: str | None = None
+    single_option_click: bool | None = None
+
+
 class Action(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -88,6 +93,7 @@ class Action(BaseModel):
     option: SelectOption | None = None
     is_checked: bool | None = None
     verified: bool = False
+    click_context: ClickContext | None = None
 
     # TOTP timing information for multi-field TOTP sequences
     totp_timing_info: dict[str, Any] | None = None

@@ -27,7 +27,8 @@ from skyvern.schemas.workflows import FileStorageType
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger(__name__)
-GENERATE_CODE_AI_MODE = "proactive"
+GENERATE_CODE_AI_MODE_PROACTIVE = "proactive"
+GENERATE_CODE_AI_MODE_FALLBACK = "fallback"
 
 
 # --------------------------------------------------------------------- #
@@ -250,10 +251,14 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         )
 
     if method == "click":
+        ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
+        click_context = act.get("click_context")
+        if click_context and isinstance(click_context, dict) and click_context.get("single_option_click"):
+            ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
         args.append(
             cst.Arg(
                 keyword=cst.Name("ai"),
-                value=_value(GENERATE_CODE_AI_MODE),
+                value=_value(ai_mode),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -286,7 +291,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         args.append(
             cst.Arg(
                 keyword=cst.Name("ai"),
-                value=_value(GENERATE_CODE_AI_MODE),
+                value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -343,7 +348,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
             args.append(
                 cst.Arg(
                     keyword=cst.Name("ai"),
-                    value=_value(GENERATE_CODE_AI_MODE),
+                    value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
                     whitespace_after_arg=cst.ParenthesizedWhitespace(
                         indent=True,
                         last_line=cst.SimpleWhitespace(INDENT),
@@ -374,7 +379,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
         args.append(
             cst.Arg(
                 keyword=cst.Name("ai"),
-                value=_value(GENERATE_CODE_AI_MODE),
+                value=_value(GENERATE_CODE_AI_MODE_PROACTIVE),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
