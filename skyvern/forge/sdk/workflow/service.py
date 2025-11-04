@@ -1454,7 +1454,8 @@ class WorkflowService:
                 duration_seconds=duration_seconds,
                 workflow_run_status=workflow_run.status,
                 organization_id=workflow_run.organization_id,
-                run_with=run_with,
+                run_with=workflow_run.run_with,
+                ai_fallback=workflow_run.ai_fallback,
             )
         return workflow_run
 
