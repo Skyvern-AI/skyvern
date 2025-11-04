@@ -86,7 +86,7 @@ async def ensure_local_server_running() -> None:
         app=app,
         host="127.0.0.1",
         port=port,
-        log_level="info",
+        log_level="error",
         reload=False,
         access_log=False,
     )
