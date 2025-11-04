@@ -166,6 +166,8 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> dict:
 
     payload_dict = json.loads(workflow_base.model_dump_json())
 
+    app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run_id}"
+
     workflow_run_response = WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
@@ -180,7 +182,7 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> dict:
         queued_at=payload_dict.get("queued_at"),
         started_at=payload_dict.get("started_at"),
         finished_at=payload_dict.get("finished_at"),
-        app_url=f"https://app.skyvern.com/workflows/{workflow_id}/{workflow_run_id}",
+        app_url=app_url,
         browser_session_id=payload_dict.get("browser_session_id"),
         max_screenshot_scrolls=payload_dict.get("max_screenshot_scrolls"),
         script_run=None,
@@ -402,10 +404,7 @@ async def _build_workflow_payload(
             f"Run {workflow_run_id} has not reached a terminal state (status={status_response.status})."
         )
 
-    app_url = (
-        f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
-        f"{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
-    )
+    app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
 
     run_response = WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
