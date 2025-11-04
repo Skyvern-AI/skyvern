@@ -26,6 +26,7 @@ from skyvern.exceptions import (
     ScriptTerminationException,
     SkyvernException,
     WorkflowNotFound,
+    WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -1123,6 +1124,23 @@ class WorkflowService:
         )
         return workflows
 
+    async def get_workflow_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        exclude_deleted: bool = True,
+    ) -> Workflow:
+        workflow = await app.DATABASE.get_workflow_for_workflow_run(
+            workflow_run_id,
+            organization_id=organization_id,
+            exclude_deleted=exclude_deleted,
+        )
+
+        if not workflow:
+            raise WorkflowNotFoundForWorkflowRun(workflow_run_id=workflow_run_id)
+
+        return workflow
+
     async def get_block_outputs_for_debug_session(
         self,
         workflow_permanent_id: str,
@@ -2049,10 +2067,8 @@ class WorkflowService:
             return
 
         # build new schema for backward compatible webhook payload
-        app_url = (
-            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
-            f"{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
-        )
+        app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
+
         workflow_run_response = WorkflowRunResponse(
             run_id=workflow_run.workflow_run_id,
             run_type=RunType.workflow_run,
