@@ -538,20 +538,23 @@ class RealSkyvernPageAi(SkyvernPageAi):
         prompt: str,
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
+        context = skyvern_context.ensure_context()
+        organization_id = context.organization_id
+        task_id = context.task_id
+        step_id = context.step_id
 
-        context = skyvern_context.current()
-        organization_id = context.organization_id if context else None
-        step_id = context.step_id if context else None
+        task = await app.DATABASE.get_task(task_id, organization_id) if task_id and organization_id else None
+        step = await app.DATABASE.get_step(step_id, organization_id) if step_id and organization_id else None
+
+        if not task or not step:
+            LOG.warning("ai_act: missing task or step", task_id=task_id, step_id=step_id)
+            return
 
         # First, infer the action type from the prompt
         infer_action_type_prompt = prompt_engine.load_prompt(
             template="infer-action-type",
             navigation_goal=prompt,
         )
-
-        step = None
-        if context and organization_id and step_id:
-            step = await app.DATABASE.get_step(step_id, organization_id)
 
         json_response = await app.SINGLE_INPUT_AGENT_LLM_API_HANDLER(
             prompt=infer_action_type_prompt,
@@ -582,36 +585,77 @@ class RealSkyvernPageAi(SkyvernPageAi):
             reasoning=action_info.get("reasoning"),
         )
 
+        refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+        self.scraped_page = refreshed_page
+        element_tree = refreshed_page.build_element_tree()
+
+        template: str
+        llm_handler: Any
+        if action_type == "CLICK":
+            template = "single-click-action"
+            llm_handler = app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
+        elif action_type == "INPUT_TEXT":
+            template = "single-input-action"
+            llm_handler = app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+        elif action_type == "UPLOAD_FILE":
+            template = "single-upload-action"
+            llm_handler = app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+        elif action_type == "SELECT_OPTION":
+            template = "single-select-action"
+            llm_handler = app.SELECT_AGENT_LLM_API_HANDLER
+        else:
+            LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
+            return
+
+        single_action_prompt = prompt_engine.load_prompt(
+            template=template,
+            navigation_goal=prompt,
+            navigation_payload_str=None,
+            current_url=self.page.url,
+            elements=element_tree,
+            local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
+        )
+
         try:
-            if action_type == "CLICK":
-                await self.ai_click(
-                    selector="",
-                    intention=prompt,
-                    data=None,
-                )
-            elif action_type == "INPUT_TEXT":
-                await self.ai_input_text(
-                    selector=None,
-                    value="",
-                    intention=prompt,
-                    data=None,
-                )
-            elif action_type == "UPLOAD_FILE":
-                await self.ai_upload_file(
-                    selector=None,
-                    files="",
-                    intention=prompt,
-                    data=None,
-                )
-            elif action_type == "SELECT_OPTION":
-                await self.ai_select_option(
-                    selector="",
-                    value="",
-                    intention=prompt,
-                    data=None,
-                )
+            action_response = await llm_handler(
+                prompt=single_action_prompt,
+                prompt_name=template,
+                step=step,
+                organization_id=organization_id,
+            )
+
+            actions_json = action_response.get("actions", [])
+            if not actions_json:
+                LOG.warning("ai_act: no actions generated", prompt=prompt, action_type=action_type)
+                return
+
+            actions = parse_actions(task, step.step_id, step.order, refreshed_page, actions_json)
+            if not actions:
+                LOG.warning("ai_act: failed to parse actions", prompt=prompt, action_type=action_type)
+                return
+
+            action = actions[0]
+
+            if action_type == "CLICK" and isinstance(action, ClickAction):
+                result = await handle_click_action(action, self.page, refreshed_page, task, step)
+            elif action_type == "INPUT_TEXT" and isinstance(action, InputTextAction):
+                result = await handle_input_text_action(action, self.page, refreshed_page, task, step)
+            elif action_type == "UPLOAD_FILE" and isinstance(action, UploadFileAction):
+                result = await handle_upload_file_action(action, self.page, refreshed_page, task, step)
+            elif action_type == "SELECT_OPTION" and isinstance(action, SelectOptionAction):
+                result = await handle_select_option_action(action, self.page, refreshed_page, task, step)
             else:
-                LOG.warning("ai_act: unknown action type", action_type=action_type, prompt=prompt)
+                LOG.warning(
+                    "ai_act: action type mismatch",
+                    expected_type=action_type,
+                    actual_type=type(action).__name__,
+                    prompt=prompt,
+                )
+                return
+
+            if result and result[-1].success is False:
+                raise Exception(result[-1].exception_message)
+
         except Exception:
             LOG.exception("ai_act: failed to execute action", action_type=action_type, prompt=prompt)
 
