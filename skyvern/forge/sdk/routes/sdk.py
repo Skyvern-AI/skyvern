@@ -174,6 +174,11 @@ async def run_sdk_action(
                 data=action.data,
                 timeout=action.timeout,
             )
+        elif action.type == "ai_act":
+            await page_ai.ai_act(
+                prompt=action.intention,
+            )
+            result = None
         elif action.type == "extract":
             extract_result = await page_ai.ai_extract(
                 prompt=action.prompt,
