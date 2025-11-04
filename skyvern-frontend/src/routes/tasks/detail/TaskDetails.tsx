@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { useState } from "react";
 import {
+  RunEngine,
   Status,
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
@@ -227,7 +228,10 @@ function TaskDetails() {
                 return {
                   method: "POST",
                   url: `${runsApiBaseUrl}/run/tasks`,
-                  body: buildTaskRunPayload(createTaskRequestObject(task)),
+                  body: buildTaskRunPayload(
+                    createTaskRequestObject(task),
+                    RunEngine.SkyvernV1,
+                  ),
                   headers,
                 } satisfies ApiCommandOptions;
               }}

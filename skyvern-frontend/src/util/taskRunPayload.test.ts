@@ -9,6 +9,7 @@ describe("buildTaskRunPayload", () => {
       url: " https://example.com/task ",
       navigation_goal: "Navigate somewhere",
       data_extraction_goal: "Collect some data",
+      navigation_payload: { name: "John", age: 30 },
       webhook_callback_url: " https://callback.example.com ",
       proxy_location: "RESIDENTIAL",
       extracted_information_schema: { foo: "bar" },
@@ -23,7 +24,8 @@ describe("buildTaskRunPayload", () => {
     const payload = buildTaskRunPayload(request);
 
     expect(payload).toEqual({
-      prompt: "Navigate somewhere\n\nCollect some data",
+      prompt:
+        'Navigate somewhere\n\nCollect some data\n\n{"name":"John","age":30}',
       url: "https://example.com/task",
       proxy_location: "RESIDENTIAL",
       data_extraction_schema: { foo: "bar" },
@@ -44,6 +46,7 @@ describe("buildTaskRunPayload", () => {
       url: "  https://fallback.example.com ",
       navigation_goal: "",
       data_extraction_goal: null,
+      navigation_payload: null,
       webhook_callback_url: "  ",
       proxy_location: null,
       extracted_information_schema: null,
@@ -70,5 +73,31 @@ describe("buildTaskRunPayload", () => {
       extra_http_headers: undefined,
       error_code_mapping: undefined,
     });
+  });
+
+  it("includes navigation_payload as string in prompt", () => {
+    const request: CreateTaskRequest = {
+      url: "https://example.com",
+      navigation_goal: "Fill form",
+      navigation_payload: '{"email": "test@example.com"}',
+    };
+
+    const payload = buildTaskRunPayload(request);
+
+    expect(payload.prompt).toBe('Fill form\n\n{"email": "test@example.com"}');
+  });
+
+  it("formats navigation_payload object as JSON in prompt", () => {
+    const request: CreateTaskRequest = {
+      url: "https://example.com",
+      navigation_goal: "Fill form",
+      navigation_payload: { email: "test@example.com", name: "Test" },
+    };
+
+    const payload = buildTaskRunPayload(request);
+
+    expect(payload.prompt).toBe(
+      'Fill form\n\n{"email":"test@example.com","name":"Test"}',
+    );
   });
 });
