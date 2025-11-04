@@ -229,7 +229,7 @@ class SkyvernPage:
                     # Auto-create action after execution
                     await skyvern_page._create_action_after_execution(
                         action_type=action,
-                        prompt=prompt,
+                        intention=prompt,
                         status=action_status,
                         data=data,
                         kwargs=kwargs,
@@ -265,18 +265,14 @@ class SkyvernPage:
         action_id: str,
         organization_id: str,
         action_type: ActionType,
-        prompt: str = "",
+        intention: str = "",
         text: str | None = None,
         select_option: SelectOption | None = None,
         file_url: str | None = None,
         data_extraction_goal: str | None = None,
         data_extraction_schema: dict[str, Any] | list | str | None = None,
-        intention: str = "",  # backward compatibility
     ) -> str:
         """Generate user-facing reasoning for an action using the secondary LLM."""
-        # Backward compatibility
-        if intention and not prompt:
-            prompt = intention
 
         reasoning = f"Auto-generated action for {action_type.value}"
         try:
@@ -288,7 +284,7 @@ class SkyvernPage:
             reasoning_prompt = prompt_engine.load_prompt(
                 template="generate-action-reasoning",
                 action_type=action_type.value,
-                intention=prompt,
+                intention=intention,
                 text=text,
                 select_option=select_option.value if select_option else None,
                 file_url=file_url,
@@ -317,17 +313,13 @@ class SkyvernPage:
     async def _create_action_after_execution(
         self,
         action_type: ActionType,
-        prompt: str = "",
+        intention: str = "",
         status: ActionStatus = ActionStatus.pending,
         data: str | dict[str, Any] = "",
         kwargs: dict[str, Any] | None = None,
         call_result: Any | None = None,
-        intention: str = "",  # backward compatibility
     ) -> Action | None:
         """Create an action record in the database before execution if task_id and step_id are available."""
-        # Backward compatibility
-        if intention and not prompt:
-            prompt = intention
 
         try:
             context = skyvern_context.current()
@@ -368,7 +360,7 @@ class SkyvernPage:
                 step_id=context.step_id,
                 step_order=0,  # Will be updated by the system if needed
                 action_order=context.action_order,  # Will be updated by the system if needed
-                intention=prompt,
+                intention=intention,
                 text=text,
                 option=select_option,
                 file_url=file_url,
@@ -391,7 +383,7 @@ class SkyvernPage:
                     step_id=context.step_id,
                     step_order=0,
                     action_order=context.action_order,
-                    intention=prompt,
+                    intention=intention,
                     data_extraction_goal=data_extraction_goal,
                     data_extraction_schema=data_extraction_schema,
                     option=select_option,
@@ -406,7 +398,7 @@ class SkyvernPage:
                     action_id=str(created_action.action_id),
                     organization_id=str(context.organization_id),
                     action_type=action_type,
-                    prompt=prompt,
+                    intention=intention,
                     text=text,
                     select_option=select_option,
                     file_url=file_url,
@@ -540,7 +532,7 @@ class SkyvernPage:
             selector=selector,
             value=value,
             ai=ai,
-            prompt=prompt,
+            intention=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
@@ -568,7 +560,7 @@ class SkyvernPage:
             selector=selector,
             value=value,
             ai=ai,
-            prompt=prompt,
+            intention=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
@@ -580,12 +572,11 @@ class SkyvernPage:
         selector: str | None,
         value: str,
         ai: str | None = "fallback",
-        prompt: str | None = None,
+        intention: str | None = None,
         data: str | dict[str, Any] | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
     ) -> str:
         """Input text into an element identified by ``selector``.
 
@@ -597,9 +588,6 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         inputting the originally supplied ``text``.
         """
-        # Backward compatibility
-        if intention is not None and prompt is None:
-            prompt = intention
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -616,11 +604,11 @@ class SkyvernPage:
                 except Exception as e:
                     error_to_raise = e
 
-            if prompt:
+            if intention:
                 return await self._ai.ai_input_text(
                     selector=selector,
                     value=value,
-                    intention=prompt,
+                    intention=intention,
                     data=data,
                     totp_identifier=totp_identifier,
                     totp_url=totp_url,
@@ -630,11 +618,11 @@ class SkyvernPage:
                 raise error_to_raise
             else:
                 return value
-        elif ai == "proactive" and prompt:
+        elif ai == "proactive" and intention:
             return await self._ai.ai_input_text(
                 selector=selector,
                 value=value,
-                intention=prompt,
+                intention=intention,
                 data=data,
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
