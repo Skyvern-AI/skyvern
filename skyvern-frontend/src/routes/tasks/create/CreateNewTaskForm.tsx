@@ -3,6 +3,7 @@ import {
   CreateTaskRequest,
   OrganizationApiResponse,
   ProxyLocation,
+  RunEngine,
 } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "@/components/ui/button";
@@ -775,7 +776,10 @@ function CreateNewTaskForm({ initialValues }: Props) {
               return {
                 method: "POST",
                 url: `${runsApiBaseUrl}/run/tasks`,
-                body: buildTaskRunPayload(createTaskRequestObject(formValues)),
+                body: buildTaskRunPayload(
+                  createTaskRequestObject(formValues),
+                  RunEngine.SkyvernV1,
+                ),
                 headers,
               } satisfies ApiCommandOptions;
             }}

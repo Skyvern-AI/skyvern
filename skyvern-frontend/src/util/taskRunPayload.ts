@@ -1,4 +1,4 @@
-import type { CreateTaskRequest, ProxyLocation } from "@/api/types";
+import type { CreateTaskRequest, ProxyLocation, RunEngine } from "@/api/types";
 
 type TaskRunPayload = {
   prompt: string;
@@ -13,6 +13,7 @@ type TaskRunPayload = {
   include_action_history_in_verification?: boolean | null;
   max_screenshot_scrolls?: number | null;
   title?: string | null;
+  engine?: RunEngine | null;
 };
 
 // Helper to trim and check for empty strings
@@ -21,12 +22,33 @@ const trim = (s: string | null | undefined): string | undefined => {
   return t && t.length > 0 ? t : undefined;
 };
 
-// Build prompt from navigation_goal + data_extraction_goal
+// Helper to format navigation_payload as a string
+function formatNavigationPayload(
+  payload: Record<string, unknown> | string | null | undefined,
+): string | undefined {
+  if (payload == null) return undefined;
+  if (typeof payload === "string") {
+    const trimmed = payload.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof payload === "object" && !Array.isArray(payload)) {
+    try {
+      const jsonStr = JSON.stringify(payload);
+      return jsonStr.length > 0 ? jsonStr : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+// Build prompt from navigation_goal + data_extraction_goal + navigation_payload
 function buildPrompt(request: CreateTaskRequest): string {
   const nav = trim(request.navigation_goal);
   const extract = trim(request.data_extraction_goal);
+  const payload = formatNavigationPayload(request.navigation_payload);
 
-  const parts = [nav, extract].filter(Boolean);
+  const parts = [nav, extract, payload].filter(Boolean);
   if (parts.length > 0) return parts.join("\n\n");
 
   // Fallback chain: try title, then goals again, then url, then default
@@ -47,14 +69,17 @@ function isValidRecord(val: unknown): val is Record<string, string> {
  * Transforms a CreateTaskRequest (old schema) to TaskRunPayload (Runs API v2 schema).
  *
  * Key transformations:
- * - navigation_goal + data_extraction_goal → prompt (combined)
+ * - navigation_goal + data_extraction_goal + navigation_payload → prompt (combined)
  * - extracted_information_schema → data_extraction_schema
  * - webhook_callback_url → webhook_url
  *
  * Note: max_steps is optional and can be added manually to the cURL if needed.
  */
-function buildTaskRunPayload(request: CreateTaskRequest): TaskRunPayload {
-  return {
+function buildTaskRunPayload(
+  request: CreateTaskRequest,
+  engine?: RunEngine | null,
+): TaskRunPayload {
+  const payload: TaskRunPayload = {
     prompt: buildPrompt(request),
     url: trim(request.url) ?? null,
     proxy_location: request.proxy_location ?? null,
@@ -73,6 +98,10 @@ function buildTaskRunPayload(request: CreateTaskRequest): TaskRunPayload {
       ? request.error_code_mapping
       : undefined,
   };
+  if (engine) {
+    payload.engine = engine;
+  }
+  return payload;
 }
 
 export type { TaskRunPayload };
