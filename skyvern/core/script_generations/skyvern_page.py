@@ -45,7 +45,7 @@ class Driver(StrEnum):
 
 @dataclass
 class ActionMetadata:
-    intention: str = ""
+    prompt: str = ""
     data: dict[str, Any] | str | None = None
     timestamp: float | None = None  # filled in by recorder
     screenshot_path: str | None = None  # if enabled
@@ -176,11 +176,16 @@ class SkyvernPage:
             async def wrapper(
                 skyvern_page: SkyvernPage,
                 *args: Any,
-                intention: str = "",
+                prompt: str = "",
                 data: str | dict[str, Any] = "",
+                intention: str = "",  # backward compatibility
                 **kwargs: Any,
             ) -> Any:
-                meta = ActionMetadata(intention, data)
+                # Backward compatibility: use intention if provided and prompt is empty
+                if intention and not prompt:
+                    prompt = intention
+
+                meta = ActionMetadata(prompt, data)
                 call = ActionCall(action, args, kwargs, meta)
 
                 action_status = ActionStatus.completed
@@ -191,14 +196,14 @@ class SkyvernPage:
                     emoji = ACTION_EMOJIS.get(action, "🔧")
                     action_name = action.value if hasattr(action, "value") else str(action)
                     print(f"{emoji} {action_name.replace('_', ' ').title()}", end="")
-                    if intention:
-                        print(f": {intention}")
+                    if prompt:
+                        print(f": {prompt}")
                     else:
                         print()
 
                 try:
                     call.result = await fn(
-                        skyvern_page, *args, intention=intention, data=data, **kwargs
+                        skyvern_page, *args, prompt=prompt, data=data, intention=intention, **kwargs
                     )  # real driver call
 
                     # Note: Action status would be updated to completed here if update method existed
@@ -224,7 +229,7 @@ class SkyvernPage:
                     # Auto-create action after execution
                     await skyvern_page._create_action_after_execution(
                         action_type=action,
-                        intention=intention,
+                        prompt=prompt,
                         status=action_status,
                         data=data,
                         kwargs=kwargs,
@@ -260,14 +265,19 @@ class SkyvernPage:
         action_id: str,
         organization_id: str,
         action_type: ActionType,
-        intention: str = "",
+        prompt: str = "",
         text: str | None = None,
         select_option: SelectOption | None = None,
         file_url: str | None = None,
         data_extraction_goal: str | None = None,
         data_extraction_schema: dict[str, Any] | list | str | None = None,
+        intention: str = "",  # backward compatibility
     ) -> str:
         """Generate user-facing reasoning for an action using the secondary LLM."""
+        # Backward compatibility
+        if intention and not prompt:
+            prompt = intention
+
         reasoning = f"Auto-generated action for {action_type.value}"
         try:
             context = skyvern_context.current()
@@ -275,10 +285,10 @@ class SkyvernPage:
                 return f"Auto-generated action for {action_type.value}"
 
             # Build the prompt with available context
-            prompt = prompt_engine.load_prompt(
+            reasoning_prompt = prompt_engine.load_prompt(
                 template="generate-action-reasoning",
                 action_type=action_type.value,
-                intention=intention,
+                intention=prompt,
                 text=text,
                 select_option=select_option.value if select_option else None,
                 file_url=file_url,
@@ -288,7 +298,7 @@ class SkyvernPage:
 
             # Call secondary LLM to generate reasoning
             json_response = await app.SECONDARY_LLM_API_HANDLER(
-                prompt=prompt,
+                prompt=reasoning_prompt,
                 prompt_name="generate-action-reasoning",
                 organization_id=context.organization_id,
             )
@@ -307,13 +317,18 @@ class SkyvernPage:
     async def _create_action_after_execution(
         self,
         action_type: ActionType,
-        intention: str = "",
+        prompt: str = "",
         status: ActionStatus = ActionStatus.pending,
         data: str | dict[str, Any] = "",
         kwargs: dict[str, Any] | None = None,
         call_result: Any | None = None,
+        intention: str = "",  # backward compatibility
     ) -> Action | None:
         """Create an action record in the database before execution if task_id and step_id are available."""
+        # Backward compatibility
+        if intention and not prompt:
+            prompt = intention
+
         try:
             context = skyvern_context.current()
             if not context or not context.task_id or not context.step_id:
@@ -353,7 +368,7 @@ class SkyvernPage:
                 step_id=context.step_id,
                 step_order=0,  # Will be updated by the system if needed
                 action_order=context.action_order,  # Will be updated by the system if needed
-                intention=intention,
+                intention=prompt,
                 text=text,
                 option=select_option,
                 file_url=file_url,
@@ -376,7 +391,7 @@ class SkyvernPage:
                     step_id=context.step_id,
                     step_order=0,
                     action_order=context.action_order,
-                    intention=intention,
+                    intention=prompt,
                     data_extraction_goal=data_extraction_goal,
                     data_extraction_schema=data_extraction_schema,
                     option=select_option,
@@ -391,7 +406,7 @@ class SkyvernPage:
                     action_id=str(created_action.action_id),
                     organization_id=str(context.organization_id),
                     action_type=action_type,
-                    intention=intention,
+                    prompt=prompt,
                     text=text,
                     select_option=select_option,
                     file_url=file_url,
@@ -447,14 +462,15 @@ class SkyvernPage:
     async def click(
         self,
         selector: str,
-        intention: str | None = None,
+        prompt: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
     ) -> str:
         """Click an element identified by ``selector``.
 
-        When ``intention`` and ``data`` are provided a new click action is
+        When ``prompt`` and ``data`` are provided a new click action is
         generated via the ``single-click-action`` prompt.  The model returns a
         fresh "xpath=..." selector based on the current DOM and the updated data for this run.
         The browser then clicks the element using this newly generated xpath selector.
@@ -462,6 +478,10 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         clicking the originally supplied ``selector``.
         """
+        # Backward compatibility
+        if intention is not None and prompt is None:
+            prompt = intention
+
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
@@ -476,10 +496,10 @@ class SkyvernPage:
                 error_to_raise = e
 
             # if the original selector doesn't work, try to click the element with the ai generated selector
-            if intention:
+            if prompt:
                 return await self._ai.ai_click(
                     selector=selector,
-                    intention=intention,
+                    intention=prompt,
                     data=data,
                     timeout=timeout,
                 )
@@ -488,10 +508,10 @@ class SkyvernPage:
             else:
                 return selector
         elif ai == "proactive":
-            if intention:
+            if prompt:
                 return await self._ai.ai_click(
                     selector=selector,
-                    intention=intention,
+                    intention=prompt,
                     data=data,
                     timeout=timeout,
                 )
@@ -505,17 +525,22 @@ class SkyvernPage:
         selector: str | None,
         value: str,
         ai: str | None = "fallback",
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        intention: str | None = None,  # backward compatibility
     ) -> str:
+        # Backward compatibility
+        if intention is not None and prompt is None:
+            prompt = intention
+
         return await self._input_text(
             selector=selector,
             value=value,
             ai=ai,
-            intention=intention,
+            prompt=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
@@ -528,17 +553,22 @@ class SkyvernPage:
         selector: str | None,
         value: str,
         ai: str | None = "fallback",
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
+        intention: str | None = None,  # backward compatibility
     ) -> str:
+        # Backward compatibility
+        if intention is not None and prompt is None:
+            prompt = intention
+
         return await self._input_text(
             selector=selector,
             value=value,
             ai=ai,
-            intention=intention,
+            prompt=prompt,
             data=data,
             timeout=timeout,
             totp_identifier=totp_identifier,
@@ -550,15 +580,16 @@ class SkyvernPage:
         selector: str | None,
         value: str,
         ai: str | None = "fallback",
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
     ) -> str:
         """Input text into an element identified by ``selector``.
 
-        When ``intention`` and ``data`` are provided a new input text action is
+        When ``prompt`` and ``data`` are provided a new input text action is
         generated via the `script-generation-input-text-generation` prompt.  The model returns a
         fresh text based on the current DOM and the updated data for this run.
         The browser then inputs the text using this newly generated text.
@@ -566,6 +597,10 @@ class SkyvernPage:
         If the prompt generation or parsing fails for any reason we fall back to
         inputting the originally supplied ``text``.
         """
+        # Backward compatibility
+        if intention is not None and prompt is None:
+            prompt = intention
+
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
@@ -581,11 +616,11 @@ class SkyvernPage:
                 except Exception as e:
                     error_to_raise = e
 
-            if intention:
+            if prompt:
                 return await self._ai.ai_input_text(
                     selector=selector,
                     value=value,
-                    intention=intention,
+                    intention=prompt,
                     data=data,
                     totp_identifier=totp_identifier,
                     totp_url=totp_url,
@@ -595,11 +630,11 @@ class SkyvernPage:
                 raise error_to_raise
             else:
                 return value
-        elif ai == "proactive" and intention:
+        elif ai == "proactive" and prompt:
             return await self._ai.ai_input_text(
                 selector=selector,
                 value=value,
-                intention=intention,
+                intention=prompt,
                 data=data,
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
@@ -619,10 +654,15 @@ class SkyvernPage:
         selector: str | None,
         files: str,
         ai: str | None = "fallback",
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
     ) -> str:
+        # Backward compatibility
+        if intention is not None and prompt is None:
+            prompt = intention
+
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
@@ -636,11 +676,11 @@ class SkyvernPage:
                 except Exception as e:
                     error_to_raise = e
 
-            if intention:
+            if prompt:
                 return await self._ai.ai_upload_file(
                     selector=selector,
                     files=files,
-                    intention=intention,
+                    intention=prompt,
                     data=data,
                     timeout=timeout,
                 )
@@ -648,11 +688,11 @@ class SkyvernPage:
                 raise error_to_raise
             else:
                 return files
-        elif ai == "proactive" and intention:
+        elif ai == "proactive" and prompt:
             return await self._ai.ai_upload_file(
                 selector=selector,
                 files=files,
-                intention=intention,
+                intention=prompt,
                 data=data,
                 timeout=timeout,
             )
@@ -672,10 +712,15 @@ class SkyvernPage:
         value: str | None = None,
         label: str | None = None,
         ai: str | None = "fallback",
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
     ) -> str:
+        # Backward compatibility
+        if intention is not None and prompt is None:
+            prompt = intention
+
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
@@ -688,11 +733,11 @@ class SkyvernPage:
                 return value
             except Exception as e:
                 error_to_raise = e
-            if intention:
+            if prompt:
                 return await self._ai.ai_select_option(
                     selector=selector,
                     value=value,
-                    intention=intention,
+                    intention=prompt,
                     data=data,
                     timeout=timeout,
                 )
@@ -700,11 +745,11 @@ class SkyvernPage:
                 raise error_to_raise
             else:
                 return value
-        elif ai == "proactive" and intention:
+        elif ai == "proactive" and prompt:
             return await self._ai.ai_select_option(
                 selector=selector,
                 value=value,
-                intention=intention,
+                intention=prompt,
                 data=data,
                 timeout=timeout,
             )
@@ -714,16 +759,24 @@ class SkyvernPage:
 
     @action_wrap(ActionType.WAIT)
     async def wait(
-        self, seconds: float, intention: str | None = None, data: str | dict[str, Any] | None = None
+        self,
+        seconds: float,
+        prompt: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        intention: str | None = None,
     ) -> None:
         await asyncio.sleep(seconds)
 
     @action_wrap(ActionType.NULL_ACTION)
-    async def null_action(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+    async def null_action(
+        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
+    ) -> None:
         return
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)
-    async def solve_captcha(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+    async def solve_captcha(
+        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
+    ) -> None:
         context = skyvern_context.current()
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             await asyncio.sleep(30)
@@ -744,13 +797,19 @@ class SkyvernPage:
 
     @action_wrap(ActionType.TERMINATE)
     async def terminate(
-        self, errors: list[str], intention: str | None = None, data: str | dict[str, Any] | None = None
+        self,
+        errors: list[str],
+        prompt: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        intention: str | None = None,
     ) -> None:
         # TODO: update the workflow run status to terminated
         return
 
     @action_wrap(ActionType.COMPLETE)
-    async def complete(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+    async def complete(
+        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
+    ) -> None:
         # TODO: add validation here. if it doesn't pass the validation criteria:
         #  1. terminate the workflow run if fallback to ai is false
         #  2. fallback to ai if fallback to ai is true
@@ -779,7 +838,9 @@ class SkyvernPage:
                 raise ScriptTerminationException(result[-1].exception_message)
 
     @action_wrap(ActionType.RELOAD_PAGE)
-    async def reload_page(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+    async def reload_page(
+        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
+    ) -> None:
         await self.page.reload()
         return
 
@@ -795,12 +856,19 @@ class SkyvernPage:
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
     @action_wrap(ActionType.VERIFICATION_CODE)
-    async def verification_code(self, intention: str | None = None, data: str | dict[str, Any] | None = None) -> None:
+    async def verification_code(
+        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
+    ) -> None:
         return
 
     @action_wrap(ActionType.SCROLL)
     async def scroll(
-        self, scroll_x: int, scroll_y: int, intention: str | None = None, data: str | dict[str, Any] | None = None
+        self,
+        scroll_x: int,
+        scroll_y: int,
+        prompt: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        intention: str | None = None,
     ) -> None:
         await self.page.evaluate(f"window.scrollBy({scroll_x}, {scroll_y})")
 
@@ -810,14 +878,20 @@ class SkyvernPage:
         keys: list[str],
         hold: bool = False,
         duration: float = 0,
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
+        intention: str | None = None,  # backward compatibility
     ) -> None:
         await handler_utils.keypress(self.page, keys, hold=hold, duration=duration)
 
     @action_wrap(ActionType.MOVE)
     async def move(
-        self, x: int, y: int, intention: str | None = None, data: str | dict[str, Any] | None = None
+        self,
+        x: int,
+        y: int,
+        prompt: str | None = None,
+        data: str | dict[str, Any] | None = None,
+        intention: str | None = None,
     ) -> None:
         await self.page.mouse.move(x, y)
 
@@ -827,8 +901,9 @@ class SkyvernPage:
         start_x: int,
         start_y: int,
         path: list[tuple[int, int]],
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
+        intention: str | None = None,  # backward compatibility
     ) -> None:
         await handler_utils.drag(self.page, start_x, start_y, path)
 
@@ -838,8 +913,9 @@ class SkyvernPage:
         x: int,
         y: int,
         direction: Literal["down", "up"],
-        intention: str | None = None,
+        prompt: str | None = None,
         data: str | dict[str, Any] | None = None,
+        intention: str | None = None,  # backward compatibility
     ) -> None:
         await handler_utils.left_mouse(self.page, x, y, direction)
 
