@@ -420,7 +420,7 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                     comma=cst.Comma(),
                 )
             )
-    intention = act.get("intention") or act.get("prompt") or act.get("reasoning") or ""
+    intention = act.get("intention") or act.get("reasoning") or ""
     if intention:
         args.extend(
             [
