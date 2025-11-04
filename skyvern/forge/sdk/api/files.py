@@ -20,6 +20,12 @@ from skyvern.exceptions import DownloadFileMaxSizeExceeded, DownloadFileMaxWaiti
 from skyvern.forge.sdk.api.aws import AsyncAWSClient, aws_client
 from skyvern.utils.url_validators import encode_url
 
+_ALLOWED_S3_PREFIX = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"
+
+_ALLOWED_FILE_PREFIX = f"{REPO_ROOT_DIR}/downloads"
+
+_LOCAL_ENV = settings.ENV == "local"
+
 LOG = structlog.get_logger()
 
 
@@ -88,28 +94,30 @@ def validate_download_url(url: str) -> bool:
         scheme = parsed_url.scheme.lower()
 
         # Allow http/https URLs (includes Google Drive which uses https)
-        if scheme in ("http", "https"):
+        if scheme == "http" or scheme == "https":
             return True
 
         # Allow S3 URIs for Skyvern uploads bucket
         if scheme == "s3":
-            if url.startswith(f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_"):
+            if url.startswith(_ALLOWED_S3_PREFIX):
                 return True
             return False
 
         # Allow file:// URLs only in local environment
         if scheme == "file":
-            if settings.ENV != "local":
+            if not _LOCAL_ENV:
                 return False
 
             # Validate the file path is within allowed directories
             try:
-                file_path = parse_uri_to_path(url)
-                allowed_prefix = f"{REPO_ROOT_DIR}/downloads"
-                if not file_path.startswith(allowed_prefix):
+                # Inline optimized parse_uri_to_path:
+                # Directly operate on parsed_url (eliminate redundant urlparse)
+                path = parsed_url.netloc + parsed_url.path
+                file_path = unquote(path)
+                if not file_path.startswith(_ALLOWED_FILE_PREFIX):
                     return False
                 return True
-            except ValueError:
+            except Exception:  # preserves ValueError and unquote errors
                 return False
 
         # Reject unsupported schemes
