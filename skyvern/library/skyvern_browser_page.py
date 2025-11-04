@@ -246,8 +246,7 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str | None:
-        ...
+    ) -> str | None: ...
 
     @overload
     async def click(
@@ -258,8 +257,7 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str | None:
-        ...
+    ) -> str | None: ...
 
     async def click(
         self,
@@ -350,8 +348,7 @@ class SkyvernBrowserPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     async def fill(
@@ -365,8 +362,7 @@ class SkyvernBrowserPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     async def fill(
         self,
@@ -457,8 +453,7 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     async def select_option(
@@ -471,8 +466,7 @@ class SkyvernBrowserPage:
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         **kwargs: Any,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     async def select_option(
         self,
@@ -564,8 +558,7 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     @overload
     async def upload_file(
@@ -577,8 +570,7 @@ class SkyvernBrowserPage:
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     async def upload_file(
         self,
