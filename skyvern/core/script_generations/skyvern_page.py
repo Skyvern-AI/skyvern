@@ -10,11 +10,9 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.config import settings
-from skyvern.core.script_generations.real_skyvern_page_ai import render_template
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge.sdk.api.files import download_file
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 
@@ -94,21 +92,7 @@ class SkyvernPage:
         return decorator
 
     async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
-        url = render_template(url)
-        url = prepend_scheme_and_validate_url(url)
-
-        # Print navigation in script mode
-        context = skyvern_context.current()
-        if context and context.script_mode:
-            print(f"🌐 Navigating to: {url}")
-
-        await self.page.goto(
-            url,
-            timeout=timeout,
-        )
-
-        if context and context.script_mode:
-            print("  ✓ Page loaded")
+        await self.page.goto(url, timeout=timeout)
 
     ######### Public Interfaces #########
     @action_wrap(ActionType.CLICK)
