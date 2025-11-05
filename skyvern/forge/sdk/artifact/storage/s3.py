@@ -195,6 +195,43 @@ class S3Storage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
+    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
+        """Store browser profile to S3."""
+        temp_zip_file = create_named_temporary_file()
+        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        sc = await self._get_storage_class_for_org(organization_id)
+        tags = await self._get_tags_for_org(organization_id)
+        LOG.debug(
+            "Storing browser profile",
+            organization_id=organization_id,
+            profile_id=profile_id,
+            zip_file_path=zip_file_path,
+            profile_uri=profile_uri,
+            storage_class=sc,
+            tags=tags,
+        )
+        await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc, tags=tags)
+
+    async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
+        """Retrieve browser profile from S3."""
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
+        if not downloaded_zip_bytes:
+            return None
+        temp_zip_file = create_named_temporary_file(delete=False)
+        temp_zip_file.write(downloaded_zip_bytes)
+        temp_zip_file_path = temp_zip_file.name
+
+        temp_dir = make_temp_directory(prefix="skyvern_browser_profile_")
+        unzip_files(temp_zip_file_path, temp_dir)
+        temp_zip_file.close()
+        return temp_dir
+
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
