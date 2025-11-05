@@ -4499,6 +4499,8 @@ class AgentDB:
         script_block_label: str,
         script_file_id: str | None = None,
         run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> ScriptBlock:
         """Create a script block."""
         async with self.Session() as session:
@@ -4509,6 +4511,8 @@ class AgentDB:
                 script_block_label=script_block_label,
                 script_file_id=script_file_id,
                 run_signature=run_signature,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
             session.add(script_block)
             await session.commit()
@@ -4521,6 +4525,8 @@ class AgentDB:
         organization_id: str,
         script_file_id: str | None = None,
         run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> ScriptBlock:
         async with self.Session() as session:
             script_block = (
@@ -4535,6 +4541,10 @@ class AgentDB:
                     script_block.script_file_id = script_file_id
                 if run_signature is not None:
                     script_block.run_signature = run_signature
+                if workflow_run_id is not None:
+                    script_block.workflow_run_id = workflow_run_id
+                if workflow_run_block_id is not None:
+                    script_block.workflow_run_block_id = workflow_run_block_id
                 await session.commit()
                 await session.refresh(script_block)
                 return convert_to_script_block(script_block)

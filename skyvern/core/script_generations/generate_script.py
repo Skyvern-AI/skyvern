@@ -1781,6 +1781,8 @@ async def generate_workflow_script_python_code(
                     block_label=block_name,
                     update=pending,
                     run_signature=run_signature,
+                    workflow_run_id=task.get("workflow_run_id"),
+                    workflow_run_block_id=task.get("workflow_run_block_id"),
                 )
             except Exception as e:
                 LOG.error("Failed to create script block", error=str(e), exc_info=True)
@@ -1837,6 +1839,8 @@ async def generate_workflow_script_python_code(
                     block_label=block_name,
                     update=pending,
                     run_signature=run_signature,
+                    workflow_run_id=task_v2.get("workflow_run_id"),
+                    workflow_run_block_id=task_v2.get("workflow_run_block_id"),
                 )
             except Exception as e:
                 LOG.error("Failed to create task_v2 script block", error=str(e), exc_info=True)
@@ -1926,6 +1930,8 @@ async def create_or_update_script_block(
     block_label: str,
     update: bool = False,
     run_signature: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_run_block_id: str | None = None,
 ) -> None:
     """
     Create a script block in the database and save the block code to a script file.
@@ -1939,6 +1945,8 @@ async def create_or_update_script_block(
         block_label: Optional custom name for the block (defaults to function name)
         update: Whether to update the script block instead of creating a new one
         run_signature: The function call code to execute this block (e.g., "await skyvern.action(...)")
+        workflow_run_id: The workflow run that generated this cached block
+        workflow_run_block_id: The workflow run block that generated this cached block
     """
     block_code_bytes = block_code if isinstance(block_code, bytes) else block_code.encode("utf-8")
     try:
@@ -1955,6 +1963,8 @@ async def create_or_update_script_block(
                 organization_id=organization_id,
                 script_block_label=block_label,
                 run_signature=run_signature,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
         elif run_signature:
             # Update the run_signature if provided
@@ -1962,6 +1972,8 @@ async def create_or_update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 run_signature=run_signature,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
 
         # Step 4: Create script file for the block
@@ -2011,6 +2023,8 @@ async def create_or_update_script_block(
                 script_block_id=script_block.script_block_id,
                 organization_id=organization_id,
                 script_file_id=script_file.file_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
 
     except Exception as e:
