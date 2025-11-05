@@ -217,6 +217,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
             try:
                 prompt = context.prompt
                 data = data or {}
+                if value and isinstance(data, dict) and "value" not in data:
+                    data["value"] = value
+
                 if (totp_identifier or totp_url) and context and organization_id and task_id:
                     if totp_identifier:
                         totp_identifier = _render_template_with_label(totp_identifier, label=self.current_label)
@@ -340,6 +343,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
             try:
                 prompt = context.prompt
                 data = data or {}
+                if files and isinstance(data, dict) and "files" not in data:
+                    data["files"] = files
 
                 refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                 self.scraped_page = refreshed_page
@@ -432,6 +437,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     prompt = context.prompt if context else None
                     # data = _get_context_data(data)
                     data = data or {}
+                    if value and isinstance(data, dict) and "value" not in data:
+                        data["value"] = value
+
                     refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
                     self.scraped_page = refreshed_page
                     element_tree = refreshed_page.build_element_tree()
