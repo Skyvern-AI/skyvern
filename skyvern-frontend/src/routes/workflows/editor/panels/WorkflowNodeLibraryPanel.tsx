@@ -84,8 +84,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Validation Block",
-    description: "Validate completion criteria",
+    title: "AI or Human Validation",
+    description: "Have an AI or Human validate the state of the screen",
   },
   /**
    * The Human Interaction block can be had via a transmutation of the

@@ -6,6 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
+import { NoticeMe } from "@/components/NoticeMe";
 import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
@@ -531,24 +532,26 @@ function NodeHeader({
                 <span className="text-xs text-slate-400">
                   {transmutations.blockTitle}
                 </span>
-                <MicroDropdown
-                  selections={[
-                    transmutations.self,
-                    ...transmutations.others.map((t) => t.label),
-                  ]}
-                  selected={transmutations.self}
-                  onChange={(label) => {
-                    const transmutation = transmutations.others.find(
-                      (t) => t.label === label,
-                    );
+                <NoticeMe trigger="viewport">
+                  <MicroDropdown
+                    selections={[
+                      transmutations.self,
+                      ...transmutations.others.map((t) => t.label),
+                    ]}
+                    selected={transmutations.self}
+                    onChange={(label) => {
+                      const transmutation = transmutations.others.find(
+                        (t) => t.label === label,
+                      );
 
-                    if (!transmutation) {
-                      return;
-                    }
+                      if (!transmutation) {
+                        return;
+                      }
 
-                    transmuteNodeCallback(nodeId, transmutation.nodeName);
-                  }}
-                />
+                      transmuteNodeCallback(nodeId, transmutation.nodeName);
+                    }}
+                  />
+                </NoticeMe>
               </div>
             ) : (
               <span className="text-xs text-slate-400">{blockTitle}</span>
