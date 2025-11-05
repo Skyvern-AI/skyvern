@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -15,8 +14,7 @@ import { statusIsFinalized } from "@/routes/tasks/types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValuesQuery";
-import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
-import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useWorkflowRunWithWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
@@ -30,11 +28,9 @@ interface Props {
 function WorkflowRunCode(props?: Props) {
   const showCacheKeyValueSelector = props?.showCacheKeyValueSelector ?? false;
   const queryClient = useQueryClient();
-  const { workflowPermanentId } = useParams();
-  const { data: workflowRun } = useWorkflowRunQuery();
-  const { data: workflow } = useWorkflowQuery({
-    workflowPermanentId,
-  });
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  const workflow = workflowRun?.workflow;
+  const workflowPermanentId = workflow?.workflow_permanent_id;
   const cacheKey = workflow?.cache_key ?? "";
   const [cacheKeyValue, setCacheKeyValue] = useState(
     cacheKey === ""

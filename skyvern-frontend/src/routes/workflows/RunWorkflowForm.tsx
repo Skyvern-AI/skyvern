@@ -246,9 +246,7 @@ function RunWorkflowForm({
       queryClient.invalidateQueries({
         queryKey: ["runs"],
       });
-      navigate(
-        `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
-      );
+      navigate(`/runs/${response.data.workflow_run_id}`);
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;

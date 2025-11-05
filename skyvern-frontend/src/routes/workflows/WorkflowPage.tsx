@@ -189,15 +189,13 @@ function WorkflowPage() {
                         if (event.ctrlKey || event.metaKey) {
                           window.open(
                             window.location.origin +
-                              `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
+                              `/runs/${workflowRun.workflow_run_id}`,
                             "_blank",
                             "noopener,noreferrer",
                           );
                           return;
                         }
-                        navigate(
-                          `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
-                        );
+                        navigate(`/runs/${workflowRun.workflow_run_id}`);
                       }}
                       className="cursor-pointer"
                     >

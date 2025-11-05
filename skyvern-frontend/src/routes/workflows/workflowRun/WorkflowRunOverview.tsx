@@ -3,8 +3,7 @@ import { BrowserStream } from "@/components/BrowserStream";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
 import { statusIsFinalized } from "@/routes/tasks/types";
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
-import { useParams } from "react-router-dom";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
   isAction,
@@ -37,17 +36,16 @@ export type WorkflowRunOverviewActiveElement =
 function WorkflowRunOverview() {
   const [searchParams] = useSearchParams();
   const active = searchParams.get("active");
-  const { workflowPermanentId } = useParams<{
-    workflowPermanentId: string;
-  }>();
   const queryClient = useQueryClient();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+    useWorkflowRunWithWorkflowQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
 
   const workflowRunId = workflowRun?.workflow_run_id;
+  const workflow = workflowRun?.workflow;
+  const workflowPermanentId = workflow?.workflow_permanent_id;
 
   const invalidateQueries = useCallback(() => {
     if (workflowRunId) {

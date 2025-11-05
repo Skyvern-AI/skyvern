@@ -33,8 +33,8 @@ function SideNav() {
             icon: <LightningBoltIcon className="size-6" />,
           },
           {
-            label: "History",
-            to: "/history",
+            label: "Runs",
+            to: "/runs",
             icon: <CounterClockwiseClockIcon className="size-6" />,
           },
           {
