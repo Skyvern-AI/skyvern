@@ -4612,6 +4612,7 @@ class AgentDB:
         run_signature: str | None = None,
         workflow_run_id: str | None = None,
         workflow_run_block_id: str | None = None,
+        clear_run_signature: bool = False,
     ) -> ScriptBlock:
         async with self.Session() as session:
             script_block = (
@@ -4624,7 +4625,9 @@ class AgentDB:
             if script_block:
                 if script_file_id is not None:
                     script_block.script_file_id = script_file_id
-                if run_signature is not None:
+                if clear_run_signature:
+                    script_block.run_signature = None
+                elif run_signature is not None:
                     script_block.run_signature = run_signature
                 if workflow_run_id is not None:
                     script_block.workflow_run_id = workflow_run_id
