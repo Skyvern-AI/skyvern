@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
-from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.exceptions import BrowserProfileNotFound, WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -23,6 +23,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
     BlockRunModel,
+    BrowserProfileModel,
     CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
@@ -77,6 +78,7 @@ from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
+from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession, DebugSessionRun
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
@@ -3499,6 +3501,89 @@ class AgentDB:
                 convert_to_workflow_run_block(workflow_run_block, task=tasks_dict.get(workflow_run_block.task_id))
                 for workflow_run_block in workflow_run_blocks
             ]
+
+    async def create_browser_profile(
+        self,
+        organization_id: str,
+        name: str,
+        description: str | None = None,
+    ) -> BrowserProfile:
+        try:
+            async with self.Session() as session:
+                browser_profile = BrowserProfileModel(
+                    organization_id=organization_id,
+                    name=name,
+                    description=description,
+                )
+                session.add(browser_profile)
+                await session.commit()
+                await session.refresh(browser_profile)
+                return BrowserProfile.model_validate(browser_profile)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in create_browser_profile", exc_info=True)
+            raise
+
+    async def get_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+        include_deleted: bool = False,
+    ) -> BrowserProfile | None:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=profile_id)
+                    .filter_by(organization_id=organization_id)
+                )
+                if not include_deleted:
+                    query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+
+                browser_profile = (await session.scalars(query)).first()
+                if not browser_profile:
+                    return None
+                return BrowserProfile.model_validate(browser_profile)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_browser_profile", exc_info=True)
+            raise
+
+    async def list_browser_profiles(
+        self,
+        organization_id: str,
+        include_deleted: bool = False,
+    ) -> list[BrowserProfile]:
+        try:
+            async with self.Session() as session:
+                query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
+                if not include_deleted:
+                    query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+                browser_profiles = await session.scalars(query.order_by(asc(BrowserProfileModel.created_at)))
+                return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in list_browser_profiles", exc_info=True)
+            raise
+
+    async def delete_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+    ) -> None:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=profile_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(BrowserProfileModel.deleted_at.is_(None))
+                )
+                browser_profile = (await session.scalars(query)).first()
+                if not browser_profile:
+                    raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+                browser_profile.deleted_at = datetime.utcnow()
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in delete_browser_profile", exc_info=True)
+            raise
 
     async def get_active_persistent_browser_sessions(
         self,
