@@ -419,7 +419,10 @@ function Workflows() {
             <Button
               disabled={createWorkflowMutation.isPending}
               onClick={() => {
-                createWorkflowMutation.mutate(emptyWorkflowRequest);
+                createWorkflowMutation.mutate({
+                  ...emptyWorkflowRequest,
+                  folder_id: selectedFolderId,
+                });
               }}
             >
               {createWorkflowMutation.isPending ? (

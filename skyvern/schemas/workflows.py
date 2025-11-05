@@ -562,6 +562,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     cache_key: str | None = "default"
     run_sequentially: bool = False
     sequential_key: str | None = None
+    folder_id: str | None = None
 
 
 class WorkflowRequest(BaseModel):

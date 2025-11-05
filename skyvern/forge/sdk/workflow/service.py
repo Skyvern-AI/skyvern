@@ -2752,6 +2752,7 @@ class WorkflowService:
                     ai_fallback=request.ai_fallback,
                     run_sequentially=request.run_sequentially,
                     sequential_key=request.sequential_key,
+                    folder_id=request.folder_id,
                 )
             # Keeping track of the new workflow id to delete it if an error occurs during the creation process
             new_workflow_id = potential_workflow.workflow_id
