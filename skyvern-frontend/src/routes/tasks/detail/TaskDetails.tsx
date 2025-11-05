@@ -302,7 +302,9 @@ function TaskDetails() {
           ) : (
             workflow &&
             workflowRun && (
-              <Link to={`/runs/${workflowRun.workflow_run_id}`}>
+              <Link
+                to={`/workflows/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`}
+              >
                 {workflow.title}
               </Link>
             )
