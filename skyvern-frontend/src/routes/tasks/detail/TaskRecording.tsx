@@ -2,12 +2,12 @@ import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { getRecordingURL } from "./artifactUtils";
-import { useParams } from "react-router-dom";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TaskApiResponse } from "@/api/types";
+import { useFirstParam } from "@/hooks/useFirstParam";
 
 function TaskRecording() {
-  const { taskId } = useParams();
+  const taskId = useFirstParam("taskId", "runId");
   const credentialGetter = useCredentialGetter();
 
   const {
