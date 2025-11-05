@@ -39,6 +39,7 @@ CREDENTIAL_AZURE_VAULT_PARAMETER_PREFIX = "azcp"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
 DEBUG_SESSION_PREFIX = "ds"
+FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
@@ -218,6 +219,11 @@ def generate_credential_id() -> str:
 def generate_debug_session_id() -> str:
     int_id = generate_id()
     return f"{DEBUG_SESSION_PREFIX}_{int_id}"
+
+
+def generate_folder_id() -> str:
+    int_id = generate_id()
+    return f"{FOLDER_PREFIX}_{int_id}"
 
 
 def generate_organization_bitwarden_collection_id() -> str:

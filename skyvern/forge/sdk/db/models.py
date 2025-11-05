@@ -32,6 +32,7 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
+    generate_folder_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
     generate_organization_auth_token_id,
@@ -218,6 +219,28 @@ class ArtifactModel(Base):
     )
 
 
+class FolderModel(Base):
+    __tablename__ = "folders"
+    __table_args__ = (
+        Index("folder_organization_id_idx", "organization_id"),
+        Index("folder_organization_title_idx", "organization_id", "title"),
+    )
+
+    folder_id = Column(String, primary_key=True, default=generate_folder_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class WorkflowModel(Base):
     __tablename__ = "workflows"
     __table_args__ = (
@@ -230,6 +253,7 @@ class WorkflowModel(Base):
         Index("permanent_id_version_idx", "workflow_permanent_id", "version"),
         Index("organization_id_title_idx", "organization_id", "title"),
         Index("workflow_oid_status_idx", "organization_id", "status"),
+        Index("workflow_folder_id_idx", "folder_id"),
     )
 
     workflow_id = Column(String, primary_key=True, default=generate_workflow_id)
@@ -252,6 +276,8 @@ class WorkflowModel(Base):
     cache_key = Column(String, nullable=True)
     run_sequentially = Column(Boolean, nullable=True)
     sequential_key = Column(String, nullable=True)
+    folder_id = Column(String, ForeignKey("folders.folder_id", ondelete="SET NULL"), nullable=True)
+    import_error = Column(String, nullable=True)  # Error message if import failed
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
