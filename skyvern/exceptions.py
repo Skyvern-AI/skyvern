@@ -799,6 +799,14 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         )
 
 
+class BrowserProfileNotFound(SkyvernHTTPException):
+    def __init__(self, profile_id: str, organization_id: str | None = None) -> None:
+        message = f"Browser profile {profile_id} not found"
+        if organization_id:
+            message += f" for organization {organization_id}"
+        super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
+
+
 class CannotUpdateWorkflowDueToCodeCache(SkyvernException):
     def __init__(self, workflow_permanent_id: str) -> None:
         super().__init__(f"No confirmation for code cache deletion on {workflow_permanent_id}.")
