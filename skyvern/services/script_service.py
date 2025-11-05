@@ -1034,6 +1034,8 @@ async def _regenerate_script_block_after_ai_fallback(
                 script_id=new_script.script_id,
                 organization_id=organization_id,
                 block_label=existing_block.script_block_label,
+                workflow_run_id=existing_block.workflow_run_id,
+                workflow_run_block_id=existing_block.workflow_run_block_id,
             )
             block_file_content_bytes = (
                 block_file_content if isinstance(block_file_content, bytes) else block_file_content.encode("utf-8")

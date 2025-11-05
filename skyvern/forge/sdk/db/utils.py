@@ -584,6 +584,8 @@ def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock
         script_block_label=script_block_model.script_block_label,
         script_file_id=script_block_model.script_file_id,
         run_signature=script_block_model.run_signature,
+        workflow_run_id=script_block_model.workflow_run_id,
+        workflow_run_block_id=script_block_model.workflow_run_block_id,
         created_at=script_block_model.created_at,
         modified_at=script_block_model.modified_at,
         deleted_at=script_block_model.deleted_at,
