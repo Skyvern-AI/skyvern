@@ -415,7 +415,10 @@ function Workflows() {
             />
           </div>
           <div className="flex gap-4">
-            <ImportWorkflowButton onImportStart={startPolling} selectedFolderId={selectedFolderId} />
+          <ImportWorkflowButton
+            onImportStart={startPolling}
+            selectedFolderId={selectedFolderId}
+          />
             <Button
               disabled={createWorkflowMutation.isPending}
               onClick={() => {

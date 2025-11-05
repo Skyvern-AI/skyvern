@@ -38,7 +38,10 @@ interface ImportWorkflowButtonProps {
   selectedFolderId?: string | null;
 }
 
-function ImportWorkflowButton({ onImportStart, selectedFolderId }: ImportWorkflowButtonProps) {
+function ImportWorkflowButton({
+  onImportStart,
+  selectedFolderId,
+}: ImportWorkflowButtonProps) {
   const inputId = useId();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
