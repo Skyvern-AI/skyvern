@@ -183,7 +183,10 @@ function RunHistory() {
                     key={run.workflow_run_id}
                     className="cursor-pointer"
                     onClick={(event) => {
-                      handleNavigate(event, `/runs/${run.workflow_run_id}`);
+                      handleNavigate(
+                        event,
+                        `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
+                      );
                     }}
                   >
                     <TableCell
