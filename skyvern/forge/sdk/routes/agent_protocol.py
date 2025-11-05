@@ -2187,7 +2187,7 @@ async def get_workflow_and_run_from_workflow_run_id(
 
     if not workflow:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Workflow run not found {workflow_run_id}",
         )
 
