@@ -2,11 +2,12 @@ import { getClient } from "@/api/AxiosClient";
 import { StepApiResponse } from "@/api/types";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { PAGE_SIZE } from "../constants";
 import { CheckboxIcon, CrossCircledIcon } from "@radix-ui/react-icons";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { apiPathPrefix } from "@/util/env";
+import { useFirstParam } from "@/hooks/useFirstParam";
 
 type Props = {
   activeIndex: number;
@@ -14,7 +15,7 @@ type Props = {
 };
 
 function StepNavigation({ activeIndex, onActiveIndexChange }: Props) {
-  const { taskId } = useParams();
+  const taskId = useFirstParam("taskId", "runId");
   const [searchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const credentialGetter = useCredentialGetter();

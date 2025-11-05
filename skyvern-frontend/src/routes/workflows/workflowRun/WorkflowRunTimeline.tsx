@@ -3,7 +3,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
 import { DotFilledIcon } from "@radix-ui/react-icons";
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
   isBlockItem,
@@ -36,7 +36,7 @@ function WorkflowRunTimeline({
   onBlockItemSelected,
 }: Props) {
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunQuery();
+    useWorkflowRunWithWorkflowQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();

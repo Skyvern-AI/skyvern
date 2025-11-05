@@ -92,6 +92,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_task(prompt=\"What's the top post on hackernews?\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    body: {\n        prompt: \"Find the top 3 posts on Hacker News.\"\n    }\n})\n"
               }
             ]
           }
@@ -210,6 +214,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.run_workflow(workflow_id=\"wpid_123\", parameters={\"parameter1\": \"value1\", \"parameter2\": \"value2\"})\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    body: {\n        workflow_id: \"wpid_123\",\n        parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n    }\n});\n"
               }
             ]
           }
@@ -312,6 +320,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nrun = await skyvern.get_run(run_id=\"tsk_v2_123\")\nprint(run)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst run = await skyvern.getRun(\"tsk_v2_123\");\nconsole.log(run);\n"
               }
             ]
           }
@@ -385,6 +397,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.cancel_run(run_id=\"tsk_v2_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.cancelRun(\"tsk_v2_123\");\n"
               }
             ]
           }
@@ -455,6 +471,10 @@
               {
                 "sdk": "python",
                 "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                cache_actions: false,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n                cache_actions: false\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -604,6 +624,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflows = await skyvern.get_workflows()\nprint(workflows)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst workflows = await skyvern.getWorkflows();\nconsole.log(workflows);\n"
               }
             ]
           }
@@ -688,6 +712,10 @@
               {
                 "sdk": "python",
                 "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\nconst updatedWorkflowDefinition = {\n    title: \"Updated Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                cache_actions: false,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n                cache_actions: false\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.updateWorkflow(\"wpid_123\", {\n    json_definition: updatedWorkflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -763,6 +791,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.delete_workflow(workflow_id=\"wpid_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.deleteWorkflow(\"wpid_123\");\n"
               }
             ]
           }
@@ -991,6 +1023,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.retry_run_webhook(run_id=\"tsk_v2_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.retryRunWebhook(\"tsk_v2_123\");\n"
               }
             ]
           }
@@ -1080,6 +1116,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\n# Get timeline for a workflow run\ntimeline = await skyvern.get_run_timeline(run_id=\"wr_123\")\nprint(timeline)\n\n# Get timeline for a task_v2 run\ntimeline = await skyvern.get_run_timeline(run_id=\"tsk_v2_123\")\nprint(timeline)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Get timeline for a workflow run\nconst timeline = await skyvern.getRunTimeline(\"wr_123\");\nconsole.log(timeline);\n\n// Get timeline for a task_v2 run\nconst timeline2 = await skyvern.getRunTimeline(\"tsk_v2_123\");\nconsole.log(timeline2);\n"
               }
             ]
           }
@@ -1156,6 +1196,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.create_browser_session(timeout=60)\nprint(browser_session)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserSession = await skyvern.createBrowserSession({\n    timeout: 60\n});\nconsole.log(browserSession);\n"
               }
             ]
           }
@@ -1224,6 +1268,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_sessions = await skyvern.get_browser_sessions()\nprint(browser_sessions)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserSessions = await skyvern.getBrowserSessions();\nconsole.log(browserSessions);\n"
               }
             ]
           }
@@ -1302,6 +1350,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.close_browser_session(browser_session_id=\"pbs_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.closeBrowserSession(\"pbs_123\");\n"
               }
             ]
           }
@@ -1385,6 +1437,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nbrowser_session = await skyvern.get_browser_session(browser_session_id=\"pbs_123\")\nprint(browser_session)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst browserSession = await skyvern.getBrowserSession(\"pbs_123\");\nconsole.log(browserSession);\n"
               }
             ]
           }
@@ -1457,7 +1513,11 @@
             "code-samples": [
               {
                 "sdk": "python",
-                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.send_totp_code(totp_code=\"123456\")\n"
+                "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.send_totp_code(\n    totp_identifier=\"john.doe@example.com\",\n    content=\"Hello, your verification code is 123456\"\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.sendTotpCode({\n    totp_identifier: \"john.doe@example.com\",\n    content: \"Hello, your verification code is 123456\"\n});\n"
               }
             ]
           }
@@ -1548,6 +1608,14 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.create_credential(\n    name=\"My Credit Card\",\n    credential_type=\"credit_card\",\n    credential={\n        \"card_number\": \"4242424242424242\",\n        \"card_cvv\": \"424\",\n        \"card_exp_month\": \"12\",\n        \"card_exp_year\": \"2028\",\n        \"card_brand\": \"visa\",\n        \"card_holder_name\": \"John Doe\",\n    },\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.createCredential({\n    name: \"My Credential\",\n    credential_type: \"password\",\n    credential: { username: \"username\", password: \"password\" }\n});\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.createCredential({\n    name: \"My Credit Card\",\n    credential_type: \"credit_card\",\n    credential: {\n        card_number: \"4242424242424242\",\n        card_cvv: \"424\",\n        card_exp_month: \"12\",\n        card_exp_year: \"2028\",\n        card_brand: \"visa\",\n        card_holder_name: \"John Doe\"\n    }\n});\n"
               }
             ]
           }
@@ -1651,6 +1719,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredentials = await skyvern.get_credentials()\nprint(credentials)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst credentials = await skyvern.getCredentials();\nconsole.log(credentials);\n"
               }
             ]
           }
@@ -1724,6 +1796,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.delete_credential(credential_id=\"cred_123\")\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.deleteCredential(\"cred_123\");\n"
               }
             ]
           }
@@ -1804,6 +1880,10 @@
               {
                 "sdk": "python",
                 "code": "from skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\ncredential = await skyvern.get_credential(credential_id=\"cred_123\")\nprint(credential)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nconst credential = await skyvern.getCredential(\"cred_123\");\nconsole.log(credential);\n"
               }
             ]
           }
@@ -1885,6 +1965,18 @@
               {
                 "sdk": "python",
                 "code": "# Login with password saved in 1Password\nfrom skyvern import Skyvern\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nawait skyvern.login(\n    url=\"https://example.com\",\n    credential_type=\"onepassword\",\n    onepassword_vault_id=\"1PASSWORD VAULT ID\",\n    onepassword_item_id=\"1PASSWORD ITEM ID\",\n)\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "// Login with password saved in Skyvern\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"skyvern\",\n    credential_id: \"cred_123\"\n});\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "// Login with password saved in Bitwarden\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n// Login with a Bitwarden collection and website url filter\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"bitwarden\",\n    bitwarden_collection_id: \"BITWARDEN COLLECTION ID\"\n});\n\n// Login with a Bitwarden item\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"bitwarden\",\n    bitwarden_item_id: \"BITWARDEN ITEM ID\"\n});\n"
+              },
+              {
+                "sdk": "typescript",
+                "code": "// Login with password saved in 1Password\nimport { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.login({\n    url: \"https://example.com\",\n    credential_type: \"onepassword\",\n    onepassword_vault_id: \"1PASSWORD VAULT ID\",\n    onepassword_item_id: \"1PASSWORD ITEM ID\"\n});\n"
               }
             ]
           }
@@ -2275,22 +2367,6 @@
               "title": "X-Api-Key"
             },
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          },
-          {
-            "name": "x-user-agent",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Agent"
-            }
           }
         ],
         "requestBody": {
@@ -2305,7 +2381,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successfully executed SDK action",
+            "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {
@@ -2313,15 +2389,6 @@
                 }
               }
             }
-          },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
-          "404": {
-            "description": "Workflow run or workflow not found"
-          },
-          "400": {
-            "description": "Invalid operation"
           },
           "422": {
             "description": "Validation Error",
@@ -2334,17 +2401,7 @@
             }
           }
         },
-        "x-fern-sdk-method-name": "run_sdk_action",
-        "x-fern-examples": [
-          {
-            "code-samples": [
-              {
-                "sdk": "python",
-                "code": "from skyvern import Skyvern\nfrom skyvern.forge.sdk.schemas.sdk_actions import ClickAction\n\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nresponse = await skyvern.run_sdk_action(\n    url=\"https://example.com\",\n    browser_session_id=\"pbs_123\",\n    action=ClickAction(\n        selector=\"button\",\n        intention=\"Click the submit button\"\n    )\n)\nprint(response.workflow_run_id)\n"
-              }
-            ]
-          }
-        ]
+        "x-fern-sdk-method-name": "run_sdk_action"
       }
     }
   },
@@ -2777,6 +2834,16 @@
             "type": "boolean",
             "title": "Verified",
             "default": false
+          },
+          "click_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClickContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "totp_timing_info": {
             "anyOf": [
@@ -4407,6 +4474,81 @@
         "title": "BrowserSessionResponse",
         "description": "Response model for browser session information."
       },
+      "ClickAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_click",
+            "title": "Type",
+            "default": "ai_click"
+          },
+          "selector": {
+            "type": "string",
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the click",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "ClickAction",
+        "description": "Click action parameters."
+      },
+      "ClickContext": {
+        "properties": {
+          "thought": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thought"
+          },
+          "single_option_click": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Single Option Click"
+          }
+        },
+        "type": "object",
+        "title": "ClickContext"
+      },
       "CodeBlock": {
         "properties": {
           "label": {
@@ -5196,6 +5338,88 @@
           "url"
         ],
         "title": "DownloadToS3BlockYAML"
+      },
+      "ExtractAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "extract",
+            "title": "Type",
+            "default": "extract"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Extraction prompt",
+            "default": ""
+          },
+          "extract_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extract Schema",
+            "description": "Schema for extraction"
+          },
+          "error_code_mapping": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code Mapping",
+            "description": "Error code mapping for extraction"
+          },
+          "intention": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intention",
+            "description": "The intention or goal of the extraction"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          }
+        },
+        "type": "object",
+        "title": "ExtractAction",
+        "description": "Extract data action parameters."
       },
       "ExtractionBlock": {
         "properties": {
@@ -7689,6 +7913,90 @@
         "type": "object",
         "title": "InputOrSelectContext"
       },
+      "InputTextAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_input_text",
+            "title": "Type",
+            "default": "ai_input_text"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Value to input",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the input",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "totp_identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Identifier",
+            "description": "TOTP identifier for input_text actions"
+          },
+          "totp_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totp Url",
+            "description": "TOTP URL for input_text actions"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "InputTextAction",
+        "description": "Input text action parameters."
+      },
       "LoginBlock": {
         "properties": {
           "label": {
@@ -9382,324 +9690,7 @@
         ],
         "title": "RunEngine"
       },
-      "RunStatus": {
-        "type": "string",
-        "enum": [
-          "created",
-          "queued",
-          "running",
-          "timed_out",
-          "failed",
-          "terminated",
-          "completed",
-          "canceled"
-        ],
-        "title": "RunStatus"
-      },
-      "ClickAction": {
-        "type": "object",
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_click",
-            "title": "Type",
-            "default": "ai_click"
-          },
-          "selector": {
-            "type": "string",
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the click",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 30000
-          }
-        },
-        "required": ["type"],
-        "title": "ClickAction"
-      },
-      "InputTextAction": {
-        "type": "object",
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_input_text",
-            "title": "Type",
-            "default": "ai_input_text"
-          },
-          "selector": {
-            "type": "string",
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "value": {
-            "type": "string",
-            "title": "Value",
-            "description": "Value to input",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the input",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "totp_identifier": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Identifier",
-            "description": "TOTP identifier for input_text actions"
-          },
-          "totp_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Totp Url",
-            "description": "TOTP URL for input_text actions"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 30000
-          }
-        },
-        "required": ["type"],
-        "title": "InputTextAction"
-      },
-      "SelectOptionAction": {
-        "type": "object",
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_select_option",
-            "title": "Type",
-            "default": "ai_select_option"
-          },
-          "selector": {
-            "type": "string",
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "value": {
-            "type": "string",
-            "title": "Value",
-            "description": "Value to select",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the selection",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 30000
-          }
-        },
-        "required": ["type"],
-        "title": "SelectOptionAction"
-      },
-      "ActAction": {
-        "type": "object",
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_act",
-            "title": "Type",
-            "default": "ai_act"
-          },
-          "intention": {
-            "type": "string",
-            "title": "Prompt",
-            "description": "Natural language prompt for the action",
-            "default": ""
-          }
-        },
-        "required": ["type"],
-        "title": "ActAction"
-      },
-      "ExtractAction": {
-        "type": "object",
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "extract",
-            "title": "Type",
-            "default": "extract"
-          },
-          "prompt": {
-            "type": "string",
-            "title": "Prompt",
-            "description": "Extraction prompt",
-            "default": ""
-          },
-          "extract_schema": {
-            "anyOf": [
-              {
-                "type": "object"
-              },
-              {
-                "type": "array"
-              },
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Extract Schema",
-            "description": "Schema for extraction"
-          },
-          "error_code_mapping": {
-            "anyOf": [
-              {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "string"
-                }
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Error Code Mapping",
-            "description": "Error code mapping for extraction"
-          },
-          "intention": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Intention",
-            "description": "The intention or goal of the extraction"
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          }
-        },
-        "required": ["type"],
-        "title": "ExtractAction"
-      },
-      "SdkAction": {
-        "oneOf": [
-          {
-            "$ref": "#/components/schemas/ClickAction"
-          },
-          {
-            "$ref": "#/components/schemas/InputTextAction"
-          },
-          {
-            "$ref": "#/components/schemas/SelectOptionAction"
-          },
-          {
-            "$ref": "#/components/schemas/ActAction"
-          },
-          {
-            "$ref": "#/components/schemas/ExtractAction"
-          }
-        ],
-        "discriminator": {
-          "propertyName": "type",
-          "mapping": {
-            "ai_click": "#/components/schemas/ClickAction",
-            "ai_input_text": "#/components/schemas/InputTextAction",
-            "ai_select_option": "#/components/schemas/SelectOptionAction",
-            "ai_act": "#/components/schemas/ActAction",
-            "extract": "#/components/schemas/ExtractAction"
-          }
-        },
-        "title": "SdkAction"
-      },
       "RunSdkActionRequest": {
-        "type": "object",
         "properties": {
           "url": {
             "type": "string",
@@ -9743,15 +9734,42 @@
             "description": "Optional workflow run ID to continue an existing workflow run"
           },
           "action": {
-            "$ref": "#/components/schemas/SdkAction",
-            "description": "The action to execute with its specific parameters"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClickAction"
+              },
+              {
+                "$ref": "#/components/schemas/InputTextAction"
+              },
+              {
+                "$ref": "#/components/schemas/SelectOptionAction"
+              },
+              {
+                "$ref": "#/components/schemas/ExtractAction"
+              }
+            ],
+            "title": "Action",
+            "description": "The action to execute with its specific parameters",
+            "discriminator": {
+              "propertyName": "type",
+              "mapping": {
+                "ai_click": "#/components/schemas/ClickAction",
+                "ai_input_text": "#/components/schemas/InputTextAction",
+                "ai_select_option": "#/components/schemas/SelectOptionAction",
+                "extract": "#/components/schemas/ExtractAction"
+              }
+            }
           }
         },
-        "required": ["url", "action"],
-        "title": "RunSdkActionRequest"
+        "type": "object",
+        "required": [
+          "url",
+          "action"
+        ],
+        "title": "RunSdkActionRequest",
+        "description": "Request to run a single SDK action."
       },
       "RunSdkActionResponse": {
-        "type": "object",
         "properties": {
           "workflow_run_id": {
             "type": "string",
@@ -9760,21 +9778,7 @@
           },
           "result": {
             "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "object"
-              },
-              {
-                "type": "array"
-              },
-              {
-                "type": "number"
-              },
-              {
-                "type": "boolean"
-              },
+              {},
               {
                 "type": "null"
               }
@@ -9783,8 +9787,26 @@
             "description": "The result from the action (e.g., selector, value, extracted data)"
           }
         },
-        "required": ["workflow_run_id"],
-        "title": "RunSdkActionResponse"
+        "type": "object",
+        "required": [
+          "workflow_run_id"
+        ],
+        "title": "RunSdkActionResponse",
+        "description": "Response from running an SDK action."
+      },
+      "RunStatus": {
+        "type": "string",
+        "enum": [
+          "created",
+          "queued",
+          "running",
+          "timed_out",
+          "failed",
+          "terminated",
+          "completed",
+          "canceled"
+        ],
+        "title": "RunStatus"
       },
       "Script": {
         "properties": {
@@ -9947,6 +9969,59 @@
         },
         "type": "object",
         "title": "SelectOption"
+      },
+      "SelectOptionAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_select_option",
+            "title": "Type",
+            "default": "ai_select_option"
+          },
+          "selector": {
+            "type": "string",
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Value to select",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the selection",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "SelectOptionAction",
+        "description": "Select option action parameters."
       },
       "SendEmailBlock": {
         "properties": {

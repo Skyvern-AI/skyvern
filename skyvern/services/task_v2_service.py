@@ -1758,11 +1758,8 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             )
 
     app_url = None
-    if task_v2.workflow_run_id and task_v2.workflow_permanent_id:
-        app_url = (
-            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
-            f"{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}"
-        )
+    if task_v2.workflow_run_id:
+        app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v2.workflow_run_id}"
 
     return TaskRunResponse(
         run_id=task_v2.observer_cruise_id,
