@@ -2,10 +2,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
 from skyvern.constants import SKYVERN_DIR
+from skyvern.utils.env_paths import resolve_backend_env_path
+
+# NOTE: _DEFAULT_ENV_FILES resolves .env paths at import time and assumes
+# the process has changed dir to the desired project root by this time.
+# Even if we were to resolve paths at instantiation time, the global `settings`
+# singleton instantiation at the bottom of this file also runs at import time
+# and relies on the same assumption.
+_DEFAULT_ENV_FILES = (
+    resolve_backend_env_path(".env"),
+    resolve_backend_env_path(".env.staging"),
+    resolve_backend_env_path(".env.prod"),
+)
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=(".env", ".env.staging", ".env.prod"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore")
 
     # settings for experimentation
     ENABLE_EXP_ALL_TEXTUAL_ELEMENTS_INTERACTABLE: bool = False
@@ -83,6 +95,12 @@ class Settings(BaseSettings):
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
 
+    # email settings
+    SMTP_HOST: str = "localhost"
+    SMTP_PORT: int = 25
+    SMTP_USERNAME: str = "username"
+    SMTP_PASSWORD: str = "password"
+
     # browser settings
     BROWSER_LOCALE: str = "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
@@ -96,6 +114,7 @@ class Settings(BaseSettings):
 
     # Workflow constant parameters
     WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY: str = "SKYVERN_DOWNLOAD_DIRECTORY"
+    WORKFLOW_TEMPLATING_STRICTNESS: str = "lax"  # options: "strict", "lax"
     WORKFLOW_WAIT_BLOCK_MAX_SEC: int = 30 * 60
 
     # Saved browser session settings
@@ -118,6 +137,8 @@ class Settings(BaseSettings):
     LLM_API_KEY: str | None = None  # API key for the model
     SECONDARY_LLM_KEY: str | None = None
     SELECT_AGENT_LLM_KEY: str | None = None
+    NORMAL_SELECT_AGENT_LLM_KEY: str | None = None
+    CUSTOM_SELECT_AGENT_LLM_KEY: str | None = None
     SINGLE_CLICK_AGENT_LLM_KEY: str | None = None
     SINGLE_INPUT_AGENT_LLM_KEY: str | None = None
     PROMPT_BLOCK_LLM_KEY: str | None = None
@@ -125,6 +146,7 @@ class Settings(BaseSettings):
     EXTRACTION_LLM_KEY: str | None = None
     CHECK_USER_GOAL_LLM_KEY: str | None = None
     AUTO_COMPLETION_LLM_KEY: str | None = None
+    SCRIPT_GENERATION_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     LLM_CONFIG_MAX_TOKENS: int = 4096
@@ -270,7 +292,7 @@ class Settings(BaseSettings):
     ENABLE_OPENROUTER: bool = False
     OPENROUTER_API_KEY: str | None = None
     OPENROUTER_MODEL: str | None = None
-    OPENROUTER_API_BASE: str = "https://api.openrouter.ai/v1"
+    OPENROUTER_API_BASE: str = "https://openrouter.ai/api/v1"
 
     # GROQ
     ENABLE_GROQ: bool = False
@@ -294,6 +316,16 @@ class Settings(BaseSettings):
     BITWARDEN_MASTER_PASSWORD: str | None = None
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
+
+    # Where credentials are stored: bitwarden or azure_vault
+    CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+
+    # Azure Setting
+    AZURE_TENANT_ID: str | None = None
+    AZURE_CLIENT_ID: str | None = None
+    AZURE_CLIENT_SECRET: str | None = None
+    # The Azure Key Vault name to store credentials
+    AZURE_CREDENTIAL_VAULT: str | None = None
 
     # Skyvern Auth Bitwarden Settings
     SKYVERN_AUTH_BITWARDEN_CLIENT_ID: str | None = None
@@ -329,7 +361,7 @@ class Settings(BaseSettings):
 
     # Trace settings
     TRACE_ENABLED: bool = False
-    TRACE_PROVIDER: str = "lmnr"
+    TRACE_PROVIDER: str = ""
     TRACE_PROVIDER_HOST: str | None = None
     TRACE_PROVIDER_API_KEY: str = "fillmein"
 
@@ -364,7 +396,7 @@ class Settings(BaseSettings):
         if self.is_cloud_environment():
             return {
                 "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash-preview-05-20": {
+                "gemini-2.5-flash": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
@@ -382,6 +414,10 @@ class Settings(BaseSettings):
                 "us.anthropic.claude-sonnet-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
                     "label": "Anthropic Claude 4 Sonnet",
+                },
+                "claude-haiku-4-5-20251001": {
+                    "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
+                    "label": "Anthropic Claude 4.5 Haiku",
                 },
                 # "claude-sonnet-4-20250514": {
                 #     "llm_key": "ANTHROPIC_CLAUDE4_SONNET",
@@ -396,7 +432,7 @@ class Settings(BaseSettings):
             # TODO: apparently the list for OSS is to be much larger
             return {
                 "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash-preview-05-20": {
+                "gemini-2.5-flash": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
@@ -414,6 +450,10 @@ class Settings(BaseSettings):
                 "us.anthropic.claude-sonnet-4-20250514-v1:0": {
                     "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
                     "label": "Anthropic Claude 4 Sonnet",
+                },
+                "claude-haiku-4-5-20251001": {
+                    "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
+                    "label": "Anthropic Claude 4.5 Haiku",
                 },
             }
 

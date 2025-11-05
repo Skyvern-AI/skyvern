@@ -43,6 +43,8 @@ import { URLNode } from "./URLNode/types";
 import { URLNode as URLNodeComponent } from "./URLNode/URLNode";
 import { HttpRequestNode } from "./HttpRequestNode/types";
 import { HttpRequestNode as HttpRequestNodeComponent } from "./HttpRequestNode/HttpRequestNode";
+import { HumanInteractionNode } from "./HumanInteractionNode/types";
+import { HumanInteractionNode as HumanInteractionNodeComponent } from "./HumanInteractionNode/HumanInteractionNode";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -57,6 +59,7 @@ export type WorkflowBlockNode =
   | FileUploadNode
   | DownloadNode
   | ValidationNode
+  | HumanInteractionNode
   | ActionNode
   | NavigationNode
   | ExtractionNode
@@ -93,6 +96,7 @@ export const nodeTypes = {
   validation: memo(ValidationNodeComponent),
   action: memo(ActionNodeComponent),
   navigation: memo(NavigationNodeComponent),
+  human_interaction: memo(HumanInteractionNodeComponent),
   extraction: memo(ExtractionNodeComponent),
   login: memo(LoginNodeComponent),
   wait: memo(WaitNodeComponent),

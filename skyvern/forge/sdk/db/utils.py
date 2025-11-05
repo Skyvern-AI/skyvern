@@ -67,6 +67,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     DragAction,
     ExtractAction,
+    GotoUrlAction,
     InputTextAction,
     KeypressAction,
     LeftMouseAction,
@@ -105,6 +106,7 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.DRAG: DragAction,
     ActionType.VERIFICATION_CODE: VerificationCodeAction,
     ActionType.LEFT_MOUSE: LeftMouseAction,
+    ActionType.GOTO_URL: GotoUrlAction,
 }
 
 
@@ -158,6 +160,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         max_screenshot_scrolls=task_obj.max_screenshot_scrolling_times,
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
+        download_timeout=task_obj.download_timeout,
     )
     return task
 
@@ -323,11 +326,13 @@ def convert_to_workflow_run(
         extra_http_headers=workflow_run_model.extra_http_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
+        depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,
         sequential_key=workflow_run_model.sequential_key,
         script_run=ScriptRunResponse.model_validate(workflow_run_model.script_run)
         if workflow_run_model.script_run
         else None,
         run_with=workflow_run_model.run_with,
+        code_gen=workflow_run_model.code_gen,
     )
 
 
@@ -518,6 +523,9 @@ def convert_to_workflow_run_block(
         body=workflow_run_block_model.body,
         created_at=workflow_run_block_model.created_at,
         modified_at=workflow_run_block_model.modified_at,
+        instructions=workflow_run_block_model.instructions,
+        positive_descriptor=workflow_run_block_model.positive_descriptor,
+        negative_descriptor=workflow_run_block_model.negative_descriptor,
     )
     if task:
         if task.finished_at and task.started_at:
@@ -575,6 +583,9 @@ def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock
         script_revision_id=script_block_model.script_revision_id,
         script_block_label=script_block_model.script_block_label,
         script_file_id=script_block_model.script_file_id,
+        run_signature=script_block_model.run_signature,
+        workflow_run_id=script_block_model.workflow_run_id,
+        workflow_run_block_id=script_block_model.workflow_run_block_id,
         created_at=script_block_model.created_at,
         modified_at=script_block_model.modified_at,
         deleted_at=script_block_model.deleted_at,

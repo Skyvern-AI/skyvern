@@ -50,6 +50,11 @@ class InputOrSelectContext(BaseModel):
         return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
 
 
+class ClickContext(BaseModel):
+    thought: str | None = None
+    single_option_click: bool | None = None
+
+
 class Action(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -72,6 +77,7 @@ class Action(BaseModel):
     skyvern_element_hash: str | None = None
     skyvern_element_data: dict[str, Any] | None = None
     tool_call_id: str | None = None
+    xpath: str | None = None
 
     # DecisiveAction (CompleteAction, TerminateAction) fields
     errors: list[UserDefinedError] | None = None
@@ -87,6 +93,10 @@ class Action(BaseModel):
     option: SelectOption | None = None
     is_checked: bool | None = None
     verified: bool = False
+    click_context: ClickContext | None = None
+
+    # TOTP timing information for multi-field TOTP sequences
+    totp_timing_info: dict[str, Any] | None = None
 
     created_at: datetime | None = None
     modified_at: datetime | None = None
@@ -121,12 +131,18 @@ class Action(BaseModel):
                 return SolveCaptchaAction.model_validate(value)
             elif action_type is ActionType.RELOAD_PAGE:
                 return ReloadPageAction.model_validate(value)
+            elif action_type is ActionType.GOTO_URL:
+                return GotoUrlAction.model_validate(value)
+            elif action_type is ActionType.CLOSE_PAGE:
+                return ClosePageAction.model_validate(value)
             else:
                 raise ValueError(f"Unsupported action type: {action_type}")
         else:
             raise ValueError("Invalid action data")
 
     def get_xpath(self) -> str | None:
+        if self.xpath:
+            return self.xpath
         if not self.skyvern_element_data:
             return None
         if "xpath" in self.skyvern_element_data:
@@ -145,6 +161,11 @@ class DecisiveAction(Action):
 # TODO: consider to implement this as a WebAction in the future
 class ReloadPageAction(Action):
     action_type: ActionType = ActionType.RELOAD_PAGE
+
+
+# TODO: right now, it's only enabled when there's magic link during login
+class ClosePageAction(Action):
+    action_type: ActionType = ActionType.CLOSE_PAGE
 
 
 class ClickAction(WebAction):
@@ -252,6 +273,12 @@ class KeypressAction(Action):
     keys: list[str] = []
     hold: bool = False
     duration: int = 0
+
+
+class GotoUrlAction(Action):
+    action_type: ActionType = ActionType.GOTO_URL
+    url: str
+    is_magic_link: bool = False  # if True, shouldn't go to url directly when replaying the cache
 
 
 class MoveAction(Action):

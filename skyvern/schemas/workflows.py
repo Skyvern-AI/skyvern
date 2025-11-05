@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
@@ -37,6 +37,7 @@ class BlockType(StrEnum):
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
+    HUMAN_INTERACTION = "human_interaction"
 
 
 class BlockStatus(StrEnum):
@@ -73,6 +74,13 @@ class ParameterYAML(BaseModel, abc.ABC):
     parameter_type: ParameterType
     key: str
     description: str | None = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_no_whitespace(cls, v: str) -> str:
+        if any(char in v for char in [" ", "\t", "\n", "\r"]):
+            raise ValueError("Key cannot contain whitespaces")
+        return v
 
 
 class AWSSecretParameterYAML(ParameterYAML):
@@ -216,6 +224,7 @@ class TaskBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
@@ -333,6 +342,7 @@ class ValidationBlockYAML(BlockYAML):
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
+    disable_cache: bool = False
 
 
 class ActionBlockYAML(BlockYAML):
@@ -352,6 +362,7 @@ class ActionBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
 
 
 class NavigationBlockYAML(BlockYAML):
@@ -372,6 +383,7 @@ class NavigationBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
@@ -390,6 +402,7 @@ class ExtractionBlockYAML(BlockYAML):
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
 
 
 class LoginBlockYAML(BlockYAML):
@@ -406,6 +419,7 @@ class LoginBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     complete_verification: bool = True
@@ -414,6 +428,20 @@ class LoginBlockYAML(BlockYAML):
 class WaitBlockYAML(BlockYAML):
     block_type: Literal[BlockType.WAIT] = BlockType.WAIT  # type: ignore
     wait_sec: int = 0
+
+
+class HumanInteractionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.HUMAN_INTERACTION] = BlockType.HUMAN_INTERACTION  # type: ignore
+
+    instructions: str = "Please review and approve or reject to continue the workflow."
+    positive_descriptor: str = "Approve"
+    negative_descriptor: str = "Reject"
+    timeout_seconds: int
+
+    sender: str
+    recipients: list[str]
+    subject: str
+    body: str
 
 
 class FileDownloadBlockYAML(BlockYAML):
@@ -433,6 +461,8 @@ class FileDownloadBlockYAML(BlockYAML):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     cache_actions: bool = False
+    disable_cache: bool = False
+    download_timeout: float | None = None
 
 
 class UrlBlockYAML(BlockYAML):
@@ -448,6 +478,7 @@ class TaskV2BlockYAML(BlockYAML):
     totp_identifier: str | None = None
     max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
     max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+    disable_cache: bool = False
 
 
 class HttpRequestBlockYAML(BlockYAML):
@@ -495,6 +526,7 @@ BLOCK_YAML_SUBCLASSES = (
     | ExtractionBlockYAML
     | LoginBlockYAML
     | WaitBlockYAML
+    | HumanInteractionBlockYAML
     | FileDownloadBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
@@ -525,7 +557,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str | None = None
     ai_fallback: bool = False
-    cache_key: str | None = None
+    cache_key: str | None = "default"
     run_sequentially: bool = False
     sequential_key: str | None = None
 

@@ -16,10 +16,10 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import {
-  envCredential,
   environment,
   wssBaseUrl,
   newWssBaseUrl,
+  getRuntimeApiKey,
 } from "@/util/env";
 import { cn } from "@/util/utils";
 
@@ -39,7 +39,30 @@ interface CommandCedeControl {
   kind: "cede-control";
 }
 
+// a "Command" is an fire-n-forget out-message - it does not require a response
 type Command = CommandTakeControl | CommandCedeControl;
+
+const messageInKinds = ["ask-for-clipboard", "copied-text"] as const;
+
+type MessageInKind = (typeof messageInKinds)[number];
+
+interface MessageInAskForClipboard {
+  kind: "ask-for-clipboard";
+}
+
+interface MessageInCopiedText {
+  kind: "copied-text";
+  text: string;
+}
+
+type MessageIn = MessageInCopiedText | MessageInAskForClipboard;
+
+interface MessageOutAskForClipboardResponse {
+  kind: "ask-for-clipboard-response";
+  text: string;
+}
+
+type MessageOut = MessageOutAskForClipboardResponse;
 
 type Props = {
   browserSessionId?: string;
@@ -52,6 +75,7 @@ type Props = {
     run: WorkflowRunStatusApiResponse;
   };
   resizeTrigger?: number;
+  isVisible?: boolean;
   // --
   onClose?: () => void;
 };
@@ -63,12 +87,13 @@ function BrowserStream({
   task = undefined,
   workflow = undefined,
   resizeTrigger,
+  isVisible = true,
   // --
   onClose,
 }: Props) {
   let showStream: boolean = false;
-  let runId: string;
-  let entity: "browserSession" | "task" | "workflow";
+  let runId: string | null;
+  let entity: "browserSession" | "task" | "workflow" | null;
 
   if (browserSessionId) {
     runId = browserSessionId;
@@ -84,11 +109,12 @@ function BrowserStream({
     showStream = statusIsNotFinalized(workflow.run);
     entity = "workflow";
   } else {
-    throw new Error("No browser session id, task or workflow provided");
+    entity = null;
+    runId = null;
   }
 
   useQuery({
-    queryKey: ["browserSession", browserSessionId],
+    queryKey: ["hasBrowserSession", browserSessionId],
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
 
@@ -101,6 +127,20 @@ function BrowserStream({
         if (!browserSession || browserSession.completed_at) {
           setHasBrowserSession(false);
           return false;
+
+          // NOTE(jdo:streaming-local-dev): remove above and use this instead
+          // if (browserSession && browserSession.completed_at) {
+          //   console.warn(
+          //     "Completed at:",
+          //     browserSession.completed_at,
+          //     "continuing anyway!",
+          //   );
+          //   setHasBrowserSession(true);
+          //   return true;
+          // } else {
+          //   setHasBrowserSession(false);
+          //   return false;
+          // }
         }
 
         setHasBrowserSession(true);
@@ -115,15 +155,17 @@ function BrowserStream({
   });
 
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
-  const [userIsControlling, setUserIsControlling] = useState(interactive);
-  const [commandSocket, setCommandSocket] = useState<WebSocket | null>(null);
+  const [userIsControlling, setUserIsControlling] = useState(false);
+  const [messageSocket, setMessageSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
   const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
-  const [commandDisconnectedTrigger, setCommandDisconnectedTrigger] =
+  const [isCanvasReady, setIsCanvasReady] = useState<boolean>(false);
+  const [isReady, setIsReady] = useState(false);
+  const [messagesDisconnectedTrigger, setMessagesDisconnectedTrigger] =
     useState(0);
-  const prevCommandConnectedRef = useRef<boolean>(false);
-  const [isCommandConnected, setIsCommandConnected] = useState<boolean>(false);
+  const prevMessageConnectedRef = useRef<boolean>(false);
+  const [isMessageConnected, setIsMessageConnected] = useState<boolean>(false);
   const [canvasContainer, setCanvasContainer] = useState<HTMLDivElement | null>(
     null,
   );
@@ -131,28 +173,30 @@ function BrowserStream({
     setCanvasContainer(node);
   }, []);
   const rfbRef = useRef<RFB | null>(null);
+  const observerRef = useRef<MutationObserver | null>(null);
   const clientId = useClientIdStore((state) => state.clientId);
   const credentialGetter = useCredentialGetter();
 
   const getWebSocketParams = useCallback(async () => {
     const clientIdQueryParam = `client_id=${clientId}`;
-    let credentialQueryParam = "";
+    const runtimeApiKey = getRuntimeApiKey();
 
-    if (environment === "local") {
-      credentialQueryParam = `apikey=${envCredential}`;
-    } else {
-      if (credentialGetter) {
-        const token = await credentialGetter();
-        credentialQueryParam = `token=Bearer ${token}`;
-      } else {
-        credentialQueryParam = `apikey=${envCredential}`;
-      }
+    let credentialQueryParam = runtimeApiKey ? `apikey=${runtimeApiKey}` : "";
+
+    if (environment !== "local" && credentialGetter) {
+      const token = await credentialGetter();
+      credentialQueryParam = token ? `token=Bearer ${token}` : "";
     }
 
-    const params = [credentialQueryParam, clientIdQueryParam].join("&");
-
-    return `${params}`;
+    return credentialQueryParam
+      ? `${credentialQueryParam}&${clientIdQueryParam}`
+      : clientIdQueryParam;
   }, [clientId, credentialGetter]);
+
+  // browser is ready
+  useEffect(() => {
+    setIsReady(isVncConnected && isCanvasReady && hasBrowserSession);
+  }, [hasBrowserSession, isCanvasReady, isVncConnected]);
 
   // effect for vnc disconnects only
   useEffect(() => {
@@ -163,14 +207,14 @@ function BrowserStream({
     prevVncConnectedRef.current = isVncConnected;
   }, [isVncConnected, onClose]);
 
-  // effect for command disconnects only
+  // effect for message disconnects only
   useEffect(() => {
-    if (prevCommandConnectedRef.current && !isCommandConnected) {
-      setCommandDisconnectedTrigger((x) => x + 1);
+    if (prevMessageConnectedRef.current && !isMessageConnected) {
+      setMessagesDisconnectedTrigger((x) => x + 1);
       onClose?.();
     }
-    prevCommandConnectedRef.current = isCommandConnected;
-  }, [isCommandConnected, onClose]);
+    prevMessageConnectedRef.current = isMessageConnected;
+  }, [isMessageConnected, onClose]);
 
   // vnc socket
   useEffect(
@@ -218,11 +262,31 @@ function BrowserStream({
           throw new Error("Canvas element not found");
         }
 
+        observerRef.current = new MutationObserver(() => {
+          const canvasElement = canvasContainer.querySelector("canvas");
+          if (canvasElement) {
+            setIsCanvasReady(true);
+            observerRef.current?.disconnect();
+          }
+        });
+
+        observerRef.current.observe(canvasContainer, {
+          childList: true,
+          subtree: true,
+        });
+
         const rfb = new RFB(canvas, vncUrl);
 
         rfb.scaleViewport = true;
 
         rfbRef.current = rfb;
+
+        const canvasElement = canvasContainer.querySelector("canvas");
+
+        if (canvasElement) {
+          setIsCanvasReady(true);
+          observerRef.current?.disconnect();
+        }
 
         rfb.addEventListener("connect", () => {
           setIsVncConnected(true);
@@ -230,19 +294,25 @@ function BrowserStream({
 
         rfb.addEventListener("disconnect", async (/* e: RfbEvent */) => {
           setIsVncConnected(false);
+          setIsCanvasReady(false);
         });
 
-        // setIsVncConnected(true); // be optimistic
+        setIsVncConnected(true); // be optimistic
       }
 
       setupVnc();
 
       return () => {
+        if (observerRef.current) {
+          observerRef.current.disconnect();
+          observerRef.current = null;
+        }
         if (rfbRef.current) {
           rfbRef.current.disconnect();
           rfbRef.current = null;
         }
         setIsVncConnected(false);
+        setIsCanvasReady(false);
       };
     },
     // cannot include isVncConnected in deps as it will cause infinite loop
@@ -258,7 +328,6 @@ function BrowserStream({
     ],
   );
 
-  // command socket
   useEffect(() => {
     if (!showStream || !canvasContainer || !runId) {
       return;
@@ -269,34 +338,52 @@ function BrowserStream({
     const connect = async () => {
       const wsParams = await getWebSocketParams();
 
-      const commandUrl =
+      const messageUrl =
         entity === "browserSession"
-          ? `${newWssBaseUrl}/stream/commands/browser_session/${runId}?${wsParams}`
+          ? `${newWssBaseUrl}/stream/messages/browser_session/${runId}?${wsParams}`
           : entity === "task"
-            ? `${wssBaseUrl}/stream/commands/task/${runId}?${wsParams}`
+            ? `${wssBaseUrl}/stream/messages/task/${runId}?${wsParams}`
             : entity === "workflow"
-              ? `${wssBaseUrl}/stream/commands/workflow_run/${runId}?${wsParams}`
+              ? `${wssBaseUrl}/stream/messages/workflow_run/${runId}?${wsParams}`
               : null;
 
-      if (!commandUrl) {
-        throw new Error("No command url");
+      if (!messageUrl) {
+        throw new Error("No message url");
       }
 
       if (!hasBrowserSession) {
-        setIsCommandConnected(false);
+        setIsMessageConnected(false);
         return;
       }
 
-      ws = new WebSocket(commandUrl);
+      ws = new WebSocket(messageUrl);
 
       ws.onopen = () => {
-        setIsCommandConnected(true);
-        setCommandSocket(ws);
+        setIsMessageConnected(true);
+        setMessageSocket(ws);
+      };
+
+      ws.onmessage = (event) => {
+        const data = event.data;
+
+        try {
+          const message = JSON.parse(data);
+
+          handleMessage(message, ws);
+
+          // handle incoming messages if needed
+        } catch (e) {
+          console.error(
+            "Error parsing message from message channel:",
+            e,
+            event,
+          );
+        }
       };
 
       ws.onclose = () => {
-        setIsCommandConnected(false);
-        setCommandSocket(null);
+        setIsMessageConnected(false);
+        setMessageSocket(null);
       };
     };
 
@@ -309,31 +396,33 @@ function BrowserStream({
         // pass
       }
     };
+    // NOTE: adding getWebSocketParams causes constant reconnects of message channel when,
+    // for instance, take-control or cede-control is clicked
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     browserSessionId,
     canvasContainer,
-    commandDisconnectedTrigger,
+    messagesDisconnectedTrigger,
     entity,
-    getWebSocketParams,
     hasBrowserSession,
     runId,
     showStream,
   ]);
 
-  // effect to send a command when the user is controlling, vs not controlling
+  // effect to send a message when the user is controlling, vs not controlling
   useEffect(() => {
-    if (!isCommandConnected) {
+    if (!isMessageConnected) {
       return;
     }
 
     const sendCommand = (command: Command) => {
-      if (!commandSocket) {
+      if (!messageSocket) {
         console.warn("Cannot send command, as command socket is closed.");
         console.warn(command);
         return;
       }
 
-      commandSocket.send(JSON.stringify(command));
+      messageSocket.send(JSON.stringify(command));
     };
 
     if (interactive || userIsControlling) {
@@ -342,7 +431,7 @@ function BrowserStream({
       sendCommand({ kind: "cede-control" });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [interactive, isCommandConnected, userIsControlling]);
+  }, [interactive, isMessageConnected, userIsControlling]);
 
   // Effect to handle window resize trigger for NoVNC canvas
   useEffect(() => {
@@ -389,6 +478,139 @@ function BrowserStream({
     }
   }, [task, workflow]);
 
+  useEffect(() => {
+    if (!interactive) {
+      setUserIsControlling(false);
+    }
+  }, [interactive]);
+  /**
+   * TODO(jdo): could use zod or smth similar
+   */
+  const getMessage = (data: unknown): MessageIn | undefined => {
+    if (!data) {
+      return;
+    }
+
+    if (typeof data !== "object") {
+      return;
+    }
+
+    if (!("kind" in data)) {
+      return;
+    }
+
+    const k = data.kind;
+
+    if (typeof k !== "string") {
+      return;
+    }
+
+    if (!messageInKinds.includes(k as MessageInKind)) {
+      return;
+    }
+
+    const kind = k as MessageInKind;
+
+    switch (kind) {
+      case "ask-for-clipboard": {
+        return data as MessageInAskForClipboard;
+      }
+      case "copied-text": {
+        if ("text" in data && typeof data.text === "string") {
+          return {
+            kind: "copied-text",
+            text: data.text,
+          };
+        }
+        break;
+      }
+      default: {
+        const _exhaustive: never = kind;
+        return _exhaustive;
+      }
+    }
+  };
+
+  const handleMessage = (data: unknown, ws: WebSocket | null) => {
+    const message = getMessage(data);
+
+    if (!message) {
+      console.warn("Unknown message received on message channel:", data);
+      return;
+    }
+
+    const kind = message.kind;
+
+    const respond = (message: MessageOut) => {
+      if (!ws) {
+        console.warn("Cannot send message, as message socket is null.");
+        console.warn(message);
+        return;
+      }
+
+      ws.send(JSON.stringify(message));
+    };
+
+    switch (kind) {
+      case "ask-for-clipboard": {
+        if (!navigator.clipboard) {
+          console.warn("Clipboard API not available.");
+          return;
+        }
+
+        navigator.clipboard
+          .readText()
+          .then((text) => {
+            toast({
+              title: "Pasting Into Browser",
+              description:
+                "Pasting your current clipboard text into the web page. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
+            });
+
+            const response: MessageOutAskForClipboardResponse = {
+              kind: "ask-for-clipboard-response",
+              text,
+            };
+
+            respond(response);
+          })
+          .catch((err) => {
+            console.error("Failed to read clipboard contents: ", err);
+          });
+
+        break;
+      }
+      case "copied-text": {
+        const text = message.text;
+
+        navigator.clipboard
+          .writeText(text)
+          .then(() => {
+            toast({
+              title: "Copied to Clipboard",
+              description:
+                "The text has been copied to your clipboard. NOTE: copy-paste only works in the web page - not in the browser (like the address bar).",
+            });
+          })
+          .catch((err) => {
+            console.error("Failed to write to clipboard:", err);
+
+            toast({
+              variant: "destructive",
+              title: "Failed to write to Clipboard",
+              description: "The text could not be copied to your clipboard.",
+            });
+          });
+
+        break;
+      }
+      default: {
+        const _exhaustive: never = kind;
+        return _exhaustive;
+      }
+    }
+  };
+
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
 
@@ -402,7 +624,7 @@ function BrowserStream({
       )}
       ref={setCanvasContainerRef}
     >
-      {isVncConnected && hasBrowserSession && (
+      {isReady && isVisible && (
         <div className="overlay z-10 flex items-center justify-center overflow-hidden">
           {showControlButtons && (
             <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
@@ -437,7 +659,7 @@ function BrowserStream({
           )}
         </div>
       )}
-      {!isVncConnected && (
+      {!isReady && (
         <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
           {browserSessionId && !hasBrowserSession ? (
             <div>This live browser session is no longer streaming.</div>

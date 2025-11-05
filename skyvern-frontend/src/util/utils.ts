@@ -36,3 +36,34 @@ export const formatMs = (elapsed: number) => {
     day: days,
   };
 };
+
+export function toDate(
+  time: string,
+  defaultDate: Date | null = new Date(0),
+): Date | null {
+  time = time.replace(/\.(\d{3})\d*/, ".$1");
+
+  if (!time.endsWith("Z")) {
+    time += "Z";
+  }
+
+  const date = new Date(time);
+
+  if (isNaN(date.getTime())) {
+    return defaultDate;
+  }
+
+  return date;
+}
+
+/** Returns a date in the format 'July 14th at 4:52pm' */
+export function formatDate(date: Date): string {
+  const options: Intl.DateTimeFormatOptions = {
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "numeric",
+    hour12: true,
+  };
+  return date.toLocaleString("en-US", options);
+}

@@ -29,6 +29,7 @@ import { cn } from "@/util/utils";
 import {
   LightningBoltIcon,
   MagnifyingGlassIcon,
+  MixerHorizontalIcon,
   Pencil2Icon,
   PlayIcon,
   PlusIcon,
@@ -39,6 +40,7 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import { NarrativeCard } from "./components/header/NarrativeCard";
+import { WorkflowParametersDialog } from "./components/WorkflowParametersDialog";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -63,6 +65,7 @@ function Workflows() {
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
+  const [openWorkflowId, setOpenWorkflowId] = useState<string | null>(null);
   const [debouncedSearch] = useDebounce(search, 500);
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -79,7 +82,9 @@ function Workflows() {
       params.append("page", String(page));
       params.append("page_size", String(itemsPerPage));
       params.append("only_workflows", "true");
-      params.append("title", debouncedSearch);
+      if (debouncedSearch) {
+        params.append("search_key", debouncedSearch);
+      }
       return client
         .get(`/workflows`, {
           params,
@@ -96,7 +101,9 @@ function Workflows() {
       params.append("page", String(page + 1));
       params.append("page_size", String(itemsPerPage));
       params.append("only_workflows", "true");
-      params.append("title", debouncedSearch);
+      if (debouncedSearch) {
+        params.append("search_key", debouncedSearch);
+      }
       return client
         .get(`/workflows`, {
           params,
@@ -198,7 +205,7 @@ function Workflows() {
                 setSearch(event.target.value);
                 setParamPatch({ page: "1" });
               }}
-              placeholder="Search by title..."
+              placeholder="Search by title or parameter..."
               className="w-48 pl-9 lg:w-72"
             />
           </div>
@@ -312,6 +319,29 @@ function Workflows() {
                             </Tooltip>
                           </TooltipProvider>
                           <WorkflowActions workflow={workflow} />
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  size="icon"
+                                  variant="outline"
+                                  onClick={() =>
+                                    setOpenWorkflowId(
+                                      workflow.workflow_permanent_id,
+                                    )
+                                  }
+                                  disabled={
+                                    !workflow.workflow_definition.parameters.some(
+                                      (p) => p.parameter_type !== "output",
+                                    )
+                                  }
+                                >
+                                  <MixerHorizontalIcon className="h-4 w-4" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>View Parameters</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
                         </div>
                       </TableCell>
                     </TableRow>
@@ -320,6 +350,14 @@ function Workflows() {
               )}
             </TableBody>
           </Table>
+          <WorkflowParametersDialog
+            open={openWorkflowId !== null}
+            onOpenChange={(open) => {
+              if (!open) setOpenWorkflowId(null);
+            }}
+            workflowId={openWorkflowId}
+            workflows={workflows}
+          />
           <div className="relative px-3 py-3">
             <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
               <span className="text-slate-400">Items per page</span>

@@ -5,13 +5,11 @@ from typing import Any
 
 import httpx
 import structlog
-from playwright.async_api import Page
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
 from skyvern.exceptions import (
     FailedToSendWebhook,
-    MissingBrowserState,
     TaskTerminationError,
     TaskV2NotFound,
     UrlGenerationFailure,
@@ -22,7 +20,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -168,6 +166,7 @@ async def initialize_task_v2(
 ) -> TaskV2:
     task_v2 = await app.DATABASE.create_task_v2(
         prompt=user_prompt,
+        url=user_url if user_url else None,
         organization_id=organization.organization_id,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
@@ -188,40 +187,13 @@ async def initialize_task_v2(
         context.run_id = context.run_id or task_v2.observer_cruise_id
         context.max_screenshot_scrolls = max_screenshot_scrolling_times
 
-    thought = await app.DATABASE.create_thought(
-        task_v2_id=task_v2.observer_cruise_id,
-        organization_id=organization.organization_id,
-        thought_type=ThoughtType.metadata,
-        thought_scenario=ThoughtScenario.generate_metadata,
-    )
-
-    metadata_prompt = prompt_engine.load_prompt("task_v2_generate_metadata", user_goal=user_prompt, user_url=user_url)
-    metadata_response = await app.LLM_API_HANDLER(
-        prompt=metadata_prompt,
-        thought=thought,
-        prompt_name="task_v2_generate_metadata",
-    )
-    # validate
-    LOG.info(f"Initialized task v2 initial response: {metadata_response}")
-    url: str = user_url or metadata_response.get("url", "")
-    if not url:
-        raise UrlGenerationFailure()
-    title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
-    metadata = TaskV2Metadata(
-        url=url,
-        workflow_title=title,
-    )
-    url = metadata.url
-    if not url:
-        raise UrlGenerationFailure()
-
     # create workflow and workflow run
     max_steps_override = 10
     try:
         workflow_status = WorkflowStatus.published if publish_workflow else WorkflowStatus.auto_generated
         new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
             organization,
-            metadata.workflow_title,
+            title=DEFAULT_WORKFLOW_TITLE,  # default title is updated as the first step of the task
             proxy_location=proxy_location,
             status=workflow_status,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
@@ -253,27 +225,13 @@ async def initialize_task_v2(
         )
         raise
 
-    try:
-        await app.DATABASE.update_thought(
-            thought_id=thought.observer_thought_id,
-            organization_id=organization.organization_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            workflow_id=new_workflow.workflow_id,
-            workflow_permanent_id=new_workflow.workflow_permanent_id,
-            thought=metadata_response.get("thoughts", ""),
-            output=metadata.model_dump(),
-        )
-    except Exception:
-        LOG.warning("Failed to update thought", exc_info=True)
-
-    # update oserver cruise
+    # update observer cruise
     try:
         task_v2 = await app.DATABASE.update_task_v2(
             task_v2_id=task_v2.observer_cruise_id,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_id=new_workflow.workflow_id,
             workflow_permanent_id=new_workflow.workflow_permanent_id,
-            url=url,
             organization_id=organization.organization_id,
         )
         if create_task_run:
@@ -282,8 +240,101 @@ async def initialize_task_v2(
                 organization_id=organization.organization_id,
                 run_id=task_v2.observer_cruise_id,
                 title=new_workflow.title,
-                url=url,
-                url_hash=generate_url_hash(url),
+            )
+    except Exception:
+        LOG.warning("Failed to update task 2.0", exc_info=True)
+        # fail the workflow run
+        task_v2 = await mark_task_v2_as_failed(
+            task_v2_id=task_v2.observer_cruise_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            failure_reason="Skyvern failed to update the task 2.0 after initializing the workflow run",
+            organization_id=organization.organization_id,
+        )
+        raise
+
+    return task_v2
+
+
+async def initialize_task_v2_metadata(
+    organization: Organization,
+    task_v2: TaskV2,
+    workflow: Workflow,
+    workflow_run: WorkflowRun,
+    user_prompt: str | None,
+    current_browser_url: str | None,
+    user_url: str | None,
+) -> TaskV2:
+    thought = await app.DATABASE.create_thought(
+        task_v2_id=task_v2.observer_cruise_id,
+        organization_id=organization.organization_id,
+        thought_type=ThoughtType.metadata,
+        thought_scenario=ThoughtScenario.generate_metadata,
+    )
+
+    metadata_prompt = prompt_engine.load_prompt(
+        "task_v2_generate_metadata",
+        user_goal=user_prompt,
+        current_browser_url=current_browser_url or "about:blank",
+        user_url=user_url,
+    )
+    metadata_response = await app.LLM_API_HANDLER(
+        prompt=metadata_prompt,
+        thought=thought,
+        prompt_name="task_v2_generate_metadata",
+    )
+
+    # validate
+    LOG.info(f"Initialized task v2 initial response: {metadata_response}")
+    url: str = user_url or metadata_response.get("url", "")
+    if not url:
+        raise UrlGenerationFailure()
+    title: str = metadata_response.get("title", DEFAULT_WORKFLOW_TITLE)
+    metadata = TaskV2Metadata(
+        url=url,
+        workflow_title=title,
+    )
+    url = metadata.url
+    if not url:
+        raise UrlGenerationFailure()
+
+    try:
+        await app.DATABASE.update_thought(
+            thought_id=thought.observer_thought_id,
+            organization_id=organization.organization_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            thought=metadata_response.get("thoughts", ""),
+            output=metadata.model_dump(),
+        )
+    except Exception:
+        LOG.warning("Failed to update thought", exc_info=True)
+
+    # update workflow & tasks with the inferred title and url
+    try:
+        await app.DATABASE.update_workflow(
+            workflow_id=workflow.workflow_id,
+            organization_id=organization.organization_id,
+            title=metadata.workflow_title,
+        )
+        task_v2 = await app.DATABASE.update_task_v2(
+            task_v2_id=task_v2.observer_cruise_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            url=metadata.url,
+            organization_id=organization.organization_id,
+        )
+        task_run = await app.DATABASE.get_run(
+            run_id=task_v2.observer_cruise_id, organization_id=organization.organization_id
+        )
+        if task_run:
+            await app.DATABASE.update_task_run(
+                organization_id=organization.organization_id,
+                run_id=task_v2.observer_cruise_id,
+                title=metadata.workflow_title,
+                url=metadata.url,
+                url_hash=generate_url_hash(metadata.url),
             )
     except Exception:
         LOG.warning("Failed to update task 2.0", exc_info=True)
@@ -306,7 +357,6 @@ async def run_task_v2(
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
-    code_gen: bool | None = None,
 ) -> TaskV2:
     organization_id = organization.organization_id
     try:
@@ -335,7 +385,6 @@ async def run_task_v2(
             request_id=request_id,
             max_steps_override=max_steps_override,
             browser_session_id=browser_session_id,
-            code_gen=code_gen,
         )
     except TaskTerminationError as e:
         task_v2 = await mark_task_v2_as_terminated(
@@ -392,7 +441,6 @@ async def run_task_v2_helper(
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
     browser_session_id: str | None = None,
-    code_gen: bool | None = None,
 ) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
     task_v2_id = task_v2.observer_cruise_id
@@ -404,7 +452,7 @@ async def run_task_v2_helper(
             organization_id=organization_id,
         )
         return None, None, task_v2
-    if not task_v2.url or not task_v2.prompt:
+    if not task_v2.prompt:
         LOG.error(
             "Task v2 url or prompt not found",
             task_v2_id=task_v2_id,
@@ -444,6 +492,8 @@ async def run_task_v2_helper(
             )
 
     workflow_run_id = task_v2.workflow_run_id
+    if not workflow_run_id:
+        raise ValueError("workflow_run_id is missing")
 
     workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id=organization_id)
     if not workflow_run:
@@ -468,7 +518,7 @@ async def run_task_v2_helper(
     current_run_id = context.run_id if context and context.run_id else task_v2_id
     # task v2 can be nested inside a workflow run, so we need to use the root workflow run id
     root_workflow_run_id = context.root_workflow_run_id if context and context.root_workflow_run_id else workflow_run_id
-    enable_parse_select_in_extract = app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+    enable_parse_select_in_extract = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
         "ENABLE_PARSE_SELECT_IN_EXTRACT",
         current_run_id,
         properties={"organization_id": organization_id, "task_url": task_v2.url},
@@ -496,12 +546,30 @@ async def run_task_v2_helper(
     workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
     await _set_up_workflow_context(workflow, workflow_run_id, organization)
 
-    url = str(task_v2.url)
     user_prompt = task_v2.prompt
     task_history: list[dict] = []
     yaml_blocks: list[BLOCK_YAML_TYPES] = []
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
-    browser_state: BrowserState | None = None
+    current_url: str | None = None
+
+    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+        workflow_run=workflow_run, browser_session_id=browser_session_id
+    )
+
+    page = await browser_state.get_working_page()
+    if page:
+        current_url = await SkyvernFrame.get_url(page)
+
+    task_v2 = await initialize_task_v2_metadata(
+        task_v2=task_v2,
+        workflow=workflow,
+        workflow_run=workflow_run,
+        organization=organization,
+        user_prompt=task_v2.prompt,
+        current_browser_url=current_url,
+        user_url=task_v2.url,
+    )
+    url = str(task_v2.url)
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
     for i in range(DEFAULT_MAX_ITERATIONS):
@@ -539,36 +607,25 @@ async def run_task_v2_helper(
         context = skyvern_context.ensure_context()
 
         # Always ensure browser_state is available at the start of the loop
-        current_url: str | None = None
-        page: Page | None = None
         fallback_url = settings.TASK_BLOCKED_SITE_FALLBACK_URL
-        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
-            workflow_run_id=workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
+        browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+            workflow_run=workflow_run, browser_session_id=browser_session_id
         )
+
         fallback_occurred = False
-        if browser_state is None:
-            try:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
+        if url != current_url:
+            if page is None:
+                page = await browser_state.get_or_create_page(
                     url=url,
-                    browser_session_id=browser_session_id,
+                    proxy_location=workflow_run.proxy_location,
+                    task_id=task_v2.task_id,
+                    workflow_run_id=workflow_run_id,
+                    script_id=task_v2.script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=task_v2.extra_http_headers,
                 )
-            except Exception:
-                LOG.warning("Failed to get or create browser state, fallback to Google", exc_info=True, url=url)
-
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
-                    url=fallback_url,
-                    browser_session_id=browser_session_id,
-                )
-
-                fallback_occurred = True
-
-            if browser_state is None:
-                LOG.error("Failed to create browser state even after fallback", workflow_run_id=workflow_run_id)
-                raise MissingBrowserState(workflow_run_id=workflow_run_id)
-
-            page = await browser_state.get_working_page()
+            else:
+                await browser_state.navigate_to_url(page, url)
 
             page_loaded = False
             if page:
@@ -593,10 +650,6 @@ async def run_task_v2_helper(
                         fallback_occurred = True
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
-        else:
-            page = await browser_state.get_working_page()
-            if page:
-                current_url = await SkyvernFrame.get_url(page)
 
         if i == 0 and current_url != url:
             if fallback_occurred:
@@ -770,26 +823,6 @@ async def run_task_v2_helper(
                     failure_reason=f"Unsupported task block type gets generated: {task_type}",
                 )
                 break
-
-        # generate the extraction task
-        block_result = await block.execute_safe(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            code_gen=code_gen,
-        )
-        task_history_record["status"] = str(block_result.status)
-        if block_result.failure_reason:
-            task_history_record["reason"] = block_result.failure_reason
-
-        extracted_data = _get_extracted_data_from_block_result(
-            block_result,
-            task_type,
-            task_v2_id=task_v2_id,
-            workflow_run_id=workflow_run_id,
-        )
-        if extracted_data is not None:
-            task_history_record["extracted_data"] = extracted_data
-        task_history.append(task_history_record)
         # refresh workflow
         yaml_blocks.extend(block_yaml_list)
         yaml_parameters.extend(parameter_yaml_list)
@@ -812,9 +845,28 @@ async def run_task_v2_helper(
             organization=organization,
             request=workflow_create_request,
             workflow_permanent_id=workflow.workflow_permanent_id,
+            delete_script=False,
         )
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
+        # generate the extraction task
+        block_result = await block.execute_safe(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        task_history_record["status"] = str(block_result.status)
+        if block_result.failure_reason:
+            task_history_record["reason"] = block_result.failure_reason
+
+        extracted_data = _get_extracted_data_from_block_result(
+            block_result,
+            task_type,
+            task_v2_id=task_v2_id,
+            workflow_run_id=workflow_run_id,
+        )
+        if extracted_data is not None:
+            task_history_record["extracted_data"] = extracted_data
+        task_history.append(task_history_record)
         # execute the extraction task
         workflow_run = await handle_block_result(
             task_v2_id,
@@ -904,11 +956,10 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=completion_screenshots,
                 )
-                if task_v2.run_with == "code" or code_gen:  # TODO(jdo): not sure about this one...
+                if task_v2.run_with == "code":
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
-                        code_gen=code_gen,
                     )
                 break
 
@@ -1464,6 +1515,10 @@ async def mark_task_v2_as_failed(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id, failure_reason=failure_reason or "Skyvern task 2.0 failed"
         )
+
+    # Add task failure tag to trace
+    TraceManager.add_task_completion_tag("failed")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1485,6 +1540,9 @@ async def mark_task_v2_as_completed(
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
+    # Add task completion tag to trace
+    TraceManager.add_task_completion_tag("completed")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1501,6 +1559,10 @@ async def mark_task_v2_as_canceled(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+
+    # Add task canceled tag to trace
+    TraceManager.add_task_completion_tag("canceled")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1518,6 +1580,10 @@ async def mark_task_v2_as_terminated(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
+
+    # Add task terminated tag to trace
+    TraceManager.add_task_completion_tag("terminated")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1535,6 +1601,10 @@ async def mark_task_v2_as_timed_out(
     )
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
+
+    # Add task timed out tag to trace
+    TraceManager.add_task_completion_tag("timed_out")
+
     await send_task_v2_webhook(task_v2)
     return task_v2
 
@@ -1688,11 +1758,8 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             )
 
     app_url = None
-    if task_v2.workflow_run_id and task_v2.workflow_permanent_id:
-        app_url = (
-            f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
-            f"{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}"
-        )
+    if task_v2.workflow_run_id:
+        app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v2.workflow_run_id}"
 
     return TaskRunResponse(
         run_id=task_v2.observer_cruise_id,
@@ -1747,17 +1814,19 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         payload_json = task_v2.model_dump_json(by_alias=True)
         payload_dict = json.loads(payload_json)
         payload_dict.update(json.loads(task_run_response_json))
-        payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-        headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key.token)
+        signed_data = generate_skyvern_webhook_signature(payload=payload_dict, api_key=api_key.token)
         LOG.info(
             "Sending task v2 response to webhook callback url",
             task_v2_id=task_v2.observer_cruise_id,
             webhook_callback_url=task_v2.webhook_callback_url,
-            payload=payload,
-            headers=headers,
+            payload=signed_data.signed_payload,
+            headers=signed_data.headers,
         )
         resp = await httpx.AsyncClient().post(
-            task_v2.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+            task_v2.webhook_callback_url,
+            data=signed_data.signed_payload,
+            headers=signed_data.headers,
+            timeout=httpx.Timeout(30.0),
         )
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(

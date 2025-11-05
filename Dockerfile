@@ -32,7 +32,7 @@ RUN cat /tmp/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodeso
 
 
 # install bitwarden cli
-RUN npm install -g @bitwarden/cli@2024.9.0
+RUN npm install -g @bitwarden/cli@2025.9.0
 # checking bw version also initializes the bw config
 RUN bw --version
 

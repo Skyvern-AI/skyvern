@@ -124,6 +124,14 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
+        """Store a browser profile from a directory."""
+
+    @abstractmethod
+    async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
+        """Retrieve a browser profile to a temporary directory."""
+
+    @abstractmethod
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:

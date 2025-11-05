@@ -1,5 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
+import { useState } from "react";
 import {
+  RunEngine,
   Status,
   TaskApiResponse,
   WorkflowRunStatusApiResponse,
@@ -24,13 +26,16 @@ import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
-import { apiBaseUrl } from "@/util/env";
-import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
+import { runsApiBaseUrl } from "@/util/env";
+import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
+import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { statusIsFinalized } from "../types";
+import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 
 function createTaskRequestObject(values: TaskApiResponse) {
@@ -124,6 +129,8 @@ function TaskDetails() {
     },
   });
 
+  const [replayOpen, setReplayOpen] = useState(false);
+
   if (taskIsError) {
     return <div>Error: {taskError?.message}</div>;
   }
@@ -189,7 +196,8 @@ function TaskDetails() {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <CopyApiCommandDropdown
+            {/** API & Webhooks consolidated dropdown + controlled dialog */}
+            <ApiWebhookActionsMenu
               getOptions={() => {
                 if (!task) {
                   return {
@@ -201,16 +209,41 @@ function TaskDetails() {
                     },
                   } satisfies ApiCommandOptions;
                 }
+
+                const includeOverrideHeader =
+                  task.max_steps_per_run !== null &&
+                  task.max_steps_per_run !== MAX_STEPS_DEFAULT;
+
+                const headers: Record<string, string> = {
+                  "Content-Type": "application/json",
+                  "x-api-key": apiCredential ?? "<your-api-key>",
+                };
+
+                if (includeOverrideHeader) {
+                  headers["x-max-steps-override"] = String(
+                    task.max_steps_per_run,
+                  );
+                }
+
                 return {
                   method: "POST",
-                  url: `${apiBaseUrl}/tasks`,
-                  body: createTaskRequestObject(task),
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiCredential ?? "<your-api-key>",
-                  },
+                  url: `${runsApiBaseUrl}/run/tasks`,
+                  body: buildTaskRunPayload(
+                    createTaskRequestObject(task),
+                    RunEngine.SkyvernV1,
+                  ),
+                  headers,
                 } satisfies ApiCommandOptions;
               }}
+              webhookDisabled={taskIsLoading || !taskHasTerminalState}
+              onTestWebhook={() => setReplayOpen(true)}
+            />
+            <WebhookReplayDialog
+              runId={task?.workflow_run_id ?? ""}
+              disabled={taskIsLoading || !taskHasTerminalState}
+              open={replayOpen}
+              onOpenChange={setReplayOpen}
+              hideTrigger
             />
             {taskIsRunningOrQueued && (
               <Dialog>

@@ -1,9 +1,11 @@
 from functools import wraps
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
+from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace.base import BaseTrace, NoOpTrace
+from skyvern.forge.sdk.trace.experiment_utils import collect_experiment_metadata_safely
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -36,6 +38,11 @@ class TraceManager:
                     new_metadata["run_id"] = context.run_id
                     new_metadata["organization_name"] = context.organization_name
                     user_id = context.run_id
+
+                    # Collect experiment metadata and include it in the span metadata
+                    experiment_metadata = await collect_experiment_metadata_safely(app.EXPERIMENTATION_PROVIDER)
+                    if experiment_metadata:
+                        new_metadata.update(experiment_metadata)
 
                 new_tags: list[str] = tags or []
                 new_tags.append(SettingsManager.get_settings().ENV)
@@ -90,3 +97,13 @@ class TraceManager:
     @staticmethod
     def set_trace_provider(trace_provider: BaseTrace) -> None:
         TraceManager.__instance = trace_provider
+
+    @staticmethod
+    def add_task_completion_tag(status: str) -> None:
+        """Add a completion tag to the current trace based on task/workflow status."""
+        TraceManager.__instance.add_task_completion_tag(status)
+
+    @staticmethod
+    def add_experiment_metadata(experiment_data: dict[str, Any]) -> None:
+        """Add experiment metadata to the current trace."""
+        TraceManager.__instance.add_experiment_metadata(experiment_data)

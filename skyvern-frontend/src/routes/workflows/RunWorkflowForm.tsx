@@ -38,18 +38,17 @@ import { KeyValueInput } from "@/components/KeyValueInput";
 import { toast } from "@/components/ui/use-toast";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useSyncFormFieldToStorage } from "@/hooks/useSyncFormFieldToStorage";
-import { useLocalStorageFormDefault } from "@/hooks/useLocalStorageFormDefault";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
-import { apiBaseUrl, lsKeys } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 
 // Utility function to omit specified keys from an object
 function omit<T extends Record<string, unknown>, K extends keyof T>(
@@ -168,6 +167,25 @@ function getRunWorkflowRequestBody(
   return body;
 }
 
+// Transform RunWorkflowRequestBody to match WorkflowRunRequest schema for Runs API v2
+function transformToWorkflowRunRequest(
+  body: RunWorkflowRequestBody,
+  workflowId: string,
+) {
+  const { data, webhook_callback_url, ...rest } = body;
+  const transformed: Record<string, unknown> = {
+    workflow_id: workflowId,
+    parameters: data,
+    ...rest,
+  };
+
+  if (webhook_callback_url) {
+    transformed.webhook_url = webhook_callback_url;
+  }
+
+  return transformed;
+}
+
 type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
@@ -188,10 +206,6 @@ function RunWorkflowForm({
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const browserSessionIdDefault = useLocalStorageFormDefault(
-    lsKeys.browserSessionId,
-    (initialValues.browserSessionId as string | undefined) ?? null,
-  );
   const apiCredential = useApiCredential();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
@@ -200,7 +214,7 @@ function RunWorkflowForm({
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation,
-      browserSessionId: browserSessionIdDefault,
+      browserSessionId: null,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -210,8 +224,6 @@ function RunWorkflowForm({
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
-
-  useSyncFormFieldToStorage(form, "browserSessionId", lsKeys.browserSessionId);
 
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
@@ -469,13 +481,37 @@ function RunWorkflowForm({
                     </FormLabel>
                     <div className="w-full space-y-2">
                       <FormControl>
-                        <Input
-                          {...field}
-                          placeholder="https://"
-                          value={
-                            field.value === null ? "" : (field.value as string)
-                          }
-                        />
+                        <div className="flex flex-col gap-2">
+                          <Input
+                            className="w-full"
+                            {...field}
+                            placeholder="https://"
+                            value={
+                              field.value === null
+                                ? ""
+                                : (field.value as string)
+                            }
+                          />
+                          <TestWebhookDialog
+                            runType="workflow_run"
+                            runId={null}
+                            initialWebhookUrl={
+                              field.value === null
+                                ? undefined
+                                : (field.value as string)
+                            }
+                            trigger={
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                className="self-start"
+                                disabled={!field.value}
+                              >
+                                Test Webhook
+                              </Button>
+                            }
+                          />
+                        </div>
                       </FormControl>
                       <FormMessage />
                     </div>
@@ -790,14 +826,22 @@ function RunWorkflowForm({
                 values,
                 workflowParameters,
               );
+              const transformedBody = transformToWorkflowRunRequest(
+                body,
+                workflowPermanentId,
+              );
+
+              // Build headers - x-max-steps-override is optional and can be added manually if needed
+              const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                "x-api-key": apiCredential ?? "<your-api-key>",
+              };
+
               return {
                 method: "POST",
-                url: `${apiBaseUrl}/workflows/${workflowPermanentId}/run`,
-                body,
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
+                url: `${runsApiBaseUrl}/run/workflows`,
+                body: transformedBody,
+                headers,
               } satisfies ApiCommandOptions;
             }}
           />

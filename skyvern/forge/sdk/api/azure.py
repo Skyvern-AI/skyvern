@@ -1,3 +1,5 @@
+from typing import Self
+
 import structlog
 from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.keyvault.secrets.aio import SecretClient
@@ -9,24 +11,57 @@ LOG = structlog.get_logger()
 
 
 class AsyncAzureVaultClient:
-    def __init__(self, credential: ClientSecretCredential | DefaultAzureCredential):
+    def __init__(self, credential: ClientSecretCredential | DefaultAzureCredential) -> None:
         self.credential = credential
 
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: object
+    ) -> None:
+        await self.credential.close()
+
     async def get_secret(self, secret_name: str, vault_name: str) -> str | None:
+        secret_client = await self._get_secret_client(vault_name)
         try:
-            # Azure Key Vault URL format: https://<your-key-vault-name>.vault.azure.net
-            # Assuming the secret_name is actually the Key Vault URL and the secret name
-            # This needs to be clarified or passed as separate parameters
-            # For now, let's assume secret_name is the actual secret name and Key Vault URL is in settings.
-            key_vault_url = f"https://{vault_name}.vault.azure.net"  # Placeholder, adjust as needed
-            secret_client = SecretClient(vault_url=key_vault_url, credential=self.credential)
             secret = await secret_client.get_secret(secret_name)
             return secret.value
         except Exception as e:
             LOG.exception("Failed to get secret from Azure Key Vault.", secret_name=secret_name, error=e)
             return None
         finally:
-            await self.credential.close()
+            await secret_client.close()
+
+    async def create_or_update_secret(self, secret_name: str, secret_value: str, vault_name: str) -> str:
+        secret_client = await self._get_secret_client(vault_name)
+        try:
+            secret = await secret_client.set_secret(secret_name, secret_value)
+            return secret.name
+        except Exception as e:
+            LOG.exception("Failed to create secret from Azure Key Vault.", secret_name=secret_name, error=e)
+            raise e
+        finally:
+            await secret_client.close()
+
+    async def delete_secret(self, secret_name: str, vault_name: str) -> str:
+        secret_client = await self._get_secret_client(vault_name)
+        try:
+            secret = await secret_client.delete_secret(secret_name)
+            return secret.name
+        except Exception as e:
+            LOG.exception("Failed to delete secret from Azure Key Vault.", secret_name=secret_name, error=e)
+            raise e
+        finally:
+            await secret_client.close()
+
+    async def _get_secret_client(self, vault_name: str) -> SecretClient:
+        # Azure Key Vault URL format: https://<your-key-vault-name>.vault.azure.net
+        # Assuming the secret_name is actually the Key Vault URL and the secret name
+        # This needs to be clarified or passed as separate parameters
+        # For now, let's assume secret_name is the actual secret name and Key Vault URL is in settings.
+        key_vault_url = f"https://{vault_name}.vault.azure.net"  # Placeholder, adjust as needed
+        return SecretClient(vault_url=key_vault_url, credential=self.credential)
 
     async def close(self) -> None:
         await self.credential.close()

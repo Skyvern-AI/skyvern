@@ -112,7 +112,7 @@ async def _generate_field_names_with_llm(custom_field_actions: List[Dict[str, An
         template="generate-workflow-parameters", custom_field_actions=custom_field_actions
     )
 
-    response = await app.SECONDARY_LLM_API_HANDLER(prompt=prompt, prompt_name="generate-workflow-parameters")
+    response = await app.SCRIPT_GENERATION_LLM_API_HANDLER(prompt=prompt, prompt_name="generate-workflow-parameters")
 
     return GeneratedFieldMapping.model_validate(response)
 

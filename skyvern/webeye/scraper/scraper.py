@@ -20,6 +20,7 @@ from skyvern.exceptions import (
     ScrapingFailedBlankPage,
     UnknownElementTreeFormat,
 )
+from skyvern.experimentation.wait_utils import empty_page_retry_wait
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -36,10 +37,11 @@ ScrapeExcludeFunc = Callable[[Page, Frame], Awaitable[bool]]
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
     "alt",
-    "shape-description",  # for css shape
     "aria-checked",  # for option tag
     "aria-current",
+    "aria-disabled",
     "aria-label",
+    "aria-readonly",
     "aria-required",
     "aria-role",
     "aria-selected",  # for option tag
@@ -47,7 +49,6 @@ RESERVED_ATTRIBUTES = {
     "data-original-title",  # for bootstrap tooltip
     "data-ui",
     "disabled",  # for button
-    "aria-disabled",
     "for",
     "href",  # For a tags
     "maxlength",
@@ -57,6 +58,7 @@ RESERVED_ATTRIBUTES = {
     "readonly",
     "required",
     "selected",  # for option tag
+    "shape-description",  # for css shape
     "src",  # do we need this?
     "text-value",
     "title",
@@ -564,8 +566,8 @@ async def scrape_web_unsafe(
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
     if not elements and not support_empty_page:
-        LOG.warning("No elements found on the page, wait for 3 seconds and retry")
-        await asyncio.sleep(3)
+        LOG.warning("No elements found on the page, wait and retry")
+        await empty_page_retry_wait()
         elements, element_tree = await get_interactable_element_tree(page, scrape_exclude)
 
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
@@ -896,16 +898,23 @@ class IncrementalScrapePage(ElementTreeBuilder):
 
 def _should_keep_unique_id(element: dict) -> bool:
     # case where we shouldn't keep unique_id
-    # 1. not disable attr and no interactable
-    # 2. disable=false and intrecatable=false
+    # 1. no readonly attr and not disable attr and no interactable
+    # 2. readonly=false and disable=false and interactable=false
 
     attributes = element.get("attributes", {})
-    if "disabled" not in attributes and "aria-disabled" not in attributes:
+    if (
+        "disabled" not in attributes
+        and "aria-disabled" not in attributes
+        and "readonly" not in attributes
+        and "aria-readonly" not in attributes
+    ):
         return element.get("interactable", False)
 
     disabled = attributes.get("disabled")
     aria_disabled = attributes.get("aria-disabled")
-    if disabled or aria_disabled:
+    readonly = attributes.get("readonly")
+    aria_readonly = attributes.get("aria-readonly")
+    if disabled or aria_disabled or readonly or aria_readonly:
         return True
     return element.get("interactable", False)
 

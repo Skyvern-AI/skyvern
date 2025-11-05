@@ -1,17 +1,19 @@
+import { useParams } from "react-router-dom";
+import { Handle, NodeProps, Position } from "@xyflow/react";
+
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
-import { useState } from "react";
-import type { CodeBlockNode } from "./types";
-import { cn } from "@/util/utils";
-import { NodeHeader } from "../components/NodeHeader";
-import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { deepEqualStringArrays } from "@/util/equality";
+import { cn } from "@/util/utils";
+
+import type { CodeBlockNode } from "./types";
+import { NodeHeader } from "../components/NodeHeader";
 
 function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
-  const { updateNodeData } = useReactFlow();
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
@@ -21,10 +23,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    code: data.code,
-    parameterKeys: data.parameterKeys,
-  });
+  const update = useUpdate<CodeBlockNode["data"]>({ id, editable });
 
   return (
     <div>
@@ -64,26 +63,23 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
           <WorkflowBlockInputSet
             nodeId={id}
             onChange={(parameterKeys) => {
-              setInputs({
-                ...inputs,
-                parameterKeys: Array.from(parameterKeys),
-              });
-              updateNodeData(id, { parameterKeys: Array.from(parameterKeys) });
+              const newParameterKeys = Array.from(parameterKeys);
+              if (
+                !deepEqualStringArrays(data.parameterKeys, newParameterKeys)
+              ) {
+                update({ parameterKeys: newParameterKeys });
+              }
             }}
-            values={new Set(inputs.parameterKeys ?? [])}
+            values={new Set(data.parameterKeys ?? [])}
           />
         </div>
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Code Input</Label>
           <CodeEditor
             language="python"
-            value={inputs.code}
+            value={data.code}
             onChange={(value) => {
-              if (!data.editable) {
-                return;
-              }
-              setInputs({ ...inputs, code: value });
-              updateNodeData(id, { code: value });
+              update({ code: value });
             }}
             className="nopan"
             fontSize={8}

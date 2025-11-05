@@ -15,14 +15,7 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import { helpTooltips } from "../../helpContent";
 import { errorMappingExampleValue } from "../types";
@@ -37,10 +30,12 @@ import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
+import { DisableCache } from "../DisableCache";
+
 function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
@@ -53,27 +48,12 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    completeCriterion: data.completeCriterion,
-    terminateCriterion: data.terminateCriterion,
-    errorCodeMapping: data.errorCodeMapping,
-    model: data.model,
-  });
-
   const rerender = useRerender({ prefix: "accordian" });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
+  const update = useUpdate<ValidationNode["data"]>({ id, editable });
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -111,6 +91,17 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
             nodeId={id}
             totpIdentifier={null}
             totpUrl={null}
+            transmutations={{
+              blockTitle: "Validation",
+              self: "agent",
+              others: [
+                {
+                  label: "human",
+                  reason: "Convert to human validation",
+                  nodeName: "human_interaction",
+                },
+              ],
+            }}
             type={type}
           />
           <div className="space-y-2">
@@ -125,9 +116,9 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
             <WorkflowBlockInputTextarea
               nodeId={id}
               onChange={(value) => {
-                handleChange("completeCriterion", value);
+                update({ completeCriterion: value });
               }}
-              value={inputs.completeCriterion}
+              value={data.completeCriterion}
               className="nopan text-xs"
             />
           </div>
@@ -136,9 +127,9 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
             <WorkflowBlockInputTextarea
               nodeId={id}
               onChange={(value) => {
-                handleChange("terminateCriterion", value);
+                update({ terminateCriterion: value });
               }}
-              value={inputs.terminateCriterion}
+              value={data.terminateCriterion}
               className="nopan text-xs"
             />
           </div>
@@ -157,16 +148,16 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan mr-[1px] w-52 text-xs"
-                      value={inputs.model}
+                      value={data.model}
                       onChange={(value) => {
-                        handleChange("model", value);
+                        update({ model: value });
                       }}
                     />
                     <ParametersMultiSelect
                       availableOutputParameters={outputParameterKeys}
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
-                        updateNodeData(id, { parameterKeys });
+                        update({ parameterKeys });
                       }}
                     />
                   </div>
@@ -183,35 +174,34 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                         />
                       </div>
                       <Checkbox
-                        checked={inputs.errorCodeMapping !== "null"}
+                        checked={data.errorCodeMapping !== "null"}
                         disabled={!editable}
                         onCheckedChange={(checked) => {
                           if (!editable) {
                             return;
                           }
-                          handleChange(
-                            "errorCodeMapping",
-                            checked
+                          update({
+                            errorCodeMapping: checked
                               ? JSON.stringify(
                                   errorMappingExampleValue,
                                   null,
                                   2,
                                 )
                               : "null",
-                          );
+                          });
                         }}
                       />
                     </div>
-                    {inputs.errorCodeMapping !== "null" && (
+                    {data.errorCodeMapping !== "null" && (
                       <div>
                         <CodeEditor
                           language="json"
-                          value={inputs.errorCodeMapping}
+                          value={data.errorCodeMapping}
                           onChange={(value) => {
                             if (!editable) {
                               return;
                             }
-                            handleChange("errorCodeMapping", value);
+                            update({ errorCodeMapping: value });
                           }}
                           className="nopan"
                           fontSize={8}
@@ -238,11 +228,21 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                           if (!editable) {
                             return;
                           }
-                          updateNodeData(id, { continueOnFailure: checked });
+                          update({ continueOnFailure: checked });
                         }}
                       />
                     </div>
                   </div>
+                  <DisableCache
+                    disableCache={data.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      update({ cacheActions });
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      update({ disableCache });
+                    }}
+                  />
                 </div>
               </AccordionContent>
             </AccordionItem>

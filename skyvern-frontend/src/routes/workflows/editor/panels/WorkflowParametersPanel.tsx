@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { WorkflowParameterAddPanel } from "./WorkflowParameterAddPanel";
 import { ParametersState } from "../types";
 import { WorkflowParameterEditPanel } from "./WorkflowParameterEditPanel";
 import { MixerVerticalIcon, PlusIcon } from "@radix-ui/react-icons";
@@ -241,8 +240,8 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           }}
         >
           {operationPanelState.operation === "add" && (
-            <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
-              <WorkflowParameterAddPanel
+            <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 px-2 shadow-xl">
+              <WorkflowParameterEditPanel
                 type={operationPanelState.type}
                 onSave={(parameter) => {
                   setWorkflowParameters([...workflowParameters, parameter]);
@@ -265,7 +264,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           )}
           {operationPanelState.operation === "edit" &&
             operationPanelState.parameter && (
-              <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl">
+              <div className="w-80 rounded-xl border border-slate-700 bg-slate-950 p-5 px-2 shadow-xl">
                 <WorkflowParameterEditPanel
                   key={operationPanelState.parameter?.key}
                   type={operationPanelState.type}

@@ -790,10 +790,7 @@ function isInteractableInput(element, hoverStylesMap) {
   // "city", "state", "zip", "country"
   // That's the reason I (Kerem) removed the valid input types check
   var type = element.getAttribute("type")?.toLowerCase().trim() ?? "text";
-  return (
-    isHoverPointerElement(element, hoverStylesMap) ||
-    (!isReadonlyElement(element) && type !== "hidden")
-  );
+  return isHoverPointerElement(element, hoverStylesMap) || type !== "hidden";
 }
 
 function isValidCSSSelector(selector) {
@@ -916,7 +913,9 @@ function isInteractable(element, hoverStylesMap) {
 
   if (
     tagName === "li" &&
-    (className.includes("ui-menu-item") || className.includes("dropdown-item"))
+    (className.includes("ui-menu-item") ||
+      className.includes("dropdown-item") ||
+      className === "option")
   ) {
     return true;
   }
@@ -944,6 +943,7 @@ function isInteractable(element, hoverStylesMap) {
     return true;
   }
 
+  // FIXME: maybe we need to enable the pointer check for all elements?
   if (
     tagName === "div" ||
     tagName === "img" ||
@@ -958,7 +958,12 @@ function isInteractable(element, hoverStylesMap) {
     tagName === "h1" ||
     tagName === "h2" ||
     tagName === "h3" ||
-    tagName === "h4"
+    tagName === "h4" ||
+    // sometime it's a customized element like <my-login-button>, we should check pointer style
+    tagName.includes("button") ||
+    tagName.includes("select") ||
+    tagName.includes("option") ||
+    tagName.includes("textarea")
   ) {
     if (isHoverPointerElement(element, hoverStylesMap)) {
       return true;
@@ -1105,6 +1110,15 @@ const isReactSelectDropdown = (element) => {
     element.getAttribute("role") === "combobox"
   );
 };
+
+function isReadonlyInputDropdown(element) {
+  const className = element.className?.toString() ?? "";
+  return (
+    element.tagName.toLowerCase() === "input" &&
+    className.includes("custom-select") &&
+    isReadonlyElement(element)
+  );
+}
 
 function hasNgAttribute(element) {
   if (!element.attributes[Symbol.iterator]) {
@@ -1490,7 +1504,8 @@ async function buildElementObject(
       isAngularDropdown(element) ||
       isAngularMaterialDatePicker(element) ||
       isSelect2Dropdown(element) ||
-      isSelect2MultiChoice(element),
+      isSelect2MultiChoice(element) ||
+      isReadonlyInputDropdown(element),
   };
 
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
@@ -1533,9 +1548,13 @@ async function buildTreeFromBody(
   ) {
     window.GlobalSkyvernFrameIndex = frame_index;
   }
+  const maxElementNumber = 15000;
   const elementsAndResultArray = await buildElementTree(
     document.documentElement,
     frame,
+    false,
+    undefined,
+    maxElementNumber,
   );
   DomUtils.elementListCache = elementsAndResultArray[0];
   return elementsAndResultArray;
@@ -1546,6 +1565,7 @@ async function buildElementTree(
   frame,
   full_tree = false,
   hoverStylesMap = undefined,
+  maxElementNumber = 0,
 ) {
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
@@ -1567,6 +1587,13 @@ async function buildElementTree(
   ) {
     if (element === null) {
       _jsConsoleLog("get a null element");
+      return;
+    }
+
+    if (maxElementNumber > 0 && elements.length >= maxElementNumber) {
+      _jsConsoleWarn(
+        "Max element number reached, aborting the element tree building",
+      );
       return;
     }
 

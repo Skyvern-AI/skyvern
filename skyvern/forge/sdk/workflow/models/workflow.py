@@ -110,6 +110,7 @@ class WorkflowRunStatus(StrEnum):
     canceled = "canceled"
     timed_out = "timed_out"
     completed = "completed"
+    paused = "paused"
 
     def is_final(self) -> bool:
         return self in [
@@ -143,8 +144,10 @@ class WorkflowRun(BaseModel):
     run_with: str | None = None
     script_run: ScriptRunResponse | None = None
     job_id: str | None = None
+    depends_on_workflow_run_id: str | None = None
     sequential_key: str | None = None
     ai_fallback: bool | None = None
+    code_gen: bool | None = None
 
     queued_at: datetime | None = None
     started_at: datetime | None = None
@@ -198,3 +201,7 @@ class WorkflowRunResponseBase(BaseModel):
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
     errors: list[dict[str, Any]] | None = None
+
+
+class WorkflowRunWithWorkflowResponse(WorkflowRunResponseBase):
+    workflow: Workflow

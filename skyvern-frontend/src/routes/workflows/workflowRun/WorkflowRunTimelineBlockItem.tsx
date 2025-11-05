@@ -4,6 +4,12 @@ import {
   CubeIcon,
   ExternalLinkIcon,
 } from "@radix-ui/react-icons";
+import { useCallback } from "react";
+import { Link } from "react-router-dom";
+
+import { Status } from "@/api/types";
+import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import {
@@ -20,14 +26,11 @@ import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
-import { cn } from "@/util/utils";
-import { isTaskVariantBlock } from "../types/workflowTypes";
-import { Link } from "react-router-dom";
-import { useCallback } from "react";
-import { Status } from "@/api/types";
-import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { ThoughtCard } from "./ThoughtCard";
 import { ObserverThought } from "../types/workflowRunTypes";
+import { isTaskVariantBlock } from "../types/workflowTypes";
+import { WorkflowRunHumanInteraction } from "./WorkflowRunHumanInteraction";
+
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
   block: WorkflowRunBlock;
@@ -166,6 +169,10 @@ function WorkflowRunTimelineBlockItem({
           <div className="text-xs text-slate-400">{block.description}</div>
         ) : null}
       </div>
+
+      {block.block_type === "human_interaction" && (
+        <WorkflowRunHumanInteraction workflowRunBlock={block} />
+      )}
 
       {actions.map((action, index) => {
         return (

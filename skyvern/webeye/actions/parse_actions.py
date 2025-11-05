@@ -7,22 +7,26 @@ from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
 from skyvern.constants import SCROLL_AMOUNT_MULTIPLIER
-from skyvern.core.totp import poll_verification_code
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.services.otp_service import poll_otp_value
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     CheckboxAction,
     ClickAction,
+    ClickContext,
+    ClosePageAction,
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    GotoUrlAction,
     InputOrSelectContext,
     InputTextAction,
     KeypressAction,
@@ -94,7 +98,15 @@ def parse_action(
 
     if action_type == ActionType.CLICK:
         file_url = action["file_url"] if "file_url" in action else None
-        return ClickAction(**base_action_dict, file_url=file_url, download=action.get("download", False))
+        click_context = action.get("click_context", None)
+        if click_context:
+            click_context = ClickContext.model_validate(click_context)
+        return ClickAction(
+            **base_action_dict,
+            file_url=file_url,
+            download=action.get("download", False),
+            click_context=click_context,
+        )
 
     if action_type == ActionType.INPUT_TEXT:
         context_dict = action.get("context", {})
@@ -165,6 +177,9 @@ def parse_action(
 
     if action_type == ActionType.SOLVE_CAPTCHA:
         return SolveCaptchaAction(**base_action_dict)
+
+    if action_type == ActionType.CLOSE_PAGE:
+        return ClosePageAction(**base_action_dict)
 
     raise UnsupportedActionType(action_type=action_type)
 
@@ -763,6 +778,9 @@ async def generate_cua_fallback_actions(
     LOG.info("Fallback action response", action_response=action_response)
     skyvern_action_type = action_response.get("action")
     useful_information = action_response.get("useful_information")
+
+    # use 'other' action as fallback in the 'cua-fallback-action' prompt
+    # it can avoid LLM returning unreasonable actions, and fallback to use 'wait' action in agent instead
     action = WaitAction(
         seconds=5,
         reasoning=reasoning,
@@ -798,6 +816,54 @@ async def generate_cua_fallback_actions(
             reasoning=reasoning,
             intention=reasoning,
         )
+    elif skyvern_action_type == "get_magic_link":
+        if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+            LOG.info(
+                "Getting magic link for CUA",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                totp_verification_url=task.totp_verification_url,
+                totp_identifier=task.totp_identifier,
+            )
+            try:
+                otp_value = await poll_otp_value(
+                    organization_id=task.organization_id,
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    totp_verification_url=task.totp_verification_url,
+                    totp_identifier=task.totp_identifier,
+                )
+                if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
+                    raise NoTOTPVerificationCodeFound()
+                magic_link = otp_value.value
+                reasoning = reasoning or "Received magic link. Navigating to the magic link URL to verify the login"
+                action = GotoUrlAction(
+                    url=magic_link,
+                    reasoning=reasoning,
+                    intention=reasoning,
+                    is_magic_link=True,
+                )
+            except NoTOTPVerificationCodeFound:
+                reasoning_suffix = "No magic link found"
+                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+            except FailedToGetTOTPVerificationCode as e:
+                reasoning_suffix = f"Failed to get magic link. Reason: {e.reason}"
+                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+                action = TerminateAction(
+                    reasoning=reasoning,
+                    intention=reasoning,
+                )
+        else:
+            action = TerminateAction(
+                reasoning=reasoning,
+                intention=reasoning,
+            )
+
     elif skyvern_action_type == "get_verification_code":
         if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
             LOG.info(
@@ -809,13 +875,16 @@ async def generate_cua_fallback_actions(
                 totp_identifier=task.totp_identifier,
             )
             try:
-                verification_code = await poll_verification_code(
+                otp_value = await poll_otp_value(
                     organization_id=task.organization_id,
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,
                 )
+                if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
+                    raise NoTOTPVerificationCodeFound()
+                verification_code = otp_value.value
                 reasoning = reasoning or f"Received verification code: {verification_code}"
                 action = VerificationCodeAction(
                     verification_code=verification_code,

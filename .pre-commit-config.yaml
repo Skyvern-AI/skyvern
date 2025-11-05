@@ -17,13 +17,13 @@ repos:
     hooks:
       - id: check-python-version
         name: Check Python Version (3.11-3.13)
-        entry: python -c "import sys; assert (3,11) <= sys.version_info[:2] <= (3,13), f'Python {sys.version_info[:2]} not supported. Use Python 3.11-3.13'"
+        entry: uv run python -c "import sys; assert (3,11) <= sys.version_info[:2] <= (3,13), f'Python {sys.version_info[:2]} not supported. Use Python 3.11-3.13'"
         language: system
         pass_filenames: false
         always_run: true
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.12.1
+    rev: v0.14.1
     hooks:
       # Run the linter.
       - id: ruff
@@ -35,7 +35,7 @@ repos:
       # Run the formatter.
       - id: ruff-format
   - repo: https://github.com/pycqa/isort
-    rev: 6.0.1
+    rev: 7.0.0
     hooks:
       - id: isort
         language_version: python3
@@ -52,7 +52,7 @@ repos:
       - id: python-no-log-warn
       - id: python-use-type-annotations
   - repo: https://github.com/asottile/pyupgrade
-    rev: v3.20.0
+    rev: v3.21.0
     hooks:
       - id: pyupgrade
         exclude: |
@@ -60,7 +60,7 @@ repos:
           ^skyvern/client/.*
           )
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.16.1
+    rev: v1.18.2
     hooks:
       - id: mypy
         args: [--show-error-codes, --warn-unused-configs, --disallow-untyped-calls, --disallow-untyped-defs, --disallow-incomplete-defs, --check-untyped-defs]
@@ -71,6 +71,8 @@ repos:
           - alembic
           - 'sqlalchemy[mypy]'
           - types-PyYAML
+          - types-toml
+          - types-redis
           - types-aiofiles
         exclude: |
           (?x)(
@@ -105,6 +107,12 @@ repos:
         types: [javascript]
   - repo: local
     hooks:
+      - id: frontend-precommit
+        name: Frontend Precommit (lint-staged)
+        entry: bash -c 'cd skyvern-frontend && npm run precommit'
+        language: system
+        files: ^skyvern-frontend/src/
+        pass_filenames: false
       - id: vitest-type-check
         name: vitest
         entry: bash -c 'cd skyvern-frontend && ([ -d node_modules ] || npm ci) && npm run test'

@@ -8,6 +8,7 @@ import { InboxIcon } from "@/components/icons/InboxIcon";
 import { MessageIcon } from "@/components/icons/MessageIcon";
 import { TrophyIcon } from "@/components/icons/TrophyIcon";
 import { ProxySelector } from "@/components/ProxySelector";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import {
@@ -29,6 +30,7 @@ import {
   PaperPlaneIcon,
   Pencil1Icon,
   ReloadIcon,
+  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
@@ -44,6 +46,7 @@ import {
   MAX_STEPS_DEFAULT,
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 
 const exampleCases = [
   {
@@ -109,7 +112,9 @@ const exampleCases = [
 function PromptBox() {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState<"v1" | "v2">("v2"); // Observer is the default
+  const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">(
+    "v2-code",
+  ); // v2-code is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
@@ -133,8 +138,48 @@ function PromptBox() {
   const { setAutoplay } = useAutoplayStore();
 
   const generateWorkflowMutation = useMutation({
-    mutationFn: async (prompt: string) => {
+    mutationFn: async ({
+      prompt,
+      version,
+    }: {
+      prompt: string;
+      version: string;
+    }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
+      const v = version === "v1" ? "v1" : "v2";
+
+      const request: Record<string, unknown> = {
+        user_prompt: prompt,
+        webhook_callback_url: webhookCallbackUrl,
+        proxy_location: proxyLocation,
+        totp_identifier: totpIdentifier,
+        max_screenshot_scrolls: maxScreenshotScrolls,
+        publish_workflow: publishWorkflow,
+        run_with: "code",
+        ai_fallback: true,
+        extracted_information_schema: dataSchema
+          ? (() => {
+              try {
+                return JSON.parse(dataSchema);
+              } catch (e) {
+                return dataSchema;
+              }
+            })()
+          : null,
+        extra_http_headers: extraHttpHeaders
+          ? (() => {
+              try {
+                return JSON.parse(extraHttpHeaders);
+              } catch (e) {
+                return extraHttpHeaders;
+              }
+            })()
+          : null,
+      };
+
+      if (v === "v1") {
+        request.url = "https://google.com"; // a stand-in value; real url is generated via prompt
+      }
 
       const result = await client.post<
         Createv2TaskRequest,
@@ -142,29 +187,8 @@ function PromptBox() {
       >(
         "/workflows/create-from-prompt",
         {
-          user_prompt: prompt,
-          webhook_callback_url: webhookCallbackUrl,
-          proxy_location: proxyLocation,
-          totp_identifier: totpIdentifier,
-          max_screenshot_scrolls: maxScreenshotScrolls,
-          extracted_information_schema: dataSchema
-            ? (() => {
-                try {
-                  return JSON.parse(dataSchema);
-                } catch (e) {
-                  return dataSchema;
-                }
-              })()
-            : null,
-          extra_http_headers: extraHttpHeaders
-            ? (() => {
-                try {
-                  return JSON.parse(extraHttpHeaders);
-                } catch (e) {
-                  return extraHttpHeaders;
-                }
-              })()
-            : null,
+          task_version: v,
+          request,
         },
         {
           headers: {
@@ -225,12 +249,26 @@ function PromptBox() {
               />
               <Select
                 value={selectValue}
-                onValueChange={(value: "v1" | "v2") => {
+                onValueChange={(value: "v1" | "v2" | "v2-code") => {
                   setSelectValue(value);
                 }}
               >
                 <SelectTrigger className="w-48 focus:ring-0">
-                  <SelectValue />
+                  {selectValue === "v2-code" ? (
+                    <div className="relative z-10 flex w-full flex-col items-center">
+                      <div className="flex items-center gap-1">
+                        <LightningBoltIcon className="size-4 shrink-0 text-yellow-400" />
+                        <div className="font-normal text-white">
+                          Skyvern 2.0
+                        </div>
+                      </div>
+                      <div className="self-start pl-7 text-xs font-semibold text-yellow-400">
+                        with code
+                      </div>
+                    </div>
+                  ) : (
+                    <SelectValue className="relative z-10" />
+                  )}
                 </SelectTrigger>
                 <SelectContent className="border-slate-500 bg-slate-elevation3">
                   <CustomSelectItem value="v1">
@@ -250,6 +288,25 @@ function PromptBox() {
                       </div>
                       <div className="text-xs text-slate-400">
                         Best for complex tasks
+                      </div>
+                    </div>
+                  </CustomSelectItem>
+                  <CustomSelectItem
+                    value="v2-code"
+                    className="relative overflow-hidden border-2 border-yellow-500/50 bg-gradient-to-r from-yellow-500/10 via-yellow-400/10 to-amber-400/10 hover:bg-slate-800"
+                  >
+                    <div className="animate-shimmer absolute inset-0 bg-gradient-to-r from-transparent via-yellow-400/20 to-transparent" />
+                    <div className="relative flex items-center gap-2 space-y-2">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <SelectItemText className="animate-pulse bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text font-bold text-transparent">
+                            Skyvern 2.0
+                          </SelectItemText>
+                          <LightningBoltIcon className="size-4 animate-bounce text-yellow-400" />
+                        </div>
+                        <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text text-xs font-semibold text-transparent">
+                          with code
+                        </div>
                       </div>
                     </div>
                   </CustomSelectItem>
@@ -274,7 +331,10 @@ function PromptBox() {
                       <PaperPlaneIcon
                         className="size-6 cursor-pointer"
                         onClick={async () => {
-                          generateWorkflowMutation.mutate(prompt);
+                          generateWorkflowMutation.mutate({
+                            prompt,
+                            version: selectValue,
+                          });
                         }}
                       />
                     )}
@@ -294,12 +354,30 @@ function PromptBox() {
                         information
                       </div>
                     </div>
-                    <Input
-                      value={webhookCallbackUrl ?? ""}
-                      onChange={(event) => {
-                        setWebhookCallbackUrl(event.target.value);
-                      }}
-                    />
+                    <div className="flex flex-col gap-2">
+                      <Input
+                        className="w-full"
+                        value={webhookCallbackUrl ?? ""}
+                        onChange={(event) => {
+                          setWebhookCallbackUrl(event.target.value);
+                        }}
+                      />
+                      <TestWebhookDialog
+                        runType="task"
+                        runId={null}
+                        initialWebhookUrl={webhookCallbackUrl ?? undefined}
+                        trigger={
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            className="self-start"
+                            disabled={!webhookCallbackUrl}
+                          >
+                            Test Webhook
+                          </Button>
+                        }
+                      />
+                    </div>
                   </div>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
@@ -475,7 +553,10 @@ function PromptBox() {
               icon={example.icon}
               label={example.label}
               onClick={() => {
-                generateWorkflowMutation.mutate(example.prompt);
+                generateWorkflowMutation.mutate({
+                  prompt: example.prompt,
+                  version: "v2",
+                });
               }}
             />
           );

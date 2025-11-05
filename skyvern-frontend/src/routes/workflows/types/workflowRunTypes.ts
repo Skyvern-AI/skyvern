@@ -58,6 +58,11 @@ export type WorkflowRunBlock = {
   // for blocks in loop
   current_value: string | null;
   current_index: number | null;
+
+  // human interaction block
+  instructions?: string | null;
+  positive_descriptor?: string | null;
+  negative_descriptor?: string | null;
 };
 
 export type WorkflowRunTimelineBlockItem = {

@@ -15,6 +15,11 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_HEADERS = {"authorization", "cookie", "x-api-key"}
+_SENSITIVE_ENDPOINTS = {
+    "POST /api/v1/credentials",
+    "POST /v1/credentials/onepassword/create",
+    "POST /v1/credentials/azure_credential/create",
+}
 _MAX_BODY_LENGTH = 1000
 _BINARY_PLACEHOLDER = "<binary>"
 
@@ -28,7 +33,9 @@ def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
     return sanitized
 
 
-def _sanitize_body(body: bytes, content_type: str | None) -> str:
+def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
+    if f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS:
+        return "****"
     if not body:
         return ""
     if content_type and not (content_type.startswith("text/") or content_type.startswith("application/json")):
@@ -53,14 +60,36 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
     except Exception:
         pass
 
+    url_path = request.url.path
+    http_method = request.method
     sanitized_headers = _sanitize_headers(dict(request.headers))
-    body_text = _sanitize_body(body_bytes, request.headers.get("content-type"))
+    body_text = _sanitize_body(request, body_bytes, request.headers.get("content-type"))
 
-    LOG.info(
-        "api.raw_request",
-        method=request.method,
-        path=request.url.path,
-        headers=sanitized_headers,
-        body=body_text,
-    )
-    return await call_next(request)
+    try:
+        response = await call_next(request)
+
+        if response.status_code >= 500:
+            log_method = LOG.error
+        elif response.status_code >= 400:
+            log_method = LOG.warning
+        else:
+            log_method = LOG.info
+        log_method(
+            "api.raw_request",
+            method=http_method,
+            path=url_path,
+            status_code=response.status_code,
+            body=body_text,
+            headers=sanitized_headers,
+        )
+        return response
+    except Exception:
+        LOG.error(
+            "api.raw_request",
+            method=http_method,
+            path=url_path,
+            body=body_text,
+            headers=sanitized_headers,
+            exc_info=True,
+        )
+        raise

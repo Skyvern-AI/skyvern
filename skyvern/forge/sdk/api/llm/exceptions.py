@@ -1,5 +1,9 @@
 from skyvern.exceptions import SkyvernException
 
+# Exception type name constants
+LLM_PROVIDER_ERROR_TYPE = "LLMProviderError"
+LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE = "LLMProviderErrorRetryableTask"
+
 
 class BaseLLMError(SkyvernException):
     pass

@@ -1,10 +1,25 @@
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
 from skyvern.schemas.runs import ProxyLocation
 
-FINAL_STATUSES = ("completed", "failed")
+
+class PersistentBrowserSessionStatus(StrEnum):
+    created = "created"
+    running = "running"
+    failed = "failed"
+    completed = "completed"
+    timeout = "timeout"
+    retry = "retry"
+
+
+FINAL_STATUSES = (
+    PersistentBrowserSessionStatus.completed,
+    PersistentBrowserSessionStatus.failed,
+    PersistentBrowserSessionStatus.timeout,
+)
 
 
 def is_final_status(status: str | None) -> bool:

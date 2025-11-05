@@ -3,6 +3,7 @@ import {
   CreateTaskRequest,
   OrganizationApiResponse,
   ProxyLocation,
+  RunEngine,
 } from "@/api/types";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "@/components/ui/button";
@@ -21,9 +22,10 @@ import { KeyValueInput } from "@/components/KeyValueInput";
 import { useApiCredential } from "@/hooks/useApiCredential";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
-import { apiBaseUrl } from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import { CopyApiCommandDropdown } from "@/components/CopyApiCommandDropdown";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { ToastAction } from "@radix-ui/react-toast";
@@ -41,6 +43,7 @@ import {
 import { ProxySelector } from "@/components/ProxySelector";
 import { Switch } from "@/components/ui/switch";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 type Props = {
   initialValues: CreateNewTaskFormValues;
 };
@@ -527,11 +530,31 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         </FormLabel>
                         <div className="w-full">
                           <FormControl>
-                            <Input
-                              {...field}
-                              placeholder="https://"
-                              value={field.value === null ? "" : field.value}
-                            />
+                            <div className="flex flex-col gap-2">
+                              <Input
+                                className="w-full"
+                                {...field}
+                                placeholder="https://"
+                                value={field.value === null ? "" : field.value}
+                              />
+                              <TestWebhookDialog
+                                runType="task"
+                                runId={null}
+                                initialWebhookUrl={
+                                  field.value === null ? undefined : field.value
+                                }
+                                trigger={
+                                  <Button
+                                    type="button"
+                                    variant="secondary"
+                                    className="self-start"
+                                    disabled={!field.value}
+                                  >
+                                    Test Webhook
+                                  </Button>
+                                }
+                              />
+                            </div>
                           </FormControl>
                           <FormMessage />
                         </div>
@@ -733,17 +756,33 @@ function CreateNewTaskForm({ initialValues }: Props) {
 
         <div className="flex justify-end gap-3">
           <CopyApiCommandDropdown
-            getOptions={() =>
-              ({
+            getOptions={() => {
+              const formValues = form.getValues();
+              const includeOverrideHeader =
+                formValues.maxStepsOverride !== null &&
+                formValues.maxStepsOverride !== MAX_STEPS_DEFAULT;
+
+              const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                "x-api-key": apiCredential ?? "<your-api-key>",
+              };
+
+              if (includeOverrideHeader) {
+                headers["x-max-steps-override"] = String(
+                  formValues.maxStepsOverride,
+                );
+              }
+
+              return {
                 method: "POST",
-                url: `${apiBaseUrl}/tasks`,
-                body: createTaskRequestObject(form.getValues()),
-                headers: {
-                  "Content-Type": "application/json",
-                  "x-api-key": apiCredential ?? "<your-api-key>",
-                },
-              }) satisfies ApiCommandOptions
-            }
+                url: `${runsApiBaseUrl}/run/tasks`,
+                body: buildTaskRunPayload(
+                  createTaskRequestObject(formValues),
+                  RunEngine.SkyvernV1,
+                ),
+                headers,
+              } satisfies ApiCommandOptions;
+            }}
           />
           <Button type="submit" disabled={mutation.isPending}>
             {mutation.isPending && (

@@ -60,7 +60,12 @@ import {
   BITWARDEN_MASTER_PASSWORD_AWS_SECRET_KEY,
 } from "./constants";
 import { edgeTypes } from "./edges";
-import { AppNode, isWorkflowBlockNode, nodeTypes } from "./nodes";
+import {
+  AppNode,
+  isWorkflowBlockNode,
+  nodeTypes,
+  WorkflowBlockNode,
+} from "./nodes";
 import {
   ParametersState,
   parameterIsSkyvernCredential,
@@ -71,6 +76,7 @@ import {
 import "./reactFlowOverrideStyles.css";
 import {
   convertEchoParameters,
+  createNode,
   descendants,
   getAdditionalParametersForEmailBlock,
   getOrderedChildrenBlocks,
@@ -82,8 +88,6 @@ import {
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
-
-const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -278,7 +282,6 @@ function FlowRenderer({
   const parameters = useWorkflowParametersStore((state) => state.parameters);
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
-  const onNodesChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const flowIsConstrained = debugStore.isDebugMode;
 
   useEffect(() => {
@@ -294,7 +297,7 @@ function FlowRenderer({
   const workflowChangesStore = useWorkflowHasChangesStore();
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
-  const saveWorkflow = useWorkflowSave();
+  const saveWorkflow = useWorkflowSave({ status: "published" });
   useShouldNotifyWhenClosingTab(workflowChangesStore.hasChanges);
   const blocker = useBlocker(({ currentLocation, nextLocation }) => {
     return (
@@ -487,6 +490,30 @@ function FlowRenderer({
     doLayout(newNodesWithUpdatedParameters, newEdges);
   }
 
+  function transmuteNode(id: string, nodeType: string) {
+    const nodeToTransmute = nodes.find((node) => node.id === id);
+
+    if (!nodeToTransmute || !isWorkflowBlockNode(nodeToTransmute)) {
+      return;
+    }
+
+    const newNode = createNode(
+      { id: nodeToTransmute.id, parentId: nodeToTransmute.parentId },
+      nodeType as NonNullable<WorkflowBlockNode["type"]>,
+      nodeToTransmute.data.label,
+    );
+
+    const newNodes = nodes.map((node) => {
+      if (node.id === id) {
+        return newNode;
+      }
+      return node;
+    });
+
+    workflowChangesStore.setHasChanges(true);
+    doLayout(newNodes, edges);
+  }
+
   function toggleScript({
     id,
     label,
@@ -649,6 +676,8 @@ function FlowRenderer({
            */
           deleteNodeCallback: (id: string) =>
             setTimeout(() => deleteNode(id), 0),
+          transmuteNodeCallback: (id: string, nodeName: string) =>
+            setTimeout(() => transmuteNode(id, nodeName), 0),
           toggleScriptForNodeCallback: toggleScript,
         }}
       >
@@ -672,6 +701,7 @@ function FlowRenderer({
                 }
               }
             });
+
             if (dimensionChanges.length > 0) {
               doLayout(tempNodes, edges);
             }
@@ -687,20 +717,23 @@ function FlowRenderer({
               workflowChangesStore.setHasChanges(true);
             }
 
-            // only allow one update in _this_ render cycle
-            if (onNodesChangeTimeoutRef.current === null) {
-              onNodesChange(changes);
-              onNodesChangeTimeoutRef.current = setTimeout(() => {
-                onNodesChangeTimeoutRef.current = null;
-              }, 0);
-            } else {
-              // if we have an update in this render cycle already, then to
-              // prevent max recursion errors, defer the update to next render
-              // cycle
-              nextTick().then(() => {
-                onNodesChange(changes);
-              });
-            }
+            onNodesChange(changes);
+
+            // NOTE: should no longer be needed (woot!) - delete if true (want real-world testing first)
+            // // only allow one update in _this_ render cycle
+            // if (onNodesChangeTimeoutRef.current === null) {
+            //   onNodesChange(changes);
+            //   onNodesChangeTimeoutRef.current = setTimeout(() => {
+            //     onNodesChangeTimeoutRef.current = null;
+            //   }, 0);
+            // } else {
+            //   // if we have an update in this render cycle already, then to
+            //   // prevent max recursion errors, defer the update to next render
+            //   // cycle
+            //   nextTick().then(() => {
+            //     onNodesChange(changes);
+            //   });
+            // }
           }}
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}

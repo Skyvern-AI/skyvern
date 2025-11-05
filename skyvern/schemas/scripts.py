@@ -134,6 +134,9 @@ class ScriptBlock(BaseModel):
     script_revision_id: str
     script_block_label: str
     script_file_id: str | None = None
+    run_signature: str | None = None  # The function call code to execute this block
+    workflow_run_id: str | None = None
+    workflow_run_block_id: str | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None

@@ -11,7 +11,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Handle, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import { Handle, NodeProps, Position } from "@xyflow/react";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { MAX_STEPS_DEFAULT, type Taskv2Node } from "./types";
@@ -24,7 +24,10 @@ import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
+
+import { DisableCache } from "../DisableCache";
 
 function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
   const { editable, label } = data;
@@ -36,29 +39,12 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const script = blockScriptStore.scripts[label];
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const rerender = useRerender({ prefix: "accordian" });
-
-  const [inputs, setInputs] = useState({
-    prompt: data.prompt,
-    url: data.url,
-    totpVerificationUrl: data.totpVerificationUrl,
-    totpIdentifier: data.totpIdentifier,
-    maxSteps: data.maxSteps,
-    model: data.model,
-  });
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const update = useUpdate<Taskv2Node["data"]>({ id, editable });
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -93,11 +79,24 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
             blockLabel={label}
             editable={editable}
             nodeId={id}
-            totpIdentifier={inputs.totpIdentifier}
-            totpUrl={inputs.totpVerificationUrl}
+            totpIdentifier={data.totpIdentifier}
+            totpUrl={data.totpVerificationUrl}
             type="task_v2" // sic: the naming is not consistent
           />
           <div className="space-y-4">
+            <div className="space-y-2">
+              <Label className="text-xs text-slate-300">URL</Label>
+              <WorkflowBlockInputTextarea
+                canWriteTitle={true}
+                nodeId={id}
+                onChange={(value) => {
+                  update({ url: value });
+                }}
+                value={data.url}
+                placeholder={placeholders[type]["url"]}
+                className="nopan text-xs"
+              />
+            </div>
             <div className="space-y-2">
               <div className="flex justify-between">
                 <Label className="text-xs text-slate-300">Prompt</Label>
@@ -110,23 +109,10 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
               <WorkflowBlockInputTextarea
                 nodeId={id}
                 onChange={(value) => {
-                  handleChange("prompt", value);
+                  update({ prompt: value });
                 }}
-                value={inputs.prompt}
+                value={data.prompt}
                 placeholder={placeholders[type]["prompt"]}
-                className="nopan text-xs"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs text-slate-300">URL</Label>
-              <WorkflowBlockInputTextarea
-                canWriteTitle={true}
-                nodeId={id}
-                onChange={(value) => {
-                  handleChange("url", value);
-                }}
-                value={inputs.url}
-                placeholder={placeholders[type]["url"]}
                 className="nopan text-xs"
               />
             </div>
@@ -145,9 +131,9 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                 <div className="space-y-4">
                   <ModelSelector
                     className="nopan w-52 text-xs"
-                    value={inputs.model}
+                    value={data.model}
                     onChange={(value) => {
-                      handleChange("model", value);
+                      update({ model: value });
                     }}
                   />
                   <div className="space-y-2">
@@ -163,10 +149,24 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                       className="nopan text-xs"
                       value={data.maxSteps ?? MAX_STEPS_DEFAULT}
                       onChange={(event) => {
-                        handleChange("maxSteps", Number(event.target.value));
+                        update({
+                          maxSteps: Number(event.target.value),
+                        });
                       }}
                     />
                   </div>
+                  <Separator />
+                  <DisableCache
+                    disableCache={data.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      update({ cacheActions });
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      update({ disableCache });
+                    }}
+                  />
+                  <Separator />
                   <div className="space-y-2">
                     <div className="flex gap-2">
                       <Label className="text-xs text-slate-300">
@@ -179,9 +179,9 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpIdentifier", value);
+                        update({ totpIdentifier: value });
                       }}
-                      value={inputs.totpIdentifier ?? ""}
+                      value={data.totpIdentifier ?? ""}
                       placeholder={placeholders["navigation"]["totpIdentifier"]}
                       className="nopan text-xs"
                     />
@@ -198,9 +198,9 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                     <WorkflowBlockInputTextarea
                       nodeId={id}
                       onChange={(value) => {
-                        handleChange("totpVerificationUrl", value);
+                        update({ totpVerificationUrl: value });
                       }}
-                      value={inputs.totpVerificationUrl ?? ""}
+                      value={data.totpVerificationUrl ?? ""}
                       placeholder={placeholders["task"]["totpVerificationUrl"]}
                       className="nopan text-xs"
                     />

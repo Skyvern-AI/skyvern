@@ -26,6 +26,7 @@ export const Status = {
   TimedOut: "timed_out",
   Canceled: "canceled",
   Skipped: "skipped",
+  Paused: "paused",
 } as const;
 
 export type Status = (typeof Status)[keyof typeof Status];
@@ -43,6 +44,12 @@ export const ProxyLocation = {
   ResidentialZA: "RESIDENTIAL_ZA",
   ResidentialAR: "RESIDENTIAL_AR",
   ResidentialAU: "RESIDENTIAL_AU",
+  ResidentialBR: "RESIDENTIAL_BR",
+  ResidentialTR: "RESIDENTIAL_TR",
+  ResidentialCA: "RESIDENTIAL_CA",
+  ResidentialMX: "RESIDENTIAL_MX",
+  ResidentialIT: "RESIDENTIAL_IT",
+  ResidentialNL: "RESIDENTIAL_NL",
   ResidentialISP: "RESIDENTIAL_ISP",
   None: "NONE",
 } as const;
@@ -237,6 +244,8 @@ export const ActionTypes = {
   VerificationCode: "verification_code",
   Drag: "drag",
   LeftMouse: "left_mouse",
+  GotoUrl: "goto_url",
+  ClosePage: "close_page",
 } as const;
 
 export type ActionType = (typeof ActionTypes)[keyof typeof ActionTypes];
@@ -261,6 +270,8 @@ export const ReadableActionTypes: {
   verification_code: "Verification Code",
   drag: "Drag",
   left_mouse: "Left Mouse",
+  goto_url: "Goto URL",
+  close_page: "Close Page",
 };
 
 export type Option = {
@@ -386,6 +397,7 @@ export type ActionsApiResponse = {
   intention: string | null;
   response: string | null;
   created_by: string | null;
+  text: string | null;
 };
 
 export type TaskV2 = {
@@ -417,6 +429,7 @@ export type Createv2TaskRequest = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
+  totp_type: "authenticator" | "email" | "text" | "none";
 };
 
 export type CreditCardCredentialApiResponse = {
@@ -453,6 +466,7 @@ export type PasswordCredential = {
   username: string;
   password: string;
   totp: string | null;
+  totp_type: "authenticator" | "email" | "text" | "none";
 };
 
 export type CreditCardCredential = {
@@ -462,6 +476,35 @@ export type CreditCardCredential = {
   card_exp_year: string;
   card_brand: string;
   card_holder_name: string;
+};
+
+export const OtpType = {
+  Totp: "totp",
+  MagicLink: "magic_link",
+} as const;
+
+export type OtpType = (typeof OtpType)[keyof typeof OtpType];
+
+export type TotpCode = {
+  totp_code_id: string;
+  totp_identifier: string | null;
+  code: string;
+  content: string;
+  workflow_run_id: string | null;
+  workflow_id: string | null;
+  task_id: string | null;
+  source: string | null;
+  otp_type: OtpType | null;
+  expired_at: string | null;
+  created_at: string;
+  modified_at: string;
+};
+
+export type TotpCodeListParams = {
+  totp_identifier?: string;
+  workflow_run_id?: string;
+  otp_type?: OtpType;
+  limit?: number;
 };
 
 export type ModelsResponse = {
@@ -480,3 +523,5 @@ export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
 export type PylonEmailHash = {
   hash: string;
 };
+
+export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;

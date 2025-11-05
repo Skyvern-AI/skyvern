@@ -1,6 +1,7 @@
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Awaitable, Callable
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 import structlog
 from fastapi import FastAPI, Response, status
@@ -19,6 +20,7 @@ from skyvern.forge.request_logging import log_raw_request_middleware
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 
 LOG = structlog.get_logger()
@@ -41,12 +43,32 @@ def custom_openapi() -> dict:
         routes=app.routes,
     )
     openapi_schema["servers"] = [
-        {"url": "https://api.skyvern.com", "x-fern-server-name": "Production"},
+        {"url": "https://api.skyvern.com", "x-fern-server-name": "Cloud"},
         {"url": "https://api-staging.skyvern.com", "x-fern-server-name": "Staging"},
-        {"url": "http://localhost:8000", "x-fern-server-name": "Development"},
+        {"url": "http://localhost:8000", "x-fern-server-name": "Local"},
     ]
     app.openapi_schema = openapi_schema
     return app.openapi_schema
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, Any]:
+    """Lifespan context manager for FastAPI app startup and shutdown."""
+    LOG.info("Server started")
+    if forge_app.api_app_startup_event:
+        LOG.info("Calling api app startup event")
+        try:
+            await forge_app.api_app_startup_event()
+        except Exception:
+            LOG.exception("Failed to execute api app startup event")
+    yield
+    if forge_app.api_app_shutdown_event:
+        LOG.info("Calling api app shutdown event")
+        try:
+            await forge_app.api_app_shutdown_event()
+        except Exception:
+            LOG.exception("Failed to execute api app shutdown event")
+    LOG.info("Server shutting down")
 
 
 def get_agent_app() -> FastAPI:
@@ -54,7 +76,7 @@ def get_agent_app() -> FastAPI:
     Start the agent server.
     """
 
-    app = FastAPI()
+    app = FastAPI(lifespan=lifespan)
 
     # Add CORS middleware
     app.add_middleware(
@@ -68,6 +90,13 @@ def get_agent_app() -> FastAPI:
     app.include_router(base_router, prefix="/v1")
     app.include_router(legacy_base_router, prefix="/api/v1")
     app.include_router(legacy_v2_router, prefix="/api/v2")
+
+    # local dev endpoints
+    if settings.ENV == "local":
+        app.include_router(internal_auth.router, prefix="/v1")
+        app.include_router(internal_auth.router, prefix="/api/v1")
+        app.include_router(internal_auth.router, prefix="/api/v2")
+
     app.openapi = custom_openapi
 
     app.add_middleware(

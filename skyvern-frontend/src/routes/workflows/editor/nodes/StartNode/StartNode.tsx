@@ -1,4 +1,3 @@
-import { getClient } from "@/api/AxiosClient";
 import { Handle, Node, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { StartNode } from "./types";
 import {
@@ -16,16 +15,13 @@ import {
 } from "@/components/ui/select";
 import { useEffect, useState } from "react";
 import { ProxyLocation } from "@/api/types";
-import { useQuery } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
-import { ModelsResponse } from "@/api/types";
 import { ModelSelector } from "@/components/ModelSelector";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
@@ -41,73 +37,60 @@ import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { cn } from "@/util/utils";
+import { Button } from "@/components/ui/button";
+import { TestWebhookDialog } from "@/components/TestWebhookDialog";
+
+interface StartSettings {
+  webhookCallbackUrl: string;
+  proxyLocation: ProxyLocation;
+  persistBrowserSession: boolean;
+  model: WorkflowModel | null;
+  maxScreenshotScrollingTimes: number | null;
+  extraHttpHeaders: string | Record<string, unknown> | null;
+}
 
 function StartNode({ id, data }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
-  const credentialGetter = useCredentialGetter();
-  const { updateNodeData } = useReactFlow();
   const reactFlowInstance = useReactFlow();
-
-  const { data: availableModels } = useQuery<ModelsResponse>({
-    queryKey: ["models"],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-
-      return client.get("/models").then((res) => res.data);
-    },
-  });
-
-  const modelNames = availableModels?.models ?? {};
-  const firstKey = Object.keys(modelNames)[0];
-  const workflowModel: WorkflowModel | null = firstKey
-    ? { model_name: modelNames[firstKey] || "" }
-    : null;
-
-  const [inputs, setInputs] = useState({
-    webhookCallbackUrl: data.withWorkflowSettings
-      ? data.webhookCallbackUrl
-      : "",
-    proxyLocation: data.withWorkflowSettings
-      ? data.proxyLocation
-      : ProxyLocation.Residential,
-    persistBrowserSession: data.withWorkflowSettings
-      ? data.persistBrowserSession
-      : false,
-    model: data.withWorkflowSettings ? data.model : workflowModel,
-    maxScreenshotScrolls: data.withWorkflowSettings
-      ? data.maxScreenshotScrolls
-      : null,
-    extraHttpHeaders: data.withWorkflowSettings ? data.extraHttpHeaders : null,
-    runWith: data.withWorkflowSettings ? data.runWith : "agent",
-    scriptCacheKey: data.withWorkflowSettings ? data.scriptCacheKey : null,
-    aiFallback: data.withWorkflowSettings ? data.aiFallback : true,
-    runSequentially: data.withWorkflowSettings ? data.runSequentially : false,
-    sequentialKey: data.withWorkflowSettings ? data.sequentialKey : null,
-  });
-
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
 
+  const makeStartSettings = (data: StartNode["data"]): StartSettings => {
+    return {
+      webhookCallbackUrl: data.withWorkflowSettings
+        ? data.webhookCallbackUrl
+        : "",
+      proxyLocation: data.withWorkflowSettings
+        ? data.proxyLocation
+        : ProxyLocation.Residential,
+      persistBrowserSession: data.withWorkflowSettings
+        ? data.persistBrowserSession
+        : false,
+      model: data.withWorkflowSettings ? data.model : null,
+      maxScreenshotScrollingTimes: data.withWorkflowSettings
+        ? data.maxScreenshotScrolls
+        : null,
+      extraHttpHeaders: data.withWorkflowSettings
+        ? data.extraHttpHeaders
+        : null,
+    };
+  };
+
+  const update = useUpdate<StartNode["data"]>({ id, editable: true });
+
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
   }, [data.showCode]);
 
   useEffect(() => {
-    workflowSettingsStore.setWorkflowSettings(inputs);
+    workflowSettingsStore.setWorkflowSettings(makeStartSettings(data));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inputs]);
-
-  function handleChange(key: string, value: unknown) {
-    if (!data.editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  }, [data]);
 
   function nodeIsFlippable(node: Node) {
     return (
@@ -178,9 +161,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                       <div className="space-y-2">
                         <ModelSelector
                           className="nopan w-52 text-xs"
-                          value={inputs.model}
+                          value={data.model}
                           onChange={(value) => {
-                            handleChange("model", value);
+                            update({ model: value });
                           }}
                         />
                       </div>
@@ -189,16 +172,35 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           <Label>Webhook Callback URL</Label>
                           <HelpTooltip content="The URL of a webhook endpoint to send the workflow results" />
                         </div>
-                        <Input
-                          value={inputs.webhookCallbackUrl}
-                          placeholder="https://"
-                          onChange={(event) => {
-                            handleChange(
-                              "webhookCallbackUrl",
-                              event.target.value,
-                            );
-                          }}
-                        />
+                        <div className="flex flex-col gap-2">
+                          <Input
+                            className="w-full"
+                            value={data.webhookCallbackUrl}
+                            placeholder="https://"
+                            onChange={(event) => {
+                              update({
+                                webhookCallbackUrl: event.target.value,
+                              });
+                            }}
+                          />
+                          <TestWebhookDialog
+                            runType="workflow_run"
+                            runId={null}
+                            initialWebhookUrl={
+                              data.webhookCallbackUrl || undefined
+                            }
+                            trigger={
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                className="self-start"
+                                disabled={!data.webhookCallbackUrl}
+                              >
+                                Test Webhook
+                              </Button>
+                            }
+                          />
+                        </div>
                       </div>
                       <div className="space-y-2">
                         <div className="flex gap-2">
@@ -206,9 +208,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           <HelpTooltip content="Route Skyvern through one of our available proxies." />
                         </div>
                         <ProxySelector
-                          value={inputs.proxyLocation}
+                          value={data.proxyLocation}
                           onChange={(value) => {
-                            handleChange("proxyLocation", value);
+                            update({ proxyLocation: value });
                           }}
                         />
                       </div>
@@ -220,16 +222,16 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
                             </div>
                             <Select
-                              value={inputs.runWith ?? "agent"}
+                              value={data.runWith ?? "agent"}
                               onValueChange={(value) => {
-                                handleChange("runWith", value);
+                                update({ runWith: value });
                               }}
                             >
                               <SelectTrigger className="w-48">
                                 <SelectValue placeholder="Run Method" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="ai">
+                                <SelectItem value="agent">
                                   Skyvern Agent
                                 </SelectItem>
                                 <SelectItem value="code">Code</SelectItem>
@@ -242,9 +244,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               <HelpTooltip content="If a run with code fails, fallback to AI and regenerate the code." />
                               <Switch
                                 className="ml-auto"
-                                checked={inputs.aiFallback}
+                                checked={data.aiFallback}
                                 onCheckedChange={(value) => {
-                                  handleChange("aiFallback", value);
+                                  update({ aiFallback: value });
                                 }}
                               />
                             </div>
@@ -258,9 +260,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               nodeId={id}
                               onChange={(value) => {
                                 const v = value.length ? value : null;
-                                handleChange("scriptCacheKey", v);
+                                update({ scriptCacheKey: v });
                               }}
-                              value={inputs.scriptCacheKey ?? ""}
+                              value={data.scriptCacheKey ?? ""}
                               placeholder={placeholders["scripts"]["scriptKey"]}
                               className="nopan text-xs"
                             />
@@ -275,14 +277,14 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                             <HelpTooltip content="Run the workflow in a sequential order" />
                             <Switch
                               className="ml-auto"
-                              checked={inputs.runSequentially}
+                              checked={data.runSequentially}
                               onCheckedChange={(value) => {
-                                handleChange("runSequentially", value);
+                                update({ runSequentially: value });
                               }}
                             />
                           </div>
                         </div>
-                        {inputs.runSequentially && (
+                        {data.runSequentially && (
                           <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
                             <div className="space-y-2">
                               <div className="flex gap-2">
@@ -293,9 +295,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                                 nodeId={id}
                                 onChange={(value) => {
                                   const v = value.length ? value : null;
-                                  handleChange("sequentialKey", v);
+                                  update({ sequentialKey: v });
                                 }}
-                                value={inputs.sequentialKey ?? ""}
+                                value={data.sequentialKey ?? ""}
                                 placeholder={placeholders["sequentialKey"]}
                                 className="nopan text-xs"
                               />
@@ -309,9 +311,9 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           <HelpTooltip content="Persist session information across workflow runs" />
                           <Switch
                             className="ml-auto"
-                            checked={inputs.persistBrowserSession}
+                            checked={data.persistBrowserSession}
                             onCheckedChange={(value) => {
-                              handleChange("persistBrowserSession", value);
+                              update({ persistBrowserSession: value });
                             }}
                           />
                         </div>
@@ -322,10 +324,28 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           <HelpTooltip content="Specify some self-defined HTTP requests headers" />
                         </div>
                         <KeyValueInput
-                          value={inputs.extraHttpHeaders ?? null}
-                          onChange={(val) =>
-                            handleChange("extraHttpHeaders", val)
+                          value={
+                            data.extraHttpHeaders &&
+                            typeof data.extraHttpHeaders === "object"
+                              ? JSON.stringify(data.extraHttpHeaders)
+                              : data.extraHttpHeaders ?? null
                           }
+                          onChange={(val) => {
+                            const v =
+                              val === null
+                                ? "{}"
+                                : typeof val === "string"
+                                  ? val.trim()
+                                  : JSON.stringify(val);
+
+                            const normalized = v === "" ? "{}" : v;
+
+                            if (normalized === data.extraHttpHeaders) {
+                              return;
+                            }
+
+                            update({ extraHttpHeaders: normalized });
+                          }}
                           addButtonText="Add Header"
                         />
                       </div>
@@ -337,7 +357,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           />
                         </div>
                         <Input
-                          value={inputs.maxScreenshotScrolls ?? ""}
+                          value={data.maxScreenshotScrolls ?? ""}
                           placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
                           onChange={(event) => {
                             const value =
@@ -345,7 +365,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                                 ? null
                                 : Number(event.target.value);
 
-                            handleChange("maxScreenshotScrolls", value);
+                            update({ maxScreenshotScrolls: value });
                           }}
                         />
                       </div>

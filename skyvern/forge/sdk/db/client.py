@@ -1,14 +1,15 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, List, Literal, Sequence, overload
 
 import structlog
-from sqlalchemy import and_, asc, case, delete, distinct, func, or_, pool, select, tuple_, update
+from sqlalchemy import and_, asc, case, delete, distinct, exists, func, or_, pool, select, tuple_, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from skyvern.config import settings
-from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
+from skyvern.exceptions import BrowserProfileNotFound, WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
     BlockRunModel,
+    BrowserProfileModel,
     CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
@@ -76,8 +78,9 @@ from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
-from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession
+from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
+from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession, DebugSessionRun
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
@@ -90,7 +93,7 @@ from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
-from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -172,6 +175,7 @@ class AgentDB:
         extra_http_headers: dict[str, str] | None = None,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
+        download_timeout: float | None = None,
     ) -> Task:
         try:
             async with self.Session() as session:
@@ -203,6 +207,7 @@ class AgentDB:
                     extra_http_headers=extra_http_headers,
                     browser_session_id=browser_session_id,
                     browser_address=browser_address,
+                    download_timeout=download_timeout,
                 )
                 session.add(new_task)
                 await session.commit()
@@ -574,7 +579,7 @@ class AgentDB:
                         step.status = status
 
                         if status.is_terminal() and step.finished_at is None:
-                            step.finished_at = datetime.now(timezone.utc)
+                            step.finished_at = datetime.utcnow()
                     if output is not None:
                         step.output = output.model_dump(exclude_none=True)
                     if is_last is not None:
@@ -890,7 +895,6 @@ class AgentDB:
         token_type: Literal["api", "onepassword_service_account", "azure_client_secret_credential"],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | None:
         try:
-            print("lol")
             async with self.Session() as session:
                 if token := (
                     await session.scalars(
@@ -1420,7 +1424,7 @@ class AgentDB:
                 status=status,
                 run_with=run_with,
                 ai_fallback=ai_fallback,
-                cache_key=cache_key,
+                cache_key=cache_key or DEFAULT_SCRIPT_RUN_ID,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
             )
@@ -1470,6 +1474,7 @@ class AgentDB:
         workflow_permanent_id: str,
         organization_id: str | None = None,
         version: int | None = None,
+        ignore_version: int | None = None,
         exclude_deleted: bool = True,
     ) -> Workflow | None:
         try:
@@ -1480,7 +1485,37 @@ class AgentDB:
                 get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
             if version:
                 get_workflow_query = get_workflow_query.filter_by(version=version)
+            if ignore_version:
+                get_workflow_query = get_workflow_query.filter(WorkflowModel.version != ignore_version)
             get_workflow_query = get_workflow_query.order_by(WorkflowModel.version.desc())
+            async with self.Session() as session:
+                if workflow := (await session.scalars(get_workflow_query)).first():
+                    return convert_to_workflow(workflow, self.debug_enabled)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_for_workflow_run(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        exclude_deleted: bool = True,
+    ) -> Workflow | None:
+        try:
+            get_workflow_query = select(WorkflowModel)
+
+            if exclude_deleted:
+                get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
+            if organization_id:
+                get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+
+            get_workflow_query = get_workflow_query.join(
+                WorkflowRunModel,
+                WorkflowRunModel.workflow_id == WorkflowModel.workflow_id,
+            )
+
+            get_workflow_query = get_workflow_query.filter(WorkflowRunModel.workflow_run_id == workflow_run_id)
             async with self.Session() as session:
                 if workflow := (await session.scalars(get_workflow_query)).first():
                     return convert_to_workflow(workflow, self.debug_enabled)
@@ -1569,11 +1604,17 @@ class AgentDB:
         page_size: int = 10,
         only_saved_tasks: bool = False,
         only_workflows: bool = False,
-        title: str = "",
+        search_key: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
+
+        Search semantics:
+        - If `search_key` is provided, its value is used as a unified search term for both
+          `workflows.title` and workflow parameter metadata (key, description, and default_value).
+        - If `search_key` is not provided, no search filtering is applied.
+        - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -1604,10 +1645,133 @@ class AgentDB:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(True))
                 elif only_workflows:
                     main_query = main_query.where(WorkflowModel.is_saved_task.is_(False))
-                if title:
-                    main_query = main_query.where(WorkflowModel.title.ilike(f"%{title}%"))
                 if statuses:
                     main_query = main_query.where(WorkflowModel.status.in_(statuses))
+                if search_key:
+                    search_like = f"%{search_key}%"
+                    title_like = WorkflowModel.title.ilike(search_like)
+
+                    parameter_filters = [
+                        # WorkflowParameterModel
+                        exists(
+                            select(1)
+                            .select_from(WorkflowParameterModel)
+                            .where(WorkflowParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(WorkflowParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    WorkflowParameterModel.key.ilike(search_like),
+                                    WorkflowParameterModel.description.ilike(search_like),
+                                    WorkflowParameterModel.default_value.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # OutputParameterModel
+                        exists(
+                            select(1)
+                            .select_from(OutputParameterModel)
+                            .where(OutputParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(OutputParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    OutputParameterModel.key.ilike(search_like),
+                                    OutputParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # AWSSecretParameterModel
+                        exists(
+                            select(1)
+                            .select_from(AWSSecretParameterModel)
+                            .where(AWSSecretParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(AWSSecretParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    AWSSecretParameterModel.key.ilike(search_like),
+                                    AWSSecretParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # BitwardenLoginCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenLoginCredentialParameterModel)
+                            .where(BitwardenLoginCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenLoginCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenLoginCredentialParameterModel.key.ilike(search_like),
+                                    BitwardenLoginCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # BitwardenSensitiveInformationParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenSensitiveInformationParameterModel)
+                            .where(BitwardenSensitiveInformationParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenSensitiveInformationParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenSensitiveInformationParameterModel.key.ilike(search_like),
+                                    BitwardenSensitiveInformationParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # BitwardenCreditCardDataParameterModel
+                        exists(
+                            select(1)
+                            .select_from(BitwardenCreditCardDataParameterModel)
+                            .where(BitwardenCreditCardDataParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(BitwardenCreditCardDataParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    BitwardenCreditCardDataParameterModel.key.ilike(search_like),
+                                    BitwardenCreditCardDataParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # OnePasswordCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(OnePasswordCredentialParameterModel)
+                            .where(OnePasswordCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(OnePasswordCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    OnePasswordCredentialParameterModel.key.ilike(search_like),
+                                    OnePasswordCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # AzureVaultCredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(AzureVaultCredentialParameterModel)
+                            .where(AzureVaultCredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(AzureVaultCredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    AzureVaultCredentialParameterModel.key.ilike(search_like),
+                                    AzureVaultCredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                        # CredentialParameterModel
+                        exists(
+                            select(1)
+                            .select_from(CredentialParameterModel)
+                            .where(CredentialParameterModel.workflow_id == WorkflowModel.workflow_id)
+                            .where(CredentialParameterModel.deleted_at.is_(None))
+                            .where(
+                                or_(
+                                    CredentialParameterModel.key.ilike(search_like),
+                                    CredentialParameterModel.description.ilike(search_like),
+                                )
+                            )
+                        ),
+                    ]
+                    main_query = main_query.where(or_(title_like, or_(*parameter_filters)))
                 main_query = (
                     main_query.order_by(WorkflowModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
                 )
@@ -1700,6 +1864,7 @@ class AgentDB:
         run_with: str | None = None,
         debug_session_id: str | None = None,
         ai_fallback: bool | None = None,
+        code_gen: bool | None = None,
     ) -> WorkflowRun:
         try:
             async with self.Session() as session:
@@ -1721,6 +1886,7 @@ class AgentDB:
                     run_with=run_with,
                     debug_session_id=debug_session_id,
                     ai_fallback=ai_fallback,
+                    code_gen=code_gen,
                 )
                 session.add(workflow_run)
                 await session.commit()
@@ -1741,6 +1907,8 @@ class AgentDB:
         run_with: str | None = None,
         sequential_key: str | None = None,
         ai_fallback: bool | None = None,
+        depends_on_workflow_run_id: str | None = None,
+        browser_session_id: str | None = None,
     ) -> WorkflowRun:
         async with self.Session() as session:
             workflow_run = (
@@ -1769,6 +1937,10 @@ class AgentDB:
                     workflow_run.sequential_key = sequential_key
                 if ai_fallback is not None:
                     workflow_run.ai_fallback = ai_fallback
+                if depends_on_workflow_run_id:
+                    workflow_run.depends_on_workflow_run_id = depends_on_workflow_run_id
+                if browser_session_id:
+                    workflow_run.browser_session_id = browser_session_id
                 await session.commit()
                 await session.refresh(workflow_run)
                 await save_workflow_run_logs(workflow_run_id)
@@ -1776,8 +1948,30 @@ class AgentDB:
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
 
+    async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:
+        async with self.Session() as session:
+            workflow_run = (
+                await session.scalars(
+                    select(WorkflowRunModel)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run:
+                workflow_run.failure_reason = None
+                await session.commit()
+                await session.refresh(workflow_run)
+                return convert_to_workflow_run(workflow_run)
+            else:
+                raise NotFoundError("Workflow run not found")
+
     async def get_all_runs(
-        self, organization_id: str, page: int = 1, page_size: int = 10, status: list[WorkflowRunStatus] | None = None
+        self,
+        organization_id: str,
+        page: int = 1,
+        page_size: int = 10,
+        status: list[WorkflowRunStatus] | None = None,
+        include_debugger_runs: bool = False,
     ) -> list[WorkflowRun | Task]:
         try:
             async with self.Session() as session:
@@ -1793,6 +1987,10 @@ class AgentDB:
                     .filter(WorkflowRunModel.organization_id == organization_id)
                     .filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
                 )
+
+                if not include_debugger_runs:
+                    workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
+
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
                 workflow_run_query = workflow_run_query.order_by(WorkflowRunModel.created_at.desc()).limit(limit)
@@ -1826,12 +2024,22 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
+    async def get_workflow_run(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        job_id: str | None = None,
+        status: WorkflowRunStatus | None = None,
+    ) -> WorkflowRun | None:
         try:
             async with self.Session() as session:
                 get_workflow_run_query = select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id)
                 if organization_id:
                     get_workflow_run_query = get_workflow_run_query.filter_by(organization_id=organization_id)
+                if job_id:
+                    get_workflow_run_query = get_workflow_run_query.filter_by(job_id=job_id)
+                if status:
+                    get_workflow_run_query = get_workflow_run_query.filter_by(status=status.value)
                 if workflow_run := (await session.scalars(get_workflow_run_query)).first():
                     return convert_to_workflow_run(workflow_run)
                 return None
@@ -1856,6 +2064,25 @@ class AgentDB:
                 query = query.order_by(WorkflowRunModel.modified_at.desc())
                 workflow_run = (await session.scalars(query)).first()
                 return convert_to_workflow_run(workflow_run) if workflow_run else None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflow_runs_by_ids(
+        self,
+        workflow_run_ids: list[str],
+        workflow_permanent_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> list[WorkflowRun]:
+        try:
+            async with self.Session() as session:
+                query = select(WorkflowRunModel).filter(WorkflowRunModel.workflow_run_id.in_(workflow_run_ids))
+                if workflow_permanent_id:
+                    query = query.filter_by(workflow_permanent_id=workflow_permanent_id)
+                if organization_id:
+                    query = query.filter_by(organization_id=organization_id)
+                workflow_runs = (await session.scalars(query)).all()
+                return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
@@ -1964,7 +2191,11 @@ class AgentDB:
         page: int = 1,
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
+        search_key: str | None = None,
     ) -> list[WorkflowRun]:
+        """
+        Get runs for a workflow, with optional `search_key` on parameter key/description/value.
+        """
         try:
             async with self.Session() as session:
                 db_page = page - 1  # offset logic is 0 based
@@ -1974,6 +2205,29 @@ class AgentDB:
                     .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
                     .filter(WorkflowRunModel.organization_id == organization_id)
                 )
+                if search_key:
+                    key_like = f"%{search_key}%"
+                    # Filter runs where any run parameter matches by key/description/value
+                    # Use EXISTS to avoid duplicate rows and to keep pagination correct
+                    param_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .join(
+                            WorkflowParameterModel,
+                            WorkflowParameterModel.workflow_parameter_id
+                            == WorkflowRunParameterModel.workflow_parameter_id,
+                        )
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowParameterModel.deleted_at.is_(None))
+                        .where(
+                            or_(
+                                WorkflowParameterModel.key.ilike(key_like),
+                                WorkflowParameterModel.description.ilike(key_like),
+                                WorkflowRunParameterModel.value.ilike(key_like),
+                            )
+                        )
+                    )
+                    query = query.where(param_exists)
                 if status:
                     query = query.filter(WorkflowRunModel.status.in_(status))
                 query = query.order_by(WorkflowRunModel.created_at.desc()).limit(page_size).offset(db_page * page_size)
@@ -2586,18 +2840,23 @@ class AgentDB:
                 return None
             return TaskGeneration.model_validate(task_generation)
 
-    async def get_totp_codes(
+    async def get_otp_codes(
         self,
         organization_id: str,
         totp_identifier: str,
         valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        otp_type: OTPType | None = None,
+        workflow_run_id: str | None = None,
+        limit: int | None = None,
     ) -> list[TOTPCode]:
         """
         1. filter by:
         - organization_id
         - totp_identifier
+        - workflow_run_id (optional)
         2. make sure created_at is within the valid lifespan
         3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
+        4. apply an optional limit at the DB layer
         """
         all_null = and_(
             TOTPCodeModel.task_id.is_(None),
@@ -2610,17 +2869,55 @@ class AgentDB:
                 .filter_by(organization_id=organization_id)
                 .filter_by(totp_identifier=totp_identifier)
                 .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-                .order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             )
+            if otp_type:
+                query = query.filter(TOTPCodeModel.otp_type == otp_type)
+            if workflow_run_id is not None:
+                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
+            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc())
+            if limit is not None:
+                query = query.limit(limit)
             totp_code = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_code]
 
-    async def create_totp_code(
+    async def get_recent_otp_codes(
+        self,
+        organization_id: str,
+        limit: int = 50,
+        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        otp_type: OTPType | None = None,
+        workflow_run_id: str | None = None,
+    ) -> list[TOTPCode]:
+        """
+        Return recent otp codes for an organization ordered by newest first with optional
+        workflow_run_id filtering.
+        """
+        all_null = and_(
+            TOTPCodeModel.task_id.is_(None),
+            TOTPCodeModel.workflow_id.is_(None),
+            TOTPCodeModel.workflow_run_id.is_(None),
+        )
+        async with self.Session() as session:
+            query = (
+                select(TOTPCodeModel)
+                .filter_by(organization_id=organization_id)
+                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
+            )
+            if otp_type:
+                query = query.filter(TOTPCodeModel.otp_type == otp_type)
+            if workflow_run_id is not None:
+                query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
+            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc()).limit(limit)
+            totp_codes = (await session.scalars(query)).all()
+            return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
+
+    async def create_otp_code(
         self,
         organization_id: str,
         totp_identifier: str,
         content: str,
         code: str,
+        otp_type: OTPType,
         task_id: str | None = None,
         workflow_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -2638,6 +2935,7 @@ class AgentDB:
                 workflow_run_id=workflow_run_id,
                 source=source,
                 expired_at=expired_at,
+                otp_type=otp_type,
             )
             session.add(new_totp_code)
             await session.commit()
@@ -2670,6 +2968,25 @@ class AgentDB:
             await session.commit()
             await session.refresh(new_action)
             return Action.model_validate(new_action)
+
+    async def update_action_reasoning(
+        self,
+        organization_id: str,
+        action_id: str,
+        reasoning: str,
+    ) -> Action:
+        async with self.Session() as session:
+            action = (
+                await session.scalars(
+                    select(ActionModel).filter_by(action_id=action_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if action:
+                action.reasoning = reasoning
+                await session.commit()
+                await session.refresh(action)
+                return Action.model_validate(action)
+            raise NotFoundError(f"Action {action_id}")
 
     async def retrieve_action_plan(self, task: Task) -> list[Action]:
         async with self.Session() as session:
@@ -3061,6 +3378,10 @@ class AgentDB:
         http_request_timeout: int | None = None,
         http_request_follow_redirects: bool | None = None,
         ai_fallback_triggered: bool | None = None,
+        # human interaction block
+        instructions: str | None = None,
+        positive_descriptor: str | None = None,
+        negative_descriptor: str | None = None,
     ) -> WorkflowRunBlock:
         async with self.Session() as session:
             workflow_run_block = (
@@ -3120,6 +3441,13 @@ class AgentDB:
                     workflow_run_block.http_request_follow_redirects = http_request_follow_redirects
                 if ai_fallback_triggered is not None:
                     workflow_run_block.script_run = {"ai_fallback_triggered": ai_fallback_triggered}
+                # human interaction block fields
+                if instructions:
+                    workflow_run_block.instructions = instructions
+                if positive_descriptor:
+                    workflow_run_block.positive_descriptor = positive_descriptor
+                if negative_descriptor:
+                    workflow_run_block.negative_descriptor = negative_descriptor
                 await session.commit()
                 await session.refresh(workflow_run_block)
             else:
@@ -3190,6 +3518,89 @@ class AgentDB:
                 convert_to_workflow_run_block(workflow_run_block, task=tasks_dict.get(workflow_run_block.task_id))
                 for workflow_run_block in workflow_run_blocks
             ]
+
+    async def create_browser_profile(
+        self,
+        organization_id: str,
+        name: str,
+        description: str | None = None,
+    ) -> BrowserProfile:
+        try:
+            async with self.Session() as session:
+                browser_profile = BrowserProfileModel(
+                    organization_id=organization_id,
+                    name=name,
+                    description=description,
+                )
+                session.add(browser_profile)
+                await session.commit()
+                await session.refresh(browser_profile)
+                return BrowserProfile.model_validate(browser_profile)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in create_browser_profile", exc_info=True)
+            raise
+
+    async def get_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+        include_deleted: bool = False,
+    ) -> BrowserProfile | None:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=profile_id)
+                    .filter_by(organization_id=organization_id)
+                )
+                if not include_deleted:
+                    query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+
+                browser_profile = (await session.scalars(query)).first()
+                if not browser_profile:
+                    return None
+                return BrowserProfile.model_validate(browser_profile)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_browser_profile", exc_info=True)
+            raise
+
+    async def list_browser_profiles(
+        self,
+        organization_id: str,
+        include_deleted: bool = False,
+    ) -> list[BrowserProfile]:
+        try:
+            async with self.Session() as session:
+                query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
+                if not include_deleted:
+                    query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+                browser_profiles = await session.scalars(query.order_by(asc(BrowserProfileModel.created_at)))
+                return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in list_browser_profiles", exc_info=True)
+            raise
+
+    async def delete_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+    ) -> None:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=profile_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(BrowserProfileModel.deleted_at.is_(None))
+                )
+                browser_profile = (await session.scalars(query)).first()
+                if not browser_profile:
+                    raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+                browser_profile.deleted_at = datetime.utcnow()
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in delete_browser_profile", exc_info=True)
+            raise
 
     async def get_active_persistent_browser_sessions(
         self,
@@ -3583,19 +3994,54 @@ class AgentDB:
             await session.refresh(task_run)
             return Run.model_validate(task_run)
 
+    async def update_task_run(
+        self,
+        organization_id: str,
+        run_id: str,
+        title: str | None = None,
+        url: str | None = None,
+        url_hash: str | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            task_run = (
+                await session.scalars(
+                    select(TaskRunModel).filter_by(run_id=run_id).filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if not task_run:
+                raise NotFoundError(f"TaskRun {run_id} not found")
+
+            if title:
+                task_run.title = title
+            if url:
+                task_run.url = url
+            if url_hash:
+                task_run.url_hash = url_hash
+            await session.commit()
+
     async def create_credential(
         self,
-        name: str,
-        credential_type: CredentialType,
         organization_id: str,
+        name: str,
+        vault_type: CredentialVaultType,
         item_id: str,
+        credential_type: CredentialType,
+        username: str | None,
+        totp_type: str,
+        card_last4: str | None,
+        card_brand: str | None,
     ) -> Credential:
         async with self.Session() as session:
             credential = CredentialModel(
                 organization_id=organization_id,
                 name=name,
-                credential_type=credential_type,
+                vault_type=vault_type,
                 item_id=item_id,
+                credential_type=credential_type,
+                username=username,
+                totp_type=totp_type,
+                card_last4=card_last4,
+                card_brand=card_brand,
             )
             session.add(credential)
             await session.commit()
@@ -3688,7 +4134,9 @@ class AgentDB:
         async with self.Session() as session:
             organization_bitwarden_collection = (
                 await session.scalars(
-                    select(OrganizationBitwardenCollectionModel).filter_by(organization_id=organization_id)
+                    select(OrganizationBitwardenCollectionModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(deleted_at=None)
                 )
             ).first()
             if organization_bitwarden_collection:
@@ -3848,6 +4296,65 @@ class AgentDB:
             model = (await session.scalars(query)).first()
 
             return DebugSession.model_validate(model) if model else None
+
+    async def get_debug_session_by_id(
+        self,
+        debug_session_id: str,
+        organization_id: str,
+    ) -> DebugSession | None:
+        async with self.Session() as session:
+            query = (
+                select(DebugSessionModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(deleted_at=None)
+                .filter_by(debug_session_id=debug_session_id)
+            )
+
+            model = (await session.scalars(query)).first()
+
+            return DebugSession.model_validate(model) if model else None
+
+    async def get_workflow_runs_by_debug_session_id(
+        self,
+        debug_session_id: str,
+        organization_id: str,
+    ) -> list[DebugSessionRun]:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunModel, BlockRunModel)
+                .join(BlockRunModel, BlockRunModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.debug_session_id == debug_session_id)
+                .order_by(WorkflowRunModel.created_at.desc())
+            )
+
+            results = (await session.execute(query)).all()
+
+            debug_session_runs = []
+            for workflow_run, block_run in results:
+                debug_session_runs.append(
+                    DebugSessionRun(
+                        ai_fallback=workflow_run.ai_fallback,
+                        block_label=block_run.block_label,
+                        browser_session_id=workflow_run.browser_session_id,
+                        code_gen=workflow_run.code_gen,
+                        debug_session_id=workflow_run.debug_session_id,
+                        failure_reason=workflow_run.failure_reason,
+                        output_parameter_id=block_run.output_parameter_id,
+                        run_with=workflow_run.run_with,
+                        script_run_id=workflow_run.script_run.get("script_run_id") if workflow_run.script_run else None,
+                        status=workflow_run.status,
+                        workflow_id=workflow_run.workflow_id,
+                        workflow_permanent_id=workflow_run.workflow_permanent_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        created_at=workflow_run.created_at,
+                        queued_at=workflow_run.queued_at,
+                        started_at=workflow_run.started_at,
+                        finished_at=workflow_run.finished_at,
+                    )
+                )
+
+            return debug_session_runs
 
     async def complete_debug_sessions(
         self,
@@ -4093,6 +4600,9 @@ class AgentDB:
         organization_id: str,
         script_block_label: str,
         script_file_id: str | None = None,
+        run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> ScriptBlock:
         """Create a script block."""
         async with self.Session() as session:
@@ -4102,6 +4612,9 @@ class AgentDB:
                 organization_id=organization_id,
                 script_block_label=script_block_label,
                 script_file_id=script_file_id,
+                run_signature=run_signature,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
             session.add(script_block)
             await session.commit()
@@ -4113,6 +4626,10 @@ class AgentDB:
         script_block_id: str,
         organization_id: str,
         script_file_id: str | None = None,
+        run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        clear_run_signature: bool = False,
     ) -> ScriptBlock:
         async with self.Session() as session:
             script_block = (
@@ -4123,8 +4640,16 @@ class AgentDB:
                 )
             ).first()
             if script_block:
-                if script_file_id:
+                if script_file_id is not None:
                     script_block.script_file_id = script_file_id
+                if clear_run_signature:
+                    script_block.run_signature = None
+                elif run_signature is not None:
+                    script_block.run_signature = run_signature
+                if workflow_run_id is not None:
+                    script_block.workflow_run_id = workflow_run_id
+                if workflow_run_block_id is not None:
+                    script_block.workflow_run_block_id = workflow_run_block_id
                 await session.commit()
                 await session.refresh(script_block)
                 return convert_to_script_block(script_block)
@@ -4447,7 +4972,7 @@ class AgentDB:
                             WorkflowScriptModel.deleted_at.is_(None),
                         )
                     )
-                    .values(deleted_at=datetime.now(timezone.utc))
+                    .values(deleted_at=datetime.utcnow())
                 )
 
                 result = await session.execute(stmt)
@@ -4465,6 +4990,8 @@ class AgentDB:
         self,
         organization_id: str,
         workflow_permanent_id: str,
+        statuses: list[ScriptStatus] | None = None,
+        script_ids: list[str] | None = None,
     ) -> int:
         """
         Soft delete all published workflow scripts for a workflow permanent id by setting deleted_at timestamp.
@@ -4482,13 +5009,45 @@ class AgentDB:
                             WorkflowScriptModel.deleted_at.is_(None),
                         )
                     )
-                    .values(deleted_at=datetime.now(timezone.utc))
+                    .values(deleted_at=datetime.utcnow())
                 )
+
+                if statuses:
+                    stmt = stmt.where(WorkflowScriptModel.status.in_([s.value for s in statuses]))
+
+                if script_ids:
+                    stmt = stmt.where(WorkflowScriptModel.script_id.in_(script_ids))
 
                 result = await session.execute(stmt)
                 await session.commit()
 
                 return result.rowcount
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+        except Exception:
+            LOG.error("UnexpectedError", exc_info=True)
+            raise
+
+    async def get_workflow_scripts_by_permanent_id(
+        self,
+        organization_id: str,
+        workflow_permanent_id: str,
+        statuses: list[ScriptStatus] | None = None,
+    ) -> list[WorkflowScriptModel]:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(WorkflowScriptModel)
+                    .filter_by(organization_id=organization_id)
+                    .filter_by(workflow_permanent_id=workflow_permanent_id)
+                    .filter_by(deleted_at=None)
+                )
+
+                if statuses:
+                    query = query.filter(WorkflowScriptModel.status.in_([s.value for s in statuses]))
+
+                return (await session.scalars(query)).all()
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

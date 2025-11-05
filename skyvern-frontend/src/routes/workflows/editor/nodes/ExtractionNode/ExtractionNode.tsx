@@ -11,14 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import {
-  Handle,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
+import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import { dataSchemaExampleValue } from "../types";
 import type { ExtractionNode } from "./types";
@@ -40,10 +33,12 @@ import { NodeTabs } from "../components/NodeTabs";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRerender } from "@/hooks/useRerender";
 
+import { DisableCache } from "../DisableCache";
+
 function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
-  const { updateNodeData } = useReactFlow();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const { editable, label } = data;
@@ -56,30 +51,12 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const [inputs, setInputs] = useState({
-    url: data.url,
-    dataExtractionGoal: data.dataExtractionGoal,
-    dataSchema: data.dataSchema,
-    maxStepsOverride: data.maxStepsOverride,
-    continueOnFailure: data.continueOnFailure,
-    cacheActions: data.cacheActions,
-    engine: data.engine,
-    model: data.model,
-  });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   const outputParameterKeys = getAvailableOutputParameterKeys(nodes, edges, id);
   const rerender = useRerender({ prefix: "accordian" });
-
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
-
-  function handleChange(key: string, value: unknown) {
-    if (!editable) {
-      return;
-    }
-    setInputs({ ...inputs, [key]: value });
-    updateNodeData(id, { [key]: value });
-  }
+  const update = useUpdate<ExtractionNode["data"]>({ id, editable });
 
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
@@ -141,22 +118,22 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                 if (!editable) {
                   return;
                 }
-                handleChange("dataExtractionGoal", value);
+                update({ dataExtractionGoal: value });
               }}
-              value={inputs.dataExtractionGoal}
+              value={data.dataExtractionGoal}
               placeholder={placeholders["extraction"]["dataExtractionGoal"]}
               className="nopan text-xs"
             />
           </div>
           <WorkflowDataSchemaInputGroup
-            value={inputs.dataSchema}
+            value={data.dataSchema}
             onChange={(value) => {
-              handleChange("dataSchema", value);
+              update({ dataSchema: value });
             }}
             exampleValue={dataSchemaExampleValue}
             suggestionContext={{
-              data_extraction_goal: inputs.dataExtractionGoal,
-              current_schema: inputs.dataSchema,
+              data_extraction_goal: data.dataExtractionGoal,
+              current_schema: data.dataSchema,
             }}
           />
           <Separator />
@@ -174,16 +151,16 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                   <div className="space-y-2">
                     <ModelSelector
                       className="nopan w-52 text-xs"
-                      value={inputs.model}
+                      value={data.model}
                       onChange={(value) => {
-                        handleChange("model", value);
+                        update({ model: value });
                       }}
                     />
                     <ParametersMultiSelect
                       availableOutputParameters={outputParameterKeys}
                       parameters={data.parameterKeys}
                       onParametersChange={(parameterKeys) => {
-                        updateNodeData(id, { parameterKeys });
+                        update({ parameterKeys });
                       }}
                     />
                   </div>
@@ -194,9 +171,9 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                       </Label>
                     </div>
                     <RunEngineSelector
-                      value={inputs.engine}
+                      value={data.engine}
                       onChange={(value) => {
-                        handleChange("engine", value);
+                        update({ engine: value });
                       }}
                       className="nopan w-52 text-xs"
                     />
@@ -217,7 +194,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                       }
                       className="nopan w-52 text-xs"
                       min="0"
-                      value={inputs.maxStepsOverride ?? ""}
+                      value={data.maxStepsOverride ?? ""}
                       onChange={(event) => {
                         if (!editable) {
                           return;
@@ -226,7 +203,7 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                           event.target.value === ""
                             ? null
                             : Number(event.target.value);
-                        handleChange("maxStepsOverride", value);
+                        update({ maxStepsOverride: value });
                       }}
                     />
                   </div>
@@ -244,37 +221,27 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
                     </div>
                     <div className="w-52">
                       <Switch
-                        checked={inputs.continueOnFailure}
+                        checked={data.continueOnFailure}
                         onCheckedChange={(checked) => {
                           if (!editable) {
                             return;
                           }
-                          handleChange("continueOnFailure", checked);
+                          update({ continueOnFailure: checked });
                         }}
                       />
                     </div>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs font-normal text-slate-300">
-                        Cache Actions
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["extraction"]["cacheActions"]}
-                      />
-                    </div>
-                    <div className="w-52">
-                      <Switch
-                        checked={inputs.cacheActions}
-                        onCheckedChange={(checked) => {
-                          if (!editable) {
-                            return;
-                          }
-                          handleChange("cacheActions", checked);
-                        }}
-                      />
-                    </div>
-                  </div>
+                  <DisableCache
+                    cacheActions={data.cacheActions}
+                    disableCache={data.disableCache}
+                    editable={editable}
+                    onCacheActionsChange={(cacheActions) => {
+                      update({ cacheActions });
+                    }}
+                    onDisableCacheChange={(disableCache) => {
+                      update({ disableCache });
+                    }}
+                  />
                 </div>
               </AccordionContent>
             </AccordionItem>

@@ -14,13 +14,16 @@ from collections import defaultdict
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, Literal, Union
 from urllib.parse import quote, urlparse
 
 import filetype
 import pandas as pd
+import pyotp
 import structlog
 from email_validator import EmailNotValidError, validate_email
+from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 from pydantic import BaseModel, Field
@@ -44,6 +47,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api import email
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureStorageClient
 from skyvern.forge.sdk.api.files import (
@@ -61,6 +65,8 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -69,6 +75,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InsecureCodeDetected,
     InvalidEmailClientConfiguration,
     InvalidFileType,
+    MissingJinjaVariables,
     NoIterableValueFound,
     NoValidEmailRecipient,
 )
@@ -83,12 +90,17 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.utils.strings import generate_random_string
+from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_factory import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
-jinja_sandbox_env = SandboxedEnvironment()
+
+if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+    jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
+else:
+    jinja_sandbox_env = SandboxedEnvironment()
 
 
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
@@ -109,6 +121,7 @@ class Block(BaseModel, abc.ABC):
     output_parameter: OutputParameter
     continue_on_failure: bool = False
     model: dict[str, Any] | None = None
+    disable_cache: bool = False
 
     @property
     def override_llm_key(self) -> str | None:
@@ -181,12 +194,35 @@ class Block(BaseModel, abc.ABC):
     ) -> str:
         if not potential_template:
             return potential_template
+
         template = jinja_sandbox_env.from_string(potential_template)
 
         block_reference_data: dict[str, Any] = workflow_run_context.get_block_metadata(self.label)
         template_data = workflow_run_context.values.copy()
         if workflow_run_context.include_secrets_in_templates:
             template_data.update(workflow_run_context.secrets)
+
+            # Create easier-to-access entries for credentials
+            # Look for credential parameters and create real_username/real_password entries
+            # First collect all credential parameters to avoid modifying dict during iteration
+            credential_params = []
+            for key, value in template_data.items():
+                if isinstance(value, dict) and "context" in value and "username" in value and "password" in value:
+                    credential_params.append((key, value))
+
+            # Now add the real_username/real_password entries
+            for key, value in credential_params:
+                username_secret_id = value.get("username", "")
+                password_secret_id = value.get("password", "")
+
+                # Get the actual values from the secrets
+                real_username = template_data.get(username_secret_id, "")
+                real_password = template_data.get(password_secret_id, "")
+
+                # Add easier-to-access entries
+                template_data[f"{key}_real_username"] = real_username
+                template_data[f"{key}_real_password"] = real_password
+
         if self.label in template_data:
             current_value = template_data[self.label]
             if isinstance(current_value, dict):
@@ -217,6 +253,13 @@ class Block(BaseModel, abc.ABC):
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
+        if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
+            if missing_variables := get_missing_variables(potential_template, template_data):
+                raise MissingJinjaVariables(
+                    template=potential_template,
+                    variables=missing_variables,
+                )
+
         return template.render(template_data)
 
     @classmethod
@@ -238,7 +281,6 @@ class Block(BaseModel, abc.ABC):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         pass
@@ -296,7 +338,6 @@ class Block(BaseModel, abc.ABC):
         parent_workflow_run_block_id: str | None = None,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_block_id = None
@@ -324,13 +365,21 @@ class Block(BaseModel, abc.ABC):
             if not browser_state:
                 LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
             else:
-                screenshot = await browser_state.take_fullpage_screenshot(
-                    use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                        "ENABLE_PLAYWRIGHT_FULLPAGE",
-                        workflow_run_id,
-                        properties={"organization_id": str(organization_id)},
+                try:
+                    screenshot = await browser_state.take_fullpage_screenshot(
+                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_PLAYWRIGHT_FULLPAGE",
+                            workflow_run_id,
+                            properties={"organization_id": str(organization_id)},
+                        )
                     )
-                )
+                except Exception:
+                    LOG.warning(
+                        "Failed to take screenshot before executing the block, ignoring the exception",
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                    )
+                    screenshot = None
                 if screenshot:
                     await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                         workflow_run_block=workflow_run_block,
@@ -346,7 +395,6 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
-                code_gen=code_gen,
                 **kwargs,
             )
         except Exception as e:
@@ -403,6 +451,7 @@ class BaseTaskBlock(Block):
     cache_actions: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
+    download_timeout: float | None = None  # minutes
 
     def get_all_parameters(
         self,
@@ -503,7 +552,6 @@ class BaseTaskBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -599,6 +647,16 @@ class BaseTaskBlock(Block):
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                         workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
                     )
+                    working_page = await browser_state.get_working_page()
+                    if not working_page:
+                        LOG.error(
+                            "BrowserState has no page",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                        )
+                        raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
+                    if working_page.url == "about:blank" and self.url:
+                        await browser_state.navigate_to_url(page=working_page, url=self.url)
+
                 except Exception as e:
                     LOG.exception(
                         "Failed to get browser state for first task",
@@ -613,10 +671,11 @@ class BaseTaskBlock(Block):
                         failure_reason=str(e),
                     )
                     raise e
+
                 try:
                     # add screenshot artifact for the first task
                     screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                             "ENABLE_PLAYWRIGHT_FULLPAGE",
                             workflow_run_id,
                             properties={"organization_id": str(organization_id)},
@@ -1311,7 +1370,6 @@ class ForLoopBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -1420,6 +1478,10 @@ class ForLoopBlock(Block):
         )
 
 
+class Credential(SimpleNamespace):
+    pass
+
+
 class CodeBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -1454,6 +1516,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "json": json,
             "Exception": Exception,
         }
 
@@ -1489,7 +1552,6 @@ async def wrapper():
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
@@ -1507,6 +1569,47 @@ async def wrapper():
                 LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        # If no browser state exists, create one (e.g., when code block is the first block)
+        if not browser_state:
+            LOG.info(
+                "No browser state found, creating one for code block execution",
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=None,  # Code block doesn't need to navigate to a URL initially
+                    browser_session_id=browser_session_id,
+                )
+                # Ensure the browser state has a working page
+                await browser_state.check_and_fix_state(
+                    url=None,  # Don't navigate to any URL, just ensure a page exists
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    browser_address=workflow_run.browser_address,
+                )
+            except Exception as e:
+                LOG.exception(
+                    "Failed to create browser state for code block",
+                    workflow_run_id=workflow_run_id,
+                    error=str(e),
+                )
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to create browser for code block: {str(e)}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
 
         if not browser_state:
             return await self.build_block_result(
@@ -1547,11 +1650,43 @@ async def wrapper():
         parameter_values = {}
         for parameter in self.parameters:
             value = workflow_run_context.get_value(parameter.key)
-            secret_value = workflow_run_context.get_original_secret_value_or_none(value)
-            if secret_value is not None:
-                parameter_values[parameter.key] = secret_value
-            else:
+            if not parameter.parameter_type.is_secret_or_credential() and not (
+                # NOTE: skyvern credential is a 'credential_id' workflow parameter type
+                parameter.parameter_type == ParameterType.WORKFLOW
+                and parameter.workflow_parameter_type is not None
+                and parameter.workflow_parameter_type.is_credential_type()
+            ):
                 parameter_values[parameter.key] = value
+                continue
+            if isinstance(value, dict):
+                real_secret_values = {}
+                for credential_field, credential_place_holder in value.items():
+                    # "context" is a skyvern-defined field to reduce LLM hallucination
+                    if credential_field == "context":
+                        continue
+                    secret_value = workflow_run_context.get_original_secret_value_or_none(credential_place_holder)
+                    if (
+                        secret_value == BitwardenConstants.TOTP
+                        or secret_value == OnePasswordConstants.TOTP
+                        or secret_value == AzureVaultConstants.TOTP
+                    ):
+                        totp_secret_key = workflow_run_context.totp_secret_value_key(credential_place_holder)
+                        totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
+                        if totp_secret:
+                            secret_value = pyotp.TOTP(totp_secret).now()
+                        else:
+                            LOG.warning(
+                                "No TOTP secret found, returning the parameter value as is",
+                                parameter=credential_place_holder,
+                            )
+
+                    real_secret_value = secret_value if secret_value is not None else credential_place_holder
+                    parameter_values[credential_field] = real_secret_value
+                    real_secret_values[credential_field] = real_secret_value
+                parameter_values[parameter.key] = Credential(**real_secret_values)
+            else:
+                secret_value = workflow_run_context.get_original_secret_value_or_none(value)
+                parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
         try:
             self.is_safe_code(self.code)
@@ -1656,7 +1791,6 @@ class TextPromptBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # Validate block execution
@@ -1741,7 +1875,6 @@ class DownloadToS3Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -1830,7 +1963,6 @@ class UploadToS3Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -1983,13 +2115,24 @@ class FileUploadBlock(Block):
 
     def _get_s3_uri(self, workflow_run_id: str, path: str) -> str:
         folder_path = self.path or f"{workflow_run_id}"
+        # Remove trailing slash from folder_path to avoid double slashes
+        folder_path = folder_path.rstrip("/")
+        # Remove any empty path segments to avoid double slashes
+        folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
         s3_suffix = f"{uuid.uuid4()}_{Path(path).name}"
         return f"s3://{self.s3_bucket}/{folder_path}/{s3_suffix}"
 
-    def _get_azure_blob_uri(self, workflow_run_id: str, file_path: str) -> str:
-        blob_name = Path(file_path).name
+    def _get_azure_blob_name(self, workflow_run_id: str, file_path: str) -> str:
+        blob_name = f"{uuid.uuid4()}_{Path(file_path).name}"
         folder_path = self.path or workflow_run_id
-        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{folder_path}/{uuid.uuid4()}_{blob_name}"
+        # Remove trailing slash from folder_path to avoid double slashes
+        folder_path = folder_path.rstrip("/")
+        # Remove any empty path segments to avoid double slashes
+        folder_path = "/".join(segment for segment in folder_path.split("/") if segment)
+        return folder_path + "/" + blob_name
+
+    def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
+        return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
 
     async def execute(
         self,
@@ -1997,7 +2140,6 @@ class FileUploadBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # get workflow run context
@@ -2115,8 +2257,9 @@ class FileUploadBlock(Block):
                     storage_account_key=actual_azure_storage_account_key,
                 )
                 for file_path in files_to_upload:
-                    blob_name = Path(file_path).name
-                    azure_uri = self._get_azure_blob_uri(workflow_run_id, file_path)
+                    LOG.info("FileUploadBlock: Uploading file to Azure Blob Storage", file_path=file_path)
+                    blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
+                    azure_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
                     uploaded_uris.append(azure_uri)
                     await azure_client.upload_file_from_path(
                         container_name=self.azure_blob_container_name or "", blob_name=blob_name, file_path=file_path
@@ -2195,8 +2338,15 @@ class SendEmailBlock(Block):
             self.subject, workflow_run_context
         )
         self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
-        # file_attachments are formatted in _get_file_paths()
-        # recipients are formatted in get_real_email_recipients()
+
+        # Format recipients
+        formatted_recipients = []
+        for recipient in self.recipients:
+            formatted_recipient = self.format_block_parameter_template_from_workflow_run_context(
+                recipient, workflow_run_context
+            )
+            formatted_recipients.append(formatted_recipient)
+        self.recipients = formatted_recipients
 
     def _decrypt_smtp_parameters(self, workflow_run_context: WorkflowRunContext) -> tuple[str, int, str, str]:
         obfuscated_smtp_host_value = workflow_run_context.get_value(self.smtp_host.key)
@@ -2295,6 +2445,7 @@ class SendEmailBlock(Block):
     def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
         recipients = []
         for recipient in self.recipients:
+            # Check if the recipient is a parameter and get its value
             if workflow_run_context.has_parameter(recipient):
                 maybe_recipient = workflow_run_context.get_value(recipient)
             else:
@@ -2414,7 +2565,6 @@ class SendEmailBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -2650,7 +2800,6 @@ class FileParserBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -2790,7 +2939,6 @@ class PDFParserBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -2891,7 +3039,6 @@ class WaitBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         # TODO: we need to support to interrupt the sleep when the workflow run failed/cancelled/terminated
@@ -2919,6 +3066,241 @@ class WaitBlock(Block):
         )
 
 
+class HumanInteractionBlock(BaseTaskBlock):
+    """
+    A block for human/agent interaction.
+
+    For the first pass at this, the implicit behaviour is that the user is given a single binary
+    choice (a go//no-go).
+
+    If the human:
+      - chooses positively, the workflow continues
+      - chooses negatively, the workflow is terminated
+      - does not respond within the timeout period, the workflow terminates
+    """
+
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.HUMAN_INTERACTION] = BlockType.HUMAN_INTERACTION  # type: ignore
+
+    instructions: str = "Please review and approve or reject to continue the workflow."
+    positive_descriptor: str = "Approve"
+    negative_descriptor: str = "Reject"
+    timeout_seconds: int = 60 * 60 * 2  # two hours
+
+    # email options
+    sender: str = "hello@skyvern.com"
+    recipients: list[str] = []
+    subject: str = "Human interaction required for workflow run"
+    body: str = "Your interaction is required for a workflow run!"
+
+    def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
+        super().format_potential_template_parameters(workflow_run_context)
+
+        self.instructions = self.format_block_parameter_template_from_workflow_run_context(
+            self.instructions, workflow_run_context
+        )
+
+        self.body = self.format_block_parameter_template_from_workflow_run_context(self.body, workflow_run_context)
+
+        self.subject = self.format_block_parameter_template_from_workflow_run_context(
+            self.subject, workflow_run_context
+        )
+
+        formatted: list[str] = []
+        for recipient in self.recipients:
+            formatted.append(
+                self.format_block_parameter_template_from_workflow_run_context(recipient, workflow_run_context)
+            )
+
+        self.recipients = formatted
+
+        self.negative_descriptor = self.format_block_parameter_template_from_workflow_run_context(
+            self.negative_descriptor, workflow_run_context
+        )
+
+        self.positive_descriptor = self.format_block_parameter_template_from_workflow_run_context(
+            self.positive_descriptor, workflow_run_context
+        )
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        # avoid circular import
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus  # noqa: PLC0415
+
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to format jinja template: {str(e)}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        await app.DATABASE.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            recipients=self.recipients,
+            subject=self.subject,
+            body=self.body,
+            instructions=self.instructions,
+            positive_descriptor=self.positive_descriptor,
+            negative_descriptor=self.negative_descriptor,
+        )
+
+        LOG.info(
+            "Pausing workflow for human interaction",
+            workflow_run_id=workflow_run_id,
+            recipients=self.recipients,
+            timeout=self.timeout_seconds,
+            browser_session_id=browser_session_id,
+        )
+
+        await app.DATABASE.update_workflow_run(
+            workflow_run_id=workflow_run_id,
+            status=WorkflowRunStatus.paused,
+        )
+
+        workflow_run = await app.DATABASE.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+
+        if not workflow_run:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Workflow run not found",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        app_url = f"{settings.SKYVERN_APP_URL}/runs/{workflow_run_id}/overview"
+        body = f"{self.body}\n\nKindly visit {app_url}\n\n{self.instructions}\n\n"
+        subject = f"{self.subject} - Workflow Run ID: {workflow_run_id}"
+
+        try:
+            await email.send(
+                body=body,
+                sender=self.sender,
+                subject=subject,
+                recipients=self.recipients,
+            )
+
+            email_success = True
+            email_failure_reason = None
+        except Exception as ex:
+            LOG.error(
+                "Failed to send human interaction email",
+                workflow_run_id=workflow_run_id,
+                error=str(ex),
+                browser_session_id=browser_session_id,
+            )
+            email_success = False
+            email_failure_reason = str(ex)
+
+        if not email_success:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to send human interaction email: {email_failure_reason or 'email failed'}",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        # Wait for the timeout_seconds or until the workflow run status changes from paused
+        start_time = asyncio.get_event_loop().time()
+        check_interval = 5  # Check every 5 seconds
+        log_that_we_are_waiting = True
+        log_wait = 0
+
+        while True:
+            if not log_that_we_are_waiting:
+                log_wait += check_interval
+                if log_wait >= 60:  # Log every 1 minute
+                    log_that_we_are_waiting = True
+                    log_wait = 0
+
+            elapsed_time_seconds = asyncio.get_event_loop().time() - start_time
+
+            if log_that_we_are_waiting:
+                LOG.info(
+                    "Waiting for human interaction...",
+                    workflow_run_id=workflow_run_id,
+                    elapsed_time_seconds=elapsed_time_seconds,
+                    timeout_seconds=self.timeout_seconds,
+                    browser_session_id=browser_session_id,
+                )
+                log_that_we_are_waiting = False
+
+            # Check if timeout_seconds has elapsed
+            if elapsed_time_seconds >= self.timeout_seconds:
+                LOG.info(
+                    "Human Interaction block timeout_seconds reached",
+                    workflow_run_id=workflow_run_id,
+                    elapsed_time_seconds=elapsed_time_seconds,
+                    browser_session_id=browser_session_id,
+                )
+
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                success = False
+                reason = "Timeout elapsed with no human interaction"
+                result_dict = {"success": success, "reason": reason}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=success,
+                    failure_reason=reason,
+                    output_parameter_value=result_dict,
+                    status=BlockStatus.timed_out,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            workflow_run = await app.DATABASE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+
+            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
+                LOG.info(
+                    "Workflow run status changed from paused",
+                    workflow_run_id=workflow_run_id,
+                    new_status=workflow_run.status,
+                    browser_session_id=browser_session_id,
+                )
+
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                result_dict = {"success": True, "reason": f"status_changed:{workflow_run.status}"}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=True,
+                    failure_reason=None,
+                    output_parameter_value=result_dict,
+                    status=BlockStatus.completed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            await asyncio.sleep(min(check_interval, self.timeout_seconds - elapsed_time_seconds))
+
+
 class ValidationBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -2936,7 +3318,6 @@ class ValidationBlock(BaseTaskBlock):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         task_order, _ = await self.get_task_order(workflow_run_id, 0)
@@ -3039,7 +3420,6 @@ class TaskV2Block(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus  # noqa: PLC0415
@@ -3111,7 +3491,6 @@ class TaskV2Block(Block):
                 request_id=None,
                 max_steps_override=self.max_steps,
                 browser_session_id=browser_session_id,
-                code_gen=code_gen,
             )
         finally:
             context: skyvern_context.SkyvernContext | None = skyvern_context.current()
@@ -3229,7 +3608,6 @@ class HttpRequestBlock(Block):
         workflow_run_block_id: str,
         organization_id: str | None = None,
         browser_session_id: str | None = None,
-        code_gen: bool | None = None,
         **kwargs: dict,
     ) -> BlockResult:
         """Execute the HTTP request and return the response"""
@@ -3395,6 +3773,7 @@ BlockSubclasses = Union[
     ExtractionBlock,
     LoginBlock,
     WaitBlock,
+    HumanInteractionBlock,
     FileDownloadBlock,
     UrlBlock,
     TaskV2Block,

@@ -36,17 +36,17 @@ async def get_action_history(
                 exclude_none=True,
                 include={"action_type", "element_id", "status", "reasoning", "option", "download"},
             ),
-            "results": [
-                result.model_dump(
-                    exclude_none=True,
-                    include={
-                        "success",
-                        "exception_type",
-                        "exception_message",
-                    },
-                )
-                for result in results
-            ],
+            # use the last result of the action, because some actions(like chain_click)
+            # might have multiple results. Only the last one can represent the real result,
+            # the previous results will be all failed
+            "result": results[-1].model_dump(
+                exclude_none=True,
+                include={
+                    "success",
+                    "exception_type",
+                    "exception_message",
+                },
+            ),
         }
         for action, results in actions_and_results
         if len(results) > 0

@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { ProxyLocation } from "@/api/types";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Drawer,
@@ -36,32 +37,25 @@ import { useCreateBrowserSessionMutation } from "@/routes/browserSessions/hooks/
 import { type BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { basicTimeFormat } from "@/util/timeFormat";
-import { cn, formatMs } from "@/util/utils";
-
-function toDate(
-  time: string,
-  defaultDate: Date | null = new Date(0),
-): Date | null {
-  time = time.replace(/\.(\d{3})\d*/, ".$1");
-
-  if (!time.endsWith("Z")) {
-    time += "Z";
-  }
-
-  const date = new Date(time);
-
-  if (isNaN(date.getTime())) {
-    return defaultDate;
-  }
-
-  return date;
-}
+import { cn, formatMs, toDate } from "@/util/utils";
 
 function sessionIsOpen(browserSession: BrowserSession): boolean {
   return (
     browserSession.completed_at === null && browserSession.started_at !== null
   );
 }
+
+const No = () => (
+  <Badge className="flex h-7 w-12 justify-center bg-gray-800 text-orange-50 hover:bg-gray-900">
+    No
+  </Badge>
+);
+
+const Yes = () => (
+  <Badge className="flex h-7 w-12 justify-center bg-green-900 text-green-50 hover:bg-green-900/80">
+    Yes
+  </Badge>
+);
 
 function BrowserSessions() {
   const navigate = useNavigate();
@@ -210,9 +204,7 @@ function BrowserSessions() {
                   ) : (
                     <span className="opacity-50">never</span>
                   );
-                  const cdpUrl =
-                    browserSession.browser_address ??
-                    "wss://session-staging.skyvern.com/pbs_442960015326262218/devtools/browser/f01f27e1-182b-4a33-9017-4c1146d3eb3e";
+                  const cdpUrl = browserSession.browser_address ?? "-";
 
                   return (
                     <TableRow
@@ -233,19 +225,9 @@ function BrowserSessions() {
                           />
                         </div>
                       </TableCell>
+                      <TableCell>{isOpen ? <Yes /> : <No />}</TableCell>
                       <TableCell>
-                        {isOpen ? (
-                          "Yes"
-                        ) : (
-                          <span className="opacity-50">No</span>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {browserSession.runnable_id ? (
-                          "Yes"
-                        ) : (
-                          <span className="opacity-50">No</span>
-                        )}
+                        {browserSession.runnable_id ? <Yes /> : <No />}
                       </TableCell>
                       <TableCell
                         title={

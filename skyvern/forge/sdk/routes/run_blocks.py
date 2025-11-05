@@ -8,9 +8,12 @@ from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.routes.code_samples import (
-    LOGIN_CODE_SAMPLE_BITWARDEN,
-    LOGIN_CODE_SAMPLE_ONEPASSWORD,
-    LOGIN_CODE_SAMPLE_SKYVERN,
+    LOGIN_CODE_SAMPLE_BITWARDEN_PYTHON,
+    LOGIN_CODE_SAMPLE_BITWARDEN_TS,
+    LOGIN_CODE_SAMPLE_ONEPASSWORD_PYTHON,
+    LOGIN_CODE_SAMPLE_ONEPASSWORD_TS,
+    LOGIN_CODE_SAMPLE_SKYVERN_PYTHON,
+    LOGIN_CODE_SAMPLE_SKYVERN_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -30,6 +33,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import workflow_service
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 
 LOG = structlog.get_logger()
 DEFAULT_LOGIN_PROMPT = """If you're not on the login page, navigate to login page and login using the credentials given.
@@ -48,18 +52,12 @@ If login is completed, you're successful."""
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": LOGIN_CODE_SAMPLE_SKYVERN,
-                    },
-                    {
-                        "sdk": "python",
-                        "code": LOGIN_CODE_SAMPLE_BITWARDEN,
-                    },
-                    {
-                        "sdk": "python",
-                        "code": LOGIN_CODE_SAMPLE_ONEPASSWORD,
-                    },
+                    {"sdk": "python", "code": LOGIN_CODE_SAMPLE_SKYVERN_PYTHON},
+                    {"sdk": "python", "code": LOGIN_CODE_SAMPLE_BITWARDEN_PYTHON},
+                    {"sdk": "python", "code": LOGIN_CODE_SAMPLE_ONEPASSWORD_PYTHON},
+                    {"sdk": "typescript", "code": LOGIN_CODE_SAMPLE_SKYVERN_TS},
+                    {"sdk": "typescript", "code": LOGIN_CODE_SAMPLE_BITWARDEN_TS},
+                    {"sdk": "typescript", "code": LOGIN_CODE_SAMPLE_ONEPASSWORD_TS},
                 ]
             }
         ],
@@ -74,6 +72,15 @@ async def login(
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    try:
+        url = prepend_scheme_and_validate_url(login_request.url) if login_request.url else None
+        totp_verification_url = (
+            prepend_scheme_and_validate_url(login_request.totp_url) if login_request.totp_url else None
+        )
+        webhook_url = prepend_scheme_and_validate_url(login_request.webhook_url) if login_request.webhook_url else None
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
     # 1. create empty workflow with a credential parameter
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
         organization,
@@ -157,11 +164,11 @@ async def login(
     login_block_yaml = LoginBlockYAML(
         label=label,
         title=label,
-        url=login_request.url,
+        url=url,
         navigation_goal=login_request.prompt or DEFAULT_LOGIN_PROMPT,
         max_steps_per_run=10,
         parameter_keys=[parameter_key],
-        totp_verification_url=login_request.totp_url,
+        totp_verification_url=totp_verification_url,
         totp_identifier=login_request.totp_identifier,
     )
     yaml_blocks = [login_block_yaml]
@@ -190,10 +197,11 @@ async def login(
     request_id = context.request_id
     legacy_workflow_request = WorkflowRequestBody(
         proxy_location=login_request.proxy_location,
-        webhook_callback_url=login_request.webhook_url,
+        webhook_callback_url=webhook_url,
         totp_identifier=login_request.totp_identifier,
-        totp_verification_url=login_request.totp_url,
+        totp_verification_url=totp_verification_url,
         browser_session_id=login_request.browser_session_id,
+        browser_address=login_request.browser_address,
         max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
         extra_http_headers=login_request.extra_http_headers,
     )
@@ -224,12 +232,12 @@ async def login(
             workflow_id=new_workflow.workflow_id,
             title=new_workflow.title,
             proxy_location=login_request.proxy_location,
-            webhook_url=login_request.webhook_url,
-            totp_url=login_request.totp_url,
+            webhook_url=webhook_url,
+            totp_url=totp_verification_url,
             totp_identifier=login_request.totp_identifier,
             browser_session_id=login_request.browser_session_id,
             max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
         ),
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=login_request.browser_session_id,
     )

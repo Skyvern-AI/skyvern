@@ -1,5 +1,4 @@
 import asyncio
-import os
 import typing
 from typing import Any
 
@@ -21,6 +20,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Request, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import CreateTaskResponse, Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.services.local_org_auth_token_service import SKYVERN_LOCAL_DOMAIN, SKYVERN_LOCAL_ORG
 from skyvern.forge.sdk.services.org_auth_token_service import API_KEY_LIFETIME
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
@@ -28,6 +28,7 @@ from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine, RunStatus, RunType
 from skyvern.services import run_service, task_v1_service, task_v2_service
 from skyvern.utils import migrate_db
+from skyvern.utils.env_paths import resolve_backend_env_path
 
 
 class Skyvern(AsyncSkyvern):
@@ -39,7 +40,7 @@ class Skyvern(AsyncSkyvern):
         cdp_url: str | None = None,
         browser_path: str | None = None,
         browser_type: str | None = None,
-        environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
+        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
@@ -47,17 +48,17 @@ class Skyvern(AsyncSkyvern):
         super().__init__(
             base_url=base_url,
             api_key=api_key,
-            x_api_key=api_key,
             environment=environment,
             timeout=timeout,
             follow_redirects=follow_redirects,
             httpx_client=httpx_client,
         )
         if base_url is None and api_key is None:
-            if not os.path.exists(".env"):
+            env_path = resolve_backend_env_path()
+            if not env_path.exists():
                 raise Exception("No .env file found. Please run 'skyvern init' first to set up your environment.")
 
-            load_dotenv(".env")
+            load_dotenv(env_path)
             migrate_db()
 
         self._api_key = api_key
@@ -95,11 +96,11 @@ class Skyvern(AsyncSkyvern):
             raise ValueError("Initializing Skyvern failed: api_key must be provided")
 
     async def get_organization(self) -> Organization:
-        organization = await app.DATABASE.get_organization_by_domain("skyvern.local")
+        organization = await app.DATABASE.get_organization_by_domain(SKYVERN_LOCAL_DOMAIN)
         if not organization:
             organization = await app.DATABASE.create_organization(
-                organization_name="Skyvern-local",
-                domain="skyvern.local",
+                organization_name=SKYVERN_LOCAL_ORG,
+                domain=SKYVERN_LOCAL_DOMAIN,
                 max_steps_per_run=10,
                 max_retries_per_step=3,
             )

@@ -113,6 +113,11 @@ class TaskBase(BaseModel):
         description="The CDP address for the task.",
         examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
     )
+    download_timeout: float | None = Field(
+        default=None,
+        description="The maximum time to wait for downloads to complete, in seconds. If not set, defaults to BROWSER_DOWNLOAD_TIMEOUT seconds.",
+        examples=[15.0],
+    )
 
 
 class TaskRequest(TaskBase):
@@ -153,6 +158,29 @@ class TaskRequest(TaskBase):
             return None
 
         return validate_url(url)
+
+
+class PromptedTaskRequest(TaskRequest):
+    ai_fallback: bool | None = Field(
+        default=False,
+        description="Whether to use AI fallback when the task fails.",
+        examples=[True, False],
+    )
+    publish_workflow: bool | None = Field(
+        default=False,
+        description="Whether to publish the workflow created from the prompt.",
+        examples=[True, False],
+    )
+    run_with: str | None = Field(
+        default=None,
+        description="The executor to run the task with.",
+        examples=["code", "agent"],
+    )
+    user_prompt: str = Field(
+        ...,
+        description="The user's prompt for the task.",
+        examples=["Get a quote for car insurance"],
+    )
 
 
 class TaskStatus(StrEnum):

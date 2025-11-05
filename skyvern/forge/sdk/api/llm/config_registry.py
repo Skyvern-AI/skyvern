@@ -80,7 +80,7 @@ if settings.ENABLE_OPENAI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -92,7 +92,7 @@ if settings.ENABLE_OPENAI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -104,7 +104,7 @@ if settings.ENABLE_OPENAI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -213,9 +213,6 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
-            litellm_params=LiteLLMParams(
-                drop_params=True,  # type: ignore
-            ),
         ),
     )
     LLMConfigRegistry.register_config(
@@ -228,9 +225,6 @@ if settings.ENABLE_OPENAI:
             max_completion_tokens=100000,
             temperature=None,  # Temperature isn't supported in the O-model series
             reasoning_effort="high",
-            litellm_params=LiteLLMParams(
-                drop_params=True,  # type: ignore
-            ),
         ),
     )
 
@@ -288,7 +282,7 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=8192,
+            max_completion_tokens=64000,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -308,7 +302,7 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=8192,
+            max_completion_tokens=32000,
         ),
     )
     LLMConfigRegistry.register_config(
@@ -318,7 +312,27 @@ if settings.ENABLE_ANTHROPIC:
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=True,
-            max_completion_tokens=8192,
+            max_completion_tokens=64000,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.5_SONNET",
+        LLMConfig(
+            "anthropic/claude-sonnet-4-5-20250929",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=64000,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.5_HAIKU",
+        LLMConfig(
+            "anthropic/claude-haiku-4-5-20251001",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=64000,
         ),
     )
 
@@ -592,7 +606,7 @@ if settings.ENABLE_AZURE_GPT5:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -617,7 +631,7 @@ if settings.ENABLE_AZURE_GPT5_MINI:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -642,7 +656,7 @@ if settings.ENABLE_AZURE_GPT5_NANO:
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=128000,
-            temperature=None,
+            temperature=1,  # GPT-5 only supports temperature=1
             reasoning_effort=settings.GPT5_REASONING_EFFORT,
         ),
     )
@@ -1079,7 +1093,7 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         ),
     )
     LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_2.5_FLASH",
+        "VERTEX_GEMINI_2.5_FLASH_DEPRECATED",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash",
             ["VERTEX_CREDENTIALS"],
@@ -1098,7 +1112,7 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
         ),
     )
     LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_2.5_FLASH_LITE",
+        "VERTEX_GEMINI_2.5_FLASH_LITE_DEPRECATED",
         LLMConfig(
             "vertex_ai/gemini-2.5-flash-lite",
             ["VERTEX_CREDENTIALS"],
@@ -1173,6 +1187,45 @@ if settings.ENABLE_VERTEX_AI and settings.VERTEX_CREDENTIALS:
             ),
         ),
     )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_FLASH",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-flash",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_2.5_FLASH_LITE",
+        LLMConfig(
+            "vertex_ai/gemini-2.5-flash-lite",
+            ["VERTEX_CREDENTIALS"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65535,
+            litellm_params=LiteLLMParams(
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                api_base=f"{api_base}/gemini-2.5-flash-lite" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking={
+                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
+                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
+                },
+            ),
+        ),
+    )
+    # Register old keys as aliases to prevent breaking existing tasks
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_09_2025",
         LLMConfig(

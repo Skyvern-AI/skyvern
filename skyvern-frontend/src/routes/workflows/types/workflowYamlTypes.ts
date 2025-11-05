@@ -14,6 +14,7 @@ export type WorkflowCreateYAMLRequest = {
   is_saved_task?: boolean;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
+  status?: string | null;
   run_with?: string | null;
   cache_key?: string | null;
   ai_fallback?: boolean;
@@ -126,6 +127,7 @@ export type BlockYAML =
   | FileUrlParserBlockYAML
   | ForLoopBlockYAML
   | ValidationBlockYAML
+  | HumanInteractionBlockYAML
   | ActionBlockYAML
   | NavigationBlockYAML
   | ExtractionBlockYAML
@@ -159,6 +161,7 @@ export type TaskBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
@@ -172,6 +175,7 @@ export type Taskv2BlockYAML = BlockYAMLBase & {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_steps: number | null;
+  disable_cache: boolean;
 };
 
 export type ValidationBlockYAML = BlockYAMLBase & {
@@ -180,6 +184,20 @@ export type ValidationBlockYAML = BlockYAMLBase & {
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
+};
+
+export type HumanInteractionBlockYAML = BlockYAMLBase & {
+  block_type: "human_interaction";
+
+  instructions: string;
+  positive_descriptor: string;
+  negative_descriptor: string;
+  timeout_seconds: number;
+
+  sender: string;
+  recipients: Array<string>;
+  subject: string;
+  body: string;
 };
 
 export type ActionBlockYAML = BlockYAMLBase & {
@@ -195,6 +213,7 @@ export type ActionBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   engine: RunEngine | null;
 };
 
@@ -212,6 +231,7 @@ export type NavigationBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -229,6 +249,7 @@ export type ExtractionBlockYAML = BlockYAMLBase & {
   max_steps_per_run?: number | null;
   parameter_keys?: Array<string> | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   engine: RunEngine | null;
 };
 
@@ -244,6 +265,7 @@ export type LoginBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
@@ -267,7 +289,9 @@ export type FileDownloadBlockYAML = BlockYAMLBase & {
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
   cache_actions: boolean;
+  disable_cache: boolean;
   engine: RunEngine | null;
+  download_timeout?: number | null;
 };
 
 export type CodeBlockYAML = BlockYAMLBase & {

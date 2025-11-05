@@ -1,7 +1,4 @@
-import asyncio
-from datetime import datetime, timedelta, timezone
 from enum import Enum
-from functools import partial
 from typing import Annotated, Any
 
 import structlog
@@ -12,7 +9,7 @@ from fastapi.responses import ORJSONResponse
 from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.config import settings
-from skyvern.exceptions import BrowserSessionNotRenewable, MissingBrowserAddressError
+from skyvern.exceptions import CannotUpdateWorkflowDueToCodeCache, MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -22,33 +19,41 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
-    CANCEL_RUN_CODE_SAMPLE,
-    CREATE_WORKFLOW_CODE_SAMPLE,
+    CANCEL_RUN_CODE_SAMPLE_PYTHON,
+    CANCEL_RUN_CODE_SAMPLE_TS,
+    CREATE_WORKFLOW_CODE_SAMPLE_CURL,
     CREATE_WORKFLOW_CODE_SAMPLE_PYTHON,
-    DELETE_WORKFLOW_CODE_SAMPLE,
-    GET_RUN_CODE_SAMPLE,
-    GET_RUN_TIMELINE_CODE_SAMPLE,
-    GET_WORKFLOWS_CODE_SAMPLE,
-    RETRY_RUN_WEBHOOK_CODE_SAMPLE,
-    RUN_TASK_CODE_SAMPLE,
-    RUN_WORKFLOW_CODE_SAMPLE,
-    UPDATE_WORKFLOW_CODE_SAMPLE,
+    CREATE_WORKFLOW_CODE_SAMPLE_TS,
+    DELETE_WORKFLOW_CODE_SAMPLE_PYTHON,
+    DELETE_WORKFLOW_CODE_SAMPLE_TS,
+    GET_RUN_CODE_SAMPLE_PYTHON,
+    GET_RUN_CODE_SAMPLE_TS,
+    GET_RUN_TIMELINE_CODE_SAMPLE_PYTHON,
+    GET_RUN_TIMELINE_CODE_SAMPLE_TS,
+    GET_WORKFLOWS_CODE_SAMPLE_PYTHON,
+    GET_WORKFLOWS_CODE_SAMPLE_TS,
+    RETRY_RUN_WEBHOOK_CODE_SAMPLE_PYTHON,
+    RETRY_RUN_WEBHOOK_CODE_SAMPLE_TS,
+    RUN_TASK_CODE_SAMPLE_PYTHON,
+    RUN_TASK_CODE_SAMPLE_TS,
+    RUN_WORKFLOW_CODE_SAMPLE_PYTHON,
+    RUN_WORKFLOW_CODE_SAMPLE_TS,
+    UPDATE_WORKFLOW_CODE_SAMPLE_CURL,
     UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON,
+    UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
-from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
     Organization,
     OrganizationUpdate,
 )
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.prompts import CreateFromPromptRequest
 from skyvern.forge.sdk.schemas.task_generations import GenerateTaskRequest, TaskGeneration
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 from skyvern.forge.sdk.schemas.tasks import (
@@ -76,13 +81,13 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
+    WorkflowRunWithWorkflowResponse,
 )
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.runs import (
     CUA_ENGINES,
     BlockRunRequest,
     BlockRunResponse,
-    ProxyLocation,
     RunEngine,
     RunResponse,
     RunType,
@@ -93,6 +98,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest, WorkflowRequest, WorkflowStatus
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.services.pdf_import_service import pdf_import_service
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -111,10 +117,8 @@ class AISuggestionType(str, Enum):
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": RUN_TASK_CODE_SAMPLE,
-                    }
+                    {"sdk": "python", "code": RUN_TASK_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": RUN_TASK_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -200,7 +204,7 @@ async def run_task(
             failure_reason=task_v1_response.failure_reason,
             created_at=task_v1_response.created_at,
             modified_at=task_v1_response.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v1_response.task_id}",
             run_request=TaskRunRequest(
                 engine=run_request.engine,
                 prompt=task_v1_response.navigation_goal,
@@ -263,7 +267,7 @@ async def run_task(
             failure_reason=None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v2.workflow_run_id}",
             run_request=TaskRunRequest(
                 engine=RunEngine.skyvern_v2,
                 prompt=task_v2.prompt,
@@ -292,10 +296,8 @@ async def run_task(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {
-                        "sdk": "python",
-                        "code": RUN_WORKFLOW_CODE_SAMPLE,
-                    }
+                    {"sdk": "python", "code": RUN_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": RUN_WORKFLOW_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -335,6 +337,8 @@ async def run_workflow(
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
         browser_address=workflow_run_request.browser_address,
+        run_with=workflow_run_request.run_with,
+        ai_fallback=workflow_run_request.ai_fallback,
     )
 
     try:
@@ -364,7 +368,9 @@ async def run_workflow(
         run_request=workflow_run_request,
         downloaded_files=None,
         recording_url=None,
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
+        run_with=workflow_run.run_with,
+        ai_fallback=workflow_run.ai_fallback,
     )
 
 
@@ -376,7 +382,14 @@ async def run_workflow(
     summary="Get a run by id",
     openapi_extra={
         "x-fern-sdk-method-name": "get_run",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_RUN_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_RUN_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     responses={
         200: {"description": "Successfully got run"},
@@ -408,7 +421,14 @@ async def get_run(
     tags=["Agent", "Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "cancel_run",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": CANCEL_RUN_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": CANCEL_RUN_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Cancel a run (task or workflow)",
     summary="Cancel a run by id",
@@ -479,8 +499,9 @@ async def create_workflow_legacy(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE},
+                    {"sdk": "curl", "code": CREATE_WORKFLOW_CODE_SAMPLE_CURL},
                     {"sdk": "python", "code": CREATE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": CREATE_WORKFLOW_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -531,18 +552,21 @@ async def create_workflow(
     include_in_schema=False,
 )
 async def create_workflow_from_prompt(
-    data: TaskV2Request,
+    data: CreateFromPromptRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
 ) -> dict[str, Any]:
+    task_version = data.task_version or "v2"
+    request = data.request
+
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(
             "Overriding max steps for workflow-from-prompt",
             max_iterations_override=x_max_iterations_override,
             max_steps_override=x_max_steps_override,
         )
-    await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
+    await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=request.browser_session_id)
 
     if isinstance(x_max_iterations_override, str):
         try:
@@ -555,26 +579,70 @@ async def create_workflow_from_prompt(
             x_max_steps_override = int(x_max_steps_override)
         except ValueError:
             x_max_steps_override = None
+
     try:
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_prompt(
             organization=organization,
-            user_prompt=data.user_prompt,
-            totp_identifier=data.totp_identifier,
-            totp_verification_url=data.totp_verification_url,
-            webhook_callback_url=data.webhook_callback_url,
-            proxy_location=data.proxy_location,
-            max_screenshot_scrolling_times=data.max_screenshot_scrolls,
-            extra_http_headers=data.extra_http_headers,
+            user_prompt=request.user_prompt,
+            totp_identifier=request.totp_identifier,
+            totp_verification_url=request.totp_verification_url,
+            webhook_callback_url=request.webhook_callback_url,
+            proxy_location=request.proxy_location,
+            max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+            extra_http_headers=request.extra_http_headers,
             max_iterations=x_max_iterations_override,
             max_steps=x_max_steps_override,
-            run_with=data.run_with,
-            ai_fallback=data.ai_fallback,
+            status=WorkflowStatus.published if request.publish_workflow else WorkflowStatus.auto_generated,
+            run_with=request.run_with,
+            ai_fallback=request.ai_fallback if request.ai_fallback is not None else True,
+            task_version=task_version,
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
         raise FailedToCreateWorkflow(str(e))
 
     return workflow.model_dump(by_alias=True)
+
+
+@legacy_base_router.post(
+    "/workflows/import-pdf",
+    response_model=dict[str, Any],
+    tags=["agent"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "import_workflow_from_pdf",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {
+                        "sdk": "curl",
+                        "code": 'curl -X POST "https://api.skyvern.com/workflows/import-pdf" \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -F "file=@sop_document.pdf"',
+                    }
+                ]
+            }
+        ],
+    },
+    description="Import a workflow from a PDF containing Standard Operating Procedures",
+    summary="Import workflow from PDF",
+    responses={
+        200: {"description": "Successfully imported workflow from PDF"},
+        400: {"description": "Invalid PDF file or no content found"},
+        422: {"description": "Failed to convert SOP to workflow"},
+        500: {"description": "Internal server error during processing"},
+    },
+)
+@legacy_base_router.post(
+    "/workflows/import-pdf/",
+    response_model=dict[str, Any],
+    include_in_schema=False,
+)
+async def import_workflow_from_pdf(
+    file: UploadFile,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict[str, Any]:
+    """Import a workflow from a PDF file containing Standard Operating Procedures."""
+    analytics.capture("skyvern-oss-workflow-import-pdf")
+
+    return await pdf_import_service.import_workflow_from_pdf(file, current_org)
 
 
 @legacy_base_router.put(
@@ -606,6 +674,7 @@ async def update_workflow_legacy(
         ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    delete_code_cache_is_ok: bool = Query(False),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
     # validate the workflow
@@ -621,7 +690,13 @@ async def update_workflow_legacy(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
+            delete_code_cache_is_ok=delete_code_cache_is_ok,
         )
+    except CannotUpdateWorkflowDueToCodeCache as e:
+        raise HTTPException(
+            status_code=422,
+            detail=str(e),
+        ) from e
     except WorkflowParameterMissingRequiredValue as e:
         raise e
     except Exception as e:
@@ -642,8 +717,9 @@ async def update_workflow_legacy(
         "x-fern-examples": [
             {
                 "code-samples": [
-                    {"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE},
+                    {"sdk": "curl", "code": UPDATE_WORKFLOW_CODE_SAMPLE_CURL},
                     {"sdk": "python", "code": UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": UPDATE_WORKFLOW_CODE_SAMPLE_TS},
                 ]
             }
         ],
@@ -717,7 +793,14 @@ async def update_workflow(
     tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_workflow",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": DELETE_WORKFLOW_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": DELETE_WORKFLOW_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Delete a workflow",
     summary="Delete a workflow",
@@ -882,7 +965,14 @@ async def get_run_artifacts(
     tags=["Agent"],
     openapi_extra={
         "x-fern-sdk-method-name": "retry_run_webhook",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": RETRY_RUN_WEBHOOK_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Retry sending the webhook for a run",
     summary="Retry run webhook",
@@ -903,7 +993,14 @@ async def retry_run_webhook(
     response_model=list[WorkflowRunTimeline],
     openapi_extra={
         "x-fern-sdk-method-name": "get_run_timeline",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_RUN_TIMELINE_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_RUN_TIMELINE_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_RUN_TIMELINE_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
     description="Get timeline for a run (workflow run or task_v2 run)",
     summary="Get run timeline",
@@ -1008,7 +1105,6 @@ async def run_block(
         user_id=user_id,
         browser_session_id=browser_session_id,
         block_outputs=block_run_request.block_outputs,
-        code_gen=block_run_request.code_gen,
     )
 
     return BlockRunResponse(
@@ -1023,7 +1119,7 @@ async def run_block(
         run_request=block_run_request,
         downloaded_files=None,
         recording_url=None,
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
     )
 
 
@@ -1210,12 +1306,29 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             WorkflowRunStatus.running,
             WorkflowRunStatus.created,
             WorkflowRunStatus.queued,
+            WorkflowRunStatus.paused,
         ]:
             continue
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
 
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
     await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=x_api_key)
+
+
+async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> None:
+    workflow_run = await app.DATABASE.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        status=WorkflowRunStatus.paused,
+    )
+
+    if not workflow_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run not found {workflow_run_id}",
+        )
+
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id)
 
 
 @legacy_base_router.post(
@@ -1232,6 +1345,18 @@ async def cancel_workflow_run(
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
     await _cancel_workflow_run(workflow_run_id, current_org.organization_id, x_api_key)
+
+
+@base_router.post(
+    "/workflows/runs/{workflow_run_id}/continue",
+    include_in_schema=False,
+)
+@base_router.post("/workflows/runs/{workflow_run_id}/continue/", include_in_schema=False)
+async def continue_workflow_run(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> None:
+    await _continue_workflow_run(workflow_run_id, current_org.organization_id)
 
 
 @legacy_base_router.post(
@@ -1627,8 +1752,15 @@ async def get_workflow_runs_by_id(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        description="Search runs by parameter key, parameter description, or run parameter value.",
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
+    """
+    Get workflow runs for a specific workflow permanent id.
+    """
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
         workflow_permanent_id=workflow_id,
@@ -1636,6 +1768,7 @@ async def get_workflow_runs_by_id(
         page=page,
         page_size=page_size,
         status=status,
+        search_key=search_key,
     )
 
 
@@ -1674,6 +1807,42 @@ async def get_workflow_run_with_workflow_id(
     return_dict["browser_session_id"] = browser_session_id or return_dict.get("browser_session_id")
 
     return return_dict
+
+
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}/",
+    include_in_schema=False,
+)
+async def get_workflow_and_run_from_workflow_run_id(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowRunWithWorkflowResponse:
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run not found {workflow_run_id}",
+        )
+
+    workflow_run_status_api_response = await get_workflow_run_with_workflow_id(
+        workflow_id=workflow.workflow_permanent_id,
+        workflow_run_id=workflow_run_id,
+        current_org=current_org,
+    )
+
+    workflow_run_status_api_response["workflow"] = workflow
+
+    response = WorkflowRunWithWorkflowResponse.model_validate(workflow_run_status_api_response)
+
+    return response
 
 
 @legacy_base_router.get(
@@ -1739,7 +1908,14 @@ async def get_workflow_run(
     tags=["Workflows"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflows",
-        "x-fern-examples": [{"code-samples": [{"sdk": "python", "code": GET_WORKFLOWS_CODE_SAMPLE}]}],
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": GET_WORKFLOWS_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": GET_WORKFLOWS_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
     },
 )
 @base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
@@ -1748,14 +1924,28 @@ async def get_workflows(
     page_size: int = Query(10, ge=1),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
-    title: str = Query(""),
+    search_key: str | None = Query(
+        None,
+        description="Unified search across workflow title and parameter metadata (key, description, default_value).",
+    ),
+    title: str = Query("", deprecated=True, description="Deprecated: use search_key instead."),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
     """
     Get all workflows with the latest version for the organization.
+
+    Search semantics:
+    - If `search_key` is provided, its value is used as a unified search term for both
+      `workflows.title` and workflow parameter metadata (key, description, and default_value for
+      `WorkflowParameterModel`).
+    - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
+    - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
     """
     analytics.capture("skyvern-oss-agent-workflows-get")
+
+    # Determine the effective search term: prioritize search_key, fallback to title
+    effective_search = search_key or (title if title else None)
 
     if template:
         global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
@@ -1765,7 +1955,7 @@ async def get_workflows(
             workflow_permanent_ids=global_workflows_permanent_ids,
             page=page,
             page_size=page_size,
-            title=title,
+            search_key=effective_search or "",
             statuses=[WorkflowStatus.published, WorkflowStatus.draft],
         )
         return workflows
@@ -1782,7 +1972,7 @@ async def get_workflows(
         page_size=page_size,
         only_saved_tasks=only_saved_tasks,
         only_workflows=only_workflows,
-        title=title,
+        search_key=effective_search,
         statuses=[WorkflowStatus.published, WorkflowStatus.draft],
     )
 
@@ -2168,241 +2358,3 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         final_workflow_run_block_timeline.extend(thought_timeline)
     final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)
     return final_workflow_run_block_timeline
-
-
-@base_router.get(
-    "/debug-session/{workflow_permanent_id}",
-    include_in_schema=False,
-)
-async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
-    workflow_permanent_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
-) -> DebugSession:
-    """
-    `current_user_id` is a unique identifier for a user, but does not map to an
-    entity in the database (at time of writing)
-
-    If the debug session does not exist, a new one will be created.
-
-    In addition, the timeout for the debug session's browser session will be
-    extended to 4 hours from the time of the request. If the browser session
-    cannot be renewed, a new one will be created and assigned to the debug
-    session. The browser_session that could not be renewed will be closed.
-    """
-
-    debug_session = await app.DATABASE.get_debug_session(
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        workflow_permanent_id=workflow_permanent_id,
-    )
-
-    if not debug_session:
-        LOG.info(
-            "Existing debug session not found, created a new one, along with a new browser session",
-            organization_id=current_org.organization_id,
-            user_id=current_user_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-
-        return await new_debug_session(
-            workflow_permanent_id,
-            current_org,
-            current_user_id,
-        )
-
-    LOG.info(
-        "Existing debug session found",
-        debug_session_id=debug_session.debug_session_id,
-        browser_session_id=debug_session.browser_session_id,
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        workflow_permanent_id=workflow_permanent_id,
-    )
-
-    try:
-        await app.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session(
-            debug_session.browser_session_id,
-            current_org.organization_id,
-        )
-        return debug_session
-    except BrowserSessionNotRenewable as ex:
-        LOG.info(
-            "Browser session was non-renewable; creating a new debug session",
-            ex=str(ex),
-            debug_session_id=debug_session.debug_session_id,
-            browser_session_id=debug_session.browser_session_id,
-            organization_id=current_org.organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-            user_id=current_user_id,
-        )
-
-        return await new_debug_session(
-            workflow_permanent_id,
-            current_org,
-            current_user_id,
-        )
-
-
-@base_router.post(
-    "/debug-session/{workflow_permanent_id}/new",
-    include_in_schema=False,
-)
-async def new_debug_session(
-    workflow_permanent_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
-) -> DebugSession:
-    """
-    Create a new debug session, along with a new browser session. If any
-    existing debug sessions are found, "complete" them. Then close the browser
-    sessions associated with those completed debug sessions.
-
-    Return the new debug session.
-
-    CAVEAT: if an existing debug session for this user is <30s old, then we
-    return that instead. This is to curtail damage from browser session
-    spamming.
-    """
-
-    if current_user_id:
-        debug_session = await app.DATABASE.get_latest_debug_session_for_user(
-            organization_id=current_org.organization_id,
-            user_id=current_user_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-
-        if debug_session:
-            now = datetime.now(timezone.utc)
-            created_at_utc = (
-                debug_session.created_at.replace(tzinfo=timezone.utc)
-                if debug_session.created_at.tzinfo is None
-                else debug_session.created_at
-            )
-            if now - created_at_utc < timedelta(seconds=30):
-                LOG.info(
-                    "Existing debug session is less than 30s old, returning it",
-                    debug_session_id=debug_session.debug_session_id,
-                    browser_session_id=debug_session.browser_session_id,
-                    organization_id=current_org.organization_id,
-                    user_id=current_user_id,
-                    workflow_permanent_id=workflow_permanent_id,
-                )
-                return debug_session
-
-    completed_debug_sessions = await app.DATABASE.complete_debug_sessions(
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        workflow_permanent_id=workflow_permanent_id,
-    )
-
-    LOG.info(
-        f"Completed {len(completed_debug_sessions)} pre-existing debug session(s)",
-        num_completed_debug_sessions=len(completed_debug_sessions),
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        workflow_permanent_id=workflow_permanent_id,
-    )
-
-    if completed_debug_sessions:
-        closeable_browser_sessions: list[PersistentBrowserSession] = []
-
-        for debug_session in completed_debug_sessions:
-            try:
-                browser_session = await app.DATABASE.get_persistent_browser_session(
-                    debug_session.browser_session_id,
-                    current_org.organization_id,
-                )
-            except NotFoundError:
-                browser_session = None
-
-            if browser_session and browser_session.completed_at is None:
-                closeable_browser_sessions.append(browser_session)
-
-        LOG.info(
-            f"Closing browser {len(closeable_browser_sessions)} browser session(s)",
-            organization_id=current_org.organization_id,
-            user_id=current_user_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-
-        def handle_close_browser_session_error(
-            browser_session_id: str,
-            organization_id: str,
-            task: asyncio.Task,
-        ) -> None:
-            if task.exception():
-                LOG.error(
-                    f"Failed to close session: {task.exception()}",
-                    browser_session_id=browser_session_id,
-                    organization_id=organization_id,
-                )
-
-        for browser_session in closeable_browser_sessions:
-            LOG.info(
-                "Closing existing browser session for debug session",
-                browser_session_id=browser_session.persistent_browser_session_id,
-                organization_id=current_org.organization_id,
-            )
-
-            # NOTE(jdo): these may fail to actually close on infra, but the user
-            # wants (and should get) a new session regardless - so we will just
-            # log the error and continue
-            task = asyncio.create_task(
-                app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                    current_org.organization_id,
-                    browser_session.persistent_browser_session_id,
-                )
-            )
-
-            task.add_done_callback(
-                partial(
-                    handle_close_browser_session_error,
-                    browser_session.persistent_browser_session_id,
-                    current_org.organization_id,
-                )
-            )
-
-    new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-        organization_id=current_org.organization_id,
-        timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-    )
-
-    debug_session = await app.DATABASE.create_debug_session(
-        browser_session_id=new_browser_session.persistent_browser_session_id,
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        workflow_permanent_id=workflow_permanent_id,
-        vnc_streaming_supported=True if new_browser_session.ip_address else False,
-    )
-
-    LOG.info(
-        "Created new debug session",
-        debug_session_id=debug_session.debug_session_id,
-        browser_session_id=new_browser_session.persistent_browser_session_id,
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        workflow_permanent_id=workflow_permanent_id,
-    )
-
-    return debug_session
-
-
-@base_router.get(
-    "/debug-session/{workflow_permanent_id}/block-outputs",
-    response_model=dict[str, dict[str, Any]],
-    include_in_schema=False,
-)
-async def get_block_outputs_for_debug_session(
-    workflow_permanent_id: str,
-    version: int | None = None,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
-) -> dict[str, dict[str, Any]]:
-    return await app.WORKFLOW_SERVICE.get_block_outputs_for_debug_session(
-        workflow_permanent_id=workflow_permanent_id,
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        version=version,
-    )

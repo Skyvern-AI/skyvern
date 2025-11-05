@@ -31,6 +31,7 @@ import {
   TextPromptBlockYAML,
   UploadToS3BlockYAML,
   ValidationBlockYAML,
+  HumanInteractionBlockYAML,
   NavigationBlockYAML,
   WorkflowCreateYAMLRequest,
   ExtractionBlockYAML,
@@ -87,6 +88,10 @@ import {
   isValidationNode,
   validationNodeDefaultData,
 } from "./nodes/ValidationNode/types";
+import {
+  isHumanInteractionNode,
+  humanInteractionNodeDefaultData,
+} from "./nodes/HumanInteractionNode/types";
 import { actionNodeDefaultData, isActionNode } from "./nodes/ActionNode/types";
 import {
   isNavigationNode,
@@ -245,6 +250,7 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+          disableCache: block.disable_cache ?? false,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           includeActionHistoryInVerification:
@@ -263,6 +269,8 @@ function convertToNode(
           prompt: block.prompt,
           url: block.url ?? "",
           maxSteps: block.max_steps,
+          cacheActions: block.cache_actions ?? false,
+          disableCache: block.disable_cache ?? false,
           totpIdentifier: block.totp_identifier,
           totpVerificationUrl: block.totp_verification_url,
           maxScreenshotScrolls: null,
@@ -280,6 +288,7 @@ function convertToNode(
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: block.parameters.map((p) => p.key),
+          disableCache: block.disable_cache ?? false,
         },
       };
     }
@@ -300,6 +309,7 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+          disableCache: block.disable_cache ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
@@ -321,12 +331,31 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+          disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           engine: block.engine ?? RunEngine.SkyvernV1,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
+        },
+      };
+    }
+    case "human_interaction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "human_interaction",
+        data: {
+          ...commonData,
+          instructions: block.instructions,
+          positiveDescriptor: block.positive_descriptor,
+          negativeDescriptor: block.negative_descriptor,
+          timeoutSeconds: block.timeout_seconds,
+          recipients: block.recipients.join(", "),
+          subject: block.subject,
+          body: block.body,
+          sender: block.sender,
         },
       };
     }
@@ -347,6 +376,7 @@ function convertToNode(
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           cacheActions: block.cache_actions,
+          disableCache: block.disable_cache ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
@@ -366,6 +396,7 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+          disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
@@ -400,8 +431,10 @@ function convertToNode(
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           cacheActions: block.cache_actions,
+          disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           engine: block.engine ?? RunEngine.SkyvernV1,
+          downloadTimeout: block.download_timeout ?? null, // seconds
         },
       };
     }
@@ -821,6 +854,17 @@ function createNode(
         },
       };
     }
+    case "human_interaction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "human_interaction",
+        data: {
+          ...humanInteractionNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "action": {
       return {
         ...identifiers,
@@ -1064,6 +1108,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        disable_cache: node.data.disableCache ?? false,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
         engine: node.data.engine,
@@ -1078,6 +1123,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         url: node.data.url,
+        disable_cache: node.data.disableCache ?? false,
       };
     }
     case "validation": {
@@ -1091,6 +1137,22 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
           string
         > | null,
         parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "human_interaction": {
+      return {
+        ...base,
+        block_type: "human_interaction",
+        instructions: node.data.instructions,
+        positive_descriptor: node.data.positiveDescriptor,
+        negative_descriptor: node.data.negativeDescriptor,
+        timeout_seconds: node.data.timeoutSeconds,
+        recipients: node.data.recipients
+          .split(",")
+          .map((recipient) => recipient.trim()),
+        subject: node.data.subject,
+        body: node.data.body,
+        sender: node.data.sender === "" ? EMAIL_BLOCK_SENDER : node.data.sender,
       };
     }
     case "action": {
@@ -1113,6 +1175,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
       };
     }
@@ -1137,6 +1200,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
         engine: node.data.engine,
@@ -1158,6 +1222,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         max_steps_per_run: node.data.maxStepsOverride,
         parameter_keys: node.data.parameterKeys,
         cache_actions: node.data.cacheActions,
+        disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
       };
     }
@@ -1180,6 +1245,7 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
         engine: node.data.engine,
@@ -1212,7 +1278,9 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
         cache_actions: node.data.cacheActions,
+        disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
+        download_timeout: node.data.downloadTimeout, // seconds
       };
     }
     case "sendEmail": {
@@ -1324,7 +1392,9 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
       };
     }
     default: {
-      throw new Error("Invalid node type for getWorkflowBlock");
+      throw new Error(
+        `Invalid node type, '${node.type}', for getWorkflowBlock`,
+      );
     }
   }
 }
@@ -1441,7 +1511,10 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
-      extraHttpHeaders: data.extraHttpHeaders,
+      extraHttpHeaders:
+        data.extraHttpHeaders && typeof data.extraHttpHeaders === "object"
+          ? JSON.stringify(data.extraHttpHeaders)
+          : data.extraHttpHeaders,
       runWith: data.runWith,
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
@@ -1858,6 +1931,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          disable_cache: block.disable_cache ?? false,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
           engine: block.engine,
@@ -1873,6 +1947,7 @@ function convertBlocksToBlockYAML(
           max_steps: block.max_steps,
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
+          disable_cache: block.disable_cache ?? false,
         };
         return blockYaml;
       }
@@ -1884,6 +1959,23 @@ function convertBlocksToBlockYAML(
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "human_interaction": {
+        const blockYaml: HumanInteractionBlockYAML = {
+          ...base,
+          block_type: "human_interaction",
+          // --
+          instructions: block.instructions,
+          positive_descriptor: block.positive_descriptor,
+          negative_descriptor: block.negative_descriptor,
+          timeout_seconds: block.timeout_seconds,
+          // --
+          sender: block.sender,
+          recipients: block.recipients,
+          subject: block.subject,
+          body: block.body,
         };
         return blockYaml;
       }
@@ -1902,6 +1994,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          disable_cache: block.disable_cache ?? false,
           engine: block.engine,
         };
         return blockYaml;
@@ -1924,6 +2017,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          disable_cache: block.disable_cache ?? false,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
           include_action_history_in_verification:
@@ -1943,6 +2037,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: block.parameters.map((p) => p.key),
           cache_actions: block.cache_actions,
+          disable_cache: block.disable_cache ?? false,
           engine: block.engine,
         };
         return blockYaml;
@@ -1961,6 +2056,7 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          disable_cache: block.disable_cache ?? false,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
           engine: block.engine,
@@ -1990,7 +2086,9 @@ function convertBlocksToBlockYAML(
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           cache_actions: block.cache_actions,
+          disable_cache: block.disable_cache ?? false,
           engine: block.engine,
+          download_timeout: null, // seconds
         };
         return blockYaml;
       }
@@ -2136,6 +2234,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
     is_saved_task: workflow.is_saved_task,
+    status: workflow.status,
     run_with: workflow.run_with,
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
@@ -2215,6 +2314,13 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
       errors.push(
         `${node.data.label}: At least one of completion or termination criteria must be provided`,
       );
+    }
+  });
+
+  const interactionNodes = nodes.filter(isHumanInteractionNode);
+  interactionNodes.forEach((node) => {
+    if (node.data.recipients.trim().length === 0) {
+      errors.push(`${node.data.label}: Recipients is required.`);
     }
   });
 

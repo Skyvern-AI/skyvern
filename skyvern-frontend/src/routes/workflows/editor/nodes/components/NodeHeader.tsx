@@ -6,7 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
-import { Timer } from "@/components/Timer";
+import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "@/components/ui/use-toast";
 import { useLogging } from "@/hooks/useLogging";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -15,8 +15,10 @@ import { useAutoplayStore } from "@/store/useAutoplayStore";
 
 import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
 import { useDeleteNodeCallback } from "@/routes/workflows/hooks/useDeleteNodeCallback";
+import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import {
   debuggableWorkflowBlockTypes,
@@ -33,7 +35,7 @@ import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
 } from "@/store/WorkflowSettingsStore";
-import { cn } from "@/util/utils";
+import { cn, formatDate, toDate } from "@/util/utils";
 import {
   statusIsAFailureType,
   statusIsFinalized,
@@ -44,6 +46,17 @@ import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
 import { workflowBlockTitle } from "../types";
+import { MicroDropdown } from "./MicroDropdown";
+
+interface Transmutations {
+  blockTitle: string;
+  self: string;
+  others: {
+    label: string;
+    reason: string;
+    nodeName: string;
+  }[];
+}
 
 interface Props {
   blockLabel: string; // today, this + wpid act as the identity of a block
@@ -52,6 +65,7 @@ interface Props {
   nodeId: string;
   totpIdentifier: string | null;
   totpUrl: string | null;
+  transmutations?: Transmutations;
   type: WorkflowBlockType;
 }
 
@@ -67,12 +81,15 @@ type Payload = Record<string, unknown> & {
   totp_url: string | null;
   webhook_url: string | null;
   workflow_id: string;
+  code_gen: boolean | null;
 };
 
 const getPayload = (opts: {
   blockLabel: string;
   blockOutputs: Record<string, unknown>;
   browserSessionId: string | null;
+  debugSessionId: string;
+  codeGen: boolean | null;
   parameters: Record<string, unknown>;
   totpIdentifier: string | null;
   totpUrl: string | null;
@@ -87,7 +104,9 @@ const getPayload = (opts: {
     extraHttpHeaders =
       opts.workflowSettings.extraHttpHeaders === null
         ? null
-        : JSON.parse(opts.workflowSettings.extraHttpHeaders);
+        : typeof opts.workflowSettings.extraHttpHeaders === "object"
+          ? opts.workflowSettings.extraHttpHeaders
+          : JSON.parse(opts.workflowSettings.extraHttpHeaders);
   } catch (e: unknown) {
     toast({
       variant: "warning",
@@ -116,6 +135,8 @@ const getPayload = (opts: {
     block_labels: [opts.blockLabel],
     block_outputs: opts.blockOutputs,
     browser_session_id: opts.browserSessionId,
+    debug_session_id: opts.debugSessionId,
+    code_gen: opts.codeGen,
     extra_http_headers: extraHttpHeaders,
     max_screenshot_scrolls: opts.workflowSettings.maxScreenshotScrollingTimes,
     parameters: opts.parameters,
@@ -136,6 +157,7 @@ function NodeHeader({
   nodeId,
   totpIdentifier,
   totpUrl,
+  transmutations,
   type,
 }: Props) {
   const log = useLogging();
@@ -154,6 +176,7 @@ function NodeHeader({
   });
   const blockTitle = workflowBlockTitle[type];
   const deleteNodeCallback = useDeleteNodeCallback();
+  const transmuteNodeCallback = useTransmuteNodeCallback();
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
@@ -167,6 +190,9 @@ function NodeHeader({
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
   });
+  const { data: workflow } = useWorkflowQuery({
+    workflowPermanentId,
+  });
   const saveWorkflow = useWorkflowSave();
 
   const thisBlockIsPlaying =
@@ -176,13 +202,6 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     urlBlockLabel !== undefined && urlBlockLabel === blockLabel;
-
-  const timerDurationOverride =
-    workflowRun && workflowRun.finished_at
-      ? new Date(workflowRun.finished_at).getTime() -
-        new Date(workflowRun.created_at).getTime() +
-        3500
-      : null;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -202,7 +221,7 @@ function NodeHeader({
     ) {
       setAutoplay(null, null);
       setTimeout(() => {
-        runBlock.mutateAsync();
+        runBlock.mutateAsync({ codeGen: true });
       }, 100);
     }
 
@@ -260,7 +279,7 @@ function NodeHeader({
   ]);
 
   const runBlock = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (opts?: { codeGen: boolean }) => {
       closeWorkflowPanel();
 
       await saveWorkflow.mutateAsync();
@@ -313,6 +332,8 @@ function NodeHeader({
         blockOutputs:
           blockOutputsStore.getOutputsWithOverrides(workflowPermanentId),
         browserSessionId: debugSession.browser_session_id,
+        debugSessionId: debugSession.debug_session_id,
+        codeGen: opts?.codeGen ?? false,
         parameters,
         totpIdentifier,
         totpUrl,
@@ -452,23 +473,40 @@ function NodeHeader({
   });
 
   const handleOnPlay = () => {
-    runBlock.mutate();
+    const numBlocksInWorkflow = (workflow?.workflow_definition.blocks ?? [])
+      .length;
+
+    runBlock.mutate({ codeGen: numBlocksInWorkflow === 1 });
   };
 
   const handleOnCancel = () => {
     cancelBlock.mutate();
   };
 
+  const isRunning = workflowRun ? statusIsRunningOrQueued(workflowRun) : false;
+  const createdAt = toDate(workflowRun?.created_at ?? "", null);
+  const finishedAt = toDate(workflowRun?.finished_at ?? "", null);
+  const dt = finishedAt
+    ? formatDate(finishedAt)
+    : createdAt
+      ? formatDate(createdAt)
+      : null;
+
   return (
     <>
-      {thisBlockIsTargetted && (
-        <div className="flex w-full animate-[auto-height_1s_ease-in-out_forwards] items-center justify-between overflow-hidden">
-          <div className="pb-4">
-            <Timer override={timerDurationOverride ?? undefined} />
+      {thisBlockIsTargetted ? (
+        <div className="flex w-full animate-[auto-height_1s_ease-in-out_forwards] items-center justify-between overflow-hidden pb-4 pt-1">
+          {isRunning ? (
+            <div>
+              <ReloadIcon className="animate-spin" />
+            </div>
+          ) : null}
+          {dt ? <div className="text-sm opacity-70">{dt}</div> : <span />}
+          <div>
+            <StatusBadge status={workflowRun?.status ?? "pending"} />
           </div>
-          <div className="pb-4">{workflowRun?.status ?? "pending"}</div>
         </div>
-      )}
+      ) : null}
 
       <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
         <div
@@ -487,7 +525,34 @@ function NodeHeader({
               titleClassName="text-base"
               inputClassName="text-base"
             />
-            <span className="text-xs text-slate-400">{blockTitle}</span>
+
+            {transmutations && transmutations.others.length ? (
+              <div className="flex items-center gap-1">
+                <span className="text-xs text-slate-400">
+                  {transmutations.blockTitle}
+                </span>
+                <MicroDropdown
+                  selections={[
+                    transmutations.self,
+                    ...transmutations.others.map((t) => t.label),
+                  ]}
+                  selected={transmutations.self}
+                  onChange={(label) => {
+                    const transmutation = transmutations.others.find(
+                      (t) => t.label === label,
+                    );
+
+                    if (!transmutation) {
+                      return;
+                    }
+
+                    transmuteNodeCallback(nodeId, transmutation.nodeName);
+                  }}
+                />
+              </div>
+            ) : (
+              <span className="text-xs text-slate-400">{blockTitle}</span>
+            )}
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">

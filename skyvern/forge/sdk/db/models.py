@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
+    generate_browser_profile_id,
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
@@ -109,6 +110,7 @@ class TaskModel(Base):
     )
     model = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
+    download_timeout = Column(Numeric, nullable=True)
 
 
 class StepModel(Base):
@@ -287,11 +289,13 @@ class WorkflowRunModel(Base):
     extra_http_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
-    job_id = Column(String, nullable=True)
+    job_id = Column(String, nullable=True, index=True)
+    depends_on_workflow_run_id = Column(String, nullable=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
     ai_fallback = Column(Boolean, nullable=True)
+    code_gen = Column(Boolean, nullable=True)
 
     queued_at = Column(DateTime, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -576,7 +580,10 @@ class AISuggestionModel(Base):
 
 class TOTPCodeModel(Base):
     __tablename__ = "totp_codes"
-    __table_args__ = (Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_totp_codes_org_created_at", "organization_id", "created_at"),
+        Index("ix_totp_codes_otp_type", "organization_id", "otp_type"),
+    )
 
     totp_code_id = Column(String, primary_key=True, default=generate_totp_code_id)
     totp_identifier = Column(String, nullable=False, index=True)
@@ -590,6 +597,7 @@ class TOTPCodeModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     expired_at = Column(DateTime, index=True)
+    otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
 
 
 class ActionModel(Base):
@@ -672,6 +680,11 @@ class WorkflowRunBlockModel(Base):
     http_request_parameters = Column(JSON, nullable=True)
     http_request_timeout = Column(Integer, nullable=True)
     http_request_follow_redirects = Column(Boolean, nullable=True)
+
+    # human interaction block
+    instructions = Column(String, nullable=True)
+    positive_descriptor = Column(String, nullable=True)
+    negative_descriptor = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -772,6 +785,23 @@ class PersistentBrowserSessionModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class BrowserProfileModel(Base):
+    __tablename__ = "browser_profiles"
+    __table_args__ = (
+        Index("idx_browser_profiles_org", "organization_id"),
+        Index("idx_browser_profiles_org_name", "organization_id", "name"),
+        UniqueConstraint("organization_id", "name", name="uc_org_browser_profile_name"),
+    )
+
+    browser_profile_id = Column(String, primary_key=True, default=generate_browser_profile_id)
+    organization_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class TaskRunModel(Base):
     __tablename__ = "task_runs"
     __table_args__ = (
@@ -804,6 +834,7 @@ class OrganizationBitwardenCollectionModel(Base):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
 
 
 class CredentialModel(Base):
@@ -811,10 +842,16 @@ class CredentialModel(Base):
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
+    vault_type = Column(String, nullable=True)
     item_id = Column(String, nullable=True)
 
     name = Column(String, nullable=False)
     credential_type = Column(String, nullable=False)
+    username = Column(String, nullable=True)
+    totp_type = Column(String, nullable=False, default="none")
+    totp_identifier = Column(String, nullable=True, default=None)
+    card_last4 = Column(String, nullable=True)
+    card_brand = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -955,6 +992,9 @@ class ScriptBlockModel(Base):
     script_revision_id = Column(String, nullable=False, index=True)
     script_block_label = Column(String, nullable=False)
     script_file_id = Column(String, nullable=True)
+    run_signature = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
+    workflow_run_block_id = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

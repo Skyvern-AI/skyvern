@@ -25,6 +25,7 @@ from pydantic import BaseModel, PrivateAttr
 from skyvern.config import settings
 from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME, SKYVERN_DIR
 from skyvern.exceptions import (
+    EmptyBrowserContext,
     FailedToNavigateToUrl,
     FailedToReloadPage,
     FailedToStopLoadingPage,
@@ -70,12 +71,14 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
     browser_context.on("console", browser_console_log)
 
 
-def set_download_file_listener(browser_context: BrowserContext, **kwargs: Any) -> None:
+def set_download_file_listener(
+    browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
+) -> None:
     async def listen_to_download(download: Download) -> None:
         workflow_run_id = kwargs.get("workflow_run_id")
         task_id = kwargs.get("task_id")
         try:
-            async with asyncio.timeout(BROWSER_DOWNLOAD_TIMEOUT):
+            async with asyncio.timeout(download_timeout or BROWSER_DOWNLOAD_TIMEOUT):
                 file_path = await download.path()
                 if file_path.suffix:
                     return
@@ -417,6 +420,13 @@ async def _create_headless_chromium(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -445,6 +455,13 @@ async def _create_headful_chromium(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     user_data_dir = make_temp_directory(prefix="skyvern_browser_")
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -501,6 +518,13 @@ async def _create_cdp_connection_browser(
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if browser_address := kwargs.get("browser_address"):
+        return await _connect_to_cdp_browser(
+            playwright,
+            remote_browser_url=str(browser_address),
+            extra_http_headers=extra_http_headers,
+        )
+
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
 
@@ -548,13 +572,20 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
+    return await _connect_to_cdp_browser(playwright, settings.BROWSER_REMOTE_DEBUGGING_URL, extra_http_headers)
+
+
+async def _connect_to_cdp_browser(
+    playwright: Playwright,
+    remote_browser_url: str,
+    extra_http_headers: dict[str, str] | None = None,
+) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     browser_args = BrowserContextFactory.build_browser_args(extra_http_headers=extra_http_headers)
 
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
     )
 
-    remote_browser_url = settings.BROWSER_REMOTE_DEBUGGING_URL
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
     browser = await playwright.chromium.connect_over_cdp(remote_browser_url)
 
@@ -659,13 +690,9 @@ class BrowserState:
             page: Page | None = None
             use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
-                pages = [
-                    http_page
-                    for http_page in self.browser_context.pages
-                    if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
-                ]
+                pages = await self.list_valid_pages()
                 if len(pages) > 0:
-                    page = pages[0]
+                    page = pages[-1]
                     use_existing_page = True
             if page is None:
                 page = await self.browser_context.new_page()
@@ -674,7 +701,7 @@ class BrowserState:
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url:
+            if url and page.url.rstrip("/") != url.rstrip("/"):
                 await self.navigate_to_url(page=page, url=url)
 
     async def navigate_to_url(self, page: Page, url: str, retry_times: int = NAVIGATION_MAX_RETRY_TIME) -> None:
@@ -718,14 +745,34 @@ class BrowserState:
     async def get_working_page(self) -> Page | None:
         # HACK: currently, assuming the last page is always the working page.
         # Need to refactor this logic when we want to manipulate multi pages together
-        if self.__page is None or self.browser_context is None or len(self.browser_context.pages) == 0:
+        # TODO: do not use index of pages, it should be more robust if we want to fully support multi pages manipulation
+        if self.__page is None or self.browser_context is None:
             return None
 
-        last_page = self.browser_context.pages[-1]
+        # pick the last and http/https page as the working page
+        pages = await self.list_valid_pages()
+        if len(pages) == 0:
+            LOG.info("No http, https or blank page found in the browser context, return None")
+            return None
+
+        last_page = pages[-1]
         if self.__page == last_page:
             return self.__page
-        await self.set_working_page(last_page, len(self.browser_context.pages) - 1)
+        await self.set_working_page(last_page, len(pages) - 1)
         return last_page
+
+    async def list_valid_pages(self) -> list[Page]:
+        # List all valid pages(blank page, and http/https page) in the browser context
+        # MSEdge CDP bug(?)
+        # when using CDP connect to a MSEdge, the download hub will be included in the context.pages
+        if self.browser_context is None:
+            return []
+
+        return [
+            http_page
+            for http_page in self.browser_context.pages
+            if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
+        ]
 
     async def validate_browser_context(self, page: Page) -> bool:
         # validate the content
@@ -868,6 +915,11 @@ class BrowserState:
         except Exception as e:
             LOG.exception(f"Error while stop loading the page: {repr(e)}")
             raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))
+
+    async def new_page(self) -> Page:
+        if self.browser_context is None:
+            raise EmptyBrowserContext()
+        return await self.browser_context.new_page()
 
     async def reload_page(self) -> None:
         page = await self.__assert_page()
