@@ -14,37 +14,39 @@ spec:
         app: skyvern-frontend
     spec:
       containers:
-        - name: skyvern-frontend
-          image: public.ecr.aws/skyvern/skyvern-ui:latest
-          ports:
-            - containerPort: 8080
-            - containerPort: 9090
-          envFrom:
-            - secretRef:
-                name: skyvern-frontend-env
-          volumeMounts:
-            - name: artifacts
-              mountPath: /data/artifacts
-            - name: videos
-              mountPath: /data/videos
-            - name: har
-              mountPath: /data/har
-            - name: streamlit
-              mountPath: /app/.streamlit
-      volumes:
+      - name: skyvern-frontend
+        image: public.ecr.aws/skyvern/skyvern-ui:latest
+        ports:
+        - containerPort: 8080
+        - containerPort: 9090
+        envFrom:
+        - secretRef:
+            name: skyvern-frontend-env
+        volumeMounts:
         - name: artifacts
-          hostPath:
-            path: /data/artifacts
-            type: DirectoryOrCreate
+          mountPath: /data/artifacts
         - name: videos
-          hostPath:
-            path: /data/videos
-            type: DirectoryOrCreate
+          mountPath: /data/videos
         - name: har
-          hostPath:
-            path: /data/har
-            type: DirectoryOrCreate
+          mountPath: /data/har
         - name: streamlit
-          hostPath:
-            path: /app/.streamlit
-            type: DirectoryOrCreate
+          mountPath: /app/.streamlit
+        securityContext:
+          allowPrivilegeEscalation: false
+      volumes:
+      - name: artifacts
+        hostPath:
+          path: /data/artifacts
+          type: DirectoryOrCreate
+      - name: videos
+        hostPath:
+          path: /data/videos
+          type: DirectoryOrCreate
+      - name: har
+        hostPath:
+          path: /data/har
+          type: DirectoryOrCreate
+      - name: streamlit
+        hostPath:
+          path: /app/.streamlit
+          type: DirectoryOrCreate
