@@ -9,10 +9,10 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useFirstParam } from "@/hooks/useFirstParam";
 
 function TaskParameters() {
-  const { taskId } = useParams();
+  const taskId = useFirstParam("taskId", "runId");
   const credentialGetter = useCredentialGetter();
   const {
     data: task,

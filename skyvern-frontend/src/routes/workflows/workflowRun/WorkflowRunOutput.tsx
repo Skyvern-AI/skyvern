@@ -1,6 +1,6 @@
 import { FileIcon } from "@radix-ui/react-icons";
 import { CodeEditor } from "../components/CodeEditor";
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useActiveWorkflowRunItem } from "./useActiveWorkflowRunItem";
 import {
   hasExtractedInformation,
@@ -17,7 +17,7 @@ function WorkflowRunOutput() {
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
   const [activeItem] = useActiveWorkflowRunItem();
-  const { data: workflowRun } = useWorkflowRunQuery();
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
 
   if (workflowRunTimelineIsLoading) {
     return <div>Loading...</div>;
