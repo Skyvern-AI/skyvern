@@ -1948,6 +1948,23 @@ class AgentDB:
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
 
+    async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:
+        async with self.Session() as session:
+            workflow_run = (
+                await session.scalars(
+                    select(WorkflowRunModel)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run:
+                workflow_run.failure_reason = None
+                await session.commit()
+                await session.refresh(workflow_run)
+                return convert_to_workflow_run(workflow_run)
+            else:
+                raise NotFoundError("Workflow run not found")
+
     async def get_all_runs(
         self,
         organization_id: str,
