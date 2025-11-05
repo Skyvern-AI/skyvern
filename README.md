@@ -10,7 +10,7 @@
  <br />
 </h1>
 <p align="center">
-🐉 Automate Browser-based workflows using LLMs and Computer Vision 🐉
+🐉 Automate Browser based workflows using LLMs and Computer Vision 🐉
 </p>
 <p align="center">
   <a href="https://www.skyvern.com/"><img src="https://img.shields.io/badge/Website-blue?logo=googlechrome&logoColor=black"/></a>
