@@ -12,6 +12,7 @@ class SdkActionType(str, Enum):
     AI_CLICK = "ai_click"
     AI_INPUT_TEXT = "ai_input_text"
     AI_SELECT_OPTION = "ai_select_option"
+    AI_ACT = "ai_act"
     EXTRACT = "extract"
 
 
@@ -37,7 +38,7 @@ class InputTextAction(SdkActionBase):
     """Input text action parameters."""
 
     type: Literal["ai_input_text"] = "ai_input_text"
-    selector: str = Field(default="", description="CSS selector for the element")
+    selector: str | None = Field(default="", description="CSS selector for the element")
     value: str = Field(default="", description="Value to input")
     intention: str = Field(default="", description="The intention or goal of the input")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
@@ -57,6 +58,14 @@ class SelectOptionAction(SdkActionBase):
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
 
 
+class ActAction(SdkActionBase):
+    """AI act action parameters."""
+
+    type: Literal["ai_act"] = "ai_act"
+    intention: str = Field(default="", description="Natural language prompt for the action")
+    data: str | dict[str, Any] | None = Field(None, description="Additional context data")
+
+
 class ExtractAction(SdkActionBase):
     """Extract data action parameters."""
 
@@ -70,7 +79,7 @@ class ExtractAction(SdkActionBase):
 
 # Discriminated union of all action types
 SdkAction = Annotated[
-    Union[ClickAction, InputTextAction, SelectOptionAction, ExtractAction],
+    Union[ClickAction, InputTextAction, SelectOptionAction, ActAction, ExtractAction],
     Field(discriminator="type"),
 ]
 

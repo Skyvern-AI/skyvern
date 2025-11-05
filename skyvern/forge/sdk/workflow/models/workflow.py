@@ -203,3 +203,7 @@ class WorkflowRunResponseBase(BaseModel):
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
     errors: list[dict[str, Any]] | None = None
+
+
+class WorkflowRunWithWorkflowResponse(WorkflowRunResponseBase):
+    workflow: Workflow

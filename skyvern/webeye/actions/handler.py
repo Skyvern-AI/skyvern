@@ -2377,7 +2377,7 @@ async def choose_auto_completion_dropdown(
     try:
         await skyvern_element.press_fill(text)
         # wait for new elemnts to load
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]

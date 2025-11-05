@@ -20,7 +20,7 @@ class SkyvernPageAi(Protocol):
 
     async def ai_input_text(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         intention: str,
         data: str | dict[str, Any] | None = None,
@@ -33,7 +33,7 @@ class SkyvernPageAi(Protocol):
 
     async def ai_upload_file(
         self,
-        selector: str,
+        selector: str | None,
         files: str,
         intention: str,
         data: str | dict[str, Any] | None = None,
@@ -62,4 +62,11 @@ class SkyvernPageAi(Protocol):
         data: str | dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
+        ...
+
+    async def ai_act(
+        self,
+        prompt: str,
+    ) -> None:
+        """Perform an action on the page using AI based on a natural language prompt."""
         ...

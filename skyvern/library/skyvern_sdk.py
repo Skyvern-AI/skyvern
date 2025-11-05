@@ -6,6 +6,7 @@ from playwright.async_api import Playwright, async_playwright
 
 from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
 from skyvern.library.constants import DEFAULT_CDP_PORT
+from skyvern.library.local_server_runner import ensure_local_server_running
 from skyvern.library.skyvern_browser import SkyvernBrowser
 
 
@@ -19,7 +20,7 @@ class SkyvernSdk:
     Example:
         ```python
         # Initialize with environment and API key
-        skyvern = SkyvernSdk(environment=SkyvernEnvironment.PRODUCTION, api_key="your-api-key")
+        skyvern = SkyvernSdk(environment=SkyvernEnvironment.CLOUD, api_key="your-api-key")
 
         # Launch a local browser
         browser = await skyvern.launch_local_browser(headless=False)
@@ -66,7 +67,7 @@ class SkyvernSdk:
     def __init__(
         self,
         *,
-        environment: SkyvernEnvironment = SkyvernEnvironment.DEVELOPMENT,
+        environment: SkyvernEnvironment = SkyvernEnvironment.LOCAL,
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
@@ -76,7 +77,7 @@ class SkyvernSdk:
         """Initialize the Skyvern SDK client.
 
         Args:
-            environment: The Skyvern environment to connect to (LOCAL or PRODUCTION).
+            environment: The Skyvern environment to connect to (LOCAL or CLOUD).
             base_url: Custom base URL for the Skyvern API. Overrides environment setting.
             api_key: Skyvern API key. If not provided, loads from SKYVERN_API_KEY environment variable.
             timeout: HTTP request timeout in seconds.
@@ -87,15 +88,17 @@ class SkyvernSdk:
             Exception: If no API key is provided and no .env file exists.
         """
 
+        self._environment = environment
+
         if api_key is None:
             if os.path.exists(".env"):
                 load_dotenv(".env")
+            elif environment == SkyvernEnvironment.LOCAL:
+                raise ValueError("Please run `skyvern quickstart` to set up your local Skyvern environment")
 
             env_key = os.getenv("SKYVERN_API_KEY")
             if not env_key:
-                raise ValueError(
-                    "SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in environment/.env."
-                )
+                raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
             self._api_key = env_key
         else:
             self._api_key = api_key
@@ -110,6 +113,7 @@ class SkyvernSdk:
         )
 
         self._playwright: Playwright | None = None
+        self._verified_has_server: bool = False
 
     @property
     def api(self) -> AsyncSkyvern:
@@ -136,7 +140,7 @@ class SkyvernSdk:
         )
         browser_address = f"http://localhost:{port}"
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        return SkyvernBrowser(browser_context, self._api, browser_address=browser_address)
+        return SkyvernBrowser(self, browser_context, browser_address=browser_address)
 
     async def connect_to_browser_over_cdp(self, cdp_url: str) -> SkyvernBrowser:
         """Connect to an existing browser instance via Chrome DevTools Protocol (CDP).
@@ -153,7 +157,7 @@ class SkyvernSdk:
         playwright = await self._get_playwright()
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        return SkyvernBrowser(browser_context, self._api, browser_address=cdp_url)
+        return SkyvernBrowser(self, browser_context, browser_address=cdp_url)
 
     async def connect_to_cloud_browser_session(self, browser_session_id: str) -> SkyvernBrowser:
         """Connect to an existing cloud-hosted browser session by ID.
@@ -196,6 +200,15 @@ class SkyvernSdk:
             browser_session = await self._api.create_browser_session()
         return await self._connect_to_cloud_browser_session(browser_session)
 
+    async def ensure_has_server(self) -> None:
+        if self._verified_has_server:
+            return
+
+        if self._environment == SkyvernEnvironment.LOCAL:
+            await ensure_local_server_running()
+
+        self._verified_has_server = True
+
     async def _connect_to_cloud_browser_session(self, browser_session: BrowserSessionResponse) -> SkyvernBrowser:
         if browser_session.browser_address is None:
             raise Exception(f"Browser address is missing for session {browser_session.browser_session_id}")
@@ -205,7 +218,7 @@ class SkyvernSdk:
             browser_session.browser_address, headers={"x-api-key": self._api_key}
         )
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        return SkyvernBrowser(browser_context, self._api, browser_session_id=browser_session.browser_session_id)
+        return SkyvernBrowser(self, browser_context, browser_session_id=browser_session.browser_session_id)
 
     async def _get_playwright(self) -> Playwright:
         if self._playwright is None:

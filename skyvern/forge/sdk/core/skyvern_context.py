@@ -55,6 +55,10 @@ class SkyvernContext:
     # next blocks won't consider the page as a magic link page
     magic_link_pages: dict[str, Page] = field(default_factory=dict)
 
+    # parallel verification optimization
+    # stores pre-scraped data for next step to avoid re-scraping
+    next_step_pre_scraped_data: dict[str, Any] | None = None
+
     """
     Example output value:
     {"loop_value": "str", "output_parameter": "the key of the parameter", "output_value": Any}

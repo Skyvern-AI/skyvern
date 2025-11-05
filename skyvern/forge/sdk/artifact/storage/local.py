@@ -207,6 +207,35 @@ class LocalStorage(BaseStorage):
             return None
         return str(stored_folder_path)
 
+    async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
+        """Store browser profile locally."""
+        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / "profiles" / profile_id
+        if directory == str(stored_folder_path):
+            return
+        self._create_directories_if_not_exists(stored_folder_path)
+        LOG.info(
+            "Storing browser profile locally",
+            organization_id=organization_id,
+            profile_id=profile_id,
+            directory=directory,
+            browser_profile_path=stored_folder_path,
+        )
+
+        for root, _, files in os.walk(directory):
+            for file in files:
+                source_file_path = Path(root) / file
+                relative_path = source_file_path.relative_to(directory)
+                target_file_path = stored_folder_path / relative_path
+                self._create_directories_if_not_exists(target_file_path)
+                shutil.copy2(source_file_path, target_file_path)
+
+    async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
+        """Retrieve browser profile from local storage."""
+        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / "profiles" / profile_id
+        if not stored_folder_path.exists():
+            return None
+        return str(stored_folder_path)
+
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         pass
 

@@ -7,7 +7,7 @@ from skyvern.client import GetRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.config import settings
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
-from skyvern.library.SdkSkyvernPageAi import SdkSkyvernPageAi
+from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.library.skyvern_locator import SkyvernLocator
 from skyvern.webeye.actions import handler_utils
 
@@ -67,6 +67,7 @@ class SkyvernPageRun:
             TaskRunResponse containing the task execution results.
         """
 
+        await self._browser.sdk.ensure_has_server()
         task_run = await self._browser.client.run_task(
             prompt=prompt,
             engine=engine,
@@ -125,6 +126,7 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the login workflow execution results.
         """
 
+        await self._browser.sdk.ensure_has_server()
         workflow_run = await self._browser.client.login(
             credential_type=credential_type,
             url=url or self._get_page_url(),
@@ -171,6 +173,8 @@ class SkyvernPageRun:
         Returns:
             WorkflowRunResponse containing the workflow execution results.
         """
+
+        await self._browser.sdk.ensure_has_server()
         workflow_run = await self._browser.client.run_workflow(
             workflow_id=workflow_id,
             parameters=parameters,
@@ -408,7 +412,7 @@ class SkyvernBrowserPage:
             ```
         """
         return await self._input_text(
-            selector=selector or "",
+            selector=selector,
             value=value or "",
             ai=ai,
             intention=prompt,
@@ -582,6 +586,23 @@ class SkyvernBrowserPage:
         """
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
+    async def act(
+        self,
+        prompt: str,
+    ) -> None:
+        """Perform an action on the page using AI based on a natural language prompt.
+
+        Args:
+            prompt: Natural language description of the action to perform.
+
+        Examples:
+            ```python
+            # Simple action
+            await page.act("Click the login button")
+            ```
+        """
+        return await self._ai.ai_act(prompt)
+
     async def reload(self, **kwargs: Any) -> None:
         """Reload the current page.
 
@@ -698,7 +719,7 @@ class SkyvernBrowserPage:
 
     async def _input_text(
         self,
-        selector: str,
+        selector: str | None,
         value: str,
         ai: str | None = "fallback",
         intention: str | None = None,
@@ -721,12 +742,13 @@ class SkyvernBrowserPage:
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
-            try:
-                locator = self._page.locator(selector)
-                await handler_utils.input_sequentially(locator, value, timeout=timeout)
-                return value
-            except Exception as e:
-                error_to_raise = e
+            if selector:
+                try:
+                    locator = self._page.locator(selector)
+                    await handler_utils.input_sequentially(locator, value, timeout=timeout)
+                    return value
+                except Exception as e:
+                    error_to_raise = e
 
             if intention:
                 return await self._ai.ai_input_text(
@@ -752,6 +774,10 @@ class SkyvernBrowserPage:
                 totp_url=totp_url,
                 timeout=timeout,
             )
+
+        if not selector:
+            raise ValueError("Selector is required but was not provided")
+
         locator = self._page.locator(selector)
         await handler_utils.input_sequentially(locator, value, timeout=timeout)
         return value

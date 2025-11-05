@@ -6,6 +6,7 @@ import typing
 from importlib import import_module
 
 if typing.TYPE_CHECKING:
+    from .act_action import ActAction
     from .action import Action
     from .action_block import ActionBlock
     from .action_block_data_schema import ActionBlockDataSchema
@@ -297,6 +298,7 @@ if typing.TYPE_CHECKING:
     from .script_run_response import ScriptRunResponse
     from .sdk_action import (
         SdkAction,
+        SdkAction_AiAct,
         SdkAction_AiClick,
         SdkAction_AiInputText,
         SdkAction_AiSelectOption,
@@ -505,6 +507,7 @@ if typing.TYPE_CHECKING:
     from .workflow_run_timeline_type import WorkflowRunTimelineType
     from .workflow_status import WorkflowStatus
 _dynamic_imports: typing.Dict[str, str] = {
+    "ActAction": ".act_action",
     "Action": ".action",
     "ActionBlock": ".action_block",
     "ActionBlockDataSchema": ".action_block_data_schema",
@@ -769,6 +772,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ScriptFileCreate": ".script_file_create",
     "ScriptRunResponse": ".script_run_response",
     "SdkAction": ".sdk_action",
+    "SdkAction_AiAct": ".sdk_action",
     "SdkAction_AiClick": ".sdk_action",
     "SdkAction_AiInputText": ".sdk_action",
     "SdkAction_AiSelectOption": ".sdk_action",
@@ -982,6 +986,7 @@ def __dir__():
 
 
 __all__ = [
+    "ActAction",
     "Action",
     "ActionBlock",
     "ActionBlockDataSchema",
@@ -1246,6 +1251,7 @@ __all__ = [
     "ScriptFileCreate",
     "ScriptRunResponse",
     "SdkAction",
+    "SdkAction_AiAct",
     "SdkAction_AiClick",
     "SdkAction_AiInputText",
     "SdkAction_AiSelectOption",

@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_credit_card_data_parameter_id,
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
+    generate_browser_profile_id,
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
@@ -810,6 +811,23 @@ class PersistentBrowserSessionModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class BrowserProfileModel(Base):
+    __tablename__ = "browser_profiles"
+    __table_args__ = (
+        Index("idx_browser_profiles_org", "organization_id"),
+        Index("idx_browser_profiles_org_name", "organization_id", "name"),
+        UniqueConstraint("organization_id", "name", name="uc_org_browser_profile_name"),
+    )
+
+    browser_profile_id = Column(String, primary_key=True, default=generate_browser_profile_id)
+    organization_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class TaskRunModel(Base):
     __tablename__ = "task_runs"
     __table_args__ = (
@@ -1001,6 +1019,8 @@ class ScriptBlockModel(Base):
     script_block_label = Column(String, nullable=False)
     script_file_id = Column(String, nullable=True)
     run_signature = Column(String, nullable=True)
+    workflow_run_id = Column(String, nullable=True)
+    workflow_run_block_id = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

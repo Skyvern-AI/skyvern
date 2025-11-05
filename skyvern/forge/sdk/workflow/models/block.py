@@ -1516,6 +1516,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "json": json,
             "Exception": Exception,
         }
 
@@ -3186,8 +3187,7 @@ class HumanInteractionBlock(BaseTaskBlock):
                 organization_id=organization_id,
             )
 
-        workflow_permanent_id = workflow_run.workflow_permanent_id
-        app_url = f"{settings.SKYVERN_APP_URL}/workflows/{workflow_permanent_id}/{workflow_run_id}/overview"
+        app_url = f"{settings.SKYVERN_APP_URL}/runs/{workflow_run_id}/overview"
         body = f"{self.body}\n\nKindly visit {app_url}\n\n{self.instructions}\n\n"
         subject = f"{self.subject} - Workflow Run ID: {workflow_run_id}"
 

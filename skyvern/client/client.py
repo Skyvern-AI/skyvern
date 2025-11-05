@@ -53,7 +53,7 @@ class Skyvern:
 
 
 
-        Defaults to SkyvernEnvironment.PRODUCTION
+        Defaults to SkyvernEnvironment.CLOUD
 
 
 
@@ -83,7 +83,7 @@ class Skyvern:
         self,
         *,
         base_url: typing.Optional[str] = None,
-        environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
+        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
         api_key: typing.Optional[str] = None,
         headers: typing.Optional[typing.Dict[str, str]] = None,
         timeout: typing.Optional[float] = None,
@@ -1584,7 +1584,7 @@ class AsyncSkyvern:
 
 
 
-        Defaults to SkyvernEnvironment.PRODUCTION
+        Defaults to SkyvernEnvironment.CLOUD
 
 
 
@@ -1614,7 +1614,7 @@ class AsyncSkyvern:
         self,
         *,
         base_url: typing.Optional[str] = None,
-        environment: SkyvernEnvironment = SkyvernEnvironment.PRODUCTION,
+        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
         api_key: typing.Optional[str] = None,
         headers: typing.Optional[typing.Dict[str, str]] = None,
         timeout: typing.Optional[float] = None,

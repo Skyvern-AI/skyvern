@@ -238,6 +238,6 @@ async def login(
             browser_session_id=login_request.browser_session_id,
             max_screenshot_scrolls=login_request.max_screenshot_scrolling_times,
         ),
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=login_request.browser_session_id,
     )

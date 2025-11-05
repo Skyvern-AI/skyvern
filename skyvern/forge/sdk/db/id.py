@@ -40,6 +40,7 @@ CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
+BROWSER_PROFILE_PREFIX = "bp"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -193,6 +194,11 @@ def generate_thought_id() -> str:
 def generate_persistent_browser_session_id() -> str:
     int_id = generate_id()
     return f"{PERSISTENT_BROWSER_SESSION_ID}_{int_id}"
+
+
+def generate_browser_profile_id() -> str:
+    int_id = generate_id()
+    return f"{BROWSER_PROFILE_PREFIX}_{int_id}"
 
 
 def generate_task_run_id() -> str:

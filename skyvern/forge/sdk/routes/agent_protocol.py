@@ -94,6 +94,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
+    WorkflowRunWithWorkflowResponse,
 )
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
@@ -217,7 +218,7 @@ async def run_task(
             failure_reason=task_v1_response.failure_reason,
             created_at=task_v1_response.created_at,
             modified_at=task_v1_response.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v1_response.task_id}",
             run_request=TaskRunRequest(
                 engine=run_request.engine,
                 prompt=task_v1_response.navigation_goal,
@@ -280,7 +281,7 @@ async def run_task(
             failure_reason=None,
             created_at=task_v2.created_at,
             modified_at=task_v2.modified_at,
-            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{task_v2.workflow_permanent_id}/{task_v2.workflow_run_id}",
+            app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v2.workflow_run_id}",
             run_request=TaskRunRequest(
                 engine=RunEngine.skyvern_v2,
                 prompt=task_v2.prompt,
@@ -381,7 +382,7 @@ async def run_workflow(
         run_request=workflow_run_request,
         downloaded_files=None,
         recording_url=None,
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
@@ -1477,7 +1478,7 @@ async def run_block(
         run_request=block_run_request,
         downloaded_files=None,
         recording_url=None,
-        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}",
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
     )
 
 
@@ -2165,6 +2166,42 @@ async def get_workflow_run_with_workflow_id(
     return_dict["browser_session_id"] = browser_session_id or return_dict.get("browser_session_id")
 
     return return_dict
+
+
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/workflows/runs/{workflow_run_id}/",
+    include_in_schema=False,
+)
+async def get_workflow_and_run_from_workflow_run_id(
+    workflow_run_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowRunWithWorkflowResponse:
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run not found {workflow_run_id}",
+        )
+
+    workflow_run_status_api_response = await get_workflow_run_with_workflow_id(
+        workflow_id=workflow.workflow_permanent_id,
+        workflow_run_id=workflow_run_id,
+        current_org=current_org,
+    )
+
+    workflow_run_status_api_response["workflow"] = workflow
+
+    response = WorkflowRunWithWorkflowResponse.model_validate(workflow_run_status_api_response)
+
+    return response
 
 
 @legacy_base_router.get(

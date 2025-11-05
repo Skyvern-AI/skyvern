@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
-from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.exceptions import BrowserProfileNotFound, WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -23,6 +23,7 @@ from skyvern.forge.sdk.db.models import (
     BitwardenLoginCredentialParameterModel,
     BitwardenSensitiveInformationParameterModel,
     BlockRunModel,
+    BrowserProfileModel,
     CredentialModel,
     CredentialParameterModel,
     DebugSessionModel,
@@ -78,6 +79,7 @@ from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
+from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.debug_sessions import BlockRun, DebugSession, DebugSessionRun
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
@@ -1497,6 +1499,34 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflow_for_workflow_run(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        exclude_deleted: bool = True,
+    ) -> Workflow | None:
+        try:
+            get_workflow_query = select(WorkflowModel)
+
+            if exclude_deleted:
+                get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
+            if organization_id:
+                get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+
+            get_workflow_query = get_workflow_query.join(
+                WorkflowRunModel,
+                WorkflowRunModel.workflow_id == WorkflowModel.workflow_id,
+            )
+
+            get_workflow_query = get_workflow_query.filter(WorkflowRunModel.workflow_run_id == workflow_run_id)
+            async with self.Session() as session:
+                if workflow := (await session.scalars(get_workflow_query)).first():
+                    return convert_to_workflow(workflow, self.debug_enabled)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def get_workflow_versions_by_permanent_id(
         self,
         workflow_permanent_id: str,
@@ -2304,6 +2334,23 @@ class AgentDB:
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
+
+    async def clear_workflow_run_failure_reason(self, workflow_run_id: str, organization_id: str) -> WorkflowRun:
+        async with self.Session() as session:
+            workflow_run = (
+                await session.scalars(
+                    select(WorkflowRunModel)
+                    .filter_by(workflow_run_id=workflow_run_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).first()
+            if workflow_run:
+                workflow_run.failure_reason = None
+                await session.commit()
+                await session.refresh(workflow_run)
+                return convert_to_workflow_run(workflow_run)
+            else:
+                raise NotFoundError("Workflow run not found")
 
     async def get_all_runs(
         self,
@@ -3859,6 +3906,89 @@ class AgentDB:
                 for workflow_run_block in workflow_run_blocks
             ]
 
+    async def create_browser_profile(
+        self,
+        organization_id: str,
+        name: str,
+        description: str | None = None,
+    ) -> BrowserProfile:
+        try:
+            async with self.Session() as session:
+                browser_profile = BrowserProfileModel(
+                    organization_id=organization_id,
+                    name=name,
+                    description=description,
+                )
+                session.add(browser_profile)
+                await session.commit()
+                await session.refresh(browser_profile)
+                return BrowserProfile.model_validate(browser_profile)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in create_browser_profile", exc_info=True)
+            raise
+
+    async def get_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+        include_deleted: bool = False,
+    ) -> BrowserProfile | None:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=profile_id)
+                    .filter_by(organization_id=organization_id)
+                )
+                if not include_deleted:
+                    query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+
+                browser_profile = (await session.scalars(query)).first()
+                if not browser_profile:
+                    return None
+                return BrowserProfile.model_validate(browser_profile)
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in get_browser_profile", exc_info=True)
+            raise
+
+    async def list_browser_profiles(
+        self,
+        organization_id: str,
+        include_deleted: bool = False,
+    ) -> list[BrowserProfile]:
+        try:
+            async with self.Session() as session:
+                query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
+                if not include_deleted:
+                    query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+                browser_profiles = await session.scalars(query.order_by(asc(BrowserProfileModel.created_at)))
+                return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in list_browser_profiles", exc_info=True)
+            raise
+
+    async def delete_browser_profile(
+        self,
+        profile_id: str,
+        organization_id: str,
+    ) -> None:
+        try:
+            async with self.Session() as session:
+                query = (
+                    select(BrowserProfileModel)
+                    .filter_by(browser_profile_id=profile_id)
+                    .filter_by(organization_id=organization_id)
+                    .filter(BrowserProfileModel.deleted_at.is_(None))
+                )
+                browser_profile = (await session.scalars(query)).first()
+                if not browser_profile:
+                    raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+                browser_profile.deleted_at = datetime.utcnow()
+                await session.commit()
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError in delete_browser_profile", exc_info=True)
+            raise
+
     async def get_active_persistent_browser_sessions(
         self,
         organization_id: str,
@@ -4858,6 +4988,8 @@ class AgentDB:
         script_block_label: str,
         script_file_id: str | None = None,
         run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
     ) -> ScriptBlock:
         """Create a script block."""
         async with self.Session() as session:
@@ -4868,6 +5000,8 @@ class AgentDB:
                 script_block_label=script_block_label,
                 script_file_id=script_file_id,
                 run_signature=run_signature,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
             )
             session.add(script_block)
             await session.commit()
@@ -4880,6 +5014,9 @@ class AgentDB:
         organization_id: str,
         script_file_id: str | None = None,
         run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        clear_run_signature: bool = False,
     ) -> ScriptBlock:
         async with self.Session() as session:
             script_block = (
@@ -4892,8 +5029,14 @@ class AgentDB:
             if script_block:
                 if script_file_id is not None:
                     script_block.script_file_id = script_file_id
-                if run_signature is not None:
+                if clear_run_signature:
+                    script_block.run_signature = None
+                elif run_signature is not None:
                     script_block.run_signature = run_signature
+                if workflow_run_id is not None:
+                    script_block.workflow_run_id = workflow_run_id
+                if workflow_run_block_id is not None:
+                    script_block.workflow_run_block_id = workflow_run_block_id
                 await session.commit()
                 await session.refresh(script_block)
                 return convert_to_script_block(script_block)
