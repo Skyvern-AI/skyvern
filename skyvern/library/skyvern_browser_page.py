@@ -586,6 +586,23 @@ class SkyvernBrowserPage:
         """
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
+    async def act(
+        self,
+        prompt: str,
+    ) -> None:
+        """Perform an action on the page using AI based on a natural language prompt.
+
+        Args:
+            prompt: Natural language description of the action to perform.
+
+        Examples:
+            ```python
+            # Simple action
+            await page.act("Click the login button")
+            ```
+        """
+        return await self._ai.ai_act(prompt)
+
     async def reload(self, **kwargs: Any) -> None:
         """Reload the current page.
 

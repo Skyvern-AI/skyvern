@@ -2,7 +2,13 @@ from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import Page
 
-from skyvern.client import SdkAction_AiClick, SdkAction_AiInputText, SdkAction_AiSelectOption, SdkAction_Extract
+from skyvern.client import (
+    SdkAction_AiAct,
+    SdkAction_AiClick,
+    SdkAction_AiInputText,
+    SdkAction_AiSelectOption,
+    SdkAction_Extract,
+)
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 
@@ -140,3 +146,21 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         )
         self._browser.workflow_run_id = response.workflow_run_id
         return response.result if response.result else None
+
+    async def ai_act(
+        self,
+        prompt: str,
+    ) -> None:
+        """Perform an action on the page using AI via API call."""
+
+        await self._browser.sdk.ensure_has_server()
+        response = await self._browser.client.run_sdk_action(
+            url=self._page.url,
+            action=SdkAction_AiAct(
+                intention=prompt,
+            ),
+            browser_session_id=self._browser.browser_session_id,
+            browser_address=self._browser.browser_address,
+            workflow_run_id=self._browser.workflow_run_id,
+        )
+        self._browser.workflow_run_id = response.workflow_run_id

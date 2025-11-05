@@ -3,7 +3,6 @@ from typing import Annotated, Literal, Union
 
 import structlog
 from azure.identity.aio import ClientSecretCredential
-from fastapi import HTTPException
 from pydantic import BaseModel, Field, TypeAdapter
 
 from skyvern.forge import app
@@ -12,13 +11,10 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
     CredentialItem,
-    CredentialResponse,
     CredentialType,
     CredentialVaultType,
     CreditCardCredential,
-    CreditCardCredentialResponse,
     PasswordCredential,
-    PasswordCredentialResponse,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 
@@ -107,17 +103,6 @@ class AzureCredentialVaultService(CredentialVaultService):
                 error=str(e),
             )
 
-    async def get_credential(self, organization_id: str, credential_id: str) -> CredentialResponse:
-        credential = await app.DATABASE.get_credential(credential_id=credential_id, organization_id=organization_id)
-        if not credential:
-            raise HTTPException(status_code=404, detail="Credential not found")
-
-        return _convert_to_response(credential)
-
-    async def get_credentials(self, organization_id: str, page: int, page_size: int) -> list[CredentialResponse]:
-        credentials = await app.DATABASE.get_credentials(organization_id, page=page, page_size=page_size)
-        return [_convert_to_response(credential) for credential in credentials]
-
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         secret_json_str = await self._client.get_secret(secret_name=db_credential.item_id, vault_name=self._vault_name)
         if secret_json_str is None:
@@ -186,30 +171,3 @@ class AzureCredentialVaultService(CredentialVaultService):
             secret_name=secret_name,
             secret_value=secret_value,
         )
-
-
-def _convert_to_response(credential: Credential) -> CredentialResponse:
-    if credential.credential_type == CredentialType.PASSWORD:
-        credential_response = PasswordCredentialResponse(
-            username=credential.username or credential.credential_id,
-            totp_type=credential.totp_type,
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=credential.credential_type,
-            name=credential.name,
-        )
-    elif credential.credential_type == CredentialType.CREDIT_CARD:
-        credential_response = CreditCardCredentialResponse(
-            last_four=credential.card_last4 or "****",
-            brand=credential.card_brand or "Card Brand",
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=credential.credential_type,
-            name=credential.name,
-        )
-    else:
-        raise HTTPException(status_code=400, detail="Credential type not supported")

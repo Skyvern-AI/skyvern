@@ -7,6 +7,7 @@ from importlib import import_module
 
 if typing.TYPE_CHECKING:
     from .types import (
+        ActAction,
         Action,
         ActionBlock,
         ActionBlockDataSchema,
@@ -271,6 +272,7 @@ if typing.TYPE_CHECKING:
         ScriptFileCreate,
         ScriptRunResponse,
         SdkAction,
+        SdkAction_AiAct,
         SdkAction_AiClick,
         SdkAction_AiInputText,
         SdkAction_AiSelectOption,
@@ -466,6 +468,7 @@ if typing.TYPE_CHECKING:
     from .environment import SkyvernEnvironment
     from .version import __version__
 _dynamic_imports: typing.Dict[str, str] = {
+    "ActAction": ".types",
     "Action": ".types",
     "ActionBlock": ".types",
     "ActionBlockDataSchema": ".types",
@@ -734,6 +737,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ScriptFileCreate": ".types",
     "ScriptRunResponse": ".types",
     "SdkAction": ".types",
+    "SdkAction_AiAct": ".types",
     "SdkAction_AiClick": ".types",
     "SdkAction_AiInputText": ".types",
     "SdkAction_AiSelectOption": ".types",
@@ -952,6 +956,7 @@ def __dir__():
 
 
 __all__ = [
+    "ActAction",
     "Action",
     "ActionBlock",
     "ActionBlockDataSchema",
@@ -1220,6 +1225,7 @@ __all__ = [
     "ScriptFileCreate",
     "ScriptRunResponse",
     "SdkAction",
+    "SdkAction_AiAct",
     "SdkAction_AiClick",
     "SdkAction_AiInputText",
     "SdkAction_AiSelectOption",

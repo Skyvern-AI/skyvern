@@ -63,3 +63,10 @@ class SkyvernPageAi(Protocol):
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
         ...
+
+    async def ai_act(
+        self,
+        prompt: str,
+    ) -> None:
+        """Perform an action on the page using AI based on a natural language prompt."""
+        ...

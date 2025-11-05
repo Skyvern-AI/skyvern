@@ -9570,6 +9570,25 @@
         "required": ["type"],
         "title": "SelectOptionAction"
       },
+      "ActAction": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_act",
+            "title": "Type",
+            "default": "ai_act"
+          },
+          "intention": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Natural language prompt for the action",
+            "default": ""
+          }
+        },
+        "required": ["type"],
+        "title": "ActAction"
+      },
       "ExtractAction": {
         "type": "object",
         "properties": {
@@ -9661,6 +9680,9 @@
             "$ref": "#/components/schemas/SelectOptionAction"
           },
           {
+            "$ref": "#/components/schemas/ActAction"
+          },
+          {
             "$ref": "#/components/schemas/ExtractAction"
           }
         ],
@@ -9670,6 +9692,7 @@
             "ai_click": "#/components/schemas/ClickAction",
             "ai_input_text": "#/components/schemas/InputTextAction",
             "ai_select_option": "#/components/schemas/SelectOptionAction",
+            "ai_act": "#/components/schemas/ActAction",
             "extract": "#/components/schemas/ExtractAction"
           }
         },

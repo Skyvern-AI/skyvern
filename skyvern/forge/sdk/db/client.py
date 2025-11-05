@@ -1494,6 +1494,34 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflow_for_workflow_run(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        exclude_deleted: bool = True,
+    ) -> Workflow | None:
+        try:
+            get_workflow_query = select(WorkflowModel)
+
+            if exclude_deleted:
+                get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
+            if organization_id:
+                get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
+
+            get_workflow_query = get_workflow_query.join(
+                WorkflowRunModel,
+                WorkflowRunModel.workflow_id == WorkflowModel.workflow_id,
+            )
+
+            get_workflow_query = get_workflow_query.filter(WorkflowRunModel.workflow_run_id == workflow_run_id)
+            async with self.Session() as session:
+                if workflow := (await session.scalars(get_workflow_query)).first():
+                    return convert_to_workflow(workflow, self.debug_enabled)
+                return None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def get_workflow_versions_by_permanent_id(
         self,
         workflow_permanent_id: str,
