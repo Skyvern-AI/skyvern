@@ -1436,6 +1436,13 @@ class AgentDB:
             if version:
                 workflow.version = version
             session.add(workflow)
+
+            # Update folder's modified_at if folder_id is provided
+            if folder_id:
+                folder_model = await session.get(FolderModel, folder_id)
+                if folder_model:
+                    folder_model.modified_at = datetime.utcnow()
+
             await session.commit()
             await session.refresh(workflow)
             return convert_to_workflow(workflow, self.debug_enabled)
