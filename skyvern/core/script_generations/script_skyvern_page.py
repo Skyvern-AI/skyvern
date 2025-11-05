@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Callable
 
 import structlog
+from playwright.async_api import Page
 
 from skyvern.config import settings
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
@@ -38,6 +39,18 @@ class ScriptSkyvernPage(SkyvernPage):
     2. Records ActionCallobjects into RunContext.trace
     3. Adds retry / fallback hooks
     """
+
+    def __init__(
+        self,
+        *,
+        scraped_page: ScrapedPage,
+        page: Page,
+        ai: RealSkyvernPageAi,
+        recorder: Callable[[ActionCall], None] | None = None,
+    ) -> None:
+        super().__init__(page=page, ai=ai)
+        self.scraped_page = scraped_page
+        self._record = recorder or (lambda ac: None)
 
     @classmethod
     async def _get_or_create_browser_state(cls, browser_session_id: str | None = None) -> BrowserState:

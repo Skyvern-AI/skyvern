@@ -17,7 +17,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.scraper.scraper import ScrapedPage
 
 LOG = structlog.get_logger()
 
@@ -54,16 +53,10 @@ class SkyvernPage:
 
     def __init__(
         self,
-        scraped_page: ScrapedPage,
         page: Page,
         ai: SkyvernPageAi,
-        *,
-        recorder: Callable[[ActionCall], None] | None = None,
-        # generate_response: bool = False,
-    ):
-        self.scraped_page = scraped_page
+    ) -> None:
         self.page = page
-        self._record = recorder or (lambda ac: None)
         self.current_label: str | None = None
         self._ai = ai
 
