@@ -635,7 +635,8 @@ class BrowserState:
         page = await self.get_working_page()
         if page is not None:
             return page
-        LOG.error("BrowserState has no page")
+        pages = (self.browser_context.pages or []) if self.browser_context else []
+        LOG.error("BrowserState has no page", urls=[p.url for p in pages])
         raise MissingBrowserStatePage()
 
     async def _close_all_other_pages(self) -> None:
