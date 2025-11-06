@@ -659,7 +659,9 @@ function Workflows() {
                                       <Pencil2Icon className="h-4 w-4" />
                                     </Button>
                                   </TooltipTrigger>
-                                  <TooltipContent>Open in Editor</TooltipContent>
+                                  <TooltipContent>
+                                    Open in Editor
+                                  </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
                               <TooltipProvider>
