@@ -65,6 +65,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
                     browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
             else:
                 raise WorkflowRunNotFound(workflow_run_id=context.workflow_run_id)
