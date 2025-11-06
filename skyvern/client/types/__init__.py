@@ -7,6 +7,7 @@ from importlib import import_module
 
 if typing.TYPE_CHECKING:
     from .act_action import ActAction
+    from .act_action_data import ActActionData
     from .action import Action
     from .action_block import ActionBlock
     from .action_block_data_schema import ActionBlockDataSchema
@@ -44,6 +45,7 @@ if typing.TYPE_CHECKING:
     from .browser_session_response import BrowserSessionResponse
     from .click_action import ClickAction
     from .click_action_data import ClickActionData
+    from .click_context import ClickContext
     from .code_block import CodeBlock
     from .code_block_parameters_item import (
         CodeBlockParametersItem,
@@ -134,6 +136,7 @@ if typing.TYPE_CHECKING:
     from .file_type import FileType
     from .file_upload_block import FileUploadBlock
     from .file_upload_block_yaml import FileUploadBlockYaml
+    from .folder import Folder
     from .for_loop_block import ForLoopBlock
     from .for_loop_block_loop_blocks_item import (
         ForLoopBlockLoopBlocksItem,
@@ -290,20 +293,19 @@ if typing.TYPE_CHECKING:
     from .pdf_parser_block_yaml import PdfParserBlockYaml
     from .proxy_location import ProxyLocation
     from .run_engine import RunEngine
+    from .run_sdk_action_request_action import (
+        RunSdkActionRequestAction,
+        RunSdkActionRequestAction_AiAct,
+        RunSdkActionRequestAction_AiClick,
+        RunSdkActionRequestAction_AiInputText,
+        RunSdkActionRequestAction_AiSelectOption,
+        RunSdkActionRequestAction_Extract,
+    )
     from .run_sdk_action_response import RunSdkActionResponse
-    from .run_sdk_action_response_result import RunSdkActionResponseResult
     from .run_status import RunStatus
     from .script import Script
     from .script_file_create import ScriptFileCreate
     from .script_run_response import ScriptRunResponse
-    from .sdk_action import (
-        SdkAction,
-        SdkAction_AiAct,
-        SdkAction_AiClick,
-        SdkAction_AiInputText,
-        SdkAction_AiSelectOption,
-        SdkAction_Extract,
-    )
     from .select_option import SelectOption
     from .select_option_action import SelectOptionAction
     from .select_option_action_data import SelectOptionActionData
@@ -508,6 +510,7 @@ if typing.TYPE_CHECKING:
     from .workflow_status import WorkflowStatus
 _dynamic_imports: typing.Dict[str, str] = {
     "ActAction": ".act_action",
+    "ActActionData": ".act_action_data",
     "Action": ".action",
     "ActionBlock": ".action_block",
     "ActionBlockDataSchema": ".action_block_data_schema",
@@ -543,6 +546,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BrowserSessionResponse": ".browser_session_response",
     "ClickAction": ".click_action",
     "ClickActionData": ".click_action_data",
+    "ClickContext": ".click_context",
     "CodeBlock": ".code_block",
     "CodeBlockParametersItem": ".code_block_parameters_item",
     "CodeBlockParametersItem_AwsSecret": ".code_block_parameters_item",
@@ -625,6 +629,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "FileType": ".file_type",
     "FileUploadBlock": ".file_upload_block",
     "FileUploadBlockYaml": ".file_upload_block_yaml",
+    "Folder": ".folder",
     "ForLoopBlock": ".for_loop_block",
     "ForLoopBlockLoopBlocksItem": ".for_loop_block_loop_blocks_item",
     "ForLoopBlockLoopBlocksItem_Action": ".for_loop_block_loop_blocks_item",
@@ -765,18 +770,17 @@ _dynamic_imports: typing.Dict[str, str] = {
     "PdfParserBlockYaml": ".pdf_parser_block_yaml",
     "ProxyLocation": ".proxy_location",
     "RunEngine": ".run_engine",
+    "RunSdkActionRequestAction": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiAct": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiClick": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiInputText": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_AiSelectOption": ".run_sdk_action_request_action",
+    "RunSdkActionRequestAction_Extract": ".run_sdk_action_request_action",
     "RunSdkActionResponse": ".run_sdk_action_response",
-    "RunSdkActionResponseResult": ".run_sdk_action_response_result",
     "RunStatus": ".run_status",
     "Script": ".script",
     "ScriptFileCreate": ".script_file_create",
     "ScriptRunResponse": ".script_run_response",
-    "SdkAction": ".sdk_action",
-    "SdkAction_AiAct": ".sdk_action",
-    "SdkAction_AiClick": ".sdk_action",
-    "SdkAction_AiInputText": ".sdk_action",
-    "SdkAction_AiSelectOption": ".sdk_action",
-    "SdkAction_Extract": ".sdk_action",
     "SelectOption": ".select_option",
     "SelectOptionAction": ".select_option_action",
     "SelectOptionActionData": ".select_option_action_data",
@@ -987,6 +991,7 @@ def __dir__():
 
 __all__ = [
     "ActAction",
+    "ActActionData",
     "Action",
     "ActionBlock",
     "ActionBlockDataSchema",
@@ -1022,6 +1027,7 @@ __all__ = [
     "BrowserSessionResponse",
     "ClickAction",
     "ClickActionData",
+    "ClickContext",
     "CodeBlock",
     "CodeBlockParametersItem",
     "CodeBlockParametersItem_AwsSecret",
@@ -1104,6 +1110,7 @@ __all__ = [
     "FileType",
     "FileUploadBlock",
     "FileUploadBlockYaml",
+    "Folder",
     "ForLoopBlock",
     "ForLoopBlockLoopBlocksItem",
     "ForLoopBlockLoopBlocksItem_Action",
@@ -1244,18 +1251,17 @@ __all__ = [
     "PdfParserBlockYaml",
     "ProxyLocation",
     "RunEngine",
+    "RunSdkActionRequestAction",
+    "RunSdkActionRequestAction_AiAct",
+    "RunSdkActionRequestAction_AiClick",
+    "RunSdkActionRequestAction_AiInputText",
+    "RunSdkActionRequestAction_AiSelectOption",
+    "RunSdkActionRequestAction_Extract",
     "RunSdkActionResponse",
-    "RunSdkActionResponseResult",
     "RunStatus",
     "Script",
     "ScriptFileCreate",
     "ScriptRunResponse",
-    "SdkAction",
-    "SdkAction_AiAct",
-    "SdkAction_AiClick",
-    "SdkAction_AiInputText",
-    "SdkAction_AiSelectOption",
-    "SdkAction_Extract",
     "SelectOption",
     "SelectOptionAction",
     "SelectOptionActionData",

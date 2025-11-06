@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import Page
 
-from skyvern.client import (
+from skyvern.client.types.sdk_action import (
     SdkAction_AiAct,
     SdkAction_AiClick,
     SdkAction_AiInputText,

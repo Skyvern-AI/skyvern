@@ -8,6 +8,10 @@ from .input_text_action_data import InputTextActionData
 
 
 class InputTextAction(UniversalBaseModel):
+    """
+    Input text action parameters.
+    """
+
     selector: typing.Optional[str] = pydantic.Field(default=None)
     """
     CSS selector for the element

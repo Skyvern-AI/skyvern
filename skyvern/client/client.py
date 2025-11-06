@@ -19,10 +19,10 @@ from .types.credential_response import CredentialResponse
 from .types.get_run_response import GetRunResponse
 from .types.proxy_location import ProxyLocation
 from .types.run_engine import RunEngine
+from .types.run_sdk_action_request_action import RunSdkActionRequestAction
 from .types.run_sdk_action_response import RunSdkActionResponse
 from .types.script import Script
 from .types.script_file_create import ScriptFileCreate
-from .types.sdk_action import SdkAction
 from .types.skyvern_forge_sdk_schemas_credentials_credential_type import SkyvernForgeSdkSchemasCredentialsCredentialType
 from .types.skyvern_schemas_run_blocks_credential_type import SkyvernSchemasRunBlocksCredentialType
 from .types.task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
@@ -32,9 +32,11 @@ from .types.workflow import Workflow
 from .types.workflow_create_yaml_request import WorkflowCreateYamlRequest
 from .types.workflow_run_response import WorkflowRunResponse
 from .types.workflow_run_timeline import WorkflowRunTimeline
+from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
     from .scripts.client import AsyncScriptsClient, ScriptsClient
+    from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
 OMIT = typing.cast(typing.Any, ...)
 
@@ -105,6 +107,7 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
+        self._workflows: typing.Optional[WorkflowsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
 
     @property
@@ -491,6 +494,8 @@ class Skyvern:
         only_workflows: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
+        folder_id: typing.Optional[str] = None,
+        status: typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[Workflow]:
@@ -498,8 +503,8 @@ class Skyvern:
         Get all workflows with the latest version for the organization.
 
         Search semantics:
-        - If `search_key` is provided, its value is used as a unified search term for both
-          `workflows.title` and workflow parameter metadata (key, description, and default_value for
+        - If `search_key` is provided, its value is used as a unified search term for
+          `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
           `WorkflowParameterModel`).
         - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
         - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -515,10 +520,15 @@ class Skyvern:
         only_workflows : typing.Optional[bool]
 
         search_key : typing.Optional[str]
-            Unified search across workflow title and parameter metadata (key, description, default_value).
+            Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
 
         title : typing.Optional[str]
             Deprecated: use search_key instead.
+
+        folder_id : typing.Optional[str]
+            Filter workflows by folder ID
+
+        status : typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]]
 
         template : typing.Optional[bool]
 
@@ -544,6 +554,7 @@ class Skyvern:
             only_workflows=True,
             search_key="search_key",
             title="title",
+            folder_id="folder_id",
             template=True,
         )
         """
@@ -554,6 +565,8 @@ class Skyvern:
             only_workflows=only_workflows,
             search_key=search_key,
             title=title,
+            folder_id=folder_id,
+            status=status,
             template=template,
             request_options=request_options,
         )
@@ -1500,8 +1513,7 @@ class Skyvern:
         self,
         *,
         url: str,
-        action: SdkAction,
-        user_agent: typing.Optional[str] = None,
+        action: RunSdkActionRequestAction,
         browser_session_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
@@ -1515,10 +1527,8 @@ class Skyvern:
         url : str
             The URL where the action should be executed
 
-        action : SdkAction
+        action : RunSdkActionRequestAction
             The action to execute with its specific parameters
-
-        user_agent : typing.Optional[str]
 
         browser_session_id : typing.Optional[str]
             The browser session ID
@@ -1535,31 +1545,37 @@ class Skyvern:
         Returns
         -------
         RunSdkActionResponse
-            Successfully executed SDK action
+            Successful Response
 
         Examples
         --------
-        from skyvern import SdkAction_AiClick, Skyvern
+        from skyvern import RunSdkActionRequestAction_AiAct, Skyvern
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
         client.run_sdk_action(
-            user_agent="x-user-agent",
             url="url",
-            action=SdkAction_AiClick(),
+            action=RunSdkActionRequestAction_AiAct(),
         )
         """
         _response = self._raw_client.run_sdk_action(
             url=url,
             action=action,
-            user_agent=user_agent,
             browser_session_id=browser_session_id,
             browser_address=browser_address,
             workflow_run_id=workflow_run_id,
             request_options=request_options,
         )
         return _response.data
+
+    @property
+    def workflows(self):
+        if self._workflows is None:
+            from .workflows.client import WorkflowsClient  # noqa: E402
+
+            self._workflows = WorkflowsClient(client_wrapper=self._client_wrapper)
+        return self._workflows
 
     @property
     def scripts(self):
@@ -1636,6 +1652,7 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
+        self._workflows: typing.Optional[AsyncWorkflowsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
 
     @property
@@ -2054,6 +2071,8 @@ class AsyncSkyvern:
         only_workflows: typing.Optional[bool] = None,
         search_key: typing.Optional[str] = None,
         title: typing.Optional[str] = None,
+        folder_id: typing.Optional[str] = None,
+        status: typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]] = None,
         template: typing.Optional[bool] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> typing.List[Workflow]:
@@ -2061,8 +2080,8 @@ class AsyncSkyvern:
         Get all workflows with the latest version for the organization.
 
         Search semantics:
-        - If `search_key` is provided, its value is used as a unified search term for both
-          `workflows.title` and workflow parameter metadata (key, description, and default_value for
+        - If `search_key` is provided, its value is used as a unified search term for
+          `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
           `WorkflowParameterModel`).
         - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
         - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -2078,10 +2097,15 @@ class AsyncSkyvern:
         only_workflows : typing.Optional[bool]
 
         search_key : typing.Optional[str]
-            Unified search across workflow title and parameter metadata (key, description, default_value).
+            Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).
 
         title : typing.Optional[str]
             Deprecated: use search_key instead.
+
+        folder_id : typing.Optional[str]
+            Filter workflows by folder ID
+
+        status : typing.Optional[typing.Union[WorkflowStatus, typing.Sequence[WorkflowStatus]]]
 
         template : typing.Optional[bool]
 
@@ -2112,6 +2136,7 @@ class AsyncSkyvern:
                 only_workflows=True,
                 search_key="search_key",
                 title="title",
+                folder_id="folder_id",
                 template=True,
             )
 
@@ -2125,6 +2150,8 @@ class AsyncSkyvern:
             only_workflows=only_workflows,
             search_key=search_key,
             title=title,
+            folder_id=folder_id,
+            status=status,
             template=template,
             request_options=request_options,
         )
@@ -3245,8 +3272,7 @@ class AsyncSkyvern:
         self,
         *,
         url: str,
-        action: SdkAction,
-        user_agent: typing.Optional[str] = None,
+        action: RunSdkActionRequestAction,
         browser_session_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         workflow_run_id: typing.Optional[str] = OMIT,
@@ -3260,10 +3286,8 @@ class AsyncSkyvern:
         url : str
             The URL where the action should be executed
 
-        action : SdkAction
+        action : RunSdkActionRequestAction
             The action to execute with its specific parameters
-
-        user_agent : typing.Optional[str]
 
         browser_session_id : typing.Optional[str]
             The browser session ID
@@ -3280,13 +3304,13 @@ class AsyncSkyvern:
         Returns
         -------
         RunSdkActionResponse
-            Successfully executed SDK action
+            Successful Response
 
         Examples
         --------
         import asyncio
 
-        from skyvern import AsyncSkyvern, SdkAction_AiClick
+        from skyvern import AsyncSkyvern, RunSdkActionRequestAction_AiAct
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
@@ -3295,9 +3319,8 @@ class AsyncSkyvern:
 
         async def main() -> None:
             await client.run_sdk_action(
-                user_agent="x-user-agent",
                 url="url",
-                action=SdkAction_AiClick(),
+                action=RunSdkActionRequestAction_AiAct(),
             )
 
 
@@ -3306,13 +3329,20 @@ class AsyncSkyvern:
         _response = await self._raw_client.run_sdk_action(
             url=url,
             action=action,
-            user_agent=user_agent,
             browser_session_id=browser_session_id,
             browser_address=browser_address,
             workflow_run_id=workflow_run_id,
             request_options=request_options,
         )
         return _response.data
+
+    @property
+    def workflows(self):
+        if self._workflows is None:
+            from .workflows.client import AsyncWorkflowsClient  # noqa: E402
+
+            self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
+        return self._workflows
 
     @property
     def scripts(self):

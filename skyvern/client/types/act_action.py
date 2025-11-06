@@ -4,32 +4,22 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .click_action_data import ClickActionData
+from .act_action_data import ActActionData
 
 
-class ClickAction(UniversalBaseModel):
+class ActAction(UniversalBaseModel):
     """
-    Click action parameters.
-    """
-
-    selector: typing.Optional[str] = pydantic.Field(default=None)
-    """
-    CSS selector for the element
+    AI act action parameters.
     """
 
     intention: typing.Optional[str] = pydantic.Field(default=None)
     """
-    The intention or goal of the click
+    Natural language prompt for the action
     """
 
-    data: typing.Optional[ClickActionData] = pydantic.Field(default=None)
+    data: typing.Optional[ActActionData] = pydantic.Field(default=None)
     """
     Additional context data
-    """
-
-    timeout: typing.Optional[float] = pydantic.Field(default=None)
-    """
-    Timeout in milliseconds
     """
 
     if IS_PYDANTIC_V2:
