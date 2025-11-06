@@ -702,7 +702,7 @@ function Workflows() {
                                       <div
                                         key={idx}
                                         className={cn(
-                                          "grid grid-cols-[140px_1fr_2fr] gap-4 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
+                                          "grid grid-cols-[minmax(200px,1fr)_minmax(200px,1fr)_minmax(300px,2fr)] gap-6 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
                                           matchesParam &&
                                             "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50",
                                         )}
