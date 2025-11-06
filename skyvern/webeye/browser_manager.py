@@ -34,6 +34,7 @@ class BrowserManager:
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -50,6 +51,7 @@ class BrowserManager:
             organization_id=organization_id,
             extra_http_headers=extra_http_headers,
             browser_address=browser_address,
+            browser_profile_id=browser_profile_id,
         )
         return BrowserState(
             pw=pw,
@@ -145,9 +147,12 @@ class BrowserManager:
         workflow_run: WorkflowRun,
         url: str | None = None,
         browser_session_id: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
+        if browser_profile_id is None:
+            browser_profile_id = workflow_run.browser_profile_id
         browser_state = self.get_for_workflow_run(
             workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
         )
@@ -192,6 +197,7 @@ class BrowserManager:
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
                 browser_address=workflow_run.browser_address,
+                browser_profile_id=browser_profile_id,
             )
 
             if browser_session_id:
@@ -213,6 +219,7 @@ class BrowserManager:
             organization_id=workflow_run.organization_id,
             extra_http_headers=workflow_run.extra_http_headers,
             browser_address=workflow_run.browser_address,
+            browser_profile_id=browser_profile_id,
         )
         return browser_state
 

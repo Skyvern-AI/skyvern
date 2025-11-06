@@ -1918,6 +1918,7 @@ class ForgeAgent:
                 workflow_run=workflow_run,
                 url=task.url,
                 browser_session_id=browser_session_id,
+                browser_profile_id=workflow_run.browser_profile_id,
             )
         else:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_task(
