@@ -32,6 +32,7 @@ import {
   LightningBoltIcon,
   MagnifyingGlassIcon,
   MixerHorizontalIcon,
+  Pencil2Icon,
   PlayIcon,
   PlusIcon,
   ReloadIcon,
@@ -629,6 +630,25 @@ function Workflows() {
                                         : "Show Parameters"
                                       : "No Parameters"}
                                   </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      size="icon"
+                                      variant="outline"
+                                      onClick={(event) => {
+                                        handleIconClick(
+                                          event,
+                                          `/workflows/${workflow.workflow_permanent_id}/debug`,
+                                        );
+                                      }}
+                                    >
+                                      <Pencil2Icon className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>Open in Editor</TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
                               <TooltipProvider>
