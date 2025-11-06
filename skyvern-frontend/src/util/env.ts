@@ -94,7 +94,7 @@ function clearRuntimeApiKey(): void {
   }
 }
 
-const useNewRunsUrl = true as const;
+const useNewRunsUrl = false as const;
 
 export {
   apiBaseUrl,
