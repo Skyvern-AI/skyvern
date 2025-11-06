@@ -598,12 +598,23 @@ function Workflows() {
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-2">
-                              <WorkflowFolderSelector
-                                workflowPermanentId={
-                                  workflow.workflow_permanent_id
-                                }
-                                currentFolderId={workflow.folder_id}
-                              />
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <div>
+                                      <WorkflowFolderSelector
+                                        workflowPermanentId={
+                                          workflow.workflow_permanent_id
+                                        }
+                                        currentFolderId={workflow.folder_id}
+                                      />
+                                    </div>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    Assign to Folder
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>
