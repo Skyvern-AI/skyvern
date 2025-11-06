@@ -664,6 +664,7 @@ class BrowserState:
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
@@ -681,6 +682,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -844,6 +846,7 @@ class BrowserState:
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -859,6 +862,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
         except Exception as e:
             error_message = str(e)
@@ -876,6 +880,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
         page = await self.__assert_page()
 
@@ -892,6 +897,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
             page = await self.__assert_page()
         return page

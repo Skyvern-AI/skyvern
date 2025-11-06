@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -23,6 +23,7 @@ class WorkflowRequestBody(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     browser_session_id: str | None = None
+    browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
     browser_address: str | None = None
@@ -35,6 +36,12 @@ class WorkflowRequestBody(BaseModel):
         if url is None:
             return None
         return validate_url(url)
+
+    @model_validator(mode="after")
+    def validate_browser_reference(cls, values: "WorkflowRequestBody") -> "WorkflowRequestBody":
+        if values.browser_session_id and values.browser_profile_id:
+            raise ValueError("Cannot specify both browser_session_id and browser_profile_id")
+        return values
 
 
 @deprecated("Use WorkflowRunResponse instead")
@@ -130,6 +137,7 @@ class WorkflowRun(BaseModel):
     workflow_permanent_id: str
     organization_id: str
     browser_session_id: str | None = None
+    browser_profile_id: str | None = None
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     extra_http_headers: dict[str, str] | None = None
@@ -199,6 +207,7 @@ class WorkflowRunResponseBase(BaseModel):
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
     browser_session_id: str | None = None
+    browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     script_run: ScriptRunResponse | None = None
