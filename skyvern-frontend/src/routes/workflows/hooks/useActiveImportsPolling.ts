@@ -57,8 +57,9 @@ export function useActiveImportsPolling() {
           description: `Successfully imported ${prevImport.title || "workflow"}`,
         });
 
-        // Refresh workflows to show new workflow
+        // Refresh workflows and folders to show new workflow and update folder counts
         queryClient.invalidateQueries({ queryKey: ["workflows"] });
+        queryClient.invalidateQueries({ queryKey: ["folders"] });
       }
     });
 

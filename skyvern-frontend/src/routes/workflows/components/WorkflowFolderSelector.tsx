@@ -66,12 +66,15 @@ function WorkflowFolderSelector({
             "h-8 w-8",
             currentFolderId ? "text-blue-400" : "text-slate-400",
           )}
-          title="Move to folder"
         >
           <FileIcon className="h-4 w-4" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-80 p-0" align="end">
+      <PopoverContent
+        className="w-80 p-0"
+        align="end"
+        onCloseAutoFocus={(e) => e.preventDefault()}
+      >
         <div className="border-b p-3">
           <h4 className="mb-2 text-sm font-medium">Move to folder</h4>
           <div className="relative">
