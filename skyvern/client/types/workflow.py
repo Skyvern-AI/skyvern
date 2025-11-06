@@ -35,6 +35,8 @@ class Workflow(UniversalBaseModel):
     cache_key: typing.Optional[str] = None
     run_sequentially: typing.Optional[bool] = None
     sequential_key: typing.Optional[str] = None
+    folder_id: typing.Optional[str] = None
+    import_error: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

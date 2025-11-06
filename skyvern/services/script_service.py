@@ -17,7 +17,7 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
-from skyvern.core.script_generations.skyvern_page import script_run_context_manager
+from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
 from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType

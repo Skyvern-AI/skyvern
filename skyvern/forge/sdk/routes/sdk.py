@@ -3,8 +3,8 @@ from typing import Any
 import structlog
 from fastapi import Depends, HTTPException, status
 
-from skyvern import SkyvernPage
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
+from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -145,7 +145,7 @@ async def run_sdk_action(
     )
     result: Any | None = None
     try:
-        scraped_page = await SkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
+        scraped_page = await ScriptSkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
         page = await scraped_page._browser_state.must_get_working_page()
         page_ai = RealSkyvernPageAi(scraped_page, page)
 
