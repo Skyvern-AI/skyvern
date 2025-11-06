@@ -1439,9 +1439,19 @@ class AgentDB:
 
             # Update folder's modified_at if folder_id is provided
             if folder_id:
-                folder_model = await session.get(FolderModel, folder_id)
-                if folder_model:
-                    folder_model.modified_at = datetime.utcnow()
+                # Validate folder exists and belongs to the same organization
+                folder_stmt = (
+                    select(FolderModel)
+                    .where(FolderModel.folder_id == folder_id)
+                    .where(FolderModel.organization_id == organization_id)
+                    .where(FolderModel.deleted_at.is_(None))
+                )
+                folder_model = await session.scalar(folder_stmt)
+                if not folder_model:
+                    raise ValueError(
+                        f"Folder {folder_id} not found or does not belong to organization {organization_id}"
+                    )
+                folder_model.modified_at = datetime.utcnow()
 
             await session.commit()
             await session.refresh(workflow)
