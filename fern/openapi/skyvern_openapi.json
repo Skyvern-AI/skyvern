@@ -485,7 +485,7 @@
           "Workflows"
         ],
         "summary": "Get Workflows",
-        "description": "Get all workflows with the latest version for the organization.\n\nSearch semantics:\n- If `search_key` is provided, its value is used as a unified search term for both\n  `workflows.title` and workflow parameter metadata (key, description, and default_value for\n  `WorkflowParameterModel`).\n- Falls back to deprecated `title` (title-only search) if `search_key` is not provided.\n- Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.",
+        "description": "Get all workflows with the latest version for the organization.\n\nSearch semantics:\n- If `search_key` is provided, its value is used as a unified search term for\n  `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for\n  `WorkflowParameterModel`).\n- Falls back to deprecated `title` (title-only search) if `search_key` is not provided.\n- Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.",
         "operationId": "get_workflows_v1_workflows_get",
         "parameters": [
           {
@@ -543,10 +543,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Unified search across workflow title and parameter metadata (key, description, default_value).",
+              "description": "Unified search across workflow title, folder name, and parameter metadata (key, description, default_value).",
               "title": "Search Key"
             },
-            "description": "Unified search across workflow title and parameter metadata (key, description, default_value)."
+            "description": "Unified search across workflow title, folder name, and parameter metadata (key, description, default_value)."
           },
           {
             "name": "title",
@@ -561,6 +561,43 @@
             },
             "description": "Deprecated: use search_key instead.",
             "deprecated": true
+          },
+          {
+            "name": "folder_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter workflows by folder ID",
+              "title": "Folder Id"
+            },
+            "description": "Filter workflows by folder ID"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowStatus"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
           },
           {
             "name": "template",
@@ -799,6 +836,479 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/folders": {
+      "post": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Create folder",
+        "description": "Create a new folder to organize workflows",
+        "operationId": "create_folder_v1_folders_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FolderCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully created folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Get folders",
+        "description": "Get all folders for the organization",
+        "operationId": "get_folders_v1_folders_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Number of folders per page",
+              "default": 100,
+              "title": "Page Size"
+            },
+            "description": "Number of folders per page"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Search folders by title or description",
+              "title": "Search"
+            },
+            "description": "Search folders by title or description"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved folders",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Folder"
+                  },
+                  "title": "Response Get Folders V1 Folders Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/folders/{folder_id}": {
+      "get": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Get folder",
+        "description": "Get a specific folder by ID",
+        "operationId": "get_folder_v1_folders__folder_id__get",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Update folder",
+        "description": "Update a folder's title or description",
+        "operationId": "update_folder_v1_folders__folder_id__put",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FolderUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Folder"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Delete folder",
+        "description": "Delete a folder. Optionally delete all workflows in the folder.",
+        "operationId": "delete_folder_v1_folders__folder_id__delete",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Folder ID",
+              "examples": [
+                "fld_123"
+              ],
+              "title": "Folder Id"
+            },
+            "description": "Folder ID"
+          },
+          {
+            "name": "delete_workflows",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "If true, also delete all workflows in this folder",
+              "default": false,
+              "title": "Delete Workflows"
+            },
+            "description": "If true, also delete all workflows in this folder"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Folder V1 Folders  Folder Id  Delete"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/folder": {
+      "put": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Update workflow folder",
+        "description": "Update a workflow's folder assignment for the latest version",
+        "operationId": "update_workflow_folder_v1_workflows__workflow_permanent_id__folder_put",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkflowFolderRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated workflow folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workflow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/artifacts/{artifact_id}": {
@@ -2510,6 +3020,41 @@
           "aws_key"
         ],
         "title": "AWSSecretParameterYAML"
+      },
+      "ActAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_act",
+            "title": "Type",
+            "default": "ai_act"
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "Natural language prompt for the action",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          }
+        },
+        "type": "object",
+        "title": "ActAction",
+        "description": "AI act action parameters."
       },
       "Action": {
         "properties": {
@@ -6814,6 +7359,125 @@
         ],
         "title": "FileUploadBlockYAML"
       },
+      "Folder": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          },
+          "folder_id": {
+            "type": "string",
+            "title": "Folder Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "workflow_count": {
+            "type": "integer",
+            "title": "Workflow Count",
+            "description": "Number of workflows in this folder",
+            "default": 0
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "folder_id",
+          "organization_id",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "Folder",
+        "description": "Response model for a folder"
+      },
+      "FolderCreate": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "title": "FolderCreate",
+        "description": "Request model for creating a folder"
+      },
+      "FolderUpdate": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title",
+            "description": "Folder title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Folder description"
+          }
+        },
+        "type": "object",
+        "title": "FolderUpdate",
+        "description": "Request model for updating a folder"
+      },
       "ForLoopBlock": {
         "properties": {
           "label": {
@@ -9745,6 +10409,9 @@
                 "$ref": "#/components/schemas/SelectOptionAction"
               },
               {
+                "$ref": "#/components/schemas/ActAction"
+              },
+              {
                 "$ref": "#/components/schemas/ExtractAction"
               }
             ],
@@ -9753,6 +10420,7 @@
             "discriminator": {
               "propertyName": "type",
               "mapping": {
+                "ai_act": "#/components/schemas/ActAction",
                 "ai_click": "#/components/schemas/ClickAction",
                 "ai_input_text": "#/components/schemas/InputTextAction",
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
@@ -12118,6 +12786,25 @@
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
       },
+      "UpdateWorkflowFolderRequest": {
+        "properties": {
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id",
+            "description": "Folder ID to assign workflow to. Set to null to remove from folder."
+          }
+        },
+        "type": "object",
+        "title": "UpdateWorkflowFolderRequest",
+        "description": "Request model for updating a workflow's folder assignment"
+      },
       "UploadToS3Block": {
         "properties": {
           "label": {
@@ -13301,6 +13988,28 @@
               }
             ],
             "title": "Sequential Key"
+          },
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id"
+          },
+          "import_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Import Error"
           },
           "created_at": {
             "type": "string",
@@ -14945,7 +15654,9 @@
         "enum": [
           "published",
           "draft",
-          "auto_generated"
+          "auto_generated",
+          "importing",
+          "import_failed"
         ],
         "title": "WorkflowStatus"
       },
