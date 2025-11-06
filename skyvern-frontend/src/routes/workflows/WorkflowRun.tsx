@@ -32,7 +32,7 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet, useParams, useSearchParams } from "react-router-dom";
+import { Link, Outlet, useSearchParams } from "react-router-dom";
 import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
@@ -44,6 +44,7 @@ import { cn } from "@/util/utils";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
+import { useFirstParam } from "@/hooks/useFirstParam";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
@@ -55,7 +56,7 @@ function WorkflowRun() {
   const embed = searchParams.get("embed");
   const isEmbedded = embed === "true";
   const active = searchParams.get("active");
-  const { workflowRunId } = useParams();
+  const workflowRunId = useFirstParam("workflowRunId", "runId");
   const credentialGetter = useCredentialGetter();
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
