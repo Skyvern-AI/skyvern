@@ -1697,6 +1697,43 @@ class ForgeAgent:
 
         return actions
 
+    async def _should_skip_screenshot_annotations(self, task: Task, draw_boxes: bool) -> bool:
+        """
+        Check PostHog feature flag to determine if screenshot annotations should be skipped.
+
+        Args:
+            task: The task being executed
+            draw_boxes: Current value indicating if boxes should be drawn
+
+        Returns:
+            bool: True if annotations should be drawn, False if they should be skipped
+        """
+        if not draw_boxes:  # Only check if we were going to draw boxes
+            return draw_boxes
+
+        try:
+            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+            skip_annotations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "SKIP_SCREENSHOT_ANNOTATIONS",
+                distinct_id,
+                properties={"organization_id": task.organization_id},
+            )
+            if skip_annotations:
+                LOG.info(
+                    "Skipping screenshot annotations per SKIP_SCREENSHOT_ANNOTATIONS feature flag",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                return False
+        except Exception:
+            LOG.warning(
+                "Failed to check SKIP_SCREENSHOT_ANNOTATIONS feature flag, using default behavior",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+
+        return draw_boxes
+
     async def _pre_scrape_for_next_step(
         self,
         task: Task,
@@ -1716,6 +1753,9 @@ class ForgeAgent:
                 max_screenshot_number = 1
                 draw_boxes = False
                 scroll = False
+
+            # Check PostHog feature flag to skip screenshot annotations
+            draw_boxes = await self._should_skip_screenshot_annotations(task, draw_boxes)
 
             scraped_page = await scrape_website(
                 browser_state,
@@ -1977,6 +2017,10 @@ class ForgeAgent:
             max_screenshot_number = 1
             draw_boxes = False
             scroll = False
+
+        # Check PostHog feature flag to skip screenshot annotations
+        draw_boxes = await self._should_skip_screenshot_annotations(task, draw_boxes)
+
         return await scrape_website(
             browser_state,
             task.url,
