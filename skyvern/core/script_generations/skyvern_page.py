@@ -166,6 +166,9 @@ class SkyvernPage:
         if intention is not None and prompt is None:
             prompt = intention
 
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
+
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
@@ -293,6 +296,9 @@ class SkyvernPage:
         if intention is not None and prompt is None:
             prompt = intention
 
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
+
         return await self._input_text(
             selector=selector,
             value=value or "",
@@ -320,6 +326,9 @@ class SkyvernPage:
         # Backward compatibility
         if intention is not None and prompt is None:
             prompt = intention
+
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
 
         return await self._input_text(
             selector=selector,
@@ -416,6 +425,9 @@ class SkyvernPage:
         # Backward compatibility
         if intention is not None and prompt is None:
             prompt = intention
+
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -539,6 +551,9 @@ class SkyvernPage:
         # Backward compatibility
         if intention is not None and prompt is None:
             prompt = intention
+
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
