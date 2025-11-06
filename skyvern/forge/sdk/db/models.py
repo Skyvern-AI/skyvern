@@ -304,6 +304,7 @@ class WorkflowRunModel(Base):
     parent_workflow_run_id = Column(String, nullable=True, index=True)
     organization_id = Column(String, nullable=False, index=True)
     browser_session_id = Column(String, nullable=True, index=True)
+    browser_profile_id = Column(String, nullable=True, index=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)

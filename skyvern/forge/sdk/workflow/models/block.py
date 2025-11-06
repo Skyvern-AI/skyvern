@@ -645,7 +645,10 @@ class BaseTaskBlock(Block):
                 # the first task block will create the browser state and do the navigation
                 try:
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
+                        workflow_run=workflow_run,
+                        url=self.url,
+                        browser_session_id=browser_session_id,
+                        browser_profile_id=workflow_run.browser_profile_id,
                     )
                     working_page = await browser_state.get_working_page()
                     if not working_page:
@@ -1586,6 +1589,7 @@ async def wrapper():
                     workflow_run=workflow_run,
                     url=None,  # Code block doesn't need to navigate to a URL initially
                     browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
                 # Ensure the browser state has a working page
                 await browser_state.check_and_fix_state(
@@ -1595,6 +1599,7 @@ async def wrapper():
                     organization_id=workflow_run.organization_id,
                     extra_http_headers=workflow_run.extra_http_headers,
                     browser_address=workflow_run.browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
             except Exception as e:
                 LOG.exception(
