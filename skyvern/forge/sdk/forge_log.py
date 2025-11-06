@@ -45,6 +45,10 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
             event_dict["task_v2_id"] = context.task_v2_id
         if context.browser_session_id:
             event_dict["browser_session_id"] = context.browser_session_id
+        if context.browser_container_ip:
+            event_dict["browser_container_ip"] = context.browser_container_ip
+        if context.browser_container_task_arn:
+            event_dict["browser_container_task_arn"] = context.browser_container_task_arn
 
     # Add env to the log
     event_dict["env"] = settings.ENV
