@@ -184,7 +184,7 @@ class SkyvernPage:
             # if the original selector doesn't work, try to click the element with the ai generated selector
             if prompt:
                 return await self._ai.ai_click(
-                    selector=selector or "",
+                    selector=selector,
                     intention=prompt,
                     data=data,
                     timeout=timeout,
@@ -196,7 +196,7 @@ class SkyvernPage:
         elif ai == "proactive":
             if prompt:
                 return await self._ai.ai_click(
-                    selector=selector or "",
+                    selector=selector,
                     intention=prompt,
                     data=data,
                     timeout=timeout,
@@ -472,7 +472,7 @@ class SkyvernPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         intention: str | None = None,  # backward compatibility
         **kwargs: Any,
-    ) -> str: ...
+    ) -> str | None: ...
 
     @overload
     async def select_option(
@@ -486,7 +486,7 @@ class SkyvernPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         intention: str | None = None,  # backward compatibility
         **kwargs: Any,
-    ) -> str: ...
+    ) -> str | None: ...
 
     @action_wrap(ActionType.SELECT_OPTION)
     async def select_option(
@@ -500,7 +500,7 @@ class SkyvernPage:
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         intention: str | None = None,  # backward compatibility
         **kwargs: Any,
-    ) -> str:
+    ) -> str | None:
         """Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
 
         This method supports three modes:
@@ -557,7 +557,7 @@ class SkyvernPage:
 
             if prompt:
                 return await self._ai.ai_select_option(
-                    selector=selector or "",
+                    selector=selector,
                     value=value,
                     intention=prompt,
                     data=data,
@@ -569,7 +569,7 @@ class SkyvernPage:
                 return value
         elif ai == "proactive" and prompt:
             return await self._ai.ai_select_option(
-                selector=selector or "",
+                selector=selector,
                 value=value,
                 intention=prompt,
                 data=data,

@@ -28,7 +28,7 @@ class ClickAction(SdkActionBase):
     """Click action parameters."""
 
     type: Literal["ai_click"] = "ai_click"
-    selector: str = Field(default="", description="CSS selector for the element")
+    selector: str | None = Field(default="", description="CSS selector for the element")
     intention: str = Field(default="", description="The intention or goal of the click")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
@@ -39,7 +39,7 @@ class InputTextAction(SdkActionBase):
 
     type: Literal["ai_input_text"] = "ai_input_text"
     selector: str | None = Field(default="", description="CSS selector for the element")
-    value: str = Field(default="", description="Value to input")
+    value: str | None = Field(default="", description="Value to input")
     intention: str = Field(default="", description="The intention or goal of the input")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
     totp_identifier: str | None = Field(None, description="TOTP identifier for input_text actions")
@@ -51,8 +51,8 @@ class SelectOptionAction(SdkActionBase):
     """Select option action parameters."""
 
     type: Literal["ai_select_option"] = "ai_select_option"
-    selector: str = Field(default="", description="CSS selector for the element")
-    value: str = Field(default="", description="Value to select")
+    selector: str | None = Field(default="", description="CSS selector for the element")
+    value: str | None = Field(default="", description="Value to select")
     intention: str = Field(default="", description="The intention or goal of the selection")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
     timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
