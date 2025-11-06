@@ -61,7 +61,7 @@ function MicroDropdown({ selections, selected, onChange }: Props) {
     <div ref={dropdownRef} className="relative inline-block">
       <div className="flex items-center gap-1">
         <div
-          className="relative inline-flex p-0 text-xs text-slate-400"
+          className="relative inline-flex p-0 text-xs text-[#00d2ff]"
           onClick={() => {
             if (!isOpen && dropdownRef.current) {
               const rect = dropdownRef.current.getBoundingClientRect();

@@ -180,58 +180,92 @@ class LocalStorage(BaseStorage):
             return None
 
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
-        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
-        if directory == str(stored_folder_path):
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to store browser session outside storage base path",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return
+        source_directory = Path(directory).resolve()
+        if source_directory == stored_folder_path:
             return
         self._create_directories_if_not_exists(stored_folder_path)
         LOG.info(
             "Storing browser session locally",
             organization_id=organization_id,
             workflow_permanent_id=workflow_permanent_id,
-            directory=directory,
-            browser_session_path=stored_folder_path,
+            directory=str(source_directory),
+            browser_session_path=str(stored_folder_path),
         )
 
         # Copy all files from the directory to the stored folder
-        for root, _, files in os.walk(directory):
+        for root, _, files in os.walk(source_directory):
             for file in files:
                 source_file_path = Path(root) / file
-                relative_path = source_file_path.relative_to(directory)
+                relative_path = source_file_path.relative_to(source_directory)
                 target_file_path = stored_folder_path / relative_path
                 self._create_directories_if_not_exists(target_file_path)
                 shutil.copy2(source_file_path, target_file_path)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
-        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / workflow_permanent_id
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to retrieve browser session outside storage base path",
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return None
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
 
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile locally."""
-        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / "profiles" / profile_id
-        if directory == str(stored_folder_path):
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to store browser profile outside storage base path",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return
+        source_directory = Path(directory).resolve()
+        if source_directory == stored_folder_path:
             return
         self._create_directories_if_not_exists(stored_folder_path)
         LOG.info(
             "Storing browser profile locally",
             organization_id=organization_id,
             profile_id=profile_id,
-            directory=directory,
-            browser_profile_path=stored_folder_path,
+            directory=str(source_directory),
+            browser_profile_path=str(stored_folder_path),
         )
 
-        for root, _, files in os.walk(directory):
+        for root, _, files in os.walk(source_directory):
             for file in files:
                 source_file_path = Path(root) / file
-                relative_path = source_file_path.relative_to(directory)
+                relative_path = source_file_path.relative_to(source_directory)
                 target_file_path = stored_folder_path / relative_path
                 self._create_directories_if_not_exists(target_file_path)
                 shutil.copy2(source_file_path, target_file_path)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from local storage."""
-        stored_folder_path = Path(settings.BROWSER_SESSION_BASE_PATH) / organization_id / "profiles" / profile_id
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to retrieve browser profile outside storage base path",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return None
         if not stored_folder_path.exists():
             return None
         return str(stored_folder_path)
@@ -281,6 +315,30 @@ class LocalStorage(BaseStorage):
     def _create_directories_if_not_exists(path_including_file_name: Path) -> None:
         path = path_including_file_name.parent
         path.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _resolve_browser_storage_path(*relative_parts: str) -> Path | None:
+        if not relative_parts:
+            return None
+        normalized_parts: list[str] = []
+        for part in relative_parts:
+            if part in {"", "."}:
+                return None
+            part_path = Path(part)
+            if part_path.is_absolute() or part_path.drive:
+                return None
+            if any(segment in {"", ".", ".."} for segment in part_path.parts):
+                return None
+            normalized_parts.extend(part_path.parts)
+        if not normalized_parts:
+            return None
+        base_path = Path(settings.BROWSER_SESSION_BASE_PATH).resolve()
+        candidate = base_path.joinpath(*normalized_parts).resolve()
+        try:
+            candidate.relative_to(base_path)
+        except ValueError:
+            return None
+        return candidate
 
     async def save_legacy_file(
         self, *, organization_id: str, filename: str, fileObj: BinaryIO

@@ -20,6 +20,7 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
 from skyvern.exceptions import (
     BlockNotFound,
+    BrowserProfileNotFound,
     BrowserSessionNotFound,
     CannotUpdateWorkflowDueToCodeCache,
     FailedToSendWebhook,
@@ -540,6 +541,7 @@ class WorkflowService:
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
         workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
         # Set workflow run status to running, create workflow run parameters
@@ -608,12 +610,14 @@ class WorkflowService:
             )
             return workflow_run
 
-        browser_session = await self.auto_create_browser_session_if_needed(
-            organization.organization_id,
-            workflow,
-            browser_session_id=browser_session_id,
-            proxy_location=workflow_run.proxy_location,
-        )
+        browser_session = None
+        if not browser_profile_id:
+            browser_session = await self.auto_create_browser_session_if_needed(
+                organization.organization_id,
+                workflow,
+                browser_session_id=browser_session_id,
+                proxy_location=workflow_run.proxy_location,
+            )
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
@@ -640,6 +644,7 @@ class WorkflowService:
             workflow_run=workflow_run,
             organization=organization,
             browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
             block_labels=block_labels,
             block_outputs=block_outputs,
             workflow_script=workflow_script,
@@ -688,6 +693,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         organization: Organization,
         browser_session_id: str | None = None,
+        browser_profile_id: str | None = None,
         block_labels: list[str] | None = None,
         block_outputs: dict[str, Any] | None = None,
         workflow_script: WorkflowScript | None = None,
@@ -1669,7 +1675,7 @@ class WorkflowService:
         debug_session_id: str | None = None,
         code_gen: bool | None = None,
     ) -> WorkflowRun:
-        # validate the browser session id
+        # validate the browser session or profile id
         if workflow_request.browser_session_id:
             browser_session = await app.DATABASE.get_persistent_browser_session(
                 session_id=workflow_request.browser_session_id,
@@ -1678,11 +1684,23 @@ class WorkflowService:
             if not browser_session:
                 raise BrowserSessionNotFound(browser_session_id=workflow_request.browser_session_id)
 
+        if workflow_request.browser_profile_id:
+            browser_profile = await app.DATABASE.get_browser_profile(
+                workflow_request.browser_profile_id,
+                organization_id=organization_id,
+            )
+            if not browser_profile:
+                raise BrowserProfileNotFound(
+                    profile_id=workflow_request.browser_profile_id,
+                    organization_id=organization_id,
+                )
+
         return await app.DATABASE.create_workflow_run(
             workflow_permanent_id=workflow_permanent_id,
             workflow_id=workflow_id,
             organization_id=organization_id,
             browser_session_id=workflow_request.browser_session_id,
+            browser_profile_id=workflow_request.browser_profile_id,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
@@ -2224,6 +2242,7 @@ class WorkflowService:
             total_cost=total_cost,
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
+            browser_profile_id=workflow_run.browser_profile_id,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
             task_v2=task_v2,
             browser_address=workflow_run.browser_address,

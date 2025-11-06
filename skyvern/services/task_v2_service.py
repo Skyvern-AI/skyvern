@@ -553,7 +553,9 @@ async def run_task_v2_helper(
     current_url: str | None = None
 
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-        workflow_run=workflow_run, browser_session_id=browser_session_id
+        workflow_run=workflow_run,
+        browser_session_id=browser_session_id,
+        browser_profile_id=workflow_run.browser_profile_id,
     )
 
     page = await browser_state.get_working_page()
@@ -609,7 +611,9 @@ async def run_task_v2_helper(
         # Always ensure browser_state is available at the start of the loop
         fallback_url = settings.TASK_BLOCKED_SITE_FALLBACK_URL
         browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-            workflow_run=workflow_run, browser_session_id=browser_session_id
+            workflow_run=workflow_run,
+            browser_session_id=browser_session_id,
+            browser_profile_id=workflow_run.browser_profile_id,
         )
 
         fallback_occurred = False
@@ -623,6 +627,7 @@ async def run_task_v2_helper(
                     script_id=task_v2.script_id,
                     organization_id=organization_id,
                     extra_http_headers=task_v2.extra_http_headers,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
             else:
                 await browser_state.navigate_to_url(page, url)
@@ -895,6 +900,7 @@ async def run_task_v2_helper(
                     workflow_run=workflow_run,
                     url=url,
                     browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
                 scraped_page = await scrape_website(
                     browser_state,

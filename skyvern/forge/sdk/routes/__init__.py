@@ -1,4 +1,5 @@
 from skyvern.forge.sdk.routes import agent_protocol  # noqa: F401
+from skyvern.forge.sdk.routes import browser_profiles  # noqa: F401
 from skyvern.forge.sdk.routes import browser_sessions  # noqa: F401
 from skyvern.forge.sdk.routes import credentials  # noqa: F401
 from skyvern.forge.sdk.routes import debug_sessions  # noqa: F401

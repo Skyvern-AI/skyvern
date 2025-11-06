@@ -29,6 +29,8 @@ class SkyvernContext:
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
     max_screenshot_scrolls: int | None = None
+    browser_container_ip: str | None = None
+    browser_container_task_arn: str | None = None
 
     # feature flags
     enable_parse_select_in_extract: bool = False
