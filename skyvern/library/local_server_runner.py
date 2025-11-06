@@ -1,8 +1,8 @@
 import asyncio
 import atexit
-import socket
 import threading
 
+import httpx
 import structlog
 import uvicorn
 
@@ -15,14 +15,14 @@ _server: uvicorn.Server | None = None
 _server_thread: threading.Thread | None = None
 
 
-def _is_port_in_use(port: int) -> bool:
-    """Check if a port is already in use."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("localhost", port))
-            return False
-        except OSError:
+async def _is_server_running(port: int) -> bool:
+    """Check if the server is running by making an HTTP request."""
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            await client.get(f"http://localhost:{port}")
             return True
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return False
 
 
 def _cleanup_on_exit() -> None:
@@ -49,7 +49,7 @@ async def _wait_for_server(port: int, timeout: float = 10.0, interval: float = 0
     """Wait for the server to become available on the specified port."""
     start_time = asyncio.get_event_loop().time()
     while asyncio.get_event_loop().time() - start_time < timeout:
-        if _is_port_in_use(port):
+        if await _is_server_running(port):
             return True
         await asyncio.sleep(interval)
     return False
@@ -66,7 +66,7 @@ async def ensure_local_server_running() -> None:
     port = settings.PORT
 
     # Check if server is already running
-    if _is_port_in_use(port):
+    if await _is_server_running(port):
         LOG.info(f"Local Skyvern server already running on port {port}")
         return
 
@@ -86,7 +86,7 @@ async def ensure_local_server_running() -> None:
         app=app,
         host="127.0.0.1",
         port=port,
-        log_level="info",
+        log_level="error",
         reload=False,
         access_log=False,
     )
