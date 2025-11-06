@@ -32,6 +32,7 @@ import {
   LightningBoltIcon,
   MagnifyingGlassIcon,
   MixerHorizontalIcon,
+  Pencil2Icon,
   PlayIcon,
   PlusIcon,
   ReloadIcon,
@@ -415,11 +416,17 @@ function Workflows() {
             />
           </div>
           <div className="flex gap-4">
-            <ImportWorkflowButton onImportStart={startPolling} />
+            <ImportWorkflowButton
+              onImportStart={startPolling}
+              selectedFolderId={selectedFolderId}
+            />
             <Button
               disabled={createWorkflowMutation.isPending}
               onClick={() => {
-                createWorkflowMutation.mutate(emptyWorkflowRequest);
+                createWorkflowMutation.mutate({
+                  ...emptyWorkflowRequest,
+                  folder_id: selectedFolderId,
+                });
               }}
             >
               {createWorkflowMutation.isPending ? (
@@ -591,12 +598,23 @@ function Workflows() {
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-2">
-                              <WorkflowFolderSelector
-                                workflowPermanentId={
-                                  workflow.workflow_permanent_id
-                                }
-                                currentFolderId={workflow.folder_id}
-                              />
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <div>
+                                      <WorkflowFolderSelector
+                                        workflowPermanentId={
+                                          workflow.workflow_permanent_id
+                                        }
+                                        currentFolderId={workflow.folder_id}
+                                      />
+                                    </div>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    Assign to Folder
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>
@@ -622,6 +640,27 @@ function Workflows() {
                                         ? "Hide Parameters"
                                         : "Show Parameters"
                                       : "No Parameters"}
+                                  </TooltipContent>
+                                </Tooltip>
+                              </TooltipProvider>
+                              <TooltipProvider>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      size="icon"
+                                      variant="outline"
+                                      onClick={(event) => {
+                                        handleIconClick(
+                                          event,
+                                          `/workflows/${workflow.workflow_permanent_id}/debug`,
+                                        );
+                                      }}
+                                    >
+                                      <Pencil2Icon className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    Open in Editor
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
@@ -676,7 +715,7 @@ function Workflows() {
                                       <div
                                         key={idx}
                                         className={cn(
-                                          "grid grid-cols-[140px_1fr_2fr] gap-4 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
+                                          "grid grid-cols-[minmax(200px,1fr)_minmax(200px,1fr)_minmax(300px,2fr)] gap-6 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
                                           matchesParam &&
                                             "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50",
                                         )}

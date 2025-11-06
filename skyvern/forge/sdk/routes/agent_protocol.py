@@ -484,6 +484,7 @@ async def cancel_run(
 )
 async def create_workflow_legacy(
     request: Request,
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create-legacy")
@@ -495,6 +496,9 @@ async def create_workflow_legacy(
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
+        # Override folder_id if provided as query parameter
+        if folder_id is not None:
+            workflow_create_request.folder_id = folder_id
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org, request=workflow_create_request
         )
@@ -535,6 +539,7 @@ async def create_workflow_legacy(
 )
 async def create_workflow(
     data: WorkflowRequest,
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
@@ -549,6 +554,9 @@ async def create_workflow(
                 status_code=422,
                 detail="Invalid workflow definition. Workflow should be provided in either yaml or json format.",
             )
+        # Override folder_id if provided as query parameter
+        if folder_id is not None:
+            workflow_definition.folder_id = folder_id
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
@@ -669,6 +677,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
 async def import_workflow_from_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = Depends(_validate_file_size),
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
@@ -702,6 +711,7 @@ async def import_workflow_from_pdf(
         workflow_definition={"parameters": [], "blocks": []},
         organization_id=current_org.organization_id,
         status=WorkflowStatus.importing,
+        folder_id=folder_id,
     )
 
     # Process PDF import in background (LLM call is the slow part)
