@@ -287,27 +287,8 @@ class LLMAPIHandlerFactory:
                     and isinstance(llm_config, LLMConfig)
                     and isinstance(llm_config.model_name, str)
                 ):
-                    # Check if this is a Vertex AI model
-                    if "vertex_ai/" in llm_config.model_name:
-                        caching_system_message = {
-                            "role": "system",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": context_cached_static_prompt,
-                                    "cache_control": {"type": "ephemeral", "ttl": "3600s"},
-                                }
-                            ],
-                        }
-                        messages = [caching_system_message] + messages
-                        LOG.info(
-                            "Applied Vertex context caching",
-                            prompt_name=prompt_name,
-                            model=llm_config.model_name,
-                            ttl_seconds=3600,
-                        )
                     # Check if this is an OpenAI model
-                    elif (
+                    if (
                         llm_config.model_name.startswith("gpt-")
                         or llm_config.model_name.startswith("o1-")
                         or llm_config.model_name.startswith("o3-")
@@ -582,27 +563,8 @@ class LLMAPIHandlerFactory:
                     and isinstance(llm_config, LLMConfig)
                     and isinstance(llm_config.model_name, str)
                 ):
-                    # Check if this is a Vertex AI model
-                    if "vertex_ai/" in llm_config.model_name:
-                        caching_system_message = {
-                            "role": "system",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": context_cached_static_prompt,
-                                    "cache_control": {"type": "ephemeral", "ttl": "3600s"},
-                                }
-                            ],
-                        }
-                        messages = [caching_system_message] + messages
-                        LOG.info(
-                            "Applied Vertex context caching",
-                            prompt_name=prompt_name,
-                            model=llm_config.model_name,
-                            ttl_seconds=3600,
-                        )
                     # Check if this is an OpenAI model
-                    elif (
+                    if (
                         llm_config.model_name.startswith("gpt-")
                         or llm_config.model_name.startswith("o1-")
                         or llm_config.model_name.startswith("o3-")
@@ -626,6 +588,24 @@ class LLMAPIHandlerFactory:
                         )
             except Exception as e:
                 LOG.warning("Failed to apply context caching system message", error=str(e), exc_info=True)
+
+            # Add Vertex AI cache reference only for the intended cached prompt
+            vertex_cache_attached = False
+            cache_resource_name = getattr(context, "vertex_cache_name", None)
+            if (
+                cache_resource_name
+                and "vertex_ai/" in model_name
+                and prompt_name == "extract-actions"
+                and getattr(context, "use_prompt_caching", False)
+            ):
+                active_parameters["cached_content"] = cache_resource_name
+                vertex_cache_attached = True
+                LOG.info(
+                    "Adding Vertex AI cache reference to request",
+                    prompt_name=prompt_name,
+                    cache_attached=True,
+                )
+
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(
                     {
@@ -633,6 +613,7 @@ class LLMAPIHandlerFactory:
                         "messages": messages,
                         # we're not using active_parameters here because it may contain sensitive information
                         **parameters,
+                        "vertex_cache_attached": vertex_cache_attached,
                     }
                 ).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_REQUEST,
@@ -641,6 +622,7 @@ class LLMAPIHandlerFactory:
                 thought=thought,
                 ai_suggestion=ai_suggestion,
             )
+
             t_llm_request = time.perf_counter()
             try:
                 # TODO (kerem): add a timeout to this call
