@@ -348,6 +348,7 @@ async def run_workflow(
         totp_identifier=workflow_run_request.totp_identifier,
         totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
+        browser_profile_id=workflow_run_request.browser_profile_id,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
         browser_address=workflow_run_request.browser_address,

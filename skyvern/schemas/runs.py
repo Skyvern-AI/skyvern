@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Union
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.schemas.docs.doc_examples import (
@@ -387,6 +387,10 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="ID of a browser profile to reuse for this workflow run",
+    )
     max_screenshot_scrolls: int | None = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
@@ -415,6 +419,12 @@ class WorkflowRunRequest(BaseModel):
         if url is None:
             return None
         return validate_url(url)
+
+    @model_validator(mode="after")
+    def validate_browser_reference(cls, values: WorkflowRunRequest) -> WorkflowRunRequest:
+        if values.browser_session_id and values.browser_profile_id:
+            raise ValueError("Cannot specify both browser_session_id and browser_profile_id")
+        return values
 
 
 class BlockRunRequest(WorkflowRunRequest):
@@ -476,6 +486,11 @@ class BaseRunResponse(BaseModel):
     )
     browser_session_id: str | None = Field(
         default=None, description="ID of the Skyvern persistent browser session used for this run", examples=["pbs_123"]
+    )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="ID of the browser profile used for this run",
+        examples=["bp_123"],
     )
     max_screenshot_scrolls: int | None = Field(
         default=None,
