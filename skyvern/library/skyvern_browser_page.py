@@ -308,6 +308,7 @@ class SkyvernBrowserPage:
                     return selector
                 except Exception as e:
                     error_to_raise = e
+                    selector = None
 
             # if the original selector doesn't work, try to click the element with the ai generated selector
             if prompt:
@@ -522,6 +523,8 @@ class SkyvernBrowserPage:
                     return value
                 except Exception as e:
                     error_to_raise = e
+                    selector = None
+
             if prompt:
                 return await self._ai.ai_select_option(
                     selector=selector or "",
@@ -749,6 +752,7 @@ class SkyvernBrowserPage:
                     return value
                 except Exception as e:
                     error_to_raise = e
+                    selector = None
 
             if intention:
                 return await self._ai.ai_input_text(
