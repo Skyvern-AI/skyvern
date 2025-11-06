@@ -2,7 +2,6 @@ import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
 import { WorkflowRunTimelineItem } from "../types/workflowRunTypes";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
@@ -10,13 +9,11 @@ import { useFirstParam } from "@/hooks/useFirstParam";
 
 function useWorkflowRunTimelineQuery() {
   const workflowRunId = useFirstParam("workflowRunId", "runId");
-  const { workflowPermanentId: workflowPermanentIdParam } = useParams();
   const credentialGetter = useCredentialGetter();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
-
-  const workflowPermanentId =
-    workflowPermanentIdParam ?? workflowRun?.workflow?.workflow_permanent_id;
+  const workflow = workflowRun?.workflow;
+  const workflowPermanentId = workflow?.workflow_permanent_id;
 
   return useQuery<Array<WorkflowRunTimelineItem>>({
     queryKey: ["workflowRunTimeline", workflowPermanentId, workflowRunId],

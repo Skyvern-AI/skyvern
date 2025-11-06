@@ -29,6 +29,7 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import * as env from "@/util/env";
 
 function isTask(run: Task | WorkflowRunApiResponse): run is Task {
   return "task_id" in run;
@@ -185,7 +186,9 @@ function RunHistory() {
                     onClick={(event) => {
                       handleNavigate(
                         event,
-                        `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
+                        env.useNewRunsUrl
+                          ? `/runs/${run.workflow_run_id}`
+                          : `/workflows/${run.workflow_permanent_id}/${run.workflow_run_id}/overview`,
                       );
                     }}
                   >

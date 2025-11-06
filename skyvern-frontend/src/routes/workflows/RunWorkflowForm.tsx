@@ -49,6 +49,7 @@ import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
 import { WorkflowParameter } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
+import * as env from "@/util/env";
 
 // Utility function to omit specified keys from an object
 function omit<T extends Record<string, unknown>, K extends keyof T>(
@@ -247,7 +248,9 @@ function RunWorkflowForm({
         queryKey: ["runs"],
       });
       navigate(
-        `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
+        env.useNewRunsUrl
+          ? `/runs/${response.data.workflow_run_id}`
+          : `/workflows/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
       );
     },
     onError: (error: AxiosError) => {

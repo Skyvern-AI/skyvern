@@ -49,6 +49,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
+import * as env from "@/util/env";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -186,18 +187,19 @@ function WorkflowPage() {
                     <TableRow
                       key={workflowRun.workflow_run_id}
                       onClick={(event) => {
+                        const url = env.useNewRunsUrl
+                          ? `/runs/${workflowRun.workflow_run_id}`
+                          : `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`;
+
                         if (event.ctrlKey || event.metaKey) {
                           window.open(
-                            window.location.origin +
-                              `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
+                            window.location.origin + url,
                             "_blank",
                             "noopener,noreferrer",
                           );
                           return;
                         }
-                        navigate(
-                          `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`,
-                        );
+                        navigate(url);
                       }}
                       className="cursor-pointer"
                     >
