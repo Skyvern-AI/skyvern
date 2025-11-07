@@ -177,6 +177,7 @@ async def get_totp_codes(
         codes = await app.DATABASE.get_recent_otp_codes(
             organization_id=curr_org.organization_id,
             limit=limit,
+            valid_lifespan_minutes=None,
             otp_type=otp_type,
             workflow_run_id=workflow_run_id,
         )
