@@ -1,15 +1,14 @@
 import asyncio
-from typing import TYPE_CHECKING, Any, Pattern, overload
+from typing import TYPE_CHECKING, Any, Pattern
 
 from playwright.async_api import Page
 
 from skyvern.client import GetRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
-from skyvern.config import settings
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.library.skyvern_locator import SkyvernLocator
-from skyvern.webeye.actions import handler_utils
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
@@ -206,7 +205,7 @@ class SkyvernPageRun:
         return url
 
 
-class SkyvernBrowserPage:
+class SkyvernBrowserPage(SkyvernPage):
     """A browser page wrapper that combines Playwright's page API with Skyvern's AI capabilities.
 
     This class provides a unified interface for both traditional browser automation (via Playwright)
@@ -230,364 +229,9 @@ class SkyvernBrowserPage:
     """
 
     def __init__(self, browser: "SkyvernBrowser", page: Page):
+        super().__init__(page, SdkSkyvernPageAi(browser, page))
         self._browser = browser
-        self._page = page
-        self._ai = SdkSkyvernPageAi(browser, page)
         self.run = SkyvernPageRun(browser, page)
-
-    @overload
-    async def click(
-        self,
-        selector: str,
-        *,
-        prompt: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        **kwargs: Any,
-    ) -> str | None: ...
-
-    @overload
-    async def click(
-        self,
-        *,
-        prompt: str,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        **kwargs: Any,
-    ) -> str | None: ...
-
-    async def click(
-        self,
-        selector: str | None = None,
-        *,
-        prompt: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        **kwargs: Any,
-    ) -> str | None:
-        """Click an element using a CSS selector, AI-powered prompt matching, or both.
-
-        This method supports three modes:
-        - **Selector-based**: Click the element matching the CSS selector
-        - **AI-powered**: Use natural language to describe which element to click
-        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
-
-        Args:
-            selector: CSS selector for the target element.
-            prompt: Natural language description of which element to click.
-            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
-            data: Additional context data for AI processing.
-            timeout: Maximum time to wait for the click action in milliseconds.
-
-        Returns:
-            The selector string that was successfully used to click the element, or None.
-
-        Examples:
-            ```python
-            # Click using a CSS selector
-            await page.click("#open-invoice-button")
-
-            # Click using AI with natural language
-            await page.click(prompt="Click on the 'Open Invoice' button")
-
-            # Try selector first, fall back to AI if selector fails
-            await page.click("#open-invoice-button", prompt="Click on the 'Open Invoice' button")
-            ```
-        """
-
-        if ai == "fallback":
-            # try to click the element with the original selector first
-            error_to_raise = None
-            if selector:
-                try:
-                    locator = self._page.locator(selector)
-                    await locator.click(timeout=timeout, **kwargs)
-                    return selector
-                except Exception as e:
-                    error_to_raise = e
-                    selector = None
-
-            # if the original selector doesn't work, try to click the element with the ai generated selector
-            if prompt:
-                return await self._ai.ai_click(
-                    selector=selector or "",
-                    intention=prompt,
-                    data=data,
-                    timeout=timeout,
-                )
-            if error_to_raise:
-                raise error_to_raise
-            else:
-                return selector
-        elif ai == "proactive":
-            if prompt:
-                return await self._ai.ai_click(
-                    selector=selector or "",
-                    intention=prompt,
-                    data=data,
-                    timeout=timeout,
-                )
-
-        if selector:
-            locator = self._page.locator(selector, **kwargs)
-            await locator.click(timeout=timeout)
-        return selector
-
-    @overload
-    async def fill(
-        self,
-        selector: str,
-        value: str,
-        *,
-        prompt: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-    ) -> str: ...
-
-    @overload
-    async def fill(
-        self,
-        *,
-        prompt: str,
-        value: str | None = None,
-        selector: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-    ) -> str: ...
-
-    async def fill(
-        self,
-        selector: str | None = None,
-        value: str | None = None,
-        *,
-        prompt: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-    ) -> str:
-        """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
-
-        This method supports three modes:
-        - **Selector-based**: Fill the input field with a value using CSS selector
-        - **AI-powered**: Use natural language prompt (AI extracts value from prompt)
-        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
-
-        Args:
-            selector: CSS selector for the target input element.
-            value: The text value to input into the field.
-            prompt: Natural language description of which field to fill and what value.
-            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
-            data: Additional context data for AI processing.
-            timeout: Maximum time to wait for the fill action in milliseconds.
-            totp_identifier: TOTP identifier for time-based one-time password fields.
-            totp_url: URL to fetch TOTP codes from for authentication.
-
-        Returns:
-            The value that was successfully filled into the field.
-
-        Examples:
-            ```python
-            # Fill using selector and value (both positional)
-            await page.fill("#email-input", "user@example.com")
-
-            # Fill using AI with natural language (prompt only)
-            await page.fill(prompt="Fill 'user@example.com' in the email address field")
-
-            # Try selector first, fall back to AI if selector fails
-            await page.fill(
-                "#email-input",
-                "user@example.com",
-                prompt="Fill the email address with user@example.com"
-            )
-            ```
-        """
-        return await self._input_text(
-            selector=selector,
-            value=value or "",
-            ai=ai,
-            intention=prompt,
-            data=data,
-            timeout=timeout,
-            totp_identifier=totp_identifier,
-            totp_url=totp_url,
-        )
-
-    async def goto(self, url: str, **kwargs: Any) -> None:
-        """Navigate to the given URL.
-
-        Args:
-            url: URL to navigate page to.
-            **kwargs: Additional options like timeout, wait_until, referer, etc.
-        """
-        await self._page.goto(url, **kwargs)
-
-    async def type(self, selector: str, text: str, **kwargs: Any) -> None:
-        """Type text into an element character by character.
-
-        Args:
-            selector: A selector to search for an element to type into.
-            text: Text to type into the element.
-            **kwargs: Additional options like delay, timeout, no_wait_after, etc.
-        """
-        await self._page.type(selector, text, **kwargs)
-
-    @overload
-    async def select_option(
-        self,
-        selector: str,
-        value: str | None = None,
-        *,
-        prompt: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        **kwargs: Any,
-    ) -> str: ...
-
-    @overload
-    async def select_option(
-        self,
-        *,
-        prompt: str,
-        value: str | None = None,
-        selector: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        **kwargs: Any,
-    ) -> str: ...
-
-    async def select_option(
-        self,
-        selector: str | None = None,
-        value: str | None = None,
-        *,
-        prompt: str | None = None,
-        ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        **kwargs: Any,
-    ) -> str:
-        """Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
-
-        This method supports three modes:
-        - **Selector-based**: Select the option with a value using CSS selector
-        - **AI-powered**: Use natural language prompt (AI extracts value from prompt)
-        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
-
-        Args:
-            selector: CSS selector for the target select/dropdown element.
-            value: The option value to select.
-            prompt: Natural language description of which option to select.
-            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
-            data: Additional context data for AI processing.
-            timeout: Maximum time to wait for the select action in milliseconds.
-
-        Returns:
-            The value that was successfully selected.
-
-        Examples:
-            ```python
-            # Select using selector and value (both positional)
-            await page.select_option("#country", "us")
-
-            # Select using AI with natural language (prompt only)
-            await page.select_option(prompt="Select 'United States' from the country dropdown")
-
-            # Try selector first, fall back to AI if selector fails
-            await page.select_option(
-                "#country",
-                "us",
-                prompt="Select United States from country"
-            )
-            ```
-        """
-        value = value or ""
-        if ai == "fallback":
-            error_to_raise = None
-            if selector:
-                try:
-                    locator = self._page.locator(selector)
-                    await locator.select_option(value, timeout=timeout, **kwargs)
-                    return value
-                except Exception as e:
-                    error_to_raise = e
-                    selector = None
-
-            if prompt:
-                return await self._ai.ai_select_option(
-                    selector=selector or "",
-                    value=value,
-                    intention=prompt,
-                    data=data,
-                    timeout=timeout,
-                )
-            if error_to_raise:
-                raise error_to_raise
-            else:
-                return value
-        elif ai == "proactive" and prompt:
-            return await self._ai.ai_select_option(
-                selector=selector or "",
-                value=value,
-                intention=prompt,
-                data=data,
-                timeout=timeout,
-            )
-        if selector:
-            locator = self._page.locator(selector)
-            await locator.select_option(value, timeout=timeout, **kwargs)
-        return value
-
-    async def extract(
-        self,
-        prompt: str,
-        schema: dict[str, Any] | list | str | None = None,
-        error_code_mapping: dict[str, str] | None = None,
-        intention: str | None = None,
-        data: str | dict[str, Any] | None = None,
-    ) -> dict[str, Any] | list | str | None:
-        """Extract structured data from the page using AI.
-
-        Args:
-            prompt: Natural language description of what data to extract.
-            schema: JSON Schema defining the structure of data to extract.
-            error_code_mapping: Mapping of error codes to custom error messages.
-            intention: Additional context about the extraction intent.
-            data: Additional context data for AI processing.
-
-        Returns:
-            Extracted data matching the provided schema, or None if extraction fails.
-
-        Examples:
-            ```python
-            # Extract structured data with JSON Schema
-            result = await page.extract(
-                prompt="Extract product information",
-                schema={
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Product name"},
-                        "price": {"type": "number", "description": "Product price"}
-                    },
-                    "required": ["name", "price"]
-                }
-            )
-            # Returns: {"name": "...", "price": 29.99}
-            ```
-        """
-        return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
     async def act(
         self,
@@ -612,7 +256,7 @@ class SkyvernBrowserPage:
         Args:
             **kwargs: Additional options like timeout, wait_until, etc.
         """
-        await self._page.reload(**kwargs)
+        await self.page.reload(**kwargs)
 
     async def screenshot(self, **kwargs: Any) -> bytes:
         """Take a screenshot of the page.
@@ -623,7 +267,7 @@ class SkyvernBrowserPage:
         Returns:
             bytes: The screenshot as bytes (unless path is specified, then saves to file).
         """
-        return await self._page.screenshot(**kwargs)
+        return await self.page.screenshot(**kwargs)
 
     def locator(self, selector: str, **kwargs: Any) -> SkyvernLocator:
         """Find an element using a CSS selector or other selector syntax.
@@ -635,7 +279,7 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object that can be used to perform actions or assertions.
         """
-        return SkyvernLocator(self._page.locator(selector, **kwargs))
+        return SkyvernLocator(self.page.locator(selector, **kwargs))
 
     def get_by_label(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
         """Find an input element by its associated label text.
@@ -647,7 +291,7 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object for the labeled input element.
         """
-        return SkyvernLocator(self._page.get_by_label(text, **kwargs))
+        return SkyvernLocator(self.page.get_by_label(text, **kwargs))
 
     def get_by_text(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
         """Find an element containing the specified text.
@@ -659,7 +303,7 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object for the element containing the text.
         """
-        return SkyvernLocator(self._page.get_by_text(text, **kwargs))
+        return SkyvernLocator(self.page.get_by_text(text, **kwargs))
 
     def get_by_title(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
         """Find an element by its title attribute.
@@ -671,7 +315,7 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object for the element with matching title.
         """
-        return SkyvernLocator(self._page.get_by_title(text, **kwargs))
+        return SkyvernLocator(self.page.get_by_title(text, **kwargs))
 
     def get_by_role(self, role: str, **kwargs: Any) -> SkyvernLocator:
         """Find an element by its ARIA role.
@@ -683,7 +327,7 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object for the element with matching role.
         """
-        return SkyvernLocator(self._page.get_by_role(role, **kwargs))
+        return SkyvernLocator(self.page.get_by_role(role, **kwargs))
 
     def get_by_placeholder(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
         """Find an input element by its placeholder text.
@@ -695,7 +339,7 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object for the input element with matching placeholder.
         """
-        return SkyvernLocator(self._page.get_by_placeholder(text, **kwargs))
+        return SkyvernLocator(self.page.get_by_placeholder(text, **kwargs))
 
     def get_by_alt_text(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
         """Find an element by its alt text (typically images).
@@ -707,7 +351,7 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object for the element with matching alt text.
         """
-        return SkyvernLocator(self._page.get_by_alt_text(text, **kwargs))
+        return SkyvernLocator(self.page.get_by_alt_text(text, **kwargs))
 
     def get_by_test_id(self, test_id: str) -> SkyvernLocator:
         """Find an element by its test ID attribute.
@@ -718,70 +362,4 @@ class SkyvernBrowserPage:
         Returns:
             SkyvernLocator object for the element with matching test ID.
         """
-        return SkyvernLocator(self._page.get_by_test_id(test_id))
-
-    async def _input_text(
-        self,
-        selector: str | None,
-        value: str,
-        ai: str | None = "fallback",
-        intention: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        totp_identifier: str | None = None,
-        totp_url: str | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
-        """Input text into an element identified by ``selector``.
-
-        When ``intention`` and ``data`` are provided a new input text action is
-        generated via the `script-generation-input-text-generation` prompt.  The model returns a
-        fresh text based on the current DOM and the updated data for this run.
-        The browser then inputs the text using this newly generated text.
-
-        If the prompt generation or parsing fails for any reason we fall back to
-        inputting the originally supplied ``value``.
-        """
-
-        # format the text with the actual value of the parameter if it's a secret when running a workflow
-        if ai == "fallback":
-            error_to_raise = None
-            if selector:
-                try:
-                    locator = self._page.locator(selector)
-                    await handler_utils.input_sequentially(locator, value, timeout=timeout)
-                    return value
-                except Exception as e:
-                    error_to_raise = e
-                    selector = None
-
-            if intention:
-                return await self._ai.ai_input_text(
-                    selector=selector,
-                    value=value,
-                    intention=intention,
-                    data=data,
-                    totp_identifier=totp_identifier,
-                    totp_url=totp_url,
-                    timeout=timeout,
-                )
-            if error_to_raise:
-                raise error_to_raise
-            else:
-                return value
-        elif ai == "proactive" and intention:
-            return await self._ai.ai_input_text(
-                selector=selector,
-                value=value,
-                intention=intention,
-                data=data,
-                totp_identifier=totp_identifier,
-                totp_url=totp_url,
-                timeout=timeout,
-            )
-
-        if not selector:
-            raise ValueError("Selector is required but was not provided")
-
-        locator = self._page.locator(selector)
-        await handler_utils.input_sequentially(locator, value, timeout=timeout)
-        return value
+        return SkyvernLocator(self.page.get_by_test_id(test_id))

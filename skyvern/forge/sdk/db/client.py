@@ -3290,7 +3290,7 @@ class AgentDB:
         self,
         organization_id: str,
         limit: int = 50,
-        valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
+        valid_lifespan_minutes: int | None = None,
         otp_type: OTPType | None = None,
         workflow_run_id: str | None = None,
     ) -> list[TOTPCode]:
@@ -3304,11 +3304,13 @@ class AgentDB:
             TOTPCodeModel.workflow_run_id.is_(None),
         )
         async with self.Session() as session:
-            query = (
-                select(TOTPCodeModel)
-                .filter_by(organization_id=organization_id)
-                .filter(TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes))
-            )
+            query = select(TOTPCodeModel).filter_by(organization_id=organization_id)
+
+            if valid_lifespan_minutes is not None:
+                query = query.filter(
+                    TOTPCodeModel.created_at > datetime.utcnow() - timedelta(minutes=valid_lifespan_minutes)
+                )
+
             if otp_type:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
             if workflow_run_id is not None:

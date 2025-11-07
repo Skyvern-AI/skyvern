@@ -10,18 +10,18 @@ class SkyvernPageAi(Protocol):
 
     async def ai_click(
         self,
-        selector: str,
+        selector: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
+    ) -> str | None:
         """Click an element using AI to locate it based on intention."""
         ...
 
     async def ai_input_text(
         self,
         selector: str | None,
-        value: str,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         totp_identifier: str | None = None,
@@ -44,8 +44,8 @@ class SkyvernPageAi(Protocol):
 
     async def ai_select_option(
         self,
-        selector: str,
-        value: str,
+        selector: str | None,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,

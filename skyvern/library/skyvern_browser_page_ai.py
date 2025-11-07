@@ -29,11 +29,11 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
     async def ai_click(
         self,
-        selector: str,
+        selector: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
+    ) -> str | None:
         """Click an element using AI via API call."""
 
         await self._browser.sdk.ensure_has_server()
@@ -55,7 +55,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     async def ai_input_text(
         self,
         selector: str | None,
-        value: str,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         totp_identifier: str | None = None,
@@ -81,12 +81,12 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=self._browser.workflow_run_id,
         )
         self._browser.workflow_run_id = response.workflow_run_id
-        return response.result if response.result else value
+        return response.result if response.result else value or ""
 
     async def ai_select_option(
         self,
-        selector: str,
-        value: str,
+        selector: str | None,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -108,7 +108,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=self._browser.workflow_run_id,
         )
         self._browser.workflow_run_id = response.workflow_run_id
-        return response.result if response.result else value
+        return response.result if response.result else value or ""
 
     async def ai_upload_file(
         self,
