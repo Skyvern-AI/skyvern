@@ -3155,6 +3155,7 @@ async def select_from_dropdown(
                 reasoning=select_reason,
                 element_id=element_id,
                 option=SelectOption(label=value),
+                input_or_select_context=context,
             )
             results = await normal_select(
                 action=action, skyvern_element=selected_element, task=task, step=step, builder=incremental_scraped
