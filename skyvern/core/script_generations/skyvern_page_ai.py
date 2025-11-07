@@ -34,10 +34,11 @@ class SkyvernPageAi(Protocol):
     async def ai_upload_file(
         self,
         selector: str | None,
-        files: str,
+        files: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        public_url_only: bool = False,
     ) -> str:
         """Upload a file using AI to process the file URL."""
         ...

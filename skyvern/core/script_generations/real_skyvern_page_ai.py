@@ -13,6 +13,7 @@ from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services.otp_service import poll_otp_value
@@ -322,10 +323,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
     async def ai_upload_file(
         self,
         selector: str | None,
-        files: str,
+        files: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        public_url_only: bool = False,
     ) -> str:
         """Upload a file using AI to process the file URL."""
 
@@ -409,6 +411,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                             files = action.file_url
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
+
+        if public_url_only and not validate_download_url(files):
+            raise Exception("Only public URLs are allowed")
 
         if action and organization_id and task and step:
             result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
