@@ -69,6 +69,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -1107,13 +1108,8 @@ async def handle_input_text_action(
         or (action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
     ):
         try:
-            distinct_id = task.workflow_run_id or task.task_id
-
-            enable_speed_optimizations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "ENABLE_SPEED_OPTIMIZATIONS",
-                distinct_id,
-                properties={"organization_id": task.organization_id},
-            )
+            current_context = skyvern_current()
+            enable_speed_optimizations = current_context.enable_speed_optimizations if current_context else False
 
             if enable_speed_optimizations:
                 skip_context_parsing = True
@@ -1125,7 +1121,7 @@ async def handle_input_text_action(
                     is_multi_field_totp=bool(action.totp_timing_info),
                 )
         except Exception:
-            LOG.warning("Failed to check ENABLE_SPEED_OPTIMIZATIONS for TOTP optimization", exc_info=True)
+            LOG.warning("Failed to read ENABLE_SPEED_OPTIMIZATIONS from context for TOTP optimization", exc_info=True)
 
     if skip_context_parsing:
         input_or_select_context = None
