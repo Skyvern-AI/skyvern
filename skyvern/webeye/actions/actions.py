@@ -45,6 +45,7 @@ class InputOrSelectContext(BaseModel):
     is_search_bar: bool | None = None  # don't trigger custom-selection logic when it's a search bar
     is_location_input: bool | None = None  # address input usually requires auto completion
     is_date_related: bool | None = None  # date picker mini agent requires some special logic
+    date_format: str | None = None
 
     def __repr__(self) -> str:
         return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
