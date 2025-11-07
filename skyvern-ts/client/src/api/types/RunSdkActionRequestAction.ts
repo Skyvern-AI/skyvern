@@ -2,13 +2,21 @@
 
 import type * as Skyvern from "../index.js";
 
-export type SdkAction =
-    | Skyvern.SdkAction.AiClick
-    | Skyvern.SdkAction.AiInputText
-    | Skyvern.SdkAction.AiSelectOption
-    | Skyvern.SdkAction.Extract;
+/**
+ * The action to execute with its specific parameters
+ */
+export type RunSdkActionRequestAction =
+    | Skyvern.RunSdkActionRequestAction.AiAct
+    | Skyvern.RunSdkActionRequestAction.AiClick
+    | Skyvern.RunSdkActionRequestAction.AiInputText
+    | Skyvern.RunSdkActionRequestAction.AiSelectOption
+    | Skyvern.RunSdkActionRequestAction.Extract;
 
-export namespace SdkAction {
+export namespace RunSdkActionRequestAction {
+    export interface AiAct extends Skyvern.ActAction {
+        type: "ai_act";
+    }
+
     export interface AiClick extends Skyvern.ClickAction {
         type: "ai_click";
     }

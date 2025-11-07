@@ -5,15 +5,13 @@ import type * as Skyvern from "../../index.js";
 /**
  * @example
  *     {
- *         "x-user-agent": "x-user-agent",
  *         url: "url",
  *         action: {
- *             type: "ai_click"
+ *             type: "ai_act"
  *         }
  *     }
  */
 export interface RunSdkActionRequest {
-    "x-user-agent"?: string;
     /** The URL where the action should be executed */
     url: string;
     /** The browser session ID */
@@ -23,5 +21,5 @@ export interface RunSdkActionRequest {
     /** Optional workflow run ID to continue an existing workflow run */
     workflow_run_id?: string;
     /** The action to execute with its specific parameters */
-    action: Skyvern.SdkAction;
+    action: Skyvern.RunSdkActionRequestAction;
 }
