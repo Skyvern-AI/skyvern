@@ -33,7 +33,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useSearchParams } from "react-router-dom";
-import { statusIsFinalized, statusIsRunningOrQueued } from "../tasks/types";
+import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
@@ -142,8 +142,8 @@ function WorkflowRun() {
     },
   });
 
-  const workflowRunIsRunningOrQueued =
-    workflowRun && statusIsRunningOrQueued(workflowRun);
+  const workflowRunIsCancellable =
+    workflowRun && statusIsCancellable(workflowRun);
 
   const workflowRunIsFinalized = workflowRun && statusIsFinalized(workflowRun);
   const selection = findActiveItem(
@@ -362,7 +362,7 @@ function WorkflowRun() {
                 Edit
               </Link>
             </Button>
-            {workflowRunIsRunningOrQueued && (
+            {workflowRunIsCancellable && (
               <Dialog>
                 <DialogTrigger asChild>
                   <Button variant="destructive">Cancel</Button>
