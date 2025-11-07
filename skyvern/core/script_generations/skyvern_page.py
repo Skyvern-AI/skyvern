@@ -4,7 +4,7 @@ import asyncio
 import copy
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, overload
 
 import structlog
 from playwright.async_api import Page
@@ -95,29 +95,79 @@ class SkyvernPage:
         await self.page.goto(url, timeout=timeout)
 
     ######### Public Interfaces #########
-    @action_wrap(ActionType.CLICK)
+
+    @overload
     async def click(
         self,
         selector: str,
+        *,
         prompt: str | None = None,
         ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         intention: str | None = None,  # backward compatibility
-    ) -> str:
-        """Click an element identified by ``selector``.
+        **kwargs: Any,
+    ) -> str | None: ...
 
-        When ``prompt`` and ``data`` are provided a new click action is
-        generated via the ``single-click-action`` prompt.  The model returns a
-        fresh "xpath=..." selector based on the current DOM and the updated data for this run.
-        The browser then clicks the element using this newly generated xpath selector.
+    @overload
+    async def click(
+        self,
+        *,
+        prompt: str,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
+    ) -> str | None: ...
 
-        If the prompt generation or parsing fails for any reason we fall back to
-        clicking the originally supplied ``selector``.
+    @action_wrap(ActionType.CLICK)
+    async def click(
+        self,
+        selector: str | None = None,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
+    ) -> str | None:
+        """Click an element using a CSS selector, AI-powered prompt matching, or both.
+
+        This method supports three modes:
+        - **Selector-based**: Click the element matching the CSS selector
+        - **AI-powered**: Use natural language to describe which element to click
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+        Args:
+            selector: CSS selector for the target element.
+            prompt: Natural language description of which element to click.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            data: Additional context data for AI processing.
+            timeout: Maximum time to wait for the click action in milliseconds.
+
+        Returns:
+            The selector string that was successfully used to click the element, or None.
+
+        Examples:
+            ```python
+            # Click using a CSS selector
+            await page.click("#open-invoice-button")
+
+            # Click using AI with natural language
+            await page.click(prompt="Click on the 'Open Invoice' button")
+
+            # Try selector first, fall back to AI if selector fails
+            await page.click("#open-invoice-button", prompt="Click on the 'Open Invoice' button")
+            ```
         """
         # Backward compatibility
         if intention is not None and prompt is None:
             prompt = intention
+
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -125,12 +175,14 @@ class SkyvernPage:
         if ai == "fallback":
             # try to click the element with the original selector first
             error_to_raise = None
-            try:
-                locator = self.page.locator(selector)
-                await locator.click(timeout=timeout)
-                return selector
-            except Exception as e:
-                error_to_raise = e
+            if selector:
+                try:
+                    locator = self.page.locator(selector)
+                    await locator.click(timeout=timeout, **kwargs)
+                    return selector
+                except Exception as e:
+                    error_to_raise = e
+                    selector = None
 
             # if the original selector doesn't work, try to click the element with the ai generated selector
             if prompt:
@@ -152,30 +204,104 @@ class SkyvernPage:
                     data=data,
                     timeout=timeout,
                 )
-        locator = self.page.locator(selector)
-        await locator.click(timeout=timeout)
+
+        if selector:
+            locator = self.page.locator(selector, **kwargs)
+            await locator.click(timeout=timeout)
+
         return selector
+
+    @overload
+    async def fill(
+        self,
+        selector: str,
+        value: str,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        intention: str | None = None,  # backward compatibility
+    ) -> str: ...
+
+    @overload
+    async def fill(
+        self,
+        *,
+        prompt: str,
+        value: str | None = None,
+        selector: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+        intention: str | None = None,  # backward compatibility
+    ) -> str: ...
 
     @action_wrap(ActionType.INPUT_TEXT)
     async def fill(
         self,
-        selector: str | None,
-        value: str,
-        ai: str | None = "fallback",
+        selector: str | None = None,
+        value: str | None = None,
+        *,
         prompt: str | None = None,
+        ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         intention: str | None = None,  # backward compatibility
     ) -> str:
+        """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
+
+        This method supports three modes:
+        - **Selector-based**: Fill the input field with a value using CSS selector
+        - **AI-powered**: Use natural language prompt (AI extracts value from prompt)
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+        Args:
+            selector: CSS selector for the target input element.
+            value: The text value to input into the field.
+            prompt: Natural language description of which field to fill and what value.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            data: Additional context data for AI processing.
+            timeout: Maximum time to wait for the fill action in milliseconds.
+            totp_identifier: TOTP identifier for time-based one-time password fields.
+            totp_url: URL to fetch TOTP codes from for authentication.
+
+        Returns:
+            The value that was successfully filled into the field.
+
+        Examples:
+            ```python
+            # Fill using selector and value (both positional)
+            await page.fill("#email-input", "user@example.com")
+
+            # Fill using AI with natural language (prompt only)
+            await page.fill(prompt="Fill 'user@example.com' in the email address field")
+
+            # Try selector first, fall back to AI if selector fails
+            await page.fill(
+                "#email-input",
+                "user@example.com",
+                prompt="Fill the email address with user@example.com"
+            )
+            ```
+        """
+
         # Backward compatibility
         if intention is not None and prompt is None:
             prompt = intention
 
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
+
         return await self._input_text(
             selector=selector,
-            value=value,
+            value=value or "",
             ai=ai,
             intention=prompt,
             data=data,
@@ -201,6 +327,9 @@ class SkyvernPage:
         if intention is not None and prompt is None:
             prompt = intention
 
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
+
         return await self._input_text(
             selector=selector,
             value=value,
@@ -225,7 +354,7 @@ class SkyvernPage:
     ) -> str:
         """Input text into an element identified by ``selector``.
 
-        When ``prompt`` and ``data`` are provided a new input text action is
+        When ``intention`` and ``data`` are provided a new input text action is
         generated via the `script-generation-input-text-generation` prompt.  The model returns a
         fresh text based on the current DOM and the updated data for this run.
         The browser then inputs the text using this newly generated text.
@@ -248,6 +377,7 @@ class SkyvernPage:
                     return value
                 except Exception as e:
                     error_to_raise = e
+                    selector = None
 
             if intention:
                 return await self._ai.ai_input_text(
@@ -296,6 +426,9 @@ class SkyvernPage:
         if intention is not None and prompt is None:
             prompt = intention
 
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
+
         context = skyvern_context.current()
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
@@ -308,6 +441,7 @@ class SkyvernPage:
                     await locator.set_input_files(file_path)
                 except Exception as e:
                     error_to_raise = e
+                    selector = None
 
             if prompt:
                 return await self._ai.ai_upload_file(
@@ -338,21 +472,88 @@ class SkyvernPage:
         await locator.set_input_files(file_path, timeout=timeout)
         return files
 
-    @action_wrap(ActionType.SELECT_OPTION)
+    @overload
     async def select_option(
         self,
         selector: str,
         value: str | None = None,
-        label: str | None = None,
-        ai: str | None = "fallback",
+        *,
         prompt: str | None = None,
+        ai: str | None = "fallback",
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         intention: str | None = None,  # backward compatibility
-    ) -> str:
+        **kwargs: Any,
+    ) -> str | None: ...
+
+    @overload
+    async def select_option(
+        self,
+        *,
+        prompt: str,
+        value: str | None = None,
+        selector: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
+    ) -> str | None: ...
+
+    @action_wrap(ActionType.SELECT_OPTION)
+    async def select_option(
+        self,
+        selector: str | None = None,
+        value: str | None = None,
+        *,
+        prompt: str | None = None,
+        ai: str | None = "fallback",
+        data: str | dict[str, Any] | None = None,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
+    ) -> str | None:
+        """Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
+
+        This method supports three modes:
+        - **Selector-based**: Select the option with a value using CSS selector
+        - **AI-powered**: Use natural language prompt (AI extracts value from prompt)
+        - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
+
+        Args:
+            selector: CSS selector for the target select/dropdown element.
+            value: The option value to select.
+            prompt: Natural language description of which option to select.
+            ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
+            data: Additional context data for AI processing.
+            timeout: Maximum time to wait for the select action in milliseconds.
+
+        Returns:
+            The value that was successfully selected.
+
+        Examples:
+            ```python
+            # Select using selector and value (both positional)
+            await page.select_option("#country", "us")
+
+            # Select using AI with natural language (prompt only)
+            await page.select_option(prompt="Select 'United States' from the country dropdown")
+
+            # Try selector first, fall back to AI if selector fails
+            await page.select_option(
+                "#country",
+                "us",
+                prompt="Select United States from country"
+            )
+            ```
+        """
+
         # Backward compatibility
         if intention is not None and prompt is None:
             prompt = intention
+
+        if not selector and not prompt:
+            raise ValueError("Missing input: pass a selector and/or a prompt.")
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -360,12 +561,15 @@ class SkyvernPage:
         value = value or ""
         if ai == "fallback":
             error_to_raise = None
-            try:
-                locator = self.page.locator(selector)
-                await locator.select_option(value, timeout=timeout)
-                return value
-            except Exception as e:
-                error_to_raise = e
+            if selector:
+                try:
+                    locator = self.page.locator(selector)
+                    await locator.select_option(value, timeout=timeout, **kwargs)
+                    return value
+                except Exception as e:
+                    error_to_raise = e
+                    selector = None
+
             if prompt:
                 return await self._ai.ai_select_option(
                     selector=selector,
@@ -386,8 +590,9 @@ class SkyvernPage:
                 data=data,
                 timeout=timeout,
             )
-        locator = self.page.locator(selector)
-        await locator.select_option(value, timeout=timeout)
+        if selector:
+            locator = self.page.locator(selector)
+            await locator.select_option(value, timeout=timeout, **kwargs)
         return value
 
     @action_wrap(ActionType.WAIT)
@@ -445,6 +650,35 @@ class SkyvernPage:
         intention: str | None = None,
         data: str | dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
+        """Extract structured data from the page using AI.
+
+        Args:
+            prompt: Natural language description of what data to extract.
+            schema: JSON Schema defining the structure of data to extract.
+            error_code_mapping: Mapping of error codes to custom error messages.
+            intention: Additional context about the extraction intent.
+            data: Additional context data for AI processing.
+
+        Returns:
+            Extracted data matching the provided schema, or None if extraction fails.
+
+        Examples:
+            ```python
+            # Extract structured data with JSON Schema
+            result = await page.extract(
+                prompt="Extract product information",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Product name"},
+                        "price": {"type": "number", "description": "Product price"}
+                    },
+                    "required": ["name", "price"]
+                }
+            )
+            # Returns: {"name": "...", "price": 29.99}
+            ```
+        """
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
     @action_wrap(ActionType.VERIFICATION_CODE)
