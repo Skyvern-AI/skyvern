@@ -25,6 +25,8 @@ export interface Workflow {
     cache_key?: string;
     run_sequentially?: boolean;
     sequential_key?: string;
+    folder_id?: string;
+    import_error?: string;
     created_at: string;
     modified_at: string;
     deleted_at?: string;

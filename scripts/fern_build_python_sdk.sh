@@ -2,6 +2,9 @@
 
 CURRENT_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
 fern generate --group python-sdk --log-level debug --version "$CURRENT_VERSION" --preview
+
+rm -fr skyvern/client
+mkdir -p skyvern/client
 cp -rf fern/.preview/fern-python-sdk/src/skyvern/* skyvern/client/
 
 # Post-processing: Patch version.py to handle missing metadata gracefully

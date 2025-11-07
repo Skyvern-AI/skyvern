@@ -1,6 +1,6 @@
 {
     "name": "@skyvern/client",
-    "version": "0.2.21",
+    "version": "0.2.22",
     "private": false,
     "repository": "github:Skyvern-AI/skyvern",
     "type": "commonjs",
@@ -61,5 +61,9 @@
     "engines": {
         "node": ">=18.0.0"
     },
-    "sideEffects": false
+    "sideEffects": false,
+    "description": "The Skyvern TypeScript library provides convenient access to the Skyvern APIs from TypeScript.",
+    "publishConfig": {
+        "access": "public"
+    }
 }

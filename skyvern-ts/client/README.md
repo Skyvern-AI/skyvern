@@ -39,7 +39,7 @@ following namespace:
 ```typescript
 import { Skyvern } from "@skyvern/client";
 
-const request: Skyvern.RunTaskRequest = {
+const request: Skyvern.GetFoldersV1FoldersGetRequest = {
     ...
 };
 ```

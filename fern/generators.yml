@@ -30,3 +30,7 @@ groups:
           repository: Skyvern-AI/skyvern-typescript
         config:
           namespaceExport: Skyvern
+          packageJson:
+            description: "The Skyvern TypeScript library provides convenient access to the Skyvern APIs from TypeScript."
+            publishConfig:
+              access: "public"

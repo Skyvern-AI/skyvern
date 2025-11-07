@@ -2,6 +2,7 @@
 
 import * as Skyvern from "./api/index.js";
 import { Scripts } from "./api/resources/scripts/client/Client.js";
+import { Workflows } from "./api/resources/workflows/client/Client.js";
 import type { BaseClientOptions, BaseRequestOptions } from "./BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "./core/headers.js";
 import * as core from "./core/index.js";
@@ -16,6 +17,7 @@ export declare namespace SkyvernClient {
 
 export class SkyvernClient {
     protected readonly _options: SkyvernClient.Options;
+    protected _workflows: Workflows | undefined;
     protected _scripts: Scripts | undefined;
 
     constructor(_options: SkyvernClient.Options = {}) {
@@ -26,14 +28,18 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "0.2.21",
-                    "User-Agent": "@skyvern/client/0.2.21",
+                    "X-Fern-SDK-Version": "0.2.22",
+                    "User-Agent": "@skyvern/client/0.2.22",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
                 _options?.headers,
             ),
         };
+    }
+
+    public get workflows(): Workflows {
+        return (this._workflows ??= new Workflows(this._options));
     }
 
     public get scripts(): Scripts {
@@ -382,8 +388,8 @@ export class SkyvernClient {
      * Get all workflows with the latest version for the organization.
      *
      * Search semantics:
-     * - If `search_key` is provided, its value is used as a unified search term for both
-     *   `workflows.title` and workflow parameter metadata (key, description, and default_value for
+     * - If `search_key` is provided, its value is used as a unified search term for
+     *   `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for
      *   `WorkflowParameterModel`).
      * - Falls back to deprecated `title` (title-only search) if `search_key` is not provided.
      * - Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.
@@ -401,6 +407,7 @@ export class SkyvernClient {
      *         only_workflows: true,
      *         search_key: "search_key",
      *         title: "title",
+     *         folder_id: "folder_id",
      *         template: true
      *     })
      */
@@ -422,6 +429,8 @@ export class SkyvernClient {
             only_workflows: onlyWorkflows,
             search_key: searchKey,
             title,
+            folder_id: folderId,
+            status,
             template,
         } = request;
         const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
@@ -447,6 +456,18 @@ export class SkyvernClient {
 
         if (title != null) {
             _queryParams.title = title;
+        }
+
+        if (folderId != null) {
+            _queryParams.folder_id = folderId;
+        }
+
+        if (status != null) {
+            if (Array.isArray(status)) {
+                _queryParams.status = status.map((item) => item);
+            } else {
+                _queryParams.status = status;
+            }
         }
 
         if (template != null) {
@@ -2209,17 +2230,13 @@ export class SkyvernClient {
      * @param {Skyvern.RunSdkActionRequest} request
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
      *
-     * @throws {@link Skyvern.BadRequestError}
-     * @throws {@link Skyvern.ForbiddenError}
-     * @throws {@link Skyvern.NotFoundError}
      * @throws {@link Skyvern.UnprocessableEntityError}
      *
      * @example
      *     await client.runSdkAction({
-     *         "x-user-agent": "x-user-agent",
      *         url: "url",
      *         action: {
-     *             type: "ai_click"
+     *             type: "ai_act"
      *         }
      *     })
      */
@@ -2234,13 +2251,9 @@ export class SkyvernClient {
         request: Skyvern.RunSdkActionRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.RunSdkActionResponse>> {
-        const { "x-user-agent": userAgent, ..._body } = request;
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({
-                "x-user-agent": userAgent != null ? userAgent : undefined,
-                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
-            }),
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -2255,7 +2268,7 @@ export class SkyvernClient {
             contentType: "application/json",
             queryParameters: requestOptions?.queryParams,
             requestType: "json",
-            body: _body,
+            body: request,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,
@@ -2266,12 +2279,6 @@ export class SkyvernClient {
 
         if (_response.error.reason === "status-code") {
             switch (_response.error.statusCode) {
-                case 400:
-                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
-                case 403:
-                    throw new Skyvern.ForbiddenError(_response.error.body as unknown, _response.rawResponse);
-                case 404:
-                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
                 case 422:
                     throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
                 default:

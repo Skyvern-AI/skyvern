@@ -9,6 +9,8 @@ fern generate --group ts-sdk --log-level debug --version "$CURRENT_VERSION" --pr
   && npx tsc --project ./tsconfig.esm.json \
   && node scripts/rename-to-esm-files.js dist/esm)
 
+rm -fr skyvern-ts/client
+mkdir -p skyvern-ts/client
 cp -rf fern/.preview/fern-typescript-sdk/* skyvern-ts/client/
 
 # Post-processing: Update repository references the monorepo
