@@ -37,6 +37,7 @@ class SkyvernContext:
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
     vertex_cache_name: str | None = None  # Vertex AI cache resource name for explicit caching
+    enable_speed_optimizations: bool = False
 
     # script run context
     script_id: str | None = None

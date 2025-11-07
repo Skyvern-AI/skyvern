@@ -1096,16 +1096,51 @@ async def handle_input_text_action(
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
 
-    input_or_select_context = await _get_input_or_select_context(
-        action=action,
-        element_tree_builder=scraped_page,
-        skyvern_element=skyvern_element,
-        step=step,
-    )
+    # OPTIMIZATION: Skip expensive LLM context parsing for TOTP and secret values
+    # TOTP inputs don't need autocomplete detection - we already have the generated code
+    # This saves ~4-5s per TOTP digit (6 digits = ~27s saved for 2FA!)
+    # Gated by ENABLE_SPEED_OPTIMIZATIONS feature flag
+    skip_context_parsing = False
+    if (
+        is_totp_value
+        or is_secret_value
+        or (action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
+    ):
+        try:
+            distinct_id = task.workflow_run_id or task.task_id
+
+            enable_speed_optimizations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "ENABLE_SPEED_OPTIMIZATIONS",
+                distinct_id,
+                properties={"organization_id": task.organization_id},
+            )
+
+            if enable_speed_optimizations:
+                skip_context_parsing = True
+                LOG.info(
+                    "Speed optimization: Skipping input context parsing for TOTP/secret input",
+                    element_id=skyvern_element.get_id(),
+                    is_totp=is_totp_value,
+                    is_secret=is_secret_value,
+                    is_multi_field_totp=bool(action.totp_timing_info),
+                )
+        except Exception:
+            LOG.warning("Failed to check ENABLE_SPEED_OPTIMIZATIONS for TOTP optimization", exc_info=True)
+
+    if skip_context_parsing:
+        input_or_select_context = None
+    else:
+        input_or_select_context = await _get_input_or_select_context(
+            action=action,
+            element_tree_builder=scraped_page,
+            skyvern_element=skyvern_element,
+            step=step,
+        )
 
     # check if it's selectable
     if (
-        not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
+        input_or_select_context is not None
+        and not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
         and not is_totp_value
         and not is_secret_value
         and skyvern_element.get_tag_name() == InteractiveElement.INPUT
@@ -1361,7 +1396,8 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if not await skyvern_element.is_raw_input():
-            if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
+            is_location_input = input_or_select_context.is_location_input if input_or_select_context else False
+            if input_or_select_context and (await skyvern_element.is_auto_completion_input() or is_location_input):
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
                     scraped_page=scraped_page,
