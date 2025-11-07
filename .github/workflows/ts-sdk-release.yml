@@ -51,6 +51,8 @@ jobs:
         with:
           node-version: '18'
           registry-url: 'https://registry.npmjs.org'
+      - name: Install Fern dependencies
+        run: npm install -g patch-package
       - name: Install dependencies
         run: npm install
       - name: Build CJS
