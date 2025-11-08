@@ -1994,7 +1994,32 @@ async def handle_complete_action(
             )
             return [ActionFailure(exception=e)]
 
-        if not verification_result.user_goal_achieved:
+        # Check if we should terminate instead of complete
+        # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
+        if verification_result.is_terminate:
+            LOG.warning(
+                "CompleteAction verification determined task should terminate instead (termination-aware experiment)",
+                workflow_run_id=task.workflow_run_id,
+                thoughts=verification_result.thoughts,
+                status=verification_result.status if verification_result.status else "legacy",
+            )
+            # Create a TerminateAction and execute it
+            terminate_action = actions.TerminateAction(
+                reasoning=verification_result.thoughts,
+                organization_id=action.organization_id,
+                workflow_run_id=action.workflow_run_id,
+                task_id=action.task_id,
+                step_id=action.step_id,
+                step_order=action.step_order,
+                action_order=action.action_order,
+            )
+            results = await handle_terminate_action(terminate_action, page, scraped_page, task, step)
+            action.action_type = ActionType.TERMINATE
+            action.reasoning = terminate_action.reasoning
+            action.errors = terminate_action.errors
+            return results
+
+        if not verification_result.is_complete:
             return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
 
         LOG.info(

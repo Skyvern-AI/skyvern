@@ -29,13 +29,50 @@ class SelectOption(BaseModel):
         return f"SelectOption(label={self.label}, value={self.value}, index={self.index})"
 
 
+class VerificationStatus(StrEnum):
+    """Status of user goal verification."""
+
+    complete = "complete"  # Goal achieved successfully
+    terminate = "terminate"  # Goal cannot be achieved, stop trying
+    continue_step = "continue"  # Goal not yet achieved, continue with more steps
+
+
 class CompleteVerifyResult(BaseModel):
-    user_goal_achieved: bool
+    # New field: explicit status with three options (used when experiment is enabled)
+    status: VerificationStatus | None = None
+
+    # Legacy fields: for backward compatibility (used when experiment is disabled)
+    user_goal_achieved: bool = False
+    should_terminate: bool = False
+
     thoughts: str
     page_info: str | None = None
 
     def __repr__(self) -> str:
-        return f"CompleteVerifyResponse(thoughts={self.thoughts}, user_goal_achieved={self.user_goal_achieved}, page_info={self.page_info})"
+        if self.status:
+            return f"CompleteVerifyResult(status={self.status}, thoughts={self.thoughts}, page_info={self.page_info})"
+        return f"CompleteVerifyResult(thoughts={self.thoughts}, user_goal_achieved={self.user_goal_achieved}, should_terminate={self.should_terminate}, page_info={self.page_info})"
+
+    @property
+    def is_complete(self) -> bool:
+        """True if goal was achieved (supports both new and legacy formats)."""
+        if self.status:
+            return self.status == VerificationStatus.complete
+        return self.user_goal_achieved
+
+    @property
+    def is_terminate(self) -> bool:
+        """True if task should terminate (supports both new and legacy formats)."""
+        if self.status:
+            return self.status == VerificationStatus.terminate
+        return self.should_terminate
+
+    @property
+    def is_continue(self) -> bool:
+        """True if task should continue (supports both new and legacy formats)."""
+        if self.status:
+            return self.status == VerificationStatus.continue_step
+        return not self.user_goal_achieved and not self.should_terminate
 
 
 class InputOrSelectContext(BaseModel):
