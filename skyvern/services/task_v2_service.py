@@ -62,7 +62,9 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
-DEFAULT_MAX_ITERATIONS = 13
+# Maximum number of planning iterations for TaskV2
+# This limits how many times the LLM can plan and execute actions
+DEFAULT_MAX_ITERATIONS = 50
 
 MINI_GOAL_TEMPLATE = """Achieve the following mini goal and once it's achieved, complete:
 ```{mini_goal}```
@@ -574,6 +576,10 @@ async def run_task_v2_helper(
     url = str(task_v2.url)
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
+
+    # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
+    # This is managed at the ForLoop level by calling run_task_v2 for each iteration
+    # The DEFAULT_MAX_ITERATIONS limit applies to this single TaskV2 execution
     for i in range(DEFAULT_MAX_ITERATIONS):
         # validate the task execution
         await app.AGENT_FUNCTION.validate_task_execution(
@@ -986,17 +992,16 @@ async def run_task_v2_helper(
             )
             return workflow, workflow_run, task_v2
     else:
+        # Loop completed without early exit - task exceeded max iterations
         LOG.info(
-            "Task v2 failed - run out of iterations",
+            "Task v2 failed - exceeded maximum iterations",
             max_iterations=DEFAULT_MAX_ITERATIONS,
-            max_steps=max_steps,
             workflow_run_id=workflow_run_id,
         )
-        failure_reason = await _summarize_max_steps_failure_reason(task_v2, organization_id, browser_state)
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
-            failure_reason=f"Max iterations reached. Possible failure reasons: {failure_reason}",
+            failure_reason=f"Task exceeded maximum of {DEFAULT_MAX_ITERATIONS} planning iterations. Consider simplifying the task or breaking it into smaller steps.",
             organization_id=organization_id,
         )
 
@@ -1821,19 +1826,22 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
         payload_dict = json.loads(payload_json)
         payload_dict.update(json.loads(task_run_response_json))
         signed_data = generate_skyvern_webhook_signature(payload=payload_dict, api_key=api_key.token)
+        payload = signed_data.signed_payload
+        headers = signed_data.headers
         LOG.info(
             "Sending task v2 response to webhook callback url",
             task_v2_id=task_v2.observer_cruise_id,
             webhook_callback_url=task_v2.webhook_callback_url,
-            payload=signed_data.signed_payload,
-            headers=signed_data.headers,
+            payload_length=len(payload),
+            header_keys=sorted(headers.keys()),
         )
-        resp = await httpx.AsyncClient().post(
-            task_v2.webhook_callback_url,
-            data=signed_data.signed_payload,
-            headers=signed_data.headers,
-            timeout=httpx.Timeout(30.0),
-        )
+        timeout = httpx.Timeout(30.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                task_v2.webhook_callback_url,
+                data=payload,
+                headers=headers,
+            )
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",
