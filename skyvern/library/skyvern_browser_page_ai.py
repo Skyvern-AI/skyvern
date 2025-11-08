@@ -40,8 +40,6 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str | None:
         """Click an element using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-
         LOG.info("AI click", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
         response = await self._browser.client.run_sdk_action(
@@ -70,8 +68,6 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
     ) -> str:
         """Input text into an element using AI via API call."""
-
-        await self._browser.sdk.ensure_has_server()
 
         LOG.info("AI input text", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
@@ -103,8 +99,6 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Select an option from a dropdown using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-
         LOG.info("AI select option", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
         response = await self._browser.client.run_sdk_action(
@@ -134,8 +128,6 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> str:
         """Upload a file using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-
         LOG.info("AI upload file", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
         response = await self._browser.client.run_sdk_action(
@@ -164,8 +156,6 @@ class SdkSkyvernPageAi(SkyvernPageAi):
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI via API call."""
 
-        await self._browser.sdk.ensure_has_server()
-
         LOG.info("AI extract", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
 
         response = await self._browser.client.run_sdk_action(
@@ -189,8 +179,6 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         prompt: str,
     ) -> None:
         """Perform an action on the page using AI via API call."""
-
-        await self._browser.sdk.ensure_has_server()
 
         LOG.info("AI act", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
 
