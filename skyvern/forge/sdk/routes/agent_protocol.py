@@ -2671,6 +2671,59 @@ async def get_task_v2(
     return task_v2.model_dump(by_alias=True)
 
 
+async def _flatten_workflow_run_timeline_recursive(
+    timeline: WorkflowRunTimeline,
+    organization_id: str,
+) -> list[WorkflowRunTimeline]:
+    """
+    Recursively flatten a timeline item and its children, handling TaskV2 blocks.
+
+    TaskV2 blocks are replaced with their internal workflow run blocks.
+    Other blocks (like ForLoop) are kept with their children recursively processed.
+    """
+    result = []
+
+    # Check if this is a TaskV2 block that needs to be flattened
+    if timeline.block and timeline.block.block_type == BlockType.TaskV2:
+        if timeline.block.block_workflow_run_id:
+            # Recursively flatten the TaskV2's internal workflow run
+            nested_timeline = await _flatten_workflow_run_timeline(
+                organization_id=organization_id,
+                workflow_run_id=timeline.block.block_workflow_run_id,
+            )
+            result.extend(nested_timeline)
+        else:
+            LOG.warning(
+                "Block workflow run id is not set for task_v2 block",
+                workflow_run_block_id=timeline.block.workflow_run_block_id if timeline.block else None,
+                organization_id=organization_id,
+            )
+            result.append(timeline)
+    else:
+        # For non-TaskV2 blocks, process children recursively to handle nested TaskV2 blocks
+        new_children = []
+        if timeline.children:
+            for child in timeline.children:
+                child_results = await _flatten_workflow_run_timeline_recursive(
+                    timeline=child,
+                    organization_id=organization_id,
+                )
+                new_children.extend(child_results)
+
+        # Create a new timeline with processed children
+        processed_timeline = WorkflowRunTimeline(
+            type=timeline.type,
+            block=timeline.block,
+            thought=timeline.thought,
+            children=new_children,
+            created_at=timeline.created_at,
+            modified_at=timeline.modified_at,
+        )
+        result.append(processed_timeline)
+
+    return result
+
+
 async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: str) -> list[WorkflowRunTimeline]:
     """
     Get the timeline workflow runs including the nested workflow runs in a flattened list
@@ -2686,29 +2739,18 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
     )
-    # loop through the run block timeline, find the task_v2 blocks, flatten the timeline for task_v2
+
+    # Recursively flatten the timeline, handling TaskV2 blocks at any nesting level
     final_workflow_run_block_timeline = []
     for timeline in workflow_run_block_timeline:
         if not timeline.block:
             continue
-        if timeline.block.block_type != BlockType.TaskV2:
-            # flatten the timeline for task_v2
-            final_workflow_run_block_timeline.append(timeline)
-            continue
-        if not timeline.block.block_workflow_run_id:
-            LOG.warning(
-                "Block workflow run id is not set for task_v2 block",
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                task_v2_id=task_v2_obj.observer_cruise_id if task_v2_obj else None,
-            )
-            continue
-        # in the future if we want to nested taskv2 shows up as a nested block, we should not flatten the timeline
-        workflow_blocks = await _flatten_workflow_run_timeline(
+
+        flattened = await _flatten_workflow_run_timeline_recursive(
+            timeline=timeline,
             organization_id=organization_id,
-            workflow_run_id=timeline.block.block_workflow_run_id,
         )
-        final_workflow_run_block_timeline.extend(workflow_blocks)
+        final_workflow_run_block_timeline.extend(flattened)
 
     if task_v2_obj and task_v2_obj.observer_cruise_id:
         thought_timeline = await task_v2_service.get_thought_timelines(
