@@ -8,7 +8,6 @@ import typer
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.utils import setup_windows_event_loop_policy
 from skyvern.utils.files import get_json_from_file, get_skyvern_state_file_path, initialize_skyvern_state_file
 
 INTERVAL = 1
@@ -74,9 +73,6 @@ async def run() -> None:
 
 
 def main() -> None:
-    # Fix for Windows: psycopg requires WindowsSelectorEventLoopPolicy
-    setup_windows_event_loop_policy()
-
     asyncio.run(run())
 
 

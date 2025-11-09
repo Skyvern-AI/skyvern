@@ -57,7 +57,7 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def do_run_migrations(connection: Connection) -> None:
+def do_run_migrations(connection: Connection):
     """Run migrations in 'online' mode.
 
     In this scenario we need to create an Engine
@@ -69,7 +69,7 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_migrations_online() -> None:
+async def run_migrations_online():
     connectable = create_async_engine(
         config.get_main_option("sqlalchemy.url"),
         poolclass=pool.NullPool,
@@ -85,7 +85,7 @@ print("Alembic mode: ", "offline" if context.is_offline_mode() else "online")
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    async def async_main() -> None:
+    async def async_main():
         await run_migrations_online()
 
     try:

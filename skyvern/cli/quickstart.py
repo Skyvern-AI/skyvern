@@ -11,7 +11,6 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from skyvern.cli.console import console
 from skyvern.cli.init_command import init  # init is used directly
 from skyvern.cli.utils import start_services
-from skyvern.utils import setup_windows_event_loop_policy
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
 
@@ -40,9 +39,6 @@ def quickstart(
     server_only: bool = typer.Option(False, "--server-only", help="Only start the server, not the UI"),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
-    # Set up Windows event loop policy for psycopg compatibility
-    setup_windows_event_loop_policy()
-    
     # Check Docker
     with console.status("Checking Docker installation...") as status:
         if not check_docker():
