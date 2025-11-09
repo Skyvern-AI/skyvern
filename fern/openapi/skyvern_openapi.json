@@ -417,6 +417,24 @@
         "operationId": "create_workflow_v1_workflows_post",
         "parameters": [
           {
+            "name": "folder_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional folder ID to assign the workflow to",
+              "title": "Folder Id"
+            },
+            "description": "Optional folder ID to assign the workflow to"
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -1634,6 +1652,262 @@
             ]
           }
         ]
+      }
+    },
+    "/v1/browser_profiles": {
+      "post": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Create a browser profile",
+        "operationId": "create_browser_profile_v1_browser_profiles_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBrowserProfileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserProfile"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "List browser profiles",
+        "description": "Get all browser profiles for the organization",
+        "operationId": "list_browser_profiles_v1_browser_profiles_get",
+        "parameters": [
+          {
+            "name": "include_deleted",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Include deleted browser profiles",
+              "default": false,
+              "title": "Include Deleted"
+            },
+            "description": "Include deleted browser profiles"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BrowserProfile"
+                  },
+                  "title": "Response List Browser Profiles V1 Browser Profiles Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/browser_profiles/{profile_id}": {
+      "get": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Get browser profile",
+        "description": "Get a specific browser profile by ID",
+        "operationId": "get_browser_profile_v1_browser_profiles__profile_id__get",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser profile. browser_profile_id starts with `bp_`",
+              "examples": [
+                "bp_123456"
+              ],
+              "title": "Profile Id"
+            },
+            "description": "The ID of the browser profile. browser_profile_id starts with `bp_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved browser profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserProfile"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser profile not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Browser Profiles"
+        ],
+        "summary": "Delete browser profile",
+        "description": "Delete a browser profile (soft delete)",
+        "operationId": "delete_browser_profile_v1_browser_profiles__profile_id__delete",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser profile to delete. browser_profile_id starts with `bp_`",
+              "examples": [
+                "bp_123456"
+              ],
+              "title": "Profile Id"
+            },
+            "description": "The ID of the browser profile to delete. browser_profile_id starts with `bp_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successfully deleted browser profile"
+          },
+          "404": {
+            "description": "Browser profile not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/browser_sessions": {
@@ -4815,6 +5089,64 @@
         ],
         "title": "BlockType"
       },
+      "BrowserProfile": {
+        "properties": {
+          "browser_profile_id": {
+            "type": "string",
+            "title": "Browser Profile Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "browser_profile_id",
+          "organization_id",
+          "name",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "BrowserProfile"
+      },
       "BrowserSessionResponse": {
         "properties": {
           "browser_session_id": {
@@ -5388,6 +5720,56 @@
           "source_parameter_key"
         ],
         "title": "ContextParameterYAML"
+      },
+      "CreateBrowserProfileRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Name for the browser profile"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Optional profile description"
+          },
+          "browser_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Session Id",
+            "description": "Persistent browser session to convert into a profile"
+          },
+          "workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Run Id",
+            "description": "Workflow run whose persisted session should be captured"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "CreateBrowserProfileRequest"
       },
       "CreateBrowserSessionRequest": {
         "properties": {
@@ -10409,9 +10791,6 @@
                 "$ref": "#/components/schemas/SelectOptionAction"
               },
               {
-                "$ref": "#/components/schemas/UploadFileAction"
-              },
-              {
                 "$ref": "#/components/schemas/ActAction"
               },
               {
@@ -10427,7 +10806,6 @@
                 "ai_click": "#/components/schemas/ClickAction",
                 "ai_input_text": "#/components/schemas/InputTextAction",
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
-                "ai_upload_file": "#/components/schemas/UploadFileAction",
                 "extract": "#/components/schemas/ExtractAction"
               }
             }
@@ -10694,73 +11072,6 @@
         "type": "object",
         "title": "SelectOptionAction",
         "description": "Select option action parameters."
-      },
-      "UploadFileAction": {
-        "properties": {
-          "type": {
-            "type": "string",
-            "const": "ai_upload_file",
-            "title": "Type",
-            "default": "ai_upload_file"
-          },
-          "selector": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Selector",
-            "description": "CSS selector for the element",
-            "default": ""
-          },
-          "file_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "File Url",
-            "description": "File URL for upload",
-            "default": ""
-          },
-          "intention": {
-            "type": "string",
-            "title": "Intention",
-            "description": "The intention or goal of the upload",
-            "default": ""
-          },
-          "data": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data",
-            "description": "Additional context data"
-          },
-          "timeout": {
-            "type": "number",
-            "title": "Timeout",
-            "description": "Timeout in milliseconds",
-            "default": 10000
-          }
-        },
-        "type": "object",
-        "title": "UploadFileAction",
-        "description": "Upload file action parameters."
       },
       "SendEmailBlock": {
         "properties": {
@@ -12156,6 +12467,21 @@
             "description": "ID of the Skyvern persistent browser session used for this run",
             "examples": [
               "pbs_123"
+            ]
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of the browser profile used for this run",
+            "examples": [
+              "bp_123"
             ]
           },
           "max_screenshot_scrolls": {
@@ -14276,6 +14602,17 @@
               }
             ],
             "title": "Sequential Key"
+          },
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id"
           }
         },
         "type": "object",
@@ -15303,6 +15640,18 @@
             "title": "Browser Session Id",
             "description": "ID of a Skyvern browser session to reuse, having it continue from the current screen state"
           },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this workflow run"
+          },
           "max_screenshot_scrolls": {
             "anyOf": [
               {
@@ -15563,6 +15912,21 @@
             "description": "ID of the Skyvern persistent browser session used for this run",
             "examples": [
               "pbs_123"
+            ]
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of the browser profile used for this run",
+            "examples": [
+              "bp_123"
             ]
           },
           "max_screenshot_scrolls": {
