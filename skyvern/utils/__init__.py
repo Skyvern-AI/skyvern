@@ -1,4 +1,5 @@
 import platform
+import asyncio
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -60,3 +61,15 @@ def get_windows_appdata_roaming() -> Optional[Path]:
         return Path(linux_path)
     except Exception:
         return None
+
+
+def setup_windows_event_loop_policy() -> None:
+    """
+    Sets up the Windows event loop policy for compatibility with psycopg.
+    
+    On Windows, psycopg cannot use the default ProactorEventLoop and requires
+    the WindowsSelectorEventLoopPolicy instead. This function automatically
+    detects Windows and sets the appropriate policy.
+    """
+    if detect_os() == "windows":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

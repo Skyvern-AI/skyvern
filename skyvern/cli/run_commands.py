@@ -21,7 +21,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.library.skyvern import Skyvern
 from skyvern.services.script_service import run_script
-from skyvern.utils import detect_os
+from skyvern.utils import detect_os, setup_windows_event_loop_policy
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
@@ -87,6 +87,9 @@ def kill_pids(pids: List[int]) -> None:
 @run_app.command(name="server")
 def run_server() -> None:
     """Run the Skyvern API server."""
+    # Set up Windows event loop policy for psycopg compatibility
+    setup_windows_event_loop_policy()
+    
     load_dotenv(resolve_backend_env_path())
     from skyvern.config import settings  # noqa: PLC0415
 
@@ -158,6 +161,7 @@ def run_ui() -> None:
 @run_app.command(name="all")
 def run_all() -> None:
     """Run the Skyvern API server and UI server in parallel."""
+    setup_windows_event_loop_policy()
     asyncio.run(start_services())
 
 
@@ -291,6 +295,7 @@ def run_code(
 
     skyvern_context.set(skyvern_context.SkyvernContext(script_mode=True, ai_mode_override=ai))
     try:
+        setup_windows_event_loop_policy()
         asyncio.run(run_script(path=script_path, parameters=parameters))
         console.print("✅ [green]Script execution completed successfully![/green]")
     except Exception as e:
