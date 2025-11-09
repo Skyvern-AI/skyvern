@@ -431,6 +431,21 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                     comma=cst.Comma(),
                 )
             )
+    action_context = act.get("input_or_select_context")
+    if action_context and action_context.get("date_format") and method in ["type", "fill", "select_option"]:
+        date_format_value = action_context.get("date_format")
+        data = {"date_format": date_format_value}
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("data"),
+                value=_value(data),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     intention = act.get("intention") or act.get("reasoning") or ""
     if intention and method not in ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT:
         args.extend(
