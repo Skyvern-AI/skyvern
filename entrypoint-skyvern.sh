@@ -10,7 +10,7 @@ ALLOWED_SKIP_DB_MIGRATION_VERSION=${ALLOWED_SKIP_DB_MIGRATION_VERSION:-}
 run_migration=true
 
 if [ -n "$ALLOWED_SKIP_DB_MIGRATION_VERSION" ]; then
-    current_version=$(alembic current 2>&1 | grep -Eo "[0-9a-f]{12,}" | tail -n 1)
+    current_version=$(alembic current 2>&1 | grep -Eo "[0-9a-f]{12,}" | tail -n 1 || echo "")
     echo "Current DB version: $current_version"
 
     if [ "$current_version" = "$ALLOWED_SKIP_DB_MIGRATION_VERSION" ]; then
