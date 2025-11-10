@@ -68,8 +68,6 @@ class SkyvernPageRun:
             TaskRunResponse containing the task execution results.
         """
 
-        await self._browser.sdk.ensure_has_server()
-
         LOG.info("AI run task", prompt=prompt)
 
         task_run = await self._browser.client.run_task(
@@ -130,8 +128,6 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the login workflow execution results.
         """
 
-        await self._browser.sdk.ensure_has_server()
-
         LOG.info("AI login", prompt=prompt)
 
         workflow_run = await self._browser.client.login(
@@ -180,8 +176,6 @@ class SkyvernPageRun:
         Returns:
             WorkflowRunResponse containing the workflow execution results.
         """
-
-        await self._browser.sdk.ensure_has_server()
 
         LOG.info("AI run workflow", workflow_id=workflow_id)
 
