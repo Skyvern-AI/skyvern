@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from playwright.async_api import Page
 
 from skyvern.client import (
@@ -15,6 +16,8 @@ from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
+
+LOG = structlog.get_logger()
 
 
 class SdkSkyvernPageAi(SkyvernPageAi):
@@ -38,6 +41,9 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         """Click an element using AI via API call."""
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI click", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             browser_session_id=self._browser.browser_session_id,
@@ -66,6 +72,9 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         """Input text into an element using AI via API call."""
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI input text", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiInputText(
@@ -95,6 +104,9 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         """Select an option from a dropdown using AI via API call."""
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI select option", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiSelectOption(
@@ -123,6 +135,9 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         """Upload a file using AI via API call."""
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI upload file", intention=intention, workflow_run_id=self._browser.workflow_run_id)
+
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiUploadFile(
@@ -150,6 +165,9 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         """Extract information from the page using AI via API call."""
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI extract", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
+
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_Extract(
@@ -173,6 +191,9 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         """Perform an action on the page using AI via API call."""
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI act", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
+
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiAct(

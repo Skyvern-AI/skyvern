@@ -1,6 +1,7 @@
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from playwright.async_api import Page
 
 from skyvern.client import GetRunResponse
@@ -14,6 +15,8 @@ if TYPE_CHECKING:
 
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import RunEngine, RunStatus, TaskRunResponse
+
+LOG = structlog.get_logger()
 
 
 class SkyvernPageRun:
@@ -66,6 +69,9 @@ class SkyvernPageRun:
         """
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI run task", prompt=prompt)
+
         task_run = await self._browser.client.run_task(
             prompt=prompt,
             engine=engine,
@@ -125,6 +131,9 @@ class SkyvernPageRun:
         """
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI login", prompt=prompt)
+
         workflow_run = await self._browser.client.login(
             credential_type=credential_type,
             url=url or self._get_page_url(),
@@ -173,6 +182,9 @@ class SkyvernPageRun:
         """
 
         await self._browser.sdk.ensure_has_server()
+
+        LOG.info("AI run workflow", workflow_id=workflow_id)
+
         workflow_run = await self._browser.client.run_workflow(
             workflow_id=workflow_id,
             parameters=parameters,
