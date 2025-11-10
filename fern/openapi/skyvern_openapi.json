@@ -5360,7 +5360,14 @@
             "default": "ai_click"
           },
           "selector": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Selector",
             "description": "CSS selector for the element",
             "default": ""
@@ -8954,6 +8961,17 @@
               }
             ],
             "title": "Is Date Related"
+          },
+          "date_format": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date Format"
           }
         },
         "type": "object",
@@ -8981,7 +8999,14 @@
             "default": ""
           },
           "value": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Value",
             "description": "Value to input",
             "default": ""
@@ -10791,6 +10816,9 @@
                 "$ref": "#/components/schemas/SelectOptionAction"
               },
               {
+                "$ref": "#/components/schemas/UploadFileAction"
+              },
+              {
                 "$ref": "#/components/schemas/ActAction"
               },
               {
@@ -10806,6 +10834,7 @@
                 "ai_click": "#/components/schemas/ClickAction",
                 "ai_input_text": "#/components/schemas/InputTextAction",
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
+                "ai_upload_file": "#/components/schemas/UploadFileAction",
                 "extract": "#/components/schemas/ExtractAction"
               }
             }
@@ -11029,13 +11058,27 @@
             "default": "ai_select_option"
           },
           "selector": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Selector",
             "description": "CSS selector for the element",
             "default": ""
           },
           "value": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Value",
             "description": "Value to select",
             "default": ""
@@ -13201,6 +13244,73 @@
         "type": "object",
         "title": "UpdateWorkflowFolderRequest",
         "description": "Request model for updating a workflow's folder assignment"
+      },
+      "UploadFileAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "ai_upload_file",
+            "title": "Type",
+            "default": "ai_upload_file"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector",
+            "description": "CSS selector for the element",
+            "default": ""
+          },
+          "file_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Url",
+            "description": "File URL for upload",
+            "default": ""
+          },
+          "intention": {
+            "type": "string",
+            "title": "Intention",
+            "description": "The intention or goal of the upload",
+            "default": ""
+          },
+          "data": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Additional context data"
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "description": "Timeout in milliseconds",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "UploadFileAction",
+        "description": "Upload file action parameters."
       },
       "UploadToS3Block": {
         "properties": {
