@@ -46,6 +46,8 @@ export interface WorkflowRunRequest {
     totp_identifier?: string;
     /** ID of a Skyvern browser session to reuse, having it continue from the current screen state */
     browser_session_id?: string;
+    /** ID of a browser profile to reuse for this workflow run */
+    browser_profile_id?: string;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. */
     max_screenshot_scrolls?: number;
     /** The extra HTTP headers for the requests in browser. */
