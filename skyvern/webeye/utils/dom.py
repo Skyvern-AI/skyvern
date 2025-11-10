@@ -8,7 +8,7 @@ from random import uniform
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import ElementHandle, Frame, FrameLocator, Locator, Page, TimeoutError
+from playwright.async_api import ElementHandle, FloatRect, Frame, FrameLocator, Locator, Page, TimeoutError
 
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_ID_ATTR, TEXT_INPUT_DELAY
@@ -133,6 +133,7 @@ class SkyvernElement:
         self._selectable = static_element.get("isSelectable", False)
         self._frame_id = static_element.get("frame", "")
         self._attributes = static_element.get("attributes", {})
+        self._rect: FloatRect | None = None
 
     def __repr__(self) -> str:
         return f"SkyvernElement({str(self.__static_element)})"
@@ -413,6 +414,12 @@ class SkyvernElement:
 
     def get_locator(self) -> Locator:
         return self.locator
+
+    async def get_rect(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> FloatRect | None:
+        if self._rect is not None:
+            return self._rect
+        self._rect = await self.get_locator().bounding_box(timeout=timeout)
+        return self._rect
 
     async def get_element_handler(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> ElementHandle:
         handler = await self.locator.element_handle(timeout=timeout)
@@ -820,6 +827,33 @@ class SkyvernElement:
     async def scroll_into_view(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         if not await self.is_visible():
             return
+
+        try:
+            target_x: int | None = None
+            target_y: int | None = None
+
+            rect = await self.get_rect(timeout=timeout)
+            if rect is not None:
+                element_x = rect["x"] if rect["x"] > 0 else None
+                element_y = rect["y"] if rect["y"] > 0 else None
+
+            # calculating y to move the element to the middle of the viewport
+            if element_y is not None:
+                target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
+
+            if element_x is not None:
+                target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
+
+            skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
+            if target_x is not None and target_y is not None:
+                await skyvern_frame.safe_scroll_to_x_y(target_x, target_y)
+        except Exception:
+            LOG.info(
+                "Failed to calculate the y to move the element to the middle of the viewport, ignore it",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+
         try:
             element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
