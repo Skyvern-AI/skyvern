@@ -1680,6 +1680,7 @@ async def handle_select_option_action(
         )
 
         try:
+            await skyvern_element.scroll_into_view()
             blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
         except Exception:
             LOG.warning(
