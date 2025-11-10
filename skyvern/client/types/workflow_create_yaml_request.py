@@ -30,6 +30,7 @@ class WorkflowCreateYamlRequest(UniversalBaseModel):
     cache_key: typing.Optional[str] = None
     run_sequentially: typing.Optional[bool] = None
     sequential_key: typing.Optional[str] = None
+    folder_id: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

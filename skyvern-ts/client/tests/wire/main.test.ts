@@ -26,6 +26,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -90,6 +91,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -197,6 +199,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -211,6 +214,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: { key: "value" },
                 browser_address: "browser_address",
@@ -261,6 +265,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -283,6 +288,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: {
                     key: "value",
@@ -362,6 +368,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -414,6 +421,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -728,7 +736,10 @@ describe("SkyvernClient", () => {
             .jsonBody(rawResponseBody)
             .build();
 
-        const response = await client.createWorkflow({});
+        const response = await client.createWorkflow({
+            folder_id: "folder_id",
+            body: {},
+        });
         expect(response).toEqual({
             workflow_id: "workflow_id",
             organization_id: "organization_id",
@@ -804,7 +815,9 @@ describe("SkyvernClient", () => {
             .build();
 
         await expect(async () => {
-            return await client.createWorkflow({});
+            return await client.createWorkflow({
+                body: {},
+            });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
@@ -2070,6 +2083,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: { ai_fallback_triggered: true },
             errors: [{ key: "value" }],
@@ -2084,6 +2098,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: { key: "value" },
                 browser_address: "browser_address",
@@ -2127,6 +2142,7 @@ describe("SkyvernClient", () => {
             finished_at: "2024-01-15T09:30:00Z",
             app_url: "app_url",
             browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
             max_screenshot_scrolls: 1,
             script_run: {
                 ai_fallback_triggered: true,
@@ -2149,6 +2165,7 @@ describe("SkyvernClient", () => {
                 totp_url: "totp_url",
                 totp_identifier: "totp_identifier",
                 browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
                 extra_http_headers: {
                     key: "value",

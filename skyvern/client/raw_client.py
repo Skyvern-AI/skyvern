@@ -256,6 +256,7 @@ class RawSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
@@ -322,6 +323,9 @@ class RawSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this workflow run
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -360,6 +364,7 @@ class RawSkyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
                 "browser_address": browser_address,
@@ -624,6 +629,7 @@ class RawSkyvern:
     def create_workflow(
         self,
         *,
+        folder_id: typing.Optional[str] = None,
         json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
         yaml_definition: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -633,6 +639,9 @@ class RawSkyvern:
 
         Parameters
         ----------
+        folder_id : typing.Optional[str]
+            Optional folder ID to assign the workflow to
+
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
 
@@ -650,6 +659,9 @@ class RawSkyvern:
         _response = self._client_wrapper.httpx_client.request(
             "v1/workflows",
             method="POST",
+            params={
+                "folder_id": folder_id,
+            },
             json={
                 "json_definition": convert_and_respect_annotation_metadata(
                     object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
@@ -2360,6 +2372,7 @@ class AsyncRawSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
@@ -2426,6 +2439,9 @@ class AsyncRawSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this workflow run
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -2464,6 +2480,7 @@ class AsyncRawSkyvern:
                 "totp_url": totp_url,
                 "totp_identifier": totp_identifier,
                 "browser_session_id": browser_session_id,
+                "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
                 "extra_http_headers": extra_http_headers,
                 "browser_address": browser_address,
@@ -2728,6 +2745,7 @@ class AsyncRawSkyvern:
     async def create_workflow(
         self,
         *,
+        folder_id: typing.Optional[str] = None,
         json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
         yaml_definition: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -2737,6 +2755,9 @@ class AsyncRawSkyvern:
 
         Parameters
         ----------
+        folder_id : typing.Optional[str]
+            Optional folder ID to assign the workflow to
+
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
 
@@ -2754,6 +2775,9 @@ class AsyncRawSkyvern:
         _response = await self._client_wrapper.httpx_client.request(
             "v1/workflows",
             method="POST",
+            params={
+                "folder_id": folder_id,
+            },
             json={
                 "json_definition": convert_and_respect_annotation_metadata(
                     object_=json_definition, annotation=WorkflowCreateYamlRequest, direction="write"
