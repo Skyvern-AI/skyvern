@@ -2,13 +2,13 @@ from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import Page
 
-from skyvern.client.types.sdk_action import (
-    SdkAction_AiAct,
-    SdkAction_AiClick,
-    SdkAction_AiInputText,
-    SdkAction_AiSelectOption,
-    SdkAction_AiUploadFile,
-    SdkAction_Extract,
+from skyvern.client import (
+    RunSdkActionRequestAction_AiAct,
+    RunSdkActionRequestAction_AiClick,
+    RunSdkActionRequestAction_AiInputText,
+    RunSdkActionRequestAction_AiSelectOption,
+    RunSdkActionRequestAction_AiUploadFile,
+    RunSdkActionRequestAction_Extract,
 )
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
@@ -43,7 +43,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
             workflow_run_id=self._browser.workflow_run_id,
-            action=SdkAction_AiClick(
+            action=RunSdkActionRequestAction_AiClick(
                 selector=selector,
                 intention=intention,
                 data=data,
@@ -68,7 +68,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_AiInputText(
+            action=RunSdkActionRequestAction_AiInputText(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -97,7 +97,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_AiSelectOption(
+            action=RunSdkActionRequestAction_AiSelectOption(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -125,7 +125,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_AiUploadFile(
+            action=RunSdkActionRequestAction_AiUploadFile(
                 selector=selector,
                 file_url=files,
                 intention=intention,
@@ -152,7 +152,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_Extract(
+            action=RunSdkActionRequestAction_Extract(
                 prompt=prompt,
                 extract_schema=schema,
                 error_code_mapping=error_code_mapping,
@@ -175,7 +175,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         await self._browser.sdk.ensure_has_server()
         response = await self._browser.client.run_sdk_action(
             url=self._page.url,
-            action=SdkAction_AiAct(
+            action=RunSdkActionRequestAction_AiAct(
                 intention=prompt,
             ),
             browser_session_id=self._browser.browser_session_id,
