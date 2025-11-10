@@ -7,4 +7,5 @@ export interface InputOrSelectContext {
     is_search_bar?: boolean;
     is_location_input?: boolean;
     is_date_related?: boolean;
+    date_format?: string;
 }

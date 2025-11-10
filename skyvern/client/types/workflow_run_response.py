@@ -83,6 +83,11 @@ class WorkflowRunResponse(UniversalBaseModel):
     ID of the Skyvern persistent browser session used for this run
     """
 
+    browser_profile_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    ID of the browser profile used for this run
+    """
+
     max_screenshot_scrolls: typing.Optional[int] = pydantic.Field(default=None)
     """
     The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot

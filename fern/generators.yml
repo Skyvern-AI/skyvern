@@ -34,3 +34,8 @@ groups:
             description: "The Skyvern TypeScript library provides convenient access to the Skyvern APIs from TypeScript."
             publishConfig:
               access: "public"
+              provenance: true
+            repository:
+              type: git
+              url: https://github.com/Skyvern-AI/skyvern.git
+              directory: skyvern-ts/client

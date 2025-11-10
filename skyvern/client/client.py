@@ -35,6 +35,7 @@ from .types.workflow_run_timeline import WorkflowRunTimeline
 from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
+    from .browser_profiles.client import AsyncBrowserProfilesClient, BrowserProfilesClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
     from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
@@ -108,6 +109,7 @@ class Skyvern:
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
         self._workflows: typing.Optional[WorkflowsClient] = None
+        self._browser_profiles: typing.Optional[BrowserProfilesClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
 
     @property
@@ -297,6 +299,7 @@ class Skyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
@@ -363,6 +366,9 @@ class Skyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this workflow run
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -412,6 +418,7 @@ class Skyvern:
             totp_url=totp_url,
             totp_identifier=totp_identifier,
             browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
             max_screenshot_scrolls=max_screenshot_scrolls,
             extra_http_headers=extra_http_headers,
             browser_address=browser_address,
@@ -575,6 +582,7 @@ class Skyvern:
     def create_workflow(
         self,
         *,
+        folder_id: typing.Optional[str] = None,
         json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
         yaml_definition: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -584,6 +592,9 @@ class Skyvern:
 
         Parameters
         ----------
+        folder_id : typing.Optional[str]
+            Optional folder ID to assign the workflow to
+
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
 
@@ -605,10 +616,15 @@ class Skyvern:
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
-        client.create_workflow()
+        client.create_workflow(
+            folder_id="folder_id",
+        )
         """
         _response = self._raw_client.create_workflow(
-            json_definition=json_definition, yaml_definition=yaml_definition, request_options=request_options
+            folder_id=folder_id,
+            json_definition=json_definition,
+            yaml_definition=yaml_definition,
+            request_options=request_options,
         )
         return _response.data
 
@@ -1578,6 +1594,14 @@ class Skyvern:
         return self._workflows
 
     @property
+    def browser_profiles(self):
+        if self._browser_profiles is None:
+            from .browser_profiles.client import BrowserProfilesClient  # noqa: E402
+
+            self._browser_profiles = BrowserProfilesClient(client_wrapper=self._client_wrapper)
+        return self._browser_profiles
+
+    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -1653,6 +1677,7 @@ class AsyncSkyvern:
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
         self._workflows: typing.Optional[AsyncWorkflowsClient] = None
+        self._browser_profiles: typing.Optional[AsyncBrowserProfilesClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
 
     @property
@@ -1850,6 +1875,7 @@ class AsyncSkyvern:
         totp_url: typing.Optional[str] = OMIT,
         totp_identifier: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
+        browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
@@ -1916,6 +1942,9 @@ class AsyncSkyvern:
         browser_session_id : typing.Optional[str]
             ID of a Skyvern browser session to reuse, having it continue from the current screen state
 
+        browser_profile_id : typing.Optional[str]
+            ID of a browser profile to reuse for this workflow run
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -1973,6 +2002,7 @@ class AsyncSkyvern:
             totp_url=totp_url,
             totp_identifier=totp_identifier,
             browser_session_id=browser_session_id,
+            browser_profile_id=browser_profile_id,
             max_screenshot_scrolls=max_screenshot_scrolls,
             extra_http_headers=extra_http_headers,
             browser_address=browser_address,
@@ -2160,6 +2190,7 @@ class AsyncSkyvern:
     async def create_workflow(
         self,
         *,
+        folder_id: typing.Optional[str] = None,
         json_definition: typing.Optional[WorkflowCreateYamlRequest] = OMIT,
         yaml_definition: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -2169,6 +2200,9 @@ class AsyncSkyvern:
 
         Parameters
         ----------
+        folder_id : typing.Optional[str]
+            Optional folder ID to assign the workflow to
+
         json_definition : typing.Optional[WorkflowCreateYamlRequest]
             Workflow definition in JSON format
 
@@ -2195,13 +2229,18 @@ class AsyncSkyvern:
 
 
         async def main() -> None:
-            await client.create_workflow()
+            await client.create_workflow(
+                folder_id="folder_id",
+            )
 
 
         asyncio.run(main())
         """
         _response = await self._raw_client.create_workflow(
-            json_definition=json_definition, yaml_definition=yaml_definition, request_options=request_options
+            folder_id=folder_id,
+            json_definition=json_definition,
+            yaml_definition=yaml_definition,
+            request_options=request_options,
         )
         return _response.data
 
@@ -3343,6 +3382,14 @@ class AsyncSkyvern:
 
             self._workflows = AsyncWorkflowsClient(client_wrapper=self._client_wrapper)
         return self._workflows
+
+    @property
+    def browser_profiles(self):
+        if self._browser_profiles is None:
+            from .browser_profiles.client import AsyncBrowserProfilesClient  # noqa: E402
+
+            self._browser_profiles = AsyncBrowserProfilesClient(client_wrapper=self._client_wrapper)
+        return self._browser_profiles
 
     @property
     def scripts(self):
