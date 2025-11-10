@@ -1,3 +1,4 @@
+import asyncio
 import platform
 import subprocess
 from pathlib import Path
@@ -6,6 +7,17 @@ from typing import Optional
 from alembic import command
 from alembic.config import Config
 from skyvern.constants import REPO_ROOT_DIR
+
+
+def setup_windows_event_loop_policy() -> None:
+    """
+    Set up Windows event loop policy for psycopg compatibility.
+
+    On Windows, psycopg cannot use the default ProactorEventLoop and requires
+    WindowsSelectorEventLoopPolicy for async operations.
+    """
+    if platform.system() == "Windows":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def migrate_db() -> None:

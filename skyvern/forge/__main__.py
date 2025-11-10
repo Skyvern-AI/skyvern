@@ -6,11 +6,15 @@ from dotenv import load_dotenv
 
 from skyvern import analytics
 from skyvern.config import settings
+from skyvern.utils import setup_windows_event_loop_policy
 
 LOG = structlog.stdlib.get_logger()
 
 
 if __name__ == "__main__":
+    # Set up Windows event loop policy for psycopg compatibility
+    setup_windows_event_loop_policy()
+
     analytics.capture("skyvern-oss-run-server")
     port = settings.PORT
     LOG.info("Agent server starting.", host="0.0.0.0", port=port)

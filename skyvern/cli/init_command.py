@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 
-from skyvern.utils import migrate_db
+from skyvern.utils import migrate_db, setup_windows_event_loop_policy
 from skyvern.utils.env_paths import resolve_backend_env_path
 
 from .browser import setup_browser_config
@@ -22,6 +22,9 @@ def init(
     no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
 ) -> None:
     """Interactive initialization command for Skyvern."""
+    # Set up Windows event loop policy for psycopg compatibility
+    setup_windows_event_loop_policy()
+
     console.print(
         Panel(
             "[bold green]Welcome to Skyvern CLI Initialization![/bold green]",
@@ -52,7 +55,7 @@ def init(
 
         backend_env_path = resolve_backend_env_path()
         if backend_env_path.exists():
-            console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow")
+            console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow", markup=False)
             redo_llm_setup = Confirm.ask(
                 "Do you want to go through [bold yellow]LLM provider setup again[/bold yellow]?",
                 default=False,
@@ -135,6 +138,9 @@ def init(
 
 def init_browser() -> None:
     """Initialize only the browser configuration and install Chromium."""
+    # Set up Windows event loop policy for psycopg compatibility
+    setup_windows_event_loop_policy()
+
     console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
     browser_type, browser_location, remote_debugging_url = setup_browser_config()
     update_or_add_env_var("BROWSER_TYPE", browser_type)

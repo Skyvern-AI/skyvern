@@ -22,6 +22,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.routes import internal_auth
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.utils import setup_windows_event_loop_policy
 
 LOG = structlog.get_logger()
 
@@ -54,6 +55,8 @@ def custom_openapi() -> dict:
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, Any]:
     """Lifespan context manager for FastAPI app startup and shutdown."""
+    # Set up Windows event loop policy for psycopg and Playwright compatibility
+    setup_windows_event_loop_policy()
     LOG.info("Server started")
     if forge_app.api_app_startup_event:
         LOG.info("Calling api app startup event")
