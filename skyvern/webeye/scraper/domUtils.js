@@ -2726,6 +2726,34 @@ function isAnimationFinished() {
 }
 
 /**
+ * Remove unique_id attribute from all elements on the page.
+ * This includes elements in the main document and shadow DOM.
+ */
+function removeAllUniqueIds() {
+  // Function to recursively remove unique_id from an element and its children
+  const removeUniqueIdFromElement = (element) => {
+    if (element.hasAttribute("unique_id")) {
+      element.removeAttribute("unique_id");
+    }
+
+    // Process children in the main DOM
+    for (const child of Array.from(element.children)) {
+      removeUniqueIdFromElement(child);
+    }
+
+    // Process elements in shadow DOM if present
+    if (element.shadowRoot) {
+      for (const shadowChild of Array.from(element.shadowRoot.children)) {
+        removeUniqueIdFromElement(shadowChild);
+      }
+    }
+  };
+
+  // Start from document.documentElement to process the entire page
+  removeUniqueIdFromElement(document.documentElement);
+}
+
+/**
 
 // How to run the code:
 
