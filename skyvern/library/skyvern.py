@@ -107,6 +107,15 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         openai_api_key: str | None = None,
+        anthropic_api_key: str | None = None,
+        azure_api_key: str | None = None,
+        azure_deployment: str | None = None,
+        azure_api_base: str | None = None,
+        azure_api_version: str | None = None,
+        gemini_api_key: str | None = None,
+        llm_key: str | None = None,
+        secondary_llm_key: str | None = None,
+        settings: dict[str, Any] | None = None,
     ) -> None:
         """Embedded mode: Run Skyvern locally in-process.
 
@@ -114,7 +123,15 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             openai_api_key: Optional OpenAI API key override for LLM operations.
-                If not provided, the one from the .env file will be used.
+            anthropic_api_key: Optional Anthropic API key override.
+            azure_api_key: Optional Azure OpenAI API key override.
+            azure_deployment: Azure deployment name (required when using Azure).
+            azure_api_base: Azure API base URL (required when using Azure).
+            azure_api_version: Azure API version (required when using Azure).
+            gemini_api_key: Optional Google Gemini API key override.
+            llm_key: Primary LLM model selection (e.g., "OPENAI_GPT4_1", "ANTHROPIC_CLAUDE4_SONNET").
+            secondary_llm_key: Secondary LLM for lightweight operations.
+            settings: Dictionary of settings to override (e.g., {"MAX_STEPS_PER_RUN": 100}).
         """
         ...
 
@@ -122,12 +139,21 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         environment: SkyvernEnvironment | None = None,
-        openai_api_key: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
+        openai_api_key: str | None = None,
+        anthropic_api_key: str | None = None,
+        azure_api_key: str | None = None,
+        azure_deployment: str | None = None,
+        azure_api_base: str | None = None,
+        azure_api_version: str | None = None,
+        gemini_api_key: str | None = None,
+        llm_key: str | None = None,
+        secondary_llm_key: str | None = None,
+        settings: dict[str, Any] | None = None,
     ):
         if environment is None:
             if httpx_client is not None:
@@ -148,6 +174,15 @@ class Skyvern(AsyncSkyvern):
                 follow_redirects=follow_redirects,
                 httpx_client=create_embedded_server(
                     openai_api_key=openai_api_key,
+                    anthropic_api_key=anthropic_api_key,
+                    azure_api_key=azure_api_key,
+                    azure_deployment=azure_deployment,
+                    azure_api_base=azure_api_base,
+                    azure_api_version=azure_api_version,
+                    gemini_api_key=gemini_api_key,
+                    llm_key=llm_key,
+                    secondary_llm_key=secondary_llm_key,
+                    settings_overrides=settings,
                 ),
             )
         else:
