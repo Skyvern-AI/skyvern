@@ -153,7 +153,7 @@ async def get_script_blocks_response(
     include_in_schema=False,
 )
 async def create_script(
-    data: CreateScriptRequest = CreateScriptRequest(),
+    data: CreateScriptRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CreateScriptResponse:
     """Create a new script with optional files and metadata."""
