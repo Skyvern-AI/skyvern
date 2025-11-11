@@ -264,7 +264,7 @@ async def preview_webhook_replay(
 )
 async def trigger_webhook_replay(
     run_id: str,
-    request: RunWebhookReplayRequest,
+    request: RunWebhookReplayRequest = RunWebhookReplayRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),  # noqa: B008
 ) -> RunWebhookReplayResponse:
     """Replay a completed run's webhook to the stored or override URL.

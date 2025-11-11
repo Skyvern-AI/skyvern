@@ -6,7 +6,6 @@ import structlog
 import yaml
 from fastapi import (
     BackgroundTasks,
-    Body,
     Depends,
     Header,
     HTTPException,
@@ -538,7 +537,7 @@ async def create_workflow_legacy(
     include_in_schema=False,
 )
 async def create_workflow(
-    data: WorkflowRequest,
+    data: WorkflowRequest = WorkflowRequest(),
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
@@ -868,7 +867,7 @@ async def update_workflow_legacy(
     include_in_schema=False,
 )
 async def update_workflow(
-    data: WorkflowRequest,
+    data: WorkflowRequest = WorkflowRequest(),
     workflow_id: str = Path(
         ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     ),
@@ -1093,7 +1092,7 @@ async def get_folders(
 @base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 async def update_folder(
     folder_id: str = Path(..., description="Folder ID", examples=["fld_123"]),
-    data: FolderUpdate = Body(...),
+    data: FolderUpdate = FolderUpdate(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Folder:
     folder = await app.DATABASE.update_folder(
@@ -1168,7 +1167,7 @@ async def delete_folder(
 @base_router.put("/workflows/{workflow_permanent_id}/folder/", response_model=Workflow, include_in_schema=False)
 async def update_workflow_folder(
     workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
-    data: UpdateWorkflowFolderRequest = Body(...),
+    data: UpdateWorkflowFolderRequest = UpdateWorkflowFolderRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
     try:
@@ -2038,7 +2037,7 @@ async def run_workflow_legacy(
     request: Request,
     background_tasks: BackgroundTasks,
     workflow_id: str,  # this is the workflow_permanent_id internally
-    workflow_request: WorkflowRequestBody,
+    workflow_request: WorkflowRequestBody = WorkflowRequestBody(),
     version: int | None = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
@@ -2508,7 +2507,7 @@ async def generate_task(
     include_in_schema=False,
 )
 async def update_organization(
-    org_update: OrganizationUpdate,
+    org_update: OrganizationUpdate = OrganizationUpdate(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Organization:
     return await app.DATABASE.update_organization(
