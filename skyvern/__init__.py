@@ -26,6 +26,7 @@ setup_logger()
 # noinspection PyUnresolvedReferences
 __all__ = [
     "Skyvern",
+    "SkyvernSdk",
     "SkyvernPage",
     "RunContext",
     "action",
@@ -54,6 +55,7 @@ __all__ = [
 
 _lazy_imports = {
     "Skyvern": "skyvern.library",
+    "SkyvernSdk": "skyvern.library",
     "SkyvernPage": "skyvern.core.script_generations.skyvern_page",
     "RunContext": "skyvern.core.script_generations.skyvern_page",
     "setup": "skyvern.core.script_generations.run_initializer",
