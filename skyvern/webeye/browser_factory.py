@@ -267,7 +267,8 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
-            set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
+            if settings.BROWSER_LOGS_ENABLED:
+                set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
 
             proxy_location: ProxyLocation | None = kwargs.get("proxy_location")

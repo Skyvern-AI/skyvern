@@ -10,6 +10,8 @@ def create_embedded_server(
     api_key: str,
     open_api_key: str | None,
 ) -> AsyncSkyvern:
+    settings.BROWSER_LOGS_ENABLED = False
+
     if open_api_key:
         settings.OPENAI_API_KEY = open_api_key
 
