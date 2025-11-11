@@ -122,7 +122,6 @@ class ScriptSkyvernPage(SkyvernPage):
         fn: Callable,
         action: ActionType,
         *args: Any,
-        prompt: str = "",
         **kwargs: Any,
     ) -> Any:
         """
@@ -146,6 +145,8 @@ class ScriptSkyvernPage(SkyvernPage):
             ActionType.COMPLETE: "✅",
             ActionType.TERMINATE: "🛑",
         }
+
+        prompt = kwargs.get("prompt", "")
 
         # Backward compatibility: use intention if provided and prompt is empty
         intention = kwargs.get("intention", None)
