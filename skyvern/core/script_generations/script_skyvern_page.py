@@ -171,9 +171,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 print()
 
         try:
-            call.result = await fn(
-                self, *args, prompt=prompt, data=data, intention=intention, **kwargs
-            )  # real driver call
+            call.result = await fn(self, *args, **kwargs)
 
             # Note: Action status would be updated to completed here if update method existed
 
