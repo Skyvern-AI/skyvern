@@ -1,7 +1,12 @@
+import typing
 from typing import Any
 
+if typing.TYPE_CHECKING:
+    from skyvern.library.skyvern import Skyvern  # noqa: E402
+    from skyvern.library.skyvern_sdk import SkyvernSdk  # noqa: E402
+
 # noinspection PyUnresolvedReferences
-__all__ = ["Skyvern"]
+__all__ = ["Skyvern", "SkyvernSdk"]
 
 
 def __getattr__(name: str) -> Any:
