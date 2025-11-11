@@ -486,6 +486,10 @@ class SkyvernFrame:
         js_script = "([element]) => getElementDomDepth(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
 
+    async def remove_all_unique_ids(self) -> None:
+        js_script = "() => removeAllUniqueIds()"
+        await self.evaluate(frame=self.frame, expression=js_script)
+
     @TraceManager.traced_async()
     async def build_tree_from_body(
         self,
