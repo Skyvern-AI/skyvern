@@ -15,7 +15,7 @@ tracer, http, TraceFilterBase, SpanBase = load_ddtrace()
 class FilterHeartbeat(TraceFilterBase):
     _HB_URL = re.compile(r"http://.*/heartbeat$")
 
-    def process_trace(self, trace: list[SpanBase]) -> list[SpanBase] | None:  # type: ignore[override]
+    def process_trace(self, trace: list[SpanBase]) -> list[SpanBase] | None:
         for span in trace:
             url = span.get_tag(http.URL)
             if span.parent_id is None and url is not None and self._HB_URL.match(url):
