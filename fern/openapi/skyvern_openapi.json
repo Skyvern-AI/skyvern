@@ -2674,6 +2674,79 @@
         ]
       }
     },
+    "/v1/prompts/improve": {
+      "post": {
+        "tags": [
+          "Prompts"
+        ],
+        "summary": "Improve prompt",
+        "description": "Improve a prompt based on a specific use-case",
+        "operationId": "improve_prompt_v1_prompts_improve_post",
+        "parameters": [
+          {
+            "name": "use-case",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The use-case for prompt improvement",
+              "title": "Use-Case"
+            },
+            "description": "The use-case for prompt improvement"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImprovePromptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImprovePromptResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/run/tasks/login": {
       "post": {
         "tags": [
@@ -8894,6 +8967,65 @@
         ],
         "title": "HumanInteractionBlockYAML"
       },
+      "ImprovePromptRequest": {
+        "properties": {
+          "context": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context",
+            "description": "Additional context about the user's needs"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Prompt",
+            "description": "The original prompt to improve"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "ImprovePromptRequest"
+      },
+      "ImprovePromptResponse": {
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error",
+            "description": "Error message if prompt improvement failed"
+          },
+          "improved": {
+            "type": "string",
+            "title": "Improved",
+            "description": "The improved version of the prompt"
+          },
+          "original": {
+            "type": "string",
+            "title": "Original",
+            "description": "The original prompt provided for improvement"
+          }
+        },
+        "type": "object",
+        "required": [
+          "improved",
+          "original"
+        ],
+        "title": "ImprovePromptResponse"
+      },
       "InputOrSelectContext": {
         "properties": {
           "intention": {
@@ -9614,6 +9746,18 @@
             "examples": [
               "pbs_123456"
             ]
+          },
+          "browser_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Profile Id",
+            "description": "ID of a browser profile to reuse for this run"
           },
           "browser_address": {
             "anyOf": [
