@@ -122,7 +122,7 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         environment: SkyvernEnvironment | None = None,
-        open_api_key: str | None = None,
+        openai_api_key: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
