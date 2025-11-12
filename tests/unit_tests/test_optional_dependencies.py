@@ -5,9 +5,10 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import ModuleType
 
 
-def _load_ddtrace_module() -> object:
+def _load_ddtrace_module() -> ModuleType:
     module_name = "skyvern__ddtrace_for_tests"
     module_path = Path(__file__).resolve().parents[2] / "skyvern" / "_ddtrace.py"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
