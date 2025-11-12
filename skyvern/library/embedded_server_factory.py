@@ -1,23 +1,27 @@
 import httpx
 from httpx import ASGITransport
 
-from skyvern.client import AsyncSkyvern, SkyvernEnvironment
-from skyvern.config import settings
-from skyvern.forge.api_app import app
-
 
 def create_embedded_server(
-    api_key: str,
     open_api_key: str | None,
-) -> AsyncSkyvern:
-    settings.BROWSER_LOGS_ENABLED = False
+) -> httpx.AsyncClient:
+    class EmbeddedServerTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self._transport: ASGITransport | None = None
 
-    if open_api_key:
-        settings.OPENAI_API_KEY = open_api_key
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if self._transport is None:
+                from skyvern.config import settings  # noqa: PLC0415
+                from skyvern.forge.api_app import app  # noqa: PLC0415
 
-    transport = ASGITransport(app=app)
-    return AsyncSkyvern(
-        environment=SkyvernEnvironment.LOCAL,
-        api_key=api_key,
-        httpx_client=httpx.AsyncClient(transport=transport, base_url="http://skyvern-embedded"),
-    )
+                settings.BROWSER_LOGS_ENABLED = False
+
+                if open_api_key:
+                    settings.OPENAI_API_KEY = open_api_key
+
+                self._transport = ASGITransport(app=app)
+
+            response = await self._transport.handle_async_request(request)
+            return response
+
+    return httpx.AsyncClient(transport=EmbeddedServerTransport(), base_url="http://skyvern-embedded")
