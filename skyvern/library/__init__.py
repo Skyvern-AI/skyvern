@@ -12,12 +12,17 @@ __all__ = ["Skyvern", "SkyvernSdk"]
 def __getattr__(name: str) -> Any:
     """Lazily import Skyvern."""
     if name == "SkyvernClient":
-        from skyvern.library.skyvern import Skyvern  # noqa: PLC0415
+        # Direct import and assignment
+        import skyvern.library.skyvern as _skyvern  # noqa: PLC0415
+
+        Skyvern = _skyvern.Skyvern
 
         globals()["SkyvernClient"] = Skyvern
         return Skyvern
     if name == "SkyvernSdk":
-        from skyvern.library.skyvern_sdk import SkyvernSdk  # noqa: PLC0415
+        import skyvern.library.skyvern_sdk as _skyvern_sdk  # noqa: PLC0415
+
+        SkyvernSdk = _skyvern_sdk.SkyvernSdk
 
         globals()["SkyvernSdk"] = SkyvernSdk
         return SkyvernSdk
