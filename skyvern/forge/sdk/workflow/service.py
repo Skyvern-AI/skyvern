@@ -2342,6 +2342,14 @@ class WorkflowService:
             )
             return
 
+        if workflow_run.browser_session_id:
+            LOG.info(
+                "Waiting for browser cookies to flush before webhook",
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_session_id=workflow_run.browser_session_id,
+            )
+            await asyncio.sleep(15)
+
         # build new schema for backward compatible webhook payload
         app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
 
