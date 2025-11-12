@@ -2,20 +2,20 @@ import re
 import typing
 from typing import Any
 
-from ddtrace import tracer
-from ddtrace.ext import http
-from ddtrace.trace import TraceFilter, Span
-
 from skyvern.forge.sdk.forge_log import setup_logger
+from skyvern._ddtrace import load_ddtrace
 
 if typing.TYPE_CHECKING:
     from skyvern.library import Skyvern  # noqa: E402
 
 
-class FilterHeartbeat(TraceFilter):
+tracer, http, TraceFilterBase, SpanBase = load_ddtrace()
+
+
+class FilterHeartbeat(TraceFilterBase):
     _HB_URL = re.compile(r"http://.*/heartbeat$")
 
-    def process_trace(self, trace: list[Span]) -> list[Span] | None:
+    def process_trace(self, trace: list[SpanBase]) -> list[SpanBase] | None:  # type: ignore[override]
         for span in trace:
             url = span.get_tag(http.URL)
             if span.parent_id is None and url is not None and self._HB_URL.match(url):
@@ -24,7 +24,8 @@ class FilterHeartbeat(TraceFilter):
         return trace
 
 
-tracer.configure(trace_processors=[FilterHeartbeat()])
+if tracer is not None:
+    tracer.configure(trace_processors=[FilterHeartbeat()])
 setup_logger()
 
 # noinspection PyUnresolvedReferences
