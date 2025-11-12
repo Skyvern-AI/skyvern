@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any, Callable, Literal, overload
 
 import structlog
@@ -17,10 +16,6 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger()
-
-
-class Driver(StrEnum):
-    PLAYWRIGHT = "playwright"
 
 
 @dataclass
@@ -41,7 +36,7 @@ class ActionCall:
     error: Exception | None = None  # populated if failed
 
 
-class SkyvernPage:
+class SkyvernPage(Page):
     """
     A lightweight adapter for the selected driver that:
     1. Executes actual browser commands
@@ -54,21 +49,31 @@ class SkyvernPage:
         page: Page,
         ai: SkyvernPageAi,
     ) -> None:
+        super().__init__(page)
         self.page = page
         self.current_label: str | None = None
         self._ai = ai
+
+    def __getattribute__(self, name: str) -> Any:
+        page = object.__getattribute__(self, "page")
+        if hasattr(page, name):
+            for cls in type(self).__mro__:
+                if cls is Page:
+                    break
+                if name in cls.__dict__:
+                    return object.__getattribute__(self, name)
+            return getattr(page, name)
+
+        return object.__getattribute__(self, name)
 
     async def _decorate_call(
         self,
         fn: Callable,
         action: ActionType,
         *args: Any,
-        prompt: str = "",
-        data: str | dict[str, Any] = "",
-        intention: str = "",  # backward compatibility
         **kwargs: Any,
     ) -> Any:
-        return await fn(self, *args, prompt=prompt, data=data, intention=intention, **kwargs)
+        return await fn(self, *args, **kwargs)
 
     @staticmethod
     def action_wrap(
@@ -78,21 +83,17 @@ class SkyvernPage:
             async def wrapper(
                 skyvern_page: SkyvernPage,
                 *args: Any,
-                prompt: str = "",
-                data: str | dict[str, Any] = "",
-                intention: str = "",  # backward compatibility
                 **kwargs: Any,
             ) -> Any:
-                return await skyvern_page._decorate_call(
-                    fn, action, *args, prompt=prompt, data=data, intention=intention, **kwargs
-                )
+                return await skyvern_page._decorate_call(fn, action, *args, **kwargs)
 
             return wrapper
 
         return decorator
 
-    async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
-        await self.page.goto(url, timeout=timeout)
+    async def goto(self, url: str, **kwargs: Any) -> None:
+        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        await self.page.goto(url, timeout=timeout, **kwargs)
 
     ######### Public Interfaces #########
 
@@ -103,9 +104,6 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -115,9 +113,6 @@ class SkyvernPage:
         *,
         prompt: str,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -128,9 +123,6 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
         **kwargs: Any,
     ) -> str | None:
         """Click an element using a CSS selector, AI-powered prompt matching, or both.
@@ -144,8 +136,7 @@ class SkyvernPage:
             selector: CSS selector for the target element.
             prompt: Natural language description of which element to click.
             ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
-            data: Additional context data for AI processing.
-            timeout: Maximum time to wait for the click action in milliseconds.
+            **kwargs: All Playwright click parameters (timeout, force, modifiers, etc.)
 
         Returns:
             The selector string that was successfully used to click the element, or None.
@@ -163,11 +154,15 @@ class SkyvernPage:
             ```
         """
         # Backward compatibility
+        intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
             prompt = intention
 
         if not selector and not prompt:
             raise ValueError("Missing input: pass a selector and/or a prompt.")
+
+        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        data = kwargs.pop("data", None)
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -206,8 +201,8 @@ class SkyvernPage:
                 )
 
         if selector:
-            locator = self.page.locator(selector, **kwargs)
-            await locator.click(timeout=timeout)
+            locator = self.page.locator(selector)
+            await locator.click(timeout=timeout, **kwargs)
 
         return selector
 
@@ -219,11 +214,9 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> str: ...
 
     @overload
@@ -234,11 +227,9 @@ class SkyvernPage:
         value: str | None = None,
         selector: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> str: ...
 
     @action_wrap(ActionType.INPUT_TEXT)
@@ -249,11 +240,9 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
 
@@ -267,8 +256,6 @@ class SkyvernPage:
             value: The text value to input into the field.
             prompt: Natural language description of which field to fill and what value.
             ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
-            data: Additional context data for AI processing.
-            timeout: Maximum time to wait for the fill action in milliseconds.
             totp_identifier: TOTP identifier for time-based one-time password fields.
             totp_url: URL to fetch TOTP codes from for authentication.
 
@@ -293,11 +280,15 @@ class SkyvernPage:
         """
 
         # Backward compatibility
+        intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
             prompt = intention
 
         if not selector and not prompt:
             raise ValueError("Missing input: pass a selector and/or a prompt.")
+
+        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        data = kwargs.pop("data", None)
 
         return await self._input_text(
             selector=selector,
@@ -317,18 +308,20 @@ class SkyvernPage:
         value: str,
         ai: str | None = "fallback",
         prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
         totp_identifier: str | None = None,
         totp_url: str | None = None,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> str:
         # Backward compatibility
+        intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
             prompt = intention
 
         if not selector and not prompt:
             raise ValueError("Missing input: pass a selector and/or a prompt.")
+
+        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        data = kwargs.pop("data", None)
 
         return await self._input_text(
             selector=selector,
@@ -419,8 +412,7 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str: ...
 
     @overload
@@ -431,8 +423,7 @@ class SkyvernPage:
         files: str | None = None,
         selector: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        **kwargs: Any,
     ) -> str: ...
 
     @action_wrap(ActionType.UPLOAD_FILE)
@@ -443,16 +434,18 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> str:
         # Backward compatibility
+        intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
             prompt = intention
 
         if not selector and not prompt:
             raise ValueError("Missing input: pass a selector and/or a prompt.")
+
+        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        data = kwargs.pop("data", None)
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -466,7 +459,7 @@ class SkyvernPage:
                 try:
                     file_path = await download_file(files)
                     locator = self.page.locator(selector)
-                    await locator.set_input_files(file_path)
+                    await locator.set_input_files(file_path, **kwargs)
                 except Exception as e:
                     error_to_raise = e
                     selector = None
@@ -501,7 +494,7 @@ class SkyvernPage:
 
         file_path = await download_file(files)
         locator = self.page.locator(selector)
-        await locator.set_input_files(file_path, timeout=timeout)
+        await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
 
     @overload
@@ -512,9 +505,6 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -526,9 +516,6 @@ class SkyvernPage:
         value: str | None = None,
         selector: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
         **kwargs: Any,
     ) -> str | None: ...
 
@@ -540,9 +527,6 @@ class SkyvernPage:
         *,
         prompt: str | None = None,
         ai: str | None = "fallback",
-        data: str | dict[str, Any] | None = None,
-        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-        intention: str | None = None,  # backward compatibility
         **kwargs: Any,
     ) -> str | None:
         """Select an option from a dropdown using a CSS selector, AI-powered prompt matching, or both.
@@ -557,8 +541,6 @@ class SkyvernPage:
             value: The option value to select.
             prompt: Natural language description of which option to select.
             ai: AI behavior mode. Defaults to "fallback" which tries selector first, then AI.
-            data: Additional context data for AI processing.
-            timeout: Maximum time to wait for the select action in milliseconds.
 
         Returns:
             The value that was successfully selected.
@@ -581,11 +563,15 @@ class SkyvernPage:
         """
 
         # Backward compatibility
+        intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
             prompt = intention
 
         if not selector and not prompt:
             raise ValueError("Missing input: pass a selector and/or a prompt.")
+
+        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        data = kwargs.pop("data", None)
 
         context = skyvern_context.current()
         if context and context.ai_mode_override:
@@ -631,46 +617,30 @@ class SkyvernPage:
     async def wait(
         self,
         seconds: float,
-        prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        intention: str | None = None,
+        **kwargs: Any,
     ) -> None:
         await asyncio.sleep(seconds)
 
     @action_wrap(ActionType.NULL_ACTION)
-    async def null_action(
-        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
-    ) -> None:
+    async def null_action(self, **kwargs: Any) -> None:
         return
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)
-    async def solve_captcha(
-        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
-    ) -> None:
+    async def solve_captcha(self, prompt: str | None = None) -> None:
         raise NotImplementedError("Solve captcha is not supported outside server context")
 
     @action_wrap(ActionType.TERMINATE)
-    async def terminate(
-        self,
-        errors: list[str],
-        prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        intention: str | None = None,
-    ) -> None:
+    async def terminate(self, errors: list[str], **kwargs: Any) -> None:
         # TODO: update the workflow run status to terminated
         return
 
     @action_wrap(ActionType.COMPLETE)
-    async def complete(
-        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
-    ) -> None:
+    async def complete(self, prompt: str | None = None) -> None:
         """Stub for complete. Override in subclasses for specific behavior."""
 
     @action_wrap(ActionType.RELOAD_PAGE)
-    async def reload_page(
-        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
-    ) -> None:
-        await self.page.reload()
+    async def reload_page(self, **kwargs: Any) -> None:
+        await self.page.reload(**kwargs)
         return
 
     @action_wrap(ActionType.EXTRACT)
@@ -680,7 +650,7 @@ class SkyvernPage:
         schema: dict[str, Any] | list | str | None = None,
         error_code_mapping: dict[str, str] | None = None,
         intention: str | None = None,
-        data: str | dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any] | list | str | None:
         """Extract structured data from the page using AI.
 
@@ -689,7 +659,6 @@ class SkyvernPage:
             schema: JSON Schema defining the structure of data to extract.
             error_code_mapping: Mapping of error codes to custom error messages.
             intention: Additional context about the extraction intent.
-            data: Additional context data for AI processing.
 
         Returns:
             Extracted data matching the provided schema, or None if extraction fails.
@@ -711,12 +680,11 @@ class SkyvernPage:
             # Returns: {"name": "...", "price": 29.99}
             ```
         """
+        data = kwargs.pop("data", None)
         return await self._ai.ai_extract(prompt, schema, error_code_mapping, intention, data)
 
     @action_wrap(ActionType.VERIFICATION_CODE)
-    async def verification_code(
-        self, prompt: str | None = None, data: str | dict[str, Any] | None = None, intention: str | None = None
-    ) -> None:
+    async def verification_code(self, prompt: str | None = None) -> None:
         return
 
     @action_wrap(ActionType.SCROLL)
@@ -724,9 +692,7 @@ class SkyvernPage:
         self,
         scroll_x: int,
         scroll_y: int,
-        prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        intention: str | None = None,
+        **kwargs: Any,
     ) -> None:
         await self.page.evaluate(f"window.scrollBy({scroll_x}, {scroll_y})")
 
@@ -736,9 +702,7 @@ class SkyvernPage:
         keys: list[str],
         hold: bool = False,
         duration: float = 0,
-        prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> None:
         await handler_utils.keypress(self.page, keys, hold=hold, duration=duration)
 
@@ -747,9 +711,7 @@ class SkyvernPage:
         self,
         x: int,
         y: int,
-        prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        intention: str | None = None,
+        **kwargs: Any,
     ) -> None:
         await self.page.mouse.move(x, y)
 
@@ -759,9 +721,7 @@ class SkyvernPage:
         start_x: int,
         start_y: int,
         path: list[tuple[int, int]],
-        prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> None:
         await handler_utils.drag(self.page, start_x, start_y, path)
 
@@ -771,9 +731,7 @@ class SkyvernPage:
         x: int,
         y: int,
         direction: Literal["down", "up"],
-        prompt: str | None = None,
-        data: str | dict[str, Any] | None = None,
-        intention: str | None = None,  # backward compatibility
+        **kwargs: Any,
     ) -> None:
         await handler_utils.left_mouse(self.page, x, y, direction)
 

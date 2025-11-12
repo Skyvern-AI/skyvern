@@ -1,6 +1,7 @@
 import asyncio
-from typing import TYPE_CHECKING, Any, Pattern
+from typing import TYPE_CHECKING, Any
 
+import structlog
 from playwright.async_api import Page
 
 from skyvern.client import GetRunResponse
@@ -8,13 +9,14 @@ from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
-from skyvern.library.skyvern_locator import SkyvernLocator
 
 if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
 
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.schemas.runs import RunEngine, RunStatus, TaskRunResponse
+
+LOG = structlog.get_logger()
 
 
 class SkyvernPageRun:
@@ -66,7 +68,8 @@ class SkyvernPageRun:
             TaskRunResponse containing the task execution results.
         """
 
-        await self._browser.sdk.ensure_has_server()
+        LOG.info("AI run task", prompt=prompt)
+
         task_run = await self._browser.client.run_task(
             prompt=prompt,
             engine=engine,
@@ -125,7 +128,8 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the login workflow execution results.
         """
 
-        await self._browser.sdk.ensure_has_server()
+        LOG.info("AI login", prompt=prompt)
+
         workflow_run = await self._browser.client.login(
             credential_type=credential_type,
             url=url or self._get_page_url(),
@@ -173,7 +177,8 @@ class SkyvernPageRun:
             WorkflowRunResponse containing the workflow execution results.
         """
 
-        await self._browser.sdk.ensure_has_server()
+        LOG.info("AI run workflow", workflow_id=workflow_id)
+
         workflow_run = await self._browser.client.run_workflow(
             workflow_id=workflow_id,
             parameters=parameters,
@@ -249,117 +254,3 @@ class SkyvernBrowserPage(SkyvernPage):
             ```
         """
         return await self._ai.ai_act(prompt)
-
-    async def reload(self, **kwargs: Any) -> None:
-        """Reload the current page.
-
-        Args:
-            **kwargs: Additional options like timeout, wait_until, etc.
-        """
-        await self.page.reload(**kwargs)
-
-    async def screenshot(self, **kwargs: Any) -> bytes:
-        """Take a screenshot of the page.
-
-        Args:
-            **kwargs: Additional options like path, full_page, clip, type, quality, etc.
-
-        Returns:
-            bytes: The screenshot as bytes (unless path is specified, then saves to file).
-        """
-        return await self.page.screenshot(**kwargs)
-
-    def locator(self, selector: str, **kwargs: Any) -> SkyvernLocator:
-        """Find an element using a CSS selector or other selector syntax.
-
-        Args:
-            selector: CSS selector or other selector syntax (xpath=, text=, etc.).
-            **kwargs: Additional options like has, has_text, has_not, etc.
-
-        Returns:
-            SkyvernLocator object that can be used to perform actions or assertions.
-        """
-        return SkyvernLocator(self.page.locator(selector, **kwargs))
-
-    def get_by_label(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
-        """Find an input element by its associated label text.
-
-        Args:
-            text: Label text to search for (supports substring and regex matching).
-            **kwargs: Additional options like exact.
-
-        Returns:
-            SkyvernLocator object for the labeled input element.
-        """
-        return SkyvernLocator(self.page.get_by_label(text, **kwargs))
-
-    def get_by_text(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
-        """Find an element containing the specified text.
-
-        Args:
-            text: Text content to search for (supports substring and regex matching).
-            **kwargs: Additional options like exact.
-
-        Returns:
-            SkyvernLocator object for the element containing the text.
-        """
-        return SkyvernLocator(self.page.get_by_text(text, **kwargs))
-
-    def get_by_title(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
-        """Find an element by its title attribute.
-
-        Args:
-            text: Title attribute value to search for (supports substring and regex matching).
-            **kwargs: Additional options like exact.
-
-        Returns:
-            SkyvernLocator object for the element with matching title.
-        """
-        return SkyvernLocator(self.page.get_by_title(text, **kwargs))
-
-    def get_by_role(self, role: str, **kwargs: Any) -> SkyvernLocator:
-        """Find an element by its ARIA role.
-
-        Args:
-            role: ARIA role (e.g., "button", "textbox", "link").
-            **kwargs: Additional options like name, checked, pressed, etc.
-
-        Returns:
-            SkyvernLocator object for the element with matching role.
-        """
-        return SkyvernLocator(self.page.get_by_role(role, **kwargs))
-
-    def get_by_placeholder(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
-        """Find an input element by its placeholder text.
-
-        Args:
-            text: Placeholder text to search for (supports substring and regex matching).
-            **kwargs: Additional options like exact.
-
-        Returns:
-            SkyvernLocator object for the input element with matching placeholder.
-        """
-        return SkyvernLocator(self.page.get_by_placeholder(text, **kwargs))
-
-    def get_by_alt_text(self, text: str | Pattern[str], **kwargs: Any) -> SkyvernLocator:
-        """Find an element by its alt text (typically images).
-
-        Args:
-            text: Alt text to search for (supports substring and regex matching).
-            **kwargs: Additional options like exact.
-
-        Returns:
-            SkyvernLocator object for the element with matching alt text.
-        """
-        return SkyvernLocator(self.page.get_by_alt_text(text, **kwargs))
-
-    def get_by_test_id(self, test_id: str) -> SkyvernLocator:
-        """Find an element by its test ID attribute.
-
-        Args:
-            test_id: Test ID value to search for.
-
-        Returns:
-            SkyvernLocator object for the element with matching test ID.
-        """
-        return SkyvernLocator(self.page.get_by_test_id(test_id))

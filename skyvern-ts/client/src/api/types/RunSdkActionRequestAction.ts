@@ -10,6 +10,7 @@ export type RunSdkActionRequestAction =
     | Skyvern.RunSdkActionRequestAction.AiClick
     | Skyvern.RunSdkActionRequestAction.AiInputText
     | Skyvern.RunSdkActionRequestAction.AiSelectOption
+    | Skyvern.RunSdkActionRequestAction.AiUploadFile
     | Skyvern.RunSdkActionRequestAction.Extract;
 
 export namespace RunSdkActionRequestAction {
@@ -27,6 +28,10 @@ export namespace RunSdkActionRequestAction {
 
     export interface AiSelectOption extends Skyvern.SelectOptionAction {
         type: "ai_select_option";
+    }
+
+    export interface AiUploadFile extends Skyvern.UploadFileAction {
+        type: "ai_upload_file";
     }
 
     export interface Extract extends Skyvern.ExtractAction {

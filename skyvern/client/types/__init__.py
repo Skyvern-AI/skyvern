@@ -42,6 +42,7 @@ if typing.TYPE_CHECKING:
     from .bitwarden_sensitive_information_parameter import BitwardenSensitiveInformationParameter
     from .bitwarden_sensitive_information_parameter_yaml import BitwardenSensitiveInformationParameterYaml
     from .block_type import BlockType
+    from .browser_profile import BrowserProfile
     from .browser_session_response import BrowserSessionResponse
     from .click_action import ClickAction
     from .click_action_data import ClickActionData
@@ -546,6 +547,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BitwardenSensitiveInformationParameter": ".bitwarden_sensitive_information_parameter",
     "BitwardenSensitiveInformationParameterYaml": ".bitwarden_sensitive_information_parameter_yaml",
     "BlockType": ".block_type",
+    "BrowserProfile": ".browser_profile",
     "BrowserSessionResponse": ".browser_session_response",
     "ClickAction": ".click_action",
     "ClickActionData": ".click_action_data",
@@ -1030,6 +1032,7 @@ __all__ = [
     "BitwardenSensitiveInformationParameter",
     "BitwardenSensitiveInformationParameterYaml",
     "BlockType",
+    "BrowserProfile",
     "BrowserSessionResponse",
     "ClickAction",
     "ClickActionData",

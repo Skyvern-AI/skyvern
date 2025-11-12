@@ -584,3 +584,9 @@ export function isOutputParameter(
 ): parameter is OutputParameter {
   return parameter.parameter_type === "output";
 }
+
+export type ImprovePromptForWorkflowResponse = {
+  error: string | null;
+  improved: string;
+  original: string;
+};

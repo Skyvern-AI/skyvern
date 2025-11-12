@@ -41,6 +41,7 @@ if typing.TYPE_CHECKING:
         BitwardenSensitiveInformationParameter,
         BitwardenSensitiveInformationParameterYaml,
         BlockType,
+        BrowserProfile,
         BrowserSessionResponse,
         ClickAction,
         ClickActionData,
@@ -468,7 +469,7 @@ if typing.TYPE_CHECKING:
         WorkflowStatus,
     )
     from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
-    from . import scripts, workflows
+    from . import browser_profiles, scripts, workflows
     from .client import AsyncSkyvern, Skyvern
     from .environment import SkyvernEnvironment
     from .version import __version__
@@ -509,6 +510,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "BitwardenSensitiveInformationParameter": ".types",
     "BitwardenSensitiveInformationParameterYaml": ".types",
     "BlockType": ".types",
+    "BrowserProfile": ".types",
     "BrowserSessionResponse": ".types",
     "ClickAction": ".types",
     "ClickActionData": ".types",
@@ -940,6 +942,7 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowRunTimelineType": ".types",
     "WorkflowStatus": ".types",
     "__version__": ".version",
+    "browser_profiles": ".browser_profiles",
     "scripts": ".scripts",
     "workflows": ".workflows",
 }
@@ -1003,6 +1006,7 @@ __all__ = [
     "BitwardenSensitiveInformationParameter",
     "BitwardenSensitiveInformationParameterYaml",
     "BlockType",
+    "BrowserProfile",
     "BrowserSessionResponse",
     "ClickAction",
     "ClickActionData",
@@ -1434,6 +1438,7 @@ __all__ = [
     "WorkflowRunTimelineType",
     "WorkflowStatus",
     "__version__",
+    "browser_profiles",
     "scripts",
     "workflows",
 ]

@@ -122,9 +122,6 @@ class ScriptSkyvernPage(SkyvernPage):
         fn: Callable,
         action: ActionType,
         *args: Any,
-        prompt: str = "",
-        data: str | dict[str, Any] = "",
-        intention: str = "",
         **kwargs: Any,
     ) -> Any:
         """
@@ -149,10 +146,14 @@ class ScriptSkyvernPage(SkyvernPage):
             ActionType.TERMINATE: "🛑",
         }
 
+        prompt = kwargs.get("prompt", "")
+
         # Backward compatibility: use intention if provided and prompt is empty
+        intention = kwargs.get("intention", None)
         if intention and not prompt:
             prompt = intention
 
+        data = kwargs.get("data", None)
         meta = ActionMetadata(prompt, data)
         call = ActionCall(action, args, kwargs, meta)
 
@@ -170,9 +171,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 print()
 
         try:
-            call.result = await fn(
-                self, *args, prompt=prompt, data=data, intention=intention, **kwargs
-            )  # real driver call
+            call.result = await fn(self, *args, **kwargs)
 
             # Note: Action status would be updated to completed here if update method existed
 
@@ -199,7 +198,6 @@ class ScriptSkyvernPage(SkyvernPage):
                 action_type=action,
                 intention=prompt,
                 status=action_status,
-                data=data,
                 kwargs=kwargs,
                 call_result=call.result,
             )
@@ -262,7 +260,6 @@ class ScriptSkyvernPage(SkyvernPage):
         action_type: ActionType,
         intention: str = "",
         status: ActionStatus = ActionStatus.pending,
-        data: str | dict[str, Any] = "",
         kwargs: dict[str, Any] | None = None,
         call_result: Any | None = None,
     ) -> Action | None:
@@ -396,7 +393,7 @@ class ScriptSkyvernPage(SkyvernPage):
             # If screenshot creation fails, don't block execution
             pass
 
-    async def goto(self, url: str, timeout: float = settings.BROWSER_LOADING_TIMEOUT_MS) -> None:
+    async def goto(self, url: str, **kwargs: Any) -> None:
         url = render_template(url)
         url = prepend_scheme_and_validate_url(url)
 
@@ -405,10 +402,8 @@ class ScriptSkyvernPage(SkyvernPage):
         if context and context.script_mode:
             print(f"🌐 Navigating to: {url}")
 
-        await self.page.goto(
-            url,
-            timeout=timeout,
-        )
+        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        await self.page.goto(url, timeout=timeout, **kwargs)
 
         if context and context.script_mode:
             print("  ✓ Page loaded")

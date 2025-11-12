@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import BrowserContext, Page
 
@@ -9,10 +9,10 @@ if TYPE_CHECKING:
     from skyvern.library.skyvern_sdk import SkyvernSdk
 
 
-class SkyvernBrowser:
+class SkyvernBrowser(BrowserContext):
     """A browser context wrapper that creates Skyvern-enabled pages.
 
-    This class wraps a Playwright BrowserContext and provides methods to create
+    This class extends Playwright BrowserContext and provides methods to create
     SkyvernBrowserPage instances that combine traditional browser automation with
     AI-powered task execution capabilities. It manages browser session state and
     enables persistent browser sessions across multiple pages.
@@ -44,12 +44,25 @@ class SkyvernBrowser:
         browser_session_id: str | None = None,
         browser_address: str | None = None,
     ):
+        super().__init__(browser_context)
         self._sdk = sdk
         self._browser_context = browser_context
         self._browser_session_id = browser_session_id
         self._browser_address = browser_address
 
         self.workflow_run_id: None | str = None
+
+    def __getattribute__(self, name: str) -> Any:
+        browser_context = object.__getattribute__(self, "_browser_context")
+        if hasattr(browser_context, name):
+            for cls in type(self).__mro__:
+                if cls is BrowserContext:
+                    break
+                if name in cls.__dict__:
+                    return object.__getattribute__(self, name)
+            return getattr(browser_context, name)
+
+        return object.__getattribute__(self, name)
 
     @property
     def browser_session_id(self) -> str | None:

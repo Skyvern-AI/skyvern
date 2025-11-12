@@ -60,7 +60,6 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
-    download_file,
     get_download_dir,
     list_downloading_files_in_directory,
     list_files_in_directory,
@@ -635,6 +634,14 @@ async def handle_click_action(
                         "No download triggered, not closing the extra page",
                         workflow_run_id=task.workflow_run_id,
                     )
+    elif action.file_url:
+        upload_file_action = UploadFileAction(
+            reasoning=action.reasoning,
+            intention=action.intention,
+            element_id=action.element_id,
+            file_url=action.file_url,
+        )
+        return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
         incremental_scraped: IncrementalScrapePage | None = None
         try:
@@ -1513,8 +1520,16 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await download_file(file_url)
+    file_path = await handler_utils.download_file(file_url, action.model_dump())
     is_file_input = await skyvern_element.is_file_input()
+
+    if not is_file_input:
+        LOG.info("Trying to find file input in children", action=action)
+        file_input_locator = await skyvern_element.find_file_input_in_children()
+        if file_input_locator:
+            LOG.info("Found file input in children", action=action)
+            locator = file_input_locator
+            is_file_input = True
 
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
@@ -1540,6 +1555,7 @@ async def handle_upload_file_action(
             page,
             action,
             skyvern_element,
+            pending_upload_files=file_path,
             timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
@@ -1680,6 +1696,7 @@ async def handle_select_option_action(
         )
 
         try:
+            await skyvern_element.scroll_into_view()
             blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
         except Exception:
             LOG.warning(
@@ -2212,6 +2229,7 @@ async def chain_click(
     page: Page,
     action: ClickAction | UploadFileAction,
     skyvern_element: SkyvernElement,
+    pending_upload_files: list[str] | str | None = None,
     timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
@@ -2222,8 +2240,8 @@ async def chain_click(
     locator = skyvern_element.locator
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
-    file: list[str] | str = []
-    if action.file_url:
+    file = pending_upload_files or []
+    if not file and action.file_url:
         file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
         file = await handler_utils.download_file(file_url, action.model_dump())
 
@@ -2394,9 +2412,9 @@ async def chain_click(
     finally:
         LOG.info("Remove file chooser listener", action=action)
 
+        # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         # Sleep for 15 seconds after uploading a file to let the page process it
         # Removing this breaks file uploads using the filechooser
-        # KEREM DO NOT REMOVE
         if file:
             await asyncio.sleep(15)
         page.remove_listener("filechooser", fc_func)

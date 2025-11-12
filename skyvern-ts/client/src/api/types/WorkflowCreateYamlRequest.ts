@@ -21,4 +21,5 @@ export interface WorkflowCreateYamlRequest {
     cache_key?: string;
     run_sequentially?: boolean;
     sequential_key?: string;
+    folder_id?: string;
 }
