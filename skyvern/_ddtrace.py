@@ -8,13 +8,6 @@ from types import SimpleNamespace
 from typing import Any, Tuple, Type
 
 
-class NoOpTraceFilter:
-    """Fallback implementation used when ddtrace is not installed."""
-
-    def process_trace(self, trace: list[Any]) -> list[Any] | None:  # pragma: no cover - trivial
-        return trace
-
-
 class NoOpSpan:
     """Fallback Span implementation used when ddtrace is unavailable."""
 
@@ -22,6 +15,13 @@ class NoOpSpan:
 
     def get_tag(self, _: str) -> Any:  # pragma: no cover - trivial
         return None
+
+
+class NoOpTraceFilter:
+    """Fallback implementation used when ddtrace is not installed."""
+
+    def process_trace(self, trace: list[NoOpSpan]) -> list[NoOpSpan] | None:  # pragma: no cover - trivial
+        return trace
 
 
 def load_ddtrace() -> Tuple[Any | None, Any, Type, Type]:
