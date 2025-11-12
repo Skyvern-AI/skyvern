@@ -4,16 +4,16 @@ from llama_index.core.tools import FunctionTool
 from llama_index.core.tools.tool_spec.base import SPEC_FUNCTION_TYPE, BaseToolSpec
 from skyvern_llamaindex.settings import settings
 
-from skyvern import Skyvern
+from skyvern import SkyvernSdk
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.runs import RunEngine
 
 
 class SkyvernTool:
-    def __init__(self, agent: Skyvern | None = None):
+    def __init__(self, agent: SkyvernSdk | None = None):
         if agent is None:
-            agent = Skyvern(base_url=None, api_key=None)
+            agent = SkyvernSdk()
         self.agent = agent
 
     def run_task(self) -> FunctionTool:
@@ -39,12 +39,12 @@ class SkyvernTaskToolSpec(BaseToolSpec):
     def __init__(
         self,
         *,
-        agent: Skyvern | None = None,
+        agent: SkyvernSdk | None = None,
         engine: RunEngine = settings.engine,
         run_task_timeout_seconds: int = settings.run_task_timeout_seconds,
     ) -> None:
         if agent is None:
-            agent = Skyvern(base_url=None, api_key=None)
+            agent = SkyvernSdk()
         self.agent = agent
         self.engine = engine
         self.run_task_timeout_seconds = run_task_timeout_seconds
@@ -74,7 +74,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
 
         assert user_prompt is not None, "user_prompt is required"
 
-        return await self.agent.run_task(
+        return await self.agent.api.run_task(
             prompt=user_prompt,
             url=url,
             engine=self.engine,
@@ -107,7 +107,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
 
         assert user_prompt is not None, "user_prompt is required"
 
-        return await self.agent.run_task(
+        return await self.agent.api.run_task(
             prompt=user_prompt,
             url=url,
             engine=self.engine,
@@ -126,4 +126,4 @@ class SkyvernTaskToolSpec(BaseToolSpec):
             task_id = kwargs["args"][0]
 
         assert task_id is not None, "task_id is required"
-        return await self.agent.get_run(run_id=task_id)
+        return await self.agent.api.get_run(run_id=task_id)

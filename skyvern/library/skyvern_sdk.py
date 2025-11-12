@@ -6,7 +6,8 @@ from dotenv import load_dotenv
 from playwright.async_api import Playwright, async_playwright
 from typing_extensions import overload
 
-from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
+from skyvern import Skyvern as SkyvernClient
+from skyvern.client import BrowserSessionResponse, SkyvernEnvironment
 from skyvern.library.constants import DEFAULT_CDP_PORT
 from skyvern.library.skyvern_browser import SkyvernBrowser
 
@@ -136,7 +137,7 @@ class SkyvernSdk:
             if not api_key:
                 raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
 
-            def create_embedded_api() -> AsyncSkyvern:
+            def create_embedded_api() -> SkyvernClient:
                 from skyvern.library.embedded_server_factory import create_embedded_server  # noqa: PLC0415
 
                 return create_embedded_server(
@@ -149,8 +150,8 @@ class SkyvernSdk:
             if not api_key:
                 raise ValueError(f"Missing api_key for {environment.name}")
 
-            def create_remote_api() -> AsyncSkyvern:
-                return AsyncSkyvern(
+            def create_remote_api() -> SkyvernClient:
+                return SkyvernClient(
                     environment=environment,
                     base_url=base_url,
                     api_key=api_key,
@@ -161,16 +162,16 @@ class SkyvernSdk:
 
             api_factory = create_remote_api
 
-        self._api_factory: Callable[[], AsyncSkyvern] = api_factory
+        self._api_factory: Callable[[], SkyvernClient] = api_factory
 
         self._environment = environment
         self._api_key = api_key
 
-        self._api: AsyncSkyvern | None = None
+        self._api: SkyvernClient | None = None
         self._playwright: Playwright | None = None
 
     @property
-    def api(self) -> AsyncSkyvern:
+    def api(self) -> SkyvernClient:
         """Get the AsyncSkyvern API client for direct API access."""
         if not self._api:
             self._api = self._api_factory()

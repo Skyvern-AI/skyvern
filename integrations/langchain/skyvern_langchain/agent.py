@@ -6,7 +6,7 @@ from pydantic import Field
 from skyvern_langchain.schema import CreateTaskInput, GetTaskInput
 from skyvern_langchain.settings import settings
 
-from skyvern import Skyvern
+from skyvern import SkyvernSdk
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.runs import RunEngine
@@ -15,7 +15,7 @@ from skyvern.schemas.runs import RunEngine
 class SkyvernTaskBaseTool(BaseTool):
     engine: RunEngine = Field(default=settings.engine)
     run_task_timeout_seconds: int = Field(default=settings.run_task_timeout_seconds)
-    agent: Skyvern = Skyvern(base_url=None, api_key=None)
+    agent: SkyvernSdk = SkyvernSdk()
 
     def _run(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError("skyvern task tool does not support sync")
@@ -27,7 +27,7 @@ class RunTask(SkyvernTaskBaseTool):
     args_schema: Type[BaseModel] = CreateTaskInput
 
     async def _arun(self, user_prompt: str, url: str | None = None) -> TaskRunResponse:
-        return await self.agent.run_task(
+        return await self.agent.api.run_task(
             prompt=user_prompt,
             url=url,
             engine=self.engine,
@@ -42,7 +42,7 @@ class DispatchTask(SkyvernTaskBaseTool):
     args_schema: Type[BaseModel] = CreateTaskInput
 
     async def _arun(self, user_prompt: str, url: str | None = None) -> TaskRunResponse:
-        return await self.agent.run_task(
+        return await self.agent.api.run_task(
             prompt=user_prompt,
             url=url,
             engine=self.engine,
@@ -57,4 +57,4 @@ class GetTask(SkyvernTaskBaseTool):
     args_schema: Type[BaseModel] = GetTaskInput
 
     async def _arun(self, task_id: str) -> GetRunResponse | None:
-        return await self.agent.get_run(run_id=task_id)
+        return await self.agent.api.get_run(run_id=task_id)
