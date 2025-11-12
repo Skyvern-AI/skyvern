@@ -335,6 +335,8 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
     elif method == "select_option":
         option = act.get("option", {})
         value = option.get("value")
+        label = option.get("label")
+        value = value or label
         if value:
             if act.get("field_name"):
                 option_value = cst.Subscript(
