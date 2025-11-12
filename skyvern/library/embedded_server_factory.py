@@ -3,7 +3,7 @@ from httpx import ASGITransport
 
 
 def create_embedded_server(
-    open_api_key: str | None,
+    openai_api_key: str | None,
 ) -> httpx.AsyncClient:
     class EmbeddedServerTransport(httpx.AsyncBaseTransport):
         def __init__(self) -> None:
@@ -16,8 +16,8 @@ def create_embedded_server(
 
                 settings.BROWSER_LOGS_ENABLED = False
 
-                if open_api_key:
-                    settings.OPENAI_API_KEY = open_api_key
+                if openai_api_key:
+                    settings.OPENAI_API_KEY = openai_api_key
 
                 self._transport = ASGITransport(app=app)
 

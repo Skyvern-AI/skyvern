@@ -106,14 +106,14 @@ class Skyvern(AsyncSkyvern):
     def __init__(
         self,
         *,
-        open_api_key: str | None = None,
+        openai_api_key: str | None = None,
     ) -> None:
         """Embedded mode: Run Skyvern locally in-process.
 
         To use this mode, run `skyvern quickstart` first.
 
         Args:
-            open_api_key: Optional OpenAI API key override for LLM operations.
+            openai_api_key: Optional OpenAI API key override for LLM operations.
                 If not provided, the one from the .env file will be used.
         """
         ...
@@ -147,7 +147,7 @@ class Skyvern(AsyncSkyvern):
                 timeout=timeout,
                 follow_redirects=follow_redirects,
                 httpx_client=create_embedded_server(
-                    open_api_key=open_api_key,
+                    openai_api_key=openai_api_key,
                 ),
             )
         else:
