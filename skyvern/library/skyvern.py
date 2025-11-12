@@ -330,10 +330,6 @@ class Skyvern(AsyncSkyvern):
                     await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
         return WorkflowRunResponse.model_validate(workflow_run.model_dump())
 
-    @property
-    def api(self) -> AsyncSkyvern:
-        return self
-
     async def launch_local_browser(self, *, headless: bool = False, port: int = DEFAULT_CDP_PORT) -> SkyvernBrowser:
         """Launch a new local Chromium browser with Chrome DevTools Protocol (CDP) enabled.
 
@@ -382,9 +378,7 @@ class Skyvern(AsyncSkyvern):
         Returns:
             SkyvernBrowser: A browser instance connected to the cloud session.
         """
-        if self._environment != SkyvernEnvironment.CLOUD and self._environment != SkyvernEnvironment.STAGING:
-            raise Exception("Cloud browser sessions are supported only in the cloud environment")
-
+        self._ensure_cloud_environment()
         browser_session = await self.get_browser_session(browser_session_id)
         return await self._connect_to_cloud_browser_session(browser_session)
 
@@ -396,9 +390,7 @@ class Skyvern(AsyncSkyvern):
         Returns:
             SkyvernBrowser: A browser instance connected to the new cloud session.
         """
-        if self._environment != SkyvernEnvironment.CLOUD and self._environment != SkyvernEnvironment.STAGING:
-            raise Exception("Cloud browser sessions are supported only in the cloud environment")
-
+        self._ensure_cloud_environment()
         browser_session = await self.create_browser_session()
         return await self._connect_to_cloud_browser_session(browser_session)
 
@@ -412,9 +404,7 @@ class Skyvern(AsyncSkyvern):
         Returns:
             SkyvernBrowser: A browser instance connected to an existing or new cloud session.
         """
-        if self._environment != SkyvernEnvironment.CLOUD and self._environment != SkyvernEnvironment.STAGING:
-            raise Exception("Cloud browser sessions are supported only in the cloud environment")
-
+        self._ensure_cloud_environment()
         browser_sessions = await self.get_browser_sessions()
         browser_session = max(
             (s for s in browser_sessions if s.runnable_id is None), key=lambda s: s.started_at, default=None
@@ -423,9 +413,13 @@ class Skyvern(AsyncSkyvern):
             browser_session = await self.create_browser_session()
         return await self._connect_to_cloud_browser_session(browser_session)
 
+    def _ensure_cloud_environment(self) -> None:
+        if self._environment not in (SkyvernEnvironment.CLOUD, SkyvernEnvironment.STAGING):
+            raise ValueError("Cloud browser sessions are supported only in the cloud environment")
+
     async def _connect_to_cloud_browser_session(self, browser_session: BrowserSessionResponse) -> SkyvernBrowser:
         if browser_session.browser_address is None:
-            raise Exception(f"Browser address is missing for session {browser_session.browser_session_id}")
+            raise ValueError(f"Browser address is missing for session {browser_session.browser_session_id}")
 
         playwright = await self._get_playwright()
         browser = await playwright.chromium.connect_over_cdp(
