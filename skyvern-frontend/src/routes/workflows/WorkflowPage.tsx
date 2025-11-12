@@ -30,7 +30,7 @@ import {
   Pencil2Icon,
   PlayIcon,
 } from "@radix-ui/react-icons";
-import { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Link,
   useNavigate,
@@ -50,6 +50,12 @@ import {
 } from "@/components/ui/tooltip";
 import { RunParametersDialog } from "./workflowRun/RunParametersDialog";
 import * as env from "@/util/env";
+import { HighlightText } from "./components/HighlightText";
+import { getClient } from "@/api/AxiosClient";
+import { WorkflowRunStatusApiResponse } from "@/api/types";
+import { useQuery } from "@tanstack/react-query";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useGlobalWorkflowsQuery } from "./hooks/useGlobalWorkflowsQuery";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
@@ -62,6 +68,11 @@ function WorkflowPage() {
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const [openRunParams, setOpenRunParams] = useState<string | null>(null);
+
+  // Parameter expansion state
+  const [manuallyExpandedRows, setManuallyExpandedRows] = useState<Set<string>>(
+    new Set(),
+  );
 
   const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
     workflowPermanentId,
@@ -82,6 +93,49 @@ function WorkflowPage() {
   const { data: workflow, isLoading: workflowIsLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
+
+  // Helper to check if a run parameter matches the search
+  const runParameterMatchesSearch = useCallback(
+    (key: string, value: unknown, description?: string | null): boolean => {
+      if (!debouncedSearch.trim()) return false;
+      const lowerQuery = debouncedSearch.toLowerCase();
+
+      const keyMatch = key?.toLowerCase().includes(lowerQuery) ?? false;
+      const descMatch =
+        description?.toLowerCase().includes(lowerQuery) ?? false;
+      const valueMatch = Boolean(
+        value !== null &&
+          value !== undefined &&
+          String(value).toLowerCase().includes(lowerQuery),
+      );
+
+      return keyMatch || descMatch || valueMatch;
+    },
+    [debouncedSearch],
+  );
+
+  // Auto-expand rows when parameters match search (only if search is active)
+  const autoExpandedRows = useMemo(() => {
+    if (!debouncedSearch.trim()) return new Set<string>();
+    // Since backend already filters by search_key, all returned runs have matching params
+    // So we auto-expand all runs when search is active
+    return new Set(workflowRuns?.map((run) => run.workflow_run_id) ?? []);
+  }, [workflowRuns, debouncedSearch]);
+
+  // Combine manual and auto-expanded rows
+  const expandedRows = useMemo(() => {
+    return new Set([...manuallyExpandedRows, ...autoExpandedRows]);
+  }, [manuallyExpandedRows, autoExpandedRows]);
+
+  const toggleParametersExpanded = (runId: string) => {
+    const newExpanded = new Set(manuallyExpandedRows);
+    if (newExpanded.has(runId)) {
+      newExpanded.delete(runId);
+    } else {
+      newExpanded.add(runId);
+    }
+    setManuallyExpandedRows(newExpanded);
+  };
 
   if (!workflowPermanentId) {
     return null; // this should never happen
@@ -154,20 +208,20 @@ function WorkflowPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-1/3">ID</TableHead>
-                <TableHead className="w-1/3">Status</TableHead>
-                <TableHead className="w-1/3">Created At</TableHead>
-                <TableHead className="w-0"></TableHead>
+                <TableHead className="w-1/4">ID</TableHead>
+                <TableHead className="w-1/4">Status</TableHead>
+                <TableHead className="w-1/4">Created At</TableHead>
+                <TableHead className="w-1/4"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
                 <TableRow>
-                  <TableCell colSpan={3}>Loading...</TableCell>
+                  <TableCell colSpan={4}>Loading...</TableCell>
                 </TableRow>
               ) : workflowRuns?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={3}>No workflow runs found</TableCell>
+                  <TableCell colSpan={4}>No workflow runs found</TableCell>
                 </TableRow>
               ) : (
                 workflowRuns?.map((workflowRun) => {
@@ -183,59 +237,92 @@ function WorkflowPage() {
                       workflowRun.workflow_run_id ?? ""
                     );
 
-                  return (
-                    <TableRow
-                      key={workflowRun.workflow_run_id}
-                      onClick={(event) => {
-                        const url = env.useNewRunsUrl
-                          ? `/runs/${workflowRun.workflow_run_id}`
-                          : `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`;
+                  const isExpanded = expandedRows.has(
+                    workflowRun.workflow_run_id,
+                  );
 
-                        if (event.ctrlKey || event.metaKey) {
-                          window.open(
-                            window.location.origin + url,
-                            "_blank",
-                            "noopener,noreferrer",
-                          );
-                          return;
-                        }
-                        navigate(url);
-                      }}
-                      className="cursor-pointer"
-                    >
-                      <TableCell>{workflowRunId}</TableCell>
-                      <TableCell>
-                        <StatusBadge status={workflowRun.status} />
-                      </TableCell>
-                      <TableCell
-                        title={basicTimeFormat(workflowRun.created_at)}
+                  return (
+                    <React.Fragment key={workflowRun.workflow_run_id}>
+                      {/* Main run row */}
+                      <TableRow
+                        onClick={(event) => {
+                          const url = env.useNewRunsUrl
+                            ? `/runs/${workflowRun.workflow_run_id}`
+                            : `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`;
+
+                          if (event.ctrlKey || event.metaKey) {
+                            window.open(
+                              window.location.origin + url,
+                              "_blank",
+                              "noopener,noreferrer",
+                            );
+                            return;
+                          }
+                          navigate(url);
+                        }}
+                        className="cursor-pointer"
                       >
-                        {basicLocalTimeFormat(workflowRun.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex justify-end">
-                          <TooltipProvider>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  size="icon"
-                                  variant="outline"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    setOpenRunParams(
-                                      workflowRun.workflow_run_id ?? null,
-                                    );
-                                  }}
-                                >
-                                  <MixerHorizontalIcon className="h-4 w-4" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>View Parameters</TooltipContent>
-                            </Tooltip>
-                          </TooltipProvider>
-                        </div>
-                      </TableCell>
-                    </TableRow>
+                        <TableCell>{workflowRunId}</TableCell>
+                        <TableCell>
+                          <StatusBadge status={workflowRun.status} />
+                        </TableCell>
+                        <TableCell
+                          title={basicTimeFormat(workflowRun.created_at)}
+                        >
+                          {basicLocalTimeFormat(workflowRun.created_at)}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex justify-end gap-2">
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="outline"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      toggleParametersExpanded(
+                                        workflowRun.workflow_run_id,
+                                      );
+                                    }}
+                                    className={cn(
+                                      isExpanded && "text-blue-400",
+                                    )}
+                                  >
+                                    <MixerHorizontalIcon className="h-4 w-4" />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  {isExpanded
+                                    ? "Hide Parameters"
+                                    : "Show Parameters"}
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+
+                      {/* Expanded parameters section */}
+                      {isExpanded && (
+                        <TableRow key={`${workflowRun.workflow_run_id}-params`}>
+                          <TableCell
+                            colSpan={4}
+                            className="bg-slate-50 dark:bg-slate-900/50"
+                          >
+                            <WorkflowRunParameters
+                              workflowPermanentId={workflowPermanentId}
+                              workflowRunId={workflowRun.workflow_run_id}
+                              workflow={workflow}
+                              searchQuery={debouncedSearch}
+                              runParameterMatchesSearch={
+                                runParameterMatchesSearch
+                              }
+                            />
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </React.Fragment>
                   );
                 })
               )}
@@ -287,6 +374,127 @@ function WorkflowPage() {
             </PaginationContent>
           </Pagination>
         </div>
+      </div>
+    </div>
+  );
+}
+
+type WorkflowRunParametersProps = {
+  workflowPermanentId: string;
+  workflowRunId: string;
+  workflow: Awaited<ReturnType<typeof useWorkflowQuery>>["data"];
+  searchQuery: string;
+  runParameterMatchesSearch: (
+    key: string,
+    value: unknown,
+    description?: string | null,
+  ) => boolean;
+};
+
+function WorkflowRunParameters({
+  workflowPermanentId,
+  workflowRunId,
+  workflow,
+  searchQuery,
+  runParameterMatchesSearch,
+}: WorkflowRunParametersProps) {
+  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
+  const credentialGetter = useCredentialGetter();
+
+  const { data: run, isLoading } = useQuery<WorkflowRunStatusApiResponse>({
+    queryKey: ["workflowRun", workflowPermanentId, workflowRunId, "params"],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter);
+      const params = new URLSearchParams();
+      const isGlobalWorkflow = globalWorkflows?.some(
+        (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
+      );
+      if (isGlobalWorkflow) {
+        params.set("template", "true");
+      }
+      return client
+        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
+          params,
+        })
+        .then((r) => r.data);
+    },
+    enabled: !!workflowPermanentId && !!workflowRunId && !!globalWorkflows,
+  });
+
+  if (isLoading) {
+    return (
+      <div className="ml-8 py-4">
+        <Skeleton className="h-20 w-full" />
+      </div>
+    );
+  }
+
+  if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
+    return (
+      <div className="ml-8 py-4 text-sm text-slate-400">
+        No parameters for this run
+      </div>
+    );
+  }
+
+  // Create a map of parameter definitions by key
+  const defByKey = new Map(
+    (workflow?.workflow_definition.parameters ?? []).map((p) => [p.key, p]),
+  );
+
+  // Convert parameters to array for rendering
+  const paramEntries = Object.entries(run.parameters);
+
+  return (
+    <div className="ml-8 space-y-2 py-4">
+      <div className="mb-3 text-sm font-medium">Parameters</div>
+      <div className="space-y-2">
+        {paramEntries.map(([key, value]) => {
+          const def = defByKey.get(key);
+          const description =
+            def && "description" in def ? def.description : null;
+          const matchesParam = runParameterMatchesSearch(
+            key,
+            value,
+            description,
+          );
+
+          const displayValue =
+            value === null || value === undefined
+              ? "-"
+              : typeof value === "string"
+                ? value
+                : JSON.stringify(value);
+
+          return (
+            <div
+              key={key}
+              className={cn(
+                "grid grid-cols-[minmax(200px,1fr)_minmax(200px,1fr)_minmax(300px,2fr)] gap-6 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
+                matchesParam &&
+                  "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50",
+              )}
+            >
+              <div className="font-medium text-blue-600 dark:text-blue-400">
+                <HighlightText text={key} query={searchQuery} />
+              </div>
+              <div className="truncate">
+                {displayValue === "-" ? (
+                  <span className="text-slate-400">-</span>
+                ) : (
+                  <HighlightText text={displayValue} query={searchQuery} />
+                )}
+              </div>
+              <div className="text-slate-500">
+                {description ? (
+                  <HighlightText text={description} query={searchQuery} />
+                ) : (
+                  <span className="text-slate-400">No description</span>
+                )}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
