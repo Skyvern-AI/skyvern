@@ -1857,6 +1857,10 @@ async def get_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        description="Search runs by parameter key, parameter description, or run parameter value.",
+    ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
 
@@ -1864,7 +1868,9 @@ async def get_runs(
     if page > 10:
         return []
 
-    runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
+    runs = await app.DATABASE.get_all_runs(
+        current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
+    )
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
