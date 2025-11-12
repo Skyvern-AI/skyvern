@@ -42,7 +42,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         LOG.info("AI click", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
-        response = await self._browser.client.run_sdk_action(
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,
@@ -71,7 +71,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         LOG.info("AI input text", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
-        response = await self._browser.client.run_sdk_action(
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiInputText(
                 selector=selector,
@@ -101,7 +101,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         LOG.info("AI select option", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
-        response = await self._browser.client.run_sdk_action(
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiSelectOption(
                 selector=selector,
@@ -130,7 +130,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         LOG.info("AI upload file", intention=intention, workflow_run_id=self._browser.workflow_run_id)
 
-        response = await self._browser.client.run_sdk_action(
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiUploadFile(
                 selector=selector,
@@ -158,7 +158,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         LOG.info("AI extract", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
 
-        response = await self._browser.client.run_sdk_action(
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_Extract(
                 prompt=prompt,
@@ -182,7 +182,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
 
         LOG.info("AI act", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
 
-        response = await self._browser.client.run_sdk_action(
+        response = await self._browser.skyvern.run_sdk_action(
             url=self._page.url,
             action=RunSdkActionRequestAction_AiAct(
                 intention=prompt,
