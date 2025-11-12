@@ -2,7 +2,7 @@
 api:
   specs:
     - openapi: openapi/skyvern_openapi.json
-      origin: https://api.skyvern.com/openapi.json
+      origin: https://api-staging.skyvern.com/openapi.json
       overrides: openapi/overrides.yml
       settings:
         title-as-schema-name: false
