@@ -11,10 +11,12 @@ from skyvern.constants import REPO_ROOT_DIR
 
 def setup_windows_event_loop_policy() -> None:
     """
-    Set up Windows event loop policy for psycopg compatibility.
+    Set up Windows event loop policy for psycopg and Playwright compatibility.
 
-    On Windows, psycopg cannot use the default ProactorEventLoop and requires
+    On Windows, psycopg and Playwright cannot use the default ProactorEventLoop and require
     WindowsSelectorEventLoopPolicy for async operations.
+
+    This must be called before any async operations or event loop creation.
     """
     if platform.system() == "Windows":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

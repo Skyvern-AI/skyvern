@@ -40,8 +40,6 @@ class BrowserManager:
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> BrowserState:
-        # Set up Windows event loop policy for Playwright compatibility
-        setup_windows_event_loop_policy()
         pw = await async_playwright().start()
         (
             browser_context,

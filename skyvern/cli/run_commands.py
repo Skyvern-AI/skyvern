@@ -24,6 +24,9 @@ from skyvern.services.script_service import run_script
 from skyvern.utils import detect_os, setup_windows_event_loop_policy
 from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
 
+# Set up Windows event loop policy at module level for psycopg and Playwright compatibility
+setup_windows_event_loop_policy()
+
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
 
 mcp = FastMCP("Skyvern")
@@ -100,6 +103,7 @@ def run_server() -> None:
         host="0.0.0.0",
         port=port,
         log_level="info",
+        loop="asyncio",  # Use asyncio loop to respect WindowsSelectorEventLoopPolicy on Windows
     )
 
 
