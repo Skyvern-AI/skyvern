@@ -1,8 +1,4 @@
-import {
-  LightningBoltIcon,
-  MagnifyingGlassIcon,
-  MixerHorizontalIcon,
-} from "@radix-ui/react-icons";
+import { LightningBoltIcon, MixerHorizontalIcon } from "@radix-ui/react-icons";
 
 import { Tip } from "@/components/Tip";
 import {
@@ -34,12 +30,11 @@ import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import * as env from "@/util/env";
-import { Input } from "@/components/ui/input";
 import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
 import {
@@ -48,8 +43,11 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { HighlightText } from "@/routes/workflows/components/HighlightText";
 import { useGlobalWorkflowsQuery } from "@/routes/workflows/hooks/useGlobalWorkflowsQuery";
+import { TableSearchInput } from "@/components/TableSearchInput";
+import { useKeywordSearch } from "@/routes/workflows/hooks/useKeywordSearch";
+import { useParameterExpansion } from "@/routes/workflows/hooks/useParameterExpansion";
+import { ParameterDisplayInline } from "@/routes/workflows/components/ParameterDisplayInline";
 
 function isTask(run: Task | WorkflowRunApiResponse): run is Task {
   return "task_id" in run;
@@ -65,9 +63,6 @@ function RunHistory() {
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
-  const [manuallyExpandedRows, setManuallyExpandedRows] = useState<Set<string>>(
-    new Set(),
-  );
 
   const { data: runs, isFetching } = useRunsQuery({
     page,
@@ -99,47 +94,28 @@ function RunHistory() {
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
 
-  const runParameterMatchesSearch = useCallback(
-    (key: string, value: unknown, description?: string | null): boolean => {
-      if (!debouncedSearch.trim()) return false;
-      const lowerQuery = debouncedSearch.toLowerCase();
+  const { matchesParameter, isSearchActive } =
+    useKeywordSearch(debouncedSearch);
+  const {
+    expandedRows,
+    toggleExpanded: toggleParametersExpanded,
+    setAutoExpandedRows,
+  } = useParameterExpansion();
 
-      const keyMatch = key?.toLowerCase().includes(lowerQuery) ?? false;
-      const descMatch =
-        description?.toLowerCase().includes(lowerQuery) ?? false;
-      const valueMatch = Boolean(
-        value !== null &&
-          value !== undefined &&
-          String(value).toLowerCase().includes(lowerQuery),
-      );
-
-      return keyMatch || descMatch || valueMatch;
-    },
-    [debouncedSearch],
-  );
-
-  const autoExpandedRows = useMemo(() => {
-    if (!debouncedSearch.trim()) return new Set<string>();
-    return new Set(
-      runs
-        ?.filter((run) => !isTask(run))
-        .map((run) => (run as WorkflowRunApiResponse).workflow_run_id) ?? [],
-    );
-  }, [runs, debouncedSearch]);
-
-  const expandedRows = useMemo(() => {
-    return new Set([...manuallyExpandedRows, ...autoExpandedRows]);
-  }, [manuallyExpandedRows, autoExpandedRows]);
-
-  const toggleParametersExpanded = (runId: string) => {
-    const newExpanded = new Set(manuallyExpandedRows);
-    if (newExpanded.has(runId)) {
-      newExpanded.delete(runId);
-    } else {
-      newExpanded.add(runId);
+  useEffect(() => {
+    if (!isSearchActive) {
+      setAutoExpandedRows([]);
+      return;
     }
-    setManuallyExpandedRows(newExpanded);
-  };
+
+    const workflowRunIds =
+      runs
+        ?.filter((run): run is WorkflowRunApiResponse => !isTask(run))
+        .map((run) => run.workflow_run_id)
+        .filter((id): id is string => Boolean(id)) ?? [];
+
+    setAutoExpandedRows(workflowRunIds);
+  }, [isSearchActive, runs, setAutoExpandedRows]);
 
   function handleNavigate(event: React.MouseEvent, path: string) {
     if (event.ctrlKey || event.metaKey) {
@@ -174,22 +150,17 @@ function RunHistory() {
         <h1 className="text-2xl">Run History</h1>
       </header>
       <div className="flex items-center justify-between gap-4">
-        <div className="relative">
-          <div className="absolute left-0 top-0 flex h-9 w-9 items-center justify-center">
-            <MagnifyingGlassIcon className="size-5" />
-          </div>
-          <Input
-            value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
-              const params = new URLSearchParams(searchParams);
-              params.set("page", "1");
-              setSearchParams(params, { replace: true });
-            }}
-            placeholder="Search runs by parameter..."
-            className="w-48 pl-9 lg:w-72"
-          />
-        </div>
+        <TableSearchInput
+          value={search}
+          onChange={(value) => {
+            setSearch(value);
+            const params = new URLSearchParams(searchParams);
+            params.set("page", "1");
+            setSearchParams(params, { replace: true });
+          }}
+          placeholder="Search runs by parameter..."
+          className="w-48 lg:w-72"
+        />
         <StatusFilterDropdown
           values={statusFilters}
           onChange={setStatusFilters}
@@ -341,9 +312,7 @@ function RunHistory() {
                             workflowPermanentId={run.workflow_permanent_id}
                             workflowRunId={run.workflow_run_id}
                             searchQuery={debouncedSearch}
-                            runParameterMatchesSearch={
-                              runParameterMatchesSearch
-                            }
+                            keywordMatchesParameter={matchesParameter}
                           />
                         </TableCell>
                       </TableRow>
@@ -407,18 +376,18 @@ type WorkflowRunParametersInlineProps = {
   workflowPermanentId: string;
   workflowRunId: string;
   searchQuery: string;
-  runParameterMatchesSearch: (
-    key: string,
-    value: unknown,
-    description?: string | null,
-  ) => boolean;
+  keywordMatchesParameter: (parameter: {
+    key: string;
+    value: unknown;
+    description?: string | null;
+  }) => boolean;
 };
 
 function WorkflowRunParametersInline({
   workflowPermanentId,
   workflowRunId,
   searchQuery,
-  runParameterMatchesSearch,
+  keywordMatchesParameter,
 }: WorkflowRunParametersInlineProps) {
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
@@ -464,46 +433,19 @@ function WorkflowRunParametersInline({
     );
   }
 
-  const paramEntries = Object.entries(run.parameters);
+  const parameterItems = Object.entries(run.parameters).map(([key, value]) => ({
+    key,
+    value,
+    description: null,
+  }));
 
   return (
-    <div className="ml-8 space-y-2 py-4">
-      <div className="mb-3 text-sm font-medium">Parameters</div>
-      <div className="space-y-2">
-        {paramEntries.map(([key, value]) => {
-          const matchesParam = runParameterMatchesSearch(key, value, null);
-
-          const displayValue =
-            value === null || value === undefined
-              ? "-"
-              : typeof value === "string"
-                ? value
-                : JSON.stringify(value);
-
-          return (
-            <div
-              key={key}
-              className={cn(
-                "grid grid-cols-[minmax(200px,1fr)_minmax(300px,2fr)] gap-6 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
-                matchesParam &&
-                  "shadow-[0_0_15px_rgba(59,130,246,0.3)] ring-2 ring-blue-500/50",
-              )}
-            >
-              <div className="font-medium text-blue-600 dark:text-blue-400">
-                <HighlightText text={key} query={searchQuery} />
-              </div>
-              <div className="truncate">
-                {displayValue === "-" ? (
-                  <span className="text-slate-400">-</span>
-                ) : (
-                  <HighlightText text={displayValue} query={searchQuery} />
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
+    <ParameterDisplayInline
+      parameters={parameterItems}
+      searchQuery={searchQuery}
+      keywordMatchesParameter={keywordMatchesParameter}
+      showDescription={false}
+    />
   );
 }
 
