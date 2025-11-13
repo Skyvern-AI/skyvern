@@ -111,6 +111,9 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     tag = element["tagName"]
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
+    if element.get("hoverOnly"):
+        attributes["data-skyvern-hover-only"] = "true"
+
     interactable = element.get("interactable", False)
     if element.get("isDropped", False):
         if not interactable:
@@ -912,6 +915,9 @@ def _should_keep_unique_id(element: dict) -> bool:
     # case where we shouldn't keep unique_id
     # 1. no readonly attr and not disable attr and no interactable
     # 2. readonly=false and disable=false and interactable=false
+
+    if element.get("hoverOnly"):
+        return True
 
     attributes = element.get("attributes", {})
     if (

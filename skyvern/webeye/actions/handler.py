@@ -32,6 +32,7 @@ from skyvern.exceptions import (
     ErrFoundSelectableElement,
     FailedToFetchSecret,
     FailToClick,
+    FailToHover,
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
@@ -1991,6 +1992,42 @@ async def handle_wait_action(
 
 
 @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+async def handle_hover_action(
+    action: actions.HoverAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    dom = DomUtil(scraped_page=scraped_page, page=page)
+    try:
+        skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
+    except Exception as exc:
+        LOG.warning(
+            "Failed to resolve element for hover action",
+            action=action,
+            workflow_run_id=task.workflow_run_id,
+            exc_info=True,
+        )
+        return [ActionFailure(exception=exc)]
+
+    try:
+        await skyvern_element.hover_to_reveal()
+        await skyvern_element.get_locator().hover(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        if action.hold_seconds and action.hold_seconds > 0:
+            await asyncio.sleep(action.hold_seconds)
+        return [ActionSuccess()]
+    except Exception as exc:
+        LOG.warning(
+            "Hover action failed",
+            action=action,
+            workflow_run_id=task.workflow_run_id,
+            exc_info=True,
+        )
+        return [ActionFailure(FailToHover(skyvern_element.get_id(), msg=str(exc)))]
+
+
+@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
 async def handle_terminate_action(
     action: actions.TerminateAction,
     page: Page,
@@ -2197,6 +2234,7 @@ ActionHandler.register_action_type(ActionType.UPLOAD_FILE, handle_upload_file_ac
 ActionHandler.register_action_type(ActionType.NULL_ACTION, handle_null_action)
 ActionHandler.register_action_type(ActionType.SELECT_OPTION, handle_select_option_action)
 ActionHandler.register_action_type(ActionType.WAIT, handle_wait_action)
+ActionHandler.register_action_type(ActionType.HOVER, handle_hover_action)
 ActionHandler.register_action_type(ActionType.TERMINATE, handle_terminate_action)
 ActionHandler.register_action_type(ActionType.COMPLETE, handle_complete_action)
 ActionHandler.register_action_type(ActionType.EXTRACT, handle_extract_action)
@@ -2276,6 +2314,7 @@ async def chain_click(
     :param css: css of the element to click
     """
     try:
+        await skyvern_element.hover_to_reveal()
         if not await skyvern_element.navigate_to_a_href(page=page):
             await locator.click(timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)

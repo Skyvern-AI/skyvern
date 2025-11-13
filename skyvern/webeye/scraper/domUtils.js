@@ -411,6 +411,40 @@ function hasASPClientControl() {
   return typeof ASPxClientControl !== "undefined";
 }
 
+// Check if element is only visible on hover (e.g., hover-only buttons)
+function isHoverOnlyElement(element) {
+  // Check for common hover-only patterns in class names
+  const className = element.className?.toString() ?? "";
+  const parentClassName = element.parentElement?.className?.toString() ?? "";
+
+  // Common hover-only class patterns
+  if (
+    className.includes("hover-") ||
+    className.includes("-hover") ||
+    parentClassName.includes("hover-") ||
+    parentClassName.includes("-hover")
+  ) {
+    return true;
+  }
+
+  // Check if parent has hover-related attributes or classes that might reveal this element
+  let parent = element.parentElement;
+  while (parent && parent !== document.body) {
+    const parentClass = parent.className?.toString() ?? "";
+    if (
+      parentClass.includes("hover") ||
+      parentClass.includes("card") ||
+      parentClass.includes("item")
+    ) {
+      // This element might be revealed on parent hover
+      return true;
+    }
+    parent = parent.parentElement;
+  }
+
+  return false;
+}
+
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 // NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
 function isElementVisible(element) {
@@ -450,6 +484,10 @@ function isElementVisible(element) {
   if (!isElementStyleVisibilityVisible(element, style)) return false;
   const rect = element.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) {
+    // Check if this element might be visible on hover before marking as invisible
+    if (isHoverOnlyElement(element)) {
+      return true;
+    }
     return false;
   }
 
@@ -824,7 +862,12 @@ function isInteractable(element, hoverStylesMap) {
   // https://developer.mozilla.org/en-US/docs/Web/CSS/pointer-events#none
   const elementPointerEvent = getElementComputedStyle(element)?.pointerEvents;
   if (elementPointerEvent === "none" && !element.disabled) {
-    return false;
+    // Some CTAs stay hidden until the parent is hovered
+    // When we can infer that the element is revealed on hover, keep it interactable so the agent
+    // has a chance to hover the parent before clicking.
+    if (!isHoverOnlyElement(element)) {
+      return false;
+    }
   }
 
   if (isInteractableInput(element, hoverStylesMap)) {
@@ -1565,6 +1608,7 @@ async function buildElementObject(
     frame: frame,
     frame_index: window.GlobalSkyvernFrameIndex,
     interactable: interactable,
+    hoverOnly: isHoverOnlyElement(element),
     tagName: elementTagNameLower,
     attributes: attrs,
     beforePseudoText: getPseudoContent(element, "::before"),
