@@ -402,6 +402,16 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow: WorkflowApiResponse;
 };
 
+export type BrowserProfile = {
+  browser_profile_id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+};
+
 export type TaskGenerationApiResponse = {
   suggested_title: string | null;
   url: string | null;
