@@ -368,14 +368,22 @@ function WorkflowRunParameters({
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const credentialGetter = useCredentialGetter();
 
+  const isGlobalWorkflow =
+    globalWorkflows?.some(
+      (wf) => wf.workflow_permanent_id === workflowPermanentId,
+    ) ?? false;
+
   const { data: run, isLoading } = useQuery<WorkflowRunStatusApiResponse>({
-    queryKey: ["workflowRun", workflowPermanentId, workflowRunId, "params"],
+    queryKey: [
+      "workflowRun",
+      workflowPermanentId,
+      workflowRunId,
+      "params",
+      isGlobalWorkflow,
+    ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const params = new URLSearchParams();
-      const isGlobalWorkflow = globalWorkflows?.some(
-        (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
-      );
       if (isGlobalWorkflow) {
         params.set("template", "true");
       }
@@ -385,7 +393,7 @@ function WorkflowRunParameters({
         })
         .then((r) => r.data);
     },
-    enabled: !!workflowPermanentId && !!workflowRunId && !!globalWorkflows,
+    enabled: Boolean(workflowPermanentId && workflowRunId),
   });
 
   if (isLoading) {
