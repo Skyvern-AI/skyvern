@@ -17,11 +17,13 @@ function useCreateBrowserProfileMutation() {
 
   return useMutation({
     mutationFn: async (input: CreateBrowserProfileInput) => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
 
       const { browserSessionId, workflowRunId, description, name } = input;
       const hasBrowserSessionId = Boolean(browserSessionId);
       const hasWorkflowRunId = Boolean(workflowRunId);
+
+      console.log("[useCreateBrowserProfileMutation] Input:", input);
 
       if (hasBrowserSessionId === hasWorkflowRunId) {
         throw new Error(
@@ -40,12 +42,18 @@ function useCreateBrowserProfileMutation() {
         body.workflow_run_id = workflowRunId;
       }
 
+      console.log("[useCreateBrowserProfileMutation] Request body:", body);
+
       return client
         .post<BrowserProfile>("/browser_profiles", body)
         .then((response) => response.data);
     },
-    onSuccess: () => {
+    onSuccess: (profile) => {
       queryClient.invalidateQueries({ queryKey: ["browserProfiles"] });
+      toast({
+        title: "Browser profile created",
+        description: `Saved profile "${profile.name}".`,
+      });
     },
     onError: (error: unknown) => {
       const message =

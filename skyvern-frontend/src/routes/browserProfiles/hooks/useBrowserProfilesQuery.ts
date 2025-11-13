@@ -16,7 +16,7 @@ function useBrowserProfilesQuery({
   return useQuery<BrowserProfile[]>({
     queryKey: ["browserProfiles", includeDeleted],
     queryFn: async () => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       const params = new URLSearchParams();
       if (includeDeleted) {
         params.set("include_deleted", "true");

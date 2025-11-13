@@ -15,7 +15,7 @@ function useBrowserProfileQuery(profileId: string | null | undefined) {
         return null;
       }
 
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       return client
         .get(`/browser_profiles/${profileId}`)
         .then((response) => response.data);

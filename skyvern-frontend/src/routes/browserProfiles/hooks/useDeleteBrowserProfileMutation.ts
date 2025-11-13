@@ -9,7 +9,7 @@ function useDeleteBrowserProfileMutation() {
 
   return useMutation({
     mutationFn: async (profileId: string) => {
-      const client = await getClient(credentialGetter);
+      const client = await getClient(credentialGetter, "sans-api-v1");
       await client.delete(`/browser_profiles/${profileId}`);
       return profileId;
     },
