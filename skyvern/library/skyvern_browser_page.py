@@ -70,7 +70,7 @@ class SkyvernPageRun:
 
         LOG.info("AI run task", prompt=prompt)
 
-        task_run = await self._browser.client.run_task(
+        task_run = await self._browser.skyvern.run_task(
             prompt=prompt,
             engine=engine,
             model=model,
@@ -130,7 +130,7 @@ class SkyvernPageRun:
 
         LOG.info("AI login", prompt=prompt)
 
-        workflow_run = await self._browser.client.login(
+        workflow_run = await self._browser.skyvern.login(
             credential_type=credential_type,
             url=url or self._get_page_url(),
             credential_id=credential_id,
@@ -179,7 +179,7 @@ class SkyvernPageRun:
 
         LOG.info("AI run workflow", workflow_id=workflow_id)
 
-        workflow_run = await self._browser.client.run_workflow(
+        workflow_run = await self._browser.skyvern.run_workflow(
             workflow_id=workflow_id,
             parameters=parameters,
             template=template,
@@ -197,7 +197,7 @@ class SkyvernPageRun:
     async def _wait_for_run_completion(self, run_id: str, timeout: float) -> GetRunResponse:
         async with asyncio.timeout(timeout):
             while True:
-                task_run = await self._browser.client.get_run(run_id)
+                task_run = await self._browser.skyvern.get_run(run_id)
                 if RunStatus(task_run.status).is_final():
                     break
                 await asyncio.sleep(DEFAULT_AGENT_HEARTBEAT_INTERVAL)
