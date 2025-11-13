@@ -408,7 +408,7 @@ class Skyvern(AsyncSkyvern):
         return await self._connect_to_cloud_browser_session(browser_session)
 
     def _ensure_cloud_environment(self) -> None:
-        if self._base_url is None or self._base_url.endswith(".skyvern.com"):
+        if self._base_url is None or not self._base_url.rstrip("/").endswith(".skyvern.com"):
             raise ValueError("Cloud browser sessions are supported only in the cloud environment")
 
     async def _connect_to_cloud_browser_session(self, browser_session: BrowserSessionResponse) -> SkyvernBrowser:
