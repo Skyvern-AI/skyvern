@@ -11,15 +11,20 @@ from skyvern.constants import REPO_ROOT_DIR
 
 def setup_windows_event_loop_policy() -> None:
     """
-    Set up Windows event loop policy for psycopg and Playwright compatibility.
+    Ensure the Windows event loop policy supports subprocesses (required by Playwright).
 
-    On Windows, psycopg and Playwright cannot use the default ProactorEventLoop and require
-    WindowsSelectorEventLoopPolicy for async operations.
-
-    This must be called before any async operations or event loop creation.
+    Explicitly setting the Proactor event loop policy prevents third-party packages or older
+    Python defaults from forcing the Selector policy, which does not implement subprocess
+    transports and causes runtime failures when Playwright tries to launch a browser.
     """
-    if platform.system() == "Windows":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    if platform.system() != "Windows":
+        return
+
+    current_policy = asyncio.get_event_loop_policy()
+    if isinstance(current_policy, asyncio.WindowsProactorEventLoopPolicy):
+        return
+
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 def migrate_db() -> None:

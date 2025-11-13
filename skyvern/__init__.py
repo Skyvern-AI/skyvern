@@ -7,6 +7,7 @@ from ddtrace.ext import http
 from ddtrace.trace import TraceFilter, Span
 
 from skyvern.forge.sdk.forge_log import setup_logger
+from skyvern.utils import setup_windows_event_loop_policy
 
 if typing.TYPE_CHECKING:
     from skyvern.library import Skyvern  # noqa: E402
@@ -25,6 +26,7 @@ class FilterHeartbeat(TraceFilter):
         return trace
 
 
+setup_windows_event_loop_policy()
 tracer.configure(trace_processors=[FilterHeartbeat()])
 setup_logger()
 

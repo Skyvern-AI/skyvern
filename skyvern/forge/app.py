@@ -21,12 +21,9 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import Crede
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.utils import setup_windows_event_loop_policy
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
-
-setup_windows_event_loop_policy()
 
 SETTINGS_MANAGER = SettingsManager.get_settings()
 DATABASE = AgentDB(

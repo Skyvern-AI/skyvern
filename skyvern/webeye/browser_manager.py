@@ -10,11 +10,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation
-from skyvern.utils import setup_windows_event_loop_policy
 from skyvern.webeye.browser_factory import BrowserContextFactory, BrowserState, VideoArtifact
-
-# Set up Windows event loop policy at module level to ensure it's applied early
-setup_windows_event_loop_policy()
 
 LOG = structlog.get_logger()
 
