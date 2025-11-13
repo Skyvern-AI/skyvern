@@ -18,6 +18,8 @@ function getActionInput(action: ActionApiResponse) {
     input = action.text;
   } else if (action.action_type === ActionTypes.Click) {
     input = "Click";
+  } else if (action.action_type === ActionTypes.Hover) {
+    input = "Hover";
   } else if (action.action_type === ActionTypes.SelectOption && action.option) {
     input = action.option.label;
   }
