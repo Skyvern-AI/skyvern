@@ -367,7 +367,13 @@ class Block(BaseModel, abc.ABC):
             # create a screenshot
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
             if not browser_state:
-                LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+                LOG.warning(
+                    "No browser state found when creating workflow_run_block",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    browser_session_id=browser_session_id,
+                    block_label=self.label,
+                )
             else:
                 try:
                     screenshot = await browser_state.take_fullpage_screenshot(

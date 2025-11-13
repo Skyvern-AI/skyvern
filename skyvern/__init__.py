@@ -10,7 +10,6 @@ from skyvern.forge.sdk.forge_log import setup_logger
 
 if typing.TYPE_CHECKING:
     from skyvern.library import Skyvern  # noqa: E402
-    from skyvern.library.skyvern_sdk import SkyvernSdk  # noqa: E402
 
 
 class FilterHeartbeat(TraceFilter):
@@ -31,7 +30,6 @@ setup_logger()
 # noinspection PyUnresolvedReferences
 __all__ = [
     "Skyvern",
-    "SkyvernSdk",
     "SkyvernPage",
     "RunContext",
     "action",
@@ -60,7 +58,6 @@ __all__ = [
 
 _lazy_imports = {
     "Skyvern": "skyvern.library",
-    "SkyvernSdk": "skyvern.library",
     "SkyvernPage": "skyvern.core.script_generations.skyvern_page",
     "RunContext": "skyvern.core.script_generations.skyvern_page",
     "setup": "skyvern.core.script_generations.run_initializer",

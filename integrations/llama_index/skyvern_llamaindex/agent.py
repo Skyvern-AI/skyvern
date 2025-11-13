@@ -13,7 +13,7 @@ from skyvern.schemas.runs import RunEngine
 class SkyvernTool:
     def __init__(self, agent: Skyvern | None = None):
         if agent is None:
-            agent = Skyvern(base_url=None, api_key=None)
+            agent = Skyvern()
         self.agent = agent
 
     def run_task(self) -> FunctionTool:
@@ -44,7 +44,7 @@ class SkyvernTaskToolSpec(BaseToolSpec):
         run_task_timeout_seconds: int = settings.run_task_timeout_seconds,
     ) -> None:
         if agent is None:
-            agent = Skyvern(base_url=None, api_key=None)
+            agent = Skyvern()
         self.agent = agent
         self.engine = engine
         self.run_task_timeout_seconds = run_task_timeout_seconds
