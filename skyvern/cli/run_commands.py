@@ -97,7 +97,6 @@ def run_server() -> None:
         host="0.0.0.0",
         port=port,
         log_level="info",
-        loop="asyncio",  # Use asyncio loop to respect WindowsSelectorEventLoopPolicy on Windows
     )
 
 
