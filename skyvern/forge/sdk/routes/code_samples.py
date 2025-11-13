@@ -6,7 +6,7 @@ await skyvern.run_task(prompt="What's the top post on hackernews?")
 """
 RUN_TASK_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.runTask({
     body: {
         prompt: "Find the top 3 posts on Hacker News."
@@ -20,7 +20,7 @@ await skyvern.run_workflow(workflow_id="wpid_123", parameters={"parameter1": "va
 """
 RUN_WORKFLOW_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.runWorkflow({
     body: {
         workflow_id: "wpid_123",
@@ -36,7 +36,7 @@ print(run)
 """
 GET_RUN_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 const run = await skyvern.getRun("tsk_v2_123");
 console.log(run);
 """
@@ -47,7 +47,7 @@ await skyvern.cancel_run(run_id="tsk_v2_123")
 """
 CANCEL_RUN_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.cancelRun("tsk_v2_123");
 """
 RETRY_RUN_WEBHOOK_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -57,7 +57,7 @@ await skyvern.retry_run_webhook(run_id="tsk_v2_123")
 """
 RETRY_RUN_WEBHOOK_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.retryRunWebhook("tsk_v2_123");
 """
 GET_RUN_TIMELINE_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -73,7 +73,7 @@ print(timeline)
 """
 GET_RUN_TIMELINE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 // Get timeline for a workflow run
 const timeline = await skyvern.getRunTimeline("wr_123");
 console.log(timeline);
@@ -95,7 +95,7 @@ await skyvern.login(
 LOGIN_CODE_SAMPLE_SKYVERN_TS = """// Login with password saved in Skyvern
 import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.login({
     url: "https://example.com",
     credential_type: "skyvern",
@@ -123,7 +123,7 @@ await skyvern.login(
 LOGIN_CODE_SAMPLE_BITWARDEN_TS = """// Login with password saved in Bitwarden
 import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 // Login with a Bitwarden collection and website url filter
 await skyvern.login({
     url: "https://example.com",
@@ -152,7 +152,7 @@ await skyvern.login(
 LOGIN_CODE_SAMPLE_ONEPASSWORD_TS = """// Login with password saved in 1Password
 import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.login({
     url: "https://example.com",
     credential_type: "onepassword",
@@ -332,7 +332,7 @@ print(workflow)
 """
 CREATE_WORKFLOW_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 
 // Create a workflow in JSON format
 const workflowDefinition = {
@@ -587,7 +587,7 @@ print(workflow)
 """
 UPDATE_WORKFLOW_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 
 const updatedWorkflowDefinition = {
     title: "Updated Contact Forms Workflow",
@@ -679,7 +679,7 @@ await skyvern.delete_workflow(workflow_id="wpid_123")
 """
 DELETE_WORKFLOW_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.deleteWorkflow("wpid_123");
 """
 GET_WORKFLOWS_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -690,7 +690,7 @@ print(workflows)
 """
 GET_WORKFLOWS_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 const workflows = await skyvern.getWorkflows();
 console.log(workflows);
 """
@@ -706,7 +706,7 @@ await skyvern.send_totp_code(
 """
 SEND_TOTP_CODE_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.sendTotpCode({
     totp_identifier: "john.doe@example.com",
     content: "Hello, your verification code is 123456"
@@ -723,7 +723,7 @@ await skyvern.create_credential(
 """
 CREATE_CREDENTIAL_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.createCredential({
     name: "My Credential",
     credential_type: "password",
@@ -748,7 +748,7 @@ await skyvern.create_credential(
 """
 CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.createCredential({
     name: "My Credit Card",
     credential_type: "credit_card",
@@ -769,7 +769,7 @@ await skyvern.delete_credential(credential_id="cred_123")
 """
 DELETE_CREDENTIAL_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 await skyvern.deleteCredential("cred_123");
 """
 GET_CREDENTIAL_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -780,7 +780,7 @@ print(credential)
 """
 GET_CREDENTIAL_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 const credential = await skyvern.getCredential("cred_123");
 console.log(credential);
 """
@@ -792,7 +792,7 @@ print(credentials)
 """
 GET_CREDENTIALS_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 const credentials = await skyvern.getCredentials();
 console.log(credentials);
 """
@@ -807,7 +807,7 @@ print(browser_session)
 """
 CREATE_BROWSER_SESSION_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey: "YOUR_API_KEY" });
 const browserSession = await skyvern.createBrowserSession({
     timeout: 60
 });
@@ -820,7 +820,7 @@ await skyvern.close_browser_session(browser_session_id="pbs_123")
 """
 CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey:  "YOUR_API_KEY" });
 await skyvern.closeBrowserSession("pbs_123");
 """
 GET_BROWSER_SESSION_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
@@ -831,7 +831,7 @@ print(browser_session)
 """
 GET_BROWSER_SESSION_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey:  "YOUR_API_KEY" });
 const browserSession = await skyvern.getBrowserSession("pbs_123");
 console.log(browserSession);
 """
@@ -843,7 +843,7 @@ print(browser_sessions)
 """
 GET_BROWSER_SESSIONS_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
-const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+const skyvern = new SkyvernClient({ environment: "https://api.skyvern.com", apiKey:  "YOUR_API_KEY" });
 const browserSessions = await skyvern.getBrowserSessions();
 console.log(browserSessions);
 """
