@@ -141,6 +141,14 @@ function BrowserSessions() {
         <div className="flex justify-end">
           <div className="flex gap-4">
             <Button
+              variant="secondary"
+              onClick={() => {
+                navigate("/browser-profiles");
+              }}
+            >
+              Manage Profiles
+            </Button>
+            <Button
               disabled={createBrowserSessionMutation.isPending}
               onClick={() => {
                 setIsDrawerOpen(true);

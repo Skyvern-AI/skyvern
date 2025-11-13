@@ -1,6 +1,7 @@
 import { Navigate, Outlet, createBrowserRouter } from "react-router-dom";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 import { BrowserSessions } from "@/routes/browserSessions/BrowserSessions";
+import { BrowserProfilesPage } from "@/routes/browserProfiles/BrowserProfilesPage";
 import { PageLayout } from "./components/PageLayout";
 import { DiscoverPage } from "./routes/discover/DiscoverPage";
 import { HistoryPage } from "./routes/history/HistoryPage";
@@ -60,6 +61,10 @@ const router = createBrowserRouter([
       {
         path: "browser-sessions",
         element: <BrowserSessions />,
+      },
+      {
+        path: "browser-profiles",
+        element: <BrowserProfilesPage />,
       },
       {
         index: true,
