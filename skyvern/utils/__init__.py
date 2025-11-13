@@ -20,11 +20,15 @@ def setup_windows_event_loop_policy() -> None:
     if platform.system() != "Windows":
         return
 
-    current_policy = asyncio.get_event_loop_policy()
-    if isinstance(current_policy, asyncio.WindowsProactorEventLoopPolicy):
+    windows_policy_cls = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+    if windows_policy_cls is None:
         return
 
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    current_policy = asyncio.get_event_loop_policy()
+    if isinstance(current_policy, windows_policy_cls):
+        return
+
+    asyncio.set_event_loop_policy(windows_policy_cls())
 
 
 def migrate_db() -> None:
