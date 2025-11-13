@@ -51,6 +51,7 @@ class BrowserProfilesClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.browser_profiles.list_browser_profiles(
             include_deleted=True,
@@ -99,6 +100,7 @@ class BrowserProfilesClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.browser_profiles.create_browser_profile(
             name="name",
@@ -138,6 +140,7 @@ class BrowserProfilesClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.browser_profiles.get_browser_profile(
             profile_id="bp_123456",
@@ -170,6 +173,7 @@ class BrowserProfilesClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.browser_profiles.delete_browser_profile(
             profile_id="bp_123456",
@@ -221,6 +225,7 @@ class AsyncBrowserProfilesClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -277,6 +282,7 @@ class AsyncBrowserProfilesClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -324,6 +330,7 @@ class AsyncBrowserProfilesClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -364,6 +371,7 @@ class AsyncBrowserProfilesClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 

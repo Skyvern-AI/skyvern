@@ -3,7 +3,6 @@
 import type { BaseClientOptions, BaseRequestOptions } from "../../../../BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "../../../../core/headers.js";
 import * as core from "../../../../core/index.js";
-import * as environments from "../../../../environments.js";
 import * as errors from "../../../../errors/index.js";
 import * as Skyvern from "../../../index.js";
 
@@ -16,7 +15,7 @@ export declare namespace BrowserProfiles {
 export class BrowserProfiles {
     protected readonly _options: BrowserProfiles.Options;
 
-    constructor(_options: BrowserProfiles.Options = {}) {
+    constructor(_options: BrowserProfiles.Options) {
         this._options = _options;
     }
 
@@ -58,8 +57,7 @@ export class BrowserProfiles {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/browser_profiles",
             ),
             method: "GET",
@@ -133,8 +131,7 @@ export class BrowserProfiles {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/browser_profiles",
             ),
             method: "POST",
@@ -212,8 +209,7 @@ export class BrowserProfiles {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/browser_profiles/${core.url.encodePathParam(profileId)}`,
             ),
             method: "GET",
@@ -292,8 +288,7 @@ export class BrowserProfiles {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/browser_profiles/${core.url.encodePathParam(profileId)}`,
             ),
             method: "DELETE",

@@ -7,7 +7,6 @@ import { Workflows } from "./api/resources/workflows/client/Client.js";
 import type { BaseClientOptions, BaseRequestOptions } from "./BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "./core/headers.js";
 import * as core from "./core/index.js";
-import * as environments from "./environments.js";
 import * as errors from "./errors/index.js";
 
 export declare namespace SkyvernClient {
@@ -22,7 +21,7 @@ export class SkyvernClient {
     protected _browserProfiles: BrowserProfiles | undefined;
     protected _scripts: Scripts | undefined;
 
-    constructor(_options: SkyvernClient.Options = {}) {
+    constructor(_options: SkyvernClient.Options) {
         this._options = {
             ..._options,
             headers: mergeHeaders(
@@ -92,8 +91,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/run/tasks",
             ),
             method: "POST",
@@ -190,8 +188,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/run/workflows",
             ),
             method: "POST",
@@ -271,8 +268,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/runs/${core.url.encodePathParam(runId)}`,
             ),
             method: "GET",
@@ -345,8 +341,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/runs/${core.url.encodePathParam(runId)}/cancel`,
             ),
             method: "POST",
@@ -488,8 +483,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/workflows",
             ),
             method: "GET",
@@ -572,8 +566,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/workflows",
             ),
             method: "POST",
@@ -653,8 +646,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/workflows/${core.url.encodePathParam(workflowId)}`,
             ),
             method: "POST",
@@ -731,8 +723,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/workflows/${core.url.encodePathParam(workflowId)}/delete`,
             ),
             method: "POST",
@@ -809,8 +800,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/artifacts/${core.url.encodePathParam(artifactId)}`,
             ),
             method: "GET",
@@ -899,8 +889,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/runs/${core.url.encodePathParam(runId)}/artifacts`,
             ),
             method: "GET",
@@ -974,8 +963,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/runs/${core.url.encodePathParam(runId)}/retry_webhook`,
             ),
             method: "POST",
@@ -1053,8 +1041,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/runs/${core.url.encodePathParam(runId)}/timeline`,
             ),
             method: "GET",
@@ -1130,8 +1117,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/browser_sessions",
             ),
             method: "GET",
@@ -1208,8 +1194,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/browser_sessions",
             ),
             method: "POST",
@@ -1289,8 +1274,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/browser_sessions/${core.url.encodePathParam(browserSessionId)}/close`,
             ),
             method: "POST",
@@ -1370,8 +1354,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/browser_sessions/${core.url.encodePathParam(browserSessionId)}`,
             ),
             method: "GET",
@@ -1454,8 +1437,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/credentials/totp",
             ),
             method: "POST",
@@ -1545,8 +1527,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/credentials",
             ),
             method: "GET",
@@ -1628,8 +1609,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/credentials",
             ),
             method: "POST",
@@ -1706,8 +1686,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/credentials/${core.url.encodePathParam(credentialId)}/delete`,
             ),
             method: "POST",
@@ -1783,8 +1762,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/credentials/${core.url.encodePathParam(credentialId)}`,
             ),
             method: "GET",
@@ -1862,8 +1840,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/run/tasks/login",
             ),
             method: "POST",
@@ -1953,8 +1930,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/scripts",
             ),
             method: "GET",
@@ -2028,8 +2004,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/scripts",
             ),
             method: "POST",
@@ -2106,8 +2081,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/scripts/${core.url.encodePathParam(scriptId)}`,
             ),
             method: "GET",
@@ -2189,8 +2163,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/scripts/${core.url.encodePathParam(scriptId)}/deploy`,
             ),
             method: "POST",
@@ -2274,8 +2247,7 @@ export class SkyvernClient {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/sdk/run_action",
             ),
             method: "POST",

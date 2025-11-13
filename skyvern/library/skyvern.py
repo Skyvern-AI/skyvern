@@ -6,7 +6,7 @@ import httpx
 from dotenv import load_dotenv
 from playwright.async_api import Playwright, async_playwright
 
-from skyvern.client import AsyncSkyvern, BrowserSessionResponse, SkyvernEnvironment
+from skyvern.client import AsyncSkyvern, BrowserSessionResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.client.types.workflow_run_response import WorkflowRunResponse
 from skyvern.library.constants import DEFAULT_AGENT_HEARTBEAT_INTERVAL, DEFAULT_AGENT_TIMEOUT, DEFAULT_CDP_PORT
@@ -27,7 +27,7 @@ class Skyvern(AsyncSkyvern):
         ```python
 
         # Initialize with remote environment and API key
-        skyvern = Skyvern(environment=SkyvernEnvironment.CLOUD, api_key="your-api-key")
+        skyvern = Skyvern(base_url="https://api.skyvern.com", api_key="your-api-key")
 
         # Or in embedded mode (run `skyvern quickstart` first):
         skyvern = Skyvern()
@@ -78,9 +78,8 @@ class Skyvern(AsyncSkyvern):
     def __init__(
         self,
         *,
-        environment: SkyvernEnvironment,
+        base_url: str = "https://api.skyvern.com",
         api_key: str,
-        base_url: str | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
@@ -88,9 +87,6 @@ class Skyvern(AsyncSkyvern):
         """Remote mode: Connect to Skyvern Cloud or self-hosted instance.
 
         Args:
-            environment: The Skyvern environment to connect to. Use SkyvernEnvironment.CLOUD
-                for Skyvern Cloud or SkyvernEnvironment.PRODUCTION/STAGING for self-hosted
-                instances.
             api_key: API key for authenticating with Skyvern.
                 Can be found on the settings page: https://app.skyvern.com/settings
             base_url: Override the base URL for the Skyvern API. If not provided, uses the default URL for
@@ -121,15 +117,14 @@ class Skyvern(AsyncSkyvern):
     def __init__(
         self,
         *,
-        environment: SkyvernEnvironment | None = None,
-        openai_api_key: str | None = None,
         base_url: str | None = None,
+        openai_api_key: str | None = None,
         api_key: str | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
     ):
-        if environment is None:
+        if base_url is None:
             if httpx_client is not None:
                 raise ValueError("httpx_client is not supported in embedded mode")
 
@@ -142,7 +137,7 @@ class Skyvern(AsyncSkyvern):
                 raise ValueError("SKYVERN_API_KEY is not set. Provide api_key or set SKYVERN_API_KEY in .env file.")
 
             super().__init__(
-                environment=SkyvernEnvironment.LOCAL,
+                base_url="http://skyvern-embedded",
                 api_key=api_key,
                 timeout=timeout,
                 follow_redirects=follow_redirects,
@@ -152,18 +147,17 @@ class Skyvern(AsyncSkyvern):
             )
         else:
             if not api_key:
-                raise ValueError(f"Missing api_key for {environment.name}")
+                raise ValueError(f"Missing api_key for {base_url}")
 
             super().__init__(
                 base_url=base_url,
-                environment=environment,
                 api_key=api_key,
                 timeout=timeout,
                 follow_redirects=follow_redirects,
                 httpx_client=httpx_client,
             )
 
-        self._environment = environment
+        self._base_url = base_url
         self._api_key = api_key
 
         self._playwright: Playwright | None = None
@@ -414,7 +408,7 @@ class Skyvern(AsyncSkyvern):
         return await self._connect_to_cloud_browser_session(browser_session)
 
     def _ensure_cloud_environment(self) -> None:
-        if self._environment not in (SkyvernEnvironment.CLOUD, SkyvernEnvironment.STAGING):
+        if self._base_url is None or self._base_url.endswith(".skyvern.com"):
             raise ValueError("Cloud browser sessions are supported only in the cloud environment")
 
     async def _connect_to_cloud_browser_session(self, browser_session: BrowserSessionResponse) -> SkyvernBrowser:

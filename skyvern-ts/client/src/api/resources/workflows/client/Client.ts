@@ -3,7 +3,6 @@
 import type { BaseClientOptions, BaseRequestOptions } from "../../../../BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "../../../../core/headers.js";
 import * as core from "../../../../core/index.js";
-import * as environments from "../../../../environments.js";
 import * as errors from "../../../../errors/index.js";
 import * as Skyvern from "../../../index.js";
 
@@ -16,7 +15,7 @@ export declare namespace Workflows {
 export class Workflows {
     protected readonly _options: Workflows.Options;
 
-    constructor(_options: Workflows.Options = {}) {
+    constructor(_options: Workflows.Options) {
         this._options = _options;
     }
 
@@ -68,8 +67,7 @@ export class Workflows {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/folders",
             ),
             method: "GET",
@@ -146,8 +144,7 @@ export class Workflows {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 "v1/folders",
             ),
             method: "POST",
@@ -227,8 +224,7 @@ export class Workflows {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/folders/${core.url.encodePathParam(folderId)}`,
             ),
             method: "GET",
@@ -308,8 +304,7 @@ export class Workflows {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/folders/${core.url.encodePathParam(folderId)}`,
             ),
             method: "PUT",
@@ -400,8 +395,7 @@ export class Workflows {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/folders/${core.url.encodePathParam(folderId)}`,
             ),
             method: "DELETE",
@@ -484,8 +478,7 @@ export class Workflows {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/workflows/${core.url.encodePathParam(workflowPermanentId)}/folder`,
             ),
             method: "PUT",

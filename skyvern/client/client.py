@@ -8,7 +8,6 @@ import typing
 import httpx
 from .core.client_wrapper import AsyncClientWrapper, SyncClientWrapper
 from .core.request_options import RequestOptions
-from .environment import SkyvernEnvironment
 from .raw_client import AsyncRawSkyvern, RawSkyvern
 from .types.artifact import Artifact
 from .types.artifact_type import ArtifactType
@@ -48,17 +47,8 @@ class Skyvern:
 
     Parameters
     ----------
-    base_url : typing.Optional[str]
+    base_url : str
         The base url to use for requests from the client.
-
-    environment : SkyvernEnvironment
-        The environment to use for requests from the client. from .environment import SkyvernEnvironment
-
-
-
-        Defaults to SkyvernEnvironment.CLOUD
-
-
 
     api_key : typing.Optional[str]
     headers : typing.Optional[typing.Dict[str, str]]
@@ -79,14 +69,14 @@ class Skyvern:
 
     client = Skyvern(
         api_key="YOUR_API_KEY",
+        base_url="https://yourhost.com/path/to/api",
     )
     """
 
     def __init__(
         self,
         *,
-        base_url: typing.Optional[str] = None,
-        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
+        base_url: str,
         api_key: typing.Optional[str] = None,
         headers: typing.Optional[typing.Dict[str, str]] = None,
         timeout: typing.Optional[float] = None,
@@ -97,7 +87,7 @@ class Skyvern:
             timeout if timeout is not None else 60 if httpx_client is None else httpx_client.timeout.read
         )
         self._client_wrapper = SyncClientWrapper(
-            base_url=_get_base_url(base_url=base_url, environment=environment),
+            base_url=base_url,
             api_key=api_key,
             headers=headers,
             httpx_client=httpx_client
@@ -255,6 +245,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.run_task(
             user_agent="x-user-agent",
@@ -398,6 +389,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.run_workflow(
             max_steps_override=1,
@@ -451,6 +443,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_run(
             run_id="tsk_123",
@@ -484,6 +477,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.cancel_run(
             run_id="run_id",
@@ -553,6 +547,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_workflows(
             page=1,
@@ -615,6 +610,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.create_workflow(
             folder_id="folder_id",
@@ -664,6 +660,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.update_workflow(
             workflow_id="wpid_123",
@@ -702,6 +699,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.delete_workflow(
             workflow_id="wpid_123",
@@ -732,6 +730,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_artifact(
             artifact_id="artifact_id",
@@ -771,6 +770,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_run_artifacts(
             run_id="run_id",
@@ -806,6 +806,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.retry_run_webhook(
             run_id="tsk_123",
@@ -839,6 +840,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_run_timeline(
             run_id="wr_123",
@@ -869,6 +871,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_browser_sessions()
         """
@@ -929,6 +932,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.create_browser_session()
         """
@@ -962,6 +966,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.close_browser_session(
             browser_session_id="pbs_123456",
@@ -995,6 +1000,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_browser_session(
             browser_session_id="pbs_123456",
@@ -1055,6 +1061,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.send_totp_code(
             totp_identifier="john.doe@example.com",
@@ -1105,6 +1112,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_credentials(
             page=1,
@@ -1150,6 +1158,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.create_credential(
             name="My Credential",
@@ -1188,6 +1197,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.delete_credential(
             credential_id="cred_1234567890",
@@ -1221,6 +1231,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_credential(
             credential_id="cred_1234567890",
@@ -1333,6 +1344,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.login(
             credential_type="skyvern",
@@ -1395,6 +1407,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_scripts(
             page=1,
@@ -1440,6 +1453,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.create_script()
         """
@@ -1471,6 +1485,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.get_script(
             script_id="s_abc123",
@@ -1511,6 +1526,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.deploy_script(
             script_id="s_abc123",
@@ -1569,6 +1585,7 @@ class Skyvern:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.run_sdk_action(
             url="url",
@@ -1616,17 +1633,8 @@ class AsyncSkyvern:
 
     Parameters
     ----------
-    base_url : typing.Optional[str]
+    base_url : str
         The base url to use for requests from the client.
-
-    environment : SkyvernEnvironment
-        The environment to use for requests from the client. from .environment import SkyvernEnvironment
-
-
-
-        Defaults to SkyvernEnvironment.CLOUD
-
-
 
     api_key : typing.Optional[str]
     headers : typing.Optional[typing.Dict[str, str]]
@@ -1647,14 +1655,14 @@ class AsyncSkyvern:
 
     client = AsyncSkyvern(
         api_key="YOUR_API_KEY",
+        base_url="https://yourhost.com/path/to/api",
     )
     """
 
     def __init__(
         self,
         *,
-        base_url: typing.Optional[str] = None,
-        environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
+        base_url: str,
         api_key: typing.Optional[str] = None,
         headers: typing.Optional[typing.Dict[str, str]] = None,
         timeout: typing.Optional[float] = None,
@@ -1665,7 +1673,7 @@ class AsyncSkyvern:
             timeout if timeout is not None else 60 if httpx_client is None else httpx_client.timeout.read
         )
         self._client_wrapper = AsyncClientWrapper(
-            base_url=_get_base_url(base_url=base_url, environment=environment),
+            base_url=base_url,
             api_key=api_key,
             headers=headers,
             httpx_client=httpx_client
@@ -1825,6 +1833,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -1976,6 +1985,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2037,6 +2047,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2078,6 +2089,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2155,6 +2167,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2225,6 +2238,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2282,6 +2296,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2328,6 +2343,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2368,6 +2384,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2415,6 +2432,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2458,6 +2476,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2499,6 +2518,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2537,6 +2557,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2605,6 +2626,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2646,6 +2668,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2687,6 +2710,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2755,6 +2779,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2813,6 +2838,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2868,6 +2894,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2916,6 +2943,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -2957,6 +2985,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -3077,6 +3106,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -3147,6 +3177,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -3200,6 +3231,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -3239,6 +3271,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -3287,6 +3320,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -3353,6 +3387,7 @@ class AsyncSkyvern:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -3398,12 +3433,3 @@ class AsyncSkyvern:
 
             self._scripts = AsyncScriptsClient(client_wrapper=self._client_wrapper)
         return self._scripts
-
-
-def _get_base_url(*, base_url: typing.Optional[str] = None, environment: SkyvernEnvironment) -> str:
-    if base_url is not None:
-        return base_url
-    elif environment is not None:
-        return environment.value
-    else:
-        raise Exception("Please pass in either base_url or environment to construct the client")

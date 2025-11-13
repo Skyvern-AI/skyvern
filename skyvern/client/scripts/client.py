@@ -47,6 +47,7 @@ class ScriptsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.scripts.run_script(
             script_id="s_abc123",
@@ -98,6 +99,7 @@ class AsyncScriptsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 

@@ -3,7 +3,6 @@
 import type { BaseClientOptions, BaseRequestOptions } from "../../../../BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "../../../../core/headers.js";
 import * as core from "../../../../core/index.js";
-import * as environments from "../../../../environments.js";
 import * as errors from "../../../../errors/index.js";
 import * as Skyvern from "../../../index.js";
 
@@ -16,7 +15,7 @@ export declare namespace Scripts {
 export class Scripts {
     protected readonly _options: Scripts.Options;
 
-    constructor(_options: Scripts.Options = {}) {
+    constructor(_options: Scripts.Options) {
         this._options = _options;
     }
 
@@ -47,8 +46,7 @@ export class Scripts {
         const _response = await core.fetcher({
             url: core.url.join(
                 (await core.Supplier.get(this._options.baseUrl)) ??
-                    (await core.Supplier.get(this._options.environment)) ??
-                    environments.SkyvernEnvironment.Cloud,
+                    (await core.Supplier.get(this._options.environment)),
                 `v1/scripts/${core.url.encodePathParam(scriptId)}/run`,
             ),
             method: "POST",

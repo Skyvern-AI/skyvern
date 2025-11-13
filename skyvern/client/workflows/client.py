@@ -63,6 +63,7 @@ class WorkflowsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.workflows.get_folders(
             page=1,
@@ -107,6 +108,7 @@ class WorkflowsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.workflows.create_folder(
             title="title",
@@ -140,6 +142,7 @@ class WorkflowsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.workflows.get_folder(
             folder_id="fld_123",
@@ -184,6 +187,7 @@ class WorkflowsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.workflows.update_folder(
             folder_id="fld_123",
@@ -226,6 +230,7 @@ class WorkflowsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.workflows.delete_folder(
             folder_id="fld_123",
@@ -269,6 +274,7 @@ class WorkflowsClient:
 
         client = Skyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
         client.workflows.update_workflow_folder(
             workflow_permanent_id="wpid_123",
@@ -333,6 +339,7 @@ class AsyncWorkflowsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -385,6 +392,7 @@ class AsyncWorkflowsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -426,6 +434,7 @@ class AsyncWorkflowsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -478,6 +487,7 @@ class AsyncWorkflowsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -528,6 +538,7 @@ class AsyncWorkflowsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 
@@ -579,6 +590,7 @@ class AsyncWorkflowsClient:
 
         client = AsyncSkyvern(
             api_key="YOUR_API_KEY",
+            base_url="https://yourhost.com/path/to/api",
         )
 
 

@@ -471,7 +471,6 @@ if typing.TYPE_CHECKING:
     from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
     from . import browser_profiles, scripts, workflows
     from .client import AsyncSkyvern, Skyvern
-    from .environment import SkyvernEnvironment
     from .version import __version__
 _dynamic_imports: typing.Dict[str, str] = {
     "ActAction": ".types",
@@ -758,7 +757,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "SendEmailBlock": ".types",
     "SendEmailBlockYaml": ".types",
     "Skyvern": ".client",
-    "SkyvernEnvironment": ".environment",
     "SkyvernForgeSdkSchemasCredentialsCredentialType": ".types",
     "SkyvernSchemasRunBlocksCredentialType": ".types",
     "TaskBlock": ".types",
@@ -1254,7 +1252,6 @@ __all__ = [
     "SendEmailBlock",
     "SendEmailBlockYaml",
     "Skyvern",
-    "SkyvernEnvironment",
     "SkyvernForgeSdkSchemasCredentialsCredentialType",
     "SkyvernSchemasRunBlocksCredentialType",
     "TaskBlock",
