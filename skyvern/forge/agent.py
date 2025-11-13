@@ -47,7 +47,6 @@ from skyvern.exceptions import (
     FailedToTakeScreenshot,
     InvalidTaskStatusTransition,
     InvalidWorkflowTaskURLState,
-    MissingBrowserState,
     MissingBrowserStatePage,
     NoTOTPVerificationCodeFound,
     ScrapingFailed,
@@ -174,21 +173,22 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
                 workflow_run_id=workflow_run.workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
             )
-            if browser_state is None:
-                raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
+            if browser_state is not None:
+                working_page = await browser_state.get_working_page()
+                if not working_page:
+                    LOG.error(
+                        "BrowserState has no page",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
 
-            working_page = await browser_state.get_working_page()
-            if not working_page:
-                LOG.error(
-                    "BrowserState has no page",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-                raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
+                if working_page.url == "about:blank":
+                    raise InvalidWorkflowTaskURLState(workflow_run.workflow_run_id)
 
-            if working_page.url == "about:blank":
-                raise InvalidWorkflowTaskURLState(workflow_run.workflow_run_id)
-
-            task_url = working_page.url
+                task_url = working_page.url
+            else:
+                LOG.info("No browser state found for workflow run, setting task url to empty string")
+                task_url = ""
 
         task = await app.DATABASE.create_task(
             url=task_url,
