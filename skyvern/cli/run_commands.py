@@ -197,7 +197,6 @@ def run_code(
 
     Note: For backward compatibility, leading dashes in -p values are automatically stripped.
     """
-
     # Disable LiteLLM loggers
     os.environ["LITELLM_LOG"] = "CRITICAL"
     import litellm  # noqa: PLC0415
