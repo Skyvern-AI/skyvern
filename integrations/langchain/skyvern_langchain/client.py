@@ -6,6 +6,7 @@ from skyvern_langchain.schema import CreateTaskInput, GetTaskInput
 from skyvern_langchain.settings import settings
 
 from skyvern import Skyvern
+from skyvern.client import SkyvernEnvironment
 from skyvern.client.types.get_run_response import GetRunResponse
 from skyvern.client.types.task_run_response import TaskRunResponse
 from skyvern.schemas.runs import RunEngine
@@ -18,7 +19,7 @@ class SkyvernTaskBaseTool(BaseTool):
     run_task_timeout_seconds: int = Field(default=settings.run_task_timeout_seconds)
 
     def get_client(self) -> Skyvern:
-        return Skyvern(base_url=self.base_url, api_key=self.api_key)
+        return Skyvern(environment=SkyvernEnvironment.CLOUD, base_url=self.base_url, api_key=self.api_key)
 
     def _run(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError("skyvern task tool does not support sync")
