@@ -1527,13 +1527,14 @@ class AgentDB:
 
             if exclude_deleted:
                 get_workflow_query = get_workflow_query.filter(WorkflowModel.deleted_at.is_(None))
-            if organization_id:
-                get_workflow_query = get_workflow_query.filter_by(organization_id=organization_id)
 
             get_workflow_query = get_workflow_query.join(
                 WorkflowRunModel,
                 WorkflowRunModel.workflow_id == WorkflowModel.workflow_id,
             )
+
+            if organization_id:
+                get_workflow_query = get_workflow_query.filter(WorkflowRunModel.organization_id == organization_id)
 
             get_workflow_query = get_workflow_query.filter(WorkflowRunModel.workflow_run_id == workflow_run_id)
             async with self.Session() as session:

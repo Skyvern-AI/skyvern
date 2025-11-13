@@ -32,6 +32,7 @@ class GetRunResponse_TaskV1(UniversalBaseModel):
     finished_at: typing.Optional[dt.datetime] = None
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
@@ -63,6 +64,7 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
     finished_at: typing.Optional[dt.datetime] = None
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
@@ -94,6 +96,7 @@ class GetRunResponse_OpenaiCua(UniversalBaseModel):
     finished_at: typing.Optional[dt.datetime] = None
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
@@ -125,6 +128,7 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
     finished_at: typing.Optional[dt.datetime] = None
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
@@ -156,6 +160,7 @@ class GetRunResponse_UiTars(UniversalBaseModel):
     finished_at: typing.Optional[dt.datetime] = None
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
@@ -187,6 +192,7 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     finished_at: typing.Optional[dt.datetime] = None
     app_url: typing.Optional[str] = None
     browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None

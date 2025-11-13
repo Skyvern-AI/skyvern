@@ -13,6 +13,7 @@ class InputOrSelectContext(UniversalBaseModel):
     is_search_bar: typing.Optional[bool] = None
     is_location_input: typing.Optional[bool] = None
     is_date_related: typing.Optional[bool] = None
+    date_format: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
