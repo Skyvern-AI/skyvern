@@ -10816,9 +10816,6 @@
                 "$ref": "#/components/schemas/SelectOptionAction"
               },
               {
-                "$ref": "#/components/schemas/UploadFileAction"
-              },
-              {
                 "$ref": "#/components/schemas/ActAction"
               },
               {
@@ -10834,7 +10831,6 @@
                 "ai_click": "#/components/schemas/ClickAction",
                 "ai_input_text": "#/components/schemas/InputTextAction",
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
-                "ai_upload_file": "#/components/schemas/UploadFileAction",
                 "extract": "#/components/schemas/ExtractAction"
               }
             }
