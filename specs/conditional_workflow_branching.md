@@ -23,7 +23,6 @@ Skyvern workflows currently execute blocks strictly in sequence: block _n_ runs 
   - `id: str` (existing internal identifier) used for persistence.
   - `label: str` (existing, author-controlled) used as the stable node reference in the DAG; must be unique per workflow.
   - `next_block_label: str | None = None` referencing another block label in the same workflow.
-  - `metadata.graph_coordinates` (optional) to aid editors in laying out DAG nodes; nullable for back-compat.
 - Introduce `ConditionalBlock` (builds on existing block hierarchy) with `branches: list[BranchCondition]`.
 - Define `BranchCondition` as a first-class dataclass / pydantic model with:
   - `id: str` for diff-friendly updates.
@@ -58,7 +57,7 @@ Skyvern workflows currently execute blocks strictly in sequence: block _n_ runs 
   - Maintain `current_block_label`, starting from a new `workflow.entry_block_label` (defaults to the first block for legacy workflows).
   - After each block completes, prefer `block.next_block_label` if set. Conditional blocks ignore `next_block_label` and instead use the branch result.
   - Detect cycles at validation time; runtime should guard against infinite loops by tracking visited blocks and aborting with a descriptive error if validation was bypassed.
-- Update persistence so workflow run records capture both the block ID and the branch taken for auditing/debugging.
+- Update persistence so workflow run records capture both the block label and the branch taken for auditing/debugging.
 - Any dependency resolution (e.g., fetching outputs from previous blocks) now uses graph traversal rather than implicit list indexes.
 - Failure handling: if a block fails, preserve existing retry/rollback semantics. Branching does not change error propagation rules.
 

@@ -22,6 +22,7 @@ class BlockType(StrEnum):
     TASK = "task"
     TaskV2 = "task_v2"
     FOR_LOOP = "for_loop"
+    CONDITIONAL = "conditional"
     CODE = "code"
     TEXT_PROMPT = "text_prompt"
     DOWNLOAD_TO_S3 = "download_to_s3"
