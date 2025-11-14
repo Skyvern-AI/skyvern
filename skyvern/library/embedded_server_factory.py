@@ -12,6 +12,12 @@ def create_embedded_server(
     azure_api_base: str | None = None,
     azure_api_version: str | None = None,
     gemini_api_key: str | None = None,
+    vertex_credentials: str | None = None,
+    vertex_project_id: str | None = None,
+    vertex_location: str | None = None,
+    groq_api_key: str | None = None,
+    groq_model: str | None = None,
+    groq_api_base: str | None = None,
     llm_key: str | None = None,
     secondary_llm_key: str | None = None,
     settings_overrides: dict[str, Any] | None = None,
@@ -51,6 +57,24 @@ def create_embedded_server(
                 if gemini_api_key:
                     settings.GEMINI_API_KEY = gemini_api_key
                     settings.ENABLE_GEMINI = True
+
+                # Vertex AI
+                if vertex_credentials:
+                    settings.VERTEX_CREDENTIALS = vertex_credentials
+                    if vertex_project_id:
+                        settings.VERTEX_PROJECT_ID = vertex_project_id
+                    if vertex_location:
+                        settings.VERTEX_LOCATION = vertex_location
+                    settings.ENABLE_VERTEX_AI = True
+
+                # Groq
+                if groq_api_key:
+                    settings.GROQ_API_KEY = groq_api_key
+                    if groq_model:
+                        settings.GROQ_MODEL = groq_model
+                    if groq_api_base:
+                        settings.GROQ_API_BASE = groq_api_base
+                    settings.ENABLE_GROQ = True
 
                 # LLM configuration
                 if llm_key:

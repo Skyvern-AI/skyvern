@@ -113,6 +113,12 @@ class Skyvern(AsyncSkyvern):
         azure_api_base: str | None = None,
         azure_api_version: str | None = None,
         gemini_api_key: str | None = None,
+        vertex_credentials: str | None = None,
+        vertex_project_id: str | None = None,
+        vertex_location: str | None = None,
+        groq_api_key: str | None = None,
+        groq_model: str | None = None,
+        groq_api_base: str | None = None,
         llm_key: str | None = None,
         secondary_llm_key: str | None = None,
         settings: dict[str, Any] | None = None,
@@ -129,6 +135,12 @@ class Skyvern(AsyncSkyvern):
             azure_api_base: Azure API base URL (required when using Azure).
             azure_api_version: Azure API version (required when using Azure).
             gemini_api_key: Optional Google Gemini API key override.
+            vertex_credentials: Path to Google Vertex AI credentials JSON file.
+            vertex_project_id: Google Cloud project ID (required when using Vertex AI).
+            vertex_location: Google Cloud location/region (required when using Vertex AI).
+            groq_api_key: Optional Groq API key override.
+            groq_model: Groq model name (e.g., "llama-3.1-70b-versatile").
+            groq_api_base: Groq API base URL override.
             llm_key: Primary LLM model selection (e.g., "OPENAI_GPT4_1", "ANTHROPIC_CLAUDE4_SONNET").
             secondary_llm_key: Secondary LLM for lightweight operations.
             settings: Dictionary of settings to override (e.g., {"MAX_STEPS_PER_RUN": 100}).
@@ -151,6 +163,12 @@ class Skyvern(AsyncSkyvern):
         azure_api_base: str | None = None,
         azure_api_version: str | None = None,
         gemini_api_key: str | None = None,
+        vertex_credentials: str | None = None,
+        vertex_project_id: str | None = None,
+        vertex_location: str | None = None,
+        groq_api_key: str | None = None,
+        groq_model: str | None = None,
+        groq_api_base: str | None = None,
         llm_key: str | None = None,
         secondary_llm_key: str | None = None,
         settings: dict[str, Any] | None = None,
@@ -180,6 +198,12 @@ class Skyvern(AsyncSkyvern):
                     azure_api_base=azure_api_base,
                     azure_api_version=azure_api_version,
                     gemini_api_key=gemini_api_key,
+                    vertex_credentials=vertex_credentials,
+                    vertex_project_id=vertex_project_id,
+                    vertex_location=vertex_location,
+                    groq_api_key=groq_api_key,
+                    groq_model=groq_model,
+                    groq_api_base=groq_api_base,
                     llm_key=llm_key,
                     secondary_llm_key=secondary_llm_key,
                     settings_overrides=settings,
