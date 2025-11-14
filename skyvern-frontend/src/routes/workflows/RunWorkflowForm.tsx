@@ -404,24 +404,17 @@ function RunWorkflowForm({
                       }
                     }
 
-                    // Only validate required parameters (those without default values)
-                    const hasDefaultValue =
-                      parameter.default_value !== null &&
-                      parameter.default_value !== undefined;
-                    const isRequired = !hasDefaultValue;
-
-                    if (isRequired) {
-                      // For string parameters, also check for empty strings
-                      if (
-                        parameter.workflow_parameter_type === "string" &&
-                        (value === null || value === "")
-                      ) {
-                        return "This field is required";
-                      }
-                      // For all other types, check for null
-                      if (value === null || value === undefined) {
-                        return "This field is required";
-                      }
+                    // For string parameters, empty strings are always invalid
+                    if (
+                      parameter.workflow_parameter_type === "string" &&
+                      (value === null || value === "")
+                    ) {
+                      return "This field is required";
+                    }
+                    
+                    // For all other types, check for null/undefined
+                    if (value === null || value === undefined) {
+                      return "This field is required";
                     }
                   },
                 }}
