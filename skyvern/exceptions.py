@@ -82,6 +82,11 @@ class MissingElement(SkyvernException):
         )
 
 
+class MissingExtractActionsResponse(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("extract-actions response missing")
+
+
 class MultipleElementsFound(SkyvernException):
     def __init__(self, num: int, selector: str | None = None, element_id: str | None = None):
         super().__init__(
