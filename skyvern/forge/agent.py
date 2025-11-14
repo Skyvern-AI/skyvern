@@ -38,7 +38,6 @@ from skyvern.errors.errors import (
 )
 from skyvern.exceptions import (
     BrowserSessionNotFound,
-    BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
     FailedToGetTOTPVerificationCode,
@@ -829,6 +828,21 @@ class ForgeAgent:
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
+        except MissingBrowserStatePage:
+            LOG.warning("Missing browser state page, marking the task as failed")
+            await self.fail_task(
+                task,
+                step,
+                "The browser does not have a valid page for skyvern to operate. This may be due to the website being empty or the browser crashing.",
+            )
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+            )
+            return step, detailed_output, None
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
 
@@ -1450,6 +1464,7 @@ class ForgeAgent:
             UnsupportedTaskType,
             FailedToParseActionInstruction,
             ScrapingFailed,
+            MissingBrowserStatePage,
         ):
             raise
 
@@ -2178,7 +2193,7 @@ class ForgeAgent:
     ) -> None:
         working_page = await browser_state.get_working_page()
         if not working_page:
-            raise BrowserStateMissingPage()
+            raise MissingBrowserStatePage()
 
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls

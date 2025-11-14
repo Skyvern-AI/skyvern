@@ -266,11 +266,6 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         )
 
 
-class BrowserStateMissingPage(SkyvernException):
-    def __init__(self) -> None:
-        super().__init__("BrowserState is missing the main page")
-
-
 class OrganizationNotFound(SkyvernHTTPException):
     def __init__(self, organization_id: str) -> None:
         super().__init__(

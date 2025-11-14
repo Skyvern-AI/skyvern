@@ -804,7 +804,8 @@ class BrowserState:
 
     async def must_get_working_page(self) -> Page:
         page = await self.get_working_page()
-        assert page is not None
+        if page is None:
+            raise MissingBrowserStatePage()
         return page
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
