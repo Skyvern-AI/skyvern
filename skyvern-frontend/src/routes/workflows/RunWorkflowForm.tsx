@@ -411,7 +411,7 @@ function RunWorkflowForm({
                     ) {
                       return "This field is required";
                     }
-                    
+
                     // For all other types, check for null/undefined
                     if (value === null || value === undefined) {
                       return "This field is required";
