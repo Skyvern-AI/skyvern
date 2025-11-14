@@ -99,6 +99,13 @@ function parseValuesForWorkflowRun(
       ) {
         return [key, value.s3uri];
       }
+      // Convert boolean values to strings for backend storage
+      if (
+        parameter?.workflow_parameter_type === "boolean" &&
+        typeof value === "boolean"
+      ) {
+        return [key, String(value)];
+      }
       return [key, value];
     }),
   );
@@ -211,6 +218,8 @@ function RunWorkflowForm({
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
   const form = useForm<RunWorkflowFormType>({
+    mode: "onTouched",
+    reValidateMode: "onChange",
     defaultValues: {
       ...initialValues,
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
@@ -297,10 +306,14 @@ function RunWorkflowForm({
     setHasCode(Object.keys(blockScripts ?? {}).length > 0);
   }, [blockScripts]);
 
+  // Watch form changes and update run parameters without triggering validation
   useEffect(() => {
-    onChange(form.getValues());
+    const subscription = form.watch((values) => {
+      onChange(values as RunWorkflowFormType);
+    });
+    return () => subscription.unsubscribe();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form]);
+  }, []);
 
   // if we're coming from debugger, block scripts may already be cached; let's ensure we bust it
   // on mount
@@ -366,11 +379,7 @@ function RunWorkflowForm({
 
   return (
     <Form {...form}>
-      <form
-        onChange={form.handleSubmit(onChange)}
-        onSubmit={form.handleSubmit(onSubmit)}
-        className="space-y-8"
-      >
+      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
             <h1 className="text-lg">Input Parameters</h1>
@@ -394,8 +403,25 @@ function RunWorkflowForm({
                         return "Invalid JSON";
                       }
                     }
-                    if (value === null) {
-                      return "This field is required";
+
+                    // Only validate required parameters (those without default values)
+                    const hasDefaultValue =
+                      parameter.default_value !== null &&
+                      parameter.default_value !== undefined;
+                    const isRequired = !hasDefaultValue;
+
+                    if (isRequired) {
+                      // For string parameters, also check for empty strings
+                      if (
+                        parameter.workflow_parameter_type === "string" &&
+                        (value === null || value === "")
+                      ) {
+                        return "This field is required";
+                      }
+                      // For all other types, check for null
+                      if (value === null || value === undefined) {
+                        return "This field is required";
+                      }
                     }
                   },
                 }}
