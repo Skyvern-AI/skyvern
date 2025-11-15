@@ -12,6 +12,7 @@ class ActionType(StrEnum):
     SELECT_OPTION = "select_option"
     CHECKBOX = "checkbox"
     WAIT = "wait"
+    HOVER = "hover"
     NULL_ACTION = "null_action"
     SOLVE_CAPTCHA = "solve_captcha"
     TERMINATE = "terminate"
@@ -37,11 +38,13 @@ class ActionType(StrEnum):
             ActionType.DOWNLOAD_FILE,
             ActionType.SELECT_OPTION,
             ActionType.CHECKBOX,
+            ActionType.HOVER,
         ]
 
 
 POST_ACTION_EXECUTION_ACTION_TYPES = [
     ActionType.CLICK,
+    ActionType.HOVER,
     ActionType.INPUT_TEXT,
     ActionType.UPLOAD_FILE,
     ActionType.DOWNLOAD_FILE,

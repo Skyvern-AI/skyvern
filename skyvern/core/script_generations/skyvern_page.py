@@ -206,6 +206,26 @@ class SkyvernPage(Page):
 
         return selector
 
+    @action_wrap(ActionType.HOVER)
+    async def hover(
+        self,
+        selector: str,
+        *,
+        timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        hold_seconds: float = 0.0,
+        intention: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Move the mouse over the element identified by `selector`."""
+        if not selector:
+            raise ValueError("Hover requires a selector.")
+
+        locator = self.page.locator(selector, **kwargs)
+        await locator.hover(timeout=timeout)
+        if hold_seconds and hold_seconds > 0:
+            await asyncio.sleep(hold_seconds)
+        return selector
+
     @overload
     async def fill(
         self,

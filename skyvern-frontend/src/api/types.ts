@@ -231,6 +231,7 @@ export interface AzureClientSecretCredentialResponse {
 export const ActionTypes = {
   InputText: "input_text",
   Click: "click",
+  Hover: "hover",
   SelectOption: "select_option",
   UploadFile: "upload_file",
   complete: "complete",
@@ -257,6 +258,7 @@ export const ReadableActionTypes: {
 } = {
   input_text: "Input Text",
   click: "Click",
+  hover: "Hover",
   select_option: "Select Option",
   upload_file: "Upload File",
   complete: "Complete",

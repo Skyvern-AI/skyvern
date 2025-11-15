@@ -91,6 +91,7 @@ def sanitize_variable_name(name: str) -> str:
 
 ACTION_MAP = {
     "click": "click",
+    "hover": "hover",
     "input_text": "fill",
     "upload_file": "upload_file",
     "select_option": "select_option",
@@ -108,6 +109,7 @@ ACTION_MAP = {
 }
 ACTIONS_WITH_XPATH = [
     "click",
+    "hover",
     "input_text",
     "type",
     "fill",
@@ -276,6 +278,19 @@ def _action_to_stmt(act: dict[str, Any], task: dict[str, Any], assign_to_output:
                 ),
             )
         )
+    elif method == "hover":
+        hold_seconds = act.get("hold_seconds")
+        if hold_seconds and hold_seconds > 0:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("hold_seconds"),
+                    value=_value(hold_seconds),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     elif method in ["type", "fill"]:
         # Use context.parameters if field_name is available, otherwise fallback to direct value
         if act.get("field_name"):
