@@ -100,11 +100,8 @@ class BrowserProfilesClient:
         client = Skyvern(
             api_key="YOUR_API_KEY",
         )
-        session = client.browser_sessions.create_browser_session()
-        client.browser_sessions.close_browser_session(session.browser_session_id)
         client.browser_profiles.create_browser_profile(
             name="name",
-            browser_session_id=session.browser_session_id,
         )
         """
         _response = self._raw_client.create_browser_profile(
