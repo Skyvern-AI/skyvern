@@ -1,9 +1,14 @@
 import { FileInputValue, FileUpload } from "@/components/FileUpload";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { CodeEditor } from "./components/CodeEditor";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
-import { Label } from "@/components/ui/label";
 import { WorkflowParameterValueType } from "./types/workflowTypes";
 import { CredentialSelector } from "./components/CredentialSelector";
 
@@ -60,16 +65,19 @@ function WorkflowParameterInput({ type, value, onChange }: Props) {
   }
 
   if (type === "boolean") {
-    const checked = typeof value === "boolean" ? value : Boolean(value);
     return (
-      <div className="flex items-center gap-2">
-        <Checkbox
-          checked={checked}
-          onCheckedChange={(checked) => onChange(checked)}
-          className="block"
-        />
-        <Label>{value ? "True" : "False"}</Label>
-      </div>
+      <Select
+        value={value === null ? "" : String(value)}
+        onValueChange={(v) => onChange(v === "true")}
+      >
+        <SelectTrigger className="w-48">
+          <SelectValue placeholder="Select value..." />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="true">True</SelectItem>
+          <SelectItem value="false">False</SelectItem>
+        </SelectContent>
+      </Select>
     );
   }
 

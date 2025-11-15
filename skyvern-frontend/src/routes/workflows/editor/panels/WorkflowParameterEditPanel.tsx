@@ -538,11 +538,23 @@ function WorkflowParameterEditPanel({
                       return;
                     }
                   }
-                  const defaultValue =
+                  let defaultValue = defaultValueState.defaultValue;
+
+                  // Handle JSON parsing
+                  if (
                     parameterType === "json" &&
                     typeof defaultValueState.defaultValue === "string"
-                      ? JSON.parse(defaultValueState.defaultValue)
-                      : defaultValueState.defaultValue;
+                  ) {
+                    defaultValue = JSON.parse(defaultValueState.defaultValue);
+                  }
+                  // Convert boolean to string for backend storage
+                  else if (
+                    parameterType === "boolean" &&
+                    typeof defaultValueState.defaultValue === "boolean"
+                  ) {
+                    defaultValue = String(defaultValueState.defaultValue);
+                  }
+
                   onSave({
                     key,
                     parameterType: "workflow",
