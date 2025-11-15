@@ -474,10 +474,15 @@ class Settings(BaseSettings):
         if platform.system() != "Windows":
             return
 
-        if "postgresql+psycopg" not in self.DATABASE_STRING:
+        scheme, sep, remainder = self.DATABASE_STRING.partition("://")
+        if not sep:
             return
 
-        updated_string = self.DATABASE_STRING.replace("postgresql+psycopg", "postgresql+asyncpg", 1)
+        dialect, driver_sep, driver = scheme.partition("+")
+        if not driver_sep or driver not in {"psycopg", "psycopg2"}:
+            return
+
+        updated_string = f"{dialect}+asyncpg://{remainder}"
         if updated_string == self.DATABASE_STRING:
             return
 
