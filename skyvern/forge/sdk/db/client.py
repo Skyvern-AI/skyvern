@@ -2379,6 +2379,7 @@ class AgentDB:
         page_size: int = 10,
         status: list[WorkflowRunStatus] | None = None,
         include_debugger_runs: bool = False,
+        search_key: str | None = None,
     ) -> list[WorkflowRun | Task]:
         try:
             async with self.Session() as session:
@@ -2397,6 +2398,28 @@ class AgentDB:
 
                 if not include_debugger_runs:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.debug_session_id.is_(None))
+
+                if search_key:
+                    key_like = f"%{search_key}%"
+                    param_exists = exists(
+                        select(1)
+                        .select_from(WorkflowRunParameterModel)
+                        .join(
+                            WorkflowParameterModel,
+                            WorkflowParameterModel.workflow_parameter_id
+                            == WorkflowRunParameterModel.workflow_parameter_id,
+                        )
+                        .where(WorkflowRunParameterModel.workflow_run_id == WorkflowRunModel.workflow_run_id)
+                        .where(WorkflowParameterModel.deleted_at.is_(None))
+                        .where(
+                            or_(
+                                WorkflowParameterModel.key.ilike(key_like),
+                                WorkflowParameterModel.description.ilike(key_like),
+                                WorkflowRunParameterModel.value.ilike(key_like),
+                            )
+                        )
+                    )
+                    workflow_run_query = workflow_run_query.where(param_exists)
 
                 if status:
                     workflow_run_query = workflow_run_query.filter(WorkflowRunModel.status.in_(status))
