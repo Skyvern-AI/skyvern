@@ -989,6 +989,14 @@ function isInteractable(element, hoverStylesMap) {
     _jsConsoleError("Error getting jQuery click events:", e);
   }
 
+  try {
+    if (hasAngularClickEvent(element)) {
+      return true;
+    }
+  } catch (e) {
+    _jsConsoleError("Error checking angular click event:", e);
+  }
+
   return false;
 }
 
@@ -1130,6 +1138,33 @@ function hasNgAttribute(element) {
       return true;
     }
   }
+  return false;
+}
+
+// TODO: it's a hack, should continue to optimize it
+function hasAngularClickEvent(element) {
+  const ctx = element.__ngContext__;
+  const tView = ctx && ctx[1];
+  if (!tView || !Array.isArray(tView.data)) {
+    return false;
+  }
+
+  const tagName = element.tagName.toLowerCase();
+  if (!tagName) {
+    _jsConsoleLog("Element has no tag name: ", element);
+    return false;
+  }
+
+  for (const tNode of tView.data) {
+    if (!tNode || typeof tNode !== "object") continue;
+    if (tNode.type !== 0 && tNode.type !== 2) continue; // 0: Element, 2: Container
+    if (tNode.value && tagName !== tNode.value.toLowerCase()) continue;
+    if (!Array.isArray(tNode.attrs)) continue;
+    if (tNode.attrs.includes("click")) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -2688,6 +2723,34 @@ function isAnimationFinished() {
     return true;
   }
   return false;
+}
+
+/**
+ * Remove unique_id attribute from all elements on the page.
+ * This includes elements in the main document and shadow DOM.
+ */
+function removeAllUniqueIds() {
+  // Function to recursively remove unique_id from an element and its children
+  const removeUniqueIdFromElement = (element) => {
+    if (element.hasAttribute("unique_id")) {
+      element.removeAttribute("unique_id");
+    }
+
+    // Process children in the main DOM
+    for (const child of Array.from(element.children)) {
+      removeUniqueIdFromElement(child);
+    }
+
+    // Process elements in shadow DOM if present
+    if (element.shadowRoot) {
+      for (const shadowChild of Array.from(element.shadowRoot.children)) {
+        removeUniqueIdFromElement(shadowChild);
+      }
+    }
+  };
+
+  // Start from document.documentElement to process the entire page
+  removeUniqueIdFromElement(document.documentElement);
 }
 
 /**

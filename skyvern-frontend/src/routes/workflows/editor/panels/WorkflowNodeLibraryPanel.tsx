@@ -84,20 +84,24 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Validation Block",
-    description: "Validate completion criteria",
+    title: "AI or Human Validation",
+    description: "Have an AI or Human validate the state of the screen",
   },
-  {
-    nodeType: "human_interaction",
-    icon: (
-      <WorkflowBlockIcon
-        workflowBlockType={WorkflowBlockTypes.HumanInteraction}
-        className="size-6"
-      />
-    ),
-    title: "Human Interaction Block",
-    description: "Validate via human interaction",
-  },
+  /**
+   * The Human Interaction block can be had via a transmutation of the
+   * Validation block.
+   */
+  // {
+  //   nodeType: "human_interaction",
+  //   icon: (
+  //     <WorkflowBlockIcon
+  //       workflowBlockType={WorkflowBlockTypes.HumanInteraction}
+  //       className="size-6"
+  //     />
+  //   ),
+  //   title: "Human Interaction Block",
+  //   description: "Validate via human interaction",
+  // },
   // {
   //   nodeType: "task",
   //   icon: (

@@ -16,7 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunBlock } from "../types/workflowRunTypes";
 
 interface Props {
@@ -26,7 +26,7 @@ interface Props {
 export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-  const { data: workflowRun } = useWorkflowRunQuery();
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
   const isPaused =
     workflowRun && workflowRun.status === WorkflowRunStatus.Paused;
 

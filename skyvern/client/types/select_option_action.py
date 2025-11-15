@@ -8,6 +8,10 @@ from .select_option_action_data import SelectOptionActionData
 
 
 class SelectOptionAction(UniversalBaseModel):
+    """
+    Select option action parameters.
+    """
+
     selector: typing.Optional[str] = pydantic.Field(default=None)
     """
     CSS selector for the element

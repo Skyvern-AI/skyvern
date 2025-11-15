@@ -288,6 +288,8 @@ def convert_to_workflow(workflow_model: WorkflowModel, debug_enabled: bool = Fal
         cache_key=workflow_model.cache_key,
         run_sequentially=workflow_model.run_sequentially,
         sequential_key=workflow_model.sequential_key,
+        folder_id=workflow_model.folder_id,
+        import_error=workflow_model.import_error,
     )
 
 
@@ -307,6 +309,7 @@ def convert_to_workflow_run(
         workflow_id=workflow_run_model.workflow_id,
         organization_id=workflow_run_model.organization_id,
         browser_session_id=workflow_run_model.browser_session_id,
+        browser_profile_id=workflow_run_model.browser_profile_id,
         status=WorkflowRunStatus[workflow_run_model.status],
         failure_reason=workflow_run_model.failure_reason,
         proxy_location=(
@@ -584,6 +587,8 @@ def convert_to_script_block(script_block_model: ScriptBlockModel) -> ScriptBlock
         script_block_label=script_block_model.script_block_label,
         script_file_id=script_block_model.script_file_id,
         run_signature=script_block_model.run_signature,
+        workflow_run_id=script_block_model.workflow_run_id,
+        workflow_run_block_id=script_block_model.workflow_run_block_id,
         created_at=script_block_model.created_at,
         modified_at=script_block_model.modified_at,
         deleted_at=script_block_model.deleted_at,

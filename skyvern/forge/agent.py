@@ -3,8 +3,10 @@ import base64
 import json
 import os
 import random
+import re
 import string
 from asyncio.exceptions import CancelledError
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Tuple, cast
@@ -36,7 +38,6 @@ from skyvern.errors.errors import (
 )
 from skyvern.exceptions import (
     BrowserSessionNotFound,
-    BrowserStateMissingPage,
     DownloadFileMaxWaitingTime,
     EmptyScrapePage,
     FailedToGetTOTPVerificationCode,
@@ -46,8 +47,8 @@ from skyvern.exceptions import (
     FailedToTakeScreenshot,
     InvalidTaskStatusTransition,
     InvalidWorkflowTaskURLState,
-    MissingBrowserState,
     MissingBrowserStatePage,
+    MissingExtractActionsResponse,
     NoTOTPVerificationCodeFound,
     ScrapingFailed,
     SkyvernException,
@@ -71,20 +72,29 @@ from skyvern.forge.sdk.api.files import (
     wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller, LLMCallerManager
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE, LLM_PROVIDER_ERROR_TYPE
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
+from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
-from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.trace import TraceManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import ActionBlock, BaseTaskBlock, ValidationBlock
+from skyvern.forge.sdk.workflow.models.block import (
+    ActionBlock,
+    BaseTaskBlock,
+    FileDownloadBlock,
+    ValidationBlock,
+)
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
@@ -121,6 +131,19 @@ from skyvern.webeye.scraper.scraper import ElementTreeFormat, ScrapedPage, scrap
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+EXTRACT_ACTION_TEMPLATE = "extract-action"
+EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
+EXTRACT_ACTION_CACHE_KEY_PREFIX = f"{EXTRACT_ACTION_TEMPLATE}-static"
+
+
+@dataclass
+class SpeculativePlan:
+    scraped_page: ScrapedPage
+    extract_action_prompt: str
+    use_caching: bool
+    llm_json_response: dict[str, Any] | None
+    llm_metadata: SpeculativeLLMMetadata | None = None
 
 
 class ActionLinkedNode:
@@ -160,21 +183,22 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
                 workflow_run_id=workflow_run.workflow_run_id, parent_workflow_run_id=workflow_run.parent_workflow_run_id
             )
-            if browser_state is None:
-                raise MissingBrowserState(workflow_run_id=workflow_run.workflow_run_id)
+            if browser_state is not None:
+                working_page = await browser_state.get_working_page()
+                if not working_page:
+                    LOG.error(
+                        "BrowserState has no page",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
 
-            working_page = await browser_state.get_working_page()
-            if not working_page:
-                LOG.error(
-                    "BrowserState has no page",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-                raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
+                if working_page.url == "about:blank":
+                    raise InvalidWorkflowTaskURLState(workflow_run.workflow_run_id)
 
-            if working_page.url == "about:blank":
-                raise InvalidWorkflowTaskURLState(workflow_run.workflow_run_id)
-
-            task_url = working_page.url
+                task_url = working_page.url
+            else:
+                LOG.info("No browser state found for workflow run, setting task url to empty string")
+                task_url = ""
 
         task = await app.DATABASE.create_task(
             url=task_url,
@@ -612,6 +636,10 @@ class ForgeAgent:
                     step=step,
                     page=await browser_state.get_working_page(),
                     task_block=task_block,
+                    browser_state=browser_state,
+                    scraped_page=detailed_output.scraped_page if detailed_output else None,
+                    engine=engine,
+                    complete_verification=complete_verification,
                 )
                 if is_task_completed is not None and maybe_last_step:
                     last_step = maybe_last_step
@@ -800,6 +828,21 @@ class ForgeAgent:
                 browser_session_id=browser_session_id,
             )
             return step, detailed_output, None
+        except MissingBrowserStatePage:
+            LOG.warning("Missing browser state page, marking the task as failed")
+            await self.fail_task(
+                task,
+                step,
+                "The browser does not have a valid page for skyvern to operate. This may be due to the website being empty or the browser crashing.",
+            )
+            await self.clean_up_task(
+                task=task,
+                last_step=step,
+                api_key=api_key,
+                close_browser_on_completion=close_browser_on_completion,
+                browser_session_id=browser_session_id,
+            )
+            return step, detailed_output, None
         except Exception as e:
             LOG.exception("Got an unexpected exception in step, marking task as failed")
 
@@ -897,19 +940,35 @@ class ForgeAgent:
                 organization=organization, task=task, step=step, browser_state=browser_state
             )
 
-            (
-                scraped_page,
-                extract_action_prompt,
-                use_caching,
-            ) = await self.build_and_record_step_prompt(
-                task,
-                step,
-                browser_state,
-                engine,
-            )
+            speculative_plan: SpeculativePlan | None = None
+            reuse_speculative_llm_response = False
+            speculative_llm_metadata: SpeculativeLLMMetadata | None = None
+            if context:
+                speculative_plan = context.speculative_plans.pop(step.step_id, None)
+
+            if speculative_plan:
+                step.is_speculative = False
+                scraped_page = speculative_plan.scraped_page
+                extract_action_prompt = speculative_plan.extract_action_prompt
+                use_caching = speculative_plan.use_caching
+                json_response = speculative_plan.llm_json_response
+                reuse_speculative_llm_response = json_response is not None
+                speculative_llm_metadata = speculative_plan.llm_metadata
+            else:
+                (
+                    scraped_page,
+                    extract_action_prompt,
+                    use_caching,
+                ) = await self.build_and_record_step_prompt(
+                    task,
+                    step,
+                    browser_state,
+                    engine,
+                )
+                json_response = None
+
             detailed_agent_step_output.scraped_page = scraped_page
             detailed_agent_step_output.extract_action_prompt = extract_action_prompt
-            json_response = None
             actions: list[Action]
 
             if engine == RunEngine.openai_cua:
@@ -968,12 +1027,20 @@ class ForgeAgent:
                         if context:
                             context.use_prompt_caching = True
 
-                    json_response = await llm_api_handler(
-                        prompt=extract_action_prompt,
-                        prompt_name="extract-actions",
-                        step=step,
-                        screenshots=scraped_page.screenshots,
-                    )
+                    if not reuse_speculative_llm_response:
+                        json_response = await llm_api_handler(
+                            prompt=extract_action_prompt,
+                            prompt_name="extract-actions",
+                            step=step,
+                            screenshots=scraped_page.screenshots,
+                        )
+                    else:
+                        LOG.debug(
+                            "Using speculative extract-actions response",
+                            step_id=step.step_id,
+                        )
+                    if json_response is None:
+                        raise MissingExtractActionsResponse()
                     try:
                         otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
                             task, step, scraped_page, browser_state, json_response
@@ -1016,6 +1083,14 @@ class ForgeAgent:
                                 errors=[GetTOTPVerificationCodeError(reason=e.reason).to_user_defined_error()],
                             )
                         ]
+
+                    if reuse_speculative_llm_response and speculative_llm_metadata:
+                        await self._persist_speculative_llm_metadata(
+                            step,
+                            speculative_llm_metadata,
+                            screenshots=scraped_page.screenshots,
+                        )
+                        speculative_llm_metadata = None
 
             detailed_agent_step_output.actions = actions
             if len(actions) == 0:
@@ -1290,6 +1365,7 @@ class ForgeAgent:
                         break
 
             task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
+            enable_parallel_verification = False
             if (
                 not has_decisive_action
                 and not task_completes_on_download
@@ -1302,13 +1378,24 @@ class ForgeAgent:
                     task.task_id,
                     properties={"task_url": task.url, "organization_id": task.organization_id},
                 )
-                if not disable_user_goal_check:
+
+                # Check if parallel verification is enabled
+                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
+                    distinct_id,
+                    properties={"organization_id": task.organization_id, "task_url": task.url},
+                )
+
+                if not disable_user_goal_check and not enable_parallel_verification:
+                    # Standard synchronous verification
                     working_page = await browser_state.must_get_working_page()
                     complete_action = await self.check_user_goal_complete(
                         page=working_page,
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
+                        task_block=task_block,
                     )
                     if complete_action is not None:
                         LOG.info("User goal achieved, executing complete action")
@@ -1323,6 +1410,13 @@ class ForgeAgent:
                         )
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
+                elif enable_parallel_verification:
+                    # Parallel verification enabled - defer check to handle_completed_step
+                    LOG.info(
+                        "Parallel verification enabled, deferring user goal check to handle_completed_step",
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
 
             # if the last action is complete and is successful, check if there's a data extraction goal
             # if task has navigation goal and extraction goal at the same time, handle ExtractAction before marking step as completed
@@ -1349,6 +1443,8 @@ class ForgeAgent:
                 status=StepStatus.completed,
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
+            if enable_parallel_verification:
+                completed_step.speculative_original_status = StepStatus.completed
             return completed_step, detailed_agent_step_output.get_clean_detailed_output()
         except CancelledError:
             LOG.exception(
@@ -1368,6 +1464,7 @@ class ForgeAgent:
             UnsupportedTaskType,
             FailedToParseActionInstruction,
             ScrapingFailed,
+            MissingBrowserStatePage,
         ):
             raise
 
@@ -1675,8 +1772,269 @@ class ForgeAgent:
 
         return actions
 
+    async def _should_skip_screenshot_annotations(self, task: Task, draw_boxes: bool) -> bool:
+        """
+        Check PostHog feature flag to determine if screenshot annotations should be skipped.
+
+        Args:
+            task: The task being executed
+            draw_boxes: Current value indicating if boxes should be drawn
+
+        Returns:
+            bool: True if annotations should be drawn, False if they should be skipped
+        """
+        if not draw_boxes:  # Only check if we were going to draw boxes
+            return draw_boxes
+
+        try:
+            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+            skip_annotations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "SKIP_SCREENSHOT_ANNOTATIONS",
+                distinct_id,
+                properties={"organization_id": task.organization_id},
+            )
+            if skip_annotations:
+                LOG.info(
+                    "Skipping screenshot annotations per SKIP_SCREENSHOT_ANNOTATIONS feature flag",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                return False
+        except Exception:
+            LOG.warning(
+                "Failed to check SKIP_SCREENSHOT_ANNOTATIONS feature flag, using default behavior",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+
+        return draw_boxes
+
+    async def _speculate_next_step_plan(
+        self,
+        task: Task,
+        current_step: Step,
+        next_step: Step,
+        browser_state: BrowserState,
+        engine: RunEngine,
+    ) -> SpeculativePlan | None:
+        if engine in CUA_ENGINES:
+            LOG.info(
+                "Skipping speculative extract-actions for CUA engine",
+                step_id=current_step.step_id,
+                task_id=task.task_id,
+            )
+            return None
+
+        try:
+            next_step.is_speculative = True
+
+            scraped_page, extract_action_prompt, use_caching = await self.build_and_record_step_prompt(
+                task,
+                next_step,
+                browser_state,
+                engine,
+                persist_artifacts=False,
+            )
+
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                task.llm_key,
+                default=app.LLM_API_HANDLER,
+            )
+
+            llm_json_response = await llm_api_handler(
+                prompt=extract_action_prompt,
+                prompt_name="extract-actions",
+                step=next_step,
+                screenshots=scraped_page.screenshots,
+            )
+
+            LOG.info(
+                "Speculative extract-actions completed",
+                current_step_id=current_step.step_id,
+                synthetic_step_id=next_step.step_id,
+            )
+
+            metadata_copy = None
+            if next_step.speculative_llm_metadata is not None:
+                metadata_copy = next_step.speculative_llm_metadata.model_copy()
+                next_step.speculative_llm_metadata = None
+            next_step.is_speculative = False
+
+            return SpeculativePlan(
+                scraped_page=scraped_page,
+                extract_action_prompt=extract_action_prompt,
+                use_caching=use_caching,
+                llm_json_response=llm_json_response,
+                llm_metadata=metadata_copy,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to run speculative extract-actions",
+                step_id=current_step.step_id,
+                exc_info=True,
+            )
+            next_step.is_speculative = False
+            return None
+
+    async def _persist_speculative_llm_metadata(
+        self,
+        step: Step,
+        metadata: SpeculativeLLMMetadata,
+        *,
+        screenshots: list[bytes] | None = None,
+    ) -> None:
+        if not metadata:
+            return
+
+        LOG.debug("Persisting speculative LLM metadata")
+
+        if metadata.prompt:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=metadata.prompt.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_PROMPT,
+                screenshots=screenshots,
+                step=step,
+            )
+
+        if metadata.llm_request_json:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=metadata.llm_request_json.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_REQUEST,
+                step=step,
+            )
+
+        if metadata.llm_response_json:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=metadata.llm_response_json.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_RESPONSE,
+                step=step,
+            )
+
+        if metadata.parsed_response_json:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=metadata.parsed_response_json.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
+                step=step,
+            )
+
+        if metadata.rendered_response_json:
+            await app.ARTIFACT_MANAGER.create_llm_artifact(
+                data=metadata.rendered_response_json.encode("utf-8"),
+                artifact_type=ArtifactType.LLM_RESPONSE_RENDERED,
+                step=step,
+            )
+
+        incremental_cost = metadata.llm_cost if metadata.llm_cost and metadata.llm_cost > 0 else None
+        incremental_input_tokens = (
+            metadata.input_tokens if metadata.input_tokens and metadata.input_tokens > 0 else None
+        )
+        incremental_output_tokens = (
+            metadata.output_tokens if metadata.output_tokens and metadata.output_tokens > 0 else None
+        )
+        incremental_reasoning_tokens = (
+            metadata.reasoning_tokens if metadata.reasoning_tokens and metadata.reasoning_tokens > 0 else None
+        )
+        incremental_cached_tokens = (
+            metadata.cached_tokens if metadata.cached_tokens and metadata.cached_tokens > 0 else None
+        )
+
+        if (
+            incremental_cost is not None
+            or incremental_input_tokens is not None
+            or incremental_output_tokens is not None
+            or incremental_reasoning_tokens is not None
+            or incremental_cached_tokens is not None
+        ):
+            await app.DATABASE.update_step(
+                task_id=step.task_id,
+                step_id=step.step_id,
+                organization_id=step.organization_id,
+                incremental_cost=incremental_cost,
+                incremental_input_tokens=incremental_input_tokens,
+                incremental_output_tokens=incremental_output_tokens,
+                incremental_reasoning_tokens=incremental_reasoning_tokens,
+                incremental_cached_tokens=incremental_cached_tokens,
+            )
+
+            if incremental_input_tokens:
+                step.input_token_count += incremental_input_tokens
+            if incremental_output_tokens:
+                step.output_token_count += incremental_output_tokens
+            if incremental_reasoning_tokens:
+                step.reasoning_token_count = (step.reasoning_token_count or 0) + incremental_reasoning_tokens
+            if incremental_cached_tokens:
+                step.cached_token_count = (step.cached_token_count or 0) + incremental_cached_tokens
+            if incremental_cost:
+                step.step_cost += incremental_cost
+
+        step.speculative_llm_metadata = None
+
+    async def _persist_speculative_metadata_for_discarded_plan(
+        self,
+        step: Step,
+        speculative_task: asyncio.Future[SpeculativePlan | None],
+        *,
+        cancel_step: bool = False,
+    ) -> None:
+        try:
+            plan = await asyncio.shield(speculative_task)
+        except CancelledError:
+            LOG.debug(
+                "Speculative extract-actions cancelled before metadata persistence",
+                step_id=step.step_id,
+            )
+            step.is_speculative = False
+            if cancel_step:
+                await self._cancel_speculative_step(step)
+            return
+        except Exception:
+            LOG.debug(
+                "Speculative extract-actions failed before metadata persistence",
+                step_id=step.step_id,
+                exc_info=True,
+            )
+            step.is_speculative = False
+            if cancel_step:
+                await self._cancel_speculative_step(step)
+            return
+
+        if not plan or not plan.llm_metadata:
+            step.is_speculative = False
+            if cancel_step:
+                await self._cancel_speculative_step(step)
+            return
+
+        try:
+            await self._persist_speculative_llm_metadata(
+                step,
+                plan.llm_metadata,
+            )
+            step.is_speculative = False
+            if cancel_step:
+                await self._cancel_speculative_step(step)
+        except Exception:
+            LOG.warning(
+                "Failed to persist speculative llm metadata for discarded plan",
+                step_id=step.step_id,
+                exc_info=True,
+            )
+
+    async def _cancel_speculative_step(self, step: Step) -> None:
+        if step.status == StepStatus.canceled:
+            return
+        try:
+            updated_step = await self.update_step(step, status=StepStatus.canceled)
+            step.status = updated_step.status
+            step.is_speculative = False
+        except Exception:
+            LOG.warning(
+                "Failed to cancel speculative step",
+                step_id=step.step_id,
+                exc_info=True,
+            )
+
     async def complete_verify(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step, task_block: BaseTaskBlock | None = None
     ) -> CompleteVerifyResult:
         LOG.info(
             "Checking if user goal is achieved after re-scraping the page",
@@ -1694,13 +2052,47 @@ class ForgeAgent:
         if task.include_action_history_in_verification:
             actions_and_results_str = await self._get_action_results(task, current_step=step)
 
+        # Check if we should use the termination-aware prompt (experiment)
+        # Only enabled for file download blocks
+        use_termination_prompt = False
+        is_file_download_block = task_block is not None and isinstance(task_block, FileDownloadBlock)
+
+        if is_file_download_block:
+            try:
+                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                use_termination_prompt = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "USE_TERMINATION_AWARE_COMPLETE_VERIFICATION",
+                    distinct_id,
+                    properties={"organization_id": task.organization_id},
+                )
+                if use_termination_prompt:
+                    LOG.info(
+                        "Experiment enabled: using termination-aware complete verification prompt for file download block",
+                        task_id=task.task_id,
+                        workflow_run_id=task.workflow_run_id,
+                        organization_id=task.organization_id,
+                        block_type="file_download",
+                    )
+            except Exception as e:
+                LOG.warning(
+                    "Failed to check USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment; using legacy behavior",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    error=str(e),
+                )
+
+        # Select the appropriate template based on experiment
+        template_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
+        prompt_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
+
         verification_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
-            template_name="check-user-goal",
+            template_name=template_name,
             navigation_goal=task.navigation_goal,
             navigation_payload=task.navigation_payload,
             complete_criterion=task.complete_criterion,
+            terminate_criterion=task.terminate_criterion,
             action_history=actions_and_results_str,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         )
@@ -1746,23 +2138,37 @@ class ForgeAgent:
             prompt=verification_prompt,
             step=step,
             screenshots=scraped_page_refreshed.screenshots,
-            prompt_name="check-user-goal",
+            prompt_name=prompt_name,
         )
         return CompleteVerifyResult.model_validate(verification_result)
 
     async def check_user_goal_complete(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
-    ) -> CompleteAction | None:
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step, task_block: BaseTaskBlock | None = None
+    ) -> CompleteAction | TerminateAction | None:
         try:
             verification_result = await self.complete_verify(
                 page=page,
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                task_block=task_block,
             )
 
+            # Check if we should terminate instead of complete
+            # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
+            if verification_result.is_terminate:
+                LOG.warning(
+                    "Periodic verification determined task should terminate (termination-aware experiment)",
+                    workflow_run_id=task.workflow_run_id,
+                    thoughts=verification_result.thoughts,
+                    status=verification_result.status if verification_result.status else "legacy",
+                )
+                return TerminateAction(
+                    reasoning=verification_result.thoughts,
+                )
+
             # We don't want to return a complete action if the user goal is not achieved since we're checking at every step
-            if not verification_result.user_goal_achieved:
+            if not verification_result.is_complete:
                 return None
 
             return CompleteAction(
@@ -1787,7 +2193,7 @@ class ForgeAgent:
     ) -> None:
         working_page = await browser_state.get_working_page()
         if not working_page:
-            raise BrowserStateMissingPage()
+            raise MissingBrowserStatePage()
 
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls
@@ -1853,6 +2259,7 @@ class ForgeAgent:
                 workflow_run=workflow_run,
                 url=task.url,
                 browser_session_id=browser_session_id,
+                browser_profile_id=workflow_run.browser_profile_id,
             )
         else:
             browser_state = await app.BROWSER_MANAGER.get_or_create_for_task(
@@ -1911,6 +2318,10 @@ class ForgeAgent:
             max_screenshot_number = 1
             draw_boxes = False
             scroll = False
+
+        # Check PostHog feature flag to skip screenshot annotations
+        draw_boxes = await self._should_skip_screenshot_annotations(task, draw_boxes)
+
         return await scrape_website(
             browser_state,
             task.url,
@@ -1927,43 +2338,93 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         engine: RunEngine,
+        *,
+        persist_artifacts: bool = True,
     ) -> tuple[ScrapedPage, str, bool]:
-        # start the async tasks while running scrape_website
-        if engine not in CUA_ENGINES:
-            self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
-
-        # Scrape the web page and get the screenshot and the elements
-        # HACK: try scrape_website three time to handle screenshot timeout
-        # first time: normal scrape to take screenshot
-        # second time: try again the normal scrape, (stopping window loading before scraping barely helps, but causing problem)
-        # third time: reload the page before scraping
+        # Check if we have pre-scraped data from parallel verification optimization
+        context = skyvern_context.current()
         scraped_page: ScrapedPage | None = None
-        extract_action_prompt = ""
-        use_caching = False
-        for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
-            try:
-                scraped_page = await self._scrape_with_type(
-                    task=task,
-                    step=step,
-                    browser_state=browser_state,
-                    scrape_type=scrape_type,
-                    engine=engine,
+
+        if (
+            context
+            and context.next_step_pre_scraped_data
+            and context.next_step_pre_scraped_data.get("step_id") == step.step_id
+        ):
+            scraped_page = context.next_step_pre_scraped_data.get("scraped_page")
+            if scraped_page:
+                timestamp = context.next_step_pre_scraped_data.get("timestamp")
+                age_seconds = (datetime.now(UTC) - timestamp).total_seconds() if timestamp else 0
+                LOG.info(
+                    "Using pre-scraped data from parallel verification optimization",
+                    step_id=step.step_id,
+                    num_elements=len(scraped_page.elements),
+                    age_seconds=age_seconds,
                 )
-                break
-            except (FailedToTakeScreenshot, ScrapingFailed) as e:
-                if idx < len(SCRAPE_TYPE_ORDER) - 1:
-                    continue
-                LOG.exception(f"{e.__class__.__name__} happened in two normal attempts and reload-page retry")
-                raise e
+                # Clear the cached data
+                context.next_step_pre_scraped_data = None
+
+        # If we don't have pre-scraped data, scrape normally
+        if scraped_page is None:
+            # Check PostHog for speed optimizations BEFORE scraping
+            # This decision will be used in both:
+            # 1. SVG conversion skip (in agent_functions.py cleanup)
+            # 2. Tree selection (economy vs regular tree)
+            # By checking once and storing in context, we ensure perfect coordination
+            if context:
+                try:
+                    distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                    context.enable_speed_optimizations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "ENABLE_SPEED_OPTIMIZATIONS",
+                        distinct_id,
+                        properties={"organization_id": task.organization_id},
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to check ENABLE_SPEED_OPTIMIZATIONS feature flag",
+                        exc_info=True,
+                        task_id=task.task_id,
+                    )
+                    context.enable_speed_optimizations = False
+
+            # start the async tasks while running scrape_website
+            if engine not in CUA_ENGINES:
+                self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
+
+            # Scrape the web page and get the screenshot and the elements
+            # HACK: try scrape_website three time to handle screenshot timeout
+            # first time: normal scrape to take screenshot
+            # second time: try again the normal scrape, (stopping window loading before scraping barely helps, but causing problem)
+            # third time: reload the page before scraping
+            extract_action_prompt = ""
+            use_caching = False
+            for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
+                try:
+                    scraped_page = await self._scrape_with_type(
+                        task=task,
+                        step=step,
+                        browser_state=browser_state,
+                        scrape_type=scrape_type,
+                        engine=engine,
+                    )
+                    break
+                except (FailedToTakeScreenshot, ScrapingFailed) as e:
+                    if idx < len(SCRAPE_TYPE_ORDER) - 1:
+                        continue
+                    LOG.exception(f"{e.__class__.__name__} happened in two normal attempts and reload-page retry")
+                    raise e
 
         if scraped_page is None:
             raise EmptyScrapePage()
 
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.HTML_SCRAPE,
-            data=scraped_page.html.encode(),
-        )
+        extract_action_prompt = ""
+        use_caching = False
+
+        if persist_artifacts:
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.HTML_SCRAPE,
+                data=scraped_page.html.encode(),
+            )
         LOG.info(
             "Scraped website",
             step_order=step.order,
@@ -1972,8 +2433,53 @@ class ForgeAgent:
             url=task.url,
         )
         # TODO: we only use HTML element for now, introduce a way to switch in the future
+        enable_speed_optimizations = getattr(context, "enable_speed_optimizations", False)
         element_tree_format = ElementTreeFormat.HTML
-        element_tree_in_prompt: str = scraped_page.build_element_tree(element_tree_format)
+
+        # OPTIMIZATION: Use economy tree (skip SVGs) when ENABLE_SPEED_OPTIMIZATIONS is enabled
+        # Economy tree removes all SVG elements from the DOM tree sent to LLM
+        # - SVGs are decorative (icons, logos, graphics) - not needed for action planning
+        # - Even for charts/graphs: LLM sees them in screenshots, not SVG code
+        # - Saves ~8s per SVG x ~15 SVGs = ~120s per workflow (30% speedup!)
+        #
+        # RETRY STRATEGY: Use economy tree on first attempt only
+        # - retry_index 0: Use economy tree (fast, no SVGs)
+        # - retry_index 1+: Use regular tree (SVGs loaded from existing 4-week cache)
+        # Note: SVG conversions are already cached globally with 4-week TTL, so retries are fast
+        #
+        # COORDINATION: The enable_speed_optimizations decision is made ONCE before scraping
+        # and stored in context. Both SVG conversion skip (agent_functions.py) and tree
+        # selection (here) use the SAME value, ensuring perfect coordination.
+        element_tree_in_prompt: str = ""
+
+        # Use the speed optimization decision from context (set before scraping)
+        enable_speed_optimizations = context.enable_speed_optimizations if context else False
+
+        if not enable_speed_optimizations:
+            # Optimization disabled - use regular tree always
+            element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
+        elif step.retry_index == 0:
+            # First attempt - use economy tree (fast, no SVG conversion)
+            # Note: SVG conversion was already skipped in cleanup_element_tree_func
+            # based on the same context.enable_speed_optimizations value
+            element_tree_in_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
+            LOG.info(
+                "Speed optimization: Using economy element tree (skipping SVGs)",
+                step_order=step.order,
+                step_retry=step.retry_index,
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
+        else:
+            # Retry 1+ - use regular tree (SVGs will be loaded from existing 4-week cache)
+            element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
+            LOG.info(
+                "Speed optimization: Using regular tree on retry (SVGs from global cache)",
+                step_order=step.order,
+                step_retry=step.retry_index,
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+            )
         extract_action_prompt = ""
         if engine not in CUA_ENGINES:
             extract_action_prompt, use_caching = await self._build_extract_action_prompt(
@@ -1985,33 +2491,150 @@ class ForgeAgent:
                 expire_verification_code=True,
             )
 
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-            data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-            data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-            data=json.dumps(scraped_page.element_tree, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-            data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
-        )
-        await app.ARTIFACT_MANAGER.create_artifact(
-            step=step,
-            artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-            data=element_tree_in_prompt.encode(),
-        )
+        if persist_artifacts:
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+                data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode(),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+                data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode(),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
+                data=json.dumps(scraped_page.element_tree, indent=2).encode(),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+                data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode(),
+            )
+            await app.ARTIFACT_MANAGER.create_artifact(
+                step=step,
+                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+                data=element_tree_in_prompt.encode(),
+            )
 
         return scraped_page, extract_action_prompt, use_caching
+
+    async def _create_vertex_cache_for_task(
+        self, task: Task, static_prompt: str, context: SkyvernContext, llm_key_override: str | None
+    ) -> None:
+        """
+        Create a Vertex AI cache for the task's static prompt.
+
+        Uses llm_key as cache key to enable cache sharing across tasks with the same model.
+
+        Args:
+            task: The task to create cache for
+            static_prompt: The static prompt content to cache
+            context: The Skyvern context to store the cache name in
+        """
+        # Early return if task doesn't have an llm_key
+        # This should not happen given the guard at the call site, but being defensive
+        resolved_llm_key = llm_key_override or task.llm_key
+
+        if not resolved_llm_key:
+            LOG.warning(
+                "Cannot create Vertex AI cache without llm_key, skipping cache creation",
+                task_id=task.task_id,
+            )
+            return
+
+        try:
+            LOG.info(
+                "Attempting Vertex AI cache creation",
+                task_id=task.task_id,
+                llm_key=resolved_llm_key,
+            )
+            cache_manager = get_cache_manager()
+
+            # Use llm_key as cache_key so all tasks with the same model share the same cache
+            # This maximizes cache reuse and reduces cache storage costs
+            cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}-{resolved_llm_key}"
+
+            # Get the actual model name from LLM config to ensure correct format
+            # (e.g., "gemini-2.5-flash" with decimal, not "gemini-2-5-flash")
+            model_name = "gemini-2.5-flash"  # Default
+
+            try:
+                llm_config = LLMConfigRegistry.get_config(resolved_llm_key)
+                extracted_name = None
+
+                # Try to extract from model_name if it contains "vertex_ai/" or starts with "gemini-"
+                if hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
+                    if "vertex_ai/" in llm_config.model_name:
+                        # Direct Vertex config: "vertex_ai/gemini-2.5-flash" -> "gemini-2.5-flash"
+                        extracted_name = llm_config.model_name.split("/")[-1]
+                    elif llm_config.model_name.startswith("gemini-"):
+                        # Already in correct format
+                        extracted_name = llm_config.model_name
+
+                # For router/fallback configs, extract from api_base or infer from key name
+                if not extracted_name and hasattr(llm_config, "litellm_params") and llm_config.litellm_params:
+                    params = llm_config.litellm_params
+                    api_base = getattr(params, "api_base", None)
+                    if api_base and isinstance(api_base, str) and "/models/" in api_base:
+                        # Extract from URL: .../models/gemini-2.5-flash -> "gemini-2.5-flash"
+                        extracted_name = api_base.split("/models/")[-1]
+
+                # For router configs without api_base, infer from the llm_key itself
+                if not extracted_name:
+                    # Extract version from llm_key (e.g., VERTEX_GEMINI_1_5_FLASH -> "1_5" or VERTEX_GEMINI_2.5_FLASH -> "2.5")
+                    # Pattern: GEMINI_{version}_{flavor} where version can use dots, underscores, or dashes
+                    version_match = re.search(r"GEMINI[_-](\d+[._-]\d+)", resolved_llm_key, re.IGNORECASE)
+                    version = version_match.group(1).replace("_", ".").replace("-", ".") if version_match else "2.5"
+
+                    # Determine flavor
+                    if "_PRO_" in resolved_llm_key or resolved_llm_key.endswith("_PRO"):
+                        extracted_name = f"gemini-{version}-pro"
+                    elif "_FLASH_LITE_" in resolved_llm_key or resolved_llm_key.endswith("_FLASH_LITE"):
+                        extracted_name = f"gemini-{version}-flash-lite"
+                    else:
+                        # Default to flash flavor
+                        extracted_name = f"gemini-{version}-flash"
+
+                if extracted_name:
+                    model_name = extracted_name
+            except Exception as e:
+                LOG.debug("Failed to extract model name from config, using default", error=str(e))
+
+            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro)
+            match = re.search(r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro))", model_name, re.IGNORECASE)
+            if match:
+                model_name = match.group(1).lower()
+
+            # Create cache for this task
+            # Use asyncio.to_thread to offload blocking HTTP request (requests.post)
+            # This prevents freezing the event loop during cache creation
+            cache_data = await asyncio.to_thread(
+                cache_manager.create_cache,
+                model_name=model_name,
+                static_content=static_prompt,
+                cache_key=cache_key,
+                ttl_seconds=3600,  # 1 hour
+            )
+
+            # Store cache resource name in context
+            context.vertex_cache_name = cache_data["name"]
+
+            LOG.info(
+                "Created Vertex AI cache for task",
+                task_id=task.task_id,
+                cache_key=cache_key,
+                cache_name=cache_data["name"],
+                model_name=model_name,
+            )
+        except Exception as e:
+            LOG.warning(
+                "Failed to create Vertex AI cache, proceeding without caching",
+                task_id=task.task_id,
+                error=str(e),
+                exc_info=True,
+            )
 
     async def _build_extract_action_prompt(
         self,
@@ -2034,11 +2657,12 @@ class ForgeAgent:
         final_navigation_payload = self._build_navigation_payload(
             task, expire_verification_code=expire_verification_code, step=step, scraped_page=scraped_page
         )
+        navigation_payload_str = json.dumps(final_navigation_payload)
 
         task_type = task.task_type if task.task_type else TaskType.general
         template = ""
         if task_type == TaskType.general:
-            template = "extract-action"
+            template = EXTRACT_ACTION_TEMPLATE
         elif task_type == TaskType.validation:
             template = "decisive-criterion-validate"
         elif task_type == TaskType.action:
@@ -2077,38 +2701,86 @@ class ForgeAgent:
 
         context = skyvern_context.ensure_context()
 
+        # Reset cached prompt by default; we will set it below if caching is enabled.
+        context.cached_static_prompt = None
+
         # Check if prompt caching is enabled for extract-action
         use_caching = False
-        if (
-            template == "extract-action"
-            and LLMAPIHandlerFactory._prompt_caching_settings
-            and LLMAPIHandlerFactory._prompt_caching_settings.get("extract-action", False)
-        ):
+        prompt_caching_settings = LLMAPIHandlerFactory._prompt_caching_settings or {}
+        effective_llm_key = task.llm_key
+        if not effective_llm_key:
+            handler_for_key = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                task.llm_key, default=app.LLM_API_HANDLER
+            )
+            effective_llm_key = getattr(handler_for_key, "llm_key", None)
+        cache_enabled = prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME) or prompt_caching_settings.get(
+            EXTRACT_ACTION_TEMPLATE
+        )
+        LOG.info(
+            "Extract-action prompt caching evaluation",
+            template=template,
+            cache_enabled=cache_enabled,
+            prompt_caching_settings=prompt_caching_settings,
+            task_llm_key=task.llm_key,
+            effective_llm_key=effective_llm_key,
+        )
+        enable_speed_optimizations = context.enable_speed_optimizations
+        element_tree_format = ElementTreeFormat.HTML
+        if enable_speed_optimizations:
+            if step.retry_index == 0:
+                elements_for_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
+            else:
+                elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
+        else:
+            elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
+
+        if template == EXTRACT_ACTION_TEMPLATE and cache_enabled:
             try:
                 # Try to load split templates for caching
-                static_prompt = prompt_engine.load_prompt(f"{template}-static")
+                prompt_kwargs = {
+                    "navigation_goal": navigation_goal,
+                    "navigation_payload_str": navigation_payload_str,
+                    "starting_url": starting_url,
+                    "current_url": current_url,
+                    "data_extraction_goal": task.data_extraction_goal,
+                    "action_history": actions_and_results_str,
+                    "error_code_mapping_str": (
+                        json.dumps(task.error_code_mapping) if task.error_code_mapping else None
+                    ),
+                    "local_datetime": datetime.now(context.tz_info).isoformat(),
+                    "verification_code_check": verification_code_check,
+                    "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
+                    "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
+                    "parse_select_feature_enabled": context.enable_parse_select_in_extract,
+                    "has_magic_link_page": context.has_magic_link_page(task.task_id),
+                }
+                static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
                     f"{template}-dynamic",
-                    navigation_goal=navigation_goal,
-                    navigation_payload_str=json.dumps(final_navigation_payload),
-                    starting_url=starting_url,
-                    current_url=current_url,
-                    data_extraction_goal=task.data_extraction_goal,
-                    action_history=actions_and_results_str,
-                    error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
-                    local_datetime=datetime.now(context.tz_info).isoformat(),
-                    verification_code_check=verification_code_check,
-                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
-                    terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-                    parse_select_feature_enabled=context.enable_parse_select_in_extract,
-                    has_magic_link_page=context.has_magic_link_page(task.task_id),
+                    elements=elements_for_prompt,
+                    **prompt_kwargs,
                 )
 
-                # Store static prompt for caching and return dynamic prompt
+                # Store static prompt for caching and continue sending it alongside the dynamic section.
+                # Vertex explicit caching expects the static content to still be present in the request so the
+                # first call succeeds even if the cache is cold. The cached reference simply lets the service
+                # reuse the static portion internally.
                 context.cached_static_prompt = static_prompt
+                context.use_prompt_caching = True
                 use_caching = True
-                LOG.info("Using cached prompt for extract-action", task_id=task.task_id)
-                return dynamic_prompt, use_caching
+
+                # Create Vertex AI cache for Gemini models
+                if effective_llm_key and "GEMINI" in effective_llm_key:
+                    await self._create_vertex_cache_for_task(task, static_prompt, context, effective_llm_key)
+
+                combined_prompt = f"{static_prompt.rstrip()}\n\n{dynamic_prompt.lstrip()}"
+
+                LOG.info(
+                    "Using cached prompt",
+                    task_id=task.task_id,
+                    prompt_name=EXTRACT_ACTION_PROMPT_NAME,
+                )
+                return combined_prompt, use_caching
 
             except Exception as e:
                 LOG.warning("Failed to load cached prompt templates, falling back to original", error=str(e))
@@ -2120,7 +2792,7 @@ class ForgeAgent:
             prompt_engine=prompt_engine,
             template_name=template,
             navigation_goal=navigation_goal,
-            navigation_payload_str=json.dumps(final_navigation_payload),
+            navigation_payload_str=navigation_payload_str,
             starting_url=starting_url,
             current_url=current_url,
             data_extraction_goal=task.data_extraction_goal,
@@ -2388,10 +3060,13 @@ class ForgeAgent:
             raise TaskNotFound(task_id=task.task_id) from e
         task = refreshed_task
 
+        # Caches expire based on TTL (1 hour) or can be cleaned up via scheduled job
+        # This allows multiple tasks with the same llm_key to share the same cache
+
         # log the task status as an event
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
-        # Add task completion tag to Laminar trace
+        # Add task completion tag to trace
         TraceManager.add_task_completion_tag(task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state
@@ -2501,19 +3176,23 @@ class ForgeAgent:
             payload_dict = json.loads(payload_json)
             if task_run_response_json:
                 payload_dict.update(json.loads(task_run_response_json))
-            payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
-            headers = generate_skyvern_webhook_headers(payload=payload, api_key=api_key)
+
+            signed_data = generate_skyvern_webhook_signature(payload=payload_dict, api_key=api_key)
+
             LOG.info(
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=payload,
-                headers=headers,
+                payload=signed_data.signed_payload,
+                headers=signed_data.headers,
             )
 
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    task.webhook_callback_url, data=payload, headers=headers, timeout=httpx.Timeout(30.0)
+                    task.webhook_callback_url,
+                    data=signed_data.signed_payload,
+                    headers=signed_data.headers,
+                    timeout=httpx.Timeout(30.0),
                 )
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
@@ -2804,6 +3483,248 @@ class ForgeAgent:
             **updates,
         )
 
+    async def _handle_completed_step_with_parallel_verification(
+        self,
+        organization: Organization,
+        task: Task,
+        step: Step,
+        page: Page | None,
+        browser_state: BrowserState,
+        scraped_page: ScrapedPage,
+        engine: RunEngine,
+        task_block: BaseTaskBlock | None = None,
+    ) -> tuple[bool | None, Step | None, Step | None]:
+        """
+        Handle completed step with parallel verification optimization.
+
+        Runs two tasks in parallel:
+        1. Verify if user goal is complete (check-user-goal)
+        2. Pre-scrape page for next step
+
+        If goal is complete, cancel pre-scraping and mark task done.
+        If goal not complete, use pre-scraped data for next step execution.
+
+        Note: This should only be called when verification is needed (i.e., when
+        the standard flow would have called check_user_goal_complete in agent_step).
+        """
+        LOG.info(
+            "Starting parallel user goal verification with speculative extract-actions",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+
+        verification_task = asyncio.create_task(
+            self.check_user_goal_complete(
+                page=page,
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                task_block=task_block,
+            ),
+            name=f"verify_goal_{step.step_id}",
+        )
+
+        next_step = await app.DATABASE.create_step(
+            task_id=task.task_id,
+            order=step.order + 1,
+            retry_index=0,
+            organization_id=task.organization_id,
+        )
+
+        LOG.debug(
+            "Waiting before launching speculative plan",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+        await asyncio.sleep(1.0)
+
+        speculative_task = asyncio.create_task(
+            self._speculate_next_step_plan(
+                task=task,
+                current_step=step,
+                next_step=next_step,
+                browser_state=browser_state,
+                engine=engine,
+            ),
+            name=f"speculate_next_step_{step.step_id}",
+        )
+
+        try:
+            complete_action = await verification_task
+        except Exception:
+            LOG.warning(
+                "User goal verification failed in parallel mode, will continue with next step",
+                step_id=step.step_id,
+                exc_info=True,
+            )
+            complete_action = None
+
+        if complete_action is not None:
+            asyncio.create_task(
+                self._persist_speculative_metadata_for_discarded_plan(
+                    next_step,
+                    speculative_task,
+                    cancel_step=True,
+                )
+            )
+
+            working_page = page or await browser_state.must_get_working_page()
+
+            if step.output is None:
+                step.output = AgentStepOutput(action_results=[], actions_and_results=[], errors=[])
+            if step.output.action_results is None:
+                step.output.action_results = []
+            if step.output.actions_and_results is None:
+                step.output.actions_and_results = []
+
+            persisted_action = cast(Action, complete_action)
+            if isinstance(persisted_action, (CompleteAction, TerminateAction)):
+                persisted_action.organization_id = task.organization_id
+                persisted_action.workflow_run_id = task.workflow_run_id
+                persisted_action.task_id = task.task_id
+                persisted_action.step_id = step.step_id
+                persisted_action.step_order = step.order
+                persisted_action.action_order = len(step.output.actions_and_results)
+
+            action_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, persisted_action)
+            await self.record_artifacts_after_action(task, step, browser_state, engine)
+            step.output.action_results.extend(action_results)
+            step.output.actions_and_results.append((persisted_action, action_results))
+            if isinstance(persisted_action, DecisiveAction) and persisted_action.errors:
+                step.output.errors.extend(persisted_action.errors)
+
+            if isinstance(persisted_action, TerminateAction):
+                LOG.warning(
+                    "Parallel verification: termination required, marking task as terminated",
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    reasoning=complete_action.reasoning,
+                )
+                final_status = step.speculative_original_status or StepStatus.completed
+                step.speculative_original_status = None
+                step.status = final_status
+                last_step = await self.update_step(
+                    step,
+                    status=final_status,
+                    output=step.output,
+                    is_last=True,
+                )
+                task_errors = None
+                if persisted_action.errors:
+                    task_errors = [error.model_dump() for error in persisted_action.errors]
+                failure_reason = persisted_action.reasoning
+                if persisted_action.errors:
+                    failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
+                await self.update_task(
+                    task,
+                    status=TaskStatus.terminated,
+                    failure_reason=failure_reason,
+                    errors=task_errors,
+                )
+                return True, last_step, None
+
+            LOG.info(
+                "Parallel verification: goal achieved, marking task as complete",
+                step_id=step.step_id,
+                task_id=task.task_id,
+            )
+            final_status = step.speculative_original_status or StepStatus.completed
+            step.speculative_original_status = None
+            step.status = final_status
+            last_step = await self.update_step(
+                step,
+                status=final_status,
+                output=step.output,
+                is_last=True,
+            )
+            extracted_information = await self.get_extracted_information_for_task(task)
+            await self.update_task(
+                task,
+                status=TaskStatus.completed,
+                extracted_information=extracted_information,
+            )
+            return True, last_step, None
+
+        LOG.info(
+            "Parallel verification: goal not achieved, awaiting speculative extract-actions",
+            step_id=step.step_id,
+            task_id=task.task_id,
+        )
+
+        try:
+            speculative_plan = await speculative_task
+        except CancelledError:
+            LOG.debug("Speculative extract-actions cancelled after verification finished", step_id=step.step_id)
+            speculative_plan = None
+        except Exception:
+            LOG.warning(
+                "Speculative extract-actions failed, next step will run sequentially",
+                step_id=step.step_id,
+                exc_info=True,
+            )
+            speculative_plan = None
+
+        context = skyvern_context.current()
+        override_max_steps_per_run = context.max_steps_override if context else None
+        max_steps_per_run = (
+            override_max_steps_per_run
+            or task.max_steps_per_run
+            or organization.max_steps_per_run
+            or settings.MAX_STEPS_PER_RUN
+        )
+
+        if step.order + 1 >= max_steps_per_run:
+            LOG.info(
+                "Step completed but max steps reached, marking task as failed",
+                step_order=step.order,
+                step_retry=step.retry_index,
+                max_steps=max_steps_per_run,
+            )
+            final_status = step.speculative_original_status or StepStatus.completed
+            step.speculative_original_status = None
+            step.status = final_status
+            last_step = await self.update_step(
+                step,
+                status=final_status,
+                output=step.output,
+                is_last=True,
+            )
+
+            generated_failure_reason = await self.summary_failure_reason_for_max_steps(
+                organization=organization,
+                task=task,
+                step=step,
+                page=page,
+            )
+            failure_reason = f"Reached the maximum steps ({max_steps_per_run}). Possible failure reasons: {generated_failure_reason.reasoning}"
+            errors = [ReachMaxStepsError().model_dump()] + [
+                error.model_dump() for error in generated_failure_reason.errors
+            ]
+
+            await self._cancel_speculative_step(next_step)
+
+            await self.update_task(
+                task,
+                status=TaskStatus.failed,
+                failure_reason=failure_reason,
+                errors=errors,
+            )
+            return False, last_step, None
+
+        if speculative_plan:
+            context = skyvern_context.ensure_context()
+            context.speculative_plans[next_step.step_id] = speculative_plan
+            LOG.info(
+                "Stored speculative extract-actions plan for next step",
+                current_step_id=step.step_id,
+                next_step_id=next_step.step_id,
+            )
+
+        step.status = step.speculative_original_status or StepStatus.completed
+        step.speculative_original_status = None
+
+        return None, None, next_step
+
     async def handle_failed_step(self, organization: Organization, task: Task, step: Step) -> Step | None:
         max_retries_per_step = (
             organization.max_retries_per_step
@@ -2862,6 +3783,8 @@ class ForgeAgent:
         page: Page | None,
     ) -> MaxStepsReasonResponse:
         steps_results = []
+        llm_errors: list[str] = []
+
         try:
             steps = await app.DATABASE.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
@@ -2888,11 +3811,36 @@ class ForgeAgent:
                 for action, action_results in step.output.actions_and_results:
                     if len(action_results) == 0:
                         continue
+                    last_result = action_results[-1]
+
+                    # Check if this is an LLM provider error
+                    if not last_result.success:
+                        exception_type = last_result.exception_type or ""
+                        exception_message = last_result.exception_message or ""
+                        if (
+                            exception_type in (LLM_PROVIDER_ERROR_TYPE, LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE)
+                            or "LLMProvider" in exception_message
+                        ):
+                            llm_errors.append(f"Step {step_cnt}: {exception_message}")
+
                     action_result_summary.append(
-                        f"{action.reasoning}(action_type={action.action_type}, result={'success' if action_results[-1].success else 'failed'})"
+                        f"{action.reasoning}(action_type={action.action_type}, result={'success' if last_result.success else 'failed'})"
                     )
                 step_result["actions_result"] = action_result_summary
                 steps_results.append(step_result)
+
+            # If we detected LLM errors, return a clear message without calling the LLM
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
+                )
 
             scroll = True
             if await service_utils.is_cua_task(task=task):
@@ -2917,6 +3865,17 @@ class ForgeAgent:
             return MaxStepsReasonResponse.model_validate(json_response)
         except Exception:
             LOG.warning("Failed to summary the failure reason")
+            # Check if we have LLM errors even if the summarization failed
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return MaxStepsReasonResponse(
+                    page_info="",
+                    reasoning=(
+                        f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                        f"Error details: {llm_error_details}"
+                    ),
+                    errors=[],
+                )
             if steps_results:
                 last_step_result = steps_results[-1]
                 return MaxStepsReasonResponse(
@@ -2941,11 +3900,21 @@ class ForgeAgent:
         html = ""
         screenshots: list[bytes] = []
         steps_results = []
+        llm_errors: list[str] = []
+        steps_without_actions = 0
+
         try:
             steps = await app.DATABASE.get_task_steps(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
+
+            # Check for LLM provider errors in the failed steps
             for step_cnt, cur_step in enumerate(steps[-max_retries:]):
+                if cur_step.status == StepStatus.failed:
+                    # If step failed with no actions, it might be an LLM error during action extraction
+                    if not cur_step.output or not cur_step.output.actions_and_results:
+                        steps_without_actions += 1
+
                 if cur_step.output and cur_step.output.actions_and_results:
                     action_result_summary: list[str] = []
                     step_result: dict[str, Any] = {
@@ -2958,11 +3927,37 @@ class ForgeAgent:
                         if last_result.success:
                             continue
                         reason = last_result.exception_message or ""
+
+                        # Check if this is an LLM provider error
+                        exception_type = last_result.exception_type or ""
+                        if (
+                            exception_type in (LLM_PROVIDER_ERROR_TYPE, LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE)
+                            or "LLMProvider" in reason
+                        ):
+                            llm_errors.append(f"Step {step_cnt}: {reason}")
+
                         action_result_summary.append(
                             f"{action.reasoning}(action_type={action.action_type}, result=failed, reason={reason})"
                         )
                     step_result["actions_result"] = action_result_summary
                     steps_results.append(step_result)
+
+            # If we detected LLM errors, return a clear message without calling the LLM
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return (
+                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                    f"This is typically caused by rate limiting, service outages, or resource exhaustion from the LLM provider. "
+                    f"Error details: {llm_error_details}"
+                )
+
+            # If multiple steps failed without producing any actions, it's likely an LLM error during action extraction
+            if steps_without_actions >= max_retries:
+                return (
+                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                    f"This is typically caused by LLM service errors during action extraction, such as rate limiting, "
+                    f"service outages, or resource exhaustion from the LLM provider. Please check the LLM service status and try again."
+                )
 
             if page is not None:
                 skyvern_frame = await SkyvernFrame.create_instance(frame=page)
@@ -2987,6 +3982,19 @@ class ForgeAgent:
             return json_response.get("reasoning", "")
         except Exception:
             LOG.warning("Failed to summarize the failure reason for max retries")
+            # Check if we have LLM errors even if the summarization failed
+            if llm_errors:
+                llm_error_details = "; ".join(llm_errors)
+                return (
+                    f"The task failed due to LLM service errors. The LLM provider encountered errors and was unable to process the requests. "
+                    f"Error details: {llm_error_details}"
+                )
+            # If multiple steps failed without actions during summarization failure, still report it
+            if steps_without_actions >= max_retries:
+                return (
+                    f"The task failed because all {max_retries} retry attempts failed to generate actions. "
+                    f"This is typically caused by LLM service errors during action extraction."
+                )
             if steps_results:
                 last_step_result = steps_results[-1]
                 return f"Retry Step {last_step_result['order']}: {last_step_result['actions_result']}"
@@ -2999,7 +4007,53 @@ class ForgeAgent:
         step: Step,
         page: Page | None,
         task_block: BaseTaskBlock | None = None,
+        browser_state: BrowserState | None = None,
+        scraped_page: ScrapedPage | None = None,
+        engine: RunEngine = RunEngine.skyvern_v1,
+        complete_verification: bool = True,
     ) -> tuple[bool | None, Step | None, Step | None]:
+        # Check if parallel verification should be used
+        # Only use it when we have the required data AND when verification would normally happen
+        should_verify = (
+            complete_verification
+            and not step.is_goal_achieved()
+            and not step.is_terminated()
+            and not isinstance(task_block, ActionBlock)
+            and (task.navigation_goal or task.complete_criterion)
+        )
+
+        if should_verify and browser_state and scraped_page:
+            try:
+                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
+                    distinct_id,
+                    properties={"organization_id": task.organization_id, "task_url": task.url},
+                )
+
+                if enable_parallel_verification:
+                    LOG.info(
+                        "Parallel verification enabled, using optimized flow",
+                        step_id=step.step_id,
+                        task_id=task.task_id,
+                    )
+                    return await self._handle_completed_step_with_parallel_verification(
+                        organization=organization,
+                        task=task,
+                        step=step,
+                        page=page,
+                        browser_state=browser_state,
+                        scraped_page=scraped_page,
+                        engine=engine,
+                        task_block=task_block,
+                    )
+            except Exception:
+                LOG.warning(
+                    "Failed to check parallel verification feature flag, using standard flow",
+                    step_id=step.step_id,
+                    exc_info=True,
+                )
+
         if step.is_goal_achieved():
             LOG.info(
                 "Step completed and goal achieved, marking task as completed",

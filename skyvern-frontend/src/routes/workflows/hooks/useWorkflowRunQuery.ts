@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useFirstParam } from "@/hooks/useFirstParam";
 import {
   statusIsNotFinalized,
   statusIsRunningOrQueued,
@@ -10,7 +11,8 @@ import { useParams } from "react-router-dom";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 
 function useWorkflowRunQuery() {
-  const { workflowRunId, workflowPermanentId } = useParams();
+  const workflowRunId = useFirstParam("workflowRunId", "runId");
+  const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
 
@@ -40,6 +42,8 @@ function useWorkflowRunQuery() {
       }
       return false;
     },
+    // required for OS-level notifications to work (workflow run completion)
+    refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
     refetchOnMount: (query) => {
       if (!query.state.data) {

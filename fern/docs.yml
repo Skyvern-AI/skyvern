@@ -192,6 +192,7 @@ navigation:
               - POST /v1/credentials/{credential_id}/delete
               - GET /v1/credentials
               - POST /v1/credentials/totp
+              - GET /v1/credentials/totp
           - section: Artifacts
             contents:
               - GET /v1/artifacts/{artifact_id}

@@ -75,6 +75,7 @@ type Props = {
     run: WorkflowRunStatusApiResponse;
   };
   resizeTrigger?: number;
+  isVisible?: boolean;
   // --
   onClose?: () => void;
 };
@@ -86,6 +87,7 @@ function BrowserStream({
   task = undefined,
   workflow = undefined,
   resizeTrigger,
+  isVisible = true,
   // --
   onClose,
 }: Props) {
@@ -112,7 +114,7 @@ function BrowserStream({
   }
 
   useQuery({
-    queryKey: ["browserSession", browserSessionId],
+    queryKey: ["hasBrowserSession", browserSessionId],
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
 
@@ -622,7 +624,7 @@ function BrowserStream({
       )}
       ref={setCanvasContainerRef}
     >
-      {isReady && (
+      {isReady && isVisible && (
         <div className="overlay z-10 flex items-center justify-center overflow-hidden">
           {showControlButtons && (
             <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">

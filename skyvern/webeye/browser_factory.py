@@ -267,7 +267,8 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
-            set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
+            if settings.BROWSER_LOGS_ENABLED:
+                set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
 
             proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
@@ -635,7 +636,8 @@ class BrowserState:
         page = await self.get_working_page()
         if page is not None:
             return page
-        LOG.error("BrowserState has no page")
+        pages = (self.browser_context.pages or []) if self.browser_context else []
+        LOG.error("BrowserState has no page", urls=[p.url for p in pages])
         raise MissingBrowserStatePage()
 
     async def _close_all_other_pages(self) -> None:
@@ -663,6 +665,7 @@ class BrowserState:
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
@@ -680,6 +683,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -800,7 +804,8 @@ class BrowserState:
 
     async def must_get_working_page(self) -> Page:
         page = await self.get_working_page()
-        assert page is not None
+        if page is None:
+            raise MissingBrowserStatePage()
         return page
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
@@ -843,6 +848,7 @@ class BrowserState:
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        browser_profile_id: str | None = None,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -858,6 +864,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
         except Exception as e:
             error_message = str(e)
@@ -875,6 +882,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
         page = await self.__assert_page()
 
@@ -891,6 +899,7 @@ class BrowserState:
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                browser_profile_id=browser_profile_id,
             )
             page = await self.__assert_page()
         return page

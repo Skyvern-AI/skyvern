@@ -17,7 +17,7 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
-from skyvern.core.script_generations.skyvern_page import script_run_context_manager
+from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
 from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -1034,6 +1034,8 @@ async def _regenerate_script_block_after_ai_fallback(
                 script_id=new_script.script_id,
                 organization_id=organization_id,
                 block_label=existing_block.script_block_label,
+                workflow_run_id=existing_block.workflow_run_id,
+                workflow_run_block_id=existing_block.workflow_run_block_id,
             )
             block_file_content_bytes = (
                 block_file_content if isinstance(block_file_content, bytes) else block_file_content.encode("utf-8")

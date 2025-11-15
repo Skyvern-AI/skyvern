@@ -21,6 +21,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     CheckboxAction,
     ClickAction,
+    ClickContext,
     ClosePageAction,
     CompleteAction,
     DownloadFileAction,
@@ -97,7 +98,15 @@ def parse_action(
 
     if action_type == ActionType.CLICK:
         file_url = action["file_url"] if "file_url" in action else None
-        return ClickAction(**base_action_dict, file_url=file_url, download=action.get("download", False))
+        click_context = action.get("click_context", None)
+        if click_context:
+            click_context = ClickContext.model_validate(click_context)
+        return ClickAction(
+            **base_action_dict,
+            file_url=file_url,
+            download=action.get("download", False),
+            click_context=click_context,
+        )
 
     if action_type == ActionType.INPUT_TEXT:
         context_dict = action.get("context", {})
@@ -769,6 +778,9 @@ async def generate_cua_fallback_actions(
     LOG.info("Fallback action response", action_response=action_response)
     skyvern_action_type = action_response.get("action")
     useful_information = action_response.get("useful_information")
+
+    # use 'other' action as fallback in the 'cua-fallback-action' prompt
+    # it can avoid LLM returning unreasonable actions, and fallback to use 'wait' action in agent instead
     action = WaitAction(
         seconds=5,
         reasoning=reasoning,

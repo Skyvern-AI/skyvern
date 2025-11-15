@@ -47,6 +47,8 @@ import {
 } from "@/routes/workflows/editor/nodes/Taskv2Node/types";
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
+import { ImprovePrompt } from "@/components/ImprovePrompt";
+import { cn } from "@/util/utils";
 
 const exampleCases = [
   {
@@ -136,6 +138,7 @@ function PromptBox() {
   const [dataSchema, setDataSchema] = useState<string | null>(null);
   const [extraHttpHeaders, setExtraHttpHeaders] = useState<string | null>(null);
   const { setAutoplay } = useAutoplayStore();
+  const [promptImprovalIsPending, setPromptImprovalIsPending] = useState(false);
 
   const generateWorkflowMutation = useMutation({
     mutationFn: async ({
@@ -240,7 +243,14 @@ function PromptBox() {
             What task would you like to accomplish?
           </span>
           <div className="flex w-full max-w-xl flex-col">
-            <div className="flex w-full items-center gap-2 rounded-xl bg-slate-700 py-2 pr-4">
+            <div
+              className={cn(
+                "flex w-full items-center gap-2 rounded-xl bg-slate-700 py-2 pr-4",
+                {
+                  "pointer-events-none opacity-50": promptImprovalIsPending,
+                },
+              )}
+            >
               <AutoResizingTextarea
                 className="min-h-0 resize-none rounded-xl border-transparent px-4 hover:border-transparent focus-visible:ring-0"
                 value={prompt}
@@ -312,6 +322,19 @@ function PromptBox() {
                   </CustomSelectItem>
                 </SelectContent>
               </Select>
+              <ImprovePrompt
+                isVisible={Boolean(prompt.trim())}
+                onBegin={() => {
+                  setPromptImprovalIsPending(true);
+                }}
+                onEnd={() => {
+                  setPromptImprovalIsPending(false);
+                }}
+                onImprove={(prompt) => setPrompt(prompt)}
+                prompt={prompt}
+                size="large"
+                useCase="new_workflow"
+              />
               <div className="flex items-center">
                 <GearIcon
                   className="size-6 cursor-pointer"
@@ -320,25 +343,23 @@ function PromptBox() {
                   }}
                 />
               </div>
-              <div className="flex items-center">
+              <div
+                className={cn("flex items-center", {
+                  "pointer-events-none opacity-20": !prompt.trim(),
+                })}
+              >
                 {generateWorkflowMutation.isPending ? (
                   <ReloadIcon className="size-6 animate-spin" />
                 ) : (
-                  <div className="flex items-center">
-                    {generateWorkflowMutation.isPending ? (
-                      <ReloadIcon className="size-6 animate-spin" />
-                    ) : (
-                      <PaperPlaneIcon
-                        className="size-6 cursor-pointer"
-                        onClick={async () => {
-                          generateWorkflowMutation.mutate({
-                            prompt,
-                            version: selectValue,
-                          });
-                        }}
-                      />
-                    )}
-                  </div>
+                  <PaperPlaneIcon
+                    className="size-6 cursor-pointer"
+                    onClick={async () => {
+                      generateWorkflowMutation.mutate({
+                        prompt,
+                        version: selectValue,
+                      });
+                    }}
+                  />
                 )}
               </div>
             </div>

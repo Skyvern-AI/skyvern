@@ -82,6 +82,11 @@ class MissingElement(SkyvernException):
         )
 
 
+class MissingExtractActionsResponse(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("extract-actions response missing")
+
+
 class MultipleElementsFound(SkyvernException):
     def __init__(self, num: int, selector: str | None = None, element_id: str | None = None):
         super().__init__(
@@ -168,6 +173,17 @@ class WorkflowNotFound(SkyvernHTTPException):
         )
 
 
+class WorkflowNotFoundForWorkflowRun(SkyvernHTTPException):
+    def __init__(
+        self,
+        workflow_run_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"Workflow not found for workflow run {workflow_run_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
 class WorkflowRunNotFound(SkyvernHTTPException):
     def __init__(self, workflow_run_id: str) -> None:
         super().__init__(f"WorkflowRun {workflow_run_id} not found", status_code=status.HTTP_404_NOT_FOUND)
@@ -248,11 +264,6 @@ class UnknownErrorWhileCreatingBrowserContext(SkyvernException):
         super().__init__(
             f"Unknown error while creating browser context for {browser_type}. Exception type: {type(exception)} Exception message: {str(exception)}"
         )
-
-
-class BrowserStateMissingPage(SkyvernException):
-    def __init__(self) -> None:
-        super().__init__("BrowserState is missing the main page")
 
 
 class OrganizationNotFound(SkyvernHTTPException):
@@ -786,6 +797,14 @@ class BrowserSessionNotFound(SkyvernHTTPException):
             f"Browser session {browser_session_id} does not exist or is not live.",
             status_code=status.HTTP_404_NOT_FOUND,
         )
+
+
+class BrowserProfileNotFound(SkyvernHTTPException):
+    def __init__(self, profile_id: str, organization_id: str | None = None) -> None:
+        message = f"Browser profile {profile_id} not found"
+        if organization_id:
+            message += f" for organization {organization_id}"
+        super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
 
 
 class CannotUpdateWorkflowDueToCodeCache(SkyvernException):

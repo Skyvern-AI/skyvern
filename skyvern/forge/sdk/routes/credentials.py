@@ -21,6 +21,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
+    Credential,
     CredentialResponse,
     CredentialType,
     CredentialVaultType,
@@ -124,6 +125,66 @@ async def send_totp_code(
     )
 
 
+@base_router.get(
+    "/credentials/totp",
+    response_model=list[TOTPCode],
+    summary="List TOTP codes",
+    description="Retrieves recent TOTP codes for the current organization.",
+    tags=["Credentials"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_totp_codes",
+    },
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/totp/",
+    response_model=list[TOTPCode],
+    include_in_schema=False,
+)
+async def get_totp_codes(
+    curr_org: Organization = Depends(org_auth_service.get_current_org),
+    totp_identifier: str | None = Query(
+        None,
+        description="Filter by TOTP identifier such as an email or phone number.",
+        examples=["john.doe@example.com"],
+    ),
+    workflow_run_id: str | None = Query(
+        None,
+        description="Filter by workflow run ID.",
+        examples=["wr_123456"],
+    ),
+    otp_type: OTPType | None = Query(
+        None,
+        description="Filter by OTP type (e.g. totp, magic_link).",
+        examples=[OTPType.TOTP.value],
+    ),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=200,
+        description="Maximum number of codes to return.",
+    ),
+) -> list[TOTPCode]:
+    if totp_identifier:
+        codes = await app.DATABASE.get_otp_codes(
+            organization_id=curr_org.organization_id,
+            totp_identifier=totp_identifier,
+            otp_type=otp_type,
+            workflow_run_id=workflow_run_id,
+            limit=limit,
+        )
+    else:
+        codes = await app.DATABASE.get_recent_otp_codes(
+            organization_id=curr_org.organization_id,
+            limit=limit,
+            valid_lifespan_minutes=None,
+            otp_type=otp_type,
+            workflow_run_id=workflow_run_id,
+        )
+
+    return codes
+
+
 @legacy_base_router.post("/credentials")
 @legacy_base_router.post("/credentials/", include_in_schema=False)
 @base_router.post(
@@ -167,7 +228,7 @@ async def create_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
+    credential_service = await _get_credential_vault_service()
 
     credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
 
@@ -289,9 +350,13 @@ async def get_credential(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> CredentialResponse:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
+    credential = await app.DATABASE.get_credential(
+        credential_id=credential_id, organization_id=current_org.organization_id
+    )
+    if not credential:
+        raise HTTPException(status_code=404, detail="Credential not found")
 
-    return await credential_service.get_credential(current_org.organization_id, credential_id)
+    return _convert_to_response(credential)
 
 
 @legacy_base_router.get("/credentials")
@@ -336,9 +401,8 @@ async def get_credentials(
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
     ),
 ) -> list[CredentialResponse]:
-    credential_service = await _get_credential_vault_service(current_org.organization_id)
-
-    return await credential_service.get_credentials(current_org.organization_id, page, page_size)
+    credentials = await app.DATABASE.get_credentials(current_org.organization_id, page=page, page_size=page_size)
+    return [_convert_to_response(credential) for credential in credentials]
 
 
 @base_router.get(
@@ -547,10 +611,8 @@ async def update_azure_client_secret_credential(
         )
 
 
-async def _get_credential_vault_service(organization_id: str) -> CredentialVaultService:
-    org_collection = await app.DATABASE.get_organization_bitwarden_collection(organization_id)
-
-    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN or org_collection:
+async def _get_credential_vault_service() -> CredentialVaultService:
+    if settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.BITWARDEN:
         return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif settings.CREDENTIAL_VAULT_TYPE == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
@@ -558,3 +620,30 @@ async def _get_credential_vault_service(organization_id: str) -> CredentialVault
         return app.AZURE_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
+
+
+def _convert_to_response(credential: Credential) -> CredentialResponse:
+    if credential.credential_type == CredentialType.PASSWORD:
+        credential_response = PasswordCredentialResponse(
+            username=credential.username or credential.credential_id,
+            totp_type=credential.totp_type,
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    elif credential.credential_type == CredentialType.CREDIT_CARD:
+        credential_response = CreditCardCredentialResponse(
+            last_four=credential.card_last4 or "****",
+            brand=credential.card_brand or "Card Brand",
+        )
+        return CredentialResponse(
+            credential=credential_response,
+            credential_id=credential.credential_id,
+            credential_type=credential.credential_type,
+            name=credential.name,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Credential type not supported")

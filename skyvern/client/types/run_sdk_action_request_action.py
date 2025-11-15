@@ -6,14 +6,39 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .act_action_data import ActActionData
 from .click_action_data import ClickActionData
 from .extract_action_data import ExtractActionData
 from .extract_action_extract_schema import ExtractActionExtractSchema
 from .input_text_action_data import InputTextActionData
 from .select_option_action_data import SelectOptionActionData
+from .upload_file_action_data import UploadFileActionData
 
 
-class SdkAction_AiClick(UniversalBaseModel):
+class RunSdkActionRequestAction_AiAct(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
+    type: typing.Literal["ai_act"] = "ai_act"
+    intention: typing.Optional[str] = None
+    data: typing.Optional[ActActionData] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class RunSdkActionRequestAction_AiClick(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
     type: typing.Literal["ai_click"] = "ai_click"
     selector: typing.Optional[str] = None
     intention: typing.Optional[str] = None
@@ -30,7 +55,11 @@ class SdkAction_AiClick(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class SdkAction_AiInputText(UniversalBaseModel):
+class RunSdkActionRequestAction_AiInputText(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
     type: typing.Literal["ai_input_text"] = "ai_input_text"
     selector: typing.Optional[str] = None
     value: typing.Optional[str] = None
@@ -50,7 +79,11 @@ class SdkAction_AiInputText(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class SdkAction_AiSelectOption(UniversalBaseModel):
+class RunSdkActionRequestAction_AiSelectOption(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
     type: typing.Literal["ai_select_option"] = "ai_select_option"
     selector: typing.Optional[str] = None
     value: typing.Optional[str] = None
@@ -68,7 +101,33 @@ class SdkAction_AiSelectOption(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class SdkAction_Extract(UniversalBaseModel):
+class RunSdkActionRequestAction_AiUploadFile(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
+    type: typing.Literal["ai_upload_file"] = "ai_upload_file"
+    selector: typing.Optional[str] = None
+    file_url: typing.Optional[str] = None
+    intention: typing.Optional[str] = None
+    data: typing.Optional[UploadFileActionData] = None
+    timeout: typing.Optional[float] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class RunSdkActionRequestAction_Extract(UniversalBaseModel):
+    """
+    The action to execute with its specific parameters
+    """
+
     type: typing.Literal["extract"] = "extract"
     prompt: typing.Optional[str] = None
     extract_schema: typing.Optional[ExtractActionExtractSchema] = None
@@ -86,4 +145,11 @@ class SdkAction_Extract(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-SdkAction = typing.Union[SdkAction_AiClick, SdkAction_AiInputText, SdkAction_AiSelectOption, SdkAction_Extract]
+RunSdkActionRequestAction = typing.Union[
+    RunSdkActionRequestAction_AiAct,
+    RunSdkActionRequestAction_AiClick,
+    RunSdkActionRequestAction_AiInputText,
+    RunSdkActionRequestAction_AiSelectOption,
+    RunSdkActionRequestAction_AiUploadFile,
+    RunSdkActionRequestAction_Extract,
+]

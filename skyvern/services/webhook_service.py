@@ -20,7 +20,7 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.core.security import generate_skyvern_webhook_headers
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
@@ -51,7 +51,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def build_sample_task_payload(run_id: str | None = None) -> str:
+def build_sample_task_payload(run_id: str | None = None) -> dict:
     """
     Build a sample task webhook payload using the real TaskResponse + TaskRunResponse models
     so schema changes are reflected automatically.
@@ -128,10 +128,10 @@ def build_sample_task_payload(run_id: str | None = None) -> str:
     )
 
     payload_dict.update(json.loads(task_run_response.model_dump_json(exclude_unset=True)))
-    return json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+    return payload_dict
 
 
-def build_sample_workflow_run_payload(run_id: str | None = None) -> str:
+def build_sample_workflow_run_payload(run_id: str | None = None) -> dict:
     """
     Build a sample workflow webhook payload using the real WorkflowRunResponseBase + WorkflowRunResponse models
     so schema changes are reflected automatically.
@@ -166,6 +166,8 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> str:
 
     payload_dict = json.loads(workflow_base.model_dump_json())
 
+    app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run_id}"
+
     workflow_run_response = WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
@@ -180,7 +182,7 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> str:
         queued_at=payload_dict.get("queued_at"),
         started_at=payload_dict.get("started_at"),
         finished_at=payload_dict.get("finished_at"),
-        app_url=f"https://app.skyvern.com/workflows/{workflow_id}/{workflow_run_id}",
+        app_url=app_url,
         browser_session_id=payload_dict.get("browser_session_id"),
         max_screenshot_scrolls=payload_dict.get("max_screenshot_scrolls"),
         script_run=None,
@@ -195,14 +197,14 @@ def build_sample_workflow_run_payload(run_id: str | None = None) -> str:
     )
 
     payload_dict.update(json.loads(workflow_run_response.model_dump_json(exclude_unset=True)))
-    return json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
+    return payload_dict
 
 
 @dataclass
 class _WebhookPayload:
     run_id: str
     run_type: str
-    payload: str
+    payload: dict
     default_webhook_url: str | None
 
 
@@ -210,13 +212,13 @@ async def build_run_preview(organization_id: str, run_id: str) -> RunWebhookPrev
     """Return the payload and headers that would be used for a replay."""
     payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
     api_key = await _get_api_key(organization_id=organization_id)
-    headers = generate_skyvern_webhook_headers(payload=payload.payload, api_key=api_key)
+    signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=api_key)
     return RunWebhookPreviewResponse(
         run_id=payload.run_id,
         run_type=payload.run_type,
         default_webhook_url=payload.default_webhook_url,
-        payload=payload.payload,
-        headers=headers,
+        payload=signed_data.signed_payload,
+        headers=signed_data.headers,
     )
 
 
@@ -226,7 +228,7 @@ async def replay_run_webhook(organization_id: str, run_id: str, target_url: str 
     """
     payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
     api_key = await _get_api_key(organization_id=organization_id)
-    headers = generate_skyvern_webhook_headers(payload=payload.payload, api_key=api_key)
+    signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=api_key)
 
     url_to_use: str | None = target_url if target_url else payload.default_webhook_url
 
@@ -237,8 +239,8 @@ async def replay_run_webhook(organization_id: str, run_id: str, target_url: str 
 
     status_code, latency_ms, response_body, error = await _deliver_webhook(
         url=validated_url,
-        payload=payload.payload,
-        headers=headers,
+        payload=signed_data.signed_payload,
+        headers=signed_data.headers,
     )
 
     return RunWebhookReplayResponse(
@@ -246,8 +248,8 @@ async def replay_run_webhook(organization_id: str, run_id: str, target_url: str 
         run_type=payload.run_type,
         default_webhook_url=payload.default_webhook_url,
         target_webhook_url=validated_url,
-        payload=payload.payload,
-        headers=headers,
+        payload=signed_data.signed_payload,
+        headers=signed_data.headers,
         status_code=status_code,
         latency_ms=latency_ms,
         response_body=response_body,
@@ -330,11 +332,10 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
         run_response_json = run_response.model_dump_json(exclude={"run_request"})
         payload_dict.update(json.loads(run_response_json))
 
-    payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
     return _WebhookPayload(
         run_id=run_id,
         run_type=run_type_str,
-        payload=payload,
+        payload=payload_dict,
         default_webhook_url=task.webhook_callback_url,
     )
 
@@ -360,12 +361,10 @@ async def _build_task_v2_payload(task_v2: TaskV2) -> _WebhookPayload:
             f"Run {task_v2.observer_cruise_id} has not reached a terminal state (status={task_run_response.status})."
         )
     task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
-
-    payload = json.dumps(json.loads(task_run_response_json), separators=(",", ":"), ensure_ascii=False)
     return _WebhookPayload(
         run_id=task_v2.observer_cruise_id,
         run_type=RunType.task_v2.value,
-        payload=payload,
+        payload=json.loads(task_run_response_json),
         default_webhook_url=task_v2.webhook_callback_url,
     )
 
@@ -405,10 +404,7 @@ async def _build_workflow_payload(
             f"Run {workflow_run_id} has not reached a terminal state (status={status_response.status})."
         )
 
-    app_url = (
-        f"{settings.SKYVERN_APP_URL.rstrip('/')}/workflows/"
-        f"{workflow_run.workflow_permanent_id}/{workflow_run.workflow_run_id}"
-    )
+    app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
 
     run_response = WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -437,12 +433,11 @@ async def _build_workflow_payload(
         )
     )
     payload_dict.update(json.loads(run_response.model_dump_json(exclude={"run_request"})))
-    payload = json.dumps(payload_dict, separators=(",", ":"), ensure_ascii=False)
 
     return _WebhookPayload(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run.value,
-        payload=payload,
+        payload=payload_dict,
         default_webhook_url=workflow_run.webhook_callback_url,
     )
 

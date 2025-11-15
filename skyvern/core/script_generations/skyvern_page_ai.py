@@ -10,18 +10,18 @@ class SkyvernPageAi(Protocol):
 
     async def ai_click(
         self,
-        selector: str,
+        selector: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
-    ) -> str:
+    ) -> str | None:
         """Click an element using AI to locate it based on intention."""
         ...
 
     async def ai_input_text(
         self,
-        selector: str,
-        value: str,
+        selector: str | None,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         totp_identifier: str | None = None,
@@ -33,19 +33,20 @@ class SkyvernPageAi(Protocol):
 
     async def ai_upload_file(
         self,
-        selector: str,
-        files: str,
+        selector: str | None,
+        files: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
+        public_url_only: bool = False,
     ) -> str:
         """Upload a file using AI to process the file URL."""
         ...
 
     async def ai_select_option(
         self,
-        selector: str,
-        value: str,
+        selector: str | None,
+        value: str | None,
         intention: str,
         data: str | dict[str, Any] | None = None,
         timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS,
@@ -62,4 +63,11 @@ class SkyvernPageAi(Protocol):
         data: str | dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
+        ...
+
+    async def ai_act(
+        self,
+        prompt: str,
+    ) -> None:
+        """Perform an action on the page using AI based on a natural language prompt."""
         ...

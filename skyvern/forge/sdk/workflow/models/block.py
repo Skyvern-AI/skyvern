@@ -113,6 +113,10 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
 
+# ForLoop constants
+DEFAULT_MAX_LOOP_ITERATIONS = 100
+DEFAULT_MAX_STEPS_PER_ITERATION = 50
+
 
 class Block(BaseModel, abc.ABC):
     # Must be unique within workflow definition
@@ -363,7 +367,13 @@ class Block(BaseModel, abc.ABC):
             # create a screenshot
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
             if not browser_state:
-                LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+                LOG.warning(
+                    "No browser state found when creating workflow_run_block",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    browser_session_id=browser_session_id,
+                    block_label=self.label,
+                )
             else:
                 try:
                     screenshot = await browser_state.take_fullpage_screenshot(
@@ -645,7 +655,10 @@ class BaseTaskBlock(Block):
                 # the first task block will create the browser state and do the navigation
                 try:
                     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run, url=self.url, browser_session_id=browser_session_id
+                        workflow_run=workflow_run,
+                        url=self.url,
+                        browser_session_id=browser_session_id,
+                        browser_profile_id=workflow_run.browser_profile_id,
                     )
                     working_page = await browser_state.get_working_page()
                     if not working_page:
@@ -1260,6 +1273,27 @@ class ForLoopBlock(Block):
         current_block: BlockTypeVar | None = None
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
+            # Check max_iterations limit
+            if loop_idx >= DEFAULT_MAX_LOOP_ITERATIONS:
+                LOG.info(
+                    f"ForLoopBlock: Reached max_iterations limit ({DEFAULT_MAX_LOOP_ITERATIONS}), stopping loop",
+                    workflow_run_id=workflow_run_id,
+                    loop_idx=loop_idx,
+                    max_iterations=DEFAULT_MAX_LOOP_ITERATIONS,
+                )
+                failure_block_result = await self.build_block_result(
+                    success=False,
+                    status=BlockStatus.failed,
+                    failure_reason=f"Reached max_loop_iterations limit of {DEFAULT_MAX_LOOP_ITERATIONS}",
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+                block_outputs.append(failure_block_result)
+                return LoopBlockExecutedResult(
+                    outputs_with_loop_values=outputs_with_loop_values,
+                    block_outputs=block_outputs,
+                    last_block=current_block,
+                )
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
             # context parameter has been deprecated. However, it's still used by task v2 - we should migrate away from it.
             context_parameters_with_value = self.get_loop_block_context_parameters(workflow_run_id, loop_over_value)
@@ -1267,6 +1301,16 @@ class ForLoopBlock(Block):
                 workflow_run_context.set_value(context_parameter.key, context_parameter.value)
 
             each_loop_output_values: list[dict[str, Any]] = []
+
+            # Track steps for current iteration
+            iteration_step_count = 0
+            LOG.info(
+                f"ForLoopBlock: Starting iteration {loop_idx} with max_steps_per_iteration={DEFAULT_MAX_STEPS_PER_ITERATION}",
+                workflow_run_id=workflow_run_id,
+                loop_idx=loop_idx,
+                max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+            )
+
             for block_idx, loop_block in enumerate(self.loop_blocks):
                 metadata: BlockMetadata = {
                     "current_index": loop_idx,
@@ -1324,6 +1368,37 @@ class ForLoopBlock(Block):
                     )
                 loop_block = original_loop_block
                 block_outputs.append(block_output)
+
+                # Check max_steps_per_iteration limit after each block execution
+                iteration_step_count += 1  # Count each block execution as a step
+                if iteration_step_count >= DEFAULT_MAX_STEPS_PER_ITERATION:
+                    LOG.info(
+                        f"ForLoopBlock: Reached max_steps_per_iteration limit ({DEFAULT_MAX_STEPS_PER_ITERATION}) in iteration {loop_idx}, stopping iteration",
+                        workflow_run_id=workflow_run_id,
+                        loop_idx=loop_idx,
+                        max_steps_per_iteration=DEFAULT_MAX_STEPS_PER_ITERATION,
+                        iteration_step_count=iteration_step_count,
+                    )
+                    # Create a failure block result for this iteration
+                    failure_block_result = await self.build_block_result(
+                        success=False,
+                        status=BlockStatus.failed,
+                        failure_reason=f"Reached max_steps_per_iteration limit of {DEFAULT_MAX_STEPS_PER_ITERATION}",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                    block_outputs.append(failure_block_result)
+                    # If continue_on_failure is False, stop the entire loop
+                    if not self.continue_on_failure:
+                        outputs_with_loop_values.append(each_loop_output_values)
+                        return LoopBlockExecutedResult(
+                            outputs_with_loop_values=outputs_with_loop_values,
+                            block_outputs=block_outputs,
+                            last_block=current_block,
+                        )
+                    # If continue_on_failure is True, break out of the block loop for this iteration
+                    break
+
                 if block_output.status == BlockStatus.canceled:
                     LOG.info(
                         f"ForLoopBlock: Block with type {loop_block.block_type} at index {block_idx} during loop {loop_idx} was canceled for workflow run {workflow_run_id}, canceling for loop",
@@ -1516,6 +1591,7 @@ class CodeBlock(Block):
             "bool": bool,
             "asyncio": asyncio,
             "re": re,
+            "json": json,
             "Exception": Exception,
         }
 
@@ -1585,6 +1661,7 @@ async def wrapper():
                     workflow_run=workflow_run,
                     url=None,  # Code block doesn't need to navigate to a URL initially
                     browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
                 # Ensure the browser state has a working page
                 await browser_state.check_and_fix_state(
@@ -1594,6 +1671,7 @@ async def wrapper():
                     organization_id=workflow_run.organization_id,
                     extra_http_headers=workflow_run.extra_http_headers,
                     browser_address=workflow_run.browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
                 )
             except Exception as e:
                 LOG.exception(
@@ -3186,8 +3264,7 @@ class HumanInteractionBlock(BaseTaskBlock):
                 organization_id=organization_id,
             )
 
-        workflow_permanent_id = workflow_run.workflow_permanent_id
-        app_url = f"{settings.SKYVERN_APP_URL}/workflows/{workflow_permanent_id}/{workflow_run_id}/overview"
+        app_url = f"{settings.SKYVERN_APP_URL}/runs/{workflow_run_id}/overview"
         body = f"{self.body}\n\nKindly visit {app_url}\n\n{self.instructions}\n\n"
         subject = f"{self.subject} - Workflow Run ID: {workflow_run_id}"
 
@@ -3426,8 +3503,17 @@ class TaskV2Block(Block):
         from skyvern.services import task_v2_service  # noqa: PLC0415
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        # Simple template resolution - no complex dynamic resolution to prevent recursion
         try:
             self.format_potential_template_parameters(workflow_run_context)
+
+            # Use the resolved values directly
+            resolved_prompt = self.prompt
+            resolved_url = self.url
+            resolved_totp_identifier = self.totp_identifier
+            resolved_totp_verification_url = self.totp_verification_url
+
         except Exception as e:
             output_reason = f"Failed to format jinja template: {str(e)}"
             await self.record_output_parameter_value(
@@ -3442,14 +3528,14 @@ class TaskV2Block(Block):
                 organization_id=organization_id,
             )
 
-        if not self.url:
+        if not resolved_url:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
             if browser_state:
                 page = await browser_state.get_working_page()
                 if page:
                     current_url = await SkyvernFrame.get_url(frame=page)
                     if current_url != "about:blank":
-                        self.url = current_url
+                        resolved_url = current_url
 
         if not organization_id:
             raise ValueError("Running TaskV2Block requires organization_id")
@@ -3463,12 +3549,12 @@ class TaskV2Block(Block):
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=organization,
-                user_prompt=self.prompt,
-                user_url=self.url,
+                user_prompt=resolved_prompt,
+                user_url=resolved_url,
                 parent_workflow_run_id=workflow_run_id,
                 proxy_location=workflow_run.proxy_location,
-                totp_identifier=self.totp_identifier,
-                totp_verification_url=self.totp_verification_url,
+                totp_identifier=resolved_totp_identifier,
+                totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             )
             await app.DATABASE.update_task_v2(

@@ -20,6 +20,7 @@ export type WorkflowCreateYAMLRequest = {
   ai_fallback?: boolean;
   run_sequentially?: boolean;
   sequential_key?: string | null;
+  folder_id?: string | null;
 };
 
 export type WorkflowDefinitionYAML = {

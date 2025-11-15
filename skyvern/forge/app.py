@@ -19,8 +19,6 @@ from skyvern.forge.sdk.services.credential.azure_credential_vault_service import
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.trace import TraceManager
-from skyvern.forge.sdk.trace.lmnr import LaminarTrace
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_manager import BrowserManager
@@ -136,7 +134,3 @@ api_app_startup_event: Callable[[], Awaitable[None]] | None = None
 api_app_shutdown_event: Callable[[], Awaitable[None]] | None = None
 
 agent = ForgeAgent()
-
-if SettingsManager.get_settings().TRACE_ENABLED:
-    if SettingsManager.get_settings().TRACE_PROVIDER == "lmnr":
-        TraceManager.set_trace_provider(LaminarTrace(api_key=SettingsManager.get_settings().TRACE_PROVIDER_API_KEY))

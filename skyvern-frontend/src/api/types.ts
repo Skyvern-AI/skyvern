@@ -1,3 +1,5 @@
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+
 export const ArtifactType = {
   Recording: "recording",
   ActionScreenshot: "screenshot_action",
@@ -374,6 +376,32 @@ export type WorkflowRunStatusApiResponse = {
   max_screenshot_scrolls: number | null;
 };
 
+export type WorkflowRunStatusApiResponseWithWorkflow = {
+  workflow_id: string;
+  workflow_run_id: string;
+  status: Status;
+  proxy_location: ProxyLocation | null;
+  webhook_callback_url: string | null;
+  extra_http_headers: Record<string, string> | null;
+  created_at: string;
+  finished_at: string;
+  modified_at: string;
+  parameters: Record<string, unknown>;
+  screenshot_urls: Array<string> | null;
+  recording_url: string | null;
+  outputs: Record<string, unknown> | null;
+  failure_reason: string | null;
+  webhook_failure_reason: string | null;
+  downloaded_file_urls: Array<string> | null;
+  total_steps: number | null;
+  total_cost: number | null;
+  task_v2: TaskV2 | null;
+  workflow_title: string | null;
+  browser_session_id: string | null;
+  max_screenshot_scrolls: number | null;
+  workflow: WorkflowApiResponse;
+};
+
 export type TaskGenerationApiResponse = {
   suggested_title: string | null;
   url: string | null;
@@ -476,6 +504,35 @@ export type CreditCardCredential = {
   card_exp_year: string;
   card_brand: string;
   card_holder_name: string;
+};
+
+export const OtpType = {
+  Totp: "totp",
+  MagicLink: "magic_link",
+} as const;
+
+export type OtpType = (typeof OtpType)[keyof typeof OtpType];
+
+export type TotpCode = {
+  totp_code_id: string;
+  totp_identifier: string | null;
+  code: string;
+  content: string;
+  workflow_run_id: string | null;
+  workflow_id: string | null;
+  task_id: string | null;
+  source: string | null;
+  otp_type: OtpType | null;
+  expired_at: string | null;
+  created_at: string;
+  modified_at: string;
+};
+
+export type TotpCodeListParams = {
+  totp_identifier?: string;
+  workflow_run_id?: string;
+  otp_type?: OtpType;
+  limit?: number;
 };
 
 export type ModelsResponse = {

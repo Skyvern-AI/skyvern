@@ -40,6 +40,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: check-version-change
     if: needs.check-version-change.outputs.version_changed == 'true' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
         working-directory: ./skyvern-ts/client
@@ -49,17 +52,21 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+      - name: Upgrade npm to a Trusted Publishing-capable version
+        run: npm i -g npm@^11.5.1
+      - name: Install Fern dependencies
+        run: npm install -g patch-package
       - name: Install dependencies
-        run: npm install
+        run: npm ci
       - name: Build CJS
         run: npx tsc --project ./tsconfig.cjs.json
       - name: Build ESM
         run: npx tsc --project ./tsconfig.esm.json
       - name: Rename ESM files
         run: node scripts/rename-to-esm-files.js dist/esm
-      - name: Publish to npm
-        run: npm publish --access public
+      - name: Publish to npm with provenance via OIDC
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+        run: npm publish --access public --provenance

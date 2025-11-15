@@ -559,6 +559,8 @@ export type WorkflowApiResponse = {
   ai_fallback: boolean | null;
   run_sequentially: boolean | null;
   sequential_key: string | null;
+  folder_id: string | null;
+  import_error: string | null;
 };
 
 export type WorkflowSettings = {
@@ -582,3 +584,9 @@ export function isOutputParameter(
 ): parameter is OutputParameter {
   return parameter.parameter_type === "output";
 }
+
+export type ImprovePromptForWorkflowResponse = {
+  error: string | null;
+  improved: string;
+  original: string;
+};

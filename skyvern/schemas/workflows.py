@@ -14,6 +14,8 @@ class WorkflowStatus(StrEnum):
     published = "published"
     draft = "draft"
     auto_generated = "auto_generated"
+    importing = "importing"
+    import_failed = "import_failed"
 
 
 class BlockType(StrEnum):
@@ -560,6 +562,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     cache_key: str | None = "default"
     run_sequentially: bool = False
     sequential_key: str | None = None
+    folder_id: str | None = None
 
 
 class WorkflowRequest(BaseModel):

@@ -1,11 +1,12 @@
-import json
+from typing import Any
 
 import structlog
 from fastapi import Depends, HTTPException, status
 
-from skyvern import SkyvernPage
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
+from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes.routers import base_router
@@ -95,8 +96,8 @@ async def run_sdk_action(
     task = await app.DATABASE.create_task(
         organization_id=organization_id,
         url=action_request.url,
-        navigation_goal=None,
-        navigation_payload=None,
+        navigation_goal=action.get_navigation_goal(),
+        navigation_payload=action.get_navigation_payload(),
         data_extraction_goal=None,
         title=f"SDK Action Task: {action_request.action.type}",
         workflow_run_id=workflow_run.workflow_run_id,
@@ -118,6 +119,18 @@ async def run_sdk_action(
         task_id=task.task_id,
     )
 
+    await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+        organization,
+        workflow_run.workflow_run_id,
+        workflow.title,
+        workflow.workflow_id,
+        workflow.workflow_permanent_id,
+        [],
+        [],
+        [],
+        [],
+    )
+
     context = skyvern_context.ensure_context()
     skyvern_context.set(
         SkyvernContext(
@@ -131,9 +144,9 @@ async def run_sdk_action(
             workflow_run_id=workflow_run.workflow_run_id,
         )
     )
-    result = None
+    result: Any | None = None
     try:
-        scraped_page = await SkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
+        scraped_page = await ScriptSkyvernPage.create_scraped_page(browser_session_id=browser_session_id)
         page = await scraped_page._browser_state.must_get_working_page()
         page_ai = RealSkyvernPageAi(scraped_page, page)
 
@@ -162,6 +175,21 @@ async def run_sdk_action(
                 data=action.data,
                 timeout=action.timeout,
             )
+        elif action.type == "ai_upload_file":
+            if action.file_url and not validate_download_url(action.file_url):
+                raise HTTPException(status_code=400, detail="Unsupported file url")
+            result = await page_ai.ai_upload_file(
+                selector=action.selector,
+                files=action.file_url,
+                intention=action.intention,
+                data=action.data,
+                timeout=action.timeout,
+            )
+        elif action.type == "ai_act":
+            await page_ai.ai_act(
+                prompt=action.intention,
+            )
+            result = None
         elif action.type == "extract":
             extract_result = await page_ai.ai_extract(
                 prompt=action.prompt,
@@ -170,7 +198,7 @@ async def run_sdk_action(
                 intention=action.intention,
                 data=action.data,
             )
-            result = json.dumps(extract_result)
+            result = extract_result
     finally:
         skyvern_context.reset()
 

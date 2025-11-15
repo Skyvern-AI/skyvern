@@ -60,7 +60,6 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
-    download_file,
     get_download_dir,
     list_downloading_files_in_directory,
     list_files_in_directory,
@@ -69,6 +68,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -634,6 +634,14 @@ async def handle_click_action(
                         "No download triggered, not closing the extra page",
                         workflow_run_id=task.workflow_run_id,
                     )
+    elif action.file_url:
+        upload_file_action = UploadFileAction(
+            reasoning=action.reasoning,
+            intention=action.intention,
+            element_id=action.element_id,
+            file_url=action.file_url,
+        )
+        return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
         incremental_scraped: IncrementalScrapePage | None = None
         try:
@@ -1096,16 +1104,46 @@ async def handle_input_text_action(
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
 
-    input_or_select_context = await _get_input_or_select_context(
-        action=action,
-        element_tree_builder=scraped_page,
-        skyvern_element=skyvern_element,
-        step=step,
-    )
+    # OPTIMIZATION: Skip expensive LLM context parsing for TOTP and secret values
+    # TOTP inputs don't need autocomplete detection - we already have the generated code
+    # This saves ~4-5s per TOTP digit (6 digits = ~27s saved for 2FA!)
+    # Gated by ENABLE_SPEED_OPTIMIZATIONS feature flag
+    skip_context_parsing = False
+    if (
+        is_totp_value
+        or is_secret_value
+        or (action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
+    ):
+        try:
+            current_context = skyvern_current()
+            enable_speed_optimizations = current_context.enable_speed_optimizations if current_context else False
+
+            if enable_speed_optimizations:
+                skip_context_parsing = True
+                LOG.info(
+                    "Speed optimization: Skipping input context parsing for TOTP/secret input",
+                    element_id=skyvern_element.get_id(),
+                    is_totp=is_totp_value,
+                    is_secret=is_secret_value,
+                    is_multi_field_totp=bool(action.totp_timing_info),
+                )
+        except Exception:
+            LOG.warning("Failed to read ENABLE_SPEED_OPTIMIZATIONS from context for TOTP optimization", exc_info=True)
+
+    if skip_context_parsing:
+        input_or_select_context = None
+    else:
+        input_or_select_context = await _get_input_or_select_context(
+            action=action,
+            element_tree_builder=scraped_page,
+            skyvern_element=skyvern_element,
+            step=step,
+        )
 
     # check if it's selectable
     if (
-        not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
+        input_or_select_context is not None
+        and not input_or_select_context.is_search_bar  # no need to to trigger selection logic for search bar
         and not is_totp_value
         and not is_secret_value
         and skyvern_element.get_tag_name() == InteractiveElement.INPUT
@@ -1361,7 +1399,8 @@ async def handle_input_text_action(
             return [ActionSuccess()]
 
         if not await skyvern_element.is_raw_input():
-            if await skyvern_element.is_auto_completion_input() or input_or_select_context.is_location_input:
+            is_location_input = input_or_select_context.is_location_input if input_or_select_context else False
+            if input_or_select_context and (await skyvern_element.is_auto_completion_input() or is_location_input):
                 if result := await input_or_auto_complete_input(
                     input_or_select_context=input_or_select_context,
                     scraped_page=scraped_page,
@@ -1481,8 +1520,16 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await download_file(file_url)
+    file_path = await handler_utils.download_file(file_url, action.model_dump())
     is_file_input = await skyvern_element.is_file_input()
+
+    if not is_file_input:
+        LOG.info("Trying to find file input in children", action=action)
+        file_input_locator = await skyvern_element.find_file_input_in_children()
+        if file_input_locator:
+            LOG.info("Found file input in children", action=action)
+            locator = file_input_locator
+            is_file_input = True
 
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
@@ -1508,6 +1555,7 @@ async def handle_upload_file_action(
             page,
             action,
             skyvern_element,
+            pending_upload_files=file_path,
             timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
@@ -1648,6 +1696,7 @@ async def handle_select_option_action(
         )
 
         try:
+            await skyvern_element.scroll_into_view()
             blocking_element, exist = await skyvern_element.find_blocking_element(dom=dom)
         except Exception:
             LOG.warning(
@@ -1962,7 +2011,32 @@ async def handle_complete_action(
             )
             return [ActionFailure(exception=e)]
 
-        if not verification_result.user_goal_achieved:
+        # Check if we should terminate instead of complete
+        # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
+        if verification_result.is_terminate:
+            LOG.warning(
+                "CompleteAction verification determined task should terminate instead (termination-aware experiment)",
+                workflow_run_id=task.workflow_run_id,
+                thoughts=verification_result.thoughts,
+                status=verification_result.status if verification_result.status else "legacy",
+            )
+            # Create a TerminateAction and execute it
+            terminate_action = actions.TerminateAction(
+                reasoning=verification_result.thoughts,
+                organization_id=action.organization_id,
+                workflow_run_id=action.workflow_run_id,
+                task_id=action.task_id,
+                step_id=action.step_id,
+                step_order=action.step_order,
+                action_order=action.action_order,
+            )
+            results = await handle_terminate_action(terminate_action, page, scraped_page, task, step)
+            action.action_type = ActionType.TERMINATE
+            action.reasoning = terminate_action.reasoning
+            action.errors = terminate_action.errors
+            return results
+
+        if not verification_result.is_complete:
             return [ActionFailure(exception=IllegitComplete(data={"error": verification_result.thoughts}))]
 
         LOG.info(
@@ -1970,13 +2044,6 @@ async def handle_complete_action(
             workflow_run_id=task.workflow_run_id,
         )
         action.verified = True
-
-        if not task.data_extraction_goal and verification_result.thoughts:
-            await app.DATABASE.update_task(
-                task.task_id,
-                organization_id=task.organization_id,
-                extracted_information=verification_result.thoughts,
-            )
 
     return [ActionSuccess()]
 
@@ -2162,6 +2229,7 @@ async def chain_click(
     page: Page,
     action: ClickAction | UploadFileAction,
     skyvern_element: SkyvernElement,
+    pending_upload_files: list[str] | str | None = None,
     timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
@@ -2172,8 +2240,8 @@ async def chain_click(
     locator = skyvern_element.locator
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
-    file: list[str] | str = []
-    if action.file_url:
+    file = pending_upload_files or []
+    if not file and action.file_url:
         file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
         file = await handler_utils.download_file(file_url, action.model_dump())
 
@@ -2344,9 +2412,9 @@ async def chain_click(
     finally:
         LOG.info("Remove file chooser listener", action=action)
 
+        # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         # Sleep for 15 seconds after uploading a file to let the page process it
         # Removing this breaks file uploads using the filechooser
-        # KEREM DO NOT REMOVE
         if file:
             await asyncio.sleep(15)
         page.remove_listener("filechooser", fc_func)
@@ -2384,7 +2452,7 @@ async def choose_auto_completion_dropdown(
     try:
         await skyvern_element.press_fill(text)
         # wait for new elemnts to load
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -3130,6 +3198,7 @@ async def select_from_dropdown(
                 reasoning=select_reason,
                 element_id=element_id,
                 option=SelectOption(label=value),
+                input_or_select_context=context,
             )
             results = await normal_select(
                 action=action, skyvern_element=selected_element, task=task, step=step, builder=incremental_scraped
