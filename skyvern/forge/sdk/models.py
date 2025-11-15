@@ -39,6 +39,22 @@ class StepStatus(StrEnum):
         return self in status_is_terminal
 
 
+class SpeculativeLLMMetadata(BaseModel):
+    prompt: str
+    llm_request_json: str
+    llm_response_json: str | None = None
+    parsed_response_json: str | None = None
+    rendered_response_json: str | None = None
+    llm_key: str | None = None
+    model: str | None = None
+    duration_seconds: float | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    llm_cost: float | None = None
+
+
 class Step(BaseModel):
     created_at: datetime
     modified_at: datetime
@@ -55,6 +71,9 @@ class Step(BaseModel):
     reasoning_token_count: int | None = None
     cached_token_count: int | None = None
     step_cost: float = 0
+    is_speculative: bool = False
+    speculative_original_status: StepStatus | None = None
+    speculative_llm_metadata: SpeculativeLLMMetadata | None = None
 
     def validate_update(
         self,
@@ -64,7 +83,7 @@ class Step(BaseModel):
     ) -> None:
         old_status = self.status
 
-        if status and not old_status.can_update_to(status):
+        if status and status != old_status and not old_status.can_update_to(status):
             raise ValueError(f"invalid_status_transition({old_status},{status},{self.step_id})")
 
         if status == StepStatus.canceled:
@@ -83,6 +102,7 @@ class Step(BaseModel):
             old_status not in [StepStatus.running, StepStatus.created]
             and self.output is not None
             and output is not None
+            and not (status == old_status == StepStatus.completed)
         ):
             raise ValueError(f"cant_override_output({self.step_id})")
 
