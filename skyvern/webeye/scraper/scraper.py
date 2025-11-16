@@ -112,7 +112,7 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
     if element.get("hoverOnly"):
-        attributes["data-skyvern-hover-only"] = "true"
+        attributes["data-hover"] = "1"
 
     interactable = element.get("interactable", False)
     if element.get("isDropped", False):
@@ -212,7 +212,7 @@ def build_element_dict(
 
     for element in elements:
         element_id: str = element.get("id", "")
-        # get_interactable_element_tree marks each interactable element with a unique_id attribute
+        # get_interactable_element_tree marks each interactable element with a SKYVERN_ID_ATTR attribute
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
         id_to_frame_dict[element_id] = element["frame"]
@@ -687,16 +687,18 @@ async def add_frame_interactable_elements(
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
         if not await frame_element.is_visible():
             return elements, element_tree
-        unique_id = await frame_element.get_attribute("unique_id")
-        if not unique_id:
+        skyvern_id = await frame_element.get_attribute(SKYVERN_ID_ATTR)
+        if not skyvern_id:
             LOG.info(
-                "No unique_id found for frame, skipping",
+                "No Skyvern id found for frame, skipping",
                 frame_index=frame_index,
+                attr=SKYVERN_ID_ATTR,
             )
             return elements, element_tree
     except Exception:
         LOG.warning(
-            "Unable to get unique_id from frame_element",
+            "Unable to get Skyvern id from frame_element",
+            attr=SKYVERN_ID_ATTR,
             exc_info=True,
         )
         return elements, element_tree
@@ -705,11 +707,11 @@ async def add_frame_interactable_elements(
     await skyvern_frame.safe_wait_for_animation_end()
 
     frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
-        frame_name=unique_id, frame_index=frame_index
+        frame_name=skyvern_id, frame_index=frame_index
     )
 
     for element in elements:
-        if element["id"] == unique_id:
+        if element["id"] == skyvern_id:
             element["children"] = frame_element_tree
 
     elements = elements + frame_elements
