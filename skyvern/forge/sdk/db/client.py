@@ -532,6 +532,7 @@ class AgentDB:
                         select(StepModel)
                         .filter_by(task_id=task_id)
                         .filter_by(organization_id=organization_id)
+                        .filter(StepModel.status != StepStatus.canceled)
                         .order_by(StepModel.order.desc())
                         .order_by(StepModel.retry_index.desc())
                     )

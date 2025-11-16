@@ -3138,12 +3138,11 @@ class ForgeAgent:
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
-            await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
+            await self.execute_task_webhook(task=task, api_key=api_key)
 
     async def execute_task_webhook(
         self,
         task: Task,
-        last_step: Step | None,
         api_key: str | None,
     ) -> None:
         if not api_key:
@@ -3159,6 +3158,7 @@ class ForgeAgent:
                 task_id=task.task_id,
             )
             return
+        last_step = await app.DATABASE.get_latest_step(task.task_id, organization_id=task.organization_id)
 
         task_response = await self.build_task_response(task=task, last_step=last_step)
         # try to build the new TaskRunResponse for backward compatibility
