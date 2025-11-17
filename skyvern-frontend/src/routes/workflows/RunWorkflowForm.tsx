@@ -277,6 +277,7 @@ function RunWorkflowForm({
     unknown
   > | null>(null);
   const [cacheKeyValue, setCacheKeyValue] = useState<string>("");
+  const [isFormReset, setIsFormReset] = useState(false);
   const cacheKey = workflow?.cache_key ?? "default";
 
   useEffect(() => {
@@ -314,6 +315,33 @@ function RunWorkflowForm({
     return () => subscription.unsubscribe();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Reset form with initial values after all fields are registered
+  useEffect(() => {
+    form.reset({
+      ...initialValues,
+      webhookCallbackUrl: initialSettings.webhookCallbackUrl,
+      proxyLocation: initialSettings.proxyLocation,
+      browserSessionId: null,
+      cdpAddress: initialSettings.cdpAddress,
+      maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
+      extraHttpHeaders: initialSettings.extraHttpHeaders
+        ? JSON.stringify(initialSettings.extraHttpHeaders)
+        : null,
+      runWithCode: workflow?.run_with === "code",
+      aiFallback: workflow?.ai_fallback ?? true,
+    });
+    setIsFormReset(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Trigger validation after form is reset and re-rendered
+  useEffect(() => {
+    if (isFormReset) {
+      form.trigger();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isFormReset]);
 
   // if we're coming from debugger, block scripts may already be cached; let's ensure we bust it
   // on mount
@@ -379,7 +407,14 @@ function RunWorkflowForm({
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          // Allow submission even with validation warnings
+          onSubmit(form.getValues());
+        }}
+        className="space-y-8"
+      >
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
             <h1 className="text-lg">Input Parameters</h1>
@@ -409,12 +444,12 @@ function RunWorkflowForm({
                       parameter.workflow_parameter_type === "string" &&
                       (value === null || value === "")
                     ) {
-                      return "This field is required";
+                      return "Warning: you left this field empty";
                     }
 
                     // For all other types, check for null/undefined
                     if (value === null || value === undefined) {
-                      return "This field is required";
+                      return "Warning: you left this field empty";
                     }
                   },
                 }}
@@ -446,7 +481,7 @@ function RunWorkflowForm({
                             />
                           </FormControl>
                           {form.formState.errors[parameter.key] && (
-                            <div className="text-destructive">
+                            <div className="text-warning">
                               {form.formState.errors[parameter.key]?.message}
                             </div>
                           )}
