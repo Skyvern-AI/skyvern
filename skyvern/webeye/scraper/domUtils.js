@@ -429,7 +429,10 @@ function isHoverOnlyElement(element) {
 
   // Check if parent has hover-related attributes or classes that might reveal this element
   let parent = element.parentElement;
-  while (parent && parent !== document.body) {
+  let depth = 0;
+  // Cap recursion to avoid walking the entire tree and bloating prompts
+  const maxDepth = 5;
+  while (parent && parent !== document.body && depth < maxDepth) {
     const parentClass = parent.className?.toString() ?? "";
     if (
       parentClass.includes("hover") ||
@@ -440,6 +443,7 @@ function isHoverOnlyElement(element) {
       return true;
     }
     parent = parent.parentElement;
+    depth += 1;
   }
 
   return false;
