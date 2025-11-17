@@ -1908,6 +1908,43 @@ function convertParametersToParameterYAML(
     .filter(Boolean);
 }
 
+function cloneBlockArray(blocks: Array<BlockYAML>): Array<BlockYAML> {
+  return JSON.parse(JSON.stringify(blocks));
+}
+
+function assignSequentialNextBlockLabels(blocks: Array<BlockYAML>): void {
+  if (!blocks || blocks.length === 0) {
+    return;
+  }
+
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index]!;
+    const nextBlock =
+      index < blocks.length - 1 ? blocks[index + 1]! : undefined;
+    block.next_block_label = nextBlock ? nextBlock.label : null;
+
+    if (block.block_type === "for_loop") {
+      const loopBlock = block as ForLoopBlockYAML;
+      assignSequentialNextBlockLabels(loopBlock.loop_blocks);
+    }
+  }
+}
+
+export function upgradeWorkflowDefinitionToVersionTwo(
+  blocks: Array<BlockYAML>,
+  currentVersion?: number | null,
+): { blocks: Array<BlockYAML>; version: number } {
+  const clonedBlocks = cloneBlockArray(blocks);
+  const baseVersion = currentVersion ?? 1;
+
+  if (baseVersion <= 2) {
+    assignSequentialNextBlockLabels(clonedBlocks);
+    return { blocks: clonedBlocks, version: 2 };
+  }
+
+  return { blocks: clonedBlocks, version: baseVersion };
+}
+
 function convertBlocksToBlockYAML(
   blocks: Array<WorkflowBlock>,
 ): Array<BlockYAML> {
@@ -1915,6 +1952,7 @@ function convertBlocksToBlockYAML(
     const base = {
       label: block.label,
       continue_on_failure: block.continue_on_failure,
+      next_block_label: block.next_block_label,
     };
     switch (block.block_type) {
       case "task": {
@@ -2216,6 +2254,7 @@ function convertBlocksToBlockYAML(
 }
 
 function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
+  const workflowDefinitionVersion = workflow.workflow_definition.version ?? 1;
   const userParameters = workflow.workflow_definition.parameters.filter(
     (parameter) => parameter.parameter_type !== WorkflowParameterTypes.Output,
   );
@@ -2230,6 +2269,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,
     extra_http_headers: workflow.extra_http_headers,
     workflow_definition: {
+      version: workflowDefinitionVersion,
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
     },
