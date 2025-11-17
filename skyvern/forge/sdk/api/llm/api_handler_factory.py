@@ -54,20 +54,41 @@ class LLMAPIHandlerFactory:
     _prompt_caching_settings: dict[str, bool] | None = None
 
     @staticmethod
+    def _extract_token_counts(response: ModelResponse | CustomStreamWrapper) -> tuple[int, int, int, int]:
+        """Extract token counts from response usage information."""
+        input_tokens = 0
+        output_tokens = 0
+        reasoning_tokens = 0
+        cached_tokens = 0
+
+        if hasattr(response, "usage") and response.usage:
+            input_tokens = getattr(response.usage, "prompt_tokens", 0)
+            output_tokens = getattr(response.usage, "completion_tokens", 0)
+
+            # Extract reasoning tokens from completion_tokens_details
+            completion_token_detail = getattr(response.usage, "completion_tokens_details", None)
+            if completion_token_detail:
+                reasoning_tokens = getattr(completion_token_detail, "reasoning_tokens", 0) or 0
+
+            # Extract cached tokens from prompt_tokens_details
+            cached_token_detail = getattr(response.usage, "prompt_tokens_details", None)
+            if cached_token_detail:
+                cached_tokens = getattr(cached_token_detail, "cached_tokens", 0) or 0
+
+            # Fallback: Some providers expose cache_read_input_tokens directly on usage
+            if cached_tokens == 0:
+                cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+
+        return input_tokens, output_tokens, reasoning_tokens, cached_tokens
+
+    @staticmethod
     def _apply_thinking_budget_optimization(
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
         """Apply thinking budget optimization based on model type and LiteLLM reasoning support."""
-        # Compute a safe model label and a representative model for capability checks
-        model_label = getattr(llm_config, "model_name", None)
-        if model_label is None and isinstance(llm_config, LLMRouterConfig):
-            model_label = getattr(llm_config, "main_model_group", "router")
-        check_model = model_label
-        if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
-            try:
-                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
-            except Exception:
-                check_model = model_label
+        model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+        check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
+
         try:
             # Early return if model doesn't support reasoning
             if check_model and not litellm.supports_reasoning(model=check_model):
@@ -78,7 +99,6 @@ class LLMAPIHandlerFactory:
                     model=model_label,
                 )
                 return
-
             # Apply optimization based on model type
             model_label_lower = (model_label or "").lower()
             if "gemini" in model_label_lower:
@@ -101,7 +121,6 @@ class LLMAPIHandlerFactory:
                     reasoning_effort="low",
                     model=model_label,
                 )
-
         except (AttributeError, KeyError, TypeError) as e:
             LOG.warning(
                 "Failed to apply thinking budget optimization",
@@ -117,14 +136,11 @@ class LLMAPIHandlerFactory:
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
         """Apply thinking optimization for Anthropic/Claude models."""
+        model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+
         if llm_config.reasoning_effort is not None:
             # Use reasoning_effort if configured in LLM config - always use "low" per LiteLLM constants
             parameters["reasoning_effort"] = "low"
-            # Get safe model label for logging
-            model_label = getattr(llm_config, "model_name", None)
-            if model_label is None and isinstance(llm_config, LLMRouterConfig):
-                model_label = getattr(llm_config, "main_model_group", "router")
-
             LOG.info(
                 "Applied thinking budget optimization (reasoning_effort)",
                 prompt_name=prompt_name,
@@ -138,11 +154,6 @@ class LLMAPIHandlerFactory:
                 parameters["thinking"]["budget_tokens"] = new_budget
             else:
                 parameters["thinking"] = {"budget_tokens": new_budget, "type": "enabled"}
-            # Get safe model label for logging
-            model_label = getattr(llm_config, "model_name", None)
-            if model_label is None and isinstance(llm_config, LLMRouterConfig):
-                model_label = getattr(llm_config, "main_model_group", "router")
-
             LOG.info(
                 "Applied thinking budget optimization (thinking)",
                 prompt_name=prompt_name,
@@ -155,6 +166,8 @@ class LLMAPIHandlerFactory:
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
         """Apply thinking optimization for Gemini models using exact integer budget value."""
+        model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+
         if "thinking" in parameters and isinstance(parameters["thinking"], dict):
             parameters["thinking"]["budget_tokens"] = new_budget
         else:
@@ -162,17 +175,32 @@ class LLMAPIHandlerFactory:
             if settings.GEMINI_INCLUDE_THOUGHT:
                 thinking_payload["type"] = "enabled"
             parameters["thinking"] = thinking_payload
-        # Get safe model label for logging
-        model_label = getattr(llm_config, "model_name", None)
-        if model_label is None and isinstance(llm_config, LLMRouterConfig):
-            model_label = getattr(llm_config, "main_model_group", "router")
-
         LOG.info(
             "Applied thinking budget optimization (budget_tokens)",
             prompt_name=prompt_name,
             budget=new_budget,
             model=model_label,
         )
+
+    @staticmethod
+    def _get_model_label(llm_config: LLMConfig | LLMRouterConfig) -> str | None:
+        """Extract a safe model label from LLMConfig or LLMRouterConfig for logging and capability checks."""
+        model_label = getattr(llm_config, "model_name", None)
+        # Compute a safe model label and a representative model for capability checks
+        if model_label is None and isinstance(llm_config, LLMRouterConfig):
+            model_label = getattr(llm_config, "main_model_group", "router")
+        return model_label
+
+    @staticmethod
+    def _get_check_model(llm_config: LLMConfig | LLMRouterConfig, model_label: str | None) -> str | None:
+        """Get a representative model name for capability checks from LLMRouterConfig or use the model label."""
+        check_model = model_label
+        if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
+            try:
+                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
+            except Exception:
+                check_model = model_label
+        return check_model
 
     @staticmethod
     def get_override_llm_api_handler(override_llm_key: str | None, *, default: LLMAPIHandler) -> LLMAPIHandler:
@@ -396,40 +424,16 @@ class LLMAPIHandlerFactory:
                     thought=thought,
                     ai_suggestion=ai_suggestion,
                 )
-            prompt_tokens = 0
-            completion_tokens = 0
-            reasoning_tokens = 0
-            cached_tokens = 0
-            completion_token_detail = None
-            cached_token_detail = None
             try:
                 # FIXME: volcengine doesn't support litellm cost calculation.
                 llm_cost = litellm.completion_cost(completion_response=response)
             except Exception as e:
                 LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
-            prompt_tokens = 0
-            completion_tokens = 0
-            reasoning_tokens = 0
-            cached_tokens = 0
 
-            if hasattr(response, "usage") and response.usage:
-                prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
-                completion_tokens = getattr(response.usage, "completion_tokens", 0)
-
-                # Extract reasoning tokens from completion_tokens_details
-                completion_token_detail = getattr(response.usage, "completion_tokens_details", None)
-                if completion_token_detail:
-                    reasoning_tokens = getattr(completion_token_detail, "reasoning_tokens", 0) or 0
-
-                # Extract cached tokens from prompt_tokens_details
-                cached_token_detail = getattr(response.usage, "prompt_tokens_details", None)
-                if cached_token_detail:
-                    cached_tokens = getattr(cached_token_detail, "cached_tokens", 0) or 0
-
-                # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
-                if cached_tokens == 0:
-                    cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens = (
+                LLMAPIHandlerFactory._extract_token_counts(response)
+            )
             if step and not is_speculative_step:
                 await app.DATABASE.update_step(
                     task_id=step.task_id,
@@ -534,6 +538,15 @@ class LLMAPIHandlerFactory:
 
         # For OpenRouter models, use LLMCaller which has native OpenRouter support
         if llm_key.startswith("openrouter/"):
+            llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
+            return llm_caller.call
+
+        # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for custom header support
+        if (
+            llm_key == "OPENAI_COMPATIBLE"
+            and settings.OPENAI_COMPATIBLE_API_BASE
+            and settings.GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
+        ):
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
@@ -735,40 +748,16 @@ class LLMAPIHandlerFactory:
                     ai_suggestion=ai_suggestion,
                 )
 
-            prompt_tokens = 0
-            completion_tokens = 0
-            reasoning_tokens = 0
-            cached_tokens = 0
-            completion_token_detail = None
-            cached_token_detail = None
             try:
                 # FIXME: volcengine doesn't support litellm cost calculation.
                 llm_cost = litellm.completion_cost(completion_response=response)
             except Exception as e:
                 LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
-            prompt_tokens = 0
-            completion_tokens = 0
-            reasoning_tokens = 0
-            cached_tokens = 0
 
-            if hasattr(response, "usage") and response.usage:
-                prompt_tokens = getattr(response.usage, "prompt_tokens", 0)
-                completion_tokens = getattr(response.usage, "completion_tokens", 0)
-
-                # Extract reasoning tokens from completion_tokens_details
-                completion_token_detail = getattr(response.usage, "completion_tokens_details", None)
-                if completion_token_detail:
-                    reasoning_tokens = getattr(completion_token_detail, "reasoning_tokens", 0) or 0
-
-                # Extract cached tokens from prompt_tokens_details
-                cached_token_detail = getattr(response.usage, "prompt_tokens_details", None)
-                if cached_token_detail:
-                    cached_tokens = getattr(cached_token_detail, "cached_tokens", 0) or 0
-
-                # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
-                if cached_tokens == 0:
-                    cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens = (
+                LLMAPIHandlerFactory._extract_token_counts(response)
+            )
 
             if step:
                 await app.DATABASE.update_step(
@@ -910,6 +899,16 @@ class LLMCaller:
         if self.llm_key.startswith("openrouter/"):
             self.llm_key = self.llm_key.replace("openrouter/", "")
             self.openai_client = AsyncOpenAI(api_key=settings.OPENROUTER_API_KEY, base_url=settings.OPENROUTER_API_BASE)
+        elif (
+            self.llm_key == "OPENAI_COMPATIBLE"
+            and settings.OPENAI_COMPATIBLE_API_BASE
+            and settings.GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
+        ):
+            # For GitHub Copilot, use the actual model name (e.g., "claude-sonnet-4.5")
+            self.llm_key = settings.OPENAI_COMPATIBLE_MODEL_NAME or self.llm_key
+            self.openai_client = AsyncOpenAI(
+                api_key=settings.OPENAI_COMPATIBLE_API_KEY, base_url=settings.OPENAI_COMPATIBLE_API_BASE
+            )
 
     def add_tool_result(self, tool_result: dict[str, Any]) -> None:
         self.current_tool_results.append(tool_result)
@@ -1175,11 +1174,18 @@ class LLMCaller:
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         if self.openai_client:
-            # Extract OpenRouter-specific parameters
+            # Extract OpenRouter-specific and GitHub Copilot-specific parameters
             extra_headers = {}
             if settings.SKYVERN_APP_URL:
                 extra_headers["HTTP-Referer"] = settings.SKYVERN_APP_URL
                 extra_headers["X-Title"] = "Skyvern"
+
+            # Add Copilot-Vision-Request header for GitHub Copilot
+            if (
+                settings.OPENAI_COMPATIBLE_API_BASE
+                and settings.GITHUB_COPILOT_DOMAIN in settings.OPENAI_COMPATIBLE_API_BASE
+            ):
+                extra_headers["Copilot-Vision-Request"] = "true"
 
             # Filter out parameters that OpenAI client doesn't support
             openai_params = {}
@@ -1314,8 +1320,24 @@ class LLMCaller:
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
+
+        # Skip cost calculation for OpenRouter as it has its own pricing
         if self.original_llm_key.startswith("openrouter/"):
             return empty_call_stats
+
+        # Handle OPENAI_COMPATIBLE providers (GitHub Copilot, custom endpoints, etc.)
+        # These don't have pricing info in litellm, so we skip cost calculation but still extract token counts
+        if self.original_llm_key == "OPENAI_COMPATIBLE" and isinstance(response, (ModelResponse, CustomStreamWrapper)):
+            input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
+                response
+            )
+            return LLMCallStats(
+                llm_cost=None,  # TODO: calculate the cost according to the price: https://github.com/features/copilot/plans
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=cached_tokens,
+                reasoning_tokens=reasoning_tokens,
+            )
 
         # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)
         if isinstance(response, UITarsResponse):
@@ -1347,28 +1369,9 @@ class LLMCaller:
             except Exception as e:
                 LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
                 llm_cost = 0
-            input_tokens = 0
-            output_tokens = 0
-            reasoning_tokens = 0
-            cached_tokens = 0
-
-            if hasattr(response, "usage") and response.usage:
-                input_tokens = getattr(response.usage, "prompt_tokens", 0)
-                output_tokens = getattr(response.usage, "completion_tokens", 0)
-
-                # Extract reasoning tokens from completion_tokens_details
-                completion_token_detail = getattr(response.usage, "completion_tokens_details", None)
-                if completion_token_detail:
-                    reasoning_tokens = getattr(completion_token_detail, "reasoning_tokens", 0) or 0
-
-                # Extract cached tokens from prompt_tokens_details
-                cached_token_detail = getattr(response.usage, "prompt_tokens_details", None)
-                if cached_token_detail:
-                    cached_tokens = getattr(cached_token_detail, "cached_tokens", 0) or 0
-
-                # Fallback for Vertex/Gemini: LiteLLM exposes cache_read_input_tokens on usage
-                if cached_tokens == 0:
-                    cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
+                response
+            )
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=input_tokens,
