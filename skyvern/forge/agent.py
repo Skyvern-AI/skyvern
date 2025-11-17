@@ -1234,7 +1234,13 @@ class ForgeAgent:
                         "is_retry": step.retry_index > 0,
                     }
 
-                results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
+                results = await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=current_page,
+                    action=action,
+                )
                 await app.AGENT_FUNCTION.post_action_execution(action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
