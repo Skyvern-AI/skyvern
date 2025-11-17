@@ -1234,7 +1234,13 @@ class ForgeAgent:
                         "is_retry": step.retry_index > 0,
                     }
 
-                results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
+                results = await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=current_page,
+                    action=action,
+                )
                 await app.AGENT_FUNCTION.post_action_execution(action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
@@ -3138,12 +3144,11 @@ class ForgeAgent:
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
-            await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
+            await self.execute_task_webhook(task=task, api_key=api_key)
 
     async def execute_task_webhook(
         self,
         task: Task,
-        last_step: Step | None,
         api_key: str | None,
     ) -> None:
         if not api_key:
@@ -3159,6 +3164,7 @@ class ForgeAgent:
                 task_id=task.task_id,
             )
             return
+        last_step = await app.DATABASE.get_latest_step(task.task_id, organization_id=task.organization_id)
 
         task_response = await self.build_task_response(task=task, last_step=last_step)
         # try to build the new TaskRunResponse for backward compatibility
