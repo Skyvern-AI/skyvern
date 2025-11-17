@@ -112,7 +112,7 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
 
     if element.get("hoverOnly"):
-        attributes["data-hover"] = "1"
+        attributes["hoverable"] = "true"
 
     interactable = element.get("interactable", False)
     if element.get("isDropped", False):
