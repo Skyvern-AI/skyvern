@@ -6420,6 +6420,25 @@
         "title": "ExtractAction",
         "description": "Extract data action parameters."
       },
+      "LocateElementAction": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "locate_element",
+            "title": "Type",
+            "default": "locate_element"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "description": "Natural language prompt to locate an element",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "LocateElementAction",
+        "description": "Locate element action parameters."
+      },
       "ExtractionBlock": {
         "properties": {
           "label": {
@@ -10915,6 +10934,9 @@
               },
               {
                 "$ref": "#/components/schemas/ExtractAction"
+              },
+              {
+                "$ref": "#/components/schemas/LocateElementAction"
               }
             ],
             "title": "Action",
@@ -10927,7 +10949,8 @@
                 "ai_input_text": "#/components/schemas/InputTextAction",
                 "ai_select_option": "#/components/schemas/SelectOptionAction",
                 "ai_upload_file": "#/components/schemas/UploadFileAction",
-                "extract": "#/components/schemas/ExtractAction"
+                "extract": "#/components/schemas/ExtractAction",
+                "locate_element": "#/components/schemas/LocateElementAction"
               }
             }
           }
