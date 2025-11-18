@@ -160,9 +160,6 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

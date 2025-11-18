@@ -225,7 +225,6 @@ class TaskBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
@@ -257,9 +256,6 @@ class CodeBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
-DEFAULT_TEXT_PROMPT_LLM_KEY = settings.SECONDARY_LLM_KEY or settings.LLM_KEY
-
-
 class TextPromptBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -267,7 +263,7 @@ class TextPromptBlockYAML(BlockYAML):
     # to infer the type of the parameter_type attribute.
     block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT  # type: ignore
 
-    llm_key: str = DEFAULT_TEXT_PROMPT_LLM_KEY
+    llm_key: str | None = None
     prompt: str
     parameter_keys: list[str] | None = None
     json_schema: dict[str, Any] | None = None
@@ -363,7 +359,6 @@ class ActionBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
 
 
@@ -384,7 +379,6 @@ class NavigationBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
@@ -403,7 +397,6 @@ class ExtractionBlockYAML(BlockYAML):
     max_retries: int = 0
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
 
 
@@ -420,7 +413,6 @@ class LoginBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
@@ -462,7 +454,6 @@ class FileDownloadBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     download_timeout: float | None = None
 

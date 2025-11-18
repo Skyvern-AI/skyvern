@@ -23,7 +23,6 @@ export const baseHelpTooltipContent = {
     "If you are running multiple workflows at once, you will need to give the block an identifier to know that this TOTP goes with this block.",
   continueOnFailure:
     "Allow the workflow to continue if it encounters a failure.",
-  cacheActions: "Cache the actions of this block.",
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
 } as const;

@@ -294,12 +294,8 @@ function LoginNode({ id, data, type }: NodeProps<LoginNode>) {
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={data.cacheActions}
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

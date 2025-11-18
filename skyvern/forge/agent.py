@@ -116,7 +116,6 @@ from skyvern.webeye.actions.actions import (
     TerminateAction,
     WebAction,
 )
-from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
@@ -1002,15 +1001,8 @@ class ForgeAgent:
                 )
 
             else:
-                using_cached_action_plan = False
                 if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
                     actions = [await self.create_extract_action(task, step, scraped_page)]
-                elif (
-                    task_block
-                    and task_block.cache_actions
-                    and (actions := await retrieve_action_plan(task, step, scraped_page))
-                ):
-                    using_cached_action_plan = True
                 else:
                     llm_key_override = task.llm_key
                     # FIXME: Redundant engine check?
@@ -1124,7 +1116,7 @@ class ForgeAgent:
                 wait_actions_len = len(wait_actions_to_skip)
                 # if there are wait actions and there are other actions in the list, skip wait actions
                 # if we are using cached action plan, we don't skip wait actions
-                if wait_actions_len > 0 and wait_actions_len < len(actions) and not using_cached_action_plan:
+                if wait_actions_len > 0 and wait_actions_len < len(actions):
                     actions = [action for action in actions if action.action_type != ActionType.WAIT]
                     LOG.info(
                         "Skipping wait actions",
@@ -3630,7 +3622,7 @@ class ForgeAgent:
                 return True, last_step, None
 
             LOG.info(
-                "Parallel verification: goal achieved, marking task as complete",
+                "Parallel verification: goal achieved, marking task as completed",
                 step_id=step.step_id,
                 task_id=task.task_id,
             )
