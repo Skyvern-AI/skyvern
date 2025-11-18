@@ -10,7 +10,7 @@ import { useDebouncedCallback } from "use-debounce";
 import { ImprovePrompt } from "./ImprovePrompt";
 
 interface AiImprove {
-  context?: string;
+  context?: Record<string, unknown>;
   useCase: string;
 }
 

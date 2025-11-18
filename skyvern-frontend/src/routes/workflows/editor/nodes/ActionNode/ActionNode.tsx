@@ -139,6 +139,10 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                 <HelpTooltip content={navigationGoalTooltip} />
               </div>
               <WorkflowBlockInputTextarea
+                aiImprove={{
+                  context: { block_type: "Action Block" },
+                  useCase: "task_v1_prompt",
+                }}
                 nodeId={id}
                 onChange={(value) => {
                   update({ navigationGoal: value });
