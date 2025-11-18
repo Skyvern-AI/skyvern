@@ -153,14 +153,6 @@ class ActionLinkedNode:
 
 class ForgeAgent:
     def __init__(self) -> None:
-        if settings.ADDITIONAL_MODULES:
-            for module in settings.ADDITIONAL_MODULES:
-                LOG.debug("Loading additional module", module=module)
-                __import__(module)
-            LOG.debug(
-                "Additional modules loaded",
-                modules=settings.ADDITIONAL_MODULES,
-            )
         self.async_operation_pool = AsyncOperationPool()
 
     async def create_task_and_step_from_block(
