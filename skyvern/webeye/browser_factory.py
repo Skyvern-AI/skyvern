@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import aiofiles
 import psutil
@@ -100,10 +100,26 @@ def set_download_file_listener(
                     )
                     file_path.rename(str(file_path) + suffix)
                     return
-                suffix = Path(download.url).suffix
+
+                parsed_url = urlparse(download.url)
+                parsed_qs = parse_qsl(parsed_url.query)
+                for key, value in parsed_qs:
+                    if key.lower() == "filename":
+                        suffix = Path(value).suffix
+                        if suffix:
+                            LOG.info(
+                                "Add extension according to the parsed query params of download url",
+                                workflow_run_id=workflow_run_id,
+                                task_id=task_id,
+                                filename=value,
+                            )
+                            file_path.rename(str(file_path) + suffix)
+                            return
+
+                suffix = Path(parsed_url.path).suffix
                 if suffix:
                     LOG.info(
-                        "Add extension according to download url",
+                        "Add extension according to download url path",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,
                         filepath=str(file_path) + suffix,
