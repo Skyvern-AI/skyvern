@@ -1806,15 +1806,12 @@ async def wrapper():
         )
 
 
-DEFAULT_TEXT_PROMPT_LLM_KEY = settings.PROMPT_BLOCK_LLM_KEY or settings.LLM_KEY
-
-
 class TextPromptBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.TEXT_PROMPT] = BlockType.TEXT_PROMPT  # type: ignore
 
-    llm_key: str = DEFAULT_TEXT_PROMPT_LLM_KEY
+    llm_key: str | None = None
     prompt: str
     parameters: list[PARAMETER_TYPE] = []
     json_schema: dict[str, Any] | None = None
@@ -1826,14 +1823,16 @@ class TextPromptBlock(Block):
         return self.parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
-            self.llm_key, workflow_run_context
-        )
+        if self.llm_key:
+            self.llm_key = self.format_block_parameter_template_from_workflow_run_context(
+                self.llm_key, workflow_run_context
+            )
         self.prompt = self.format_block_parameter_template_from_workflow_run_context(self.prompt, workflow_run_context)
 
     async def send_prompt(self, prompt: str, parameter_values: dict[str, Any]) -> dict[str, Any]:
-        llm_key = self.llm_key or DEFAULT_TEXT_PROMPT_LLM_KEY
-        llm_api_handler = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+            self.override_llm_key or self.llm_key, default=app.LLM_API_HANDLER
+        )
         if not self.json_schema:
             self.json_schema = {
                 "type": "object",
