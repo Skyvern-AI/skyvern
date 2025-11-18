@@ -25,7 +25,6 @@ export interface NavigationBlock {
     download_suffix?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
-    cache_actions?: boolean;
     complete_verification?: boolean;
     include_action_history_in_verification?: boolean;
     download_timeout?: number;

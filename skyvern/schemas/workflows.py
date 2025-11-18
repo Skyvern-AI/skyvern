@@ -225,7 +225,6 @@ class TaskBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
@@ -360,7 +359,6 @@ class ActionBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
 
 
@@ -381,7 +379,6 @@ class NavigationBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
@@ -400,7 +397,6 @@ class ExtractionBlockYAML(BlockYAML):
     max_retries: int = 0
     max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
 
 
@@ -417,7 +413,6 @@ class LoginBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
@@ -459,7 +454,6 @@ class FileDownloadBlockYAML(BlockYAML):
     )
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     disable_cache: bool = False
     download_timeout: float | None = None
 

@@ -458,7 +458,6 @@ class BaseTaskBlock(Block):
     download_suffix: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    cache_actions: bool = False
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes

@@ -17,6 +17,5 @@ export interface ActionBlockYaml {
     download_suffix?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
-    cache_actions?: boolean;
     disable_cache?: boolean;
 }

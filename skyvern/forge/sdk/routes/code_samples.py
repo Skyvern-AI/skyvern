@@ -228,7 +228,6 @@ workflow_definition:
       parameter_keys: []
       totp_identifier: null
       totp_verification_url: null
-      cache_actions: false
       complete_criterion: ""
       terminate_criterion: ""
       include_action_history_in_verification: false
@@ -242,7 +241,6 @@ workflow_definition:
       max_retries: 0
       max_steps_per_run: null
       parameter_keys: []
-      cache_actions: false
 '
 """
 CREATE_WORKFLOW_CODE_SAMPLE_PYTHON = """
@@ -305,7 +303,6 @@ workflow_definition = {
                 "parameter_keys": [],
                 "totp_identifier": None,
                 "totp_verification_url": None,
-                "cache_actions": False,
                 "complete_criterion": "",
                 "terminate_criterion": "",
                 "include_action_history_in_verification": False,
@@ -321,7 +318,6 @@ workflow_definition = {
                 "max_retries": 0,
                 "max_steps_per_run": None,
                 "parameter_keys": [],
-                "cache_actions": False,
             },
         ],
     },
@@ -391,7 +387,6 @@ const workflowDefinition = {
                 parameter_keys: [],
                 totp_identifier: null,
                 totp_verification_url: null,
-                cache_actions: false,
                 complete_criterion: "",
                 terminate_criterion: "",
                 include_action_history_in_verification: false
@@ -407,7 +402,6 @@ const workflowDefinition = {
                 max_retries: 0,
                 max_steps_per_run: null,
                 parameter_keys: [],
-                cache_actions: false
             }
         ]
     }
@@ -484,7 +478,6 @@ workflow_definition:
       parameter_keys: []
       totp_identifier: null
       totp_verification_url: null
-      cache_actions: false
       complete_criterion: ""
       terminate_criterion: ""
       include_action_history_in_verification: false
@@ -498,7 +491,6 @@ workflow_definition:
       max_retries: 0
       max_steps_per_run: null
       parameter_keys: []
-      cache_actions: false
 '
 """
 UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON = """
@@ -560,7 +552,6 @@ updated_workflow_definition = {
                 "parameter_keys": [],
                 "totp_identifier": None,
                 "totp_verification_url": None,
-                "cache_actions": False,
                 "complete_criterion": "",
                 "terminate_criterion": "",
                 "include_action_history_in_verification": False,
@@ -576,7 +567,6 @@ updated_workflow_definition = {
                 "max_retries": 0,
                 "max_steps_per_run": None,
                 "parameter_keys": [],
-                "cache_actions": False,
             },
         ],
     },
@@ -645,7 +635,6 @@ const updatedWorkflowDefinition = {
                 parameter_keys: [],
                 totp_identifier: null,
                 totp_verification_url: null,
-                cache_actions: false,
                 complete_criterion: "",
                 terminate_criterion: "",
                 include_action_history_in_verification: false
@@ -660,8 +649,7 @@ const updatedWorkflowDefinition = {
                 data_schema: null,
                 max_retries: 0,
                 max_steps_per_run: null,
-                parameter_keys: [],
-                cache_actions: false
+                parameter_keys: []
             }
         ]
     }
