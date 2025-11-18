@@ -3622,7 +3622,7 @@ class ForgeAgent:
                 return True, last_step, None
 
             LOG.info(
-                "Parallel verification: goal achieved, marking task as complete",
+                "Parallel verification: goal achieved, marking task as completed",
                 step_id=step.step_id,
                 task_id=task.task_id,
             )
