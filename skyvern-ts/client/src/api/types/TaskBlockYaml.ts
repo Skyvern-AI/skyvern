@@ -20,6 +20,7 @@ export interface TaskBlockYaml {
     download_suffix?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
+    cache_actions?: boolean;
     disable_cache?: boolean;
     complete_criterion?: string;
     terminate_criterion?: string;

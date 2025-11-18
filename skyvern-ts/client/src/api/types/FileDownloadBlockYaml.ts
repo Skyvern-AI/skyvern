@@ -17,6 +17,7 @@ export interface FileDownloadBlockYaml {
     download_suffix?: string;
     totp_verification_url?: string;
     totp_identifier?: string;
+    cache_actions?: boolean;
     disable_cache?: boolean;
     download_timeout?: number;
 }

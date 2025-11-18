@@ -14,6 +14,7 @@ export interface ExtractionBlockYaml {
     max_retries?: number;
     max_steps_per_run?: number;
     parameter_keys?: string[];
+    cache_actions?: boolean;
     disable_cache?: boolean;
 }
 
