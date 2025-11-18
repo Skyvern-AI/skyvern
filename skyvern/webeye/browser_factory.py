@@ -791,7 +791,11 @@ class BrowserState:
         return [
             http_page
             for http_page in self.browser_context.pages
-            if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
+            if (
+                http_page.url == "about:blank"
+                or http_page.url == "chrome-error://chromewebdata/"
+                or urlparse(http_page.url).scheme in ["http", "https"]
+            )
         ]
 
     async def validate_browser_context(self, page: Page) -> bool:
