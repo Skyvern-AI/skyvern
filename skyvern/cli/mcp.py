@@ -7,7 +7,6 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
 from skyvern.forge import app
-from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.core import security
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
