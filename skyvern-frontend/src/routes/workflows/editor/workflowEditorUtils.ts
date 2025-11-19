@@ -1908,8 +1908,8 @@ function convertParametersToParameterYAML(
     .filter(Boolean);
 }
 
-function cloneBlockArray(blocks: Array<BlockYAML>): Array<BlockYAML> {
-  return JSON.parse(JSON.stringify(blocks));
+function clone<T>(objectToClone: T): T {
+  return JSON.parse(JSON.stringify(objectToClone));
 }
 
 function assignSequentialNextBlockLabels(blocks: Array<BlockYAML>): void {
@@ -1934,7 +1934,7 @@ export function upgradeWorkflowDefinitionToVersionTwo(
   blocks: Array<BlockYAML>,
   currentVersion?: number | null,
 ): { blocks: Array<BlockYAML>; version: number } {
-  const clonedBlocks = cloneBlockArray(blocks);
+  const clonedBlocks = clone(blocks);
   const baseVersion = currentVersion ?? 1;
 
   if (baseVersion <= 2) {
