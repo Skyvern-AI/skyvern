@@ -73,6 +73,24 @@ class ForgeApp:
     api_app_shutdown_event: Callable[[], Awaitable[None]] | None
     agent: ForgeAgent
 
+    async def cleanup(self) -> None:
+        """Clean up async clients to prevent destructor warnings."""
+        try:
+            await self.OPENAI_CLIENT.close()
+        except Exception:
+            pass
+
+        try:
+            await self.ANTHROPIC_CLIENT.close()
+        except Exception:
+            pass
+
+        if self.UI_TARS_CLIENT:
+            try:
+                await self.UI_TARS_CLIENT.close()
+            except Exception:
+                pass
+
 
 def create_forge_app() -> ForgeApp:
     """Create and initialize a ForgeApp instance with all services"""
@@ -187,7 +205,8 @@ def create_forge_app() -> ForgeApp:
     app.authenticate_user_function = None
     app.setup_api_app = None
     app.api_app_startup_event = None
-    app.api_app_shutdown_event = None
+    # Set default shutdown event to cleanup async clients
+    app.api_app_shutdown_event = app.cleanup
 
     app.agent = ForgeAgent()
 

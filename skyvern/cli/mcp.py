@@ -7,6 +7,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
 from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.core import security
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -40,7 +41,19 @@ async def get_or_create_local_organization() -> Organization:
     return organization
 
 
+_forge_initialized = False
+
+
+def ensure_forge_app_initialized() -> None:
+    global _forge_initialized
+    if _forge_initialized:
+        return
+    start_forge_app()
+    _forge_initialized = True
+
+
 async def setup_local_organization() -> str:
+    ensure_forge_app_initialized()
     organization = await get_or_create_local_organization()
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
         organization_id=organization.organization_id,
