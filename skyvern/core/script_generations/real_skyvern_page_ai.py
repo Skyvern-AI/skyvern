@@ -158,7 +158,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 current_url=self.page.url,
                 elements=element_tree,
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
-                # user_context=getattr(context, "prompt", None),
+                user_context=context.prompt,
             )
             json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
                 prompt=single_click_prompt,
