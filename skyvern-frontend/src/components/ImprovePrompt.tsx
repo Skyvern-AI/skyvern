@@ -25,7 +25,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { ImprovePromptForWorkflowResponse } from "@/routes/workflows/types/workflowTypes";
 
 interface Props {
-  context?: string;
+  context?: Record<string, unknown>;
   isVisible?: boolean;
   onBegin?: () => void;
   onEnd?: () => void;

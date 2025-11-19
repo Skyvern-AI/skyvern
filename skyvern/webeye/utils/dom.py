@@ -85,6 +85,7 @@ RAW_INPUT_NAME_VALUE = ["name", "email", "username", "password", "phone"]
 class SkyvernOptionType(typing.TypedDict):
     optionIndex: int
     text: str
+    value: str
 
 
 class SkyvernElement:

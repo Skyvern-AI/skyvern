@@ -17,9 +17,10 @@ LOG = structlog.get_logger()
 
 
 class Constants:
-    ImprovePromptUseCaseToTemplateMap = {
-        "new_workflow": "improve-prompt-for-ai-browser-agent",
-        "task_v2_prompt": "improve-prompt-for-ai-browser-agent",
+    DEFAULT_TEMPLATE_NAME = "improve-prompt-for-ai-browser-agent"
+    IMPROVE_PROMPT_USE_CASE_TO_TEMPLATE_MAP = {
+        "new_workflow": DEFAULT_TEMPLATE_NAME,
+        "task_v2_prompt": DEFAULT_TEMPLATE_NAME,
     }
 
 
@@ -37,13 +38,10 @@ async def improve_prompt(
     """
     Improve a prompt based on a specific use-case.
     """
-    if use_case not in Constants.ImprovePromptUseCaseToTemplateMap:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"'{use_case}' use-case is unsupported.",
-        )
-
-    template_name = Constants.ImprovePromptUseCaseToTemplateMap[use_case]
+    template_name = Constants.IMPROVE_PROMPT_USE_CASE_TO_TEMPLATE_MAP.get(
+        use_case,
+        Constants.DEFAULT_TEMPLATE_NAME,
+    )
 
     llm_prompt = prompt_engine.load_prompt(
         context=request.context,
@@ -55,8 +53,7 @@ async def improve_prompt(
         "Improving prompt",
         use_case=use_case,
         organization_id=current_org.organization_id,
-        prompt=request.prompt,
-        llm_prompt=llm_prompt,
+        context=request.context,
     )
 
     try:
@@ -81,9 +78,17 @@ async def improve_prompt(
             error = None
             output = output["improved_prompt"]
 
+        LOG.info(
+            "Prompt improved",
+            use_case=use_case,
+            organization_id=current_org.organization_id,
+            prompt=request.prompt,
+            improved_prompt=output,
+        )
+
         response = ImprovePromptResponse(
             error=error,
-            improved=output,
+            improved=output.strip(),
             original=request.prompt,
         )
 
