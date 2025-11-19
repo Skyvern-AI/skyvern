@@ -85,8 +85,6 @@ def create_embedded_server(
                         else:
                             raise ValueError(f"Invalid setting: {key}")
 
-                from skyvern.forge.api_app import app  # noqa: PLC0415
-
                 from skyvern.forge.api_app import create_api_app  # noqa: PLC0415
 
                 self._transport = ASGITransport(app=create_api_app())
