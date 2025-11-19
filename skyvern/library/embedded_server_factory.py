@@ -87,7 +87,9 @@ def create_embedded_server(
 
                 from skyvern.forge.api_app import app  # noqa: PLC0415
 
-                self._transport = ASGITransport(app=app)
+                from skyvern.forge.api_app import create_api_app  # noqa: PLC0415
+
+                self._transport = ASGITransport(app=create_api_app())
 
             response = await self._transport.handle_async_request(request)
             return response

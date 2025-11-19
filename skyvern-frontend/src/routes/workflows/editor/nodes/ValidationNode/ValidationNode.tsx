@@ -236,9 +236,6 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
                   <DisableCache
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

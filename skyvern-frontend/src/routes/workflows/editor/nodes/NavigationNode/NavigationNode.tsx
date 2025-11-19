@@ -328,12 +328,8 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
                     </div>
                   </div>
                   <DisableCache
-                    cacheActions={data.cacheActions}
                     disableCache={data.disableCache}
                     editable={editable}
-                    onCacheActionsChange={(cacheActions) => {
-                      update({ cacheActions });
-                    }}
                     onDisableCacheChange={(disableCache) => {
                       update({ disableCache });
                     }}

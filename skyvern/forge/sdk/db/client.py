@@ -532,6 +532,7 @@ class AgentDB:
                         select(StepModel)
                         .filter_by(task_id=task_id)
                         .filter_by(organization_id=organization_id)
+                        .filter(StepModel.status != StepStatus.canceled)
                         .order_by(StepModel.order.desc())
                         .order_by(StepModel.retry_index.desc())
                     )
@@ -2537,6 +2538,31 @@ class AgentDB:
                 query = query.order_by(WorkflowRunModel.started_at.desc())
                 workflow_run = (await session.scalars(query)).first()
                 return convert_to_workflow_run(workflow_run) if workflow_run else None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_workflows_depending_on(
+        self,
+        workflow_run_id: str,
+    ) -> list[WorkflowRun]:
+        """
+        Get all workflow runs that depend on the given workflow_run_id.
+
+        Used to find workflows that should be signaled when a workflow completes,
+        for sequential workflow dependency handling.
+
+        Args:
+            workflow_run_id: The workflow_run_id to find dependents for
+
+        Returns:
+            List of WorkflowRun objects that have depends_on_workflow_run_id set to workflow_run_id
+        """
+        try:
+            async with self.Session() as session:
+                query = select(WorkflowRunModel).filter_by(depends_on_workflow_run_id=workflow_run_id)
+                workflow_runs = (await session.scalars(query)).all()
+                return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise

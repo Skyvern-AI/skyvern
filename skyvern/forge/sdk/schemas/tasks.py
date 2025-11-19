@@ -323,7 +323,7 @@ class Task(TaskBase):
             raise ValueError(f"status_requires_failure_reason({status},{self.task_id}")
 
         if status.requires_extracted_info() and self.data_extraction_goal and extracted_information is None:
-            raise ValueError(f"status_requires_extracted_information({status},{self.task_id}")
+            raise ValueError(f"status_requires_extracted_information({status},{self.task_id})")
 
         if status.cant_have_extracted_info() and extracted_information is not None:
             raise ValueError(f"status_cant_have_extracted_information({self.task_id})")

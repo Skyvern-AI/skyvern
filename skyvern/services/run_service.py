@@ -86,8 +86,7 @@ async def cancel_task_v1(task_id: str, organization_id: str | None = None, api_k
     if not task:
         raise TaskNotFound(task_id=task_id)
     task = await app.agent.update_task(task, status=TaskStatus.canceled)
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=organization_id)
-    await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=api_key)
+    await app.agent.execute_task_webhook(task=task, api_key=api_key)
 
 
 async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> None:
@@ -164,7 +163,7 @@ async def retry_run_webhook(run_id: str, organization_id: str | None = None, api
             raise TaskNotFound(task_id=run_id)
         latest_step = await app.DATABASE.get_latest_step(run_id, organization_id=organization_id)
         if latest_step:
-            await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=api_key)
+            await app.agent.execute_task_webhook(task=task, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.get_task_v2(run_id, organization_id=organization_id)
         if not task_v2:
