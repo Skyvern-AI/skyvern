@@ -152,6 +152,8 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     # build option HTML
     option_html = "".join(
         f'<option index="{option.get("optionIndex")}">{option.get("text")}</option>'
+        if option.get("text")
+        else f'<option index="{option.get("optionIndex")}" value="{option.get("value")}">{option.get("text")}</option>'
         for option in element.get("options", [])
     )
 
