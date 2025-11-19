@@ -12,14 +12,15 @@ def create_embedded_server(
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             if self._transport is None:
                 from skyvern.config import settings  # noqa: PLC0415
-                from skyvern.forge.api_app import app  # noqa: PLC0415
 
                 settings.BROWSER_LOGS_ENABLED = False
 
                 if openai_api_key:
                     settings.OPENAI_API_KEY = openai_api_key
 
-                self._transport = ASGITransport(app=app)
+                from skyvern.forge.api_app import create_api_app  # noqa: PLC0415
+
+                self._transport = ASGITransport(app=create_api_app())
 
             response = await self._transport.handle_async_request(request)
             return response

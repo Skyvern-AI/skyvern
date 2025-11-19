@@ -137,6 +137,10 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       />
                     </div>
                     <WorkflowBlockInputTextarea
+                      aiImprove={{
+                        context: { block_type: "Task Block" },
+                        useCase: "task_v1_prompt",
+                      }}
                       nodeId={id}
                       onChange={(value) => {
                         update({ navigationGoal: value });

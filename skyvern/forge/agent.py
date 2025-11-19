@@ -153,14 +153,6 @@ class ActionLinkedNode:
 
 class ForgeAgent:
     def __init__(self) -> None:
-        if settings.ADDITIONAL_MODULES:
-            for module in settings.ADDITIONAL_MODULES:
-                LOG.debug("Loading additional module", module=module)
-                __import__(module)
-            LOG.debug(
-                "Additional modules loaded",
-                modules=settings.ADDITIONAL_MODULES,
-            )
         self.async_operation_pool = AsyncOperationPool()
 
     async def create_task_and_step_from_block(
@@ -3621,6 +3613,14 @@ class ForgeAgent:
                 )
                 return True, last_step, None
 
+            if isinstance(persisted_action, CompleteAction) and task.navigation_goal and task.data_extraction_goal:
+                task = await self._run_data_extraction_after_complete_action(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                    working_page=working_page,
+                )
+
             LOG.info(
                 "Parallel verification: goal achieved, marking task as completed",
                 step_id=step.step_id,
@@ -4360,3 +4360,33 @@ class ForgeAgent:
             return False
 
         return any(action_result.success for action_result in last_action_results)
+
+    async def _run_data_extraction_after_complete_action(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        working_page: Page,
+    ) -> Task:
+        """
+        Run the extraction flow when a task with a data extraction goal completes during parallel verification.
+        """
+        refreshed_task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+        if refreshed_task:
+            task = refreshed_task
+
+        extract_action = await self.create_extract_action(task, step, scraped_page)
+        extract_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, extract_action)
+        await app.AGENT_FUNCTION.post_action_execution(extract_action)
+
+        if step.output is None:
+            step.output = AgentStepOutput(action_results=[], actions_and_results=[], errors=[])
+        if step.output.action_results is None:
+            step.output.action_results = []
+        if step.output.actions_and_results is None:
+            step.output.actions_and_results = []
+
+        step.output.action_results.extend(extract_results)
+        step.output.actions_and_results.append((extract_action, extract_results))
+
+        return task

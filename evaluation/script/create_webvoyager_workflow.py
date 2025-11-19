@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from evaluation.core import Evaluator, SkyvernClient
 from evaluation.core.utils import load_webvoyager_case_from_json
 from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.schemas.runs import ProxyLocation
@@ -69,6 +70,8 @@ def main(
         None, "--proxy-location", help="overwrite the workflow proxy location"
     ),
 ) -> None:
+    start_forge_app()
+
     asyncio.run(
         create_workflow_run(base_url=base_url, cred=cred, workflow_pid=workflow_pid, proxy_location=proxy_location)
     )
