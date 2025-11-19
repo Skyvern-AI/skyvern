@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 from playwright.async_api import Locator, Page
@@ -21,8 +22,8 @@ class AILocator(Locator):
         page: Page,
         page_ai: SkyvernPageAi,
         prompt: str,
-        fallback_selector: str | None = None,
-        fallback_kwargs: dict[str, Any] | None = None,
+        fallback_selector: str | None,
+        fallback_kwargs: dict[str, Any] | None,
     ):
         super().__init__(page)
         self._page = page
@@ -39,22 +40,36 @@ class AILocator(Locator):
                 if not xpath:
                     raise ValueError(f"AI failed to locate element with prompt: {self._prompt}")
 
-                self._resolved_locator = self._page.locator(f"xpath={xpath}")
+                # Handle xpath that may or may not have a selector prefix
+                self._resolved_locator = self._page.locator(
+                    xpath if xpath.startswith(("xpath=", "css=", "text=", "role=", "id=")) else f"xpath={xpath}"
+                )
             except Exception as e:
                 if self._fallback_selector:
+                    # AI failed, use fallback selector
                     self._resolved_locator = self._page.locator(self._fallback_selector, **self._fallback_kwargs)
                 else:
                     raise e
 
         return self._resolved_locator
 
-    def __getattribute__(self, name: str) -> Any:
-        if name.startswith("_") or name in ("__class__", "__dict__"):
-            return object.__getattribute__(self, name)
+    def __getattr__(self, name: str) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            async def _execute() -> Any:
+                locator = await self._resolve()
 
-        async def async_method_wrapper(*args: Any, **kwargs: Any) -> Any:
-            locator = await object.__getattribute__(self, "_resolve")()
-            method = getattr(locator, name)
-            return await method(*args, **kwargs)
+                attr = getattr(locator, name)
 
-        return async_method_wrapper
+                if callable(attr):
+                    result = attr(*args, **kwargs)
+
+                    if inspect.iscoroutine(result):
+                        return await result
+
+                    return result
+                else:
+                    return attr
+
+            return _execute()
+
+        return wrapper

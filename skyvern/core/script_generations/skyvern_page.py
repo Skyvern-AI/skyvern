@@ -765,7 +765,13 @@ class SkyvernPage(Page):
                     error_to_raise = e
 
             if prompt:
-                return AILocator(self.page, self._ai, prompt)
+                return AILocator(
+                    self.page,
+                    self._ai,
+                    prompt,
+                    fallback_selector=selector,
+                    fallback_kwargs=kwargs,
+                )
 
             if error_to_raise:
                 raise error_to_raise
