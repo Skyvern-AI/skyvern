@@ -317,7 +317,7 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
-    depends_on_workflow_run_id = Column(String, nullable=True)
+    depends_on_workflow_run_id = Column(String, nullable=True, index=True)
     sequential_key = Column(String, nullable=True)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
     debug_session_id: Column = Column(String, nullable=True)
