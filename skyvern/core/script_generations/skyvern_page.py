@@ -757,33 +757,39 @@ class SkyvernPage(Page):
             ai = context.ai_mode_override
 
         if ai == "fallback":
-            error_to_raise = None
+            if selector and prompt:
+                # Try selector first, then AI
+                return AILocator(
+                    self.page,
+                    self._ai,
+                    prompt,
+                    selector=selector,
+                    selector_kwargs=kwargs,
+                    try_selector_first=True,
+                )
+
             if selector:
-                try:
-                    return self.page.locator(selector, **kwargs)
-                except Exception as e:
-                    error_to_raise = e
+                return self.page.locator(selector, **kwargs)
 
             if prompt:
                 return AILocator(
                     self.page,
                     self._ai,
                     prompt,
-                    fallback_selector=selector,
-                    fallback_kwargs=kwargs,
+                    selector=None,
+                    selector_kwargs=kwargs,
                 )
-
-            if error_to_raise:
-                raise error_to_raise
 
         elif ai == "proactive":
             if prompt:
+                # Try AI first, then selector
                 return AILocator(
                     self.page,
                     self._ai,
                     prompt,
-                    fallback_selector=selector,
-                    fallback_kwargs=kwargs,
+                    selector=selector,
+                    selector_kwargs=kwargs,
+                    try_selector_first=False,
                 )
 
         if selector:
