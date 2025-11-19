@@ -40,6 +40,7 @@ async def get_or_create_local_organization() -> Organization:
         )
     return organization
 
+
 async def setup_local_organization() -> str:
     organization = await get_or_create_local_organization()
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
