@@ -1380,6 +1380,7 @@ function getSelectOptions(element) {
     selectOptions.push({
       optionIndex: option.index,
       text: removeMultipleSpaces(option.textContent),
+      value: removeMultipleSpaces(option.value),
     });
   }
 
