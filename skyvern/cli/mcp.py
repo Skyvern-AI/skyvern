@@ -40,20 +40,7 @@ async def get_or_create_local_organization() -> Organization:
         )
     return organization
 
-
-_forge_initialized = False
-
-
-def ensure_forge_app_initialized() -> None:
-    global _forge_initialized
-    if _forge_initialized:
-        return
-    start_forge_app()
-    _forge_initialized = True
-
-
 async def setup_local_organization() -> str:
-    ensure_forge_app_initialized()
     organization = await get_or_create_local_organization()
     org_auth_token = await app.DATABASE.get_valid_org_auth_token(
         organization_id=organization.organization_id,
