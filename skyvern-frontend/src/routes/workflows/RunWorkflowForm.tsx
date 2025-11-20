@@ -117,7 +117,11 @@ function parseValuesForWorkflowRun(
         parameter?.workflow_parameter_type === "integer" ||
         parameter?.workflow_parameter_type === "float"
       ) {
-        if (value === null || value === undefined) {
+        if (
+          value === null ||
+          value === undefined ||
+          (typeof value === "number" && Number.isNaN(value))
+        ) {
           return [key, ""];
         }
         return [key, String(value)];
@@ -419,12 +423,15 @@ function RunWorkflowForm({
   }
 
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
-    const hasBooleanErrors = workflowParameters.some(
+    const hasBlockingErrors = workflowParameters.some(
       (param) =>
-        param.workflow_parameter_type === "boolean" && errors[param.key],
+        (param.workflow_parameter_type === "boolean" ||
+          param.workflow_parameter_type === "integer" ||
+          param.workflow_parameter_type === "float") &&
+        errors[param.key],
     );
 
-    if (!hasBooleanErrors) {
+    if (!hasBlockingErrors) {
       onSubmit(form.getValues());
     }
   };
@@ -466,6 +473,21 @@ function RunWorkflowForm({
                     // Boolean parameters are required - show error and block submission
                     if (parameter.workflow_parameter_type === "boolean") {
                       if (value === null || value === undefined) {
+                        return "This field is required";
+                      }
+                      return;
+                    }
+
+                    // Numeric parameters are required - show error and block submission
+                    if (
+                      parameter.workflow_parameter_type === "integer" ||
+                      parameter.workflow_parameter_type === "float"
+                    ) {
+                      if (
+                        value === null ||
+                        value === undefined ||
+                        Number.isNaN(value)
+                      ) {
                         return "This field is required";
                       }
                       return;
@@ -518,7 +540,10 @@ function RunWorkflowForm({
                           {form.formState.errors[parameter.key] && (
                             <div
                               className={`text-xs ${
-                                parameter.workflow_parameter_type === "boolean"
+                                parameter.workflow_parameter_type === "boolean" ||
+                                parameter.workflow_parameter_type ===
+                                  "integer" ||
+                                parameter.workflow_parameter_type === "float"
                                   ? "text-destructive"
                                   : "text-warning"
                               }`}
