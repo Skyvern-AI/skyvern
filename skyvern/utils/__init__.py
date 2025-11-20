@@ -1,3 +1,4 @@
+import asyncio
 import platform
 import subprocess
 from pathlib import Path
@@ -6,6 +7,28 @@ from typing import Optional
 from alembic import command
 from alembic.config import Config
 from skyvern.constants import REPO_ROOT_DIR
+
+
+def setup_windows_event_loop_policy() -> None:
+    """
+    Ensure the Windows event loop policy supports subprocesses (required by Playwright).
+
+    Explicitly setting the Proactor event loop policy prevents third-party packages or older
+    Python defaults from forcing the Selector policy, which does not implement subprocess
+    transports and causes runtime failures when Playwright tries to launch a browser.
+    """
+    if platform.system() != "Windows":
+        return
+
+    windows_policy_cls = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+    if windows_policy_cls is None:
+        return
+
+    current_policy = asyncio.get_event_loop_policy()
+    if isinstance(current_policy, windows_policy_cls):
+        return
+
+    asyncio.set_event_loop_policy(windows_policy_cls())
 
 
 def migrate_db() -> None:
