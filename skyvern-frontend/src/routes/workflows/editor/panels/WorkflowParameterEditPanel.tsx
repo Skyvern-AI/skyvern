@@ -556,7 +556,8 @@ function WorkflowParameterEditPanel({
                   }
                   // Convert numeric defaults to strings for backend storage
                   else if (
-                    (parameterType === "integer" || parameterType === "float") &&
+                    (parameterType === "integer" ||
+                      parameterType === "float") &&
                     (typeof defaultValueState.defaultValue === "number" ||
                       typeof defaultValueState.defaultValue === "string")
                   ) {
