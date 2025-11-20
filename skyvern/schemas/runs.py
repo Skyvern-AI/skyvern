@@ -353,8 +353,8 @@ class TaskRunRequest(BaseModel):
         Returns:
             The validated URL or None if no URL was provided
         """
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)
 
@@ -416,8 +416,8 @@ class WorkflowRunRequest(BaseModel):
     @field_validator("webhook_url", "totp_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
         return validate_url(url)
 
     @model_validator(mode="after")
