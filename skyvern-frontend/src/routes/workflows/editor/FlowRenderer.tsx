@@ -124,6 +124,17 @@ function convertToParametersYAML(
           ) {
             defaultValue = String(parameter.defaultValue);
           }
+          if (
+            (parameter.dataType === "integer" ||
+              parameter.dataType === "float") &&
+            (typeof parameter.defaultValue === "number" ||
+              typeof parameter.defaultValue === "string")
+          ) {
+            defaultValue =
+              parameter.defaultValue === null
+                ? parameter.defaultValue
+                : String(parameter.defaultValue);
+          }
 
           return {
             parameter_type: WorkflowParameterTypes.Workflow,

@@ -554,6 +554,14 @@ function WorkflowParameterEditPanel({
                   ) {
                     defaultValue = String(defaultValueState.defaultValue);
                   }
+                  // Convert numeric defaults to strings for backend storage
+                  else if (
+                    (parameterType === "integer" || parameterType === "float") &&
+                    (typeof defaultValueState.defaultValue === "number" ||
+                      typeof defaultValueState.defaultValue === "string")
+                  ) {
+                    defaultValue = String(defaultValueState.defaultValue);
+                  }
 
                   onSave({
                     key,

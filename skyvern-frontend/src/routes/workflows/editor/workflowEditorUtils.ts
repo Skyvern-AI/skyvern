@@ -1865,13 +1865,23 @@ function convertParametersToParameterYAML(
           };
         }
         case WorkflowParameterTypes.Workflow: {
-          // Convert boolean default values to strings for backend
+          // Convert default values to strings for backend when needed
           let defaultValue = parameter.default_value;
           if (
             parameter.workflow_parameter_type === "boolean" &&
             typeof parameter.default_value === "boolean"
           ) {
             defaultValue = String(parameter.default_value);
+          } else if (
+            (parameter.workflow_parameter_type === "integer" ||
+              parameter.workflow_parameter_type === "float") &&
+            (typeof parameter.default_value === "number" ||
+              typeof parameter.default_value === "string")
+          ) {
+            defaultValue =
+              parameter.default_value === null
+                ? parameter.default_value
+                : String(parameter.default_value);
           }
 
           return {

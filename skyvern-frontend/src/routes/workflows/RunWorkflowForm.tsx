@@ -1,7 +1,7 @@
 import { AxiosError } from "axios";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
-import { useForm } from "react-hook-form";
+import { type FieldErrors, useForm } from "react-hook-form";
 import { useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
@@ -106,6 +106,23 @@ function parseValuesForWorkflowRun(
       ) {
         return [key, String(value)];
       }
+      if (parameter?.workflow_parameter_type === "string") {
+        if (value === null || value === undefined) {
+          return [key, ""];
+        }
+        return [key, String(value)];
+      }
+
+      if (
+        parameter?.workflow_parameter_type === "integer" ||
+        parameter?.workflow_parameter_type === "float"
+      ) {
+        if (value === null || value === undefined) {
+          return [key, ""];
+        }
+        return [key, String(value)];
+      }
+
       return [key, value];
     }),
   );
@@ -401,6 +418,17 @@ function RunWorkflowForm({
     setRunParameters(parsedParameters);
   }
 
+  const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
+    const hasBooleanErrors = workflowParameters.some(
+      (param) =>
+        param.workflow_parameter_type === "boolean" && errors[param.key],
+    );
+
+    if (!hasBooleanErrors) {
+      onSubmit(form.getValues());
+    }
+  };
+
   if (!workflowPermanentId || !workflow) {
     return <div>Invalid workflow</div>;
   }
@@ -408,11 +436,7 @@ function RunWorkflowForm({
   return (
     <Form {...form}>
       <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          // Allow submission even with validation warnings
-          onSubmit(form.getValues());
-        }}
+        onSubmit={form.handleSubmit(onSubmit, handleInvalid)}
         className="space-y-8"
       >
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
@@ -439,7 +463,15 @@ function RunWorkflowForm({
                       }
                     }
 
-                    // For string parameters, empty strings are always invalid
+                    // Boolean parameters are required - show error and block submission
+                    if (parameter.workflow_parameter_type === "boolean") {
+                      if (value === null || value === undefined) {
+                        return "This field is required";
+                      }
+                      return;
+                    }
+
+                    // For string parameters, show warning but don't block
                     if (
                       parameter.workflow_parameter_type === "string" &&
                       (value === null || value === "")
@@ -447,7 +479,7 @@ function RunWorkflowForm({
                       return "Warning: you left this field empty";
                     }
 
-                    // For all other types, check for null/undefined
+                    // For all other non-boolean types, show warning but don't block
                     if (value === null || value === undefined) {
                       return "Warning: you left this field empty";
                     }
@@ -457,7 +489,7 @@ function RunWorkflowForm({
                   return (
                     <FormItem>
                       <div className="flex gap-16">
-                        <FormLabel>
+                        <FormLabel className="!text-slate-50">
                           <div className="w-72">
                             <div className="flex items-center gap-2 text-lg">
                               {parameter.key}
@@ -477,11 +509,20 @@ function RunWorkflowForm({
                             <WorkflowParameterInput
                               type={parameter.workflow_parameter_type}
                               value={field.value}
-                              onChange={field.onChange}
+                              onChange={(value) => {
+                                field.onChange(value);
+                                form.trigger(parameter.key);
+                              }}
                             />
                           </FormControl>
                           {form.formState.errors[parameter.key] && (
-                            <div className="text-warning">
+                            <div
+                              className={`text-xs ${
+                                parameter.workflow_parameter_type === "boolean"
+                                  ? "text-destructive"
+                                  : "text-warning"
+                              }`}
+                            >
                               {form.formState.errors[parameter.key]?.message}
                             </div>
                           )}
