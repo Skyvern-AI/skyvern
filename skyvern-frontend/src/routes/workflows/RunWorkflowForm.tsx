@@ -568,9 +568,9 @@ function RunWorkflowForm({
                                   "boolean" ||
                                 parameter.workflow_parameter_type ===
                                   "integer" ||
+                                parameter.workflow_parameter_type === "float" ||
                                 parameter.workflow_parameter_type ===
-                                  "float" ||
-                                parameter.workflow_parameter_type === "file_url" ||
+                                  "file_url" ||
                                 parameter.workflow_parameter_type === "json"
                                   ? "text-destructive"
                                   : "text-warning"
