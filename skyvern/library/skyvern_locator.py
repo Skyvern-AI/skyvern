@@ -48,6 +48,7 @@ class SkyvernLocator:
 
     async def hover(self, **kwargs: Any) -> None:
         """Hover over the element."""
+        await self._locator.scroll_into_view_if_needed()
         await self._locator.hover(**kwargs)
 
     async def focus(self, **kwargs: Any) -> None:

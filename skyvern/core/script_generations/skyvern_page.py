@@ -221,6 +221,7 @@ class SkyvernPage(Page):
             raise ValueError("Hover requires a selector.")
 
         locator = self.page.locator(selector, **kwargs)
+        await locator.scroll_into_view_if_needed()
         await locator.hover(timeout=timeout)
         if hold_seconds and hold_seconds > 0:
             await asyncio.sleep(hold_seconds)

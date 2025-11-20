@@ -2013,6 +2013,7 @@ async def handle_hover_action(
 
     try:
         await skyvern_element.hover_to_reveal()
+        await skyvern_element.get_locator().scroll_into_view_if_needed()
         await skyvern_element.get_locator().hover(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
         if action.hold_seconds and action.hold_seconds > 0:
             await asyncio.sleep(action.hold_seconds)
