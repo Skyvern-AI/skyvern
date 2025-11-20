@@ -13,7 +13,6 @@ export type ActionNodeData = NodeBaseData & {
   parameterKeys: Array<string>;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
-  cacheActions: boolean;
   disableCache: boolean;
   engine: RunEngine | null;
 };
@@ -34,7 +33,6 @@ export const actionNodeDefaultData: ActionNodeData = {
   totpVerificationUrl: null,
   totpIdentifier: null,
   continueOnFailure: false,
-  cacheActions: false,
   disableCache: false,
   engine: RunEngine.SkyvernV1,
   model: null,

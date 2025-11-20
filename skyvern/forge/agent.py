@@ -116,7 +116,6 @@ from skyvern.webeye.actions.actions import (
     TerminateAction,
     WebAction,
 )
-from skyvern.webeye.actions.caching import retrieve_action_plan
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.parse_actions import (
@@ -154,14 +153,6 @@ class ActionLinkedNode:
 
 class ForgeAgent:
     def __init__(self) -> None:
-        if settings.ADDITIONAL_MODULES:
-            for module in settings.ADDITIONAL_MODULES:
-                LOG.debug("Loading additional module", module=module)
-                __import__(module)
-            LOG.debug(
-                "Additional modules loaded",
-                modules=settings.ADDITIONAL_MODULES,
-            )
         self.async_operation_pool = AsyncOperationPool()
 
     async def create_task_and_step_from_block(
@@ -1002,15 +993,8 @@ class ForgeAgent:
                 )
 
             else:
-                using_cached_action_plan = False
                 if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
                     actions = [await self.create_extract_action(task, step, scraped_page)]
-                elif (
-                    task_block
-                    and task_block.cache_actions
-                    and (actions := await retrieve_action_plan(task, step, scraped_page))
-                ):
-                    using_cached_action_plan = True
                 else:
                     llm_key_override = task.llm_key
                     # FIXME: Redundant engine check?
@@ -1124,7 +1108,7 @@ class ForgeAgent:
                 wait_actions_len = len(wait_actions_to_skip)
                 # if there are wait actions and there are other actions in the list, skip wait actions
                 # if we are using cached action plan, we don't skip wait actions
-                if wait_actions_len > 0 and wait_actions_len < len(actions) and not using_cached_action_plan:
+                if wait_actions_len > 0 and wait_actions_len < len(actions):
                     actions = [action for action in actions if action.action_type != ActionType.WAIT]
                     LOG.info(
                         "Skipping wait actions",
@@ -1234,7 +1218,13 @@ class ForgeAgent:
                         "is_retry": step.retry_index > 0,
                     }
 
-                results = await ActionHandler.handle_action(scraped_page, task, step, current_page, action)
+                results = await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=current_page,
+                    action=action,
+                )
                 await app.AGENT_FUNCTION.post_action_execution(action)
                 detailed_agent_step_output.actions_and_results[action_idx] = (
                     action,
@@ -3138,12 +3128,11 @@ class ForgeAgent:
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         if need_call_webhook:
-            await self.execute_task_webhook(task=task, last_step=last_step, api_key=api_key)
+            await self.execute_task_webhook(task=task, api_key=api_key)
 
     async def execute_task_webhook(
         self,
         task: Task,
-        last_step: Step | None,
         api_key: str | None,
     ) -> None:
         if not api_key:
@@ -3159,6 +3148,7 @@ class ForgeAgent:
                 task_id=task.task_id,
             )
             return
+        last_step = await app.DATABASE.get_latest_step(task.task_id, organization_id=task.organization_id)
 
         task_response = await self.build_task_response(task=task, last_step=last_step)
         # try to build the new TaskRunResponse for backward compatibility
@@ -3623,8 +3613,16 @@ class ForgeAgent:
                 )
                 return True, last_step, None
 
+            if isinstance(persisted_action, CompleteAction) and task.navigation_goal and task.data_extraction_goal:
+                task = await self._run_data_extraction_after_complete_action(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                    working_page=working_page,
+                )
+
             LOG.info(
-                "Parallel verification: goal achieved, marking task as complete",
+                "Parallel verification: goal achieved, marking task as completed",
                 step_id=step.step_id,
                 task_id=task.task_id,
             )
@@ -4362,3 +4360,33 @@ class ForgeAgent:
             return False
 
         return any(action_result.success for action_result in last_action_results)
+
+    async def _run_data_extraction_after_complete_action(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        working_page: Page,
+    ) -> Task:
+        """
+        Run the extraction flow when a task with a data extraction goal completes during parallel verification.
+        """
+        refreshed_task = await app.DATABASE.get_task(task.task_id, task.organization_id)
+        if refreshed_task:
+            task = refreshed_task
+
+        extract_action = await self.create_extract_action(task, step, scraped_page)
+        extract_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, extract_action)
+        await app.AGENT_FUNCTION.post_action_execution(extract_action)
+
+        if step.output is None:
+            step.output = AgentStepOutput(action_results=[], actions_and_results=[], errors=[])
+        if step.output.action_results is None:
+            step.output.action_results = []
+        if step.output.actions_and_results is None:
+            step.output.actions_and_results = []
+
+        step.output.action_results.extend(extract_results)
+        step.output.actions_and_results.append((extract_action, extract_results))
+
+        return task

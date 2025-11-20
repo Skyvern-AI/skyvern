@@ -54,6 +54,26 @@ class LLMAPIHandlerFactory:
     _prompt_caching_settings: dict[str, bool] | None = None
 
     @staticmethod
+    def _models_equivalent(left: str | None, right: str | None) -> bool:
+        """Used only by `llm_api_handler_with_router_and_fallback`. Router model
+        groups carry the `vertex-` prefix while LiteLLM responses return the
+        underlying provider label (e.g. `gemini-2.5-pro`). Stripping the prefix
+        lets us detect whether the configured primary (the router's
+        `main_model_group`) actually served the request without replumbing every
+        config/registry reference.
+        """
+        if left == right:
+            return True
+        if left is None or right is None:
+            return False
+
+        def _normalize(label: str) -> str:
+            normalized = label.lower()
+            return normalized[len("vertex-") :] if normalized.startswith("vertex-") else normalized
+
+        return _normalize(left) == _normalize(right)
+
+    @staticmethod
     def _apply_thinking_budget_optimization(
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
@@ -349,10 +369,21 @@ class LLMAPIHandlerFactory:
                     thought=thought,
                     ai_suggestion=ai_suggestion,
                 )
+            model_used = main_model_group
             try:
                 response = await router.acompletion(
                     model=main_model_group, messages=messages, timeout=settings.LLM_CONFIG_TIMEOUT, **parameters
                 )
+                response_model = response.model or main_model_group
+                model_used = response_model
+                if not LLMAPIHandlerFactory._models_equivalent(response_model, main_model_group):
+                    LOG.info(
+                        "LLM router fallback succeeded",
+                        llm_key=llm_key,
+                        prompt_name=prompt_name,
+                        primary_model=main_model_group,
+                        fallback_model=response_model,
+                    )
             except litellm.exceptions.APIError as e:
                 raise LLMProviderErrorRetryableTask(llm_key) from e
             except litellm.exceptions.ContextWindowExceededError as e:
@@ -487,7 +518,7 @@ class LLMAPIHandlerFactory:
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=llm_key,
-                model=main_model_group,
+                model=model_used,
                 prompt_name=prompt_name,
                 duration_seconds=duration_seconds,
                 step_id=step.step_id if step else None,
@@ -508,7 +539,7 @@ class LLMAPIHandlerFactory:
                     parsed_response_json=parsed_response_json,
                     rendered_response_json=rendered_response_json,
                     llm_key=llm_key,
-                    model=main_model_group,
+                    model=model_used,
                     duration_seconds=duration_seconds,
                     input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                     output_tokens=completion_tokens if completion_tokens > 0 else None,
@@ -1090,6 +1121,31 @@ class LLMCaller:
                 thought_cost=call_stats.llm_cost,
             )
 
+        organization_id = organization_id or (
+            step.organization_id if step else (thought.organization_id if thought else None)
+        )
+        # Track LLM API handler duration, token counts, and cost
+        duration_seconds = time.perf_counter() - start_time
+        LOG.info(
+            "LLM API handler duration metrics",
+            llm_key=self.llm_key,
+            prompt_name=prompt_name,
+            model=self.llm_config.model_name,
+            duration_seconds=duration_seconds,
+            step_id=step.step_id if step else None,
+            thought_id=thought.observer_thought_id if thought else None,
+            organization_id=organization_id,
+            input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
+            output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
+            reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
+            cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
+            llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
+        )
+
+        # Raw response is used for CUA engine LLM calls.
+        if raw_response:
+            return response.model_dump(exclude_none=True)
+
         parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix)
         parsed_response_json = json.dumps(parsed_response, indent=2)
         if step and not is_speculative_step:
@@ -1118,27 +1174,6 @@ class LLMCaller:
                     ai_suggestion=ai_suggestion,
                 )
 
-        organization_id = organization_id or (
-            step.organization_id if step else (thought.organization_id if thought else None)
-        )
-        # Track LLM API handler duration, token counts, and cost
-        duration_seconds = time.perf_counter() - start_time
-        LOG.info(
-            "LLM API handler duration metrics",
-            llm_key=self.llm_key,
-            prompt_name=prompt_name,
-            model=self.llm_config.model_name,
-            duration_seconds=duration_seconds,
-            step_id=step.step_id if step else None,
-            thought_id=thought.observer_thought_id if thought else None,
-            organization_id=organization_id,
-            input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens else None,
-            output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens else None,
-            reasoning_tokens=call_stats.reasoning_tokens if call_stats and call_stats.reasoning_tokens else None,
-            cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens else None,
-            llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost else None,
-        )
-
         if step and is_speculative_step:
             step.speculative_llm_metadata = SpeculativeLLMMetadata(
                 prompt=llm_prompt_value,
@@ -1155,9 +1190,6 @@ class LLMCaller:
                 cached_tokens=call_stats.cached_tokens,
                 llm_cost=call_stats.llm_cost,
             )
-
-        if raw_response:
-            return response.model_dump(exclude_none=True)
 
         return parsed_response
 

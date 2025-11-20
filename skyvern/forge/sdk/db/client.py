@@ -532,6 +532,7 @@ class AgentDB:
                         select(StepModel)
                         .filter_by(task_id=task_id)
                         .filter_by(organization_id=organization_id)
+                        .filter(StepModel.status != StepStatus.canceled)
                         .order_by(StepModel.order.desc())
                         .order_by(StepModel.retry_index.desc())
                     )
@@ -2541,6 +2542,31 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
+    async def get_workflows_depending_on(
+        self,
+        workflow_run_id: str,
+    ) -> list[WorkflowRun]:
+        """
+        Get all workflow runs that depend on the given workflow_run_id.
+
+        Used to find workflows that should be signaled when a workflow completes,
+        for sequential workflow dependency handling.
+
+        Args:
+            workflow_run_id: The workflow_run_id to find dependents for
+
+        Returns:
+            List of WorkflowRun objects that have depends_on_workflow_run_id set to workflow_run_id
+        """
+        try:
+            async with self.Session() as session:
+                query = select(WorkflowRunModel).filter_by(depends_on_workflow_run_id=workflow_run_id)
+                workflow_runs = (await session.scalars(query)).all()
+                return [convert_to_workflow_run(workflow_run) for workflow_run in workflow_runs]
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
     async def get_workflow_runs(
         self,
         organization_id: str,
@@ -3285,14 +3311,9 @@ class AgentDB:
         - totp_identifier
         - workflow_run_id (optional)
         2. make sure created_at is within the valid lifespan
-        3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
+        3. sort by created_at desc
         4. apply an optional limit at the DB layer
         """
-        all_null = and_(
-            TOTPCodeModel.task_id.is_(None),
-            TOTPCodeModel.workflow_id.is_(None),
-            TOTPCodeModel.workflow_run_id.is_(None),
-        )
         async with self.Session() as session:
             query = (
                 select(TOTPCodeModel)
@@ -3304,7 +3325,7 @@ class AgentDB:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
             if workflow_run_id is not None:
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
-            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc())
+            query = query.order_by(TOTPCodeModel.created_at.desc())
             if limit is not None:
                 query = query.limit(limit)
             totp_code = (await session.scalars(query)).all()
@@ -3322,11 +3343,6 @@ class AgentDB:
         Return recent otp codes for an organization ordered by newest first with optional
         workflow_run_id filtering.
         """
-        all_null = and_(
-            TOTPCodeModel.task_id.is_(None),
-            TOTPCodeModel.workflow_id.is_(None),
-            TOTPCodeModel.workflow_run_id.is_(None),
-        )
         async with self.Session() as session:
             query = select(TOTPCodeModel).filter_by(organization_id=organization_id)
 
@@ -3339,7 +3355,7 @@ class AgentDB:
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
             if workflow_run_id is not None:
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
-            query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc()).limit(limit)
+            query = query.order_by(TOTPCodeModel.created_at.desc()).limit(limit)
             totp_codes = (await session.scalars(query)).all()
             return [TOTPCode.model_validate(totp_code) for totp_code in totp_codes]
 

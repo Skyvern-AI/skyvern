@@ -4,6 +4,13 @@ import { useNavigate } from "react-router-dom";
 import { WorkflowTemplateCard } from "./WorkflowTemplateCard";
 import testImg from "@/assets/promptBoxBg.png";
 import { TEMPORARY_TEMPLATE_IMAGES } from "./TemporaryTemplateImages";
+import {
+  Carousel,
+  CarouselContent,
+  CarouselItem,
+  CarouselNext,
+  CarouselPrevious,
+} from "@/components/ui/carousel";
 
 function WorkflowTemplates() {
   const { data: workflowTemplates, isLoading } = useGlobalWorkflowsQuery();
@@ -26,23 +33,37 @@ function WorkflowTemplates() {
   return (
     <div className="space-y-5">
       <h1 className="text-xl">Explore Workflows</h1>
-      <div className="flex gap-6">
-        {workflowTemplates.map((workflow) => {
-          return (
-            <WorkflowTemplateCard
+      <Carousel
+        opts={{
+          align: "start",
+          loop: true,
+        }}
+        className="w-full"
+      >
+        <CarouselContent className="-ml-6">
+          {workflowTemplates.map((workflow) => (
+            <CarouselItem
               key={workflow.workflow_permanent_id}
-              title={workflow.title}
-              image={
-                TEMPORARY_TEMPLATE_IMAGES[workflow.workflow_permanent_id] ??
-                testImg
-              }
-              onClick={() => {
-                navigate(`/workflows/${workflow.workflow_permanent_id}/debug`);
-              }}
-            />
-          );
-        })}
-      </div>
+              className="basis-1/5 pl-6"
+            >
+              <WorkflowTemplateCard
+                title={workflow.title}
+                image={
+                  TEMPORARY_TEMPLATE_IMAGES[workflow.workflow_permanent_id] ??
+                  testImg
+                }
+                onClick={() => {
+                  navigate(
+                    `/workflows/${workflow.workflow_permanent_id}/debug`,
+                  );
+                }}
+              />
+            </CarouselItem>
+          ))}
+        </CarouselContent>
+        <CarouselPrevious className="-left-4" />
+        <CarouselNext className="-right-4" />
+      </Carousel>
     </div>
   );
 }

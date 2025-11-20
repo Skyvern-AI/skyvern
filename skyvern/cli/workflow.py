@@ -56,7 +56,7 @@ def run_workflow(
         raise typer.Exit(code=1)
 
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
-    run_resp = client.agent.run_workflow(
+    run_resp = client.run_workflow(
         workflow_id=workflow_id,
         parameters=params_dict,
         title=title,
@@ -77,7 +77,7 @@ def cancel_workflow(
 ) -> None:
     """Cancel a running workflow."""
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
-    client.agent.cancel_run(run_id=run_id)
+    client.cancel_run(run_id=run_id)
     console.print(Panel(f"Cancel signal sent for run {run_id}", border_style="red"))
 
 
@@ -89,7 +89,7 @@ def workflow_status(
 ) -> None:
     """Retrieve status information for a workflow run."""
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
-    run = client.agent.get_run(run_id=run_id)
+    run = client.get_run(run_id=run_id)
     console.print(Panel(run.model_dump_json(indent=2), border_style="cyan"))
     if tasks:
         task_list = _list_workflow_tasks(client, run_id)
@@ -105,7 +105,7 @@ def list_workflows(
 ) -> None:
     """List workflows for the organization."""
     client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
-    resp = client.agent._client_wrapper.httpx_client.request(
+    resp = client._client_wrapper.httpx_client.request(
         "api/v1/workflows",
         method="GET",
         params={"page": page, "page_size": page_size, "template": template},

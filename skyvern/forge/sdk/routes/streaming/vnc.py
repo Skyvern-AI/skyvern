@@ -19,14 +19,14 @@ from fastapi import WebSocket, WebSocketDisconnect
 from websockets import Data
 from websockets.exceptions import ConnectionClosedError
 
-import skyvern.forge.sdk.routes.streaming_clients as sc
+import skyvern.forge.sdk.routes.streaming.clients as sc
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming_agent import connected_agent
-from skyvern.forge.sdk.routes.streaming_auth import auth
-from skyvern.forge.sdk.routes.streaming_verify import (
+from skyvern.forge.sdk.routes.streaming.agent import connected_agent
+from skyvern.forge.sdk.routes.streaming.auth import auth
+from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
     loop_verify_task,
     loop_verify_workflow_run,

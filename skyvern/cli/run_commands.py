@@ -95,10 +95,11 @@ def run_server() -> None:
     port = settings.PORT
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))
     uvicorn.run(
-        "skyvern.forge.api_app:app",
+        "skyvern.forge.api_app:create_api_app",
         host="0.0.0.0",
         port=port,
         log_level="info",
+        factory=True,
     )
 
 
