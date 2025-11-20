@@ -116,6 +116,26 @@ function convertToParametersYAML(
         | CredentialParameterYAML
         | undefined => {
         if (parameter.parameterType === WorkflowEditorParameterTypes.Workflow) {
+          // Convert boolean default values to strings for backend
+          let defaultValue = parameter.defaultValue;
+          if (
+            parameter.dataType === "boolean" &&
+            typeof parameter.defaultValue === "boolean"
+          ) {
+            defaultValue = String(parameter.defaultValue);
+          }
+          if (
+            (parameter.dataType === "integer" ||
+              parameter.dataType === "float") &&
+            (typeof parameter.defaultValue === "number" ||
+              typeof parameter.defaultValue === "string")
+          ) {
+            defaultValue =
+              parameter.defaultValue === null
+                ? parameter.defaultValue
+                : String(parameter.defaultValue);
+          }
+
           return {
             parameter_type: WorkflowParameterTypes.Workflow,
             key: parameter.key,
@@ -123,7 +143,7 @@ function convertToParametersYAML(
             workflow_parameter_type: parameter.dataType,
             ...(parameter.defaultValue === null
               ? {}
-              : { default_value: parameter.defaultValue }),
+              : { default_value: defaultValue }),
           };
         } else if (
           parameter.parameterType === WorkflowEditorParameterTypes.Context
