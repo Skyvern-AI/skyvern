@@ -1508,6 +1508,50 @@ async function buildElementObject(
     attrs["required"] = true;
   }
 
+  // check DOM property of required/checked/selected/readonly/disabled
+  // the value from the DOM property should be the top priority
+  if (element.required !== undefined) {
+    delete attrs["required"];
+    delete attrs["aria-required"];
+    if (element.required) {
+      attrs["required"] = true;
+    }
+  }
+  if (element.checked !== undefined) {
+    delete attrs["checked"];
+    delete attrs["aria-checked"];
+    if (element.checked) {
+      attrs["checked"] = true;
+    } else if (
+      elementTagNameLower === "input" &&
+      (element.type === "checkbox" || element.type === "radio")
+    ) {
+      // checked property always exists for checkbox and radio elements
+      attrs["checked"] = false;
+    }
+  }
+  if (element.selected !== undefined) {
+    delete attrs["selected"];
+    delete attrs["aria-selected"];
+    if (element.selected) {
+      attrs["selected"] = true;
+    }
+  }
+  if (element.readOnly !== undefined) {
+    delete attrs["readonly"];
+    delete attrs["aria-readonly"];
+    if (element.readOnly) {
+      attrs["readonly"] = true;
+    }
+  }
+  if (element.disabled !== undefined) {
+    delete attrs["disabled"];
+    delete attrs["aria-disabled"];
+    if (element.disabled) {
+      attrs["disabled"] = true;
+    }
+  }
+
   if (elementTagNameLower === "input" || elementTagNameLower === "textarea") {
     if (element.type === "password") {
       attrs["value"] = element.value ? "*".repeat(element.value.length) : "";
