@@ -673,12 +673,6 @@ class LLMAPIHandlerFactory:
             # Add Vertex AI cache reference only for the intended cached prompt
             vertex_cache_attached = False
             cache_resource_name = getattr(context, "vertex_cache_name", None)
-            LOG.info(
-                "Vertex cache attachment check",
-                cache_resource_name=cache_resource_name,
-                prompt_name=prompt_name,
-                use_prompt_caching=getattr(context, "use_prompt_caching", None) if context else None,
-            )
             if (
                 cache_resource_name
                 and prompt_name == EXTRACT_ACTION_PROMPT_NAME
