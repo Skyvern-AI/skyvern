@@ -416,6 +416,7 @@ class SkyvernElement:
         hover_target = self.get_locator()
         for depth in range(max_depth):
             try:
+                await hover_target.scroll_into_view_if_needed()
                 await hover_target.hover(timeout=timeout)
                 await asyncio.sleep(settle_delay_s)
                 if await self.get_locator().is_visible(timeout=timeout):
