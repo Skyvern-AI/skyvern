@@ -54,7 +54,7 @@ def init(
 
         backend_env_path = resolve_backend_env_path()
         if backend_env_path.exists():
-            console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow")
+            console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow", markup=False)
             redo_llm_setup = Confirm.ask(
                 "Do you want to go through [bold yellow]LLM provider setup again[/bold yellow]?",
                 default=False,
