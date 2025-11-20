@@ -5,7 +5,6 @@ from typing import Annotated
 import structlog
 from asyncache import cached
 from cachetools import TTLCache
-from ddtrace import tracer
 from fastapi import Header, HTTPException, status
 from jose import jwt
 from jose.exceptions import JWTError
@@ -17,6 +16,13 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.client import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
+
+try:
+    from ddtrace import tracer
+
+    _DDTRACE_AVAILABLE = True
+except ImportError:
+    _DDTRACE_AVAILABLE = False
 
 LOG = structlog.get_logger()
 
@@ -60,12 +66,12 @@ async def get_current_org(
                 curr_ctx.organization_id = organization.organization_id
                 curr_ctx.organization_name = organization.organization_name
 
-            # Tag datadog span immediately
-            span = tracer.current_span()
-            if span:
-                span.set_tag("organization_id", organization.organization_id)
-                if organization.organization_name:
-                    span.set_tag("organization_name", organization.organization_name)
+            if _DDTRACE_AVAILABLE:
+                span = tracer.current_span()
+                if span:
+                    span.set_tag("organization_id", organization.organization_id)
+                    if organization.organization_name:
+                        span.set_tag("organization_name", organization.organization_name)
         except Exception:
             pass
 

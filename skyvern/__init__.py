@@ -2,31 +2,36 @@ import re
 import typing
 from typing import Any
 
-from ddtrace import tracer
-from ddtrace.ext import http
-from ddtrace.trace import TraceFilter, Span
-
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.utils import setup_windows_event_loop_policy
 
 if typing.TYPE_CHECKING:
     from skyvern.library import Skyvern  # noqa: E402
 
+try:
+    from ddtrace import tracer
+    from ddtrace.ext import http
+    from ddtrace.trace import TraceFilter, Span
 
-class FilterHeartbeat(TraceFilter):
-    _HB_URL = re.compile(r"http://.*/heartbeat$")
+    class FilterHeartbeat(TraceFilter):
+        _HB_URL = re.compile(r"http://.*/heartbeat$")
 
-    def process_trace(self, trace: list[Span]) -> list[Span] | None:
-        for span in trace:
-            url = span.get_tag(http.URL)
-            if span.parent_id is None and url is not None and self._HB_URL.match(url):
-                # drop the full trace chunk
-                return None
-        return trace
+        def process_trace(self, trace: list[Span]) -> list[Span] | None:
+            for span in trace:
+                url = span.get_tag(http.URL)
+                if span.parent_id is None and url is not None and self._HB_URL.match(url):
+                    # drop the full trace chunk
+                    return None
+            return trace
+
+    _DDTRACE_AVAILABLE = True
+except ImportError:
+    _DDTRACE_AVAILABLE = False
 
 
 setup_windows_event_loop_policy()
-tracer.configure(trace_processors=[FilterHeartbeat()])
+if _DDTRACE_AVAILABLE:
+    tracer.configure(trace_processors=[FilterHeartbeat()])
 setup_logger()
 
 # noinspection PyUnresolvedReferences
