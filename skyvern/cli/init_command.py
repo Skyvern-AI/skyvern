@@ -8,6 +8,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.utils import migrate_db
 from skyvern.utils.env_paths import resolve_backend_env_path
 
@@ -44,6 +45,7 @@ def init(
         console.print("✅ [green]Database migration complete.[/green]")
 
         console.print("🔑 [bold blue]Generating local organization API key...[/bold blue]")
+        start_forge_app()
         api_key = asyncio.run(setup_local_organization())
         if api_key:
             console.print("✅ [green]Local organization API key generated.[/green]")

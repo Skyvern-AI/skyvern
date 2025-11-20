@@ -1852,11 +1852,30 @@ function convertParametersToParameterYAML(
           };
         }
         case WorkflowParameterTypes.Workflow: {
+          // Convert default values to strings for backend when needed
+          let defaultValue = parameter.default_value;
+          if (
+            parameter.workflow_parameter_type === "boolean" &&
+            typeof parameter.default_value === "boolean"
+          ) {
+            defaultValue = String(parameter.default_value);
+          } else if (
+            (parameter.workflow_parameter_type === "integer" ||
+              parameter.workflow_parameter_type === "float") &&
+            (typeof parameter.default_value === "number" ||
+              typeof parameter.default_value === "string")
+          ) {
+            defaultValue =
+              parameter.default_value === null
+                ? parameter.default_value
+                : String(parameter.default_value);
+          }
+
           return {
             ...base,
             parameter_type: WorkflowParameterTypes.Workflow,
             workflow_parameter_type: parameter.workflow_parameter_type,
-            default_value: parameter.default_value,
+            default_value: defaultValue,
           };
         }
         case WorkflowParameterTypes.Credential: {
