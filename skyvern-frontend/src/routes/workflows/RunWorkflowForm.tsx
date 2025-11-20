@@ -427,7 +427,9 @@ function RunWorkflowForm({
       (param) =>
         (param.workflow_parameter_type === "boolean" ||
           param.workflow_parameter_type === "integer" ||
-          param.workflow_parameter_type === "float") &&
+          param.workflow_parameter_type === "float" ||
+          param.workflow_parameter_type === "file_url" ||
+          param.workflow_parameter_type === "json") &&
         errors[param.key],
     );
 
@@ -458,16 +460,23 @@ function RunWorkflowForm({
                 name={parameter.key}
                 rules={{
                   validate: (value) => {
-                    if (
-                      parameter.workflow_parameter_type === "json" &&
-                      typeof value === "string"
-                    ) {
-                      try {
-                        JSON.parse(value);
-                        return true;
-                      } catch (e) {
-                        return "Invalid JSON";
+                    if (parameter.workflow_parameter_type === "json") {
+                      if (value === null || value === undefined) {
+                        return "This field is required";
                       }
+                      if (typeof value === "string") {
+                        const trimmed = value.trim();
+                        if (trimmed === "") {
+                          return "This field is required";
+                        }
+                        try {
+                          JSON.parse(trimmed);
+                          return true;
+                        } catch (e) {
+                          return "Invalid JSON";
+                        }
+                      }
+                      return;
                     }
 
                     // Boolean parameters are required - show error and block submission
@@ -487,6 +496,21 @@ function RunWorkflowForm({
                         value === null ||
                         value === undefined ||
                         Number.isNaN(value)
+                      ) {
+                        return "This field is required";
+                      }
+                      return;
+                    }
+
+                    if (parameter.workflow_parameter_type === "file_url") {
+                      if (
+                        value === null ||
+                        value === undefined ||
+                        (typeof value === "string" && value.trim() === "") ||
+                        (typeof value === "object" &&
+                          value !== null &&
+                          "s3uri" in value &&
+                          !value.s3uri)
                       ) {
                         return "This field is required";
                       }
@@ -540,10 +564,14 @@ function RunWorkflowForm({
                           {form.formState.errors[parameter.key] && (
                             <div
                               className={`text-xs ${
-                                parameter.workflow_parameter_type === "boolean" ||
+                                parameter.workflow_parameter_type ===
+                                  "boolean" ||
                                 parameter.workflow_parameter_type ===
                                   "integer" ||
-                                parameter.workflow_parameter_type === "float"
+                                parameter.workflow_parameter_type ===
+                                  "float" ||
+                                parameter.workflow_parameter_type === "file_url" ||
+                                parameter.workflow_parameter_type === "json"
                                   ? "text-destructive"
                                   : "text-warning"
                               }`}
