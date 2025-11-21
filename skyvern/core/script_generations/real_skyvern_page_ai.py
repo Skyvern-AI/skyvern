@@ -14,6 +14,7 @@ from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
+from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services.otp_service import poll_otp_value
@@ -532,6 +533,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
             screenshots=scraped_page_refreshed.screenshots,
             prompt_name="extract-information",
         )
+
+        # Validate and fill missing fields based on schema
+        if schema:
+            result = validate_and_fill_extraction_result(
+                extraction_result=result,
+                schema=schema,
+            )
+
         if context and context.script_mode:
             print(f"\n✨ 📊 Extracted Information:\n{'-' * 50}")
 
