@@ -1,3 +1,14 @@
+"""
+Provides WS endpoints for streaming screenshots.
+
+Screenshot streaming is created on the basis of one of these database entities:
+  - task (run)
+  - workflow run
+
+Screenshot streaming is used for a run that is invoked without a browser session.
+Otherwise, VNC streaming is used.
+"""
+
 import asyncio
 import base64
 from datetime import datetime
