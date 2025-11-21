@@ -1561,10 +1561,13 @@ class ForgeAgent:
 
                 # Check if parallel verification is enabled
                 distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                    distinct_id,
-                    properties={"organization_id": task.organization_id, "task_url": task.url},
+                enable_parallel_verification = (
+                    await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "ENABLE_PARALLEL_USER_GOAL_CHECK",
+                        distinct_id,
+                        properties={"organization_id": task.organization_id, "task_url": task.url},
+                    )
+                    and not disable_user_goal_check
                 )
 
                 if not disable_user_goal_check and not enable_parallel_verification:
@@ -1590,7 +1593,7 @@ class ForgeAgent:
                         )
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
-                elif enable_parallel_verification:
+                elif not disable_user_goal_check and enable_parallel_verification:
                     # Parallel verification enabled - defer check to handle_completed_step
                     LOG.info(
                         "Parallel verification enabled, deferring user goal check to handle_completed_step",
@@ -4204,29 +4207,42 @@ class ForgeAgent:
 
         if should_verify and browser_state and scraped_page:
             try:
-                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                    distinct_id,
-                    properties={"organization_id": task.organization_id, "task_url": task.url},
+                disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "DISABLE_USER_GOAL_CHECK",
+                    task.workflow_run_id if task.workflow_run_id else task.task_id,
+                    properties={"task_url": task.url, "organization_id": task.organization_id},
                 )
 
-                if enable_parallel_verification:
+                if disable_user_goal_check:
                     LOG.info(
-                        "Parallel verification enabled, using optimized flow",
+                        "User goal verification disabled via feature flag, skipping parallel verification",
                         step_id=step.step_id,
                         task_id=task.task_id,
                     )
-                    return await self._handle_completed_step_with_parallel_verification(
-                        organization=organization,
-                        task=task,
-                        step=step,
-                        page=page,
-                        browser_state=browser_state,
-                        scraped_page=scraped_page,
-                        engine=engine,
-                        task_block=task_block,
+                else:
+                    distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                    enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "ENABLE_PARALLEL_USER_GOAL_CHECK",
+                        distinct_id,
+                        properties={"organization_id": task.organization_id, "task_url": task.url},
                     )
+
+                    if enable_parallel_verification:
+                        LOG.info(
+                            "Parallel verification enabled, using optimized flow",
+                            step_id=step.step_id,
+                            task_id=task.task_id,
+                        )
+                        return await self._handle_completed_step_with_parallel_verification(
+                            organization=organization,
+                            task=task,
+                            step=step,
+                            page=page,
+                            browser_state=browser_state,
+                            scraped_page=scraped_page,
+                            engine=engine,
+                            task_block=task_block,
+                        )
             except Exception:
                 LOG.warning(
                     "Failed to check parallel verification feature flag, using standard flow",
