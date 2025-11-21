@@ -10,7 +10,7 @@ import structlog
 
 from skyvern.constants import MAX_IMAGE_MESSAGES
 from skyvern.forge.sdk.api.llm import commentjson
-from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
+from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat, InvalidLLMResponseType
 
 LOG = structlog.get_logger()
 
@@ -155,13 +155,14 @@ def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
             return first_dict
 
         LOG.warning("List response contained no dict entries; returning empty dict")
-        return {}
+        raise InvalidLLMResponseType("list")
 
     LOG.warning(
         "Parsed LLM response is not a dict; returning empty dict",
         response_type=type(response).__name__,
     )
-    return {}
+
+    raise InvalidLLMResponseType(type(response).__name__)
 
 
 def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False) -> dict[str, Any]:
