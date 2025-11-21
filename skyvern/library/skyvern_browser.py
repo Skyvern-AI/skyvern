@@ -2,11 +2,10 @@ from typing import TYPE_CHECKING, Any
 
 from playwright.async_api import BrowserContext, Page
 
-from skyvern.client import AsyncSkyvern
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 
 if TYPE_CHECKING:
-    from skyvern.library.skyvern_sdk import SkyvernSdk
+    from skyvern.library.skyvern import Skyvern
 
 
 class SkyvernBrowser(BrowserContext):
@@ -19,8 +18,8 @@ class SkyvernBrowser(BrowserContext):
 
     Example:
         ```python
-            sdk = SkyvernSdk()
-            browser = await sdk.launch_local_browser()
+            skyvern = Skyvern()
+            browser = await skyvern.launch_local_browser()
 
             # Get or create the working page
             page = await browser.get_working_page()
@@ -38,14 +37,14 @@ class SkyvernBrowser(BrowserContext):
 
     def __init__(
         self,
-        sdk: "SkyvernSdk",
+        skyvern: "Skyvern",
         browser_context: BrowserContext,
         *,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
     ):
         super().__init__(browser_context)
-        self._sdk = sdk
+        self._skyvern = skyvern
         self._browser_context = browser_context
         self._browser_session_id = browser_session_id
         self._browser_address = browser_address
@@ -73,12 +72,8 @@ class SkyvernBrowser(BrowserContext):
         return self._browser_address
 
     @property
-    def client(self) -> AsyncSkyvern:
-        return self._sdk.api
-
-    @property
-    def sdk(self) -> "SkyvernSdk":
-        return self._sdk
+    def skyvern(self) -> "Skyvern":
+        return self._skyvern
 
     async def get_working_page(self) -> SkyvernBrowserPage:
         """Get the most recent page or create a new one if none exists.

@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import aiofiles
 import psutil
@@ -100,10 +100,26 @@ def set_download_file_listener(
                     )
                     file_path.rename(str(file_path) + suffix)
                     return
-                suffix = Path(download.url).suffix
+
+                parsed_url = urlparse(download.url)
+                parsed_qs = parse_qsl(parsed_url.query)
+                for key, value in parsed_qs:
+                    if key.lower() == "filename":
+                        suffix = Path(value).suffix
+                        if suffix:
+                            LOG.info(
+                                "Add extension according to the parsed query params of download url",
+                                workflow_run_id=workflow_run_id,
+                                task_id=task_id,
+                                filename=value,
+                            )
+                            file_path.rename(str(file_path) + suffix)
+                            return
+
+                suffix = Path(parsed_url.path).suffix
                 if suffix:
                     LOG.info(
-                        "Add extension according to download url",
+                        "Add extension according to download url path",
                         workflow_run_id=workflow_run_id,
                         task_id=task_id,
                         filepath=str(file_path) + suffix,
@@ -267,7 +283,8 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
-            set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
+            if settings.BROWSER_LOGS_ENABLED:
+                set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
 
             proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
@@ -774,7 +791,11 @@ class BrowserState:
         return [
             http_page
             for http_page in self.browser_context.pages
-            if http_page.url == "about:blank" or urlparse(http_page.url).scheme in ["http", "https"]
+            if (
+                http_page.url == "about:blank"
+                or http_page.url == "chrome-error://chromewebdata/"
+                or urlparse(http_page.url).scheme in ["http", "https"]
+            )
         ]
 
     async def validate_browser_context(self, page: Page) -> bool:
@@ -803,7 +824,8 @@ class BrowserState:
 
     async def must_get_working_page(self) -> Page:
         page = await self.get_working_page()
-        assert page is not None
+        if page is None:
+            raise MissingBrowserStatePage()
         return page
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:

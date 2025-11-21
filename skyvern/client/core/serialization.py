@@ -72,7 +72,7 @@ def convert_and_respect_annotation_metadata(
 
     if (
         typing_extensions.get_origin(clean_type) == typing.Dict
-        or typing_extensions.get_origin(clean_type) == dict
+        or typing_extensions.get_origin(clean_type) is dict
         or clean_type == typing.Dict
     ) and isinstance(object_, typing.Dict):
         key_type = typing_extensions.get_args(clean_type)[0]
@@ -92,7 +92,7 @@ def convert_and_respect_annotation_metadata(
     if not isinstance(object_, str):
         if (
             typing_extensions.get_origin(clean_type) == typing.Set
-            or typing_extensions.get_origin(clean_type) == set
+            or typing_extensions.get_origin(clean_type) is set
             or clean_type == typing.Set
         ) and isinstance(object_, typing.Set):
             inner_type = typing_extensions.get_args(clean_type)[0]
@@ -108,14 +108,14 @@ def convert_and_respect_annotation_metadata(
         elif (
             (
                 typing_extensions.get_origin(clean_type) == typing.List
-                or typing_extensions.get_origin(clean_type) == list
+                or typing_extensions.get_origin(clean_type) is list
                 or clean_type == typing.List
             )
             and isinstance(object_, typing.List)
         ) or (
             (
                 typing_extensions.get_origin(clean_type) == typing.Sequence
-                or typing_extensions.get_origin(clean_type) == collections.abc.Sequence
+                or typing_extensions.get_origin(clean_type) is collections.abc.Sequence
                 or clean_type == typing.Sequence
             )
             and isinstance(object_, typing.Sequence)
@@ -131,7 +131,7 @@ def convert_and_respect_annotation_metadata(
                 for item in object_
             ]
 
-    if typing_extensions.get_origin(clean_type) == typing.Union:
+    if typing_extensions.get_origin(clean_type) is typing.Union:
         # We should be able to ~relatively~ safely try to convert keys against all
         # member types in the union, the edge case here is if one member aliases a field
         # of the same name to a different name from another member

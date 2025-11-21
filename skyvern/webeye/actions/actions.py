@@ -258,9 +258,10 @@ class SolveCaptchaAction(Action):
 class SelectOptionAction(WebAction):
     action_type: ActionType = ActionType.SELECT_OPTION
     option: SelectOption
+    download: bool = False
 
     def __repr__(self) -> str:
-        return f"SelectOptionAction(element_id={self.element_id}, option={self.option}, context={self.input_or_select_context})"
+        return f"SelectOptionAction(element_id={self.element_id}, option={self.option}, context={self.input_or_select_context}, download={self.download})"
 
 
 ###

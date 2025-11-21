@@ -3,7 +3,7 @@ from datetime import datetime
 
 import structlog
 
-import skyvern.forge.sdk.routes.streaming_clients as sc
+import skyvern.forge.sdk.routes.streaming.clients as sc
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession

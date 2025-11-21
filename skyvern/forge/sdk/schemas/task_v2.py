@@ -78,8 +78,8 @@ class TaskV2(BaseModel):
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)
 
@@ -137,8 +137,8 @@ class TaskV2Metadata(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_urls(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
+        if not v:
+            return v
         return validate_url(v)
 
 
@@ -162,7 +162,7 @@ class TaskV2Request(BaseModel):
     @field_validator("url", "webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)

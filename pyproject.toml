@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "0.2.22"
+version = "1.0.0"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -23,7 +23,6 @@ dependencies = [
     "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
     "pillow>=10.1.0,<11",
     "starlette-context>=0.3.6,<0.4",
-    "ddtrace>=2.3.2,<3",
     "pydantic>=2.5.2,<3",
     "pydantic-settings>=2.1.0,<3",
     "fastapi>=0.115.4,<0.116",
@@ -70,6 +69,7 @@ dependencies = [
 
 [dependency-groups]
 cloud = [
+    "ddtrace>=2.3.2,<3",
     "stripe>=9.7.0,<10",
     "temporalio>=1.6.0,<2",
     "dramatiq[asyncio]>=1.18.0,<2",

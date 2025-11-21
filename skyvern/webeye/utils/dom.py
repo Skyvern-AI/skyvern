@@ -85,6 +85,7 @@ RAW_INPUT_NAME_VALUE = ["name", "email", "username", "password", "phone"]
 class SkyvernOptionType(typing.TypedDict):
     optionIndex: int
     text: str
+    value: str
 
 
 class SkyvernElement:
@@ -619,6 +620,13 @@ class SkyvernElement:
 
             index += 1
         return None
+
+    async def find_file_input_in_children(self) -> Locator | None:
+        """Sometime the file input is invisible on the page, so it won't exist in the element tree, but it can be found in the DOM."""
+        locator = self.get_locator().locator('input[type="file"]')
+        if await locator.count() != 1:
+            return None
+        return locator
 
     async def get_attr(
         self,

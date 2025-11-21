@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from evaluation.core import Evaluator, SkyvernClient
 from evaluation.core.utils import load_webvoyager_case_from_json
 from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Request
 
@@ -19,6 +20,8 @@ async def create_task_v2(
     base_url: str,
     cred: str,
 ) -> None:
+    start_forge_app()
+
     client = SkyvernClient(base_url=base_url, credentials=cred)
     group_id = uuid4()
 

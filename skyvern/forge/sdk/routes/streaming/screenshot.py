@@ -146,7 +146,11 @@ async def workflow_run_streaming(
         organization = await get_current_org(x_api_key=apikey, authorization=token)
         organization_id = organization.organization_id
     except Exception:
-        LOG.exception("WofklowRun Streaming: Error while getting organization", workflow_run_id=workflow_run_id)
+        LOG.exception(
+            "WofklowRun Streaming: Error while getting organization",
+            workflow_run_id=workflow_run_id,
+            token=token,
+        )
         try:
             await websocket.send_text("Invalid credential provided")
         except ConnectionClosedOK:

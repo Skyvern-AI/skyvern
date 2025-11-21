@@ -16,6 +16,7 @@ from rich.prompt import Confirm
 
 from skyvern.cli.console import console
 from skyvern.cli.utils import start_services
+from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.forge_log import setup_logger
@@ -45,6 +46,7 @@ async def skyvern_run_task(prompt: str, url: str) -> dict[str, Any]:
         url: The starting URL of the website where the task should be performed
     """
     skyvern_agent = Skyvern(
+        environment=SkyvernEnvironment.CLOUD,
         base_url=settings.SKYVERN_BASE_URL,
         api_key=settings.SKYVERN_API_KEY,
     )
@@ -93,10 +95,11 @@ def run_server() -> None:
     port = settings.PORT
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))
     uvicorn.run(
-        "skyvern.forge.api_app:app",
+        "skyvern.forge.api_app:create_api_app",
         host="0.0.0.0",
         port=port,
         log_level="info",
+        factory=True,
     )
 
 

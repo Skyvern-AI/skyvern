@@ -1644,10 +1644,8 @@ async def cancel_task(
             detail=f"Task not found {task_id}",
         )
     task = await app.agent.update_task(task_obj, status=TaskStatus.canceled)
-    # get latest step
-    latest_step = await app.DATABASE.get_latest_step(task_id, organization_id=current_org.organization_id)
     # retry the webhook
-    await app.agent.execute_task_webhook(task=task, last_step=latest_step, api_key=x_api_key)
+    await app.agent.execute_task_webhook(task=task, api_key=x_api_key)
 
 
 async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api_key: str | None = None) -> None:
@@ -1778,7 +1776,7 @@ async def retry_webhook(
         return await app.agent.build_task_response(task=task_obj)
 
     # retry the webhook
-    await app.agent.execute_task_webhook(task=task_obj, last_step=latest_step, api_key=x_api_key)
+    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key)
 
     return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
 
@@ -1857,6 +1855,10 @@ async def get_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
+    search_key: str | None = Query(
+        None,
+        description="Search runs by parameter key, parameter description, or run parameter value.",
+    ),
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-get")
 
@@ -1864,7 +1866,9 @@ async def get_runs(
     if page > 10:
         return []
 
-    runs = await app.DATABASE.get_all_runs(current_org.organization_id, page=page, page_size=page_size, status=status)
+    runs = await app.DATABASE.get_all_runs(
+        current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
+    )
     return ORJSONResponse([run.model_dump() for run in runs])
 
 

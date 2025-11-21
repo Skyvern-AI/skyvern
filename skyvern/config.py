@@ -1,3 +1,7 @@
+import logging
+import platform
+from typing import Any
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -14,6 +18,9 @@ _DEFAULT_ENV_FILES = (
     resolve_backend_env_path(".env.staging"),
     resolve_backend_env_path(".env.prod"),
 )
+
+
+LOG = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -46,7 +53,11 @@ class Settings(BaseSettings):
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95
     MAX_RETRIES_PER_STEP: int = 5
     DEBUG_MODE: bool = False
-    DATABASE_STRING: str = "postgresql+psycopg://skyvern@localhost/skyvern"
+    DATABASE_STRING: str = (
+        "postgresql+asyncpg://skyvern@localhost/skyvern"
+        if platform.system() == "Windows"
+        else "postgresql+psycopg://skyvern@localhost/skyvern"
+    )
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
@@ -107,6 +118,7 @@ class Settings(BaseSettings):
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
+    BROWSER_LOGS_ENABLED: bool = True
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
@@ -400,6 +412,7 @@ class Settings(BaseSettings):
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
+                "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
                 "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",
@@ -436,6 +449,7 @@ class Settings(BaseSettings):
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH",
                     "label": "Gemini 2.5 Flash",
                 },
+                "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
                 "gemini-2.5-flash-lite": {
                     "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
                     "label": "Gemini 2.5 Flash Lite",
@@ -456,6 +470,29 @@ class Settings(BaseSettings):
                     "label": "Anthropic Claude 4.5 Haiku",
                 },
             }
+
+    def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
+        super().model_post_init(__context)
+        if platform.system() != "Windows":
+            return
+
+        scheme, sep, remainder = self.DATABASE_STRING.partition("://")
+        if not sep:
+            return
+
+        dialect, driver_sep, driver = scheme.partition("+")
+        if not driver_sep or driver not in {"psycopg", "psycopg2"}:
+            return
+
+        updated_string = f"{dialect}+asyncpg://{remainder}"
+        if updated_string == self.DATABASE_STRING:
+            return
+
+        LOG.warning(
+            "Detected Windows environment: switching DATABASE_STRING driver from psycopg to asyncpg "
+            "for compatibility with the Proactor event loop policy."
+        )
+        object.__setattr__(self, "DATABASE_STRING", updated_string)
 
     def is_cloud_environment(self) -> bool:
         """

@@ -82,7 +82,7 @@ async def get_browser_sessions_all(
     include_in_schema=False,
 )
 async def create_browser_session(
-    browser_session_request: CreateBrowserSessionRequest,
+    browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(

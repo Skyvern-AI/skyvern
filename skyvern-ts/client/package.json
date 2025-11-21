@@ -1,6 +1,6 @@
 {
     "name": "@skyvern/client",
-    "version": "0.2.22",
+    "version": "1.0.0",
     "private": false,
     "repository": {
         "type": "git",

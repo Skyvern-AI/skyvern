@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 import structlog
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
-import skyvern.forge.sdk.routes.streaming_clients as sc
+import skyvern.forge.sdk.routes.streaming.clients as sc
 from skyvern.config import settings
 
 LOG = structlog.get_logger()

@@ -62,6 +62,7 @@ class SkyvernContext:
     # parallel verification optimization
     # stores pre-scraped data for next step to avoid re-scraping
     next_step_pre_scraped_data: dict[str, Any] | None = None
+    speculative_plans: dict[str, Any] = field(default_factory=dict)
 
     """
     Example output value:

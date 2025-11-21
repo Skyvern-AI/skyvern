@@ -9,7 +9,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 
 from skyvern.config import settings
-from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
+from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -133,6 +133,13 @@ class RealSkyvernPageAi(SkyvernPageAi):
         self.page = page
         self.current_label: str | None = None
 
+    async def _refresh_scraped_page(
+        self, take_screenshots: bool = True, max_retries: int = SKYVERN_PAGE_MAX_SCRAPING_RETRIES
+    ) -> None:
+        self.scraped_page = await self.scraped_page.generate_scraped_page(
+            take_screenshots=take_screenshots, max_retries=max_retries
+        )
+
     async def ai_click(
         self,
         selector: str | None,
@@ -145,8 +152,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
             # Build the element tree of the current page for the prompt
             context = skyvern_context.ensure_context()
             payload_str = _get_context_data(data)
-            refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
-            element_tree = refreshed_page.build_element_tree()
+            await self._refresh_scraped_page(take_screenshots=False)
+            element_tree = self.scraped_page.build_element_tree()
 
             organization_id = context.organization_id if context else None
             step_id = context.step_id if context else None
@@ -158,7 +165,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 current_url=self.page.url,
                 elements=element_tree,
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
-                # user_context=getattr(context, "prompt", None),
+                user_context=context.prompt,
             )
             json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
                 prompt=single_click_prompt,
@@ -244,8 +251,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         else:
                             data = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
 
-                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
-                self.scraped_page = refreshed_page
+                await self._refresh_scraped_page(take_screenshots=False)
 
                 # Try to get element_id from selector if selector is provided
                 element_id = await _get_element_id_by_selector(selector, self.page) if selector else None
@@ -284,7 +290,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     )
                 else:
                     # Use a heavier single-input-action when selector is not found
-                    element_tree = refreshed_page.build_element_tree()
+                    element_tree = self.scraped_page.build_element_tree()
                     payload_str = _get_context_data(data)
                     merged_goal = INPUT_GOAL.format(intention=intention, prompt=prompt)
 
@@ -305,7 +311,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
                     actions_json = json_response.get("actions", [])
                     if actions_json and task and step:
-                        actions = parse_actions(task, step.step_id, step.order, refreshed_page, actions_json)
+                        actions = parse_actions(task, step.step_id, step.order, self.scraped_page, actions_json)
                         if actions and isinstance(actions[0], InputTextAction):
                             action = cast(InputTextAction, actions[0])
             except Exception:
@@ -348,8 +354,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 if files and isinstance(data, dict) and "files" not in data:
                     data["files"] = files
 
-                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
-                self.scraped_page = refreshed_page
+                await self._refresh_scraped_page(take_screenshots=False)
 
                 # Try to get element_id from selector if selector is provided
                 element_id = await _get_element_id_by_selector(selector, self.page) if selector else None
@@ -384,7 +389,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     )
                 else:
                     # Use a heavier single-upload-action when selector is not found
-                    element_tree = refreshed_page.build_element_tree()
+                    element_tree = self.scraped_page.build_element_tree()
                     payload_str = _get_context_data(data)
                     merged_goal = UPLOAD_GOAL.format(intention=intention, prompt=prompt)
 
@@ -405,7 +410,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
                     actions_json = json_response.get("actions", [])
                     if actions_json and task and step:
-                        actions = parse_actions(task, step.step_id, step.order, refreshed_page, actions_json)
+                        actions = parse_actions(task, step.step_id, step.order, self.scraped_page, actions_json)
                         if actions and isinstance(actions[0], UploadFileAction):
                             action = cast(UploadFileAction, actions[0])
                             files = action.file_url
@@ -445,9 +450,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     if value and isinstance(data, dict) and "value" not in data:
                         data["value"] = value
 
-                    refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
-                    self.scraped_page = refreshed_page
-                    element_tree = refreshed_page.build_element_tree()
+                    await self._refresh_scraped_page(take_screenshots=False)
+                    element_tree = self.scraped_page.build_element_tree()
                     merged_goal = SELECT_OPTION_GOAL.format(intention=intention, prompt=prompt)
                     single_select_prompt = prompt_engine.load_prompt(
                         template="single-select-action",
@@ -501,21 +505,21 @@ class RealSkyvernPageAi(SkyvernPageAi):
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
 
-        scraped_page_refreshed = await self.scraped_page.refresh()
+        await self._refresh_scraped_page(take_screenshots=True)
         context = skyvern_context.current()
         tz_info = datetime.now(tz=timezone.utc).tzinfo
         if context and context.tz_info:
             tz_info = context.tz_info
         prompt = _render_template_with_label(prompt, label=self.current_label)
         extract_information_prompt = load_prompt_with_elements(
-            element_tree_builder=scraped_page_refreshed,
+            element_tree_builder=self.scraped_page,
             prompt_engine=prompt_engine,
             template_name="extract-information",
             html_need_skyvern_attrs=False,
             data_extraction_goal=prompt,
             extracted_information_schema=schema,
-            current_url=scraped_page_refreshed.url,
-            extracted_text=scraped_page_refreshed.extracted_text,
+            current_url=self.scraped_page.url,
+            extracted_text=self.scraped_page.extracted_text,
             error_code_mapping_str=(json.dumps(error_code_mapping) if error_code_mapping else None),
             local_datetime=datetime.now(tz_info).isoformat(),
         )
@@ -529,7 +533,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         result = await app.EXTRACTION_LLM_API_HANDLER(
             prompt=extract_information_prompt,
             step=step,
-            screenshots=scraped_page_refreshed.screenshots,
+            screenshots=self.scraped_page.screenshots,
             prompt_name="extract-information",
         )
         if context and context.script_mode:
@@ -598,9 +602,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
             reasoning=action_info.get("reasoning"),
         )
 
-        refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
-        self.scraped_page = refreshed_page
-        element_tree = refreshed_page.build_element_tree()
+        await self._refresh_scraped_page(take_screenshots=False)
+        element_tree = self.scraped_page.build_element_tree()
 
         template: str
         llm_handler: Any
@@ -642,7 +645,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.warning("ai_act: no actions generated", prompt=prompt, action_type=action_type)
                 return
 
-            actions = parse_actions(task, step.step_id, step.order, refreshed_page, actions_json)
+            actions = parse_actions(task, step.step_id, step.order, self.scraped_page, actions_json)
             if not actions:
                 LOG.warning("ai_act: failed to parse actions", prompt=prompt, action_type=action_type)
                 return
@@ -650,13 +653,13 @@ class RealSkyvernPageAi(SkyvernPageAi):
             action = actions[0]
 
             if action_type == "CLICK" and isinstance(action, ClickAction):
-                result = await handle_click_action(action, self.page, refreshed_page, task, step)
+                result = await handle_click_action(action, self.page, self.scraped_page, task, step)
             elif action_type == "INPUT_TEXT" and isinstance(action, InputTextAction):
-                result = await handle_input_text_action(action, self.page, refreshed_page, task, step)
+                result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
             elif action_type == "UPLOAD_FILE" and isinstance(action, UploadFileAction):
-                result = await handle_upload_file_action(action, self.page, refreshed_page, task, step)
+                result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
             elif action_type == "SELECT_OPTION" and isinstance(action, SelectOptionAction):
-                result = await handle_select_option_action(action, self.page, refreshed_page, task, step)
+                result = await handle_select_option_action(action, self.page, self.scraped_page, task, step)
             else:
                 LOG.warning(
                     "ai_act: action type mismatch",

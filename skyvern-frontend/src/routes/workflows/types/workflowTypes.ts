@@ -307,7 +307,6 @@ export type TaskBlock = WorkflowBlockBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
@@ -320,7 +319,6 @@ export type Taskv2Block = WorkflowBlockBase & {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_steps: number | null;
-  cache_actions?: boolean;
   disable_cache: boolean;
 };
 
@@ -425,7 +423,6 @@ export type ActionBlock = WorkflowBlockBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   engine: RunEngine | null;
 };
@@ -443,7 +440,6 @@ export type NavigationBlock = WorkflowBlockBase & {
   download_suffix?: string | null;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
@@ -460,7 +456,6 @@ export type ExtractionBlock = WorkflowBlockBase & {
   max_retries?: number;
   max_steps_per_run?: number | null;
   parameters: Array<WorkflowParameter>;
-  cache_actions: boolean;
   disable_cache?: boolean;
   engine: RunEngine | null;
 };
@@ -476,7 +471,6 @@ export type LoginBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
@@ -500,7 +494,6 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   totp_verification_url?: string | null;
   totp_identifier?: string | null;
-  cache_actions: boolean;
   disable_cache?: boolean;
   engine: RunEngine | null;
   download_timeout: number | null; // seconds
@@ -584,3 +577,9 @@ export function isOutputParameter(
 ): parameter is OutputParameter {
   return parameter.parameter_type === "output";
 }
+
+export type ImprovePromptForWorkflowResponse = {
+  error: string | null;
+  improved: string;
+  original: string;
+};

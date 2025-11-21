@@ -249,7 +249,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
-          cacheActions: block.cache_actions,
           disableCache: block.disable_cache ?? false,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
@@ -269,7 +268,6 @@ function convertToNode(
           prompt: block.prompt,
           url: block.url ?? "",
           maxSteps: block.max_steps,
-          cacheActions: block.cache_actions ?? false,
           disableCache: block.disable_cache ?? false,
           totpIdentifier: block.totp_identifier,
           totpVerificationUrl: block.totp_verification_url,
@@ -308,7 +306,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
-          cacheActions: block.cache_actions,
           disableCache: block.disable_cache ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
         },
@@ -330,7 +327,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
-          cacheActions: block.cache_actions,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
@@ -375,7 +371,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
-          cacheActions: block.cache_actions,
           disableCache: block.disable_cache ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
         },
@@ -395,7 +390,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
-          cacheActions: block.cache_actions,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
@@ -430,7 +424,6 @@ function convertToNode(
           parameterKeys: block.parameters.map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
-          cacheActions: block.cache_actions,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           engine: block.engine ?? RunEngine.SkyvernV1,
@@ -1107,7 +1100,6 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
-        cache_actions: node.data.cacheActions,
         disable_cache: node.data.disableCache ?? false,
         include_action_history_in_verification:
           node.data.includeActionHistoryInVerification,
@@ -1174,7 +1166,6 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
-        cache_actions: node.data.cacheActions,
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
       };
@@ -1199,7 +1190,6 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
-        cache_actions: node.data.cacheActions,
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
@@ -1221,7 +1211,6 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         }),
         max_steps_per_run: node.data.maxStepsOverride,
         parameter_keys: node.data.parameterKeys,
-        cache_actions: node.data.cacheActions,
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
       };
@@ -1244,7 +1233,6 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
-        cache_actions: node.data.cacheActions,
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
@@ -1277,7 +1265,6 @@ function getWorkflowBlock(node: WorkflowBlockNode): BlockYAML {
         parameter_keys: node.data.parameterKeys,
         totp_identifier: node.data.totpIdentifier,
         totp_verification_url: node.data.totpVerificationUrl,
-        cache_actions: node.data.cacheActions,
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
         download_timeout: node.data.downloadTimeout, // seconds
@@ -1865,11 +1852,30 @@ function convertParametersToParameterYAML(
           };
         }
         case WorkflowParameterTypes.Workflow: {
+          // Convert default values to strings for backend when needed
+          let defaultValue = parameter.default_value;
+          if (
+            parameter.workflow_parameter_type === "boolean" &&
+            typeof parameter.default_value === "boolean"
+          ) {
+            defaultValue = String(parameter.default_value);
+          } else if (
+            (parameter.workflow_parameter_type === "integer" ||
+              parameter.workflow_parameter_type === "float") &&
+            (typeof parameter.default_value === "number" ||
+              typeof parameter.default_value === "string")
+          ) {
+            defaultValue =
+              parameter.default_value === null
+                ? parameter.default_value
+                : String(parameter.default_value);
+          }
+
           return {
             ...base,
             parameter_type: WorkflowParameterTypes.Workflow,
             workflow_parameter_type: parameter.workflow_parameter_type,
-            default_value: parameter.default_value,
+            default_value: defaultValue,
           };
         }
         case WorkflowParameterTypes.Credential: {
@@ -1930,7 +1936,6 @@ function convertBlocksToBlockYAML(
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
-          cache_actions: block.cache_actions,
           disable_cache: block.disable_cache ?? false,
           include_action_history_in_verification:
             block.include_action_history_in_verification,
@@ -1993,7 +1998,6 @@ function convertBlocksToBlockYAML(
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
-          cache_actions: block.cache_actions,
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
         };
@@ -2016,7 +2020,6 @@ function convertBlocksToBlockYAML(
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
-          cache_actions: block.cache_actions,
           disable_cache: block.disable_cache ?? false,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
@@ -2036,7 +2039,6 @@ function convertBlocksToBlockYAML(
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
           parameter_keys: block.parameters.map((p) => p.key),
-          cache_actions: block.cache_actions,
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
         };
@@ -2055,7 +2057,6 @@ function convertBlocksToBlockYAML(
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
-          cache_actions: block.cache_actions,
           disable_cache: block.disable_cache ?? false,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
@@ -2085,7 +2086,6 @@ function convertBlocksToBlockYAML(
           parameter_keys: block.parameters.map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
-          cache_actions: block.cache_actions,
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
           download_timeout: null, // seconds

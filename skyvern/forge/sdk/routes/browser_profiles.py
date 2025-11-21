@@ -227,8 +227,8 @@ async def _create_profile_from_session(
     description: str | None,
     browser_session_id: str,
 ) -> BrowserProfile:
-    browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
-    if browser_state is None:
+    browser_session = await app.DATABASE.get_persistent_browser_session(browser_session_id, organization_id)
+    if browser_session is None:
         LOG.warning(
             "Browser session not found for profile creation",
             organization_id=organization_id,
@@ -236,16 +236,22 @@ async def _create_profile_from_session(
         )
         raise BrowserSessionNotFound(browser_session_id)
 
-    session_dir = browser_state.browser_artifacts.browser_session_dir
+    session_dir = await app.STORAGE.retrieve_browser_profile(
+        organization_id=organization_id,
+        profile_id=browser_session_id,
+    )
     if not session_dir:
         LOG.warning(
-            "Browser session has no persisted data",
+            "Browser session archive not found for profile creation",
             organization_id=organization_id,
             browser_session_id=browser_session_id,
         )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Browser session does not have persisted data to store",
+            detail=(
+                "Browser session does not have a persisted profile archive. "
+                "Close the session and wait for upload before creating a browser profile."
+            ),
         )
 
     try:

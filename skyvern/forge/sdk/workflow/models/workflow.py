@@ -33,8 +33,8 @@ class WorkflowRequestBody(BaseModel):
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
         return validate_url(url)
 
     @model_validator(mode="after")

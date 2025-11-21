@@ -18,7 +18,7 @@ from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.core.script_generations.generate_script import _build_block_fn, create_or_update_script_block
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
-from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, WorkflowRunNotFound
+from skyvern.exceptions import ScriptNotFound, ScriptTerminationException, StepTerminationError, WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
@@ -612,6 +612,30 @@ async def _update_workflow_block(
 
             task_output = TaskOutput.from_task(updated_task, downloaded_files)
             final_output = task_output.model_dump()
+            step_for_billing: Step | None = None
+            if step_id:
+                step_for_billing = await app.DATABASE.get_step(
+                    step_id=step_id,
+                    organization_id=context.organization_id,
+                )
+            if step_for_billing:
+                try:
+                    if not ai_fallback_triggered:
+                        await app.AGENT_FUNCTION.post_cache_step_execution(
+                            updated_task,
+                            step_for_billing,
+                        )
+                except StepTerminationError as billing_error:
+                    LOG.warning(
+                        "Cached step billing failed; marking workflow block as failed.",
+                        organization_id=context.organization_id,
+                        task_id=task_id,
+                        step_id=step_id,
+                        error=str(billing_error),
+                    )
+                    status = BlockStatus.failed
+                    failure_reason = str(billing_error)
+                    final_output = None
         else:
             final_output = None
 
@@ -819,6 +843,7 @@ async def _fallback_to_ai_run(
                 BlockStatus(task.status.value),
                 failure_reason=failure_reason,
                 label=cache_key,
+                ai_fallback_triggered=True,
             )
 
         # 5. After successful AI execution, regenerate the script block and create new version

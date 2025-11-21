@@ -60,7 +60,6 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
-    download_file,
     get_download_dir,
     list_downloading_files_in_directory,
     list_files_in_directory,
@@ -396,6 +395,146 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+        # TODO: maybe support all action types in the future(?)
+        trigger_download_action = isinstance(action, (SelectOptionAction, ClickAction)) and action.download
+        if not trigger_download_action:
+            results = await ActionHandler._handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+            await app.DATABASE.create_action(action=action)
+            return results
+
+        context = skyvern_context.current()
+        download_dir = Path(
+            get_download_dir(
+                run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+            )
+        )
+        initial_page_count = 0
+        # get the initial page count
+        if browser_state:
+            initial_page_count = len(await browser_state.list_valid_pages())
+
+        list_files_before = list_files_in_directory(download_dir)
+        if task.browser_session_id:
+            files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                organization_id=task.organization_id, browser_session_id=task.browser_session_id
+            )
+            list_files_before = list_files_before + files_in_browser_session
+        LOG.info(
+            "Number of files in download directory before action",
+            num_downloaded_files_before=len(list_files_before),
+            download_dir=download_dir,
+        )
+
+        download_triggered = False
+        try:
+            results = await ActionHandler._handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+            if not results:
+                return results
+            try:
+                LOG.info(
+                    "Checking if there is any new files after click",
+                    download_dir=download_dir,
+                )
+                async with asyncio.timeout(task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME):
+                    while True:
+                        list_files_after = list_files_in_directory(download_dir)
+                        if task.browser_session_id:
+                            files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                                organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                            )
+                            list_files_after = list_files_after + files_in_browser_session
+
+                        if len(list_files_after) > len(list_files_before):
+                            LOG.info(
+                                "Found new files in download directory after action",
+                                num_downloaded_files_after=len(list_files_after),
+                                download_dir=download_dir,
+                                workflow_run_id=task.workflow_run_id,
+                            )
+                            download_triggered = True
+                            break
+                        await asyncio.sleep(1)
+
+            except asyncio.TimeoutError:
+                LOG.warning(
+                    "No file to download after action",
+                    workflow_run_id=task.workflow_run_id,
+                )
+
+            if not download_triggered:
+                return results
+            results[-1].download_triggered = True
+
+            # check if there's any file is still downloading
+            downloading_files = list_downloading_files_in_directory(download_dir)
+            if task.browser_session_id:
+                files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
+                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                )
+                downloading_files = downloading_files + files_in_browser_session
+
+            if len(downloading_files) == 0:
+                return results
+
+            LOG.info(
+                "File downloading hasn't completed, wait for a while",
+                downloading_files=downloading_files,
+                workflow_run_id=task.workflow_run_id,
+            )
+            try:
+                await wait_for_download_finished(
+                    downloading_files=downloading_files, timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
+                )
+            except DownloadFileMaxWaitingTime as e:
+                LOG.warning(
+                    "There're several long-time downloading files, these files might be broken",
+                    downloading_files=e.downloading_files,
+                    workflow_run_id=task.workflow_run_id,
+                )
+            return results
+        finally:
+            if browser_state is not None and download_triggered:
+                # get the page count after download
+                pages_after_download = await browser_state.list_valid_pages()
+                page_count_after_download = len(pages_after_download)
+                LOG.info(
+                    "Page count after download file action",
+                    initial_page_count=initial_page_count,
+                    page_count_after_download=page_count_after_download,
+                )
+                if page_count_after_download > initial_page_count:
+                    LOG.info(
+                        "Download triggered, closing the extra page",
+                    )
+
+                    if page == pages_after_download[-1]:
+                        LOG.warning("The extra page is the current page, closing it")
+                    # close the extra page
+                    await pages_after_download[-1].close()
+
+            await app.DATABASE.create_action(action=action)
+
+    @staticmethod
+    async def _handle_action(
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        page: Page,
+        action: Action,
+    ) -> list[ActionResult]:
         LOG.info("Handling action", action=action)
         actions_result: list[ActionResult] = []
         llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
@@ -468,8 +607,6 @@ class ActionHandler:
                 if not actions_result:
                     LOG.warning("Action failed to execute, setting status to failed", action=action)
                 action.status = ActionStatus.failed
-
-            await app.DATABASE.create_action(action=action)
 
             if llm_caller and action.tool_call_id:
                 tool_call_result = {
@@ -587,54 +724,16 @@ async def handle_click_action(
         return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     if action.download:
-        # get the initial page count
-        browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
-        initial_page_count = 0
-        if browser_state is not None:
-            initial_page_count = len(browser_state.browser_context.pages if browser_state.browser_context else [])
-        LOG.info(
-            "Page count before download file action",
-            initial_page_count=initial_page_count,
-            workflow_run_id=task.workflow_run_id,
+        results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
+
+    elif action.file_url:
+        upload_file_action = UploadFileAction(
+            reasoning=action.reasoning,
+            intention=action.intention,
+            element_id=action.element_id,
+            file_url=action.file_url,
         )
-        results: list[ActionResult] = []
-        try:
-            results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
-        except Exception:
-            raise
-        finally:
-            # get the page count after download
-            page_count_after_download = 0
-            if browser_state is not None:
-                page_count_after_download = len(
-                    browser_state.browser_context.pages if browser_state.browser_context else []
-                )
-
-            LOG.info(
-                "Page count after download file action",
-                initial_page_count=initial_page_count,
-                page_count_after_download=page_count_after_download,
-                workflow_run_id=task.workflow_run_id,
-            )
-            if page_count_after_download > initial_page_count and browser_state and browser_state.browser_context:
-                if results and results[-1].download_triggered:
-                    LOG.info(
-                        "Download triggered, closing the extra page",
-                        workflow_run_id=task.workflow_run_id,
-                    )
-
-                    if page == browser_state.browser_context.pages[-1]:
-                        LOG.warning(
-                            "The extra page is the current page, closing it",
-                            workflow_run_id=task.workflow_run_id,
-                        )
-                    # close the extra page
-                    await browser_state.browser_context.pages[-1].close()
-                else:
-                    LOG.info(
-                        "No download triggered, not closing the extra page",
-                        workflow_run_id=task.workflow_run_id,
-                    )
+        return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
         incremental_scraped: IncrementalScrapePage | None = None
         try:
@@ -752,7 +851,7 @@ async def handle_sequential_click_for_dropdown(
     response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
         step=step,
-        prompt_name="check-user-goal",
+        prompt_name="check-user-goal-after-click",
     )
     verify_result = CompleteVerifyResult.model_validate(response)
     if verify_result.user_goal_achieved:
@@ -821,24 +920,6 @@ async def handle_click_to_download_file_action(
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     locator = skyvern_element.locator
 
-    context = skyvern_context.current()
-    download_dir = Path(
-        get_download_dir(run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id)
-    )
-    list_files_before = list_files_in_directory(download_dir)
-    if task.browser_session_id:
-        files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-            organization_id=task.organization_id, browser_session_id=task.browser_session_id
-        )
-        list_files_before = list_files_before + files_in_browser_session
-
-    LOG.info(
-        "Number of files in download directory before click",
-        num_downloaded_files_before=len(list_files_before),
-        download_dir=download_dir,
-        workflow_run_id=task.workflow_run_id,
-    )
-
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
@@ -852,65 +933,7 @@ async def handle_click_to_download_file_action(
         )
         return [ActionFailure(e, download_triggered=False)]
 
-    try:
-        LOG.info(
-            "Checking if there is any new files after click",
-            download_dir=download_dir,
-        )
-        async with asyncio.timeout(task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME):
-            while True:
-                list_files_after = list_files_in_directory(download_dir)
-                if task.browser_session_id:
-                    files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                        organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                    )
-                    list_files_after = list_files_after + files_in_browser_session
-
-                if len(list_files_after) > len(list_files_before):
-                    LOG.info(
-                        "Found new files in download directory after click",
-                        num_downloaded_files_after=len(list_files_after),
-                        download_dir=download_dir,
-                        workflow_run_id=task.workflow_run_id,
-                    )
-                    break
-                await asyncio.sleep(1)
-
-    except asyncio.TimeoutError:
-        LOG.warning(
-            "No file to download after click",
-            workflow_run_id=task.workflow_run_id,
-        )
-        return [ActionSuccess(download_triggered=False)]
-
-    # check if there's any file is still downloading
-    downloading_files = list_downloading_files_in_directory(download_dir)
-    if task.browser_session_id:
-        files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
-            organization_id=task.organization_id, browser_session_id=task.browser_session_id
-        )
-        downloading_files = downloading_files + files_in_browser_session
-
-    if len(downloading_files) == 0:
-        return [ActionSuccess(download_triggered=True)]
-
-    LOG.info(
-        "File downloading hasn't completed, wait for a while",
-        downloading_files=downloading_files,
-        workflow_run_id=task.workflow_run_id,
-    )
-    try:
-        await wait_for_download_finished(
-            downloading_files=downloading_files, timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
-        )
-    except DownloadFileMaxWaitingTime as e:
-        LOG.warning(
-            "There're several long-time downloading files, these files might be broken",
-            downloading_files=e.downloading_files,
-            workflow_run_id=task.workflow_run_id,
-        )
-
-    return [ActionSuccess(download_triggered=True)]
+    return [ActionSuccess()]
 
 
 # TOTP timing constants
@@ -1513,8 +1536,16 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await download_file(file_url)
+    file_path = await handler_utils.download_file(file_url, action.model_dump())
     is_file_input = await skyvern_element.is_file_input()
+
+    if not is_file_input:
+        LOG.info("Trying to find file input in children", action=action)
+        file_input_locator = await skyvern_element.find_file_input_in_children()
+        if file_input_locator:
+            LOG.info("Found file input in children", action=action)
+            locator = file_input_locator
+            is_file_input = True
 
     if is_file_input:
         LOG.info("Taking UploadFileAction. Found file input tag", action=action)
@@ -1540,6 +1571,7 @@ async def handle_upload_file_action(
             page,
             action,
             skyvern_element,
+            pending_upload_files=file_path,
             timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
         )
 
@@ -2213,6 +2245,7 @@ async def chain_click(
     page: Page,
     action: ClickAction | UploadFileAction,
     skyvern_element: SkyvernElement,
+    pending_upload_files: list[str] | str | None = None,
     timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
@@ -2223,8 +2256,8 @@ async def chain_click(
     locator = skyvern_element.locator
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
-    file: list[str] | str = []
-    if action.file_url:
+    file = pending_upload_files or []
+    if not file and action.file_url:
         file_url = await get_actual_value_of_parameter_if_secret(task, action.file_url)
         file = await handler_utils.download_file(file_url, action.model_dump())
 
@@ -2395,9 +2428,9 @@ async def chain_click(
     finally:
         LOG.info("Remove file chooser listener", action=action)
 
+        # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         # Sleep for 15 seconds after uploading a file to let the page process it
         # Removing this breaks file uploads using the filechooser
-        # KEREM DO NOT REMOVE
         if file:
             await asyncio.sleep(15)
         page.remove_listener("filechooser", fc_func)

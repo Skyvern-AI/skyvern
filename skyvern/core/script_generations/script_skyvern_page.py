@@ -122,7 +122,6 @@ class ScriptSkyvernPage(SkyvernPage):
         fn: Callable,
         action: ActionType,
         *args: Any,
-        prompt: str = "",
         **kwargs: Any,
     ) -> Any:
         """
@@ -147,6 +146,8 @@ class ScriptSkyvernPage(SkyvernPage):
             ActionType.TERMINATE: "🛑",
         }
 
+        prompt = kwargs.get("prompt", "")
+
         # Backward compatibility: use intention if provided and prompt is empty
         intention = kwargs.get("intention", None)
         if intention and not prompt:
@@ -170,9 +171,7 @@ class ScriptSkyvernPage(SkyvernPage):
                 print()
 
         try:
-            call.result = await fn(
-                self, *args, prompt=prompt, data=data, intention=intention, **kwargs
-            )  # real driver call
+            call.result = await fn(self, *args, **kwargs)
 
             # Note: Action status would be updated to completed here if update method existed
 

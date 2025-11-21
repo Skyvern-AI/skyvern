@@ -71,10 +71,9 @@ class SkyvernPage(Page):
         fn: Callable,
         action: ActionType,
         *args: Any,
-        prompt: str = "",
         **kwargs: Any,
     ) -> Any:
-        return await fn(self, *args, prompt=prompt, **kwargs)
+        return await fn(self, *args, **kwargs)
 
     @staticmethod
     def action_wrap(
@@ -84,10 +83,9 @@ class SkyvernPage(Page):
             async def wrapper(
                 skyvern_page: SkyvernPage,
                 *args: Any,
-                prompt: str = "",
                 **kwargs: Any,
             ) -> Any:
-                return await skyvern_page._decorate_call(fn, action, *args, prompt=prompt, **kwargs)
+                return await skyvern_page._decorate_call(fn, action, *args, **kwargs)
 
             return wrapper
 

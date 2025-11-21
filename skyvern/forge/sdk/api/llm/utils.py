@@ -10,7 +10,7 @@ import structlog
 
 from skyvern.constants import MAX_IMAGE_MESSAGES
 from skyvern.forge.sdk.api.llm import commentjson
-from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
+from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat, InvalidLLMResponseType
 
 LOG = structlog.get_logger()
 
@@ -138,6 +138,33 @@ async def llm_messages_builder_with_history(
     return messages
 
 
+def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
+    """Ensure parsed LLM responses expose a dict interface to callers."""
+    if isinstance(response, dict):
+        return response
+
+    if isinstance(response, list):
+        first_dict = next((item for item in response if isinstance(item, dict)), None)
+        LOG.warning(
+            "Parsed LLM response is a list; using first dict element",
+            response_length=len(response),
+            first_item_type=type(response[0]).__name__ if response else None,
+            first_item_keys=list(first_dict.keys()) if first_dict else None,
+        )
+        if first_dict is not None:
+            return first_dict
+
+        LOG.warning("List response contained no dict entries; returning empty dict")
+        raise InvalidLLMResponseType("list")
+
+    LOG.warning(
+        "Parsed LLM response is not a dict; returning empty dict",
+        response_type=type(response).__name__,
+    )
+
+    raise InvalidLLMResponseType(type(response).__name__)
+
+
 def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False) -> dict[str, Any]:
     content = None
     try:
@@ -146,7 +173,8 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
         if add_assistant_prefix:
             content = "{" + content
 
-        return json_repair.loads(content)
+        parsed = json_repair.loads(content)
+        return _coerce_response_to_dict(parsed)
 
     except Exception:
         LOG.warning(
@@ -157,7 +185,8 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
             if not content:
                 raise EmptyLLMResponseError(str(response))
             content = _try_to_extract_json_from_markdown_format(content)
-            return commentjson.loads(content)
+            parsed = commentjson.loads(content)
+            return _coerce_response_to_dict(parsed)
         except Exception as e:
             if content:
                 LOG.warning(
@@ -166,7 +195,8 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
                     content=content,
                 )
                 try:
-                    return _fix_and_parse_json_string(content)
+                    parsed = _fix_and_parse_json_string(content)
+                    return _coerce_response_to_dict(parsed)
                 except Exception as e2:
                     LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
                     raise InvalidLLMResponseFormat(str(response)) from e2

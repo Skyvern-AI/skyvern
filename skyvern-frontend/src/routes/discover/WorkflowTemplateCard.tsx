@@ -6,7 +6,7 @@ type Props = {
 
 function WorkflowTemplateCard({ title, image, onClick }: Props) {
   return (
-    <div className="h-48 w-56 cursor-pointer rounded-xl" onClick={onClick}>
+    <div className="h-48 w-full cursor-pointer rounded-xl" onClick={onClick}>
       <div className="h-28 rounded-t-xl bg-slate-elevation1 px-6 pt-6">
         <img src={image} alt={title} className="h-full w-full object-contain" />
       </div>

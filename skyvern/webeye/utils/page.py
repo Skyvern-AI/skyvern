@@ -25,7 +25,7 @@ def load_js_script() -> str:
     try:
         # TODO: Implement TS of domUtils.js and use the complied JS file instead of the raw JS file.
         # This will allow our code to be type safe.
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError as e:
         LOG.exception("Failed to load the JS script", path=path)
@@ -485,6 +485,10 @@ class SkyvernFrame:
     async def get_element_dom_depth(self, element: ElementHandle) -> int:
         js_script = "([element]) => getElementDomDepth(element)"
         return await self.evaluate(frame=self.frame, expression=js_script, arg=[element])
+
+    async def remove_all_unique_ids(self) -> None:
+        js_script = "() => removeAllUniqueIds()"
+        await self.evaluate(frame=self.frame, expression=js_script)
 
     @TraceManager.traced_async()
     async def build_tree_from_body(

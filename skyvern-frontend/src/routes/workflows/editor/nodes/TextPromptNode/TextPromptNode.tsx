@@ -15,6 +15,7 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
   const { editable, label } = data;
@@ -75,6 +76,7 @@ function TextPromptNode({ id, data }: NodeProps<TextPromptNode>) {
           </div>
 
           <WorkflowBlockInputTextarea
+            aiImprove={AI_IMPROVE_CONFIGS.textPrompt.prompt}
             nodeId={id}
             onChange={(value) => {
               update({ prompt: value });
