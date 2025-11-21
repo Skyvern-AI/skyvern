@@ -9,7 +9,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
 
 from skyvern.config import settings
-from skyvern.constants import SPECIAL_FIELD_VERIFICATION_CODE
+from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -145,7 +145,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
             # Build the element tree of the current page for the prompt
             context = skyvern_context.ensure_context()
             payload_str = _get_context_data(data)
-            refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+            refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots(
+                max_retries=SKYVERN_PAGE_MAX_SCRAPING_RETRIES
+            )
             element_tree = refreshed_page.build_element_tree()
 
             organization_id = context.organization_id if context else None
@@ -244,7 +246,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         else:
                             data = {SPECIAL_FIELD_VERIFICATION_CODE: verification_code}
 
-                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots(
+                    max_retries=SKYVERN_PAGE_MAX_SCRAPING_RETRIES
+                )
                 self.scraped_page = refreshed_page
 
                 # Try to get element_id from selector if selector is provided
@@ -348,7 +352,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 if files and isinstance(data, dict) and "files" not in data:
                     data["files"] = files
 
-                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+                refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots(
+                    max_retries=SKYVERN_PAGE_MAX_SCRAPING_RETRIES
+                )
                 self.scraped_page = refreshed_page
 
                 # Try to get element_id from selector if selector is provided
@@ -445,7 +451,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     if value and isinstance(data, dict) and "value" not in data:
                         data["value"] = value
 
-                    refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+                    refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots(
+                        max_retries=SKYVERN_PAGE_MAX_SCRAPING_RETRIES
+                    )
                     self.scraped_page = refreshed_page
                     element_tree = refreshed_page.build_element_tree()
                     merged_goal = SELECT_OPTION_GOAL.format(intention=intention, prompt=prompt)
@@ -501,7 +509,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
     ) -> dict[str, Any] | list | str | None:
         """Extract information from the page using AI."""
 
-        scraped_page_refreshed = await self.scraped_page.refresh()
+        scraped_page_refreshed = await self.scraped_page.refresh(max_retries=SKYVERN_PAGE_MAX_SCRAPING_RETRIES)
         context = skyvern_context.current()
         tz_info = datetime.now(tz=timezone.utc).tzinfo
         if context and context.tz_info:
@@ -598,7 +606,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
             reasoning=action_info.get("reasoning"),
         )
 
-        refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots()
+        refreshed_page = await self.scraped_page.generate_scraped_page_without_screenshots(
+            max_retries=SKYVERN_PAGE_MAX_SCRAPING_RETRIES
+        )
         self.scraped_page = refreshed_page
         element_tree = refreshed_page.build_element_tree()
 
