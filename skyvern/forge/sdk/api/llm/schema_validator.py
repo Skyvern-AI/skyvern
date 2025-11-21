@@ -26,17 +26,24 @@ def get_default_value_for_type(schema_type: str | list[Any]) -> Any:
             # All types are null
             return None
 
-    type_defaults: dict[str, Any] = {
-        "string": "",
-        "number": 0,
-        "integer": 0,
-        "boolean": False,
-        "array": [],
-        "object": {},
-        "null": None,
-    }
-
-    return type_defaults.get(str(schema_type), None)
+    # Return new instances for mutable types to avoid sharing across fields
+    schema_type_str = str(schema_type)
+    if schema_type_str == "string":
+        return ""
+    elif schema_type_str == "number":
+        return 0
+    elif schema_type_str == "integer":
+        return 0
+    elif schema_type_str == "boolean":
+        return False
+    elif schema_type_str == "array":
+        return []
+    elif schema_type_str == "object":
+        return {}
+    elif schema_type_str == "null":
+        return None
+    else:
+        return None
 
 
 def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, path: str = "root") -> Any:
