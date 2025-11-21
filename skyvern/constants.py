@@ -43,3 +43,6 @@ TEXT_PRESS_MAX_LENGTH = 20
 
 # Script generation constants
 DEFAULT_SCRIPT_RUN_ID = "default"
+
+# SkyvernPage constants
+SKYVERN_PAGE_MAX_SCRAPING_RETRIES = 2
