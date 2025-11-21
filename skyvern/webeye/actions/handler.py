@@ -851,7 +851,7 @@ async def handle_sequential_click_for_dropdown(
     response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
         step=step,
-        prompt_name="check-user-goal",
+        prompt_name="check-user-goal-after-click",
     )
     verify_result = CompleteVerifyResult.model_validate(response)
     if verify_result.user_goal_achieved:

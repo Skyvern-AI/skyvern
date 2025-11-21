@@ -154,8 +154,8 @@ class TaskRequest(TaskBase):
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
     def validate_optional_urls(cls, url: str | None) -> str | None:
-        if url is None:
-            return None
+        if not url:
+            return url
 
         return validate_url(url)
 

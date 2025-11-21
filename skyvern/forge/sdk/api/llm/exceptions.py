@@ -24,6 +24,11 @@ class InvalidLLMResponseFormat(BaseLLMError):
         super().__init__(f"LLM response content is not a valid JSON: {response}")
 
 
+class InvalidLLMResponseType(BaseLLMError):
+    def __init__(self, response_type: str) -> None:
+        super().__init__(f"LLM response content is expected to be a dict, but got {response_type}")
+
+
 class DuplicateCustomLLMProviderError(BaseLLMError):
     def __init__(self, llm_key: str) -> None:
         super().__init__(f"Custom LLMProvider {llm_key} is already registered")
