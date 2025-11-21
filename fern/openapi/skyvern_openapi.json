@@ -484,15 +484,15 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\n# Create a workflow in JSON format\nworkflow_definition = {\n    \"title\": \"Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.create_workflow(json_definition=workflow_definition)\nprint(workflow)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                cache_actions: false,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n                cache_actions: false\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\n// Create a workflow in JSON format\nconst workflowDefinition = {\n    title: \"Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.createWorkflow({\n    json_definition: workflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -762,15 +762,15 @@
             "code-samples": [
               {
                 "sdk": "curl",
-                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      cache_actions: false\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n      cache_actions: false\n'\n"
+                "code": "curl -X POST https://api.skyvern.com/v1/workflows/wpid_123 --header 'x-api-key: {{x-api-key}}' --header 'Content-Type: text/plain' --data-raw 'title: Contact Forms\ndescription: Fill the contact form on the website\nproxy_location: RESIDENTIAL\nwebhook_callback_url: https://example.com/webhook\ntotp_verification_url: https://example.com/totp\npersist_browser_session: false\nmodel:\n  name: gpt-4.1\nworkflow_definition:\n  parameters:\n    - key: website_url\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: name\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n    - key: additional_information\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: |-\n        Message: I'd love to learn more about your...\n        Phone: 123-456-7890\n        Inquiry type: sales\n        Optional Subject: Hello from [Company Here]\n    - key: email\n      description: null\n      parameter_type: workflow\n      workflow_parameter_type: string\n      default_value: null\n  blocks:\n    - label: Fill_Out_Contact_Form\n      continue_on_failure: true\n      block_type: navigation\n      url: \"{{website_url}}\"\n      title: Fill_Out_Contact_Form\n      engine: skyvern-1.0\n      navigation_goal: >-\n        Find the contact form. Fill out the contact us form and submit it. Your\n        goal is complete when the page says your message has been sent. In the\n        case you can't find a contact us form, terminate.\n\n\n        Fill out required fields as best you can using the following\n        information:\n\n        {{name}}\n\n        {{email}}\n\n        {{additional_information}}\n      error_code_mapping: null\n      max_retries: 0\n      max_steps_per_run: null\n      complete_on_download: false\n      download_suffix: null\n      parameter_keys: []\n      totp_identifier: null\n      totp_verification_url: null\n      complete_criterion: \"\"\n      terminate_criterion: \"\"\n      include_action_history_in_verification: false\n    - label: Extract_Email\n      continue_on_failure: false\n      block_type: extraction\n      url: \"\"\n      title: Extract_Email\n      data_extraction_goal: \"Extract a company email if available \"\n      data_schema: null\n      max_retries: 0\n      max_steps_per_run: null\n      parameter_keys: []\n'\n"
               },
               {
                 "sdk": "python",
-                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"cache_actions\": False,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n                \"cache_actions\": False,\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
+                "code": "\nfrom skyvern import Skyvern\n\nupdated_workflow_definition = {\n    \"title\": \"Updated Contact Forms Workflow\",\n    \"description\": \"Fill the contact form on the website\",\n    \"proxy_location\": \"RESIDENTIAL\",\n    \"webhook_callback_url\": \"https://example.com/webhook\",\n    \"totp_verification_url\": \"https://example.com/totp\",\n    \"totp_identifier\": \"4155555555\",\n    \"model\": {\"name\": \"gpt-4.1\"},\n    \"workflow_definition\": {\n        \"parameters\": [\n            {\n                \"key\": \"website_url\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"name\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n            {\n                \"key\": \"additional_information\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": \"Message: I'd love to learn more about your...\nPhone: 123-456-7890\nInquiry type: sales\nOptional Subject: Hello from [Company Here]\",\n            },\n            {\n                \"key\": \"email\",\n                \"description\": None,\n                \"parameter_type\": \"workflow\",\n                \"workflow_parameter_type\": \"string\",\n                \"default_value\": None,\n            },\n        ],\n        \"blocks\": [\n            {\n                \"label\": \"Fill_Out_Contact_Form\",\n                \"continue_on_failure\": True,\n                \"block_type\": \"navigation\",\n                \"url\": \"{{website_url}}\",\n                \"title\": \"Fill_Out_Contact_Form\",\n                \"engine\": \"skyvern-1.0\",\n                \"navigation_goal\": \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\n\nFill out required fields as best you can using the following information:\n{{name}}\n{{email}}\n{{additional_information}}\",\n                \"error_code_mapping\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"complete_on_download\": False,\n                \"download_suffix\": None,\n                \"parameter_keys\": [],\n                \"totp_identifier\": None,\n                \"totp_verification_url\": None,\n                \"complete_criterion\": \"\",\n                \"terminate_criterion\": \"\",\n                \"include_action_history_in_verification\": False,\n            },\n            {\n                \"label\": \"Extract_Email\",\n                \"continue_on_failure\": False,\n                \"block_type\": \"extraction\",\n                \"url\": \"\",\n                \"title\": \"Extract_Email\",\n                \"data_extraction_goal\": \"Extract a company email if available \",\n                \"data_schema\": None,\n                \"max_retries\": 0,\n                \"max_steps_per_run\": None,\n                \"parameter_keys\": [],\n            },\n        ],\n    },\n}\nskyvern = Skyvern(api_key=\"YOUR_API_KEY\")\nworkflow = await skyvern.update_workflow(workflow_id=\"wpid_123\", json_definition=updated_workflow_definition)\nprint(workflow)\n"
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\nconst updatedWorkflowDefinition = {\n    title: \"Updated Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                cache_actions: false,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: [],\n                cache_actions: false\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.updateWorkflow(\"wpid_123\", {\n    json_definition: updatedWorkflowDefinition\n});\nconsole.log(workflow);\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\n\nconst updatedWorkflowDefinition = {\n    title: \"Updated Contact Forms Workflow\",\n    description: \"Fill the contact form on the website\",\n    proxy_location: \"RESIDENTIAL\",\n    webhook_callback_url: \"https://example.com/webhook\",\n    totp_verification_url: \"https://example.com/totp\",\n    totp_identifier: \"4155555555\",\n    model: { name: \"gpt-4.1\" },\n    workflow_definition: {\n        parameters: [\n            {\n                key: \"website_url\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"name\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            },\n            {\n                key: \"additional_information\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: \"Message: I'd love to learn more about your...\\nPhone: 123-456-7890\\nInquiry type: sales\\nOptional Subject: Hello from [Company Here]\"\n            },\n            {\n                key: \"email\",\n                description: null,\n                parameter_type: \"workflow\",\n                workflow_parameter_type: \"string\",\n                default_value: null\n            }\n        ],\n        blocks: [\n            {\n                label: \"Fill_Out_Contact_Form\",\n                continue_on_failure: true,\n                block_type: \"navigation\",\n                url: \"{{website_url}}\",\n                title: \"Fill_Out_Contact_Form\",\n                engine: \"skyvern-1.0\",\n                navigation_goal: \"Find the contact form. Fill out the contact us form and submit it. Your goal is complete when the page says your message has been sent. In the case you can't find a contact us form, terminate.\\n\\nFill out required fields as best you can using the following information:\\n{{name}}\\n{{email}}\\n{{additional_information}}\",\n                error_code_mapping: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                complete_on_download: false,\n                download_suffix: null,\n                parameter_keys: [],\n                totp_identifier: null,\n                totp_verification_url: null,\n                complete_criterion: \"\",\n                terminate_criterion: \"\",\n                include_action_history_in_verification: false\n            },\n            {\n                label: \"Extract_Email\",\n                continue_on_failure: false,\n                block_type: \"extraction\",\n                url: \"\",\n                title: \"Extract_Email\",\n                data_extraction_goal: \"Extract a company email if available \",\n                data_schema: null,\n                max_retries: 0,\n                max_steps_per_run: null,\n                parameter_keys: []\n            }\n        ]\n    }\n};\n\nconst workflow = await skyvern.updateWorkflow(\"wpid_123\", {\n    json_definition: updatedWorkflowDefinition\n});\nconsole.log(workflow);\n"
               }
             ]
           }
@@ -4044,11 +4044,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -4208,11 +4203,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -6674,11 +6664,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -6810,11 +6795,6 @@
               }
             ],
             "title": "Parameter Keys"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -7080,11 +7060,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -7243,11 +7218,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -8812,11 +8782,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -8974,7 +8939,8 @@
           "context": {
             "anyOf": [
               {
-                "type": "string"
+                "additionalProperties": true,
+                "type": "object"
               },
               {
                 "type": "null"
@@ -9453,11 +9419,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -9612,11 +9573,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -10166,11 +10122,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -10335,11 +10286,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -11953,11 +11899,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -12158,11 +12099,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "disable_cache": {
             "type": "boolean",
@@ -12966,9 +12902,15 @@
             "default": false
           },
           "llm_key": {
-            "type": "string",
-            "title": "Llm Key",
-            "default": "AZURE_OPENAI_GPT4_1"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
           },
           "prompt": {
             "type": "string",
@@ -13083,9 +13025,15 @@
             "title": "Model"
           },
           "llm_key": {
-            "type": "string",
-            "title": "Llm Key",
-            "default": "GEMINI_2_5_FLASH_WITH_GPT_4_1_MINI_FALLBACK"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Key"
           },
           "prompt": {
             "type": "string",
@@ -13805,11 +13753,6 @@
             ],
             "title": "Totp Identifier"
           },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
-          },
           "complete_verification": {
             "type": "boolean",
             "title": "Complete Verification",
@@ -14156,11 +14099,6 @@
               }
             ],
             "title": "Totp Identifier"
-          },
-          "cache_actions": {
-            "type": "boolean",
-            "title": "Cache Actions",
-            "default": false
           },
           "complete_verification": {
             "type": "boolean",
