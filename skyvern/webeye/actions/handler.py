@@ -67,6 +67,7 @@ from skyvern.forge.sdk.api.files import (
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
@@ -3798,6 +3799,13 @@ async def extract_information_for_navigation_goal(
         prompt_name="extract-information",
         force_dict=False,
     )
+
+    # Validate and fill missing fields based on schema
+    if task.extracted_information_schema:
+        json_response = validate_and_fill_extraction_result(
+            extraction_result=json_response,
+            schema=task.extracted_information_schema,
+        )
 
     return ScrapeResult(
         scraped_data=json_response,
