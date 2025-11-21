@@ -81,7 +81,7 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
 
             if field_name not in data:
                 if field_name in required_fields:
-                    default_value = get_default_value_for_type(field_schema.get("type"))
+                    default_value = field_schema.get("default", get_default_value_for_type(field_schema.get("type")))
                     LOG.info(
                         "Filling missing required field with default value",
                         path=field_path,
