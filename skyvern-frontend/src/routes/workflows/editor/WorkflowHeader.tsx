@@ -19,7 +19,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
-import { useUser } from "@/hooks/useUser";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
@@ -85,7 +84,6 @@ function WorkflowHeader({
   const debugStore = useDebugStore();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
-  const user = useUser().get();
   const [chosenCacheKeyValue, setChosenCacheKeyValue] = useState<string | null>(
     cacheKeyValue ?? null,
   );
@@ -106,6 +104,9 @@ function WorkflowHeader({
     setChosenCacheKeyValue(cacheKeyValue ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKeyValue]);
+
+  const shouldShowCacheControls =
+    !isGeneratingCode && (cacheKeyValues?.total_count ?? 0) > 0;
 
   if (!globalWorkflows) {
     return null; // this should be loaded already by some other components
@@ -134,79 +135,77 @@ function WorkflowHeader({
         />
       </div>
       <div className="flex h-full items-center justify-end gap-4">
-        {user &&
-          !isGeneratingCode &&
-          (cacheKeyValues?.total_count ?? 0) > 0 && (
-            <>
-              {debugStore.isDebugMode && (
-                <Button
-                  className="pl-2 pr-3"
-                  size="lg"
-                  variant={!showAllCode ? "tertiary" : "default"}
-                  onClick={handleShowAllCode}
-                >
-                  <CodeIcon className="mr-2 h-6 w-6" />
-                  Show Code
-                </Button>
-              )}
-              <div
-                tabIndex={1}
-                className="flex max-w-[10rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
+        {shouldShowCacheControls && (
+          <>
+            {debugStore.isDebugMode && (
+              <Button
+                className="pl-2 pr-3"
+                size="lg"
+                variant={!showAllCode ? "tertiary" : "default"}
+                onClick={handleShowAllCode}
               >
-                <Input
-                  ref={dom.input}
-                  className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
-                  onChange={(e) => {
-                    setChosenCacheKeyValue(e.target.value);
-                    onCacheKeyValuesFilter(e.target.value);
-                  }}
-                  onMouseDown={() => {
-                    if (!cacheKeyValuesPanelOpen) {
-                      onCacheKeyValuesClick();
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      const numFiltered = cacheKeyValues?.values?.length ?? 0;
+                <CodeIcon className="mr-2 h-6 w-6" />
+                Show Code
+              </Button>
+            )}
+            <div
+              tabIndex={1}
+              className="flex max-w-[10rem] items-center justify-center gap-1 rounded-md border border-input pr-1 focus-within:ring-1 focus-within:ring-ring"
+            >
+              <Input
+                ref={dom.input}
+                className="focus-visible:transparent focus-visible:none h-[2.75rem] text-ellipsis whitespace-nowrap border-none focus-visible:outline-none focus-visible:ring-0"
+                onChange={(e) => {
+                  setChosenCacheKeyValue(e.target.value);
+                  onCacheKeyValuesFilter(e.target.value);
+                }}
+                onMouseDown={() => {
+                  if (!cacheKeyValuesPanelOpen) {
+                    onCacheKeyValuesClick();
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    const numFiltered = cacheKeyValues?.values?.length ?? 0;
 
-                      if (numFiltered === 1) {
-                        const first = cacheKeyValues?.values?.[0];
-                        if (first) {
-                          setChosenCacheKeyValue(first);
-                          onCacheKeyValueAccept(first);
-                        }
-                        return;
+                    if (numFiltered === 1) {
+                      const first = cacheKeyValues?.values?.[0];
+                      if (first) {
+                        setChosenCacheKeyValue(first);
+                        onCacheKeyValueAccept(first);
                       }
-
-                      setChosenCacheKeyValue(chosenCacheKeyValue);
-                      onCacheKeyValueAccept(chosenCacheKeyValue);
+                      return;
                     }
-                    onCacheKeyValuesKeydown(e);
-                  }}
-                  placeholder="Code Key Value"
-                  value={chosenCacheKeyValue ?? undefined}
-                  onBlur={(e) => {
-                    onCacheKeyValuesBlurred(e.target.value);
-                    setChosenCacheKeyValue(e.target.value);
+
+                    setChosenCacheKeyValue(chosenCacheKeyValue);
+                    onCacheKeyValueAccept(chosenCacheKeyValue);
+                  }
+                  onCacheKeyValuesKeydown(e);
+                }}
+                placeholder="Code Key Value"
+                value={chosenCacheKeyValue ?? undefined}
+                onBlur={(e) => {
+                  onCacheKeyValuesBlurred(e.target.value);
+                  setChosenCacheKeyValue(e.target.value);
+                }}
+              />
+              {cacheKeyValuesPanelOpen ? (
+                <ChevronUpIcon
+                  className="h-6 w-6 cursor-pointer"
+                  onClick={onCacheKeyValuesClick}
+                />
+              ) : (
+                <ChevronDownIcon
+                  className="h-6 w-6 cursor-pointer"
+                  onClick={() => {
+                    dom.input.current?.focus();
+                    onCacheKeyValuesClick();
                   }}
                 />
-                {cacheKeyValuesPanelOpen ? (
-                  <ChevronUpIcon
-                    className="h-6 w-6 cursor-pointer"
-                    onClick={onCacheKeyValuesClick}
-                  />
-                ) : (
-                  <ChevronDownIcon
-                    className="h-6 w-6 cursor-pointer"
-                    onClick={() => {
-                      dom.input.current?.focus();
-                      onCacheKeyValuesClick();
-                    }}
-                  />
-                )}
-              </div>
-            </>
-          )}
+              )}
+            </div>
+          </>
+        )}
         {isGeneratingCode && (
           <Button
             className="size-10 min-w-[6rem]"
