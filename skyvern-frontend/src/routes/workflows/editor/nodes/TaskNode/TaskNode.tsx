@@ -21,6 +21,7 @@ import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useState } from "react";
 import { AppNode } from "..";
 import { helpTooltips, placeholders } from "../../helpContent";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { getAvailableOutputParameterKeys } from "../../workflowEditorUtils";
 import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
@@ -137,10 +138,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       />
                     </div>
                     <WorkflowBlockInputTextarea
-                      aiImprove={{
-                        context: { block_type: "Task Block" },
-                        useCase: "task_v1_prompt",
-                      }}
+                      aiImprove={AI_IMPROVE_CONFIGS.task.navigationGoal}
                       nodeId={id}
                       onChange={(value) => {
                         update({ navigationGoal: value });
@@ -176,6 +174,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       />
                     </div>
                     <WorkflowBlockInputTextarea
+                      aiImprove={AI_IMPROVE_CONFIGS.task.dataExtractionGoal}
                       nodeId={id}
                       onChange={(value) => {
                         update({ dataExtractionGoal: value });
@@ -209,6 +208,7 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
                       Complete if...
                     </Label>
                     <WorkflowBlockInputTextarea
+                      aiImprove={AI_IMPROVE_CONFIGS.task.completeCriterion}
                       nodeId={id}
                       onChange={(value) => {
                         update({ completeCriterion: value });
