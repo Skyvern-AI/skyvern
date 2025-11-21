@@ -19,6 +19,7 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
 import { NodeTabs } from "../components/NodeTabs";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
@@ -107,7 +108,7 @@ function Taskv2Node({ id, data, type }: NodeProps<Taskv2Node>) {
                 ) : null}
               </div>
               <WorkflowBlockInputTextarea
-                aiImprove={{ useCase: "task_v2_prompt" }}
+                aiImprove={AI_IMPROVE_CONFIGS.taskV2.prompt}
                 nodeId={id}
                 onChange={(value) => {
                   update({ prompt: value });
