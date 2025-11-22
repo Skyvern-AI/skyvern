@@ -603,30 +603,20 @@ class RealSkyvernPageAi(SkyvernPageAi):
         element_id = result.get("element_id", None)
         confidence = result.get("confidence_float", 0.0)
 
-        if not element_id:
-            LOG.error(
-                "AI locate element failed - no element_id returned",
-                result=result,
-                prompt=prompt_rendered,
-            )
-            return None
+        xpath: str | None = None
+        if element_id:
+            skyvern_element_data = scraped_page_refreshed.id_to_element_dict.get(element_id)
+            if skyvern_element_data and "xpath" in skyvern_element_data:
+                xpath = skyvern_element_data.get("xpath")
 
-        # Get the xpath from the element_id using the scraped page data
-        skyvern_element_data = scraped_page_refreshed.id_to_element_dict.get(element_id)
-        if not skyvern_element_data:
-            LOG.error(
-                "AI locate element failed - element_id not found in scraped page",
-                element_id=element_id,
-                prompt=prompt_rendered,
-            )
-            return None
+        if not xpath:
+            xpath = result.get("xpath", None)
 
-        xpath = skyvern_element_data.get("xpath", None)
         if not xpath:
             LOG.error(
                 "AI locate element failed - no xpath in element data",
                 element_id=element_id,
-                skyvern_element_data=skyvern_element_data,
+                result=result,
                 prompt=prompt_rendered,
             )
             return None

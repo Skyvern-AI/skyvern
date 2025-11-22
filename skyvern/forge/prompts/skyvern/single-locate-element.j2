@@ -8,6 +8,7 @@ Reply in JSON format with the following keys:
 {
     "thoughts": str, // Think step by step. Explain what information and visual cues help you identify the correct element. Reference specific attributes, text content, position, or visual characteristics you see.
     "element_id": str, // The ID of the element from the HTML elements list. This must be one of the IDs from the elements provided above or the nearest parent with id containing the element.
+    "xpath": str, // A fallback XPath selector for the element. This will be used if the element_id cannot be found in the page data. Provide a complete, valid XPath (e.g., "//button[@id='submit']" or "//input[@name='username']").
     "confidence_float": float // Your confidence that this is the correct element. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence.
 }
 
