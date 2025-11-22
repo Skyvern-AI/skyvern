@@ -88,9 +88,34 @@ class LLMAPIHandlerFactory:
                 check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
             except Exception:
                 check_model = model_label
+
+        # Check reasoning support (safe call - log but don't fail if litellm errors)
+        supports_reasoning = False
+        if check_model:
+            try:
+                supports_reasoning = litellm.supports_reasoning(model=check_model)
+            except Exception as exc:  # pragma: no cover - diagnostic safeguard
+                LOG.debug(
+                    "Failed to check reasoning support via litellm",
+                    model=check_model,
+                    error=str(exc),
+                )
+
         try:
-            # Early return if model doesn't support reasoning
-            if check_model and not litellm.supports_reasoning(model=check_model):
+            # Gemini router/fallback configs (e.g., gemini-2.5-pro-gpt-5-fallback-router)
+            # are not recognized by litellm, but they do support reasoning budgets.
+            if not supports_reasoning and model_label:
+                model_label_lower = model_label.lower()
+                if "gemini" in model_label_lower and "fallback" in model_label_lower:
+                    supports_reasoning = True
+                    LOG.info(
+                        "Forcing reasoning support for Gemini fallback model",
+                        prompt_name=prompt_name,
+                        budget=new_budget,
+                        model=model_label,
+                    )
+
+            if check_model and not supports_reasoning:
                 LOG.info(
                     "Thinking budget optimization not supported for model",
                     prompt_name=prompt_name,
