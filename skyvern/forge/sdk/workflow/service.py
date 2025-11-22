@@ -173,6 +173,8 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "onepassword_credential_parameter_id",
         "azure_vault_credential_parameter_id",
         "disable_cache",
+        "next_block_label",
+        "version",
     ]
 
     # Use BFS to recursively remove fields from all nested objects
@@ -2685,8 +2687,12 @@ class WorkflowService:
             blocks.append(block)
             block_label_mapping[block.label] = block
 
-        # Set the blocks for the workflow definition
-        workflow_definition = WorkflowDefinition(parameters=parameters.values(), blocks=blocks)
+        # Set the blocks for the workflow definition and derive DAG version metadata
+        dag_version = workflow_definition_yaml.version
+        if dag_version is None:
+            dag_version = 2 if WorkflowService._has_dag_metadata(workflow_definition_yaml.blocks) else 1
+
+        workflow_definition = WorkflowDefinition(parameters=parameters.values(), blocks=blocks, version=dag_version)
 
         LOG.info(
             f"Created workflow from request, title: {title}",
@@ -2840,11 +2846,25 @@ class WorkflowService:
         return output_parameters
 
     @staticmethod
+    def _build_block_kwargs(
+        block_yaml: BLOCK_YAML_TYPES,
+        output_parameter: OutputParameter,
+    ) -> dict[str, Any]:
+        return {
+            "label": block_yaml.label,
+            "next_block_label": block_yaml.next_block_label,
+            "output_parameter": output_parameter,
+            "continue_on_failure": block_yaml.continue_on_failure,
+            "model": block_yaml.model,
+        }
+
+    @staticmethod
     async def block_yaml_to_block(
         block_yaml: BLOCK_YAML_TYPES,
         parameters: dict[str, PARAMETER_TYPE],
     ) -> BlockTypeVar:
         output_parameter = cast(OutputParameter, parameters[f"{block_yaml.label}_output"])
+        base_kwargs = WorkflowService._build_block_kwargs(block_yaml, output_parameter)
         if block_yaml.block_type == BlockType.TASK:
             task_block_parameters = (
                 [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
@@ -2852,22 +2872,19 @@ class WorkflowService:
                 else []
             )
             return TaskBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=task_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 data_extraction_goal=block_yaml.data_extraction_goal,
                 data_schema=block_yaml.data_schema,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 disable_cache=block_yaml.disable_cache,
@@ -2899,29 +2916,25 @@ class WorkflowService:
                 raise Exception("Loop value parameter is required for for loop block")
 
             return ForLoopBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 loop_over=loop_over_parameter,
                 loop_variable_reference=block_yaml.loop_variable_reference,
                 loop_blocks=loop_blocks,
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
                 complete_if_empty=block_yaml.complete_if_empty,
             )
         elif block_yaml.block_type == BlockType.CODE:
             return CodeBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 code=block_yaml.code,
                 parameters=(
                     [parameters[parameter_key] for parameter_key in block_yaml.parameter_keys]
                     if block_yaml.parameter_keys
                     else []
                 ),
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.TEXT_PROMPT:
             return TextPromptBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 llm_key=block_yaml.llm_key,
                 prompt=block_yaml.prompt,
                 parameters=(
@@ -2930,28 +2943,20 @@ class WorkflowService:
                     else []
                 ),
                 json_schema=block_yaml.json_schema,
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
-                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.DOWNLOAD_TO_S3:
             return DownloadToS3Block(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 url=block_yaml.url,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.UPLOAD_TO_S3:
             return UploadToS3Block(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 path=block_yaml.path,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.FILE_UPLOAD:
             return FileUploadBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 storage_type=block_yaml.storage_type,
                 s3_bucket=block_yaml.s3_bucket,
                 aws_access_key_id=block_yaml.aws_access_key_id,
@@ -2961,12 +2966,10 @@ class WorkflowService:
                 azure_storage_account_key=block_yaml.azure_storage_account_key,
                 azure_blob_container_name=block_yaml.azure_blob_container_name,
                 path=block_yaml.path,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.SEND_EMAIL:
             return SendEmailBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
                 smtp_port=parameters[block_yaml.smtp_port_secret_parameter_key],
                 smtp_username=parameters[block_yaml.smtp_username_secret_parameter_key],
@@ -2976,26 +2979,19 @@ class WorkflowService:
                 subject=block_yaml.subject,
                 body=block_yaml.body,
                 file_attachments=block_yaml.file_attachments or [],
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
             return FileParserBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 file_url=block_yaml.file_url,
                 file_type=block_yaml.file_type,
                 json_schema=block_yaml.json_schema,
-                continue_on_failure=block_yaml.continue_on_failure,
-                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.PDF_PARSER:
             return PDFParserBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 file_url=block_yaml.file_url,
                 json_schema=block_yaml.json_schema,
-                continue_on_failure=block_yaml.continue_on_failure,
-                model=block_yaml.model,
             )
         elif block_yaml.block_type == BlockType.VALIDATION:
             validation_block_parameters = (
@@ -3008,18 +3004,14 @@ class WorkflowService:
                 raise Exception("Both complete criterion and terminate criterion are empty")
 
             return ValidationBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 task_type=TaskType.validation,
                 parameters=validation_block_parameters,
-                output_parameter=output_parameter,
                 complete_criterion=block_yaml.complete_criterion,
                 terminate_criterion=block_yaml.terminate_criterion,
                 error_code_mapping=block_yaml.error_code_mapping,
-                continue_on_failure=block_yaml.continue_on_failure,
                 # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
                 max_steps_per_run=2,
-                disable_cache=block_yaml.disable_cache,
-                model=block_yaml.model,
             )
 
         elif block_yaml.block_type == BlockType.ACTION:
@@ -3033,20 +3025,17 @@ class WorkflowService:
                 raise Exception("empty action instruction")
 
             return ActionBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 task_type=TaskType.action,
                 parameters=action_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 disable_cache=block_yaml.disable_cache,
@@ -3062,20 +3051,17 @@ class WorkflowService:
                 else []
             )
             return NavigationBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=navigation_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 complete_on_download=block_yaml.complete_on_download,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 disable_cache=block_yaml.disable_cache,
@@ -3087,8 +3073,7 @@ class WorkflowService:
 
         elif block_yaml.block_type == BlockType.HUMAN_INTERACTION:
             return HumanInteractionBlock(
-                label=block_yaml.label,
-                output_parameter=output_parameter,
+                **base_kwargs,
                 instructions=block_yaml.instructions,
                 positive_descriptor=block_yaml.positive_descriptor,
                 negative_descriptor=block_yaml.negative_descriptor,
@@ -3107,18 +3092,15 @@ class WorkflowService:
                 else []
             )
             return ExtractionBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=extraction_block_parameters,
-                output_parameter=output_parameter,
                 data_extraction_goal=block_yaml.data_extraction_goal,
                 data_schema=block_yaml.data_schema,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
-                continue_on_failure=block_yaml.continue_on_failure,
                 disable_cache=block_yaml.disable_cache,
                 complete_verification=False,
             )
@@ -3130,18 +3112,15 @@ class WorkflowService:
                 else []
             )
             return LoginBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=login_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 disable_cache=block_yaml.disable_cache,
@@ -3155,10 +3134,8 @@ class WorkflowService:
                 raise InvalidWaitBlockTime(settings.WORKFLOW_WAIT_BLOCK_MAX_SEC)
 
             return WaitBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 wait_sec=block_yaml.wait_sec,
-                continue_on_failure=block_yaml.continue_on_failure,
-                output_parameter=output_parameter,
             )
 
         elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
@@ -3168,19 +3145,16 @@ class WorkflowService:
                 else []
             )
             return FileDownloadBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
                 title=block_yaml.title,
                 engine=block_yaml.engine,
                 parameters=file_download_block_parameters,
-                output_parameter=output_parameter,
                 navigation_goal=block_yaml.navigation_goal,
                 error_code_mapping=block_yaml.error_code_mapping,
                 max_steps_per_run=block_yaml.max_steps_per_run,
                 max_retries=block_yaml.max_retries,
-                model=block_yaml.model,
                 download_suffix=block_yaml.download_suffix,
-                continue_on_failure=block_yaml.continue_on_failure,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 disable_cache=block_yaml.disable_cache,
@@ -3190,16 +3164,13 @@ class WorkflowService:
             )
         elif block_yaml.block_type == BlockType.TaskV2:
             return TaskV2Block(
-                label=block_yaml.label,
+                **base_kwargs,
                 prompt=block_yaml.prompt,
                 url=block_yaml.url,
                 totp_verification_url=block_yaml.totp_verification_url,
                 totp_identifier=block_yaml.totp_identifier,
                 max_iterations=block_yaml.max_iterations,
                 max_steps=block_yaml.max_steps,
-                disable_cache=block_yaml.disable_cache,
-                model=block_yaml.model,
-                output_parameter=output_parameter,
             )
         elif block_yaml.block_type == BlockType.HTTP_REQUEST:
             http_request_block_parameters = (
@@ -3208,7 +3179,7 @@ class WorkflowService:
                 else []
             )
             return HttpRequestBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 method=block_yaml.method,
                 url=block_yaml.url,
                 headers=block_yaml.headers,
@@ -3216,14 +3187,11 @@ class WorkflowService:
                 timeout=block_yaml.timeout,
                 follow_redirects=block_yaml.follow_redirects,
                 parameters=http_request_block_parameters,
-                output_parameter=output_parameter,
-                continue_on_failure=block_yaml.continue_on_failure,
             )
         elif block_yaml.block_type == BlockType.GOTO_URL:
             return UrlBlock(
-                label=block_yaml.label,
+                **base_kwargs,
                 url=block_yaml.url,
-                output_parameter=output_parameter,
                 complete_verification=False,
             )
 
@@ -3447,4 +3415,13 @@ class WorkflowService:
             return False
         if workflow.run_with == "code":
             return True
+        return False
+
+    @staticmethod
+    def _has_dag_metadata(block_yamls: list[BLOCK_YAML_TYPES]) -> bool:
+        for block_yaml in block_yamls:
+            if block_yaml.next_block_label:
+                return True
+            if isinstance(block_yaml, ForLoopBlockYAML) and WorkflowService._has_dag_metadata(block_yaml.loop_blocks):
+                return True
         return False
