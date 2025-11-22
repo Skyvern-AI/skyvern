@@ -571,10 +571,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
             template_name="single-locate-element",
-            html_need_skyvern_attrs=False,
+            html_need_skyvern_attrs=True,
             data_extraction_goal=prompt_rendered,
             current_url=scraped_page_refreshed.url,
-            extracted_text=scraped_page_refreshed.extracted_text,
             local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
         )
 
@@ -601,11 +600,40 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
             return None
 
-        xpath = result.get("xpath", None)
+        element_id = result.get("element_id", None)
         confidence = result.get("confidence_float", 0.0)
+
+        if not element_id:
+            LOG.error(
+                "AI locate element failed - no element_id returned",
+                result=result,
+                prompt=prompt_rendered,
+            )
+            return None
+
+        # Get the xpath from the element_id using the scraped page data
+        skyvern_element_data = scraped_page_refreshed.id_to_element_dict.get(element_id)
+        if not skyvern_element_data:
+            LOG.error(
+                "AI locate element failed - element_id not found in scraped page",
+                element_id=element_id,
+                prompt=prompt_rendered,
+            )
+            return None
+
+        xpath = skyvern_element_data.get("xpath", None)
+        if not xpath:
+            LOG.error(
+                "AI locate element failed - no xpath in element data",
+                element_id=element_id,
+                skyvern_element_data=skyvern_element_data,
+                prompt=prompt_rendered,
+            )
+            return None
 
         LOG.info(
             "AI locate element result",
+            element_id=element_id,
             xpath=xpath,
             confidence=confidence,
             prompt=prompt_rendered,
