@@ -121,7 +121,7 @@ class MessageChannel:
             return base | {"browser_session_id": self.browser_session.persistent_browser_session_id}
 
         if self.workflow_run:
-            return base | {"workflow_run_id": self.workflow_run.id}
+            return base | {"workflow_run_id": self.workflow_run.workflow_run_id}
 
         return base
 
@@ -174,8 +174,8 @@ class MessageChannel:
                 datums.append(data)
             except asyncio.TimeoutError:
                 break
-            except RuntimeError:
-                if "not connected" in str(RuntimeError).lower():
+            except RuntimeError as ex:
+                if "not connected" in str(ex).lower():
                     break
             except Exception:
                 LOG.exception(f"{self.class_name} Failed to receive message from message channel", **self.identity)

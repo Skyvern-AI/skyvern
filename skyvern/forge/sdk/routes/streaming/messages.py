@@ -82,6 +82,7 @@ async def messages(
             browser_session_id=browser_session_id,
             workflow_run_id=workflow_run_id,
         )
+        await websocket.close(code=1002)
         return
 
     message_channel: MessageChannel

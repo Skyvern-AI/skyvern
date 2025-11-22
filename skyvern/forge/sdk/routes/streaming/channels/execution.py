@@ -16,6 +16,7 @@ import typing as t
 from contextlib import asynccontextmanager
 
 import structlog
+from playwright.async_api import Browser, BrowserContext, Page, Playwright
 
 from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
 
@@ -26,6 +27,11 @@ LOG = structlog.get_logger()
 
 
 class ExecutionChannel(CdpChannel):
+    # Explicitly declare inherited attributes for mypy when follow_imports = skip
+    browser: Browser | None
+    browser_context: BrowserContext | None
+    page: Page | None
+    pw: Playwright | None
     """
     ExecutionChannel.
     """
@@ -44,7 +50,7 @@ class ExecutionChannel(CdpChannel):
         }
         """
 
-        selected_text = await self.evaluate_js(js_expression, self.page)
+        selected_text = await self.evaluate_js(js_expression)
 
         if isinstance(selected_text, str) or selected_text is None:
             LOG.info(
