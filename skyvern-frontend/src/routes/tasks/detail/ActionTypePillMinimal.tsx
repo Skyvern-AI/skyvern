@@ -13,6 +13,7 @@ type Props = {
 
 const icons: Partial<Record<ActionType, React.ReactNode>> = {
   click: <CursorArrowIcon className="h-4 w-4" />,
+  hover: <CursorArrowIcon className="h-4 w-4" />,
   complete: <CheckCircledIcon className="h-4 w-4" />,
   input_text: <InputIcon className="h-4 w-4" />,
 };

@@ -283,6 +283,11 @@ class WaitAction(Action):
     seconds: int = 20
 
 
+class HoverAction(WebAction):
+    action_type: ActionType = ActionType.HOVER
+    hold_seconds: float = 0.0
+
+
 class TerminateAction(DecisiveAction):
     action_type: ActionType = ActionType.TERMINATE
 
