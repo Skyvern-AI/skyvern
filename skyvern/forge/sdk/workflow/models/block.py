@@ -2873,7 +2873,9 @@ class FileParserBlock(Block):
             self.override_llm_key, default=app.LLM_API_HANDLER
         )
 
-        llm_response = await llm_api_handler(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+        llm_response = await llm_api_handler(
+            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+        )
         return llm_response
 
     async def execute(
@@ -3088,7 +3090,9 @@ class PDFParserBlock(Block):
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=extracted_text, json_schema=self.json_schema
         )
-        llm_response = await app.LLM_API_HANDLER(prompt=llm_prompt, prompt_name="extract-information-from-file-text")
+        llm_response = await app.LLM_API_HANDLER(
+            prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
+        )
         # Record the parsed data
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, llm_response)
         return await self.build_block_result(
