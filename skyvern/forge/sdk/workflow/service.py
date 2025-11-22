@@ -127,6 +127,16 @@ DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
 CacheInvalidationReason = Literal["updated_block", "new_block", "removed_block"]
+BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
+    BlockType.TASK,
+    BlockType.TaskV2,
+    BlockType.VALIDATION,
+    BlockType.ACTION,
+    BlockType.NAVIGATION,
+    BlockType.EXTRACTION,
+    BlockType.LOGIN,
+    BlockType.FILE_DOWNLOAD,
+}
 
 
 @dataclass
@@ -961,6 +971,7 @@ class WorkflowService:
                     and block.label
                     and block_result.status == BlockStatus.completed
                     and not getattr(block, "disable_cache", False)
+                    and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
                 ):
                     blocks_to_update.add(block.label)
                 if block_result.status == BlockStatus.canceled:
@@ -3320,12 +3331,16 @@ class WorkflowService:
                 if script_block.script_block_label:
                     cached_block_labels.add(script_block.script_block_label)
 
-            definition_labels = {block.label for block in workflow.workflow_definition.blocks if block.label}
-            definition_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
+            should_cache_block_labels = {
+                block.label
+                for block in workflow.workflow_definition.blocks
+                if block.label and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+            }
+            should_cache_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
             cached_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
 
-            if cached_block_labels != definition_labels:
-                missing_labels = definition_labels - cached_block_labels
+            if cached_block_labels != should_cache_block_labels:
+                missing_labels = should_cache_block_labels - cached_block_labels
                 if missing_labels:
                     blocks_to_update.update(missing_labels)
                 # Always rebuild the orchestrator if the definition changed
@@ -3344,6 +3359,18 @@ class WorkflowService:
                     run_with=workflow_run.run_with,
                 )
                 return
+
+            LOG.info(
+                "deleting old workflow script and generating new script",
+                workflow_id=workflow.workflow_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                cache_key_value=rendered_cache_key_value,
+                script_id=existing_script.script_id,
+                script_revision_id=existing_script.script_revision_id,
+                run_with=workflow_run.run_with,
+                blocks_to_update=list(blocks_to_update),
+                code_gen=code_gen,
+            )
 
             # delete the existing workflow scripts if any
             await app.DATABASE.delete_workflow_scripts_by_permanent_id(
