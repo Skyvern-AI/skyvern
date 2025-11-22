@@ -50,7 +50,6 @@ class SkyvernContext:
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
     script_mode: bool = False
     ai_mode_override: str | None = None
-    workflow_model: dict[str, Any] | None = None
 
     # magic link handling
     # task_id is the key, page is the value
