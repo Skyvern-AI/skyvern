@@ -224,11 +224,9 @@ if typing.TYPE_CHECKING:
         HumanInteractionBlockParametersItem_Output,
         HumanInteractionBlockParametersItem_Workflow,
         HumanInteractionBlockYaml,
-        ImprovePromptResponse,
         InputOrSelectContext,
         InputTextAction,
         InputTextActionData,
-        LocateElementAction,
         LoginBlock,
         LoginBlockDataSchema,
         LoginBlockParametersItem,
@@ -278,7 +276,6 @@ if typing.TYPE_CHECKING:
         RunSdkActionRequestAction_AiSelectOption,
         RunSdkActionRequestAction_AiUploadFile,
         RunSdkActionRequestAction_Extract,
-        RunSdkActionRequestAction_LocateElement,
         RunSdkActionResponse,
         RunStatus,
         Script,
@@ -472,7 +469,7 @@ if typing.TYPE_CHECKING:
         WorkflowStatus,
     )
     from .errors import BadRequestError, ForbiddenError, NotFoundError, UnprocessableEntityError
-    from . import browser_profiles, prompts, scripts, workflows
+    from . import browser_profiles, scripts, workflows
     from .client import AsyncSkyvern, Skyvern
     from .environment import SkyvernEnvironment
     from .version import __version__
@@ -697,11 +694,9 @@ _dynamic_imports: typing.Dict[str, str] = {
     "HumanInteractionBlockParametersItem_Output": ".types",
     "HumanInteractionBlockParametersItem_Workflow": ".types",
     "HumanInteractionBlockYaml": ".types",
-    "ImprovePromptResponse": ".types",
     "InputOrSelectContext": ".types",
     "InputTextAction": ".types",
     "InputTextActionData": ".types",
-    "LocateElementAction": ".types",
     "LoginBlock": ".types",
     "LoginBlockDataSchema": ".types",
     "LoginBlockParametersItem": ".types",
@@ -752,7 +747,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "RunSdkActionRequestAction_AiSelectOption": ".types",
     "RunSdkActionRequestAction_AiUploadFile": ".types",
     "RunSdkActionRequestAction_Extract": ".types",
-    "RunSdkActionRequestAction_LocateElement": ".types",
     "RunSdkActionResponse": ".types",
     "RunStatus": ".types",
     "Script": ".types",
@@ -949,7 +943,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "WorkflowStatus": ".types",
     "__version__": ".version",
     "browser_profiles": ".browser_profiles",
-    "prompts": ".prompts",
     "scripts": ".scripts",
     "workflows": ".workflows",
 }
@@ -1197,11 +1190,9 @@ __all__ = [
     "HumanInteractionBlockParametersItem_Output",
     "HumanInteractionBlockParametersItem_Workflow",
     "HumanInteractionBlockYaml",
-    "ImprovePromptResponse",
     "InputOrSelectContext",
     "InputTextAction",
     "InputTextActionData",
-    "LocateElementAction",
     "LoginBlock",
     "LoginBlockDataSchema",
     "LoginBlockParametersItem",
@@ -1252,7 +1243,6 @@ __all__ = [
     "RunSdkActionRequestAction_AiSelectOption",
     "RunSdkActionRequestAction_AiUploadFile",
     "RunSdkActionRequestAction_Extract",
-    "RunSdkActionRequestAction_LocateElement",
     "RunSdkActionResponse",
     "RunStatus",
     "Script",
@@ -1449,7 +1439,6 @@ __all__ = [
     "WorkflowStatus",
     "__version__",
     "browser_profiles",
-    "prompts",
     "scripts",
     "workflows",
 ]

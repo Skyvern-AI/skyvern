@@ -199,11 +199,6 @@ async def run_sdk_action(
                 data=action.data,
             )
             result = extract_result
-        elif action.type == "locate_element":
-            xpath_result = await page_ai.ai_locate_element(
-                prompt=action.prompt,
-            )
-            result = xpath_result
     finally:
         skyvern_context.reset()
 

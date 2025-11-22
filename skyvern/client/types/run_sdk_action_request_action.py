@@ -145,24 +145,6 @@ class RunSdkActionRequestAction_Extract(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class RunSdkActionRequestAction_LocateElement(UniversalBaseModel):
-    """
-    The action to execute with its specific parameters
-    """
-
-    type: typing.Literal["locate_element"] = "locate_element"
-    prompt: typing.Optional[str] = None
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
 RunSdkActionRequestAction = typing.Union[
     RunSdkActionRequestAction_AiAct,
     RunSdkActionRequestAction_AiClick,
@@ -170,5 +152,4 @@ RunSdkActionRequestAction = typing.Union[
     RunSdkActionRequestAction_AiSelectOption,
     RunSdkActionRequestAction_AiUploadFile,
     RunSdkActionRequestAction_Extract,
-    RunSdkActionRequestAction_LocateElement,
 ]

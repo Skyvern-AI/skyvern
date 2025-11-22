@@ -3787,6 +3787,7 @@ async def extract_information_for_navigation_goal(
         step=step,
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
+        force_dict=False,
     )
 
     return ScrapeResult(
