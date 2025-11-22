@@ -150,9 +150,9 @@ function NavigationNode({ id, data, type }: NodeProps<NavigationNode>) {
             <div className="rounded-md bg-slate-800 p-2">
               <div className="space-y-1 text-xs text-slate-400">
                 Tip: Try to phrase your prompt as a goal with an explicit
-                completion criteria. While executing, Skyvern will take as many
+                completion criteria. While executing, Skyzona will take as many
                 actions as necessary to accomplish the goal. Use words like
-                "Complete" or "Terminate" to help Skyvern identify when it's
+                "Complete" or "Terminate" to help Skyzona identify when it's
                 finished or when it should give up.
               </div>
             </div>

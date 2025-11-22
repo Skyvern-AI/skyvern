@@ -82,7 +82,7 @@ function CredentialsTotpTab() {
       <div className="rounded-lg border border-slate-700 bg-slate-elevation1 p-6">
         <h2 className="text-lg font-semibold">Push a 2FA Code</h2>
         <p className="mt-1 text-sm text-slate-400">
-          Paste the verification message you received. Skyvern extracts the code
+          Paste the verification message you received. Skyzona extracts the code
           and attaches it to the relevant run.
         </p>
         <PushTotpCodeForm

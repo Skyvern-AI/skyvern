@@ -116,7 +116,7 @@ function StepArtifacts({ id, stepProps }: Props) {
         <TabsTrigger value="html_raw">HTML (Raw)</TabsTrigger>
         <TabsTrigger value="llm_request">LLM Request (Raw)</TabsTrigger>
         {enable_log_artifacts && (
-          <TabsTrigger value="skyvern_log">Skyvern Log</TabsTrigger>
+          <TabsTrigger value="skyvern_log">Skyzona Log</TabsTrigger>
         )}
       </TabsList>
       <TabsContent value="info">

@@ -39,9 +39,9 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { DisableCache } from "../DisableCache";
 
 const urlTooltip =
-  "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
+  "The URL Skyzona is navigating to. Leave this field blank to pick up from where the last block left off.";
 const navigationGoalTooltip =
-  "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify parameters to use.";
+  "Specify a single step or action you'd like Skyzona to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify parameters to use.";
 
 const navigationGoalPlaceholder = 'Input {{ name }} into "Name" field.';
 
@@ -152,7 +152,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
             </div>
             <div className="rounded-md bg-slate-800 p-2">
               <div className="space-y-1 text-xs text-slate-400">
-                Tip: While executing the action block, Skyvern will only take
+                Tip: While executing the action block, Skyzona will only take
                 one action.
               </div>
             </div>

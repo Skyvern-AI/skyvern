@@ -141,7 +141,7 @@ function PasswordCredentialContent({
           <AccordionContent>
             <div className="space-y-4">
               <p className="text-sm text-slate-400">
-                Set up Skyvern to automatically retrieve two-factor
+                Set up Skyzona to automatically retrieve two-factor
                 authentication codes.
               </p>
               <div className="grid h-36 grid-cols-3 gap-4">

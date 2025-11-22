@@ -61,7 +61,7 @@ function WorkflowsPageBanner() {
               3
             </div>
             <div>
-              Allow Skyvern agents to execute non-browser tasks such as sending
+              Allow Skyzona agents to execute non-browser tasks such as sending
               emails, or parsing PDFs
             </div>
           </div>

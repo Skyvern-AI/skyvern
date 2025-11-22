@@ -20,7 +20,7 @@ function RunEngineSelector({ value, onChange, className }: Props) {
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value={RunEngine.SkyvernV1}>Skyvern 1.0</SelectItem>
+        <SelectItem value={RunEngine.SkyvernV1}>Skyzona 1.0</SelectItem>
         <SelectItem value={RunEngine.OpenaiCua}>OpenAI CUA</SelectItem>
         <SelectItem value={RunEngine.AnthropicCua}>Anthropic CUA</SelectItem>
       </SelectContent>

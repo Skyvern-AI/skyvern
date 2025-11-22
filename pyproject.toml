@@ -1,8 +1,11 @@
 [project]
-name = "skyvern"
+name = "skyzona"
 version = "1.0.0"
-description = ""
-authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
+description = "Skyzona is the community fork of Skyvern for fully local, open browser automation."
+authors = [
+    { name = "Myzona Labs", email = "myzona@gmail.com" },
+    { name = "Skyvern AI", email = "info@skyvern.com" },
+]
 requires-python = ">=3.11,<3.14"
 readme = "README.md"
 
@@ -189,6 +192,7 @@ plugins = "sqlalchemy.ext.mypy.plugin"
 
 [project.scripts]
 skyvern = "skyvern.cli.commands:cli_app"
+skyzona = "skyvern.cli.commands:cli_app"
 
 [tool.pytest.ini_options]
 norecursedirs = ["eval"]

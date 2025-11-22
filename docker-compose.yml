@@ -18,7 +18,10 @@ services:
       timeout: 5s
       retries: 5
   skyvern:
-    image: public.ecr.aws/skyvern/skyvern:latest
+    image: skyzona/backend:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: on-failure
     env_file:
       - .env
@@ -132,11 +135,14 @@ services:
       timeout: 5s
       retries: 5
   skyvern-ui:
-    image: public.ecr.aws/skyvern/skyvern-ui:latest
+    image: skyzona/frontend:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
     restart: on-failure
     ports:
-      - 8080:8080
-      - 9090:9090
+      - 38080:8080
+      - 39090:9090
     volumes:
       - ./artifacts:/data/artifacts
       - ./videos:/data/videos
@@ -144,7 +150,13 @@ services:
       - ./.streamlit:/app/.streamlit
     env_file:
       - skyvern-frontend/.env
-    environment: {}
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api/v1
+      - VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
+      - VITE_ARTIFACT_API_BASE_URL=http://localhost:39090
+      - VITE_ENVIRONMENT=local
+      - VITE_API_PATH_PREFIX=
+      - VITE_SKYVERN_API_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDg3MzA1OTgsInN1YiI6Im9fNDY0MjMxODQyNDMwNjkxOTc2In0.9OUu9emsg3_itNQJb32CF0Q1w6mZzWeYSr8kvSHt5ME
     #  - VITE_ENABLE_CODE_BLOCK=true
     # if you want to run skyvern on a remote server,
     # you need to change the host in VITE_WSS_BASE_URL and VITE_API_BASE_URL to match your server ip

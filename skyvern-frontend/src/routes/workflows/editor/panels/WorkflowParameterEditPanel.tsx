@@ -319,7 +319,7 @@ function WorkflowParameterEditPanel({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
-                      <SelectItem value="skyvern">Skyvern</SelectItem>
+                      <SelectItem value="skyvern">Skyzona</SelectItem>
                       <SelectItem value="bitwarden">Bitwarden</SelectItem>
                       <SelectItem value="onepassword">1Password</SelectItem>
                       <SelectItem value="azurevault">Azure Vault</SelectItem>

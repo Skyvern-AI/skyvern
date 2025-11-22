@@ -40,11 +40,11 @@ import { DisableCache } from "../DisableCache";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 const urlTooltip =
-  "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.";
+  "The URL Skyzona is navigating to. Leave this field blank to pick up from where the last block left off.";
 const urlPlaceholder = "https://";
 const navigationGoalTooltip =
-  "Give Skyvern an objective that describes how to download the file.";
-const navigationGoalPlaceholder = "Tell Skyvern which file to download.";
+  "Give Skyzona an objective that describes how to download the file.";
+const navigationGoalPlaceholder = "Tell Skyzona which file to download.";
 
 function FileDownloadNode({ id, data }: NodeProps<FileDownloadNode>) {
   const [facing, setFacing] = useState<"front" | "back">("front");

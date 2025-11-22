@@ -269,7 +269,7 @@ function PromptBox() {
                       <div className="flex items-center gap-1">
                         <LightningBoltIcon className="size-4 shrink-0 text-yellow-400" />
                         <div className="font-normal text-white">
-                          Skyvern 2.0
+                          Skyzona 2.0
                         </div>
                       </div>
                       <div className="self-start pl-7 text-xs font-semibold text-yellow-400">
@@ -284,7 +284,7 @@ function PromptBox() {
                   <CustomSelectItem value="v1">
                     <div className="space-y-2">
                       <div>
-                        <SelectItemText>Skyvern 1.0</SelectItemText>
+                        <SelectItemText>Skyzona 1.0</SelectItemText>
                       </div>
                       <div className="text-xs text-slate-400">
                         Best for simple tasks
@@ -294,7 +294,7 @@ function PromptBox() {
                   <CustomSelectItem value="v2" className="hover:bg-slate-800">
                     <div className="space-y-2">
                       <div>
-                        <SelectItemText>Skyvern 2.0</SelectItemText>
+                        <SelectItemText>Skyzona 2.0</SelectItemText>
                       </div>
                       <div className="text-xs text-slate-400">
                         Best for complex tasks
@@ -310,7 +310,7 @@ function PromptBox() {
                       <div className="flex-1">
                         <div className="flex items-center gap-2">
                           <SelectItemText className="animate-pulse bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text font-bold text-transparent">
-                            Skyvern 2.0
+                            Skyzona 2.0
                           </SelectItemText>
                           <LightningBoltIcon className="size-4 animate-bounce text-yellow-400" />
                         </div>
@@ -404,7 +404,7 @@ function PromptBox() {
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Proxy Location</div>
                       <div className="text-xs text-slate-400">
-                        Route Skyvern through one of our available proxies.
+                        Route Skyzona through one of our available proxies.
                       </div>
                     </div>
                     <ProxySelector

@@ -15,25 +15,25 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
   switch (status) {
     case "missing_env":
       return {
-        title: "Skyvern API key missing",
+        title: "Skyzona API key missing",
         description:
           "All requests from the UI to the local backend will fail until a valid key is configured.",
       };
     case "invalid_format":
       return {
-        title: "Skyvern API key is invalid",
+        title: "Skyzona API key is invalid",
         description:
           "The configured key cannot be decoded. Regenerate a new key to continue using the UI.",
       };
     case "invalid":
       return {
-        title: "Skyvern API key not recognized",
+        title: "Skyzona API key not recognized",
         description:
           "The backend rejected the configured key. Regenerate it to refresh local auth.",
       };
     case "expired":
       return {
-        title: "Skyvern API key expired",
+        title: "Skyzona API key expired",
         description:
           "The current key is no longer valid. Generate a fresh key to restore connectivity.",
       };
@@ -41,12 +41,12 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
       return {
         title: "Local organization missing",
         description:
-          "The backend could not find the Skyvern-local organization. Regenerate the key to recreate it.",
+          "The backend could not find the Skyzona-local organization. Regenerate the key to recreate it.",
       };
     case "error":
     default:
       return {
-        title: "Unable to verify Skyvern API key",
+        title: "Unable to verify Skyzona API key",
         description:
           "The UI could not reach the diagnostics endpoint. Ensure the backend is running locally.",
       };

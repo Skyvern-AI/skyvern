@@ -205,7 +205,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                       <div className="space-y-2">
                         <div className="flex gap-2">
                           <Label>Proxy Location</Label>
-                          <HelpTooltip content="Route Skyvern through one of our available proxies." />
+                          <HelpTooltip content="Route Skyzona through one of our available proxies." />
                         </div>
                         <ProxySelector
                           value={data.proxyLocation}
@@ -219,7 +219,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                           <div className="flex justify-between">
                             <div className="flex items-center gap-2">
                               <Label>Run With</Label>
-                              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
+                              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyzona Agent'." />
                             </div>
                             <Select
                               value={data.runWith ?? "agent"}
@@ -232,7 +232,7 @@ function StartNode({ id, data }: NodeProps<StartNode>) {
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="agent">
-                                  Skyvern Agent
+                                  Skyzona Agent
                                 </SelectItem>
                                 <SelectItem value="code">Code</SelectItem>
                               </SelectContent>

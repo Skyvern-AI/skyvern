@@ -22,7 +22,7 @@ type Props = {
 };
 
 const constants = {
-  SkyvernOptimized: "Skyvern Optimized",
+  SkyvernOptimized: "Skyzona Optimized",
 } as const;
 
 function ModelSelector({
@@ -78,7 +78,7 @@ function ModelSelector({
             {choices.map((m) => (
               <SelectItem key={m} value={m}>
                 {m === constants.SkyvernOptimized ? (
-                  <span>Skyvern Optimized ✨</span>
+                  <span>Skyzona Optimized ✨</span>
                 ) : (
                   m
                 )}

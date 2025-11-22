@@ -47,7 +47,7 @@ function DebuggerTaskBlockParameters({ block }: Props) {
         <div className="flex flex-col gap-2">
           <div className="flex w-full items-center justify-start gap-2">
             <h1 className="text-sm">Navigation Goal</h1>
-            <HelpTooltip content="What should Skyvern do on this page?" />
+            <HelpTooltip content="What should Skyzona do on this page?" />
           </div>
           <AutoResizingTextarea value={block.navigation_goal ?? ""} readOnly />
         </div>

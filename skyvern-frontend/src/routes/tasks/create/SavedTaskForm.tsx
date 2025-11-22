@@ -398,7 +398,7 @@ function SavedTaskForm({ initialValues }: Props) {
                           <div className="w-72">
                             <h1 className="text-lg">Navigation Goal</h1>
                             <h2 className="text-base text-slate-400">
-                              Where should Skyvern go and what should Skyvern
+                              Where should Skyzona go and what should Skyzona
                               do?
                             </h2>
                           </div>
@@ -407,7 +407,7 @@ function SavedTaskForm({ initialValues }: Props) {
                           <FormControl>
                             <AutoResizingTextarea
                               {...field}
-                              placeholder="Tell Skyvern what to do."
+                              placeholder="Tell Skyzona what to do."
                               value={field.value === null ? "" : field.value}
                             />
                           </FormControl>
@@ -681,7 +681,7 @@ function SavedTaskForm({ initialValues }: Props) {
                                 Proxy Location
                               </div>
                               <h2 className="text-sm text-slate-400">
-                                Route Skyvern through one of our available
+                                Route Skyzona through one of our available
                                 proxies.
                               </h2>
                             </div>

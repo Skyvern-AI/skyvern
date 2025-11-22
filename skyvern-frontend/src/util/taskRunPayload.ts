@@ -57,7 +57,7 @@ function buildPrompt(request: CreateTaskRequest): string {
     nav ??
     extract ??
     trim(request.url) ??
-    "Task run triggered from Skyvern UI"
+    "Task run triggered from Skyzona UI"
   );
 }
 

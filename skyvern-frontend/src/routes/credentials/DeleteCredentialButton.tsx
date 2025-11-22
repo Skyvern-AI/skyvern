@@ -72,7 +72,7 @@ function DeleteCredentialButton({ credential }: Props) {
         <div className="text-sm text-slate-400">
           The credential{" "}
           <span className="font-bold text-primary">{credential.name}</span> will
-          be PERMANENTLY deleted. The Skyvern team has no way to restore a
+          be PERMANENTLY deleted. The Skyzona team has no way to restore a
           credential once it's deleted.
         </div>
         <DialogFooter>

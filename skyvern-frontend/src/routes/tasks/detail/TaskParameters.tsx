@@ -53,7 +53,7 @@ function TaskParameters() {
         <div className="w-72">
           <h1 className="text-lg">Navigation Goal</h1>
           <h2 className="text-base text-slate-400">
-            Where should Skyvern go and what should Skyvern do?
+            Where should Skyzona go and what should Skyzona do?
           </h2>
         </div>
         <AutoResizingTextarea

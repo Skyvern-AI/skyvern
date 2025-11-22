@@ -40,7 +40,7 @@ const commonHeaders = [
     value: "Basic YOUR_CREDENTIALS",
     description: "Basic auth",
   },
-  { name: "User-Agent", value: "Skyvern/1.0", description: "User agent" },
+  { name: "User-Agent", value: "Skyzona/1.0", description: "User agent" },
   {
     name: "Accept",
     value: "application/json",

@@ -7,7 +7,10 @@ RUN npm install
 
 ENV VITE_API_BASE_URL=http://localhost:8000/api/v1
 ENV VITE_WSS_BASE_URL=ws://localhost:8000/api/v1
-ENV VITE_ARTIFACT_API_BASE_URL=http://localhost:9090
+ENV VITE_ARTIFACT_API_BASE_URL=http://localhost:39090
+ENV VITE_ENVIRONMENT=local
+ENV VITE_API_PATH_PREFIX=
+ENV VITE_SKYVERN_API_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQ5MDg3MzA1OTgsInN1YiI6Im9fNDY0MjMxODQyNDMwNjkxOTc2In0.9OUu9emsg3_itNQJb32CF0Q1w6mZzWeYSr8kvSHt5ME
 
 CMD [ "/bin/bash", "/app/entrypoint-skyvernui.sh" ]
 

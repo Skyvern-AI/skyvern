@@ -1,7 +1,7 @@
 <!-- DOCTOC SKIP -->
 
 <h1 align="center">
- <a href="https://www.skyvern.com">
+ <a href="https://github.com/myzona/skyzona">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="fern/images/skyvern_logo.png"/>
     <img height="120" src="fern/images/skyvern_logo_blackbg.png"/>
@@ -10,20 +10,17 @@
  <br />
 </h1>
 <p align="center">
-🐉 Automate Browser-based workflows using LLMs and Computer Vision 🐉
+🐉 Skyzona — the community fork of Skyvern for open browser automation 🐉
 </p>
 <p align="center">
-  <a href="https://www.skyvern.com/"><img src="https://img.shields.io/badge/Website-blue?logo=googlechrome&logoColor=black"/></a>
-  <a href="https://www.skyvern.com/docs/"><img src="https://img.shields.io/badge/Docs-yellow?logo=gitbook&logoColor=black"/></a>
+  <a href="https://github.com/myzona/skyzona"><img src="https://img.shields.io/badge/Repo-Skyzona-blue?logo=github"/></a>
   <a href="https://discord.gg/fG2XXEuQX3"><img src="https://img.shields.io/discord/1212486326352617534?logo=discord&label=discord"/></a>
-  <!-- <a href="https://pepy.tech/project/skyvern" target="_blank"><img src="https://static.pepy.tech/badge/skyvern" alt="Total Downloads"/></a> -->
-  <a href="https://github.com/skyvern-ai/skyvern"><img src="https://img.shields.io/github/stars/skyvern-ai/skyvern" /></a>
   <a href="https://github.com/Skyvern-AI/skyvern/blob/main/LICENSE"><img src="https://img.shields.io/github/license/skyvern-ai/skyvern"/></a>
-  <a href="https://twitter.com/skyvernai"><img src="https://img.shields.io/twitter/follow/skyvernai?style=social"/></a>
-  <a href="https://www.linkedin.com/company/95726232"><img src="https://img.shields.io/badge/Follow%20 on%20LinkedIn-8A2BE2?logo=linkedin"/></a>
 </p>
 
-[Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a simple API endpoint to fully automate manual workflows on a large number of websites, replacing brittle or unreliable automation solutions.
+[Skyzona](https://github.com/myzona/skyzona) is an independent, MIT-licensed fork of Skyvern that keeps the OSS core free while giving us room to experiment with our own features and integrations. It automates browser-based workflows using LLMs and computer vision and provides a simple API endpoint to fully automate manual workflows on a large number of websites, replacing brittle or unreliable automation solutions.
+
+> **Note:** Under the hood the Python package and many environment variables still use the `skyvern` name to remain compatible with upstream tooling. Whenever you see `skyvern ...` in commands below, run them the same way—they now power Skyzona.
 
 <p align="center">
   <img src="fern/images/geico_shu_recording_cropped.gif"/>
@@ -76,10 +73,8 @@ Skyvern is the best performing agent on WRITE tasks (eg filling out forms, loggi
 
 # Quickstart
 
-## Skyvern Cloud
-[Skyvern Cloud](https://app.skyvern.com) is a managed cloud version of Skyvern that allows you to run Skyvern without worrying about the infrastructure. It allows you to run multiple Skyvern instances in parallel and comes bundled with anti-bot detection mechanisms, proxy network, and CAPTCHA solvers.
-
-If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.com) and create an account.
+## Skyzona Cloud (optional)
+[Skyvern Cloud](https://app.skyvern.com) remains available from the upstream maintainers if you want a hosted control plane. Skyzona focuses on the self-hosted, community-driven experience, so everything in this repo runs locally by default.
 
 ## Install & Run
 
@@ -94,24 +89,24 @@ Additionally, for Windows:
 ### 1. Install Skyvern
 
 ```bash
-pip install skyvern
+pip install skyzona
 ```
 
-### 2. Run Skyvern
+### 2. Run Skyzona
 This is most helpful for first time run (db setup, db migrations etc).
 
 ```bash
-skyvern quickstart
+skyzona quickstart  # "skyvern" still works as a backwards-compatible alias
 ```
 
 ### 3. Run task
 
 #### UI (Recommended)
 
-Start the Skyvern service and UI (when DB is up and running)
+Start the Skyzona service and UI (when DB is up and running)
 
 ```bash
-skyvern run all
+skyzona run all
 ```
 
 Go to http://localhost:8080 and use the UI to run a task
@@ -171,7 +166,7 @@ CHROME_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Ch
 BROWSER_TYPE=cdp-connect
 ```
 
-Restart Skyvern service `skyvern run all` and run the task through UI or code
+Restart Skyzona service `skyzona run all` (or `skyvern run all`) and run the task through UI or code
 
 ### Run Skyvern with any remote browser
 Grab the cdp connection url and pass it to Skyvern
@@ -217,23 +212,23 @@ task = await skyvern.run_task(
 
 
 ```bash
-# Launch the Skyvern Server Separately*
-skyvern run server
+# Launch the Skyzona Server Separately*
+skyzona run server
 
-# Launch the Skyvern UI
-skyvern run ui
+# Launch the Skyzona UI
+skyzona run ui
 
-# Check status of the Skyvern service
-skyvern status
+# Check status of the Skyzona service
+skyzona status
 
-# Stop the Skyvern service
-skyvern stop all
+# Stop the Skyzona service
+skyzona stop all
 
-# Stop the Skyvern UI
-skyvern stop ui
+# Stop the Skyzona UI
+skyzona stop ui
 
-# Stop the Skyvern Server Separately
-skyvern stop server
+# Stop the Skyzona Server Separately
+skyzona stop server
 ```
 
 ## Docker Compose setup
@@ -405,7 +400,7 @@ Make sure to have [uv](https://docs.astral.sh/uv/getting-started/installation/) 
     ```
 2. Perform initial server configuration
     ```bash
-    uv run skyvern quickstart
+    uv run skyzona quickstart
     ```
 3. Navigate to `http://localhost:8080` in your browser to start using the UI
    *The Skyvern CLI supports Windows, WSL, macOS, and Linux environments.*

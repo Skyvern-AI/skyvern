@@ -1,10 +1,10 @@
-import { useIsSkyvernUser } from "@/hooks/useIsSkyvernUser";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useIsSkyzonaUser } from "@/hooks/useIsSkyzonaUser";
 
 import { cn } from "@/util/utils";
 
@@ -17,9 +17,9 @@ function OrgWalled({
   className?: string;
   hideTooltipContent?: boolean;
 }) {
-  const isSkyvernUser = useIsSkyvernUser();
+  const isSkyzonaUser = useIsSkyzonaUser();
 
-  if (!isSkyvernUser) {
+  if (!isSkyzonaUser) {
     return null;
   }
 
@@ -40,7 +40,7 @@ function OrgWalled({
         {!hideTooltipContent && (
           <TooltipContent>
             <p>
-              This feature is only available to Skyvern organization members
+              This feature is only available to Skyzona organization members
             </p>
           </TooltipContent>
         )}

@@ -1,18 +1,18 @@
 export const baseHelpTooltipContent = {
-  url: "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.",
+  url: "The URL Skyzona is navigating to. Leave this field blank to pick up from where the last block left off.",
   navigationGoal:
-    "Give Skyvern an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails. Use {{ parameter_name }} to reference a parameter value",
+    "Give Skyzona an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails. Use {{ parameter_name }} to reference a parameter value",
   parameters:
     'Define placeholder values using the "parameters" drop down that you predefine or redefine run-to-run.',
   dataExtractionGoal:
-    "Tell Skyvern what data you would like to scrape at the end of your run.",
+    "Tell Skyzona what data you would like to scrape at the end of your run.",
   dataSchema: "Specify a format for extracted data in JSON.",
   maxRetries:
     "Specify how many times you would like a block to retry upon failure.",
   maxStepsOverride:
     "Specify the maximum number of steps a block can take in total.",
   completeOnDownload:
-    "Allow Skyvern to auto-complete the block when it downloads a file.",
+    "Allow Skyzona to auto-complete the block when it downloads a file.",
   fileSuffix:
     "The complete filename (without extension) for downloaded files. This replaces the entire filename instead of being appended to a random name.",
   errorCodeMapping:
@@ -29,7 +29,7 @@ export const baseHelpTooltipContent = {
 
 export const basePlaceholderContent = {
   url: "(optional) Navigate to this URL: https://...",
-  navigationGoal: "Tell Skyvern what to do.",
+  navigationGoal: "Tell Skyzona what to do.",
   dataExtractionGoal: "What data do you need to extract?",
   maxRetries: "Default: 3",
   maxStepsOverride: "Default: 10",
@@ -49,17 +49,17 @@ export const helpTooltips = {
   extraction: {
     ...baseHelpTooltipContent,
     dataExtractionGoal:
-      "Tell Skyvern what data you would like to scrape. Use {{ parameter_name }} to specify parameters to use.",
+      "Tell Skyzona what data you would like to scrape. Use {{ parameter_name }} to specify parameters to use.",
   },
   action: {
     ...baseHelpTooltipContent,
     navigationGoal:
-      "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify parameters to use.",
+      "Specify a single step or action you'd like Skyzona to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify parameters to use.",
   },
   fileDownload: {
     ...baseHelpTooltipContent,
     navigationGoal:
-      "Give Skyvern an objective that describes how to download the file.",
+      "Give Skyzona an objective that describes how to download the file.",
   },
   validation: baseHelpTooltipContent,
   textPrompt: {
@@ -134,7 +134,7 @@ export const placeholders = {
   task: basePlaceholderContent,
   taskv2: {
     ...basePlaceholderContent,
-    prompt: "Tell Skyvern what to do",
+    prompt: "Tell Skyzona what to do",
   },
   navigation: {
     ...basePlaceholderContent,
@@ -151,7 +151,7 @@ export const placeholders = {
     navigationGoal: 'Input {{ name }} into "Name" field.',
   },
   fileDownload: {
-    navigationGoal: "Tell Skyvern which file to download.",
+    navigationGoal: "Tell Skyzona which file to download.",
   },
   validation: basePlaceholderContent,
   textPrompt: basePlaceholderContent,

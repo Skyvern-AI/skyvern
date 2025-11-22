@@ -903,7 +903,7 @@ function Workspace({
           <DialogHeader>
             <DialogTitle>Are you sure?</DialogTitle>
             <DialogDescription>
-              Saving will delete cached code, and Skyvern will re-generate it in
+              Saving will delete cached code, and Skyzona will re-generate it in
               the next run. Proceed?
             </DialogDescription>
           </DialogHeader>

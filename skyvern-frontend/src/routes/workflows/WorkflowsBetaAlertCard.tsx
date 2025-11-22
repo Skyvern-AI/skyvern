@@ -8,7 +8,7 @@ function WorkflowsBetaAlertCard() {
       </header>
       <div>Workflows through UI are currently under construction.</div>
       <div>
-        Today, you can create and run workflows through the Skyvern API.
+        Today, you can create and run workflows through the Skyzona API.
       </div>
       <div className="flex gap-4 py-4">
         <Button variant="secondary" asChild>
