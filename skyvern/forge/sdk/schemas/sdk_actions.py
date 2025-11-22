@@ -15,6 +15,7 @@ class SdkActionType(str, Enum):
     AI_UPLOAD_FILE = "ai_upload_file"
     AI_ACT = "ai_act"
     EXTRACT = "extract"
+    LOCATE_ELEMENT = "locate_element"
 
 
 # Base action class
@@ -137,9 +138,30 @@ class ExtractAction(SdkActionBase):
         return self.data if isinstance(self.data, dict) else None
 
 
+class LocateElementAction(SdkActionBase):
+    """Locate element action parameters."""
+
+    type: Literal["locate_element"] = "locate_element"
+    prompt: str = Field(default="", description="Natural language prompt to locate an element")
+
+    def get_navigation_goal(self) -> str | None:
+        return self.prompt
+
+    def get_navigation_payload(self) -> dict[str, Any] | None:
+        return None
+
+
 # Discriminated union of all action types
 SdkAction = Annotated[
-    Union[ClickAction, InputTextAction, SelectOptionAction, UploadFileAction, ActAction, ExtractAction],
+    Union[
+        ClickAction,
+        InputTextAction,
+        SelectOptionAction,
+        UploadFileAction,
+        ActAction,
+        ExtractAction,
+        LocateElementAction,
+    ],
     Field(discriminator="type"),
 ]
 
