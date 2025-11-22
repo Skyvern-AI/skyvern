@@ -251,7 +251,8 @@ class LLMAPIHandlerFactory:
             use_message_history: bool = False,
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
-        ) -> dict[str, Any]:
+            force_dict: bool = True,
+        ) -> dict[str, Any] | Any:
             """
             Custom LLM API handler that utilizes the LiteLLM router and fallbacks to OpenAI GPT-4 Vision.
 
@@ -482,7 +483,7 @@ class LLMAPIHandlerFactory:
                     reasoning_token_count=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_token_count=cached_tokens if cached_tokens > 0 else None,
                 )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
             parsed_response_json = json.dumps(parsed_response, indent=2)
             if step and not is_speculative_step:
                 await app.ARTIFACT_MANAGER.create_llm_artifact(
@@ -585,7 +586,8 @@ class LLMAPIHandlerFactory:
             use_message_history: bool = False,
             raw_response: bool = False,
             window_dimension: Resolution | None = None,
-        ) -> dict[str, Any]:
+            force_dict: bool = True,
+        ) -> dict[str, Any] | Any:
             start_time = time.time()
             active_parameters = base_parameters or {}
             if parameters is None:
@@ -816,7 +818,7 @@ class LLMAPIHandlerFactory:
                     cached_token_count=cached_tokens if cached_tokens > 0 else None,
                     thought_cost=llm_cost,
                 )
-            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix)
+            parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
             await app.ARTIFACT_MANAGER.create_llm_artifact(
                 data=json.dumps(parsed_response, indent=2).encode("utf-8"),
                 artifact_type=ArtifactType.LLM_RESPONSE_PARSED,
@@ -957,8 +959,9 @@ class LLMCaller:
         use_message_history: bool = False,
         raw_response: bool = False,
         window_dimension: Resolution | None = None,
+        force_dict: bool = True,
         **extra_parameters: Any,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | Any:
         start_time = time.perf_counter()
         active_parameters = self.base_parameters or {}
         if parameters is None:
@@ -1140,7 +1143,7 @@ class LLMCaller:
         if raw_response:
             return response.model_dump(exclude_none=True)
 
-        parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix)
+        parsed_response = parse_api_response(response, self.llm_config.add_assistant_prefix, force_dict)
         parsed_response_json = json.dumps(parsed_response, indent=2)
         if step and not is_speculative_step:
             await app.ARTIFACT_MANAGER.create_llm_artifact(

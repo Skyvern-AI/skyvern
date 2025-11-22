@@ -10,7 +10,6 @@ from skyvern.client import (
     RunSdkActionRequestAction_AiSelectOption,
     RunSdkActionRequestAction_AiUploadFile,
     RunSdkActionRequestAction_Extract,
-    RunSdkActionRequestAction_LocateElement,
 )
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
@@ -193,35 +192,3 @@ class SdkSkyvernPageAi(SkyvernPageAi):
             workflow_run_id=self._browser.workflow_run_id,
         )
         self._browser.workflow_run_id = response.workflow_run_id
-
-    async def ai_locate_element(
-        self,
-        prompt: str,
-    ) -> str | None:
-        """Locate an element on the page using AI and return its XPath selector via API call.
-
-        Args:
-            prompt: Natural language description of the element to locate (e.g., 'find "download invoices" button')
-
-        Returns:
-            XPath selector string (e.g., 'xpath=//button[@id="download"]') or None if not found
-        """
-
-        LOG.info("AI locate element", prompt=prompt, workflow_run_id=self._browser.workflow_run_id)
-
-        response = await self._browser.skyvern.run_sdk_action(
-            url=self._page.url,
-            action=RunSdkActionRequestAction_LocateElement(
-                prompt=prompt,
-            ),
-            browser_session_id=self._browser.browser_session_id,
-            browser_address=self._browser.browser_address,
-            workflow_run_id=self._browser.workflow_run_id,
-        )
-        self._browser.workflow_run_id = response.workflow_run_id
-
-        # Return the XPath result directly
-        if response.result and isinstance(response.result, str):
-            return response.result
-
-        return None

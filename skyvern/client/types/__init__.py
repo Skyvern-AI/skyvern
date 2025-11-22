@@ -245,11 +245,9 @@ if typing.TYPE_CHECKING:
         HumanInteractionBlockParametersItem_Workflow,
     )
     from .human_interaction_block_yaml import HumanInteractionBlockYaml
-    from .improve_prompt_response import ImprovePromptResponse
     from .input_or_select_context import InputOrSelectContext
     from .input_text_action import InputTextAction
     from .input_text_action_data import InputTextActionData
-    from .locate_element_action import LocateElementAction
     from .login_block import LoginBlock
     from .login_block_data_schema import LoginBlockDataSchema
     from .login_block_parameters_item import (
@@ -304,7 +302,6 @@ if typing.TYPE_CHECKING:
         RunSdkActionRequestAction_AiSelectOption,
         RunSdkActionRequestAction_AiUploadFile,
         RunSdkActionRequestAction_Extract,
-        RunSdkActionRequestAction_LocateElement,
     )
     from .run_sdk_action_response import RunSdkActionResponse
     from .run_status import RunStatus
@@ -733,11 +730,9 @@ _dynamic_imports: typing.Dict[str, str] = {
     "HumanInteractionBlockParametersItem_Output": ".human_interaction_block_parameters_item",
     "HumanInteractionBlockParametersItem_Workflow": ".human_interaction_block_parameters_item",
     "HumanInteractionBlockYaml": ".human_interaction_block_yaml",
-    "ImprovePromptResponse": ".improve_prompt_response",
     "InputOrSelectContext": ".input_or_select_context",
     "InputTextAction": ".input_text_action",
     "InputTextActionData": ".input_text_action_data",
-    "LocateElementAction": ".locate_element_action",
     "LoginBlock": ".login_block",
     "LoginBlockDataSchema": ".login_block_data_schema",
     "LoginBlockParametersItem": ".login_block_parameters_item",
@@ -787,7 +782,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "RunSdkActionRequestAction_AiSelectOption": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_AiUploadFile": ".run_sdk_action_request_action",
     "RunSdkActionRequestAction_Extract": ".run_sdk_action_request_action",
-    "RunSdkActionRequestAction_LocateElement": ".run_sdk_action_request_action",
     "RunSdkActionResponse": ".run_sdk_action_response",
     "RunStatus": ".run_status",
     "Script": ".script",
@@ -1221,11 +1215,9 @@ __all__ = [
     "HumanInteractionBlockParametersItem_Output",
     "HumanInteractionBlockParametersItem_Workflow",
     "HumanInteractionBlockYaml",
-    "ImprovePromptResponse",
     "InputOrSelectContext",
     "InputTextAction",
     "InputTextActionData",
-    "LocateElementAction",
     "LoginBlock",
     "LoginBlockDataSchema",
     "LoginBlockParametersItem",
@@ -1275,7 +1267,6 @@ __all__ = [
     "RunSdkActionRequestAction_AiSelectOption",
     "RunSdkActionRequestAction_AiUploadFile",
     "RunSdkActionRequestAction_Extract",
-    "RunSdkActionRequestAction_LocateElement",
     "RunSdkActionResponse",
     "RunStatus",
     "Script",

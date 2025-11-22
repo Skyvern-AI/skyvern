@@ -165,7 +165,9 @@ def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
     raise InvalidLLMResponseType(type(response).__name__)
 
 
-def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bool = False) -> dict[str, Any]:
+def parse_api_response(
+    response: litellm.ModelResponse, add_assistant_prefix: bool = False, force_dict: bool = True
+) -> dict[str, Any] | Any:
     content = None
     try:
         content = response.choices[0].message.content
@@ -174,6 +176,8 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
             content = "{" + content
 
         parsed = json_repair.loads(content)
+        if not force_dict:
+            return parsed
         return _coerce_response_to_dict(parsed)
 
     except Exception:
@@ -186,6 +190,8 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
                 raise EmptyLLMResponseError(str(response))
             content = _try_to_extract_json_from_markdown_format(content)
             parsed = commentjson.loads(content)
+            if not force_dict:
+                return parsed
             return _coerce_response_to_dict(parsed)
         except Exception as e:
             if content:
@@ -196,6 +202,8 @@ def parse_api_response(response: litellm.ModelResponse, add_assistant_prefix: bo
                 )
                 try:
                     parsed = _fix_and_parse_json_string(content)
+                    if not force_dict:
+                        return parsed
                     return _coerce_response_to_dict(parsed)
                 except Exception as e2:
                     LOG.exception("Failed to auto-fix LLM response.", error=str(e2))

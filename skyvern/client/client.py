@@ -36,7 +36,6 @@ from .types.workflow_status import WorkflowStatus
 
 if typing.TYPE_CHECKING:
     from .browser_profiles.client import AsyncBrowserProfilesClient, BrowserProfilesClient
-    from .prompts.client import AsyncPromptsClient, PromptsClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
     from .workflows.client import AsyncWorkflowsClient, WorkflowsClient
 # this is used as the default value for optional parameters
@@ -111,7 +110,6 @@ class Skyvern:
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
         self._workflows: typing.Optional[WorkflowsClient] = None
         self._browser_profiles: typing.Optional[BrowserProfilesClient] = None
-        self._prompts: typing.Optional[PromptsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
 
     @property
@@ -1242,7 +1240,6 @@ class Skyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
-        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
@@ -1285,9 +1282,6 @@ class Skyvern:
 
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
-
-        browser_profile_id : typing.Optional[str]
-            ID of a browser profile to reuse for this run
 
         browser_address : typing.Optional[str]
             The CDP address for the task.
@@ -1353,7 +1347,6 @@ class Skyvern:
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             browser_session_id=browser_session_id,
-            browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
@@ -1609,14 +1602,6 @@ class Skyvern:
         return self._browser_profiles
 
     @property
-    def prompts(self):
-        if self._prompts is None:
-            from .prompts.client import PromptsClient  # noqa: E402
-
-            self._prompts = PromptsClient(client_wrapper=self._client_wrapper)
-        return self._prompts
-
-    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -1693,7 +1678,6 @@ class AsyncSkyvern:
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
         self._workflows: typing.Optional[AsyncWorkflowsClient] = None
         self._browser_profiles: typing.Optional[AsyncBrowserProfilesClient] = None
-        self._prompts: typing.Optional[AsyncPromptsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
 
     @property
@@ -2998,7 +2982,6 @@ class AsyncSkyvern:
         totp_identifier: typing.Optional[str] = OMIT,
         totp_url: typing.Optional[str] = OMIT,
         browser_session_id: typing.Optional[str] = OMIT,
-        browser_profile_id: typing.Optional[str] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         max_screenshot_scrolling_times: typing.Optional[int] = OMIT,
@@ -3041,9 +3024,6 @@ class AsyncSkyvern:
 
         browser_session_id : typing.Optional[str]
             ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
-
-        browser_profile_id : typing.Optional[str]
-            ID of a browser profile to reuse for this run
 
         browser_address : typing.Optional[str]
             The CDP address for the task.
@@ -3117,7 +3097,6 @@ class AsyncSkyvern:
             totp_identifier=totp_identifier,
             totp_url=totp_url,
             browser_session_id=browser_session_id,
-            browser_profile_id=browser_profile_id,
             browser_address=browser_address,
             extra_http_headers=extra_http_headers,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
@@ -3411,14 +3390,6 @@ class AsyncSkyvern:
 
             self._browser_profiles = AsyncBrowserProfilesClient(client_wrapper=self._client_wrapper)
         return self._browser_profiles
-
-    @property
-    def prompts(self):
-        if self._prompts is None:
-            from .prompts.client import AsyncPromptsClient  # noqa: E402
-
-            self._prompts = AsyncPromptsClient(client_wrapper=self._client_wrapper)
-        return self._prompts
 
     @property
     def scripts(self):
