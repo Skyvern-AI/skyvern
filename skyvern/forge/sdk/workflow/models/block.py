@@ -26,7 +26,7 @@ from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from playwright.async_api import Page
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
@@ -119,8 +119,15 @@ DEFAULT_MAX_STEPS_PER_ITERATION = 50
 
 
 class Block(BaseModel, abc.ABC):
+    """Base class for workflow nodes (see branching spec [[s-4bnl]] for metadata semantics)."""
+
     # Must be unique within workflow definition
-    label: str
+    label: str = Field(description="Author-facing identifier for a block; unique within a workflow.")
+    next_block_label: str | None = Field(
+        default=None,
+        description="Optional pointer to the next block label when constructing a DAG. "
+        "Defaults to sequential order when omitted.",
+    )
     block_type: BlockType
     output_parameter: OutputParameter
     continue_on_failure: bool = False
@@ -3821,6 +3828,107 @@ class HttpRequestBlock(Block):
             )
 
 
+class BranchEvaluationContext(BaseModel):
+    """Collection of runtime data that BranchCriteria evaluators can consume."""
+
+    workflow_parameters: dict[str, Any] = Field(default_factory=dict)
+    block_outputs: dict[str, Any] = Field(default_factory=dict)
+    environment: dict[str, Any] | None = None
+    llm_results: dict[str, Any] | None = None
+
+
+class BranchCriteria(BaseModel, abc.ABC):
+    """Abstract interface describing how a branch condition should be evaluated."""
+
+    criteria_type: str
+    description: str | None = None
+
+    @abc.abstractmethod
+    async def evaluate(self, context: BranchEvaluationContext) -> bool:
+        """Return True when the branch should execute."""
+        raise NotImplementedError
+
+    def requires_llm(self) -> bool:
+        """Whether the criteria relies on an LLM classification step."""
+        return False
+
+
+class BranchCondition(BaseModel):
+    """Represents a single conditional branch edge within a ConditionalBlock."""
+
+    criteria: BranchCriteria | None = None
+    next_block_label: str | None = None
+    description: str | None = None
+    order: int = Field(ge=0)
+    is_default: bool = False
+
+    @model_validator(mode="after")
+    def validate_condition(cls, condition: BranchCondition) -> BranchCondition:
+        if condition.criteria is None and not condition.is_default:
+            raise ValueError("Branches without criteria must be marked as default.")
+        if condition.criteria is not None and condition.is_default:
+            raise ValueError("Default branches may not define criteria.")
+        return condition
+
+
+class ConditionalBlock(Block):
+    """Branching block that selects the next block label based on ordered conditions."""
+
+    # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
+    # Parameter 1 of Literal[...] cannot be of type "Any"
+    block_type: Literal[BlockType.CONDITIONAL] = BlockType.CONDITIONAL  # type: ignore
+
+    branches: list[BranchCondition] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_branches(cls, block: ConditionalBlock) -> ConditionalBlock:
+        if not block.branches:
+            raise ValueError("Conditional blocks require at least one branch.")
+
+        orders = [branch.order for branch in block.branches]
+        if len(orders) != len(set(orders)):
+            raise ValueError("Branch order must be unique within a conditional block.")
+
+        default_branches = [branch for branch in block.branches if branch.is_default]
+        if len(default_branches) > 1:
+            raise ValueError("Only one default branch is permitted per conditional block.")
+
+        block.branches = sorted(block.branches, key=lambda branch: branch.order)
+        return block
+
+    def get_all_parameters(
+        self,
+        workflow_run_id: str,  # noqa: ARG002 - preserved for interface compatibility
+    ) -> list[PARAMETER_TYPE]:
+        # BranchCriteria subclasses will surface their parameter dependencies once implemented.
+        return []
+
+    async def execute(  # noqa: D401
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        """
+        Placeholder execute implementation.
+
+        Conditional block execution will be implemented alongside the DAG workflow
+        engine refactor (see branching workflow spec).
+        """
+        raise NotImplementedError("Conditional block execution is handled by the DAG engine.")
+
+    @property
+    def ordered_branches(self) -> list[BranchCondition]:
+        """Convenience accessor that returns branches sorted by order."""
+        return list(self.branches)
+
+    def get_default_branch(self) -> BranchCondition | None:
+        """Return the default/else branch when configured."""
+        return next((branch for branch in self.branches if branch.is_default), None)
+
+
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
     """
     Recursively get "all blocks" in a workflow definition.
@@ -3842,6 +3950,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 BlockSubclasses = Union[
+    ConditionalBlock,
     ForLoopBlock,
     TaskBlock,
     CodeBlock,
