@@ -84,6 +84,7 @@ import {
   getWorkflowBlocks,
   getWorkflowSettings,
   layout,
+  upgradeWorkflowDefinitionToVersionTwo,
 } from "./workflowEditorUtils";
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
@@ -360,6 +361,11 @@ function FlowRenderer({
 
   const constructSaveData = useCallback((): WorkflowSaveData => {
     const blocks = getWorkflowBlocks(nodes, edges);
+    const { blocks: upgradedBlocks, version: workflowDefinitionVersion } =
+      upgradeWorkflowDefinitionToVersionTwo(
+        blocks,
+        workflow.workflow_definition.version,
+      );
     const settings = getWorkflowSettings(nodes);
     const parametersInYAMLConvertibleJSON = convertToParametersYAML(parameters);
     const filteredParameters = workflow.workflow_definition.parameters.filter(
@@ -377,7 +383,7 @@ function FlowRenderer({
 
     // if there is an email node, we need to add the email aws secret parameters
     const emailAwsSecretParameters = getAdditionalParametersForEmailBlock(
-      blocks,
+      upgradedBlocks,
       overallParameters,
     );
 
@@ -387,7 +393,8 @@ function FlowRenderer({
         ...parametersInYAMLConvertibleJSON,
         ...emailAwsSecretParameters,
       ],
-      blocks,
+      blocks: upgradedBlocks,
+      workflowDefinitionVersion,
       title,
       settings,
       workflow,
