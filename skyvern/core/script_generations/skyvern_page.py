@@ -719,7 +719,8 @@ class SkyvernPage(Page):
         - **Fallback mode** (default): Try the selector first, fall back to AI if it fails
 
         The AI-powered locator is lazy - it only calls ai_locate_element when you actually
-        use the locator (e.g., when you call .click(), .fill(), etc.).
+        use the locator (e.g., when you call .click(), .fill(), etc.). Note that using this
+        AI locator lookup with prompt only works for elements you can interact with on the page.
 
         Args:
             selector: CSS selector for the target element.
