@@ -130,7 +130,6 @@ CacheInvalidationReason = Literal["updated_block", "new_block", "removed_block"]
 BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
     BlockType.TASK,
     BlockType.TaskV2,
-    BlockType.VALIDATION,
     BlockType.ACTION,
     BlockType.NAVIGATION,
     BlockType.EXTRACTION,
