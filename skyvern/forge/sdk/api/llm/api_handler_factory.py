@@ -257,15 +257,8 @@ class LLMAPIHandlerFactory:
     ) -> None:
         """Apply thinking budget optimization based on model type and LiteLLM reasoning support."""
         # Compute a safe model label and a representative model for capability checks
-        model_label = getattr(llm_config, "model_name", None)
-        if model_label is None and isinstance(llm_config, LLMRouterConfig):
-            model_label = getattr(llm_config, "main_model_group", "router")
-        check_model = model_label
-        if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
-            try:
-                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
-            except Exception:
-                check_model = model_label
+        model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+        check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
         # Check reasoning support (safe call - log but don't fail if litellm errors)
         supports_reasoning = False
@@ -278,9 +271,6 @@ class LLMAPIHandlerFactory:
                     model=check_model,
                     error=str(exc),
                 )
-
-        model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
-        check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
         try:
             # Gemini router/fallback configs (e.g., gemini-2.5-pro-gpt-5-fallback-router)
