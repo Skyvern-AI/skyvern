@@ -443,7 +443,7 @@ class ForgeAgent:
                 page = await browser_state.must_get_working_page()
                 current_url = page.url
                 if current_url.rstrip("/") != task.url.rstrip("/"):
-                    await page.goto(task.url)
+                    await page.goto(task.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                 step = await self.update_step(
                     step, status=StepStatus.completed, is_last=True, output=AgentStepOutput(action_results=[])
                 )
