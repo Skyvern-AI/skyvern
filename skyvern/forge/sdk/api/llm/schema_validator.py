@@ -71,6 +71,22 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
 
     schema_type = schema.get("type")
 
+    if isinstance(schema_type, list) and "null" in schema_type and data is None:
+        LOG.debug("Data is None and schema allows null type, keeping as None", path=path)
+        return None
+
+    if isinstance(schema_type, list):
+        non_null_types = [t for t in schema_type if t != "null"]
+        if len(non_null_types) == 1:
+            schema_type = non_null_types[0]
+        elif len(non_null_types) > 1:
+            LOG.warning(
+                "Multiple non-null types in schema, using first one",
+                path=path,
+                types=non_null_types,
+            )
+            schema_type = non_null_types[0]
+
     if schema_type == "object" or "properties" in schema:
         if not isinstance(data, dict):
             LOG.warning(
