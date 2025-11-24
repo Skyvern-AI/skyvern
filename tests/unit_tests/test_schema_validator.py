@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from skyvern.forge.sdk.api.llm.schema_validator import (
@@ -208,30 +206,6 @@ class TestSchemaValidator:
         result = validate_and_fill_extraction_result(invalid_data, medication_schema)
         # Should return empty array since invalid_data gets converted
         assert result == []
-
-    def test_fill_missing_fields_with_real_extraction_file(self, medication_schema):
-        """Test with real extraction data from file."""
-        # Load the extraction file
-        with open("/home/mkhalil/skyvern_task/skyvern/extraction") as f:
-            extraction_data = json.load(f)
-
-        # Validate and fill
-        result = fill_missing_fields(extraction_data, medication_schema)
-
-        # Verify structure
-        assert isinstance(result, list)
-        assert len(result) > 0
-
-        # Check that all items have required fields
-        for item in result:
-            assert "Medication Name" in item
-            assert "NDC" in item
-            assert "quantity" in item
-            assert "facility" in item
-            assert "recoverydate" in item
-            assert "isAllocation" in item
-            assert "ErrorMessage" in item
-            assert isinstance(item["isAllocation"], bool)
 
     def test_fill_missing_fields_preserves_existing_values(self, medication_schema):
         """Test that existing values are preserved and not overwritten."""
