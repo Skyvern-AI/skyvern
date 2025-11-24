@@ -968,8 +968,8 @@ class WorkflowService:
                 if (
                     not block_executed_with_code
                     and block.label
+                    and block.label not in script_blocks_by_label
                     and block_result.status == BlockStatus.completed
-                    and not getattr(block, "disable_cache", False)
                     and block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
                 ):
                     blocks_to_update.add(block.label)
