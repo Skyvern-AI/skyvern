@@ -1,49 +1,51 @@
 from typing import Any
 
 import structlog
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
+
+from skyvern.exceptions import InvalidSchemaError
 
 LOG = structlog.get_logger()
 
 
-def get_default_value_for_type(schema_type: str | list[Any]) -> Any:
-    """
-    Get a default value based on JSON schema type.
+_TYPE_DEFAULT_FACTORIES: dict[str, Any] = {
+    "string": lambda: "",
+    "number": lambda: 0,
+    "integer": lambda: 0,
+    "boolean": lambda: False,
+    "array": list,
+    "object": dict,
+    "null": lambda: None,
+}
 
-    Args:
-        schema_type: The JSON schema type (string or list of types)
 
-    Returns:
-        An appropriate default value for the type
-    """
-    # Handle type as list (e.g., ["string", "null"])
+def _resolve_schema_type(schema_type: str | list[Any] | None, path: str) -> str | None:
+    """Normalize a schema type definition to a single string value."""
     if isinstance(schema_type, list):
-        # Use the first non-null type
-        for t in schema_type:
-            if t != "null":
-                schema_type = str(t)
-                break
-        else:
-            # All types are null
-            return None
+        non_null_types = [str(t) for t in schema_type if t != "null"]
+        if not non_null_types:
+            return "null"
 
-    # Return new instances for mutable types to avoid sharing across fields
-    schema_type_str = str(schema_type)
-    if schema_type_str == "string":
-        return ""
-    elif schema_type_str == "number":
-        return 0
-    elif schema_type_str == "integer":
-        return 0
-    elif schema_type_str == "boolean":
-        return False
-    elif schema_type_str == "array":
-        return []
-    elif schema_type_str == "object":
-        return {}
-    elif schema_type_str == "null":
+        if len(non_null_types) > 1:
+            LOG.warning(
+                "Multiple non-null types in schema, using first one",
+                path=path,
+                types=non_null_types,
+            )
+        return non_null_types[0]
+
+    return str(schema_type) if schema_type is not None else None
+
+
+def get_default_value_for_type(schema_type: str | list[Any] | None, path: str = "root") -> Any:
+    """Get a default value based on JSON schema type."""
+    normalized_type = _resolve_schema_type(schema_type, path)
+    if normalized_type is None:
         return None
-    else:
-        return None
+
+    factory = _TYPE_DEFAULT_FACTORIES.get(normalized_type)
+    return factory() if callable(factory) else None
 
 
 def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, path: str = "root") -> Any:
@@ -61,33 +63,26 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
     if schema is None:
         return data
 
-    if isinstance(schema, str):
-        LOG.debug("Schema is a string, treating as permissive", path=path, schema=schema)
+    if isinstance(schema, (str, list)):
+        LOG.debug("Schema is permissive", path=path, schema=schema)
         return data
 
-    if isinstance(schema, list):
-        LOG.debug("Schema is a list, treating as permissive", path=path)
-        return data
+    schema_type = _resolve_schema_type(schema.get("type"), path)
+    raw_schema_type = schema.get("type")
 
-    schema_type = schema.get("type")
-
-    if isinstance(schema_type, list) and "null" in schema_type and data is None:
+    if schema_type == "null" and data is None:
         LOG.debug("Data is None and schema allows null type, keeping as None", path=path)
         return None
 
-    if isinstance(schema_type, list):
-        non_null_types = [t for t in schema_type if t != "null"]
-        if len(non_null_types) == 1:
-            schema_type = non_null_types[0]
-        elif len(non_null_types) > 1:
-            LOG.warning(
-                "Multiple non-null types in schema, using first one",
-                path=path,
-                types=non_null_types,
-            )
-            schema_type = non_null_types[0]
+    # Check if null is allowed in the schema type
+    is_nullable = isinstance(raw_schema_type, list) and "null" in raw_schema_type
 
     if schema_type == "object" or "properties" in schema:
+        # If data is None and schema allows null, keep it as None
+        if data is None and is_nullable:
+            LOG.debug("Data is None and schema allows null, keeping as None", path=path)
+            return None
+
         if not isinstance(data, dict):
             LOG.warning(
                 "Expected object but got different type, creating empty object",
@@ -97,14 +92,16 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
             data = {}
 
         properties = schema.get("properties", {})
-        required_fields = schema.get("required", [])
+        required_fields = set(schema.get("required", []))
 
         for field_name, field_schema in properties.items():
             field_path = f"{path}.{field_name}"
 
             if field_name not in data:
                 if field_name in required_fields:
-                    default_value = field_schema.get("default", get_default_value_for_type(field_schema.get("type")))
+                    default_value = field_schema.get(
+                        "default", get_default_value_for_type(field_schema.get("type"), field_path)
+                    )
                     LOG.info(
                         "Filling missing required field with default value",
                         path=field_path,
@@ -115,12 +112,16 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
                     LOG.debug("Skipping optional missing field", path=field_path)
                     continue
 
-            if field_name in data:
-                data[field_name] = fill_missing_fields(data[field_name], field_schema, field_path)
+            data[field_name] = fill_missing_fields(data[field_name], field_schema, field_path)
 
         return data
 
-    elif schema_type == "array":
+    if schema_type == "array":
+        # If data is None and schema allows null, keep it as None
+        if data is None and is_nullable:
+            LOG.debug("Data is None and schema allows null, keeping as None", path=path)
+            return None
+
         if not isinstance(data, list):
             LOG.warning(
                 "Expected array but got different type, creating empty array",
@@ -130,17 +131,54 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
             return []
 
         items_schema = schema.get("items")
-        if items_schema:
-            validated_items = []
-            for idx, item in enumerate(data):
-                item_path = f"{path}[{idx}]"
-                validated_item = fill_missing_fields(item, items_schema, item_path)
-                validated_items.append(validated_item)
-            return validated_items
+        if not items_schema:
+            return data
 
-        return data
-    else:
-        return data
+        return [fill_missing_fields(item, items_schema, f"{path}[{idx}]") for idx, item in enumerate(data)]
+
+    return data
+
+
+def validate_schema(schema: dict[str, Any] | list | str | None) -> None:
+    """
+    Validate that the schema itself is a valid JSON Schema.
+
+    Args:
+        schema: The JSON schema to validate
+
+    Raises:
+        InvalidSchemaError: If the schema is invalid with details about why
+    """
+    if schema is None or isinstance(schema, (str, list)):
+        return
+
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as e:
+        error_message = f"Invalid JSON schema: {str(e)}"
+        LOG.error("Invalid JSON schema", error=str(e), schema=schema)
+        raise InvalidSchemaError(error_message, [str(e)])
+
+
+def validate_data_against_schema(data: Any, schema: dict[str, Any]) -> list[str]:
+    """
+    Validate data against a JSON schema using Draft202012Validator.
+
+    Args:
+        data: The data to validate
+        schema: The JSON schema to validate against
+
+    Returns:
+        List of validation error messages (empty if valid)
+    """
+    validator = Draft202012Validator(schema)
+    errors = []
+
+    for error in validator.iter_errors(data):
+        error_path = ".".join(str(p) for p in error.path) if error.path else "root"
+        errors.append(f"{error_path}: {error.message}")
+
+    return errors
 
 
 def validate_and_fill_extraction_result(
@@ -151,9 +189,10 @@ def validate_and_fill_extraction_result(
     Validate extraction result against schema and fill missing fields with defaults.
 
     This function handles malformed JSON responses from LLMs by:
-    1. Validating the structure against the provided schema
+    1. Validating the schema itself is valid JSON Schema (raises InvalidSchemaError if not)
     2. Filling in missing required fields with appropriate default values
-    3. Preserving optional fields that are present
+    3. Validating the filled structure against the provided schema using jsonschema
+    4. Preserving optional fields that are present
 
     Args:
         extraction_result: The extraction result from the LLM
@@ -161,22 +200,37 @@ def validate_and_fill_extraction_result(
 
     Returns:
         The validated and filled extraction result
+
+    Raises:
+        InvalidSchemaError: If the provided schema is invalid. This allows the FE to notify
+                           the user about schema issues and that type correctness cannot be guaranteed.
     """
     if schema is None:
         LOG.debug("No schema provided, returning extraction result as-is")
         return extraction_result
 
+    validate_schema(schema)
     LOG.info("Validating and filling extraction result against schema")
 
     try:
         filled_result = fill_missing_fields(extraction_result, schema)
+
+        if isinstance(schema, dict):
+            validation_errors = validate_data_against_schema(filled_result, schema)
+            if validation_errors:
+                LOG.warning(
+                    "Validation errors found after filling",
+                    errors=validation_errors,
+                )
+
         LOG.info("Successfully validated and filled extraction result")
         return filled_result
+    except InvalidSchemaError:
+        raise
     except Exception as e:
         LOG.error(
             "Failed to validate and fill extraction result",
             error=str(e),
             exc_info=True,
         )
-        # Return original result if validation fails
         return extraction_result

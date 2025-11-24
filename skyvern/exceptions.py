@@ -858,3 +858,10 @@ class AzureConfigurationError(AzureBaseError):
 class ScriptTerminationException(SkyvernException):
     def __init__(self, reason: str | None = None) -> None:
         super().__init__(reason)
+
+
+class InvalidSchemaError(SkyvernException):
+    def __init__(self, message: str, validation_errors: list[str] | None = None):
+        self.message = message
+        self.validation_errors = validation_errors or []
+        super().__init__(self.message)

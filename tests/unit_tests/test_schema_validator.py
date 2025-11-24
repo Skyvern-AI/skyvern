@@ -1,15 +1,20 @@
+from typing import Any
+
 import pytest
 
+from skyvern.exceptions import InvalidSchemaError
 from skyvern.forge.sdk.api.llm.schema_validator import (
     fill_missing_fields,
     get_default_value_for_type,
     validate_and_fill_extraction_result,
+    validate_data_against_schema,
+    validate_schema,
 )
 
 
 class TestSchemaValidator:
     @pytest.fixture
-    def medication_schema(self):
+    def medication_schema(self) -> dict[str, Any]:
         """Schema for medication extraction data."""
         return {
             "type": "array",
@@ -37,7 +42,7 @@ class TestSchemaValidator:
         }
 
     @pytest.fixture
-    def complete_medication_data(self):
+    def complete_medication_data(self) -> list[dict[str, Any]]:
         """Complete medication data with all required fields."""
         return [
             {
@@ -61,7 +66,7 @@ class TestSchemaValidator:
         ]
 
     @pytest.fixture
-    def incomplete_medication_data(self):
+    def incomplete_medication_data(self) -> list[dict[str, Any]]:
         """Incomplete medication data missing some required fields."""
         return [
             {
@@ -77,41 +82,45 @@ class TestSchemaValidator:
             },
         ]
 
-    def test_get_default_value_for_string(self):
+    def test_get_default_value_for_string(self) -> None:
         """Test default value generation for string type."""
         assert get_default_value_for_type("string") == ""
 
-    def test_get_default_value_for_boolean(self):
+    def test_get_default_value_for_boolean(self) -> None:
         """Test default value generation for boolean type."""
         assert get_default_value_for_type("boolean") is False
 
-    def test_get_default_value_for_array(self):
+    def test_get_default_value_for_array(self) -> None:
         """Test default value generation for array type."""
         assert get_default_value_for_type("array") == []
 
-    def test_get_default_value_for_object(self):
+    def test_get_default_value_for_object(self) -> None:
         """Test default value generation for object type."""
         assert get_default_value_for_type("object") == {}
 
-    def test_get_default_value_for_null(self):
+    def test_get_default_value_for_null(self) -> None:
         """Test default value generation for null type."""
         assert get_default_value_for_type("null") is None
 
-    def test_get_default_value_for_type_list_with_null(self):
+    def test_get_default_value_for_type_list_with_null(self) -> None:
         """Test default value generation for type list containing null."""
         assert get_default_value_for_type(["string", "null"]) == ""
         assert get_default_value_for_type(["null", "string"]) == ""
 
-    def test_get_default_value_for_type_list_all_null(self):
+    def test_get_default_value_for_type_list_all_null(self) -> None:
         """Test default value generation for type list with only null."""
         assert get_default_value_for_type(["null"]) is None
 
-    def test_fill_missing_fields_complete_data(self, medication_schema, complete_medication_data):
+    def test_fill_missing_fields_complete_data(
+        self, medication_schema: dict[str, Any], complete_medication_data: list[dict[str, Any]]
+    ) -> None:
         """Test that complete data passes through unchanged."""
         result = fill_missing_fields(complete_medication_data, medication_schema)
         assert result == complete_medication_data
 
-    def test_fill_missing_fields_incomplete_data(self, medication_schema, incomplete_medication_data):
+    def test_fill_missing_fields_incomplete_data(
+        self, medication_schema: dict[str, Any], incomplete_medication_data: list[dict[str, Any]]
+    ) -> None:
         """Test that missing required fields are filled with defaults."""
         result = fill_missing_fields(incomplete_medication_data, medication_schema)
 
@@ -133,7 +142,7 @@ class TestSchemaValidator:
         assert result[1]["isAllocation"] is False  # Default for boolean
         assert result[1]["ErrorMessage"] == ""  # Default for ["string", "null"]
 
-    def test_fill_missing_fields_with_error_message(self, medication_schema):
+    def test_fill_missing_fields_with_error_message(self, medication_schema: dict[str, Any]) -> None:
         """Test filling fields when ErrorMessage has a value."""
         data = [
             {
@@ -150,18 +159,18 @@ class TestSchemaValidator:
         result = fill_missing_fields(data, medication_schema)
         assert result[0]["ErrorMessage"] == "Some error occurred"
 
-    def test_fill_missing_fields_empty_array(self, medication_schema):
+    def test_fill_missing_fields_empty_array(self, medication_schema: dict[str, Any]) -> None:
         """Test handling of empty array."""
         result = fill_missing_fields([], medication_schema)
         assert result == []
 
-    def test_fill_missing_fields_invalid_data_type(self, medication_schema):
+    def test_fill_missing_fields_invalid_data_type(self, medication_schema: dict[str, Any]) -> None:
         """Test handling when data is not an array."""
         # When data is not a list, it should be converted to empty array
         result = fill_missing_fields("not an array", medication_schema)
         assert result == []
 
-    def test_fill_missing_fields_nested_object_missing_fields(self, medication_schema):
+    def test_fill_missing_fields_nested_object_missing_fields(self, medication_schema: dict[str, Any]) -> None:
         """Test that nested objects have missing fields filled."""
         data = [
             {
@@ -179,7 +188,9 @@ class TestSchemaValidator:
         assert "isAllocation" in result[0]
         assert "ErrorMessage" in result[0]
 
-    def test_validate_and_fill_extraction_result_with_schema(self, medication_schema, incomplete_medication_data):
+    def test_validate_and_fill_extraction_result_with_schema(
+        self, medication_schema: dict[str, Any], incomplete_medication_data: list[dict[str, Any]]
+    ) -> None:
         """Test validate_and_fill_extraction_result with medication schema."""
         result = validate_and_fill_extraction_result(incomplete_medication_data, medication_schema)
 
@@ -193,13 +204,13 @@ class TestSchemaValidator:
             assert "isAllocation" in item
             assert "ErrorMessage" in item
 
-    def test_validate_and_fill_extraction_result_no_schema(self):
+    def test_validate_and_fill_extraction_result_no_schema(self) -> None:
         """Test that data passes through unchanged when no schema is provided."""
         data = {"some": "data"}
         result = validate_and_fill_extraction_result(data, None)
         assert result == data
 
-    def test_validate_and_fill_extraction_result_with_exception(self, medication_schema):
+    def test_validate_and_fill_extraction_result_with_exception(self, medication_schema: dict[str, Any]) -> None:
         """Test that original data is returned if validation fails."""
         # This should not raise an exception, but return original data
         invalid_data = "not a valid structure"
@@ -207,7 +218,7 @@ class TestSchemaValidator:
         # Should return empty array since invalid_data gets converted
         assert result == []
 
-    def test_fill_missing_fields_preserves_existing_values(self, medication_schema):
+    def test_fill_missing_fields_preserves_existing_values(self, medication_schema: dict[str, Any]) -> None:
         """Test that existing values are preserved and not overwritten."""
         data = [
             {
@@ -232,7 +243,7 @@ class TestSchemaValidator:
         assert result[0]["isAllocation"] is True
         assert result[0]["ErrorMessage"] == "Existing error"
 
-    def test_fill_missing_fields_nullable_object_with_null(self):
+    def test_fill_missing_fields_nullable_object_with_null(self) -> None:
         """Test handling of nullable object type when data is null."""
         schema = {
             "type": ["object", "null"],
@@ -247,7 +258,7 @@ class TestSchemaValidator:
         result = fill_missing_fields(None, schema)
         assert result is None
 
-    def test_fill_missing_fields_nullable_object_with_object(self):
+    def test_fill_missing_fields_nullable_object_with_object(self) -> None:
         """Test handling of nullable object type when data is an object with missing fields."""
         schema = {
             "type": ["object", "null"],
@@ -267,7 +278,7 @@ class TestSchemaValidator:
         assert "name" in result
         assert "age" in result
 
-    def test_fill_missing_fields_nullable_array_with_null(self):
+    def test_fill_missing_fields_nullable_array_with_null(self) -> None:
         """Test handling of nullable array type when data is null."""
         schema = {
             "type": ["array", "null"],
@@ -284,7 +295,7 @@ class TestSchemaValidator:
         result = fill_missing_fields(None, schema)
         assert result is None
 
-    def test_fill_missing_fields_nullable_array_with_array(self):
+    def test_fill_missing_fields_nullable_array_with_array(self) -> None:
         """Test handling of nullable array type when data is an array."""
         schema = {
             "type": ["array", "null"],
@@ -307,3 +318,156 @@ class TestSchemaValidator:
         assert result[0] == {"id": "1", "name": ""}
         assert "id" in result[0]
         assert "name" in result[0]
+
+    def test_validate_schema_valid(self) -> None:
+        """Test that valid schemas pass validation without raising."""
+        valid_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name"],
+        }
+        # Should not raise
+        validate_schema(valid_schema)
+
+    def test_validate_schema_invalid(self) -> None:
+        """Test that invalid schemas raise InvalidSchemaError."""
+        invalid_schema = {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": "not_a_number",  # Should be a number
+                }
+            },
+        }
+        # Should raise InvalidSchemaError with details
+        with pytest.raises(InvalidSchemaError) as exc_info:
+            validate_schema(invalid_schema)
+
+        assert "Invalid JSON schema" in str(exc_info.value)
+        assert len(exc_info.value.validation_errors) > 0
+
+    def test_validate_schema_none(self) -> None:
+        """Test that None schema is considered valid."""
+        # Should not raise
+        validate_schema(None)
+
+    def test_validate_schema_string(self) -> None:
+        """Test that string schema is considered valid (permissive)."""
+        # Should not raise
+        validate_schema("some_string")
+
+    def test_validate_schema_list(self) -> None:
+        """Test that list schema is considered valid (permissive)."""
+        # Should not raise
+        validate_schema([])
+
+    def test_validate_data_against_schema_valid(self) -> None:
+        """Test validation of valid data against schema."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+        }
+        data = {"name": "John", "age": 30}
+        errors = validate_data_against_schema(data, schema)
+        assert errors == []
+
+    def test_validate_data_against_schema_missing_required(self) -> None:
+        """Test validation when required fields are missing."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+        }
+        data = {"name": "John"}  # Missing 'age'
+        errors = validate_data_against_schema(data, schema)
+        assert len(errors) > 0
+        assert any("age" in error for error in errors)
+
+    def test_validate_data_against_schema_wrong_type(self) -> None:
+        """Test validation when data has wrong type."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+        }
+        data = {"name": "John", "age": "thirty"}  # age should be integer
+        errors = validate_data_against_schema(data, schema)
+        assert len(errors) > 0
+        assert any("age" in error for error in errors)
+
+    def test_validate_data_against_schema_array(self) -> None:
+        """Test validation of array data."""
+        schema = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                },
+                "required": ["id"],
+            },
+        }
+        data = [{"id": "1"}, {"id": "2"}]
+        errors = validate_data_against_schema(data, schema)
+        assert errors == []
+
+    def test_validate_and_fill_with_jsonschema_validation(self, medication_schema: dict[str, Any]) -> None:
+        """Test that validate_and_fill uses jsonschema for validation."""
+        # Data with all required fields filled correctly
+        data = [
+            {
+                "Medication Name": "TEST MED",
+                "NDC": "12345",
+                "quantity": "10",
+                "facility": "TEST",
+                "recoverydate": None,
+                "isAllocation": False,
+                "ErrorMessage": None,
+            }
+        ]
+
+        result = validate_and_fill_extraction_result(data, medication_schema)
+        assert result == data
+
+    def test_validate_and_fill_with_invalid_schema(self) -> None:
+        """Test that validate_and_fill raises InvalidSchemaError for invalid schemas."""
+        # Create a schema that will fail Draft202012Validator.check_schema
+        invalid_schema = {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": "not_a_number",  # Should be a number
+                }
+            },
+        }
+
+        data = {"name": "test"}
+        # Should raise InvalidSchemaError so FE can notify user
+        with pytest.raises(InvalidSchemaError) as exc_info:
+            validate_and_fill_extraction_result(data, invalid_schema)
+
+        # Verify error has useful information for FE
+        assert "Invalid JSON schema" in str(exc_info.value)
+        assert exc_info.value.validation_errors
+        assert len(exc_info.value.validation_errors) > 0
+
+    def test_invalid_schema_error_attributes(self) -> None:
+        """Test that InvalidSchemaError has the expected attributes."""
+        error = InvalidSchemaError("Test error message", ["error1", "error2"])
+        assert error.message == "Test error message"
+        assert error.validation_errors == ["error1", "error2"]
+        assert "Test error message" in str(error)
