@@ -5290,47 +5290,31 @@ class AgentDB:
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
     ) -> Script | None:
-        """Get latest script versions linked to a workflow by a specific cache_key_value."""
+        """Get latest script version linked to a workflow by a specific cache_key_value."""
         try:
             async with self.Session() as session:
-                # Subquery: script_ids associated with this workflow + cache_key_value
-                ws_script_ids_subquery = (
-                    select(WorkflowScriptModel.script_id)
-                    .where(WorkflowScriptModel.organization_id == organization_id)
-                    .where(WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id)
-                    .where(WorkflowScriptModel.cache_key_value == cache_key_value)
-                    .where(WorkflowScriptModel.deleted_at.is_(None))
-                )
-                if workflow_run_id:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(
-                        WorkflowScriptModel.workflow_run_id == workflow_run_id
+                # Build the query: join workflow_scripts with scripts
+                query = (
+                    select(ScriptModel)
+                    .join(WorkflowScriptModel, ScriptModel.script_id == WorkflowScriptModel.script_id)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
                     )
+                )
+
+                if workflow_run_id:
+                    query = query.where(WorkflowScriptModel.workflow_run_id == workflow_run_id)
 
                 if cache_key is not None:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.cache_key == cache_key)
+                    query = query.where(WorkflowScriptModel.cache_key == cache_key)
 
                 if statuses is not None and len(statuses) > 0:
-                    ws_script_ids_subquery = ws_script_ids_subquery.where(WorkflowScriptModel.status.in_(statuses))
+                    query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-                # Latest version per script_id within the org and not deleted
-                latest_versions_subquery = (
-                    select(
-                        ScriptModel.script_id,
-                        func.max(ScriptModel.version).label("latest_version"),
-                    )
-                    .where(ScriptModel.organization_id == organization_id)
-                    .where(ScriptModel.deleted_at.is_(None))
-                    .where(ScriptModel.script_id.in_(ws_script_ids_subquery))
-                    .group_by(ScriptModel.script_id)
-                    .subquery()
-                )
-
-                query = select(ScriptModel).join(
-                    latest_versions_subquery,
-                    (ScriptModel.script_id == latest_versions_subquery.c.script_id)
-                    & (ScriptModel.version == latest_versions_subquery.c.latest_version),
-                )
-                query = query.order_by(ScriptModel.created_at.desc())
+                query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
 
                 script = (await session.scalars(query)).first()
                 return convert_to_script(script) if script else None
