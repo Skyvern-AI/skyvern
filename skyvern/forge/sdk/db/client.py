@@ -5289,7 +5289,7 @@ class AgentDB:
         workflow_run_id: str | None = None,
         cache_key: str | None = None,
         statuses: list[ScriptStatus] | None = None,
-    ) -> list[Script]:
+    ) -> Script | None:
         """Get latest script versions linked to a workflow by a specific cache_key_value."""
         try:
             async with self.Session() as session:
@@ -5332,8 +5332,8 @@ class AgentDB:
                 )
                 query = query.order_by(ScriptModel.created_at.desc())
 
-                scripts = (await session.scalars(query)).all()
-                return [convert_to_script(script) for script in scripts]
+                script = (await session.scalars(query)).first()
+                return convert_to_script(script) if script else None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
