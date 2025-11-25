@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import typing as t
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 
@@ -66,6 +66,34 @@ async def verify_browser_session(
             organization_id=organization_id,
         )
         return None
+
+    if is_final_status(browser_session.status):
+        LOG.info(
+            "Browser session is invalid, as it is in a final state.",
+            browser_session_status=browser_session.status,
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        return None
+
+    started_at = browser_session.started_at
+    timeout_minutes = browser_session.timeout_minutes
+
+    if started_at and timeout_minutes:
+        current_time = datetime.utcnow()
+        times_out_at = started_at + timedelta(minutes=timeout_minutes)
+
+        if current_time > times_out_at:
+            LOG.info(
+                "Browser session invalid, as it has timed out, but is still in a non-final status. This is likely a bug!",
+                browser_session_id=browser_session_id,
+                organization_id=organization_id,
+                timeout_minutes=timeout_minutes,
+                started_at=started_at.isoformat(),
+                now=current_time.isoformat(),
+                times_out_at=times_out_at.isoformat(),
+            )
+            return None
 
     browser_address = browser_session.browser_address
 
