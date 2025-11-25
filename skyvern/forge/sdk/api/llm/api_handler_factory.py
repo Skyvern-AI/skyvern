@@ -366,18 +366,33 @@ class LLMAPIHandlerFactory:
 
             vertex_cache_attached = False
             cache_resource_name = getattr(context, "vertex_cache_name", None)
+            # Add cached_content to primary model's litellm_params (not global parameters)
+            # This ensures it's only passed to the Gemini primary, not to fallback models.
+            # By setting it in the model-specific litellm_params, LiteLLM will only include it
+            # when calling the primary model. When falling back to GPT-5, the fallback model's
+            # litellm_params won't have cached_content, so it won't be sent.
             if (
                 cache_resource_name
                 and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                 and getattr(context, "use_prompt_caching", False)
+                and "gemini" in main_model_group.lower()
             ):
-                parameters = {**parameters, "cached_content": cache_resource_name}
-                vertex_cache_attached = True
-                LOG.info(
-                    "Adding Vertex AI cache reference to router request",
-                    prompt_name=prompt_name,
-                    cache_attached=True,
-                )
+                # Modify the router's model_list to add cached_content only to the primary model
+                # The router is created per-handler-instance, so this modification is safe
+                # and idempotent (setting the same value multiple times is fine)
+                for model_dict in router.model_list:
+                    if model_dict.get("model_name") == main_model_group:
+                        if "litellm_params" not in model_dict:
+                            model_dict["litellm_params"] = {}
+                        model_dict["litellm_params"]["cached_content"] = cache_resource_name
+                        vertex_cache_attached = True
+                        LOG.info(
+                            "Adding Vertex AI cache reference to primary model in router",
+                            prompt_name=prompt_name,
+                            primary_model=main_model_group,
+                            fallback_model=llm_config.fallback_model_group,
+                        )
+                        break
 
             llm_request_payload = {
                 "model": llm_key,
@@ -704,6 +719,7 @@ class LLMAPIHandlerFactory:
                 cache_resource_name
                 and prompt_name == EXTRACT_ACTION_PROMPT_NAME
                 and getattr(context, "use_prompt_caching", False)
+                and "gemini" in model_name.lower()
             ):
                 active_parameters["cached_content"] = cache_resource_name
                 vertex_cache_attached = True
