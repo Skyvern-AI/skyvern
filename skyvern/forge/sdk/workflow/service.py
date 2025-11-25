@@ -646,10 +646,6 @@ class WorkflowService:
                 current_context.generate_script = False
             if workflow_run.code_gen:
                 current_context.generate_script = True
-        is_script_run = self.should_run_script(workflow, workflow_run)
-        # Unified execution: execute blocks one by one, using script code when available
-        if is_script_run is False:
-            workflow_script = None
         workflow_run, blocks_to_update = await self._execute_workflow_blocks(
             workflow=workflow,
             workflow_run=workflow_run,
@@ -719,6 +715,8 @@ class WorkflowService:
         loaded_script_module = None
         blocks_to_update: set[str] = set()
 
+        is_script_run = self.should_run_script(workflow, workflow_run)
+
         if workflow_script:
             LOG.info(
                 "Loading script blocks for workflow execution",
@@ -732,12 +730,6 @@ class WorkflowService:
                     organization_id=organization_id,
                 )
                 if script:
-                    script_files = await app.DATABASE.get_script_files(
-                        script_revision_id=script.script_revision_id,
-                        organization_id=organization_id,
-                    )
-                    await script_service.load_scripts(script, script_files)
-
                     script_blocks = await app.DATABASE.get_script_blocks_by_script_revision_id(
                         script_revision_id=script.script_revision_id,
                         organization_id=organization_id,
@@ -748,33 +740,43 @@ class WorkflowService:
                         if script_block.run_signature:
                             script_blocks_by_label[script_block.script_block_label] = script_block
 
-                    script_path = os.path.join(settings.TEMP_PATH, workflow_script.script_id, "main.py")
-                    if os.path.exists(script_path):
-                        # setup script run
-                        parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
-                            workflow_run_id=workflow_run.workflow_run_id
+                    if is_script_run:
+                        # load the script files
+                        script_files = await app.DATABASE.get_script_files(
+                            script_revision_id=script.script_revision_id,
+                            organization_id=organization_id,
                         )
-                        script_parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
+                        await script_service.load_scripts(script, script_files)
 
-                        spec = importlib.util.spec_from_file_location("user_script", script_path)
-                        if spec and spec.loader:
-                            loaded_script_module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(loaded_script_module)
-                            await skyvern.setup(
-                                script_parameters,
-                                generated_parameter_cls=loaded_script_module.GeneratedWorkflowParameters,
+                        script_path = os.path.join(settings.TEMP_PATH, workflow_script.script_id, "main.py")
+                        if os.path.exists(script_path):
+                            # setup script run
+                            parameter_tuples = await app.DATABASE.get_workflow_run_parameters(
+                                workflow_run_id=workflow_run.workflow_run_id
                             )
-                            LOG.info(
-                                "Successfully loaded script module",
+                            script_parameters = {
+                                wf_param.key: run_param.value for wf_param, run_param in parameter_tuples
+                            }
+
+                            spec = importlib.util.spec_from_file_location("user_script", script_path)
+                            if spec and spec.loader:
+                                loaded_script_module = importlib.util.module_from_spec(spec)
+                                spec.loader.exec_module(loaded_script_module)
+                                await skyvern.setup(
+                                    script_parameters,
+                                    generated_parameter_cls=loaded_script_module.GeneratedWorkflowParameters,
+                                )
+                                LOG.info(
+                                    "Successfully loaded script module",
+                                    script_id=workflow_script.script_id,
+                                    block_count=len(script_blocks_by_label),
+                                )
+                        else:
+                            LOG.warning(
+                                "Script file not found at path",
+                                script_path=script_path,
                                 script_id=workflow_script.script_id,
-                                block_count=len(script_blocks_by_label),
                             )
-                    else:
-                        LOG.warning(
-                            "Script file not found at path",
-                            script_path=script_path,
-                            script_id=workflow_script.script_id,
-                        )
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",
@@ -860,7 +862,9 @@ class WorkflowService:
 
                 # Try executing with script code if available
                 block_executed_with_code = False
-                valid_to_run_code = block.label and block.label in script_blocks_by_label and not block.disable_cache
+                valid_to_run_code = (
+                    is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
+                )
                 if valid_to_run_code:
                     script_block = script_blocks_by_label[block.label]
                     LOG.info(
