@@ -4893,43 +4893,6 @@ class AgentDB:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
 
-    async def update_script(
-        self,
-        script_revision_id: str,
-        organization_id: str,
-        artifact_id: str | None = None,
-        run_id: str | None = None,
-        version: int | None = None,
-    ) -> Script:
-        try:
-            async with self.Session() as session:
-                get_script_query = (
-                    select(ScriptModel)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(script_revision_id=script_revision_id)
-                )
-                if script := (await session.scalars(get_script_query)).first():
-                    if artifact_id:
-                        script.artifact_id = artifact_id
-                    if run_id:
-                        script.run_id = run_id
-                    if version:
-                        script.version = version
-                    await session.commit()
-                    await session.refresh(script)
-                    return convert_to_script(script)
-                else:
-                    raise NotFoundError("Script not found")
-        except SQLAlchemyError:
-            LOG.error("SQLAlchemyError", exc_info=True)
-            raise
-        except NotFoundError:
-            LOG.error("No script found to update", script_revision_id=script_revision_id)
-            raise
-        except Exception:
-            LOG.error("UnexpectedError", exc_info=True)
-            raise
-
     async def get_scripts(
         self,
         organization_id: str,
