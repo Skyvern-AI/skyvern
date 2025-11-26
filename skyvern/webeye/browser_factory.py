@@ -23,7 +23,13 @@ from playwright.async_api import BrowserContext, ConsoleMessage, Download, Page,
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME, SKYVERN_DIR
+from skyvern.constants import (
+    BROWSER_CLOSE_TIMEOUT,
+    BROWSER_DOWNLOAD_TIMEOUT,
+    BROWSER_PAGE_CLOSE_TIMEOUT,
+    NAVIGATION_MAX_RETRY_TIME,
+    SKYVERN_DIR,
+)
 from skyvern.exceptions import (
     EmptyBrowserContext,
     FailedToNavigateToUrl,
@@ -809,7 +815,11 @@ class BrowserState:
             closing_pages=closing_pages,
         )
         for page in closing_pages:
-            await page.close()
+            try:
+                async with asyncio.timeout(BROWSER_PAGE_CLOSE_TIMEOUT):
+                    await page.close()
+            except Exception:
+                LOG.warning("Error while closing the page", exc_info=True)
 
         return reserved_pages
 
