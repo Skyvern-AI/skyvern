@@ -1808,17 +1808,25 @@ class WorkflowService:
         )
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
-        LOG.info(
-            f"Marking workflow run {workflow_run_id} as running",
-            workflow_run_id=workflow_run_id,
-            workflow_status="running",
-            run_with=run_with,
-        )
-        return await self._update_workflow_run_status(
+        workflow_run = await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.running,
             run_with=run_with,
         )
+        start_time = (
+            workflow_run.started_at.replace(tzinfo=UTC)
+            if workflow_run.started_at
+            else workflow_run.created_at.replace(tzinfo=UTC)
+        )
+        queued_seconds = (start_time - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
+        LOG.info(
+            f"Marked workflow run {workflow_run_id} as running",
+            workflow_run_id=workflow_run_id,
+            workflow_status="running",
+            run_with=run_with,
+            queued_seconds=queued_seconds,
+        )
+        return workflow_run
 
     async def mark_workflow_run_as_terminated(
         self,
