@@ -403,7 +403,7 @@ class ScriptSkyvernPage(SkyvernPage):
         if context and context.script_mode:
             print(f"🌐 Navigating to: {url}")
 
-        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
 
         if context and context.script_mode:

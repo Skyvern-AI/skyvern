@@ -92,7 +92,6 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
-    FileDownloadBlock,
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -443,7 +442,7 @@ class ForgeAgent:
                 page = await browser_state.must_get_working_page()
                 current_url = page.url
                 if current_url.rstrip("/") != task.url.rstrip("/"):
-                    await page.goto(task.url)
+                    await page.goto(task.url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                 step = await self.update_step(
                     step, status=StepStatus.completed, is_last=True, output=AgentStepOutput(action_results=[])
                 )
@@ -501,7 +500,6 @@ class ForgeAgent:
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             retry = False
 
-            download_detected = False
             if task_block and task_block.complete_on_download and task.workflow_run_id:
                 workflow_download_directory = get_path_for_workflow_download_directory(
                     context.run_id if context and context.run_id else task.workflow_run_id
@@ -539,7 +537,6 @@ class ForgeAgent:
                     )
                     list_files_after = list_files_after + browser_session_downloaded_files_after
                 if len(list_files_after) > len(list_files_before):
-                    download_detected = True
                     files_to_rename = list(set(list_files_after) - set(list_files_before))
                     for file in files_to_rename:
                         if file.startswith("s3://"):
@@ -600,28 +597,6 @@ class ForgeAgent:
                         browser_session_id=browser_session_id,
                     )
                     return last_step, detailed_output, None
-
-            if (
-                task_block
-                and isinstance(task_block, FileDownloadBlock)
-                and task_block.complete_on_download
-                and task.workflow_run_id
-                and not download_detected
-            ):
-                handled, fallback_last_step = await self._handle_file_download_verification_fallback(
-                    organization=organization,
-                    task=task,
-                    step=step,
-                    browser_state=browser_state,
-                    task_block=task_block,
-                    detailed_output=detailed_output,
-                    engine=engine,
-                    api_key=api_key,
-                    close_browser_on_completion=close_browser_on_completion,
-                    browser_session_id=browser_session_id,
-                )
-                if handled and fallback_last_step:
-                    return fallback_last_step, detailed_output, None
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
@@ -917,172 +892,6 @@ class ForgeAgent:
     @TraceManager.traced_async(
         ignore_inputs=["browser_state", "organization", "task_block", "cua_response", "llm_caller"]
     )
-    async def _handle_file_download_verification_fallback(
-        self,
-        *,
-        organization: Organization,
-        task: Task,
-        step: Step,
-        browser_state: BrowserState,
-        task_block: FileDownloadBlock,
-        detailed_output: DetailedAgentStepOutput | None,
-        engine: RunEngine,
-        api_key: str | None,
-        close_browser_on_completion: bool,
-        browser_session_id: str | None,
-    ) -> tuple[bool, Step | None]:
-        if detailed_output is None or detailed_output.scraped_page is None:
-            return False, None
-
-        try:
-            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-            use_termination_prompt = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                "USE_TERMINATION_AWARE_COMPLETE_VERIFICATION",
-                distinct_id,
-                properties={"organization_id": task.organization_id},
-            )
-        except Exception as error:  # pragma: no cover - defensive logging
-            LOG.warning(
-                "Failed to check USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment; skipping download fallback verification",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                error=str(error),
-            )
-            return False, None
-
-        if not use_termination_prompt:
-            return False, None
-
-        try:
-            page = await browser_state.get_working_page()
-            if page is None:
-                page = await browser_state.must_get_working_page()
-        except Exception:
-            LOG.warning(
-                "File download fallback verification could not fetch working page, skipping verification",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                exc_info=True,
-            )
-            return False, None
-
-        try:
-            fallback_action = await self.check_user_goal_complete(
-                page=page,
-                scraped_page=detailed_output.scraped_page,
-                task=task,
-                step=step,
-                task_block=task_block,
-            )
-        except Exception:
-            LOG.warning(
-                "File download fallback verification failed, continuing with standard flow",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                exc_info=True,
-            )
-            return False, None
-
-        if fallback_action is None:
-            LOG.info(
-                "File download fallback verification completed with continue status",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-            return False, None
-
-        LOG.info(
-            "File download fallback verification returned decisive action",
-            task_id=task.task_id,
-            workflow_run_id=task.workflow_run_id,
-            action_type=fallback_action.action_type if isinstance(fallback_action, Action) else "unknown",
-        )
-
-        if step.output is None:
-            step.output = AgentStepOutput(action_results=[], actions_and_results=[], errors=[])
-        if step.output.action_results is None:
-            step.output.action_results = []
-        if step.output.actions_and_results is None:
-            step.output.actions_and_results = []
-        if step.output.errors is None:
-            step.output.errors = []
-        if detailed_output.actions_and_results is None:
-            detailed_output.actions_and_results = []
-
-        persisted_action = cast(Action, fallback_action)
-        if isinstance(persisted_action, (CompleteAction, TerminateAction)):
-            persisted_action.organization_id = task.organization_id
-            persisted_action.workflow_run_id = task.workflow_run_id
-            persisted_action.task_id = task.task_id
-            persisted_action.step_id = step.step_id
-            persisted_action.step_order = step.order
-            persisted_action.action_order = len(step.output.actions_and_results)
-
-        action_results = await ActionHandler.handle_action(
-            detailed_output.scraped_page,
-            task,
-            step,
-            page,
-            persisted_action,
-        )
-        await self.record_artifacts_after_action(task, step, browser_state, engine)
-
-        step.output.action_results.extend(action_results)
-        step.output.actions_and_results.append((persisted_action, action_results))
-        detailed_output.actions_and_results.append((persisted_action, action_results))
-        if isinstance(persisted_action, DecisiveAction) and persisted_action.errors:
-            step.output.errors.extend(persisted_action.errors)
-
-        if isinstance(persisted_action, TerminateAction):
-            LOG.warning(
-                "File download fallback verification determined workflow should terminate",
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-                reasoning=persisted_action.reasoning,
-            )
-            last_step = await self.update_step(step, output=step.output, is_last=True)
-            task_errors = None
-            if persisted_action.errors:
-                task_errors = [error.model_dump() for error in persisted_action.errors]
-            failure_reason = persisted_action.reasoning
-            if persisted_action.errors:
-                failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
-            updated_task = await self.update_task(
-                task,
-                status=TaskStatus.terminated,
-                failure_reason=failure_reason,
-                errors=task_errors,
-            )
-            await self.clean_up_task(
-                task=updated_task,
-                last_step=last_step,
-                api_key=api_key,
-                close_browser_on_completion=close_browser_on_completion,
-                browser_session_id=browser_session_id,
-            )
-            return True, last_step
-
-        LOG.info(
-            "File download fallback verification marked task as complete",
-            task_id=task.task_id,
-            workflow_run_id=task.workflow_run_id,
-        )
-        last_step = await self.update_step(step, output=step.output, is_last=True)
-        extracted_information = await self.get_extracted_information_for_task(task)
-        updated_task = await self.update_task(
-            task,
-            status=TaskStatus.completed,
-            extracted_information=extracted_information,
-        )
-        await self.clean_up_task(
-            task=updated_task,
-            last_step=last_step,
-            api_key=api_key,
-            close_browser_on_completion=close_browser_on_completion,
-            browser_session_id=browser_session_id,
-        )
-        return True, last_step
-
     async def agent_step(
         self,
         task: Task,
@@ -1561,10 +1370,13 @@ class ForgeAgent:
 
                 # Check if parallel verification is enabled
                 distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                    distinct_id,
-                    properties={"organization_id": task.organization_id, "task_url": task.url},
+                enable_parallel_verification = (
+                    await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "ENABLE_PARALLEL_USER_GOAL_CHECK",
+                        distinct_id,
+                        properties={"organization_id": task.organization_id, "task_url": task.url},
+                    )
+                    and not disable_user_goal_check
                 )
 
                 if not disable_user_goal_check and not enable_parallel_verification:
@@ -1575,7 +1387,6 @@ class ForgeAgent:
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
-                        task_block=task_block,
                     )
                     if complete_action is not None:
                         LOG.info("User goal achieved, executing complete action")
@@ -1590,7 +1401,7 @@ class ForgeAgent:
                         )
                         detailed_agent_step_output.actions_and_results.append((complete_action, complete_results))
                         await self.record_artifacts_after_action(task, step, browser_state, engine)
-                elif enable_parallel_verification:
+                elif not disable_user_goal_check and enable_parallel_verification:
                     # Parallel verification enabled - defer check to handle_completed_step
                     LOG.info(
                         "Parallel verification enabled, deferring user goal check to handle_completed_step",
@@ -2214,14 +2025,7 @@ class ForgeAgent:
             )
 
     async def complete_verify(
-        self,
-        page: Page,
-        scraped_page: ScrapedPage,
-        task: Task,
-        step: Step,
-        task_block: BaseTaskBlock | None = None,
-        *,
-        use_termination_prompt: bool = False,
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteVerifyResult:
         LOG.info(
             "Checking if user goal is achieved after re-scraping the page",
@@ -2238,6 +2042,31 @@ class ForgeAgent:
         actions_and_results_str = ""
         if task.include_action_history_in_verification:
             actions_and_results_str = await self._get_action_results(task, current_step=step)
+
+        # Check if we should use the termination-aware prompt (experiment)
+        use_termination_prompt = False
+        try:
+            distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+            use_termination_prompt = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "USE_TERMINATION_AWARE_COMPLETE_VERIFICATION",
+                distinct_id,
+                properties={"organization_id": task.organization_id, "task_url": task.url},
+            )
+            if use_termination_prompt:
+                LOG.info(
+                    "Experiment enabled: using termination-aware complete verification prompt for file download block",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    organization_id=task.organization_id,
+                    block_type="file_download",
+                )
+        except Exception as e:
+            LOG.warning(
+                "Failed to check USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment; using legacy behavior",
+                task_id=task.task_id,
+                workflow_run_id=task.workflow_run_id,
+                error=str(e),
+            )
 
         # Select the appropriate template based on experiment
         template_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
@@ -2301,14 +2130,7 @@ class ForgeAgent:
         return CompleteVerifyResult.model_validate(verification_result)
 
     async def check_user_goal_complete(
-        self,
-        page: Page,
-        scraped_page: ScrapedPage,
-        task: Task,
-        step: Step,
-        task_block: BaseTaskBlock | None = None,
-        *,
-        use_termination_prompt: bool = False,
+        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteAction | TerminateAction | None:
         try:
             verification_result = await self.complete_verify(
@@ -2316,25 +2138,17 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
-                task_block=task_block,
-                use_termination_prompt=use_termination_prompt,
             )
 
             # Check if we should terminate instead of complete
+            # Note: This requires the USE_TERMINATION_AWARE_COMPLETE_VERIFICATION experiment to be enabled
             if verification_result.is_terminate:
-                if use_termination_prompt:
-                    LOG.warning(
-                        "Periodic verification determined task should terminate (termination-aware experiment)",
-                        workflow_run_id=task.workflow_run_id,
-                        thoughts=verification_result.thoughts,
-                        status=verification_result.status if verification_result.status else "legacy",
-                    )
-                else:
-                    LOG.warning(
-                        "Periodic verification determined task should terminate",
-                        workflow_run_id=task.workflow_run_id,
-                        thoughts=verification_result.thoughts,
-                    )
+                LOG.warning(
+                    "Periodic verification determined task should terminate (termination-aware experiment)",
+                    workflow_run_id=task.workflow_run_id,
+                    thoughts=verification_result.thoughts,
+                    status=verification_result.status if verification_result.status else "legacy",
+                )
                 return TerminateAction(
                     reasoning=verification_result.thoughts,
                 )
@@ -2367,6 +2181,12 @@ class ForgeAgent:
         if not working_page:
             raise MissingBrowserStatePage()
 
+        try:
+            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            await skyvern_frame.safe_wait_for_animation_end()
+        except Exception:
+            LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
+
         context = skyvern_context.ensure_context()
         scrolling_number = context.max_screenshot_scrolls
         if scrolling_number is None:
@@ -2378,11 +2198,6 @@ class ForgeAgent:
         try:
             screenshot = await browser_state.take_post_action_screenshot(
                 scrolling_number=scrolling_number,
-                use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PLAYWRIGHT_FULLPAGE",
-                    task.workflow_run_id or task.task_id,
-                    properties={"organization_id": task.organization_id},
-                ),
             )
             await app.ARTIFACT_MANAGER.create_artifact(
                 step=step,
@@ -3249,13 +3064,7 @@ class ForgeAgent:
             browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
             if browser_state is not None and await browser_state.get_working_page() is not None:
                 try:
-                    screenshot = await browser_state.take_fullpage_screenshot(
-                        use_playwright_fullpage=await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_PLAYWRIGHT_FULLPAGE",
-                            task.workflow_run_id or task.task_id,
-                            properties={"organization_id": task.organization_id},
-                        )
-                    )
+                    screenshot = await browser_state.take_fullpage_screenshot()
                     await app.ARTIFACT_MANAGER.create_artifact(
                         step=last_step,
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,
@@ -3691,7 +3500,6 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
-                task_block=task_block,
             ),
             name=f"verify_goal_{step.step_id}",
         )
@@ -4194,39 +4002,54 @@ class ForgeAgent:
     ) -> tuple[bool | None, Step | None, Step | None]:
         # Check if parallel verification should be used
         # Only use it when we have the required data AND when verification would normally happen
+        task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
         should_verify = (
             complete_verification
             and not step.is_goal_achieved()
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
+            and not task_completes_on_download
             and (task.navigation_goal or task.complete_criterion)
         )
 
         if should_verify and browser_state and scraped_page:
             try:
-                distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "ENABLE_PARALLEL_USER_GOAL_CHECK",
-                    distinct_id,
-                    properties={"organization_id": task.organization_id, "task_url": task.url},
+                disable_user_goal_check = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                    "DISABLE_USER_GOAL_CHECK",
+                    task.workflow_run_id if task.workflow_run_id else task.task_id,
+                    properties={"task_url": task.url, "organization_id": task.organization_id},
                 )
 
-                if enable_parallel_verification:
+                if disable_user_goal_check:
                     LOG.info(
-                        "Parallel verification enabled, using optimized flow",
+                        "User goal verification disabled via feature flag, skipping parallel verification",
                         step_id=step.step_id,
                         task_id=task.task_id,
                     )
-                    return await self._handle_completed_step_with_parallel_verification(
-                        organization=organization,
-                        task=task,
-                        step=step,
-                        page=page,
-                        browser_state=browser_state,
-                        scraped_page=scraped_page,
-                        engine=engine,
-                        task_block=task_block,
+                else:
+                    distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                    enable_parallel_verification = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                        "ENABLE_PARALLEL_USER_GOAL_CHECK",
+                        distinct_id,
+                        properties={"organization_id": task.organization_id, "task_url": task.url},
                     )
+
+                    if enable_parallel_verification:
+                        LOG.info(
+                            "Parallel verification enabled, using optimized flow",
+                            step_id=step.step_id,
+                            task_id=task.task_id,
+                        )
+                        return await self._handle_completed_step_with_parallel_verification(
+                            organization=organization,
+                            task=task,
+                            step=step,
+                            page=page,
+                            browser_state=browser_state,
+                            scraped_page=scraped_page,
+                            engine=engine,
+                            task_block=task_block,
+                        )
             except Exception:
                 LOG.warning(
                     "Failed to check parallel verification feature flag, using standard flow",

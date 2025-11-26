@@ -688,16 +688,30 @@ def _build_action_statement(
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
     ]
-
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("label"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block.get("label")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+                comma=cst.Comma(),
+            )
+        )
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("action")),
         args=args,
@@ -748,15 +762,30 @@ def _build_extract_statement(
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
-        cst.Arg(
-            keyword=cst.Name("label"),
-            value=_value(block_title),
-            whitespace_after_arg=cst.ParenthesizedWhitespace(
-                indent=True,
-            ),
-            comma=cst.Comma(),
-        ),
     ]
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("label"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("label"),
+                value=_value(block_title),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                ),
+                comma=cst.Comma(),
+            )
+        )
+    _mark_last_arg_as_comma(args)
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("extract")),
@@ -890,6 +919,18 @@ def _build_validate_statement(
             cst.Arg(
                 keyword=cst.Name("error_code_mapping"),
                 value=_value(block.get("error_code_mapping")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1129,6 +1170,18 @@ def _build_pdf_parser_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
             )
         )
 
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(
@@ -1180,6 +1233,18 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             cst.Arg(
                 keyword=cst.Name("schema"),
                 value=_value(block.get("json_schema")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -1334,6 +1399,18 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             )
         )
 
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
     if block.get("label") is not None:
         args.append(
             cst.Arg(
@@ -1346,7 +1423,7 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
             )
         )
 
-    if block.get("parameters") is not None:
+    if block.get("parameters"):
         parameters = block.get("parameters", [])
         parameter_list = [parameter["key"] for parameter in parameters]
         args.append(
@@ -1355,10 +1432,12 @@ def _build_prompt_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
                 value=_value(parameter_list),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
                 ),
             )
         )
 
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("prompt")),
         args=args,
@@ -1577,6 +1656,17 @@ def __build_base_task_statement(
             cst.Arg(
                 keyword=cst.Name("totp_url"),
                 value=_value(block.get("totp_verification_url", "")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+    if block.get("model"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("model"),
+                value=_value(block.get("model")),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),

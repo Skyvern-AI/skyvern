@@ -476,6 +476,7 @@ class ActionHandler:
                 )
 
             if not download_triggered:
+                results[-1].download_triggered = False
                 return results
             results[-1].download_triggered = True
 
@@ -3827,6 +3828,7 @@ async def extract_information_for_navigation_goal(
         step=step,
         screenshots=scraped_page.screenshots,
         prompt_name="extract-information",
+        force_dict=False,
     )
 
     return ScrapeResult(

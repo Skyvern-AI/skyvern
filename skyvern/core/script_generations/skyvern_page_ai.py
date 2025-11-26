@@ -71,3 +71,10 @@ class SkyvernPageAi(Protocol):
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
         ...
+
+    async def ai_locate_element(
+        self,
+        prompt: str,
+    ) -> str | None:
+        """Locate an element on the page using AI and return its XPath selector."""
+        ...

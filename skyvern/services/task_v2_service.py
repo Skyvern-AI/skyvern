@@ -657,7 +657,7 @@ async def run_task_v2_helper(
                 # Page failed to load properly, fallback to Google
                 if page:
                     try:
-                        await page.goto(fallback_url, timeout=15000)
+                        await page.goto(fallback_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                         fallback_occurred = True
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)

@@ -17,6 +17,7 @@ import { errorMappingExampleValue } from "../types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { Switch } from "@/components/ui/switch";
 import { placeholders, helpTooltips } from "../../helpContent";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { useRerender } from "@/hooks/useRerender";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
@@ -139,10 +140,7 @@ function ActionNode({ id, data, type }: NodeProps<ActionNode>) {
                 <HelpTooltip content={navigationGoalTooltip} />
               </div>
               <WorkflowBlockInputTextarea
-                aiImprove={{
-                  context: { block_type: "Action Block" },
-                  useCase: "task_v1_prompt",
-                }}
+                aiImprove={AI_IMPROVE_CONFIGS.action.navigationGoal}
                 nodeId={id}
                 onChange={(value) => {
                   update({ navigationGoal: value });

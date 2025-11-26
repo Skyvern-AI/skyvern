@@ -1,16 +1,41 @@
+"""
+Channels (see ./channels/README.md) variously rely on the state of one of
+these database entities:
+  - browser session
+  - task
+  - workflow run
+
+That is, channels are created on the basis of one of those entities, and that
+entity must be in a valid state for the channel to continue.
+
+So, in order to continue operating a channel, we need to periodically verify
+that the underlying entity is still valid. This module provides logic to
+perform those verifications.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime
+import typing as t
+from datetime import datetime, timedelta
 
 import structlog
 
-import skyvern.forge.sdk.routes.streaming.clients as sc
 from skyvern.config import settings
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 
+if t.TYPE_CHECKING:
+    from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel
+    from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
+
 LOG = structlog.get_logger()
+
+
+class Constants:
+    POLL_INTERVAL_FOR_VERIFICATION_SECONDS = 5
 
 
 async def verify_browser_session(
@@ -41,6 +66,34 @@ async def verify_browser_session(
             organization_id=organization_id,
         )
         return None
+
+    if is_final_status(browser_session.status):
+        LOG.info(
+            "Browser session is invalid, as it is in a final state.",
+            browser_session_status=browser_session.status,
+            browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        return None
+
+    started_at = browser_session.started_at
+    timeout_minutes = browser_session.timeout_minutes
+
+    if started_at and timeout_minutes:
+        current_time = datetime.utcnow()
+        times_out_at = started_at + timedelta(minutes=timeout_minutes)
+
+        if current_time > times_out_at:
+            LOG.info(
+                "Browser session invalid, as it has timed out, but is still in a non-final status. This is likely a bug!",
+                browser_session_id=browser_session_id,
+                organization_id=organization_id,
+                timeout_minutes=timeout_minutes,
+                started_at=started_at.isoformat(),
+                now=current_time.isoformat(),
+                times_out_at=times_out_at.isoformat(),
+            )
+            return None
 
     browser_address = browser_session.browser_address
 
@@ -122,9 +175,7 @@ async def verify_task(
             **browser_session.model_dump() | {"browser_address": browser_session.browser_address},
         )
     except Exception as e:
-        LOG.error(
-            "streaming-vnc.browser-session-reify-error", task_id=task_id, organization_id=organization_id, error=e
-        )
+        LOG.error("vnc.browser-session-reify-error", task_id=task_id, organization_id=organization_id, error=e)
         return task, None
 
     return task, addressable_browser_session
@@ -238,7 +289,7 @@ async def verify_workflow_run(
     return workflow_run, addressable_browser_session
 
 
-async def loop_verify_browser_session(verifiable: sc.MessageChannel | sc.Streaming) -> None:
+async def loop_verify_browser_session(verifiable: MessageChannel | VncChannel) -> None:
     """
     Loop until the browser session is cleared or the websocket is closed.
     """
@@ -251,27 +302,27 @@ async def loop_verify_browser_session(verifiable: sc.MessageChannel | sc.Streami
 
         verifiable.browser_session = browser_session
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 
 
-async def loop_verify_task(streaming: sc.Streaming) -> None:
+async def loop_verify_task(vnc_channel: VncChannel) -> None:
     """
     Loop until the task is cleared or the websocket is closed.
     """
 
-    while streaming.task and streaming.is_open:
+    while vnc_channel.task and vnc_channel.is_open:
         task, browser_session = await verify_task(
-            task_id=streaming.task.task_id,
-            organization_id=streaming.organization_id,
+            task_id=vnc_channel.task.task_id,
+            organization_id=vnc_channel.organization_id,
         )
 
-        streaming.task = task
-        streaming.browser_session = browser_session
+        vnc_channel.task = task
+        vnc_channel.browser_session = browser_session
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 
 
-async def loop_verify_workflow_run(verifiable: sc.MessageChannel | sc.Streaming) -> None:
+async def loop_verify_workflow_run(verifiable: MessageChannel | VncChannel) -> None:
     """
     Loop until the workflow run is cleared or the websocket is closed.
     """
@@ -285,4 +336,4 @@ async def loop_verify_workflow_run(verifiable: sc.MessageChannel | sc.Streaming)
         verifiable.workflow_run = workflow_run
         verifiable.browser_session = browser_session
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)

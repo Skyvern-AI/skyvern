@@ -369,11 +369,12 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
             element["children"] = new_children
         return element
 
-    async def refresh(self, draw_boxes: bool = True, scroll: bool = True) -> Self:
+    async def refresh(self, draw_boxes: bool = True, scroll: bool = True, max_retries: int = 0) -> Self:
         refreshed_page = await scrape_website(
             browser_state=self._browser_state,
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
+            max_retries=max_retries,
             scrape_exclude=self._scrape_exclude,
             draw_boxes=draw_boxes,
             scroll=scroll,
@@ -393,20 +394,25 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         return self
 
     async def generate_scraped_page(
-        self, draw_boxes: bool = True, scroll: bool = True, take_screenshots: bool = True
+        self,
+        draw_boxes: bool = True,
+        scroll: bool = True,
+        take_screenshots: bool = True,
+        max_retries: int = 0,
     ) -> Self:
         return await scrape_website(
             browser_state=self._browser_state,
             url=self.url,
             cleanup_element_tree=self._clean_up_func,
+            max_retries=max_retries,
             scrape_exclude=self._scrape_exclude,
             take_screenshots=take_screenshots,
             draw_boxes=draw_boxes,
             scroll=scroll,
         )
 
-    async def generate_scraped_page_without_screenshots(self) -> Self:
-        return await self.generate_scraped_page(take_screenshots=False)
+    async def generate_scraped_page_without_screenshots(self, max_retries: int = 0) -> Self:
+        return await self.generate_scraped_page(take_screenshots=False, max_retries=max_retries)
 
 
 @TraceManager.traced_async(ignore_input=True)
@@ -415,6 +421,7 @@ async def scrape_website(
     url: str,
     cleanup_element_tree: CleanupElementTreeFunc,
     num_retry: int = 0,
+    max_retries: int = settings.MAX_SCRAPING_RETRIES,
     scrape_exclude: ScrapeExcludeFunc | None = None,
     take_screenshots: bool = True,
     draw_boxes: bool = True,
@@ -463,10 +470,11 @@ async def scrape_website(
         raise
     except Exception as e:
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
-        if num_retry > settings.MAX_SCRAPING_RETRIES:
+        if num_retry > max_retries:
             LOG.error(
                 "Scraping failed after max retries, aborting.",
-                max_retries=settings.MAX_SCRAPING_RETRIES,
+                max_retries=max_retries,
+                num_retry=num_retry,
                 url=url,
                 exc_info=True,
             )
@@ -474,12 +482,14 @@ async def scrape_website(
                 raise e
             else:
                 raise ScrapingFailed() from e
-        LOG.info("Scraping failed, will retry", num_retry=num_retry, url=url)
+        LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
+        await asyncio.sleep(0.5)
         return await scrape_website(
             browser_state,
             url,
             cleanup_element_tree,
             num_retry=num_retry,
+            max_retries=max_retries,
             scrape_exclude=scrape_exclude,
             take_screenshots=take_screenshots,
             draw_boxes=draw_boxes,

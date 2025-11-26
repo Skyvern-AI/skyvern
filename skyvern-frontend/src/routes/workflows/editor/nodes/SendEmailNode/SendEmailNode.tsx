@@ -13,6 +13,7 @@ import { useParams } from "react-router-dom";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useUpdate } from "@/routes/workflows/editor/useUpdate";
+import { AI_IMPROVE_CONFIGS } from "../../constants";
 
 function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
   const { editable, label } = data;
@@ -94,6 +95,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
         <div className="space-y-2">
           <Label className="text-xs text-slate-300">Body</Label>
           <WorkflowBlockInputTextarea
+            aiImprove={AI_IMPROVE_CONFIGS.sendEmail.body}
             nodeId={id}
             onChange={(value) => {
               update({ body: value });
