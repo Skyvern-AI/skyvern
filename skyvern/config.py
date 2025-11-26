@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
+    BROWSER_MAX_PAGES_NUMBER: int = 10
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
