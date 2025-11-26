@@ -124,38 +124,4 @@ export type CredentialGetter = () => Promise<string | null>;
 // self-hosted Skyvern instances accessed remotely (non-localhost)
 // See: https://github.com/Skyvern-AI/skyvern/issues/3782
 [client, v2Client, clientSansApiV1].forEach((instance) => {
-  instance.interceptors.response.use(
-    (response) => response,
-    (error) => {
-      try {
-        const url = String(error?.config?.url || "");
-        const status = Number(error?.response?.status || 0);
-        // Extract 'detail' for logging purposes to aid debugging and monitoring.
-        const detail = String(error?.response?.data?.detail || "");
-
-        // Only intercept the internal auth endpoint
-        const isInternalAuth =
-          url.endsWith("/internal/auth/status") ||
-          url.endsWith("/api/v1/internal/auth/status");
-
-        if (isInternalAuth && (status === 403 || status === 404)) {
-          console.warn(
-            "Ignoring /internal/auth/status API error:",
-            status,
-            detail,
-          );
-          return Promise.resolve({
-            ...error.response,
-            status: 200,
-            data: { status: "ok" },
-          });
-        }
-      } catch (err) {
-        console.error("Interceptor error:", err);
-      }
-      return Promise.reject(error);
-    },
-  );
-});
-
 export { getClient, artifactApiClient };
