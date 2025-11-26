@@ -2,7 +2,6 @@ from typing import Any
 
 import pytest
 
-from skyvern.exceptions import InvalidSchemaError
 from skyvern.forge.sdk.api.llm.schema_validator import (
     fill_missing_fields,
     get_default_value_for_type,
@@ -110,6 +109,23 @@ class TestSchemaValidator:
     def test_get_default_value_for_type_list_all_null(self) -> None:
         """Test default value generation for type list with only null."""
         assert get_default_value_for_type(["null"]) is None
+
+    def test_get_default_value_for_uppercase_type(self) -> None:
+        """Test default value generation for uppercase type names."""
+        assert get_default_value_for_type("STRING") == ""
+        assert get_default_value_for_type("NUMBER") == 0
+        assert get_default_value_for_type("INTEGER") == 0
+        assert get_default_value_for_type("BOOLEAN") is False
+        assert get_default_value_for_type("ARRAY") == []
+        assert get_default_value_for_type("OBJECT") == {}
+        assert get_default_value_for_type("NULL") is None
+
+    def test_get_default_value_for_mixed_case_type(self) -> None:
+        """Test default value generation for mixed case type names."""
+        assert get_default_value_for_type("String") == ""
+        assert get_default_value_for_type("Boolean") is False
+        assert get_default_value_for_type(["STRING", "null"]) == ""
+        assert get_default_value_for_type(["NULL", "STRING"]) == ""
 
     def test_fill_missing_fields_complete_data(
         self, medication_schema: dict[str, Any], complete_medication_data: list[dict[str, Any]]
@@ -320,7 +336,7 @@ class TestSchemaValidator:
         assert "name" in result[0]
 
     def test_validate_schema_valid(self) -> None:
-        """Test that valid schemas pass validation without raising."""
+        """Test that valid schemas return True."""
         valid_schema = {
             "type": "object",
             "properties": {
@@ -329,11 +345,10 @@ class TestSchemaValidator:
             },
             "required": ["name"],
         }
-        # Should not raise
-        validate_schema(valid_schema)
+        assert validate_schema(valid_schema) is True
 
     def test_validate_schema_invalid(self) -> None:
-        """Test that invalid schemas raise InvalidSchemaError."""
+        """Test that invalid schemas return False."""
         invalid_schema = {
             "type": "object",
             "properties": {
@@ -343,27 +358,20 @@ class TestSchemaValidator:
                 }
             },
         }
-        # Should raise InvalidSchemaError with details
-        with pytest.raises(InvalidSchemaError) as exc_info:
-            validate_schema(invalid_schema)
-
-        assert "Invalid JSON schema" in str(exc_info.value)
-        assert len(exc_info.value.validation_errors) > 0
+        # Should return False for invalid schema
+        assert validate_schema(invalid_schema) is False
 
     def test_validate_schema_none(self) -> None:
         """Test that None schema is considered valid."""
-        # Should not raise
-        validate_schema(None)
+        assert validate_schema(None) is True
 
     def test_validate_schema_string(self) -> None:
         """Test that string schema is considered valid (permissive)."""
-        # Should not raise
-        validate_schema("some_string")
+        assert validate_schema("some_string") is True
 
     def test_validate_schema_list(self) -> None:
         """Test that list schema is considered valid (permissive)."""
-        # Should not raise
-        validate_schema([])
+        assert validate_schema([]) is True
 
     def test_validate_data_against_schema_valid(self) -> None:
         """Test validation of valid data against schema."""
@@ -443,7 +451,7 @@ class TestSchemaValidator:
         assert result == data
 
     def test_validate_and_fill_with_invalid_schema(self) -> None:
-        """Test that validate_and_fill raises InvalidSchemaError for invalid schemas."""
+        """Test that validate_and_fill returns data as-is for invalid schemas."""
         # Create a schema that will fail Draft202012Validator.check_schema
         invalid_schema = {
             "type": "object",
@@ -456,18 +464,6 @@ class TestSchemaValidator:
         }
 
         data = {"name": "test"}
-        # Should raise InvalidSchemaError so FE can notify user
-        with pytest.raises(InvalidSchemaError) as exc_info:
-            validate_and_fill_extraction_result(data, invalid_schema)
-
-        # Verify error has useful information for FE
-        assert "Invalid JSON schema" in str(exc_info.value)
-        assert exc_info.value.validation_errors
-        assert len(exc_info.value.validation_errors) > 0
-
-    def test_invalid_schema_error_attributes(self) -> None:
-        """Test that InvalidSchemaError has the expected attributes."""
-        error = InvalidSchemaError("Test error message", ["error1", "error2"])
-        assert error.message == "Test error message"
-        assert error.validation_errors == ["error1", "error2"]
-        assert "Test error message" in str(error)
+        # Should return data as-is without transformations when schema is invalid
+        result = validate_and_fill_extraction_result(data, invalid_schema)
+        assert result == data

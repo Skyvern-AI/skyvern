@@ -4,8 +4,6 @@ import structlog
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
-from skyvern.exceptions import InvalidSchemaError
-
 LOG = structlog.get_logger()
 
 
@@ -23,7 +21,7 @@ _TYPE_DEFAULT_FACTORIES: dict[str, Any] = {
 def _resolve_schema_type(schema_type: str | list[Any] | None, path: str) -> str | None:
     """Normalize a schema type definition to a single string value."""
     if isinstance(schema_type, list):
-        non_null_types = [str(t) for t in schema_type if t != "null"]
+        non_null_types = [str(t).lower() for t in schema_type if str(t).lower() != "null"]
         if not non_null_types:
             return "null"
 
@@ -35,7 +33,7 @@ def _resolve_schema_type(schema_type: str | list[Any] | None, path: str) -> str 
             )
         return non_null_types[0]
 
-    return str(schema_type) if schema_type is not None else None
+    return str(schema_type).lower() if schema_type is not None else None
 
 
 def get_default_value_for_type(schema_type: str | list[Any] | None, path: str = "root") -> Any:
@@ -85,7 +83,7 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
 
         if not isinstance(data, dict):
             LOG.warning(
-                "Schema expects object type but received incompatible type, creating empty object to satisfy schema requirements and continue validation",
+                "Expected object but got different type, creating empty object",
                 path=path,
                 data_type=type(data).__name__,
             )
@@ -139,25 +137,25 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
     return data
 
 
-def validate_schema(schema: dict[str, Any] | list | str | None) -> None:
+def validate_schema(schema: dict[str, Any] | list | str | None) -> bool:
     """
     Validate that the schema itself is a valid JSON Schema.
 
     Args:
         schema: The JSON schema to validate
 
-    Raises:
-        InvalidSchemaError: If the schema is invalid with details about why
+    Returns:
+        True if the schema is valid, False otherwise
     """
     if schema is None or isinstance(schema, (str, list)):
-        return
+        return True
 
     try:
         Draft202012Validator.check_schema(schema)
+        return True
     except SchemaError as e:
-        error_message = f"Invalid JSON schema: {str(e)}"
-        LOG.error("Invalid JSON schema", error=str(e), schema=schema)
-        raise InvalidSchemaError(error_message, [str(e)])
+        LOG.warning("Invalid JSON schema, will return data as-is", error=str(e), schema=schema)
+        return False
 
 
 def validate_data_against_schema(data: Any, schema: dict[str, Any]) -> list[str]:
@@ -189,7 +187,7 @@ def validate_and_fill_extraction_result(
     Validate extraction result against schema and fill missing fields with defaults.
 
     This function handles malformed JSON responses from LLMs by:
-    1. Validating the schema itself is valid JSON Schema (raises InvalidSchemaError if not)
+    1. Validating the schema itself is valid JSON Schema (returns data as-is if invalid)
     2. Filling in missing required fields with appropriate default values
     3. Validating the filled structure against the provided schema using jsonschema
     4. Preserving optional fields that are present
@@ -199,17 +197,16 @@ def validate_and_fill_extraction_result(
         schema: The JSON schema that defines the expected structure
 
     Returns:
-        The validated and filled extraction result
-
-    Raises:
-        InvalidSchemaError: If the provided schema is invalid. This allows the FE to notify
-                           the user about schema issues and that type correctness cannot be guaranteed.
+        The validated and filled extraction result, or the original data if schema is invalid
     """
     if schema is None:
         LOG.debug("No schema provided, returning extraction result as-is")
         return extraction_result
 
-    validate_schema(schema)
+    if not validate_schema(schema):
+        LOG.info("Schema is invalid, returning extraction result as-is without transformations")
+        return extraction_result
+
     LOG.info("Validating and filling extraction result against schema")
 
     try:
@@ -225,8 +222,6 @@ def validate_and_fill_extraction_result(
 
         LOG.info("Successfully validated and filled extraction result")
         return filled_result
-    except InvalidSchemaError:
-        raise
     except Exception as e:
         LOG.error(
             "Failed to validate and fill extraction result",
