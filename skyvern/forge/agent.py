@@ -4013,11 +4013,13 @@ class ForgeAgent:
     ) -> tuple[bool | None, Step | None, Step | None]:
         # Check if parallel verification should be used
         # Only use it when we have the required data AND when verification would normally happen
+        task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
         should_verify = (
             complete_verification
             and not step.is_goal_achieved()
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
+            and not task_completes_on_download
             and (task.navigation_goal or task.complete_criterion)
         )
 
