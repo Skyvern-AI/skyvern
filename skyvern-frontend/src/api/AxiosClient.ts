@@ -134,7 +134,7 @@ export type CredentialGetter = () => Promise<string | null>;
 
         // Only intercept the internal auth endpoint
         const isInternalAuth =
-          url.includes("/internal/auth/status") ||
+          url.endsWith("/internal/auth/status") ||
           url.endsWith("/api/v1/internal/auth/status");
 
         if (isInternalAuth && (status === 403 || status === 404)) {
