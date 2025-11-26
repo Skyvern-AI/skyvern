@@ -2487,6 +2487,7 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
                 query = query.filter_by(status=WorkflowRunStatus.queued)
@@ -2527,6 +2528,7 @@ class AgentDB:
         try:
             async with self.Session() as session:
                 query = select(WorkflowRunModel).filter_by(workflow_permanent_id=workflow_permanent_id)
+                query = query.filter(WorkflowRunModel.browser_session_id.is_(None))
                 if organization_id:
                     query = query.filter_by(organization_id=organization_id)
                 query = query.filter_by(status=WorkflowRunStatus.running)
@@ -2538,6 +2540,36 @@ class AgentDB:
                 query = query.order_by(WorkflowRunModel.started_at.desc())
                 workflow_run = (await session.scalars(query)).first()
                 return convert_to_workflow_run(workflow_run) if workflow_run else None
+        except SQLAlchemyError:
+            LOG.error("SQLAlchemyError", exc_info=True)
+            raise
+
+    async def get_last_workflow_run_for_browser_session(
+        self,
+        browser_session_id: str,
+        organization_id: str | None = None,
+    ) -> WorkflowRun | None:
+        try:
+            async with self.Session() as session:
+                # check if there's a queued run
+                query = select(WorkflowRunModel).filter_by(browser_session_id=browser_session_id)
+                if organization_id:
+                    query = query.filter_by(organization_id=organization_id)
+
+                queue_query = query.filter_by(status=WorkflowRunStatus.queued)
+                queue_query = queue_query.order_by(WorkflowRunModel.modified_at.desc())
+                workflow_run = (await session.scalars(queue_query)).first()
+                if workflow_run:
+                    return convert_to_workflow_run(workflow_run)
+
+                # check if there's a running run
+                running_query = query.filter_by(status=WorkflowRunStatus.running)
+                running_query = running_query.filter(WorkflowRunModel.started_at.isnot(None))
+                running_query = running_query.order_by(WorkflowRunModel.started_at.desc())
+                workflow_run = (await session.scalars(running_query)).first()
+                if workflow_run:
+                    return convert_to_workflow_run(workflow_run)
+                return None
         except SQLAlchemyError:
             LOG.error("SQLAlchemyError", exc_info=True)
             raise
