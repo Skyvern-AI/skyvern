@@ -112,7 +112,7 @@ async def messages(
         return
 
     if not result:
-        LOG.error(
+        LOG.warning(
             "No message channel found.",
             browser_session_id=browser_session_id,
             workflow_run_id=workflow_run_id,
