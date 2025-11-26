@@ -1186,6 +1186,10 @@ const isAngularDropdown = (element) => {
     return false;
   }
 
+  if (element.type?.toLowerCase() === "search") {
+    return false;
+  }
+
   const tagName = element.tagName.toLowerCase();
   if (tagName === "input" || tagName === "span") {
     const ariaLabel = element.hasAttribute("aria-label")
