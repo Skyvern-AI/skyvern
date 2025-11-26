@@ -130,6 +130,7 @@ export type CredentialGetter = () => Promise<string | null>;
       try {
         const url = String(error?.config?.url || "");
         const status = Number(error?.response?.status || 0);
+        // Extract 'detail' for logging purposes to aid debugging and monitoring.
         const detail = String(error?.response?.data?.detail || "");
 
         // Only intercept the internal auth endpoint
