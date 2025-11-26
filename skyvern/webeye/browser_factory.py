@@ -781,14 +781,14 @@ class BrowserState:
         await self.set_working_page(last_page, len(pages) - 1)
         return last_page
 
-    async def list_valid_pages(self) -> list[Page]:
-        # List all valid pages(blank page, and http/https page) in the browser context
+    async def list_valid_pages(self, max_pages: int = settings.BROWSER_MAX_PAGES_NUMBER) -> list[Page]:
+        # List all valid pages(blank page, and http/https page) in the browser context, up to max_pages
         # MSEdge CDP bug(?)
         # when using CDP connect to a MSEdge, the download hub will be included in the context.pages
         if self.browser_context is None:
             return []
 
-        return [
+        pages = [
             http_page
             for http_page in self.browser_context.pages
             if (
@@ -797,6 +797,21 @@ class BrowserState:
                 or urlparse(http_page.url).scheme in ["http", "https"]
             )
         ]
+
+        if max_pages <= 0 or len(pages) <= max_pages:
+            return pages
+
+        reserved_pages = pages[-max_pages:]
+
+        closing_pages = pages[: len(pages) - max_pages]
+        LOG.warning(
+            "The page number exceeds the limit, closing the oldest pages. It might cause the video missing",
+            closing_pages=closing_pages,
+        )
+        for page in closing_pages:
+            await page.close()
+
+        return reserved_pages
 
     async def validate_browser_context(self, page: Page) -> bool:
         # validate the content
