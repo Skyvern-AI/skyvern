@@ -93,7 +93,7 @@ class SkyvernPage(Page):
         return decorator
 
     async def goto(self, url: str, **kwargs: Any) -> None:
-        timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
+        timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
 
     ######### Public Interfaces #########

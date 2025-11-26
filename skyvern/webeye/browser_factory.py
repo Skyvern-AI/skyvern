@@ -23,7 +23,13 @@ from playwright.async_api import BrowserContext, ConsoleMessage, Download, Page,
 from pydantic import BaseModel, PrivateAttr
 
 from skyvern.config import settings
-from skyvern.constants import BROWSER_CLOSE_TIMEOUT, BROWSER_DOWNLOAD_TIMEOUT, NAVIGATION_MAX_RETRY_TIME, SKYVERN_DIR
+from skyvern.constants import (
+    BROWSER_CLOSE_TIMEOUT,
+    BROWSER_DOWNLOAD_TIMEOUT,
+    BROWSER_PAGE_CLOSE_TIMEOUT,
+    NAVIGATION_MAX_RETRY_TIME,
+    SKYVERN_DIR,
+)
 from skyvern.exceptions import (
     EmptyBrowserContext,
     FailedToNavigateToUrl,
@@ -781,14 +787,14 @@ class BrowserState:
         await self.set_working_page(last_page, len(pages) - 1)
         return last_page
 
-    async def list_valid_pages(self) -> list[Page]:
-        # List all valid pages(blank page, and http/https page) in the browser context
+    async def list_valid_pages(self, max_pages: int = settings.BROWSER_MAX_PAGES_NUMBER) -> list[Page]:
+        # List all valid pages(blank page, and http/https page) in the browser context, up to max_pages
         # MSEdge CDP bug(?)
         # when using CDP connect to a MSEdge, the download hub will be included in the context.pages
         if self.browser_context is None:
             return []
 
-        return [
+        pages = [
             http_page
             for http_page in self.browser_context.pages
             if (
@@ -797,6 +803,25 @@ class BrowserState:
                 or urlparse(http_page.url).scheme in ["http", "https"]
             )
         ]
+
+        if max_pages <= 0 or len(pages) <= max_pages:
+            return pages
+
+        reserved_pages = pages[-max_pages:]
+
+        closing_pages = pages[: len(pages) - max_pages]
+        LOG.warning(
+            "The page number exceeds the limit, closing the oldest pages. It might cause the video missing",
+            closing_pages=closing_pages,
+        )
+        for page in closing_pages:
+            try:
+                async with asyncio.timeout(BROWSER_PAGE_CLOSE_TIMEOUT):
+                    await page.close()
+            except Exception:
+                LOG.warning("Error while closing the page", exc_info=True)
+
+        return reserved_pages
 
     async def validate_browser_context(self, page: Page) -> bool:
         # validate the content
@@ -1002,21 +1027,18 @@ class BrowserState:
     async def take_fullpage_screenshot(
         self,
         file_path: str | None = None,
-        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         page = await self.__assert_page()
         return await SkyvernFrame.take_scrolling_screenshot(
             page=page,
             file_path=file_path,
             mode=ScreenshotMode.LITE,
-            use_playwright_fullpage=use_playwright_fullpage,
         )
 
     async def take_post_action_screenshot(
         self,
         scrolling_number: int,
         file_path: str | None = None,
-        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         page = await self.__assert_page()
         return await SkyvernFrame.take_scrolling_screenshot(
@@ -1024,5 +1046,4 @@ class BrowserState:
             file_path=file_path,
             mode=ScreenshotMode.LITE,
             scrolling_number=scrolling_number,
-            use_playwright_fullpage=use_playwright_fullpage,
         )

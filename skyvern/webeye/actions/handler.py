@@ -475,6 +475,7 @@ class ActionHandler:
                 )
 
             if not download_triggered:
+                results[-1].download_triggered = False
                 return results
             results[-1].download_triggered = True
 
