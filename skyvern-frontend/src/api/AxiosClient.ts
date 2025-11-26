@@ -119,4 +119,42 @@ async function getClient(
 
 export type CredentialGetter = () => Promise<string | null>;
 
+// Interceptor to handle 403/404 responses from internal auth status endpoint
+// This prevents misleading "API key verification failed" errors when running
+// self-hosted Skyvern instances accessed remotely (non-localhost)
+// See: https://github.com/Skyvern-AI/skyvern/issues/3782
+[client, v2Client, clientSansApiV1].forEach((instance) => {
+  instance.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      try {
+        const url = String(error?.config?.url || "");
+        const status = Number(error?.response?.status || 0);
+        const detail = String(error?.response?.data?.detail || "");
+
+        // Only intercept the internal auth endpoint
+        const isInternalAuth =
+          url.includes("/internal/auth/status") ||
+          url.endsWith("/api/v1/internal/auth/status");
+
+        if (isInternalAuth && (status === 403 || status === 404)) {
+          console.warn(
+            "Ignoring /internal/auth/status API error:",
+            status,
+            detail,
+          );
+          return Promise.resolve({
+            ...error.response,
+            status: 200,
+            data: { status: "ok" },
+          });
+        }
+      } catch (err) {
+        console.error("Interceptor error:", err);
+      }
+      return Promise.reject(error);
+    },
+  );
+});
+
 export { getClient, artifactApiClient };
