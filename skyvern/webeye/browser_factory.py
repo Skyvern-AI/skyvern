@@ -1017,21 +1017,18 @@ class BrowserState:
     async def take_fullpage_screenshot(
         self,
         file_path: str | None = None,
-        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         page = await self.__assert_page()
         return await SkyvernFrame.take_scrolling_screenshot(
             page=page,
             file_path=file_path,
             mode=ScreenshotMode.LITE,
-            use_playwright_fullpage=use_playwright_fullpage,
         )
 
     async def take_post_action_screenshot(
         self,
         scrolling_number: int,
         file_path: str | None = None,
-        use_playwright_fullpage: bool = False,  # TODO: THIS IS ONLY FOR EXPERIMENT. will be removed after experiment.
     ) -> bytes:
         page = await self.__assert_page()
         return await SkyvernFrame.take_scrolling_screenshot(
@@ -1039,5 +1036,4 @@ class BrowserState:
             file_path=file_path,
             mode=ScreenshotMode.LITE,
             scrolling_number=scrolling_number,
-            use_playwright_fullpage=use_playwright_fullpage,
         )
