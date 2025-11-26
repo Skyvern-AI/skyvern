@@ -8,7 +8,7 @@ LOG = structlog.get_logger()
 
 
 _TYPE_DEFAULT_FACTORIES: dict[str, Any] = {
-    "string": lambda: "",
+    "string": lambda: None,
     "number": lambda: 0,
     "integer": lambda: 0,
     "boolean": lambda: False,
@@ -179,6 +179,75 @@ def validate_data_against_schema(data: Any, schema: dict[str, Any]) -> list[str]
     return errors
 
 
+def _is_all_default_values(data: dict[str, Any], schema: dict[str, Any]) -> bool:
+    """
+    Check if a dict contains only default values (indicating it was created from invalid data).
+
+    Args:
+        data: The data object to check
+        schema: The schema defining the expected structure
+
+    Returns:
+        True if all values are defaults, False otherwise
+    """
+    if not isinstance(data, dict):
+        return False
+
+    properties = schema.get("properties", {})
+    if not properties:
+        return False
+
+    # Check each property against its default value
+    for field_name, field_schema in properties.items():
+        if field_name not in data:
+            continue
+
+        field_value = data[field_name]
+        field_type = _resolve_schema_type(field_schema.get("type"), f"check.{field_name}")
+        default_value = get_default_value_for_type(field_type)
+
+        # If any field has a non-default value, the record is meaningful
+        if field_value != default_value:
+            return False
+
+    return True
+
+
+def _filter_invalid_array_items(data: list[Any], schema: dict[str, Any]) -> list[Any]:
+    """
+    Filter out array items that are all default values (created from invalid data like strings).
+
+    Args:
+        data: The array data to filter
+        schema: The array schema
+
+    Returns:
+        Filtered array with invalid items removed
+    """
+    items_schema = schema.get("items")
+    if not items_schema or not isinstance(items_schema, dict):
+        return data
+
+    # Only filter if items are objects
+    if items_schema.get("type") not in ("object", ["object", "null"]):
+        return data
+
+    filtered = []
+    removed_count = 0
+
+    for item in data:
+        if isinstance(item, dict) and _is_all_default_values(item, items_schema):
+            removed_count += 1
+            LOG.info("Filtering out invalid array item with all default values", item=item)
+        else:
+            filtered.append(item)
+
+    if removed_count > 0:
+        LOG.info(f"Removed {removed_count} invalid array items")
+
+    return filtered
+
+
 def validate_and_fill_extraction_result(
     extraction_result: dict[str, Any],
     schema: dict[str, Any] | list | str | None,
@@ -211,6 +280,10 @@ def validate_and_fill_extraction_result(
 
     try:
         filled_result = fill_missing_fields(extraction_result, schema)
+
+        # Filter out invalid array items if the schema is for an array
+        if isinstance(schema, dict) and schema.get("type") == "array" and isinstance(filled_result, list):
+            filled_result = _filter_invalid_array_items(filled_result, schema)
 
         if isinstance(schema, dict):
             validation_errors = validate_data_against_schema(filled_result, schema)

@@ -83,7 +83,7 @@ class TestSchemaValidator:
 
     def test_get_default_value_for_string(self) -> None:
         """Test default value generation for string type."""
-        assert get_default_value_for_type("string") == ""
+        assert get_default_value_for_type("string") is None
 
     def test_get_default_value_for_boolean(self) -> None:
         """Test default value generation for boolean type."""
@@ -103,8 +103,8 @@ class TestSchemaValidator:
 
     def test_get_default_value_for_type_list_with_null(self) -> None:
         """Test default value generation for type list containing null."""
-        assert get_default_value_for_type(["string", "null"]) == ""
-        assert get_default_value_for_type(["null", "string"]) == ""
+        assert get_default_value_for_type(["string", "null"]) is None
+        assert get_default_value_for_type(["null", "string"]) is None
 
     def test_get_default_value_for_type_list_all_null(self) -> None:
         """Test default value generation for type list with only null."""
@@ -112,7 +112,7 @@ class TestSchemaValidator:
 
     def test_get_default_value_for_uppercase_type(self) -> None:
         """Test default value generation for uppercase type names."""
-        assert get_default_value_for_type("STRING") == ""
+        assert get_default_value_for_type("STRING") is None
         assert get_default_value_for_type("NUMBER") == 0
         assert get_default_value_for_type("INTEGER") == 0
         assert get_default_value_for_type("BOOLEAN") is False
@@ -122,10 +122,10 @@ class TestSchemaValidator:
 
     def test_get_default_value_for_mixed_case_type(self) -> None:
         """Test default value generation for mixed case type names."""
-        assert get_default_value_for_type("String") == ""
+        assert get_default_value_for_type("String") is None
         assert get_default_value_for_type("Boolean") is False
-        assert get_default_value_for_type(["STRING", "null"]) == ""
-        assert get_default_value_for_type(["NULL", "STRING"]) == ""
+        assert get_default_value_for_type(["STRING", "null"]) is None
+        assert get_default_value_for_type(["NULL", "STRING"]) is None
 
     def test_fill_missing_fields_complete_data(
         self, medication_schema: dict[str, Any], complete_medication_data: list[dict[str, Any]]
@@ -145,18 +145,18 @@ class TestSchemaValidator:
         assert result[0]["NDC"] == "00904-7481-59"
         assert result[0]["quantity"] == "0"
         assert result[0]["facility"] == "CHI-IL"
-        assert result[0]["recoverydate"] == ""  # Default for ["string", "null"]
+        assert result[0]["recoverydate"] is None  # Default for ["string", "null"]
         assert result[0]["isAllocation"] is False  # Default for boolean
-        assert result[0]["ErrorMessage"] == ""  # Default for ["string", "null"]
+        assert result[0]["ErrorMessage"] is None  # Default for ["string", "null"]
 
         # Second item should have all missing fields filled
         assert result[1]["Medication Name"] == "AMOXICILLIN 500MG CAPSULE 500"
-        assert result[1]["NDC"] == ""  # Default for string
-        assert result[1]["quantity"] == ""  # Default for string
-        assert result[1]["facility"] == ""  # Default for string
-        assert result[1]["recoverydate"] == ""  # Default for ["string", "null"]
+        assert result[1]["NDC"] is None  # Default for string
+        assert result[1]["quantity"] is None  # Default for string
+        assert result[1]["facility"] is None  # Default for string
+        assert result[1]["recoverydate"] is None  # Default for ["string", "null"]
         assert result[1]["isAllocation"] is False  # Default for boolean
-        assert result[1]["ErrorMessage"] == ""  # Default for ["string", "null"]
+        assert result[1]["ErrorMessage"] is None  # Default for ["string", "null"]
 
     def test_fill_missing_fields_with_error_message(self, medication_schema: dict[str, Any]) -> None:
         """Test filling fields when ErrorMessage has a value."""
@@ -331,7 +331,7 @@ class TestSchemaValidator:
 
         # With the fix, missing fields in array items should be filled
         assert len(result) == 1
-        assert result[0] == {"id": "1", "name": ""}
+        assert result[0] == {"id": "1", "name": None}
         assert "id" in result[0]
         assert "name" in result[0]
 
@@ -467,3 +467,54 @@ class TestSchemaValidator:
         # Should return data as-is without transformations when schema is invalid
         result = validate_and_fill_extraction_result(data, invalid_schema)
         assert result == data
+
+    def test_filter_invalid_array_items_with_string(self, medication_schema: dict[str, Any]) -> None:
+        """Test that array items created from invalid data (strings) are filtered out."""
+        # Simulate LLM response with a string mixed in the array
+        data = [
+            {
+                "Medication Name": "ACETAMINOPHEN 500MG",
+                "NDC": "12345-678-90",
+                "quantity": "100",
+                "facility": "TEST-FACILITY",
+                "recoverydate": None,
+                "isAllocation": False,
+                "ErrorMessage": None,
+            },
+            "This is an invalid string that should be filtered out",
+            {
+                "Medication Name": "IBUPROFEN 200MG",
+                "NDC": "98765-432-10",
+                "quantity": "50",
+                "facility": "TEST-FACILITY",
+                "recoverydate": "2024-01-01",
+                "isAllocation": True,
+                "ErrorMessage": None,
+            },
+        ]
+
+        result = validate_and_fill_extraction_result(data, medication_schema)
+
+        # Should have only 2 valid records (the string should be filtered out)
+        assert len(result) == 2
+        assert result[0]["Medication Name"] == "ACETAMINOPHEN 500MG"
+        assert result[1]["Medication Name"] == "IBUPROFEN 200MG"
+
+    def test_filter_invalid_array_items_preserves_valid_defaults(self, medication_schema: dict[str, Any]) -> None:
+        """Test that records with some valid data are preserved even if some fields are defaults."""
+        data = [
+            {
+                "Medication Name": "VALID MEDICATION",
+                "NDC": "12345-678-90",
+                # Missing other required fields - should be filled with defaults but NOT filtered
+            }
+        ]
+
+        result = validate_and_fill_extraction_result(data, medication_schema)
+
+        # Should preserve the record because it has meaningful data
+        assert len(result) == 1
+        assert result[0]["Medication Name"] == "VALID MEDICATION"
+        assert result[0]["NDC"] == "12345-678-90"
+        assert result[0]["quantity"] is None  # Filled with default
+        assert result[0]["facility"] is None  # Filled with default
