@@ -104,7 +104,7 @@ async def stream(
         )
 
         if not result:
-            LOG.error(
+            LOG.warning(
                 "No vnc context found for the browser session.",
                 browser_session_id=browser_session_id,
                 organization_id=organization_id,
@@ -128,7 +128,7 @@ async def stream(
         )
 
         if not result:
-            LOG.error("No vnc context found for the task.", task_id=task_id, organization_id=organization_id)
+            LOG.warning("No vnc context found for the task.", task_id=task_id, organization_id=organization_id)
             await websocket.close(code=1013)
             return
 
@@ -146,7 +146,7 @@ async def stream(
         )
 
         if not result:
-            LOG.error(
+            LOG.warning(
                 "No vnc context found for the workflow run.",
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
