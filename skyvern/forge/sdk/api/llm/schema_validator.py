@@ -85,7 +85,7 @@ def fill_missing_fields(data: Any, schema: dict[str, Any] | list | str | None, p
 
         if not isinstance(data, dict):
             LOG.warning(
-                "Expected object but got different type, creating empty object",
+                "Schema expects object type but received incompatible type, creating empty object to satisfy schema requirements and continue validation",
                 path=path,
                 data_type=type(data).__name__,
             )
